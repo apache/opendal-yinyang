@@ -16,7 +16,7 @@
 // under the License.
 
 use futures_util::TryStreamExt as _;
-use opendal::{ErrorKind as StorageErrorKind, Operator};
+use opendal::{ErrorKind as StorageErrorKind, Operator, Writer};
 
 use crate::{
     BlobRef, CommitId, ContentId, Error, File, FilePart, FsVersion, Generation, Node, NodeBody,
@@ -28,7 +28,8 @@ const VERSION_PREFIX: &str = ".yinyang/versions/";
 const HEAD_MAGIC: &[u8; 8] = b"YYHEAD01";
 const VERSION_MAGIC: &[u8; 8] = b"YYVER001";
 const MAX_HEAD_BYTES: usize = 4 * 1024;
-const MAX_VERSION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MATERIALIZED_VERSION_BYTES: usize = 64 * 1024 * 1024;
+const VERSION_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 const CHECKSUM_BYTES: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,45 +48,50 @@ pub(crate) fn validate_operator(operator: &Operator) -> Result<()> {
     let capability = operator.info().capability();
     if !capability.read
         || !capability.write
+        || !capability.write_can_multi
         || !capability.write_with_if_match
         || !capability.write_with_if_not_exists
     {
         return Err(Error::unsupported(
             "use YinYang filesystem",
-            "OpenDAL backend must support read, write, create-if-absent, and ETag if-match",
+            "OpenDAL backend must support read, streaming write, create-if-absent, and ETag if-match",
         ));
     }
     Ok(())
 }
 
 pub(crate) async fn write_version(operator: &Operator, version: &FsVersion) -> Result<BlobRef> {
-    let bytes = encode_version(version)?;
-    let content = content_id(&bytes);
-    let path = version_path(content);
-    let already_exists = match operator.write_with(&path, bytes).if_not_exists(true).await {
-        Ok(_) => false,
-        Err(error)
-            if matches!(
-                error.kind(),
-                StorageErrorKind::AlreadyExists | StorageErrorKind::ConditionNotMatch
-            ) =>
-        {
-            true
-        }
-        Err(error) => return Err(Error::from_storage("write YinYang version", error)),
-    };
-    let reference = BlobRef::new(path, content);
-    if already_exists {
-        read_version(operator, &reference).await?;
+    let path = new_version_path();
+    let writer = operator
+        .writer_with(&path)
+        .if_not_exists(true)
+        .await
+        .map_err(|error| Error::from_storage("write YinYang version", error))?;
+    let mut encoder = VersionEncoder::new(writer);
+    if let Err(error) = encoder.encode(version).await {
+        encoder.abort().await;
+        return Err(error);
     }
-    Ok(reference)
+    let content = match encoder.finish().await {
+        Ok(content) => content,
+        Err(error) => {
+            encoder.abort().await;
+            return Err(error);
+        }
+    };
+    Ok(BlobRef::new(path, content))
 }
 
 pub(crate) async fn read_version(operator: &Operator, reference: &BlobRef) -> Result<FsVersion> {
-    let expected_path = version_path(reference.content());
-    if reference.as_bytes() != expected_path.as_bytes()
-        || reference.content().length() > MAX_VERSION_BYTES as u64
-    {
+    let path = version_reference_path(reference)
+        .ok_or_else(|| Error::corrupt("read YinYang version", "version reference is invalid"))?;
+    if reference.content().length() > MAX_MATERIALIZED_VERSION_BYTES as u64 {
+        return Err(Error::unsupported(
+            "read YinYang version",
+            "version exceeds the current materialized implementation limit",
+        ));
+    }
+    if reference.content().length() < VERSION_MAGIC.len() as u64 {
         return Err(Error::corrupt(
             "read YinYang version",
             "version reference is invalid",
@@ -93,8 +99,8 @@ pub(crate) async fn read_version(operator: &Operator, reference: &BlobRef) -> Re
     }
     let object = read_bounded(
         operator,
-        &expected_path,
-        MAX_VERSION_BYTES,
+        path,
+        MAX_MATERIALIZED_VERSION_BYTES,
         "read YinYang version",
     )
     .await?
@@ -220,22 +226,14 @@ async fn read_bounded(
     Ok(Some(StoredObject { bytes, etag }))
 }
 
-fn encode_version(version: &FsVersion) -> Result<Vec<u8>> {
-    let mut encoder = Encoder::new(VERSION_MAGIC, MAX_VERSION_BYTES, "encode YinYang version");
-    encoder.sequence_len(version.tree().iter().count())?;
-    for (path, node) in version.tree().iter() {
-        encoder.value(path.as_str())?;
-        encode_node(&mut encoder, node)?;
-    }
-    encoder.sequence_len(version.commits().len())?;
-    for commit in version.commits() {
-        encoder.value(commit.as_bytes())?;
-    }
-    Ok(encoder.finish())
-}
-
 fn decode_version(bytes: &[u8]) -> Result<FsVersion> {
-    if bytes.len() > MAX_VERSION_BYTES || !bytes.starts_with(VERSION_MAGIC) {
+    if bytes.len() > MAX_MATERIALIZED_VERSION_BYTES {
+        return Err(Error::unsupported(
+            "decode YinYang version",
+            "version exceeds the current materialized implementation limit",
+        ));
+    }
+    if !bytes.starts_with(VERSION_MAGIC) {
         return Err(Error::corrupt(
             "decode YinYang version",
             "version envelope is invalid",
@@ -298,11 +296,18 @@ fn content_id(bytes: &[u8]) -> ContentId {
     ContentId::new(blake3::hash(bytes).into(), bytes.len() as u64)
 }
 
-fn version_path(content: ContentId) -> String {
-    format!(
-        "{VERSION_PREFIX}{}",
-        blake3::Hash::from_bytes(*content.digest()).to_hex()
-    )
+fn new_version_path() -> String {
+    format!("{VERSION_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
+fn version_reference_path(reference: &BlobRef) -> Option<&str> {
+    let path = std::str::from_utf8(reference.as_bytes()).ok()?;
+    let key = path.strip_prefix(VERSION_PREFIX)?;
+    (key.len() == 32
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(path)
 }
 
 fn encode_node(encoder: &mut Encoder, node: &Node) -> Result<()> {
@@ -391,18 +396,109 @@ fn corrupt_version_value(error: Error) -> Error {
     Error::corrupt("decode YinYang version", error.message())
 }
 
+struct VersionEncoder {
+    writer: Writer,
+    encoder: Encoder,
+    hasher: blake3::Hasher,
+}
+
+impl VersionEncoder {
+    fn new(writer: Writer) -> Self {
+        Self {
+            writer,
+            encoder: Encoder::new_with_implementation_limit(
+                VERSION_MAGIC,
+                MAX_MATERIALIZED_VERSION_BYTES,
+                "encode YinYang version",
+            ),
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    async fn encode(&mut self, version: &FsVersion) -> Result<()> {
+        self.encoder.sequence_len(version.tree().iter().count())?;
+        for (path, node) in version.tree().iter() {
+            self.encoder.value(path.as_str())?;
+            encode_node(&mut self.encoder, node)?;
+            self.flush_if_full().await?;
+        }
+        self.encoder.sequence_len(version.commits().len())?;
+        for commit in version.commits() {
+            self.encoder.value(commit.as_bytes())?;
+            self.flush_if_full().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_if_full(&mut self) -> Result<()> {
+        if self.encoder.buffered_len() >= VERSION_WRITE_BUFFER_BYTES {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        let bytes = self.encoder.take_bytes();
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.hasher.update(&bytes);
+        self.writer
+            .write(bytes)
+            .await
+            .map_err(|error| Error::from_storage("write YinYang version", error))
+    }
+
+    async fn finish(&mut self) -> Result<ContentId> {
+        self.flush().await?;
+        self.writer
+            .close()
+            .await
+            .map_err(|error| Error::from_storage("write YinYang version", error))?;
+        Ok(ContentId::new(
+            self.hasher.finalize().into(),
+            self.encoder.encoded_len() as u64,
+        ))
+    }
+
+    async fn abort(&mut self) {
+        let _ = self.writer.abort().await;
+    }
+}
+
 struct Encoder {
     bytes: Vec<u8>,
+    flushed_bytes: usize,
     maximum_bytes: usize,
     operation: &'static str,
+    implementation_limit: bool,
+    limit_exceeded: bool,
 }
 
 impl Encoder {
     fn new(magic: &[u8], maximum_bytes: usize, operation: &'static str) -> Self {
         Self {
             bytes: magic.to_vec(),
+            flushed_bytes: 0,
             maximum_bytes,
             operation,
+            implementation_limit: false,
+            limit_exceeded: false,
+        }
+    }
+
+    fn new_with_implementation_limit(
+        magic: &[u8],
+        maximum_bytes: usize,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            bytes: magic.to_vec(),
+            flushed_bytes: 0,
+            maximum_bytes,
+            operation,
+            implementation_limit: true,
+            limit_exceeded: false,
         }
     }
 
@@ -415,26 +511,54 @@ impl Encoder {
     fn value<T: borsh::BorshSerialize + ?Sized>(&mut self, value: &T) -> Result<()> {
         value
             .serialize(self)
-            .map_err(|error| Error::invalid(self.operation, error.to_string()))
+            .map_err(|error| self.encode_error(error))
     }
 
     fn raw_bytes(&mut self, value: &[u8]) -> Result<()> {
-        borsh::io::Write::write_all(self, value)
-            .map_err(|error| Error::invalid(self.operation, error.to_string()))
+        borsh::io::Write::write_all(self, value).map_err(|error| self.encode_error(error))
     }
 
     fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    fn buffered_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.flushed_bytes + self.bytes.len()
+    }
+
+    fn take_bytes(&mut self) -> Vec<u8> {
+        self.flushed_bytes += self.bytes.len();
+        std::mem::replace(
+            &mut self.bytes,
+            Vec::with_capacity(VERSION_WRITE_BUFFER_BYTES),
+        )
+    }
+
+    fn encode_error(&self, error: borsh::io::Error) -> Error {
+        if self.implementation_limit && self.limit_exceeded {
+            Error::unsupported(
+                self.operation,
+                "version exceeds the current materialized implementation limit",
+            )
+        } else {
+            Error::invalid(self.operation, error.to_string())
+        }
+    }
+
     fn finish(self) -> Vec<u8> {
+        debug_assert_eq!(self.flushed_bytes, 0);
         self.bytes
     }
 }
 
 impl borsh::io::Write for Encoder {
     fn write(&mut self, value: &[u8]) -> borsh::io::Result<usize> {
-        if value.len() > self.maximum_bytes.saturating_sub(self.bytes.len()) {
+        if value.len() > self.maximum_bytes.saturating_sub(self.encoded_len()) {
+            self.limit_exceeded = true;
             return Err(borsh::io::Error::new(
                 borsh::io::ErrorKind::InvalidData,
                 "encoded object exceeds its size limit",
@@ -478,13 +602,23 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opendal::services::Memory;
 
-    #[test]
-    fn version_wire_contract_is_stable() {
+    async fn persisted_version_bytes(version: &FsVersion) -> Vec<u8> {
+        let operator = Operator::new(Memory::default()).unwrap();
+        let reference = write_version(&operator, version).await.unwrap();
+        let path = version_reference_path(&reference).unwrap();
+        let bytes = operator.read(path).await.unwrap().to_bytes().to_vec();
+        assert_eq!(content_id(&bytes), reference.content());
+        bytes
+    }
+
+    #[tokio::test]
+    async fn version_wire_contract_is_stable() {
         let root = NodeId::from_bytes([1; 16]);
         let version = FsVersion::new(Tree::genesis(root), Vec::new()).unwrap();
 
-        let actual = encode_version(&version).unwrap();
+        let actual = persisted_version_bytes(&version).await;
         let mut expected = VERSION_MAGIC.to_vec();
         expected.extend_from_slice(&1_u32.to_le_bytes());
         expected.extend_from_slice(&0_u32.to_le_bytes());
@@ -499,8 +633,8 @@ mod tests {
         assert_eq!(decode_version(&actual).unwrap(), version);
     }
 
-    #[test]
-    fn file_version_wire_contract_is_stable() {
+    #[tokio::test]
+    async fn file_version_wire_contract_is_stable() {
         let root = NodeId::from_bytes([1; 16]);
         let mut tree = Tree::genesis(root);
         tree.insert(
@@ -524,7 +658,7 @@ mod tests {
         );
         let version = FsVersion::new(tree, vec![CommitId::from_bytes([5; 16])]).unwrap();
 
-        let actual = encode_version(&version).unwrap();
+        let actual = persisted_version_bytes(&version).await;
         let mut expected = VERSION_MAGIC.to_vec();
         expected.extend_from_slice(&2_u32.to_le_bytes());
         expected.extend_from_slice(&0_u32.to_le_bytes());
@@ -556,11 +690,11 @@ mod tests {
         assert_eq!(decode_version(&actual).unwrap(), version);
     }
 
-    #[test]
-    fn version_decoder_rejects_invalid_borsh() {
+    #[tokio::test]
+    async fn version_decoder_rejects_invalid_borsh() {
         let root = NodeId::from_bytes([1; 16]);
         let version = FsVersion::new(Tree::genesis(root), Vec::new()).unwrap();
-        let encoded = encode_version(&version).unwrap();
+        let encoded = persisted_version_bytes(&version).await;
 
         let mut invalid_boolean = encoded.clone();
         invalid_boolean[40] = 2;
@@ -606,5 +740,44 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(decode_head(&actual).unwrap(), reference);
+    }
+
+    #[test]
+    fn oversized_materialized_version_is_unsupported() {
+        let mut encoder = Encoder::new_with_implementation_limit(
+            VERSION_MAGIC,
+            VERSION_MAGIC.len(),
+            "encode YinYang version",
+        );
+
+        let error = encoder.value(&0_u8).unwrap_err();
+
+        assert_eq!(error.kind(), crate::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_version_object_keys() {
+        let operator = Operator::new(Memory::default()).unwrap();
+        let reference = BlobRef::new(
+            b".yinyang/versions/not-a-version-id".to_vec(),
+            ContentId::new([0; 32], VERSION_MAGIC.len() as u64),
+        );
+
+        let error = read_version(&operator, &reference).await.unwrap_err();
+
+        assert_eq!(error.kind(), crate::ErrorKind::Corrupt);
+    }
+
+    #[tokio::test]
+    async fn oversized_version_reference_is_unsupported() {
+        let operator = Operator::new(Memory::default()).unwrap();
+        let reference = BlobRef::new(
+            new_version_path(),
+            ContentId::new([0; 32], MAX_MATERIALIZED_VERSION_BYTES as u64 + 1),
+        );
+
+        let error = read_version(&operator, &reference).await.unwrap_err();
+
+        assert_eq!(error.kind(), crate::ErrorKind::Unsupported);
     }
 }

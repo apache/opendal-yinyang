@@ -37,6 +37,7 @@ struct TestState {
     next_revision: u64,
     fail_after_head_write: bool,
     stat_calls: u64,
+    version_write_calls: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -47,8 +48,17 @@ struct StoredObject {
 
 impl TestBackend {
     fn operator(&self) -> Operator {
+        self.operator_with_streaming_write(true)
+    }
+
+    fn operator_without_streaming_write(&self) -> Operator {
+        self.operator_with_streaming_write(false)
+    }
+
+    fn operator_with_streaming_write(&self, write_can_multi: bool) -> Operator {
         let service: Servicer = Arc::new(TestService {
             state: self.state.clone(),
+            write_can_multi,
         });
         Operator::from_parts(OperationContext::default(), service)
     }
@@ -59,6 +69,25 @@ impl TestBackend {
 
     fn stat_calls(&self) -> u64 {
         self.state.lock().unwrap().stat_calls
+    }
+
+    fn reset_version_write_calls(&self) {
+        self.state.lock().unwrap().version_write_calls = 0;
+    }
+
+    fn version_write_calls(&self) -> u64 {
+        self.state.lock().unwrap().version_write_calls
+    }
+
+    fn version_objects(&self) -> Vec<(String, Vec<u8>)> {
+        self.state
+            .lock()
+            .unwrap()
+            .objects
+            .iter()
+            .filter(|(path, _)| path.starts_with(".yinyang/versions/"))
+            .map(|(path, object)| (path.clone(), object.bytes.clone()))
+            .collect()
     }
 
     fn remove_current_version(&self) {
@@ -96,6 +125,7 @@ impl TestBackend {
 #[derive(Debug)]
 struct TestService {
     state: Arc<Mutex<TestState>>,
+    write_can_multi: bool,
 }
 
 impl Service for TestService {
@@ -114,6 +144,7 @@ impl Service for TestService {
             stat: true,
             read: true,
             write: true,
+            write_can_multi: self.write_can_multi,
             write_can_empty: true,
             write_with_if_match: true,
             write_with_if_not_exists: true,
@@ -232,6 +263,9 @@ struct TestWriter {
 
 impl oio::Write for TestWriter {
     async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
+        if self.path.starts_with(".yinyang/versions/") {
+            self.state.lock().unwrap().version_write_calls += 1;
+        }
         for chunk in buffer {
             self.bytes.extend_from_slice(&chunk);
         }
@@ -353,6 +387,43 @@ async fn creates_and_reopens_one_filesystem() {
 }
 
 #[tokio::test]
+async fn streams_versions_to_opaque_object_keys() {
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
+    let observed = filesystem.observe().await.unwrap();
+    let mut successor = observed.tree().clone();
+    advance_root_membership(&mut successor);
+    for index in 0..10_000 {
+        successor.insert(
+            Path::new(format!("dir-{index:05}")).unwrap(),
+            Node::dir(
+                NodeId::generate(),
+                Generation::FIRST,
+                false,
+                Generation::FIRST,
+            ),
+        );
+    }
+    backend.reset_version_write_calls();
+
+    filesystem
+        .commit(&observed, CommitId::generate(), successor)
+        .await
+        .unwrap();
+
+    assert!(backend.version_write_calls() > 1);
+    for (path, bytes) in backend.version_objects() {
+        let key = path.strip_prefix(".yinyang/versions/").unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(
+            key.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(key, blake3::hash(&bytes).to_hex().as_str());
+    }
+}
+
+#[tokio::test]
 async fn resolves_a_lost_head_creation_response() {
     let backend = TestBackend::default();
     backend.fail_next_head_write_after_success();
@@ -367,6 +438,17 @@ async fn rejects_backends_without_conditional_head_replacement() {
     let operator = Operator::new(Memory::default()).unwrap();
 
     let error = Fs::create(operator).await.unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[tokio::test]
+async fn rejects_backends_without_streaming_write() {
+    let backend = TestBackend::default();
+
+    let error = Fs::create(backend.operator_without_streaming_write())
+        .await
+        .unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::Unsupported);
 }

@@ -61,29 +61,29 @@ one head history uses the same root `NodeId`.
 ## OpenDAL contract
 
 The supplied OpenDAL operator is rooted at one YinYang filesystem. It must
-support read, write, create-if-absent, and ETag if-match writes. Creation and
-open fail with `Unsupported` when any required capability is absent. An ETag
-used to replace the head comes from the same read that returned the head bytes;
-it is never reconstructed with a later metadata request.
+support read, streaming write, create-if-absent, and ETag if-match writes.
+Creation and open fail with `Unsupported` when any required capability is
+absent. An ETag used to replace the head comes from the same read that returned
+the head bytes; it is never reconstructed with a later metadata request.
 
 YinYang owns these paths below the operator root:
 
 ```text
 .yinyang/head
-.yinyang/versions/<digest>
+.yinyang/versions/<object-id>
 ```
 
-`<digest>` is the 64-character lowercase hexadecimal BLAKE3 digest of the
-complete encoded version object. A version `BlobRef` contains that object path
-and a `ContentId` covering the complete encoded object. Version writes use
-create-if-absent. An existing object at the same content-addressed path is
-accepted after its length, digest, and encoding are verified. Every later read
-performs the same verification.
+`<object-id>` is a generated UUID encoded as 32 lowercase hexadecimal
+characters and selected before encoding starts. A version writer streams the
+encoded object to that path while computing its BLAKE3 digest and length. The
+resulting version `BlobRef` contains the object path and a `ContentId` covering
+the complete encoded object. Version writes use create-if-absent. Every later
+read verifies the stored length, digest, and encoding against that reference.
 
 The head is created with create-if-absent and replaced with ETag if-match. A
-condition mismatch is a publication conflict. Missing, truncated, oversized,
-or unverifiable referenced objects are corrupt data. Direct external writes
-under `.yinyang/` are outside the format contract.
+condition mismatch is a publication conflict. Missing, truncated,
+length-mismatched, or unverifiable referenced objects are corrupt data. Direct
+external writes under `.yinyang/` are outside the format contract.
 
 ## Persistent encoding
 
@@ -125,8 +125,11 @@ ContentId { digest: [u8; 32], length: u64 }
 
 Entries are encoded in ascending canonical `Path` order. File parts and commits
 retain their logical order. `Dir` has discriminant 0 and `File` has
-discriminant 1. A version object is `YYVER001 || borsh(VersionBody)` and is
-limited to 64 MiB including the magic. The head is
+discriminant 1. A version object is `YYVER001 || borsh(VersionBody)`. The
+current materialized reader and writer impose a 64 MiB resource limit including
+the magic; this is an implementation limit, not part of the persistent format.
+An otherwise valid version above that limit is unsupported by this
+implementation, not corrupt data. The head is
 `YYHEAD01 || borsh(BlobRef) || BLAKE3(magic || payload)` and is limited to 4
 KiB. The head checksum covers its magic and payload, excluding the checksum
 itself.
