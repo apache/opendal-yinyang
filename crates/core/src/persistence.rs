@@ -221,23 +221,17 @@ async fn read_bounded(
 }
 
 fn encode_version(version: &FsVersion) -> Result<Vec<u8>> {
-    let wire = WireVersion::from(version);
-    let mut bytes = VERSION_MAGIC.to_vec();
-    let body = bincode::encode_to_vec(
-        wire,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_limit::<MAX_VERSION_BYTES>(),
-    )
-    .map_err(|_| Error::invalid("encode YinYang version", "version cannot be encoded"))?;
-    bytes.extend_from_slice(&body);
-    if bytes.len() > MAX_VERSION_BYTES {
-        return Err(Error::invalid(
-            "encode YinYang version",
-            "version exceeds its size limit",
-        ));
+    let mut encoder = Encoder::new(VERSION_MAGIC, MAX_VERSION_BYTES, "encode YinYang version");
+    encoder.sequence_len(version.tree().iter().count())?;
+    for (path, node) in version.tree().iter() {
+        encoder.value(path.as_str())?;
+        encode_node(&mut encoder, node)?;
     }
-    Ok(bytes)
+    encoder.sequence_len(version.commits().len())?;
+    for commit in version.commits() {
+        encoder.value(commit.as_bytes())?;
+    }
+    Ok(encoder.finish())
 }
 
 fn decode_version(bytes: &[u8]) -> Result<FsVersion> {
@@ -247,43 +241,31 @@ fn decode_version(bytes: &[u8]) -> Result<FsVersion> {
             "version envelope is invalid",
         ));
     }
-    let body = &bytes[VERSION_MAGIC.len()..];
-    let (wire, consumed) = bincode::decode_from_slice::<WireVersion, _>(
-        body,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_limit::<MAX_VERSION_BYTES>(),
-    )
-    .map_err(|_| Error::corrupt("decode YinYang version", "version body is invalid"))?;
-    if consumed != body.len() {
-        return Err(Error::corrupt(
-            "decode YinYang version",
-            "version contains trailing bytes",
-        ));
+
+    let mut decoder = Decoder::new(&bytes[VERSION_MAGIC.len()..], "decode YinYang version");
+    let entry_count: u32 = decoder.value()?;
+    let mut entries = Vec::new();
+    for _ in 0..entry_count {
+        let path = Path::new(decoder.value::<String>()?).map_err(corrupt_version_value)?;
+        entries.push((path, decode_node(&mut decoder)?));
     }
-    wire.into_version()
-        .map_err(|error| Error::corrupt("decode YinYang version", error.message()))
+    let commit_count: u32 = decoder.value()?;
+    let mut commits = Vec::new();
+    for _ in 0..commit_count {
+        commits.push(CommitId::from_bytes(decoder.value()?));
+    }
+    decoder.finish()?;
+
+    let tree = Tree::from_entries(entries).map_err(corrupt_version_value)?;
+    FsVersion::new(tree, commits).map_err(corrupt_version_value)
 }
 
 fn encode_head(reference: &BlobRef) -> Result<Vec<u8>> {
-    let wire = WireBlobRef::from(reference);
-    let mut bytes = HEAD_MAGIC.to_vec();
-    let body = bincode::encode_to_vec(
-        wire,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_limit::<MAX_HEAD_BYTES>(),
-    )
-    .map_err(|_| Error::invalid("encode YinYang head", "head cannot be encoded"))?;
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
-    if bytes.len() > MAX_HEAD_BYTES {
-        return Err(Error::invalid(
-            "encode YinYang head",
-            "head exceeds its size limit",
-        ));
-    }
-    Ok(bytes)
+    let mut encoder = Encoder::new(HEAD_MAGIC, MAX_HEAD_BYTES, "encode YinYang head");
+    encode_blob_ref(&mut encoder, reference)?;
+    let checksum = blake3::hash(encoder.as_bytes());
+    encoder.raw_bytes(checksum.as_bytes())?;
+    Ok(encoder.finish())
 }
 
 fn decode_head(bytes: &[u8]) -> Result<BlobRef> {
@@ -303,21 +285,13 @@ fn decode_head(bytes: &[u8]) -> Result<BlobRef> {
             "head checksum is invalid",
         ));
     }
-    let body = &bytes[HEAD_MAGIC.len()..checksum_offset];
-    let (wire, consumed) = bincode::decode_from_slice::<WireBlobRef, _>(
-        body,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_limit::<MAX_HEAD_BYTES>(),
-    )
-    .map_err(|_| Error::corrupt("decode YinYang head", "head body is invalid"))?;
-    if consumed != body.len() {
-        return Err(Error::corrupt(
-            "decode YinYang head",
-            "head contains trailing bytes",
-        ));
-    }
-    Ok(wire.into_blob_ref())
+    let mut decoder = Decoder::new(
+        &bytes[HEAD_MAGIC.len()..checksum_offset],
+        "decode YinYang head",
+    );
+    let reference = decode_blob_ref(&mut decoder)?;
+    decoder.finish()?;
+    Ok(reference)
 }
 
 fn content_id(bytes: &[u8]) -> ContentId {
@@ -331,201 +305,173 @@ fn version_path(content: ContentId) -> String {
     )
 }
 
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireVersion {
-    entries: Vec<WireEntry>,
-    commits: Vec<[u8; 16]>,
+fn encode_node(encoder: &mut Encoder, node: &Node) -> Result<()> {
+    encoder.value(node.id().as_bytes())?;
+    encoder.value(&node.generation().value())?;
+    encoder.value(&node.executable())?;
+    match node.body() {
+        NodeBody::Dir { entries_generation } => {
+            encoder.value(&0_u8)?;
+            encoder.value(&entries_generation.value())
+        }
+        NodeBody::File(file) => {
+            encoder.value(&1_u8)?;
+            encode_file(encoder, file)
+        }
+    }
 }
 
-impl From<&FsVersion> for WireVersion {
-    fn from(version: &FsVersion) -> Self {
+fn encode_file(encoder: &mut Encoder, file: &File) -> Result<()> {
+    encode_content_id(encoder, file.content())?;
+    encoder.sequence_len(file.parts().len())?;
+    for part in file.parts() {
+        encoder.value(&part.range().start)?;
+        encoder.value(&part.range().end)?;
+        encoder.value(&part.blob_offset())?;
+        encode_blob_ref(encoder, part.blob())?;
+    }
+    Ok(())
+}
+
+fn encode_blob_ref(encoder: &mut Encoder, reference: &BlobRef) -> Result<()> {
+    encoder.value(reference.as_bytes())?;
+    encode_content_id(encoder, reference.content())
+}
+
+fn encode_content_id(encoder: &mut Encoder, content: ContentId) -> Result<()> {
+    encoder.value(content.digest())?;
+    encoder.value(&content.length())
+}
+
+fn decode_node(decoder: &mut Decoder<'_>) -> Result<Node> {
+    let id = NodeId::from_bytes(decoder.value()?);
+    let generation = Generation::from_value(decoder.value()?);
+    let executable = decoder.value()?;
+    match decoder.value::<u8>()? {
+        0 => Ok(Node::dir(
+            id,
+            generation,
+            executable,
+            Generation::from_value(decoder.value()?),
+        )),
+        1 => Ok(Node::file(
+            id,
+            generation,
+            executable,
+            decode_file(decoder)?,
+        )),
+        _ => Err(decoder.corrupt("node kind is invalid")),
+    }
+}
+
+fn decode_file(decoder: &mut Decoder<'_>) -> Result<File> {
+    let content = decode_content_id(decoder)?;
+    let part_count: u32 = decoder.value()?;
+    let mut parts = Vec::new();
+    for _ in 0..part_count {
+        let start = decoder.value()?;
+        let end = decoder.value()?;
+        let blob_offset = decoder.value()?;
+        let blob = decode_blob_ref(decoder)?;
+        parts.push(FilePart::new(start..end, blob_offset, blob).map_err(corrupt_version_value)?);
+    }
+    File::new(content, parts).map_err(corrupt_version_value)
+}
+
+fn decode_blob_ref(decoder: &mut Decoder<'_>) -> Result<BlobRef> {
+    let reference = decoder.value::<Vec<u8>>()?;
+    Ok(BlobRef::new(reference, decode_content_id(decoder)?))
+}
+
+fn decode_content_id(decoder: &mut Decoder<'_>) -> Result<ContentId> {
+    Ok(ContentId::new(decoder.value()?, decoder.value()?))
+}
+
+fn corrupt_version_value(error: Error) -> Error {
+    Error::corrupt("decode YinYang version", error.message())
+}
+
+struct Encoder {
+    bytes: Vec<u8>,
+    maximum_bytes: usize,
+    operation: &'static str,
+}
+
+impl Encoder {
+    fn new(magic: &[u8], maximum_bytes: usize, operation: &'static str) -> Self {
         Self {
-            entries: version
-                .tree()
-                .iter()
-                .map(|(path, node)| WireEntry {
-                    path: path.as_str().to_owned(),
-                    node: WireNode::from(node),
-                })
-                .collect(),
-            commits: version
-                .commits()
-                .iter()
-                .map(|commit| *commit.as_bytes())
-                .collect(),
+            bytes: magic.to_vec(),
+            maximum_bytes,
+            operation,
         }
     }
-}
 
-impl WireVersion {
-    fn into_version(self) -> Result<FsVersion> {
-        let entries = self
-            .entries
-            .into_iter()
-            .map(|entry| Ok((Path::new(entry.path)?, entry.node.into_node()?)))
-            .collect::<Result<Vec<_>>>()?;
-        let commits = self.commits.into_iter().map(CommitId::from_bytes).collect();
-        FsVersion::new(Tree::from_entries(entries)?, commits)
+    fn sequence_len(&mut self, value: usize) -> Result<()> {
+        let value = u32::try_from(value)
+            .map_err(|_| Error::invalid(self.operation, "length cannot be encoded"))?;
+        self.value(&value)
+    }
+
+    fn value<T: borsh::BorshSerialize + ?Sized>(&mut self, value: &T) -> Result<()> {
+        value
+            .serialize(self)
+            .map_err(|error| Error::invalid(self.operation, error.to_string()))
+    }
+
+    fn raw_bytes(&mut self, value: &[u8]) -> Result<()> {
+        borsh::io::Write::write_all(self, value)
+            .map_err(|error| Error::invalid(self.operation, error.to_string()))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireEntry {
-    path: String,
-    node: WireNode,
-}
-
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireNode {
-    id: [u8; 16],
-    generation: u64,
-    executable: bool,
-    body: WireNodeBody,
-}
-
-impl From<&Node> for WireNode {
-    fn from(node: &Node) -> Self {
-        Self {
-            id: *node.id().as_bytes(),
-            generation: node.generation().value(),
-            executable: node.executable(),
-            body: WireNodeBody::from(node.body()),
+impl borsh::io::Write for Encoder {
+    fn write(&mut self, value: &[u8]) -> borsh::io::Result<usize> {
+        if value.len() > self.maximum_bytes.saturating_sub(self.bytes.len()) {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                "encoded object exceeds its size limit",
+            ));
         }
+        self.bytes.extend_from_slice(value);
+        Ok(value.len())
+    }
+
+    fn flush(&mut self) -> borsh::io::Result<()> {
+        Ok(())
     }
 }
 
-impl WireNode {
-    fn into_node(self) -> Result<Node> {
-        let id = NodeId::from_bytes(self.id);
-        let generation = Generation::from_value(self.generation);
-        match self.body {
-            WireNodeBody::Dir { entries_generation } => Ok(Node::dir(
-                id,
-                generation,
-                self.executable,
-                Generation::from_value(entries_generation),
-            )),
-            WireNodeBody::File(file) => Ok(Node::file(
-                id,
-                generation,
-                self.executable,
-                file.into_file()?,
-            )),
+struct Decoder<'a> {
+    bytes: &'a [u8],
+    operation: &'static str,
+}
+
+impl<'a> Decoder<'a> {
+    const fn new(bytes: &'a [u8], operation: &'static str) -> Self {
+        Self { bytes, operation }
+    }
+
+    fn value<T: borsh::BorshDeserialize>(&mut self) -> Result<T> {
+        T::deserialize(&mut self.bytes).map_err(|error| self.corrupt(error.to_string()))
+    }
+
+    fn finish(self) -> Result<()> {
+        if !self.bytes.is_empty() {
+            return Err(self.corrupt("encoded object contains trailing bytes"));
         }
+        Ok(())
     }
-}
 
-#[derive(bincode::Encode, bincode::Decode)]
-enum WireNodeBody {
-    Dir { entries_generation: u64 },
-    File(WireFile),
-}
-
-impl From<&NodeBody> for WireNodeBody {
-    fn from(body: &NodeBody) -> Self {
-        match body {
-            NodeBody::Dir { entries_generation } => Self::Dir {
-                entries_generation: entries_generation.value(),
-            },
-            NodeBody::File(file) => Self::File(WireFile::from(file)),
-        }
-    }
-}
-
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireFile {
-    content: WireContentId,
-    parts: Vec<WireFilePart>,
-}
-
-impl From<&File> for WireFile {
-    fn from(file: &File) -> Self {
-        Self {
-            content: WireContentId::from(file.content()),
-            parts: file.parts().iter().map(WireFilePart::from).collect(),
-        }
-    }
-}
-
-impl WireFile {
-    fn into_file(self) -> Result<File> {
-        let parts = self
-            .parts
-            .into_iter()
-            .map(WireFilePart::into_part)
-            .collect::<Result<Vec<_>>>()?;
-        File::new(self.content.into_content_id(), parts)
-    }
-}
-
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireFilePart {
-    start: u64,
-    end: u64,
-    blob_offset: u64,
-    blob: WireBlobRef,
-}
-
-impl From<&FilePart> for WireFilePart {
-    fn from(part: &FilePart) -> Self {
-        Self {
-            start: part.range().start,
-            end: part.range().end,
-            blob_offset: part.blob_offset(),
-            blob: WireBlobRef::from(part.blob()),
-        }
-    }
-}
-
-impl WireFilePart {
-    fn into_part(self) -> Result<FilePart> {
-        FilePart::new(
-            self.start..self.end,
-            self.blob_offset,
-            self.blob.into_blob_ref(),
-        )
-    }
-}
-
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireBlobRef {
-    reference: Vec<u8>,
-    content: WireContentId,
-}
-
-impl From<&BlobRef> for WireBlobRef {
-    fn from(reference: &BlobRef) -> Self {
-        Self {
-            reference: reference.as_bytes().to_vec(),
-            content: WireContentId::from(reference.content()),
-        }
-    }
-}
-
-impl WireBlobRef {
-    fn into_blob_ref(self) -> BlobRef {
-        BlobRef::new(self.reference, self.content.into_content_id())
-    }
-}
-
-#[derive(bincode::Encode, bincode::Decode)]
-struct WireContentId {
-    digest: [u8; 32],
-    length: u64,
-}
-
-impl From<ContentId> for WireContentId {
-    fn from(content: ContentId) -> Self {
-        Self {
-            digest: *content.digest(),
-            length: content.length(),
-        }
-    }
-}
-
-impl WireContentId {
-    const fn into_content_id(self) -> ContentId {
-        ContentId::new(self.digest, self.length)
+    fn corrupt(&self, message: impl Into<String>) -> Error {
+        Error::corrupt(self.operation, message)
     }
 }
 
@@ -540,17 +486,109 @@ mod tests {
 
         let actual = encode_version(&version).unwrap();
         let mut expected = VERSION_MAGIC.to_vec();
-        expected.extend_from_slice(&1_u64.to_le_bytes());
-        expected.extend_from_slice(&0_u64.to_le_bytes());
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
         expected.extend_from_slice(&[1; 16]);
         expected.extend_from_slice(&1_u64.to_le_bytes());
         expected.push(0);
-        expected.extend_from_slice(&0_u32.to_le_bytes());
+        expected.push(0);
         expected.extend_from_slice(&1_u64.to_le_bytes());
-        expected.extend_from_slice(&0_u64.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
 
         assert_eq!(actual, expected);
         assert_eq!(decode_version(&actual).unwrap(), version);
+    }
+
+    #[test]
+    fn file_version_wire_contract_is_stable() {
+        let root = NodeId::from_bytes([1; 16]);
+        let mut tree = Tree::genesis(root);
+        tree.insert(
+            Path::root(),
+            Node::dir(root, Generation::FIRST, false, Generation::from_value(2)),
+        );
+        let blob = BlobRef::new(b"blob".to_vec(), ContentId::new([4; 32], 8));
+        let file = File::new(
+            ContentId::new([3; 32], 4),
+            vec![FilePart::new(0..4, 1, blob).unwrap()],
+        )
+        .unwrap();
+        tree.insert(
+            Path::new("file").unwrap(),
+            Node::file(
+                NodeId::from_bytes([2; 16]),
+                Generation::from_value(3),
+                true,
+                file,
+            ),
+        );
+        let version = FsVersion::new(tree, vec![CommitId::from_bytes([5; 16])]).unwrap();
+
+        let actual = encode_version(&version).unwrap();
+        let mut expected = VERSION_MAGIC.to_vec();
+        expected.extend_from_slice(&2_u32.to_le_bytes());
+        expected.extend_from_slice(&0_u32.to_le_bytes());
+        expected.extend_from_slice(&[1; 16]);
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.push(0);
+        expected.push(0);
+        expected.extend_from_slice(&2_u64.to_le_bytes());
+        expected.extend_from_slice(&4_u32.to_le_bytes());
+        expected.extend_from_slice(b"file");
+        expected.extend_from_slice(&[2; 16]);
+        expected.extend_from_slice(&3_u64.to_le_bytes());
+        expected.push(1);
+        expected.push(1);
+        expected.extend_from_slice(&[3; 32]);
+        expected.extend_from_slice(&4_u64.to_le_bytes());
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.extend_from_slice(&0_u64.to_le_bytes());
+        expected.extend_from_slice(&4_u64.to_le_bytes());
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(&4_u32.to_le_bytes());
+        expected.extend_from_slice(b"blob");
+        expected.extend_from_slice(&[4; 32]);
+        expected.extend_from_slice(&8_u64.to_le_bytes());
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.extend_from_slice(&[5; 16]);
+
+        assert_eq!(actual, expected);
+        assert_eq!(decode_version(&actual).unwrap(), version);
+    }
+
+    #[test]
+    fn version_decoder_rejects_invalid_borsh() {
+        let root = NodeId::from_bytes([1; 16]);
+        let version = FsVersion::new(Tree::genesis(root), Vec::new()).unwrap();
+        let encoded = encode_version(&version).unwrap();
+
+        let mut invalid_boolean = encoded.clone();
+        invalid_boolean[40] = 2;
+        assert_eq!(
+            decode_version(&invalid_boolean).unwrap_err().kind(),
+            crate::ErrorKind::Corrupt
+        );
+
+        let mut invalid_node_kind = encoded.clone();
+        invalid_node_kind[41] = 2;
+        assert_eq!(
+            decode_version(&invalid_node_kind).unwrap_err().kind(),
+            crate::ErrorKind::Corrupt
+        );
+
+        assert_eq!(
+            decode_version(&encoded[..encoded.len() - 1])
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Corrupt
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            decode_version(&trailing).unwrap_err().kind(),
+            crate::ErrorKind::Corrupt
+        );
     }
 
     #[test]
@@ -559,7 +597,7 @@ mod tests {
 
         let actual = encode_head(&reference).unwrap();
         let mut expected = HEAD_MAGIC.to_vec();
-        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(&1_u32.to_le_bytes());
         expected.push(b'v');
         expected.extend_from_slice(&[2; 32]);
         expected.extend_from_slice(&3_u64.to_le_bytes());

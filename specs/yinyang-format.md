@@ -87,11 +87,13 @@ under `.yinyang/` are outside the format contract.
 
 ## Persistent encoding
 
-The current encoding uses bincode 2.0.1 with little-endian fixed-width integer
-encoding. Collection and string lengths are `u64`; enum discriminants are
-`u32`; booleans use one byte. Fixed byte arrays contain their bytes without a
-length. Fields appear in the order shown below, and readers reject trailing
-bytes.
+The payload uses [Borsh encoding](https://borsh.io/). Integers use little-endian
+fixed-width encoding. Collection, string, and byte-sequence lengths are `u32`;
+enum discriminants are `u8`; booleans use one byte, with 0 for false and 1 for
+true.
+Strings contain UTF-8 bytes. Fixed byte arrays contain their bytes without a
+length. Fields appear in the order shown below, and readers reject unknown
+discriminants, invalid booleans, truncated values, and trailing bytes.
 
 ```text
 VersionBody {
@@ -123,10 +125,10 @@ ContentId { digest: [u8; 32], length: u64 }
 
 Entries are encoded in ascending canonical `Path` order. File parts and commits
 retain their logical order. `Dir` has discriminant 0 and `File` has
-discriminant 1. A version object is `YYVER001 || bincode(VersionBody)` and is
+discriminant 1. A version object is `YYVER001 || borsh(VersionBody)` and is
 limited to 64 MiB including the magic. The head is
-`YYHEAD01 || bincode(BlobRef) || BLAKE3(magic || payload)` and is limited to
-4 KiB. The head checksum covers its magic and payload, excluding the checksum
+`YYHEAD01 || borsh(BlobRef) || BLAKE3(magic || payload)` and is limited to 4
+KiB. The head checksum covers its magic and payload, excluding the checksum
 itself.
 
 ## Lifecycle

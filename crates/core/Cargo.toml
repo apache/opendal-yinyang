@@ -26,8 +26,8 @@ rust-version.workspace = true
 version = "0.0.24"
 
 [dependencies]
-bincode.workspace = true
 blake3.workspace = true
+borsh.workspace = true
 futures-util.workspace = true
 opendal.workspace = true
 unicode-casefold.workspace = true
