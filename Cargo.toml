@@ -42,7 +42,11 @@ repository = "https://github.com/apache/opendal-yinyang"
 rust-version = "1.91.0"
 
 [workspace.dependencies]
+blake3 = "1"
+borsh = { version = "1.8.1", default-features = false, features = ["std"] }
 clap = { version = "4.6.5", features = ["derive"] }
+futures-util = "0.3"
+opendal = { version = "0.58.2", default-features = false }
 unicode-casefold = "0.2"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }

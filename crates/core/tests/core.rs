@@ -18,104 +18,318 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use opendal::raw::*;
+use opendal::services::Memory;
+use opendal::{Buffer, BytesRange, EntryMode, Metadata, OperationContext, Operator};
 use yinyang_core::{
-    BlobRef, CommitId, CommitOutcome, ContentId, Error, ErrorKind, File, FilePart, Fs, FsVersion,
-    Generation, HeadObservation, Node, NodeBody, NodeId, Path, Result, Storage, Tree,
+    BlobRef, CommitId, CommitOutcome, ContentId, ErrorKind, File, FilePart, Fs, Generation, Node,
+    NodeBody, NodeId, Path, Tree,
 };
 
 #[derive(Clone, Debug, Default)]
-struct MemoryStorage {
-    state: Arc<Mutex<MemoryState>>,
+struct TestBackend {
+    state: Arc<Mutex<TestState>>,
 }
 
 #[derive(Debug, Default)]
-struct MemoryState {
-    head: Option<BlobRef>,
-    head_revision: u64,
-    versions: BTreeMap<BlobRef, FsVersion>,
-    next_blob: u64,
-    fail_after_replace: bool,
+struct TestState {
+    objects: BTreeMap<String, StoredObject>,
+    next_revision: u64,
+    fail_after_head_write: bool,
+    stat_calls: u64,
+    version_write_calls: u64,
 }
 
-impl MemoryStorage {
-    fn fail_next_replace_after_success(&self) {
-        self.state.lock().unwrap().fail_after_replace = true;
-    }
-
-    fn remove_current_version(&self) {
-        let mut state = self.state.lock().unwrap();
-        let reference = state
-            .head
-            .as_ref()
-            .expect("the test filesystem has a head")
-            .clone();
-        state.versions.remove(&reference);
-    }
+#[derive(Clone, Debug)]
+struct StoredObject {
+    bytes: Vec<u8>,
+    etag: String,
 }
 
-impl Storage for MemoryStorage {
-    async fn write_version(&self, version: &FsVersion) -> Result<BlobRef> {
-        let mut state = self.state.lock().unwrap();
-        state.next_blob += 1;
-        let identity = state.next_blob;
-        let mut digest = [0; 32];
-        digest[..8].copy_from_slice(&identity.to_le_bytes());
-        let reference = BlobRef::new(identity.to_le_bytes(), ContentId::new(digest, 1));
-        state.versions.insert(reference.clone(), version.clone());
-        Ok(reference)
+impl TestBackend {
+    fn operator(&self) -> Operator {
+        self.operator_with_streaming_write(true)
     }
 
-    async fn read_version(&self, reference: &BlobRef) -> Result<FsVersion> {
+    fn operator_without_streaming_write(&self) -> Operator {
+        self.operator_with_streaming_write(false)
+    }
+
+    fn operator_with_streaming_write(&self, write_can_multi: bool) -> Operator {
+        let service: Servicer = Arc::new(TestService {
+            state: self.state.clone(),
+            write_can_multi,
+        });
+        Operator::from_parts(OperationContext::default(), service)
+    }
+
+    fn fail_next_head_write_after_success(&self) {
+        self.state.lock().unwrap().fail_after_head_write = true;
+    }
+
+    fn stat_calls(&self) -> u64 {
+        self.state.lock().unwrap().stat_calls
+    }
+
+    fn reset_version_write_calls(&self) {
+        self.state.lock().unwrap().version_write_calls = 0;
+    }
+
+    fn version_write_calls(&self) -> u64 {
+        self.state.lock().unwrap().version_write_calls
+    }
+
+    fn version_objects(&self) -> Vec<(String, Vec<u8>)> {
         self.state
             .lock()
             .unwrap()
-            .versions
-            .get(reference)
-            .cloned()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Corrupt,
-                    "read in-memory YinYang version",
-                    "referenced version is missing",
-                )
-            })
+            .objects
+            .iter()
+            .filter(|(path, _)| path.starts_with(".yinyang/versions/"))
+            .map(|(path, object)| (path.clone(), object.bytes.clone()))
+            .collect()
     }
 
-    async fn create_head(&self, version: &BlobRef) -> Result<()> {
+    fn remove_current_version(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .objects
+            .retain(|path, _| !path.starts_with(".yinyang/versions/"));
+    }
+
+    fn corrupt_current_version(&self) {
         let mut state = self.state.lock().unwrap();
-        if state.head.is_some() {
-            return Ok(());
+        let object = state
+            .objects
+            .iter_mut()
+            .find_map(|(path, object)| path.starts_with(".yinyang/versions/").then_some(object))
+            .expect("the test filesystem has a version object");
+        object.bytes[0] ^= 1;
+    }
+
+    fn corrupt_head(&self) {
+        let mut state = self.state.lock().unwrap();
+        let object = state
+            .objects
+            .get_mut(".yinyang/head")
+            .expect("the test filesystem has a head");
+        let checksum = object
+            .bytes
+            .last_mut()
+            .expect("the head contains a checksum");
+        *checksum ^= 1;
+    }
+}
+
+#[derive(Debug)]
+struct TestService {
+    state: Arc<Mutex<TestState>>,
+    write_can_multi: bool,
+}
+
+impl Service for TestService {
+    type Reader = TestReader;
+    type Writer = TestWriter;
+    type Lister = ();
+    type Deleter = ();
+    type Copier = ();
+
+    fn info(&self) -> ServiceInfo {
+        ServiceInfo::with_scheme("yinyang-test")
+    }
+
+    fn capability(&self) -> opendal::Capability {
+        opendal::Capability {
+            stat: true,
+            read: true,
+            write: true,
+            write_can_multi: self.write_can_multi,
+            write_can_empty: true,
+            write_with_if_match: true,
+            write_with_if_not_exists: true,
+            shared: true,
+            ..Default::default()
         }
-        state.head = Some(version.clone());
-        state.head_revision = 1;
+    }
+
+    async fn create_dir(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: OpCreateDir,
+    ) -> opendal::Result<RpCreateDir> {
+        Err(unsupported())
+    }
+
+    async fn stat(&self, _: &OperationContext, path: &str, _: OpStat) -> opendal::Result<RpStat> {
+        let mut state = self.state.lock().unwrap();
+        state.stat_calls += 1;
+        let object = state.objects.get(path).ok_or_else(not_found)?;
+        Ok(RpStat::new(metadata(object)))
+    }
+
+    fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> opendal::Result<Self::Reader> {
+        let state = self.state.lock().unwrap();
+        let object = state.objects.get(path).cloned().ok_or_else(not_found)?;
+        Ok(TestReader { object })
+    }
+
+    fn write(
+        &self,
+        _: &OperationContext,
+        path: &str,
+        args: OpWrite,
+    ) -> opendal::Result<Self::Writer> {
+        Ok(TestWriter {
+            state: self.state.clone(),
+            path: path.to_owned(),
+            if_match: args.if_match().map(str::to_owned),
+            if_not_exists: args.if_not_exists(),
+            bytes: Vec::new(),
+        })
+    }
+
+    fn delete(&self, _: &OperationContext) -> opendal::Result<Self::Deleter> {
+        Err(unsupported())
+    }
+
+    fn list(&self, _: &OperationContext, _: &str, _: OpList) -> opendal::Result<Self::Lister> {
+        Err(unsupported())
+    }
+
+    fn copy(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: &str,
+        _: OpCopy,
+        _: OpCopier,
+    ) -> opendal::Result<Self::Copier> {
+        Err(unsupported())
+    }
+
+    async fn rename(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: &str,
+        _: OpRename,
+    ) -> opendal::Result<RpRename> {
+        Err(unsupported())
+    }
+
+    async fn presign(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: OpPresign,
+    ) -> opendal::Result<RpPresign> {
+        Err(unsupported())
+    }
+}
+
+#[derive(Debug)]
+struct TestReader {
+    object: StoredObject,
+}
+
+impl oio::Read for TestReader {
+    async fn open(
+        &self,
+        range: BytesRange,
+    ) -> opendal::Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        let (response, buffer) = self.read(range).await?;
+        Ok((response, Box::new(buffer)))
+    }
+
+    async fn read(&self, range: BytesRange) -> opendal::Result<(RpRead, Buffer)> {
+        let range = range.to_content_range(self.object.bytes.len())?;
+        Ok((
+            RpRead::new(metadata(&self.object)),
+            Buffer::from(self.object.bytes[range].to_vec()),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct TestWriter {
+    state: Arc<Mutex<TestState>>,
+    path: String,
+    if_match: Option<String>,
+    if_not_exists: bool,
+    bytes: Vec<u8>,
+}
+
+impl oio::Write for TestWriter {
+    async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
+        if self.path.starts_with(".yinyang/versions/") {
+            self.state.lock().unwrap().version_write_calls += 1;
+        }
+        for chunk in buffer {
+            self.bytes.extend_from_slice(&chunk);
+        }
         Ok(())
     }
 
-    async fn observe_head(&self) -> Result<Option<HeadObservation>> {
-        let state = self.state.lock().unwrap();
-        Ok(state
-            .head
-            .clone()
-            .map(|head| HeadObservation::new(head, state.head_revision.to_le_bytes().to_vec())))
-    }
-
-    async fn replace_head(&self, observed: &HeadObservation, next: &BlobRef) -> Result<bool> {
+    async fn close(&mut self) -> opendal::Result<Metadata> {
         let mut state = self.state.lock().unwrap();
-        if state.head.is_none() || observed.condition() != state.head_revision.to_le_bytes() {
-            return Ok(false);
+        let current = state.objects.get(&self.path);
+        if self.if_not_exists && current.is_some() {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::ConditionNotMatch,
+                "object already exists",
+            ));
         }
-        state.head = Some(next.clone());
-        state.head_revision += 1;
-        if state.fail_after_replace {
-            state.fail_after_replace = false;
-            return Err(Error::new(
-                ErrorKind::Storage,
-                "replace in-memory YinYang head",
+        if self
+            .if_match
+            .as_ref()
+            .is_some_and(|etag| current.is_none_or(|object| object.etag != *etag))
+        {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::ConditionNotMatch,
+                "ETag does not match",
+            ));
+        }
+
+        state.next_revision += 1;
+        let object = StoredObject {
+            bytes: self.bytes.clone(),
+            etag: format!("\"{}\"", state.next_revision),
+        };
+        let metadata = metadata(&object);
+        state.objects.insert(self.path.clone(), object);
+        if self.path == ".yinyang/head" && state.fail_after_head_write {
+            state.fail_after_head_write = false;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
                 "publication response was lost",
             ));
         }
-        Ok(true)
+        Ok(metadata)
     }
+
+    async fn abort(&mut self) -> opendal::Result<()> {
+        self.bytes.clear();
+        Ok(())
+    }
+}
+
+fn metadata(object: &StoredObject) -> Metadata {
+    Metadata::new(EntryMode::FILE)
+        .with_content_length(object.bytes.len() as u64)
+        .with_etag(object.etag.clone())
+}
+
+fn not_found() -> opendal::Error {
+    opendal::Error::new(opendal::ErrorKind::NotFound, "object is missing")
+}
+
+fn unsupported() -> opendal::Error {
+    opendal::Error::new(
+        opendal::ErrorKind::Unsupported,
+        "operation is not supported by the test backend",
+    )
 }
 
 fn add_directory(tree: &Tree, name: &str, id: NodeId) -> Tree {
@@ -150,13 +364,21 @@ fn advance_root_membership(tree: &mut Tree) {
 
 #[tokio::test]
 async fn creates_and_reopens_one_filesystem() {
-    let storage = MemoryStorage::default();
-    let (left, right) = tokio::join!(Fs::create(storage.clone()), Fs::create(storage.clone()));
+    let backend = TestBackend::default();
+    let (left, right) = tokio::join!(
+        Fs::create(backend.operator()),
+        Fs::create(backend.operator())
+    );
     let left = left.unwrap();
     let right = right.unwrap();
 
     assert_eq!(left.root(), right.root());
-    let observed = Fs::open(storage).await.unwrap().observe().await.unwrap();
+    let observed = Fs::open(backend.operator())
+        .await
+        .unwrap()
+        .observe()
+        .await
+        .unwrap();
     assert_eq!(observed.version().number(), 0);
     assert_eq!(
         observed.tree().get(&Path::root()).unwrap().id(),
@@ -165,9 +387,76 @@ async fn creates_and_reopens_one_filesystem() {
 }
 
 #[tokio::test]
+async fn streams_versions_to_opaque_object_keys() {
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
+    let observed = filesystem.observe().await.unwrap();
+    let mut successor = observed.tree().clone();
+    advance_root_membership(&mut successor);
+    for index in 0..10_000 {
+        successor.insert(
+            Path::new(format!("dir-{index:05}")).unwrap(),
+            Node::dir(
+                NodeId::generate(),
+                Generation::FIRST,
+                false,
+                Generation::FIRST,
+            ),
+        );
+    }
+    backend.reset_version_write_calls();
+
+    filesystem
+        .commit(&observed, CommitId::generate(), successor)
+        .await
+        .unwrap();
+
+    assert!(backend.version_write_calls() > 1);
+    for (path, bytes) in backend.version_objects() {
+        let key = path.strip_prefix(".yinyang/versions/").unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(
+            key.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(key, blake3::hash(&bytes).to_hex().as_str());
+    }
+}
+
+#[tokio::test]
+async fn resolves_a_lost_head_creation_response() {
+    let backend = TestBackend::default();
+    backend.fail_next_head_write_after_success();
+
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
+
+    assert_eq!(filesystem.observe().await.unwrap().version().number(), 0);
+}
+
+#[tokio::test]
+async fn rejects_backends_without_conditional_head_replacement() {
+    let operator = Operator::new(Memory::default()).unwrap();
+
+    let error = Fs::create(operator).await.unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[tokio::test]
+async fn rejects_backends_without_streaming_write() {
+    let backend = TestBackend::default();
+
+    let error = Fs::create(backend.operator_without_streaming_write())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[tokio::test]
 async fn publishes_and_retries_one_commit() {
-    let storage = MemoryStorage::default();
-    let filesystem = Fs::create(storage.clone()).await.unwrap();
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
     let observed = filesystem.observe().await.unwrap();
     let commit = CommitId::generate();
     let successor = add_directory(observed.tree(), "dir", NodeId::generate());
@@ -187,7 +476,7 @@ async fn publishes_and_retries_one_commit() {
         CommitOutcome::Committed { version: 1 }
     );
 
-    let reopened = Fs::open(storage).await.unwrap();
+    let reopened = Fs::open(backend.operator()).await.unwrap();
     let current = reopened.observe().await.unwrap();
     assert!(current.tree().get(&Path::new("dir").unwrap()).is_some());
     assert_eq!(current.version().commits().len(), 1);
@@ -195,8 +484,25 @@ async fn publishes_and_retries_one_commit() {
 }
 
 #[tokio::test]
+async fn uses_the_etag_from_the_same_head_read() {
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
+    let observed = filesystem.observe().await.unwrap();
+    let successor = add_directory(observed.tree(), "dir", NodeId::generate());
+
+    assert_eq!(
+        filesystem
+            .commit(&observed, CommitId::generate(), successor)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed { version: 1 }
+    );
+    assert_eq!(backend.stat_calls(), 0);
+}
+
+#[tokio::test]
 async fn reports_conflict_for_competing_observations() {
-    let filesystem = Fs::create(MemoryStorage::default()).await.unwrap();
+    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
     let first = filesystem.observe().await.unwrap();
     let second = filesystem.observe().await.unwrap();
 
@@ -220,11 +526,11 @@ async fn reports_conflict_for_competing_observations() {
 
 #[tokio::test]
 async fn resolves_a_lost_publication_response() {
-    let storage = MemoryStorage::default();
-    let filesystem = Fs::create(storage.clone()).await.unwrap();
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
     let observed = filesystem.observe().await.unwrap();
     let successor = add_directory(observed.tree(), "durable", NodeId::generate());
-    storage.fail_next_replace_after_success();
+    backend.fail_next_head_write_after_success();
 
     assert_eq!(
         filesystem
@@ -237,7 +543,7 @@ async fn resolves_a_lost_publication_response() {
 
 #[tokio::test]
 async fn requires_directory_generation_for_membership_changes() {
-    let filesystem = Fs::create(MemoryStorage::default()).await.unwrap();
+    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
     let observed = filesystem.observe().await.unwrap();
     let mut invalid = observed.tree().clone();
     invalid.insert(
@@ -259,7 +565,7 @@ async fn requires_directory_generation_for_membership_changes() {
 
 #[tokio::test]
 async fn rejects_duplicate_nodes_and_missing_parents() {
-    let filesystem = Fs::create(MemoryStorage::default()).await.unwrap();
+    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
     let observed = filesystem.observe().await.unwrap();
     let node = NodeId::generate();
     let mut duplicate = add_directory(observed.tree(), "first", node);
@@ -298,7 +604,7 @@ async fn rejects_duplicate_nodes_and_missing_parents() {
 
 #[tokio::test]
 async fn rejects_case_folding_collisions_within_a_directory() {
-    let filesystem = Fs::create(MemoryStorage::default()).await.unwrap();
+    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
     let observed = filesystem.observe().await.unwrap();
     let mut successor = observed.tree().clone();
     advance_root_membership(&mut successor);
@@ -330,7 +636,7 @@ async fn rejects_case_folding_collisions_within_a_directory() {
 
 #[tokio::test]
 async fn requires_node_generation_for_file_changes() {
-    let filesystem = Fs::create(MemoryStorage::default()).await.unwrap();
+    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
     let genesis = filesystem.observe().await.unwrap();
     let node = NodeId::generate();
     let mut first = genesis.tree().clone();
@@ -372,7 +678,7 @@ async fn requires_node_generation_for_file_changes() {
 
 #[tokio::test]
 async fn preserves_node_generation_across_rename() {
-    let filesystem = Fs::create(MemoryStorage::default()).await.unwrap();
+    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
     let genesis = filesystem.observe().await.unwrap();
     let node_id = NodeId::generate();
     filesystem
@@ -446,10 +752,32 @@ fn accepts_only_canonical_portable_paths() {
 
 #[tokio::test]
 async fn rejects_a_missing_referenced_version() {
-    let storage = MemoryStorage::default();
-    let filesystem = Fs::create(storage.clone()).await.unwrap();
-    storage.remove_current_version();
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
+    backend.remove_current_version();
 
     let error = filesystem.observe().await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Corrupt);
+}
+
+#[tokio::test]
+async fn rejects_a_version_that_does_not_match_its_reference() {
+    let backend = TestBackend::default();
+    let filesystem = Fs::create(backend.operator()).await.unwrap();
+    backend.corrupt_current_version();
+
+    let error = filesystem.observe().await.unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::Corrupt);
+}
+
+#[tokio::test]
+async fn rejects_a_corrupt_head() {
+    let backend = TestBackend::default();
+    Fs::create(backend.operator()).await.unwrap();
+    backend.corrupt_head();
+
+    let error = Fs::open(backend.operator()).await.unwrap_err();
+
     assert_eq!(error.kind(), ErrorKind::Corrupt);
 }

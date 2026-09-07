@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    CommitId, Error, ErrorKind, FsVersion, HeadObservation, NodeId, Result, Storage, Tree,
+use crate::persistence::{
+    HeadObservation, create_head, observe_head, read_version, replace_head, validate_operator,
+    write_version,
 };
+use crate::{CommitId, Error, ErrorKind, FsVersion, NodeId, Result, Tree};
 
 /// Current immutable version together with the condition needed for publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,43 +45,61 @@ pub enum CommitOutcome {
     Conflict { current: u64 },
 }
 
-/// Open YinYang filesystem over one storage implementation.
+/// Open YinYang filesystem over one OpenDAL operator.
+///
+/// YinYang owns the `.yinyang/` prefix below the operator root. The backend
+/// must support read, write, create-if-absent, and ETag if-match writes.
 #[derive(Debug)]
-pub struct Fs<S> {
+pub struct Fs {
     root: NodeId,
-    storage: S,
+    operator: opendal::Operator,
 }
 
-impl<S: Storage> Fs<S> {
+impl Fs {
     /// Create a filesystem, or reopen the existing filesystem.
-    pub async fn create(storage: S) -> Result<Self> {
-        if let Some(head) = storage.observe_head().await? {
-            return Self::from_head(storage, head).await;
+    ///
+    /// Returns [`ErrorKind::Unsupported`] when the operator lacks a required
+    /// capability or does not return an ETag with the head read.
+    pub async fn create(operator: opendal::Operator) -> Result<Self> {
+        validate_operator(&operator)?;
+        if let Some(head) = observe_head(&operator).await? {
+            return Self::from_head(operator, head).await;
         }
 
         let root = NodeId::generate();
         let genesis = FsVersion::new(Tree::genesis(root), Vec::new())?;
-        let blob = storage.write_version(&genesis).await?;
-        storage.create_head(&blob).await?;
-        Self::open(storage).await
+        let blob = write_version(&operator, &genesis).await?;
+        if let Err(create_error) = create_head(&operator, &blob).await {
+            return match Self::open(operator).await {
+                Ok(filesystem) => Ok(filesystem),
+                Err(open_error) if open_error.kind() == ErrorKind::NotFound => Err(create_error),
+                Err(open_error) => Err(open_error),
+            };
+        }
+        Self::open(operator).await
     }
 
     /// Open and validate an existing filesystem.
-    pub async fn open(storage: S) -> Result<Self> {
-        let head = storage.observe_head().await?.ok_or_else(|| {
+    ///
+    /// Returns [`ErrorKind::NotFound`] when no head exists and
+    /// [`ErrorKind::Unsupported`] when the operator lacks a required
+    /// capability or does not return an ETag with the head read.
+    pub async fn open(operator: opendal::Operator) -> Result<Self> {
+        validate_operator(&operator)?;
+        let head = observe_head(&operator).await?.ok_or_else(|| {
             Error::new(
                 ErrorKind::NotFound,
                 "open YinYang filesystem",
                 "head is missing",
             )
         })?;
-        Self::from_head(storage, head).await
+        Self::from_head(operator, head).await
     }
 
-    async fn from_head(storage: S, head: HeadObservation) -> Result<Self> {
-        let version = storage.read_version(head.version()).await?;
+    async fn from_head(operator: opendal::Operator, head: HeadObservation) -> Result<Self> {
+        let version = read_version(&operator, head.version()).await?;
         let root = version.tree().root_id()?;
-        Ok(Self { root, storage })
+        Ok(Self { root, operator })
     }
 
     pub const fn root(&self) -> NodeId {
@@ -88,7 +108,7 @@ impl<S: Storage> Fs<S> {
 
     /// Observe the head and materialize its immutable version.
     pub async fn observe(&self) -> Result<Observation> {
-        let head = self.storage.observe_head().await?.ok_or_else(|| {
+        let head = observe_head(&self.operator).await?.ok_or_else(|| {
             Error::new(
                 ErrorKind::NotFound,
                 "observe YinYang filesystem",
@@ -118,8 +138,8 @@ impl<S: Storage> Fs<S> {
             .tree()
             .validate_successor(version.tree(), self.root)?;
         let number = version.number();
-        let blob = self.storage.write_version(&version).await?;
-        match self.storage.replace_head(&observed.head, &blob).await {
+        let blob = write_version(&self.operator, &version).await?;
+        match replace_head(&self.operator, &observed.head, &blob).await {
             Ok(true) => Ok(CommitOutcome::Committed { version: number }),
             Ok(false) => self.resolve_conflict(id).await,
             Err(error) => match self.find_commit(id).await {
@@ -130,7 +150,7 @@ impl<S: Storage> Fs<S> {
     }
 
     async fn read_observation(&self, head: HeadObservation) -> Result<Observation> {
-        let version = self.storage.read_version(head.version()).await?;
+        let version = read_version(&self.operator, head.version()).await?;
         version.validate_root(self.root)?;
         Ok(Observation { head, version })
     }

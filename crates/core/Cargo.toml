@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-description = "YinYang Format semantics and publication state machine"
+description = "YinYang Format values, OpenDAL persistence, and publication state machine"
 edition.workspace = true
 license.workspace = true
 name = "yinyang-core"
@@ -26,11 +26,16 @@ rust-version.workspace = true
 version = "0.0.24"
 
 [dependencies]
+blake3.workspace = true
+borsh.workspace = true
+futures-util.workspace = true
+opendal.workspace = true
 unicode-casefold.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+opendal = { workspace = true, features = ["services-memory"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

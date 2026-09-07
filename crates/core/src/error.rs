@@ -23,6 +23,7 @@ pub enum ErrorKind {
     Invalid,
     Corrupt,
     NotFound,
+    Unsupported,
     Storage,
 }
 
@@ -61,6 +62,14 @@ impl Error {
 
     pub(crate) fn corrupt(operation: &'static str, message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Corrupt, operation, message)
+    }
+
+    pub(crate) fn unsupported(operation: &'static str, message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unsupported, operation, message)
+    }
+
+    pub(crate) fn from_storage(operation: &'static str, error: opendal::Error) -> Self {
+        Self::new(ErrorKind::Storage, operation, error.to_string())
     }
 }
 

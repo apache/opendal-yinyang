@@ -2,11 +2,11 @@
 
 ## Scope
 
-The YinYang Format core defines the filesystem values and publication state
-machine independently of storage representation. It owns the materialized
+The YinYang Format core defines the filesystem values, their OpenDAL
+persistence, and the publication state machine. It owns the materialized
 `Tree`, immutable `FsVersion` values, durable commit identities, and the mutable
-head. A storage implementation supplies immutable blobs and conditional head
-replacement. The core defines no wire representation.
+head. `Fs` operates directly on one `opendal::Operator`; there is no storage
+provider abstraction inside YinYang.
 
 The current implementation stores complete materialized versions and retains
 all commits.
@@ -26,9 +26,8 @@ non-overlapping, and exactly cover
 the content identified by its `BlobRef`.
 
 `BlobRef` is an opaque persistent reference plus the identity of its referenced
-bytes. The storage implementation constructs and verifies it. The core does
-not interpret object keys, byte-range syntax, framing, or integrity
-metadata inside the reference.
+bytes. YinYang persistence constructs and verifies it. Filesystem values do not
+interpret object keys or integrity metadata inside the reference.
 
 Paths use normalized portable components. They are relative, NFC-normalized,
 at most 4096 bytes, and contain components of at most 255 bytes. Empty,
@@ -59,21 +58,81 @@ caller-assigned `CommitId` is its published version number.
 The head contains the current version's `BlobRef`. Every version reached through
 one head history uses the same root `NodeId`.
 
-## Storage contract
+## OpenDAL contract
 
-A `Storage` implementation provides five operations:
+The supplied OpenDAL operator is rooted at one YinYang filesystem. It must
+support read, streaming write, create-if-absent, and ETag if-match writes.
+Creation and open fail with `Unsupported` when any required capability is
+absent. An ETag used to replace the head comes from the same read that returned
+the head bytes; it is never reconstructed with a later metadata request.
 
-1. write an immutable `FsVersion` and return its `BlobRef`;
-2. read and verify an `FsVersion` through its `BlobRef`;
-3. create the initial head;
-4. observe the head together with an opaque condition bound to that exact read;
-5. replace the head when the observed condition remains current.
+YinYang owns these paths below the operator root:
 
-Head creation is idempotent and never replaces an existing value.
-Compare-exchange reports whether it replaced the observed head. An observed
-condition is never reconstructed through a later metadata request. The storage
-implementation rejects a missing, truncated, or unverifiable blob as corrupt
-data.
+```text
+.yinyang/head
+.yinyang/versions/<object-id>
+```
+
+`<object-id>` is a generated UUID encoded as 32 lowercase hexadecimal
+characters and selected before encoding starts. A version writer streams the
+encoded object to that path while computing its BLAKE3 digest and length. The
+resulting version `BlobRef` contains the object path and a `ContentId` covering
+the complete encoded object. Version writes use create-if-absent. Every later
+read verifies the stored length, digest, and encoding against that reference.
+
+The head is created with create-if-absent and replaced with ETag if-match. A
+condition mismatch is a publication conflict. Missing, truncated,
+length-mismatched, or unverifiable referenced objects are corrupt data. Direct
+external writes under `.yinyang/` are outside the format contract.
+
+## Persistent encoding
+
+The payload uses [Borsh encoding](https://borsh.io/). Integers use little-endian
+fixed-width encoding. Collection, string, and byte-sequence lengths are `u32`;
+enum discriminants are `u8`; booleans use one byte, with 0 for false and 1 for
+true.
+Strings contain UTF-8 bytes. Fixed byte arrays contain their bytes without a
+length. Fields appear in the order shown below, and readers reject unknown
+discriminants, invalid booleans, truncated values, and trailing bytes.
+
+```text
+VersionBody {
+  entries: [Entry],
+  commits: [[u8; 16]],
+}
+
+Entry { path: string, node: Node }
+
+Node {
+  id: [u8; 16],
+  generation: u64,
+  executable: bool,
+  body: Dir { entries_generation: u64 } | File(File),
+}
+
+File { content: ContentId, parts: [FilePart] }
+
+FilePart {
+  start: u64,
+  end: u64,
+  blob_offset: u64,
+  blob: BlobRef,
+}
+
+BlobRef { reference: [u8], content: ContentId }
+ContentId { digest: [u8; 32], length: u64 }
+```
+
+Entries are encoded in ascending canonical `Path` order. File parts and commits
+retain their logical order. `Dir` has discriminant 0 and `File` has
+discriminant 1. A version object is `YYVER001 || borsh(VersionBody)`. The
+current materialized reader and writer impose a 64 MiB resource limit including
+the magic; this is an implementation limit, not part of the persistent format.
+An otherwise valid version above that limit is unsupported by this
+implementation, not corrupt data. The head is
+`YYHEAD01 || borsh(BlobRef) || BLAKE3(magic || payload)` and is limited to 4
+KiB. The head checksum covers its magic and payload, excluding the checksum
+itself.
 
 ## Lifecycle
 

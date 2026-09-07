@@ -15,18 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! YinYang Format semantics and publication state machine.
+//! YinYang Format values, OpenDAL persistence, and publication state machine.
 
 mod error;
 mod filesystem;
 mod identity;
+mod persistence;
 mod publication;
-mod storage;
 mod version;
 
 pub use error::{Error, ErrorKind, Result};
 pub use filesystem::{BlobRef, ContentId, File, FilePart, Node, NodeBody, Path, Tree};
 pub use identity::{CommitId, Generation, NodeId};
 pub use publication::{CommitOutcome, Fs, Observation};
-pub use storage::{HeadObservation, Storage};
 pub use version::FsVersion;
