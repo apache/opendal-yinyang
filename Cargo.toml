@@ -47,6 +47,7 @@ borsh = { version = "1.8.1", default-features = false, features = ["std"] }
 clap = { version = "4.6.5", features = ["derive"] }
 futures-util = "0.3"
 opendal = { version = "0.58.2", default-features = false }
+tokio = { version = "1", features = ["io-util"] }
 unicode-casefold = "0.2"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }

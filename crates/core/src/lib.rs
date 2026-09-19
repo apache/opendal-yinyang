@@ -17,6 +17,7 @@
 
 //! YinYang Format values, OpenDAL persistence, and publication state machine.
 
+mod content;
 mod error;
 mod filesystem;
 mod identity;

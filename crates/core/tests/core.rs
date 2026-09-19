@@ -38,6 +38,8 @@ struct TestState {
     fail_after_head_write: bool,
     stat_calls: u64,
     version_write_calls: u64,
+    fail_data_close: bool,
+    data_aborts: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +276,12 @@ impl oio::Write for TestWriter {
 
     async fn close(&mut self) -> opendal::Result<Metadata> {
         let mut state = self.state.lock().unwrap();
+        if self.path.starts_with(".yinyang/data/") && state.fail_data_close {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "data close failed",
+            ));
+        }
         let current = state.objects.get(&self.path);
         if self.if_not_exists && current.is_some() {
             return Err(opendal::Error::new(
@@ -310,6 +318,9 @@ impl oio::Write for TestWriter {
     }
 
     async fn abort(&mut self) -> opendal::Result<()> {
+        if self.path.starts_with(".yinyang/data/") {
+            self.state.lock().unwrap().data_aborts += 1;
+        }
         self.bytes.clear();
         Ok(())
     }
@@ -360,6 +371,300 @@ fn advance_root_membership(tree: &mut Tree) {
             entries_generation.next().unwrap(),
         ),
     );
+}
+
+fn add_file(tree: &Tree, name: &str, file: File) -> Tree {
+    let mut tree = tree.clone();
+    advance_root_membership(&mut tree);
+    tree.insert(
+        Path::new(name).unwrap(),
+        Node::file(NodeId::generate(), Generation::FIRST, false, file),
+    );
+    tree
+}
+
+#[tokio::test]
+async fn persists_file_bytes_across_reopen_and_old_versions() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let bytes = (0..900_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let file = fs.write_file(&mut bytes.as_slice()).await.unwrap();
+    let initial = fs.observe().await.unwrap();
+    let id = CommitId::generate();
+    let tree = add_file(initial.tree(), "large", file.clone());
+    backend.fail_next_head_write_after_success();
+    assert_eq!(
+        fs.commit(&initial, id, tree.clone()).await.unwrap(),
+        CommitOutcome::Committed { version: 1 }
+    );
+    assert_eq!(
+        fs.commit(&initial, id, tree).await.unwrap(),
+        CommitOutcome::Committed { version: 1 }
+    );
+    let reopened = Fs::open(backend.operator()).await.unwrap();
+    let observed = reopened.observe().await.unwrap();
+    let NodeBody::File(persisted) = observed
+        .tree()
+        .get(&Path::new("large").unwrap())
+        .unwrap()
+        .body()
+    else {
+        panic!()
+    };
+    let mut output = Vec::new();
+    reopened.read_file(persisted, &mut output).await.unwrap();
+    assert_eq!(output, bytes);
+    let replacement = fs.write_file(&mut &b"new"[..]).await.unwrap();
+    let old_node = observed.tree().get(&Path::new("large").unwrap()).unwrap();
+    let mut next = observed.tree().clone();
+    next.insert(
+        Path::new("large").unwrap(),
+        Node::file(
+            old_node.id(),
+            old_node.generation().next().unwrap(),
+            false,
+            replacement,
+        ),
+    );
+    fs.commit(&observed, CommitId::generate(), next)
+        .await
+        .unwrap();
+    output.clear();
+    reopened.read_file(&file, &mut output).await.unwrap();
+    assert_eq!(output, bytes);
+}
+
+#[tokio::test]
+async fn reads_parts_offsets_and_checks_the_logical_digest() {
+    let fs = Fs::create(TestBackend::default().operator()).await.unwrap();
+    let source = fs.write_file(&mut &b"0123456789"[..]).await.unwrap();
+    let blob = source.parts()[0].blob().clone();
+    let parts = vec![
+        FilePart::new(0..3, 6, blob.clone()).unwrap(),
+        FilePart::new(3..5, 1, blob).unwrap(),
+    ];
+    let file = File::new(
+        ContentId::new(blake3::hash(b"67812").into(), 5),
+        parts.clone(),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    fs.read_file(&file, &mut output).await.unwrap();
+    assert_eq!(output, b"67812");
+    let wrong = File::new(ContentId::new([0; 32], 5), parts).unwrap();
+    assert_eq!(
+        fs.read_file(&wrong, &mut tokio::io::sink())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+}
+
+#[tokio::test]
+async fn empty_files_need_no_data_objects() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let empty = fs.write_file(&mut &b""[..]).await.unwrap();
+    assert!(empty.parts().is_empty());
+    fs.read_file(&empty, &mut tokio::io::sink()).await.unwrap();
+    assert!(
+        !backend
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .keys()
+            .any(|path| path.starts_with(".yinyang/data/"))
+    );
+}
+
+#[tokio::test]
+async fn missing_or_corrupt_data_cannot_be_published() {
+    for corruption in ["missing", "digest", "short", "long"] {
+        let backend = TestBackend::default();
+        let fs = Fs::create(backend.operator()).await.unwrap();
+        let file = fs.write_file(&mut &b"content"[..]).await.unwrap();
+        let path = std::str::from_utf8(file.parts()[0].blob().as_bytes()).unwrap();
+        {
+            let mut state = backend.state.lock().unwrap();
+            if corruption == "missing" {
+                state.objects.remove(path);
+            } else {
+                let bytes = &mut state.objects.get_mut(path).unwrap().bytes;
+                match corruption {
+                    "digest" => bytes[0] ^= 1,
+                    "short" => {
+                        bytes.pop();
+                    }
+                    _ => bytes.push(0),
+                }
+            }
+        }
+        let observed = fs.observe().await.unwrap();
+        let error = fs
+            .commit(
+                &observed,
+                CommitId::generate(),
+                add_file(observed.tree(), "bad", file),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt, "{corruption}: {error}");
+        assert_eq!(fs.observe().await.unwrap(), observed);
+    }
+}
+
+#[tokio::test]
+async fn failed_upload_aborts_and_never_changes_head() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let observed = fs.observe().await.unwrap();
+    backend.state.lock().unwrap().fail_data_close = true;
+    assert_eq!(
+        fs.write_file(&mut &b"content"[..])
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Storage
+    );
+    assert_eq!(backend.state.lock().unwrap().data_aborts, 1);
+    assert_eq!(fs.observe().await.unwrap(), observed);
+}
+
+#[tokio::test]
+async fn invalid_data_locations_are_rejected() {
+    let fs = Fs::create(TestBackend::default().operator()).await.unwrap();
+    for path in [".yinyang/head", ".yinyang/data/../head", "external"] {
+        let content = ContentId::new(blake3::hash(b"x").into(), 1);
+        let file = File::new(
+            content,
+            vec![FilePart::new(0..1, 0, BlobRef::new(path, content)).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            fs.read_file(&file, &mut tokio::io::sink())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
+        );
+    }
+}
+
+#[tokio::test]
+async fn verifies_unselected_blob_bytes_and_reports_destination_errors() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let uploaded = fs.write_file(&mut &b"abcdef"[..]).await.unwrap();
+    let blob = uploaded.parts()[0].blob().clone();
+    let file = File::new(
+        ContentId::new(blake3::hash(b"bc").into(), 2),
+        vec![FilePart::new(0..2, 1, blob.clone()).unwrap()],
+    )
+    .unwrap();
+    let (mut sink, peer) = tokio::io::duplex(1);
+    drop(peer);
+    assert_eq!(
+        fs.read_file(&file, &mut sink).await.unwrap_err().kind(),
+        ErrorKind::Io
+    );
+    backend
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .get_mut(std::str::from_utf8(blob.as_bytes()).unwrap())
+        .unwrap()
+        .bytes[5] ^= 1;
+    assert_eq!(
+        fs.read_file(&file, &mut tokio::io::sink())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+}
+
+#[tokio::test]
+async fn source_failure_after_upload_starts_aborts_the_writer() {
+    struct FailingSource(bool);
+    impl tokio::io::AsyncRead for FailingSource {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.0 {
+                return std::task::Poll::Ready(Err(std::io::Error::other("source failed")));
+            }
+            self.0 = true;
+            buffer.put_slice(b"started");
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    assert_eq!(
+        fs.write_file(&mut FailingSource(false))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Io
+    );
+    assert_eq!(backend.state.lock().unwrap().data_aborts, 1);
+    assert_eq!(fs.observe().await.unwrap().version().number(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
+async fn s3_file_publication_and_reopen() {
+    opendal::install_default();
+    let config = std::env::vars()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("YINYANG_S3_")
+                .map(|key| (key.to_ascii_lowercase(), value))
+        })
+        .collect::<Vec<_>>();
+    let operator = Operator::via_iter("s3", config).unwrap();
+    let fs = Fs::create(operator.clone()).await.unwrap();
+    let bytes = vec![37; 12 * 1024 * 1024 + 17];
+    let file = fs.write_file(&mut bytes.as_slice()).await.unwrap();
+    let observed = fs.observe().await.unwrap();
+    let name = format!("file-{}", uuid::Uuid::new_v4().simple());
+    let tree = add_file(observed.tree(), &name, file);
+    let id = CommitId::generate();
+    assert!(matches!(
+        fs.commit(&observed, id, tree.clone()).await.unwrap(),
+        CommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        fs.commit(&observed, id, tree).await.unwrap(),
+        CommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        fs.commit(
+            &observed,
+            CommitId::generate(),
+            add_directory(observed.tree(), "loser", NodeId::generate())
+        )
+        .await
+        .unwrap(),
+        CommitOutcome::Conflict { .. }
+    ));
+    let reopened = Fs::open(operator).await.unwrap();
+    let current = reopened.observe().await.unwrap();
+    let NodeBody::File(file) = current
+        .tree()
+        .get(&Path::new(name).unwrap())
+        .unwrap()
+        .body()
+    else {
+        panic!()
+    };
+    let mut output = Vec::new();
+    reopened.read_file(file, &mut output).await.unwrap();
+    assert_eq!(output, bytes);
 }
 
 #[tokio::test]
@@ -647,7 +952,7 @@ async fn requires_node_generation_for_file_changes() {
             node,
             Generation::FIRST,
             false,
-            File::new(ContentId::new([1; 32], 0), Vec::new()).unwrap(),
+            filesystem.write_file(&mut &b"original"[..]).await.unwrap(),
         ),
     );
     filesystem
