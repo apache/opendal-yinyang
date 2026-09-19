@@ -48,6 +48,34 @@ Directory membership is compared as `name -> NodeId`. A create, remove,
 replacement, or rename affecting that mapping advances the directory membership
 generation by exactly one. Unchanged membership preserves its generation.
 
+## Checked namespace edits
+
+`Observation::edit` creates a `TreeEdit` batch rooted in that observation.
+It supports creating directories and files, replacing file content, setting
+the executable attribute, renaming a subtree, removing a file or empty
+directory, and explicitly removing a whole subtree. Creation requires an
+existing directory parent and a free case-folded name. Rename preserves every
+moved node identity, allows case-only changes, and never overwrites another
+entry. Removing or renaming the root and moving a directory into itself are
+invalid. Operations that return an error leave the batch unchanged.
+
+Missing entries or parents return `NotFound`; occupied names return
+`AlreadyExists`; incompatible node kinds and forbidden operations return
+`Invalid`. The batch owns a name index keyed by parent identity to check
+collisions without rescanning the complete tree on every creation.
+
+`TreeEdit::tree` exposes staged state; its generations are provisional.
+`finish` computes generations once from the final state relative to the
+observation, validates the successor, and returns a tree for `Fs::commit` with
+that same observation. Multiple changes to one node or membership set advance
+its generation only once; reverted changes do not advance it. New identities
+start at generation 1, including directories populated in the same batch.
+Overflow fails before publication. A batch is atomically visible at the head
+CAS, not operation by operation; a stale observation returns `Conflict` rather
+than rebasing or silently overwriting concurrent changes. Callers retain their
+`CommitId` when retrying an uncertain publication. Removing a node never
+deletes its immutable file data.
+
 ## Versions and commits
 
 `FsVersion.number` is its commit count and therefore its publication order.

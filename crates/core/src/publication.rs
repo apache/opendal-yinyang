@@ -29,6 +29,11 @@ pub struct Observation {
 }
 
 impl Observation {
+    /// Stage namespace operations against this observation without publishing.
+    pub fn edit(&self) -> crate::TreeEdit<'_> {
+        crate::TreeEdit::new(self.tree())
+    }
+
     pub const fn version(&self) -> &FsVersion {
         &self.version
     }

@@ -692,6 +692,64 @@ async fn creates_and_reopens_one_filesystem() {
 }
 
 #[tokio::test]
+async fn publishes_checked_edits_and_detects_stale_batches() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let observed = fs.observe().await.unwrap();
+    let mut edit = observed.edit();
+    edit.create_dir(Path::new("dir").unwrap(), false).unwrap();
+    let file = fs.write_file(&mut &b"first"[..]).await.unwrap();
+    let id = edit
+        .create_file(Path::new("dir/file").unwrap(), file.clone(), false)
+        .unwrap();
+    let tree = edit.finish().unwrap();
+    let commit = CommitId::generate();
+    fs.commit(&observed, commit, tree.clone()).await.unwrap();
+    assert_eq!(
+        fs.commit(&observed, commit, tree).await.unwrap(),
+        CommitOutcome::Committed { version: 1 }
+    );
+    let mut stale = observed.edit();
+    stale
+        .create_dir(Path::new("stale").unwrap(), false)
+        .unwrap();
+    assert_eq!(
+        fs.commit(&observed, CommitId::generate(), stale.finish().unwrap())
+            .await
+            .unwrap(),
+        CommitOutcome::Conflict { current: 1 }
+    );
+    let current = fs.observe().await.unwrap();
+    let mut edit = current.edit();
+    edit.rename(&Path::new("dir/file").unwrap(), Path::new("moved").unwrap())
+        .unwrap();
+    edit.remove(&Path::new("dir").unwrap()).unwrap();
+    edit.replace_file(
+        &Path::new("moved").unwrap(),
+        fs.write_file(&mut &b"second"[..]).await.unwrap(),
+    )
+    .unwrap();
+    edit.set_executable(&Path::new("moved").unwrap(), true)
+        .unwrap();
+    fs.commit(&current, CommitId::generate(), edit.finish().unwrap())
+        .await
+        .unwrap();
+    let current = Fs::open(backend.operator())
+        .await
+        .unwrap()
+        .observe()
+        .await
+        .unwrap();
+    let node = current.tree().get(&Path::new("moved").unwrap()).unwrap();
+    assert_eq!(node.id(), id);
+    assert_eq!(node.generation().value(), 2);
+    assert!(node.executable());
+    let mut old = Vec::new();
+    fs.read_file(&file, &mut old).await.unwrap();
+    assert_eq!(old, b"first");
+}
+
+#[tokio::test]
 async fn streams_versions_to_opaque_object_keys() {
     let backend = TestBackend::default();
     let filesystem = Fs::create(backend.operator()).await.unwrap();

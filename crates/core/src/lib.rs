@@ -26,7 +26,7 @@ mod publication;
 mod version;
 
 pub use error::{Error, ErrorKind, Result};
-pub use filesystem::{BlobRef, ContentId, File, FilePart, Node, NodeBody, Path, Tree};
+pub use filesystem::{BlobRef, ContentId, File, FilePart, Node, NodeBody, Path, Tree, TreeEdit};
 pub use identity::{CommitId, Generation, NodeId};
 pub use publication::{CommitOutcome, Fs, Observation};
 pub use version::FsVersion;

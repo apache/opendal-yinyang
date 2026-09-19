@@ -24,6 +24,9 @@ use unicode_normalization::UnicodeNormalization as _;
 
 use crate::{Error, Generation, NodeId, Result};
 
+mod edit;
+pub use edit::TreeEdit;
+
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_PATH_BYTES: usize = 4096;
 
