@@ -20,8 +20,42 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 > **Status: active redesign**
 >
 > We are actively working on the design of the next Apache OpenDAL™ YinYang release under
-> [RFC-0016]. The `main` branch is a buildable project scaffold and does not
-> currently provide a mount command or runtime API.
+> [RFC-0016]. The core supports persisted Managed filesystems and checked
+> namespace edits. The experimental `yy` CLI publishes and restores directory
+> snapshots. Mount and bidirectional Sync are not implemented yet.
+
+## Publish and restore a directory
+
+Build the experimental CLI with `cargo build --bin yy`. It currently connects
+to S3-compatible storage. Create a bucket first, then configure OpenDAL through
+`YINYANG_S3_*` environment variables:
+
+```shell
+export YINYANG_S3_BUCKET=my-bucket
+export YINYANG_S3_REGION=us-east-1
+export YINYANG_S3_ROOT=my-filesystem
+# For an S3-compatible service, also set YINYANG_S3_ENDPOINT.
+# Supply credentials using YINYANG_S3_ACCESS_KEY_ID and
+# YINYANG_S3_SECRET_ACCESS_KEY, or the OpenDAL AWS credential chain.
+
+target/debug/yy create
+target/debug/yy publish ./source
+target/debug/yy status
+target/debug/yy restore ./new-destination
+```
+
+Keep the source directory unchanged during publication. Publishing a later
+complete snapshot requires `publish ./source --replace`: remote-only paths are
+removed. Publication prints a commit UUID before transfer; retain it and pass
+`--commit-id UUID` if the result is uncertain. Concurrent remote changes return
+a conflict without automatic overwrite.
+
+Restore requires a destination that does not exist. It verifies and installs
+files individually without overwriting anything. An interrupted restore can
+leave a partial directory; inspect it and restore into a new destination to
+retry. This is one-shot transfer, not a background or bidirectional Sync engine.
+See the [directory transfer contract](specs/directory-transfer.md) for supported
+metadata, failure semantics, and limitations.
 
 ## Previous releases
 
