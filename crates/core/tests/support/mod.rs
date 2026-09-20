@@ -33,10 +33,18 @@ pub struct TestState {
     pub next_revision: u64,
     pub fail_after_head_write: bool,
     pub stat_calls: u64,
+    pub head_stat_calls: u64,
     pub version_write_calls: u64,
     pub fail_data_close: bool,
     pub data_aborts: u64,
-    pub file_to_change_on_data_close: Option<std::path::PathBuf>,
+    pub data_read_bytes: u64,
+    pub data_reads: u64,
+    pub corrupt_pack_on_close: bool,
+    pub read_paths: Vec<String>,
+    pub written_bytes: u64,
+    pub head_barrier: Option<(Arc<tokio::sync::Barrier>, usize)>,
+    pub delay_next_head: bool,
+    pub pending_head: Option<(Vec<u8>, Option<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,9 +130,9 @@ impl TestBackend {
 }
 
 #[derive(Debug)]
-struct TestService {
-    state: Arc<Mutex<TestState>>,
-    write_can_multi: bool,
+pub struct TestService {
+    pub state: Arc<Mutex<TestState>>,
+    pub write_can_multi: bool,
 }
 
 impl Service for TestService {
@@ -135,7 +143,7 @@ impl Service for TestService {
     type Copier = ();
 
     fn info(&self) -> ServiceInfo {
-        ServiceInfo::with_scheme("yinyang-test")
+        ServiceInfo::with_scheme("s3")
     }
 
     fn capability(&self) -> opendal::Capability {
@@ -164,14 +172,22 @@ impl Service for TestService {
     async fn stat(&self, _: &OperationContext, path: &str, _: OpStat) -> opendal::Result<RpStat> {
         let mut state = self.state.lock().unwrap();
         state.stat_calls += 1;
+        if path == ".yinyang/head" {
+            state.head_stat_calls += 1;
+        }
         let object = state.objects.get(path).ok_or_else(not_found)?;
         Ok(RpStat::new(metadata(object)))
     }
 
     fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> opendal::Result<Self::Reader> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.read_paths.push(path.to_owned());
         let object = state.objects.get(path).cloned().ok_or_else(not_found)?;
-        Ok(TestReader { object })
+        Ok(TestReader {
+            object,
+            state: self.state.clone(),
+            data: path.contains("/packs/"),
+        })
     }
 
     fn write(
@@ -229,8 +245,10 @@ impl Service for TestService {
 }
 
 #[derive(Debug)]
-struct TestReader {
-    object: StoredObject,
+pub struct TestReader {
+    pub object: StoredObject,
+    pub state: Arc<Mutex<TestState>>,
+    pub data: bool,
 }
 
 impl oio::Read for TestReader {
@@ -244,6 +262,11 @@ impl oio::Read for TestReader {
 
     async fn read(&self, range: BytesRange) -> opendal::Result<(RpRead, Buffer)> {
         let range = range.to_content_range(self.object.bytes.len())?;
+        if self.data {
+            let mut state = self.state.lock().unwrap();
+            state.data_read_bytes += range.len() as u64;
+            state.data_reads += 1;
+        }
         Ok((
             RpRead::new(metadata(&self.object)),
             Buffer::from(self.object.bytes[range].to_vec()),
@@ -252,12 +275,12 @@ impl oio::Read for TestReader {
 }
 
 #[derive(Debug)]
-struct TestWriter {
-    state: Arc<Mutex<TestState>>,
-    path: String,
-    if_match: Option<String>,
-    if_not_exists: bool,
-    bytes: Vec<u8>,
+pub struct TestWriter {
+    pub state: Arc<Mutex<TestState>>,
+    pub path: String,
+    pub if_match: Option<String>,
+    pub if_not_exists: bool,
+    pub bytes: Vec<u8>,
 }
 
 impl oio::Write for TestWriter {
@@ -272,8 +295,37 @@ impl oio::Write for TestWriter {
     }
 
     async fn close(&mut self) -> opendal::Result<Metadata> {
+        if self.path == ".yinyang/head" && self.if_match.is_some() {
+            let barrier = {
+                let mut state = self.state.lock().unwrap();
+                state
+                    .head_barrier
+                    .as_mut()
+                    .and_then(|(barrier, remaining)| {
+                        if *remaining == 0 {
+                            None
+                        } else {
+                            *remaining -= 1;
+                            Some(barrier.clone())
+                        }
+                    })
+            };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+        }
         let mut state = self.state.lock().unwrap();
-        if self.path.starts_with(".yinyang/data/") && state.fail_data_close {
+        if self.path == ".yinyang/head" && state.delay_next_head {
+            state.delay_next_head = false;
+            state.pending_head = Some((self.bytes.clone(), self.if_match.clone()));
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "head completion is delayed",
+            ));
+        }
+        if (self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/"))
+            && state.fail_data_close
+        {
             return Err(opendal::Error::new(
                 opendal::ErrorKind::Unexpected,
                 "data close failed",
@@ -298,17 +350,17 @@ impl oio::Write for TestWriter {
         }
 
         state.next_revision += 1;
-        let object = StoredObject {
+        state.written_bytes += self.bytes.len() as u64;
+        let mut object = StoredObject {
             bytes: self.bytes.clone(),
             etag: format!("\"{}\"", state.next_revision),
         };
+        if self.path.contains("/packs/") && state.corrupt_pack_on_close && !object.bytes.is_empty()
+        {
+            object.bytes[0] ^= 1;
+        }
         let metadata = metadata(&object);
         state.objects.insert(self.path.clone(), object);
-        if self.path.starts_with(".yinyang/data/")
-            && let Some(path) = state.file_to_change_on_data_close.take()
-        {
-            std::fs::write(path, b"source changed during upload").unwrap();
-        }
         if self.path == ".yinyang/head" && state.fail_after_head_write {
             state.fail_after_head_write = false;
             return Err(opendal::Error::new(
@@ -320,7 +372,7 @@ impl oio::Write for TestWriter {
     }
 
     async fn abort(&mut self) -> opendal::Result<()> {
-        if self.path.starts_with(".yinyang/data/") {
+        if self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/") {
             self.state.lock().unwrap().data_aborts += 1;
         }
         self.bytes.clear();

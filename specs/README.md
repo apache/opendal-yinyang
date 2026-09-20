@@ -1,15 +1,26 @@
 # Specifications
 
-This directory contains the current, maintained contracts for Apache OpenDAL™
-YinYang.
+This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 
-- [YinYang Format core](yinyang-format.md)
-- [Directory publication and restoration](directory-transfer.md)
+| Specification | Status |
+| --- | --- |
+| [YinYang object profile](yinyang-format.md) | Experimental indexed transactions and OpenDAL head publication. |
+| [Directory transfer](directory-transfer.md) | One-shot local directory publication and restoration. |
+| [Authenticated content profile](content-profile.md) | Experimental range verification and trusted preparation; independent of publication authority. |
+| [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage binding implemented experimentally; metadata-service binding remains open. |
 
 A specification describes the currently supported behavior, APIs, wire formats,
 invariants, compatibility rules, and implementation boundaries. Specifications
 evolve with the implementation and must be updated in the same change as the
 contract they describe.
+
+The transactional filesystem specification is an explicit design-ahead
+exception. It defines the replacement contract without requiring compatibility
+with the legacy format. Its normative requirements apply to both bindings;
+the linked implementation profiles describe the supported subset and byte
+encoding. Keep experimental status and remaining evaluation decisions visible
+until conformance evidence justifies changing them. Object-storage publication
+is implemented first; both publication modes remain part of the target contract.
 
 RFCs in [`../rfcs`](../rfcs) preserve design decisions and their historical
 context. An RFC may change while it is under review, but its file becomes
