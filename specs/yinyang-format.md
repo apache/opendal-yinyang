@@ -31,6 +31,9 @@ identity lookup, path resolution, directory pagination, prepared published
 content, indexed receipt lookup, and ordered changes. `observe_revision` uses
 the retained-snapshot index. There is no listing-based discovery, implicit
 latest-cache substitution, expiry, garbage collection, or history replay.
+Revision tokens round-trip through 24-byte representations for persistence
+across process restarts. Decoding a token does not establish its validity:
+historical lookup checks membership in this filesystem's retained lineage.
 
 `Planner` captures conditions while constructing a deterministic transaction.
 `lookup` and `resolve` capture name bindings; `node` captures the complete
