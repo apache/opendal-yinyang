@@ -1,5 +1,9 @@
 # YinYang Format Core
 
+**Status: current implementation.** The replacement design is specified in
+[Transactional filesystem](transactional-filesystem.md). That target is not
+implemented and does not change the behavior or encoding documented here.
+
 ## Scope
 
 The YinYang Format core defines the filesystem values, their OpenDAL

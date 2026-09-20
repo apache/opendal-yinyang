@@ -40,6 +40,9 @@ struct TestState {
     version_write_calls: u64,
     fail_data_close: bool,
     data_aborts: u64,
+    data_read_bytes: u64,
+    data_reads: u64,
+    corrupt_pack_on_close: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +177,11 @@ impl Service for TestService {
     fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> opendal::Result<Self::Reader> {
         let state = self.state.lock().unwrap();
         let object = state.objects.get(path).cloned().ok_or_else(not_found)?;
-        Ok(TestReader { object })
+        Ok(TestReader {
+            object,
+            state: self.state.clone(),
+            data: path.contains("/packs/"),
+        })
     }
 
     fn write(
@@ -234,6 +241,8 @@ impl Service for TestService {
 #[derive(Debug)]
 struct TestReader {
     object: StoredObject,
+    state: Arc<Mutex<TestState>>,
+    data: bool,
 }
 
 impl oio::Read for TestReader {
@@ -247,6 +256,11 @@ impl oio::Read for TestReader {
 
     async fn read(&self, range: BytesRange) -> opendal::Result<(RpRead, Buffer)> {
         let range = range.to_content_range(self.object.bytes.len())?;
+        if self.data {
+            let mut state = self.state.lock().unwrap();
+            state.data_read_bytes += range.len() as u64;
+            state.data_reads += 1;
+        }
         Ok((
             RpRead::new(metadata(&self.object)),
             Buffer::from(self.object.bytes[range].to_vec()),
@@ -276,7 +290,9 @@ impl oio::Write for TestWriter {
 
     async fn close(&mut self) -> opendal::Result<Metadata> {
         let mut state = self.state.lock().unwrap();
-        if self.path.starts_with(".yinyang/data/") && state.fail_data_close {
+        if (self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/"))
+            && state.fail_data_close
+        {
             return Err(opendal::Error::new(
                 opendal::ErrorKind::Unexpected,
                 "data close failed",
@@ -301,10 +317,14 @@ impl oio::Write for TestWriter {
         }
 
         state.next_revision += 1;
-        let object = StoredObject {
+        let mut object = StoredObject {
             bytes: self.bytes.clone(),
             etag: format!("\"{}\"", state.next_revision),
         };
+        if self.path.contains("/packs/") && state.corrupt_pack_on_close && !object.bytes.is_empty()
+        {
+            object.bytes[0] ^= 1;
+        }
         let metadata = metadata(&object);
         state.objects.insert(self.path.clone(), object);
         if self.path == ".yinyang/head" && state.fail_after_head_write {
@@ -318,12 +338,39 @@ impl oio::Write for TestWriter {
     }
 
     async fn abort(&mut self) -> opendal::Result<()> {
-        if self.path.starts_with(".yinyang/data/") {
+        if self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/") {
             self.state.lock().unwrap().data_aborts += 1;
         }
         self.bytes.clear();
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn content_preparation_requires_verified_storage_acknowledgement() {
+    use yinyang_core::data::DataStore;
+    let backend = TestBackend::default();
+    let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    backend.state.lock().unwrap().fail_data_close = true;
+    assert_eq!(
+        store
+            .prepare(&mut b"abc".as_slice())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Storage
+    );
+    assert_eq!(backend.state.lock().unwrap().data_aborts, 1);
+    backend.state.lock().unwrap().fail_data_close = false;
+    backend.state.lock().unwrap().corrupt_pack_on_close = true;
+    assert_eq!(
+        store
+            .prepare(&mut b"abc".as_slice())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
 }
 
 fn metadata(object: &StoredObject) -> Metadata {
@@ -351,6 +398,163 @@ fn add_directory(tree: &Tree, name: &str, id: NodeId) -> Tree {
         Node::dir(id, Generation::FIRST, false, Generation::FIRST),
     );
     successor
+}
+
+#[tokio::test]
+async fn canonical_content_range_reads_and_incremental_overwrites() {
+    use yinyang_core::data::{BLOCK_BYTES, DataStore};
+    let backend = TestBackend::default();
+    let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    let bytes = (0..BLOCK_BYTES * 9 + 17)
+        .map(|n| (n % 251) as u8)
+        .collect::<Vec<_>>();
+    let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+    let second = store.prepare(&mut bytes.as_slice()).await.unwrap();
+    assert_eq!(file.content_id(), second.content_id());
+    assert_ne!(file.descriptor(), second.descriptor());
+    backend.state.lock().unwrap().data_read_bytes = 0;
+    let range = (BLOCK_BYTES as u64 - 3)..(BLOCK_BYTES as u64 + 4);
+    let mut output = Vec::new();
+    store
+        .read_range(file.descriptor(), range.clone(), &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+    assert!(backend.state.lock().unwrap().data_read_bytes < (BLOCK_BYTES * 2 + 10_000) as u64);
+    backend.state.lock().unwrap().data_read_bytes = 0;
+    let patched = store
+        .overwrite_prepared(&file, range.clone(), b"changed")
+        .await
+        .unwrap();
+    assert!(backend.state.lock().unwrap().data_read_bytes < (BLOCK_BYTES * 5) as u64);
+    let mut expected = bytes.clone();
+    expected[range.start as usize..range.end as usize].copy_from_slice(b"changed");
+    let complete = store.prepare(&mut expected.as_slice()).await.unwrap();
+    assert_eq!(patched.content_id(), complete.content_id());
+    output.clear();
+    store
+        .read_range(patched.descriptor(), 0..expected.len() as u64, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, expected);
+    output.clear();
+    store
+        .read_range(file.descriptor(), 0..bytes.len() as u64, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, bytes);
+}
+
+#[tokio::test]
+async fn content_corruption_is_rejected_before_releasing_its_unit() {
+    use yinyang_core::data::{BLOCK_BYTES, DataStore};
+    let backend = TestBackend::default();
+    let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    let bytes = vec![7; BLOCK_BYTES * 3];
+    let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+    let key = backend
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .keys()
+        .find(|key| key.contains("/packs/"))
+        .unwrap()
+        .clone();
+    backend
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .get_mut(&key)
+        .unwrap()
+        .bytes[0] ^= 1;
+    let mut output = Vec::new();
+    assert_eq!(
+        store
+            .read_range(file.descriptor(), 0..1, &mut output)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+    assert!(output.is_empty());
+    store
+        .read_range(
+            file.descriptor(),
+            BLOCK_BYTES as u64..BLOCK_BYTES as u64 + 1,
+            &mut output,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output, vec![7]);
+    assert_eq!(
+        store.import(file.descriptor()).await.unwrap_err().kind(),
+        ErrorKind::Corrupt
+    );
+}
+
+#[tokio::test]
+async fn preparation_evidence_cannot_be_recreated_from_a_descriptor() {
+    use yinyang_core::data::{ContentDescriptor, DataStore};
+    let backend = TestBackend::default();
+    let id = NodeId::generate();
+    let store = DataStore::new(backend.operator(), id).unwrap();
+    let impostor = DataStore::new(backend.operator(), id).unwrap();
+    let file = store.prepare(&mut &b"trusted"[..]).await.unwrap();
+    assert_eq!(
+        impostor.accept(&file).unwrap_err().kind(),
+        ErrorKind::Invalid
+    );
+    let decoded = ContentDescriptor::from_bytes(&file.descriptor().to_bytes()).unwrap();
+    let imported = impostor.import(&decoded).await.unwrap();
+    assert_eq!(impostor.accept(&imported).unwrap(), decoded);
+    let before = backend.state.lock().unwrap().data_reads;
+    store.accept(&file).unwrap();
+    assert_eq!(backend.state.lock().unwrap().data_reads, before);
+    let another = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    assert_eq!(
+        another.import(&decoded).await.unwrap_err().kind(),
+        ErrorKind::Invalid
+    );
+}
+
+#[tokio::test]
+async fn content_profile_is_independent_of_input_chunking() {
+    use yinyang_core::data::{BLOCK_BYTES, DataStore};
+    struct ShortReads<'a>(&'a [u8]);
+    impl tokio::io::AsyncRead for ShortReads<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            output: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let count = self.0.len().min(output.remaining()).min(17);
+            output.put_slice(&self.0[..count]);
+            self.0 = &self.0[count..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    let store = DataStore::new(TestBackend::default().operator(), NodeId::generate()).unwrap();
+    for length in [
+        0,
+        1,
+        BLOCK_BYTES - 1,
+        BLOCK_BYTES,
+        BLOCK_BYTES + 1,
+        5 * BLOCK_BYTES + 9,
+    ] {
+        let bytes = vec![42; length];
+        let first = store.prepare(&mut bytes.as_slice()).await.unwrap();
+        let second = store.prepare(&mut ShortReads(&bytes)).await.unwrap();
+        assert_eq!(first.content_id(), second.content_id());
+        let mut read = Vec::new();
+        store
+            .read_range(first.descriptor(), 0..length as u64, &mut read)
+            .await
+            .unwrap();
+        assert_eq!(bytes, read);
+    }
 }
 
 fn advance_root_membership(tree: &mut Tree) {
@@ -627,6 +831,25 @@ async fn s3_file_publication_and_reopen() {
         })
         .collect::<Vec<_>>();
     let operator = Operator::via_iter("s3", config).unwrap();
+    let content = yinyang_core::data::DataStore::new(operator.clone(), NodeId::generate()).unwrap();
+    let original = vec![37; 12 * 1024 * 1024 + 17];
+    let prepared = content.prepare(&mut original.as_slice()).await.unwrap();
+    let changed = content
+        .overwrite_prepared(&prepared, 65534..65538, b"test")
+        .await
+        .unwrap();
+    let mut range = Vec::new();
+    content
+        .read_range(changed.descriptor(), 65533..65539, &mut range)
+        .await
+        .unwrap();
+    assert_eq!(range, b"%test%");
+    let mut entire = Vec::new();
+    content
+        .read_range(prepared.descriptor(), 0..original.len() as u64, &mut entire)
+        .await
+        .unwrap();
+    assert_eq!(entire, original);
     let fs = Fs::create(operator.clone()).await.unwrap();
     let bytes = vec![37; 12 * 1024 * 1024 + 17];
     let file = fs.write_file(&mut bytes.as_slice()).await.unwrap();
