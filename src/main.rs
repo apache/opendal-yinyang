@@ -15,42 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-
-use clap::{Parser, Subcommand};
-use yinyang::core::{CommitId, CommitOutcome, Fs, NodeBody};
+use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
 
 #[derive(Parser)]
 #[command(
     name = "yy",
-    about = "Publish and restore directories on a Managed YinYang filesystem"
+    about = "Publish and restore transactional YinYang snapshots"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
-
 #[derive(Subcommand)]
 enum Command {
     /// Create a filesystem, or validate an existing one.
     Create,
-    /// Publish a complete directory snapshot, removing remote-only paths.
+    /// Publish a complete directory, removing remote-only paths.
     Publish {
         source: PathBuf,
         /// Allow replacement of a non-empty remote namespace.
         #[arg(long)]
         replace: bool,
-        /// Reuse this UUID when retrying an uncertain publication.
+        /// Unique UUID for a new request, not a request to replan an old attempt.
         #[arg(long)]
         commit_id: Option<uuid::Uuid>,
     },
-    /// Restore the current snapshot into a directory that does not exist.
+    /// Query an existing request without rescanning or republishing local files.
+    Receipt { commit_id: uuid::Uuid },
+    /// Restore the current pinned snapshot into a directory that does not exist.
     Restore { destination: PathBuf },
-    /// Show the current version and namespace size.
+    /// Enumerate the pinned namespace and report its size.
     Status,
 }
-
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
@@ -61,9 +60,14 @@ async fn main() -> ExitCode {
         }
     }
 }
-
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     opendal::install_default();
+    let profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
+        Ok("amazon-s3") => BackendProfile::AmazonS3,
+        Ok("minio") => BackendProfile::Minio,
+        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => BackendProfile::AmazonS3,
+        _ => return Err("set YINYANG_STORAGE_PROFILE to amazon-s3 or minio for the configured endpoint; other S3-compatible deployments are unsupported".into()),
+    };
     let config = std::env::vars()
         .filter_map(|(key, value)| {
             key.strip_prefix("YINYANG_S3_")
@@ -72,15 +76,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let operator = opendal::Operator::via_iter("s3", config)?;
     if matches!(cli.command, Command::Create) {
-        let fs = Fs::create(operator).await?;
+        let fs = Fs::create(operator, profile).await?;
         println!(
-            "filesystem ready at version {}",
-            fs.observe().await?.version().number()
+            "filesystem ready at revision {}",
+            revision(fs.observe_latest().await?.revision())
         );
         return Ok(());
     }
-    let fs = Fs::open(operator).await?;
-    let observed = fs.observe().await?;
+    let fs = Fs::open(operator, profile).await?;
+    let observed = fs.observe_latest().await?;
     match cli.command {
         Command::Create => unreachable!(),
         Command::Publish {
@@ -90,38 +94,62 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
             let id = CommitId::from_bytes(*uuid.as_bytes());
-            if !replace
-                && observed.tree().iter().count() > 1
-                && !observed.version().commits().contains(&id)
-            {
-                return Err("remote namespace is not empty; use --replace to publish a complete replacement".into());
+            if observed.receipt(id).await?.is_some() {
+                return Err(format!("commit identity is already used; query its original result with yy receipt {uuid}; use a new identity for a new snapshot").into());
             }
-            eprintln!("publication ID: {uuid}; reuse --commit-id {uuid} for an uncertain retry");
-            match yinyang::publish_directory(&fs, &observed, &source, id).await? {
-                CommitOutcome::Committed { version } => println!("published version {version} (commit {uuid})"),
-                CommitOutcome::Conflict { current } => return Err(format!("publication conflict: remote is at version {current}; inspect it before retrying").into()),
+            if !replace && !observed.scan(fs.root(), None, 1).await?.entries.is_empty() {
+                return Err(
+                    "remote namespace is not empty; use --replace for a complete replacement"
+                        .into(),
+                );
             }
+            eprintln!("publication ID: {uuid}");
+            let request = yinyang::prepare_directory(&fs, &observed, &source, id).await?;
+            eprintln!(
+                "request digest: {}",
+                blake3::Hash::from(request.digest()).to_hex()
+            );
+            match fs.commit(&request).await? {
+                CommitOutcome::Committed(receipt) => println!("published revision {} (commit {uuid})",revision(receipt.cursor.revision)),
+                CommitOutcome::Conflict => return Err("original namespace predicates changed; inspect the remote state before planning a new request".into()),
+                CommitOutcome::Retryable => return Err("publication opportunity was exhausted without an unresolved write; submit a new directory request or retry the frozen Transaction through the library".into()),
+                CommitOutcome::Unknown(_) => return Err(format!("publication may still complete; query yy receipt {uuid}; an absent receipt does not prove failure").into()),
+            }
+        }
+        Command::Receipt { commit_id } => {
+            let id = CommitId::from_bytes(*commit_id.as_bytes());
+            let receipt = observed.receipt(id).await?.ok_or("receipt not found; a delayed attempt may still publish, so absence is not proof of failure")?;
+            println!(
+                "commit: {commit_id}\nrevision: {}\nordinal: {}\nrequest digest: {}",
+                revision(receipt.cursor.revision),
+                receipt.cursor.ordinal,
+                blake3::Hash::from(receipt.request_digest).to_hex()
+            );
         }
         Command::Restore { destination } => {
             yinyang::restore_directory(&fs, &observed, &destination).await?;
             println!(
-                "restored version {} to {}",
-                observed.version().number(),
+                "restored revision {} to {}",
+                revision(observed.revision()),
                 destination.display()
             );
         }
         Command::Status => {
-            let files = observed
-                .tree()
-                .iter()
-                .filter(|(_, node)| matches!(node.body(), NodeBody::File(_)))
-                .count();
-            let directories = observed.tree().iter().count() - files;
+            let nodes = yinyang::directory_nodes(&observed).await?;
+            let directories = nodes.values().filter(|n| n.is_directory()).count();
             println!(
-                "version: {}\nfiles: {files}\ndirectories: {directories}",
-                observed.version().number()
+                "revision: {}\nfiles: {}\ndirectories: {directories}",
+                revision(observed.revision()),
+                nodes.len() - directories
             );
         }
     }
     Ok(())
+}
+fn revision(value: Revision) -> String {
+    value
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }

@@ -20,21 +20,22 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 > **Status: active redesign**
 >
 > We are actively working on the design of the next Apache OpenDAL™ YinYang release under
-> [RFC-0016]. The core supports persisted Managed filesystems and checked
-> namespace edits. The experimental `yy` CLI publishes and restores directory
-> snapshots. Mount and bidirectional Sync are not implemented yet.
+> [RFC-0016]. The core provides experimental indexed object-storage transactions,
+> retained snapshots, and authenticated range-verifiable content. The `yy` CLI
+> publishes and restores directories. Metadata-service publication, Mount, and
+> bidirectional Sync are not implemented yet.
 
 ## Publish and restore a directory
 
 Build the experimental CLI with `cargo build --bin yy`. It currently connects
-to S3-compatible storage. Create a bucket first, then configure OpenDAL through
+to Amazon S3 or MinIO. Create a bucket first, then configure OpenDAL through
 `YINYANG_S3_*` environment variables:
 
 ```shell
 export YINYANG_S3_BUCKET=my-bucket
 export YINYANG_S3_REGION=us-east-1
 export YINYANG_S3_ROOT=my-filesystem
-# For an S3-compatible service, also set YINYANG_S3_ENDPOINT.
+# For MinIO, also set YINYANG_S3_ENDPOINT and YINYANG_STORAGE_PROFILE=minio.
 # Supply credentials using YINYANG_S3_ACCESS_KEY_ID and
 # YINYANG_S3_SECRET_ACCESS_KEY, or the OpenDAL AWS credential chain.
 
@@ -46,9 +47,12 @@ target/debug/yy restore ./new-destination
 
 Keep the source directory unchanged during publication. Publishing a later
 complete snapshot requires `publish ./source --replace`: remote-only paths are
-removed. Publication prints a commit UUID before transfer; retain it and pass
-`--commit-id UUID` if the result is uncertain. Concurrent remote changes return
-a conflict without automatic overwrite.
+removed. Publication prints a commit UUID; retain it and query `yy receipt UUID`
+if the result is uncertain. A missing receipt does not prove failure while an
+attempt may still complete. `--commit-id` selects an identity for a new request,
+not permission to replan an old one. The library exposes a frozen transaction
+for exact retries without rescanning or reuploading. Concurrent changes within
+the replaced scope return a conflict without silently erasing them.
 
 Restore requires a destination that does not exist. It verifies and installs
 files individually without overwriting anything. An interrupted restore can

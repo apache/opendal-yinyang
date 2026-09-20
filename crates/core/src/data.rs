@@ -44,6 +44,46 @@ pub struct ContentId {
 }
 
 impl ContentId {
+    /// Identify unknown local bytes without uploading them. This shares the
+    /// canonical hash profile with prepared content and uses bounded buffers.
+    pub async fn calculate(source: &mut (impl AsyncRead + Unpin)) -> Result<Self> {
+        let mut frontier = Vec::<(u64, u64, [u8; 32])>::new();
+        let mut length = 0_u64;
+        loop {
+            let bytes = read_unit(source).await?;
+            if bytes.is_empty() {
+                break;
+            }
+            let start = length / BLOCK_BYTES as u64;
+            length = length
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| Error::invalid("identify content", "length overflows"))?;
+            frontier.push((start, 1, leaf_hash(start, &bytes)));
+            while frontier.len() >= 2
+                && frontier[frontier.len() - 1].1 == frontier[frontier.len() - 2].1
+            {
+                let (_, right_count, right) = frontier.pop().unwrap();
+                let (start, left_count, left) = frontier.pop().unwrap();
+                let count = left_count + right_count;
+                frontier.push((start, count, branch_hash(start, count, left, right)));
+            }
+        }
+        let mut subtree = empty_hash();
+        if let Some((_, mut count, mut hash)) = frontier.pop() {
+            while let Some((start, left_count, left)) = frontier.pop() {
+                count += left_count;
+                hash = branch_hash(start, count, left, hash);
+            }
+            subtree = hash;
+        }
+        let mut hash = domain(b"file");
+        hash.update(&length.to_le_bytes());
+        hash.update(&subtree);
+        Ok(Self {
+            length,
+            digest: hash.finalize().into(),
+        })
+    }
     pub const fn length(self) -> u64 {
         self.length
     }
@@ -198,25 +238,13 @@ impl DataStore {
         let mut frontier = Vec::<(u64, u64, Child)>::new();
         let mut length = 0_u64;
         loop {
-            let mut bytes = vec![0; BLOCK_BYTES];
-            let mut used = 0;
-            while used < bytes.len() {
-                let count = source
-                    .read(&mut bytes[used..])
-                    .await
-                    .map_err(|error| Error::from_io("read content source", error))?;
-                if count == 0 {
-                    break;
-                }
-                used += count;
-            }
-            if used == 0 {
+            let bytes = read_unit(source).await?;
+            if bytes.is_empty() {
                 break;
             }
-            bytes.truncate(used);
             let start = length / BLOCK_BYTES as u64;
             length = length
-                .checked_add(used as u64)
+                .checked_add(bytes.len() as u64)
                 .ok_or_else(|| Error::invalid("prepare content", "length overflows"))?;
             let child = pack.leaf(start, &bytes).await?;
             frontier.push((start, 1, child));
@@ -712,6 +740,23 @@ impl Pack {
 
 fn leaves(length: u64) -> u64 {
     length.div_ceil(BLOCK_BYTES as u64)
+}
+
+async fn read_unit(source: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+    let mut bytes = vec![0; BLOCK_BYTES];
+    let mut used = 0;
+    while used < bytes.len() {
+        let count = source
+            .read(&mut bytes[used..])
+            .await
+            .map_err(|e| Error::from_io("read content source", e))?;
+        if count == 0 {
+            break;
+        }
+        used += count;
+    }
+    bytes.truncate(used);
+    Ok(bytes)
 }
 fn split(count: u64) -> u64 {
     1_u64 << (63 - (count - 1).leading_zeros())

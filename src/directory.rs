@@ -15,132 +15,156 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::SystemTime;
-
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use yinyang_core::{
-    CommitId, CommitOutcome, ContentId, Error, ErrorKind, File, Fs, NodeBody, Observation,
-    Path as FsPath, Result,
+    CommitId, CommitOutcome, ContentId, Error, ErrorKind, Fs, Node, NodeKind, Planner, Result,
+    Snapshot, Transaction,
 };
 
-/// Publish a complete local directory as one remote namespace version.
-///
-/// The source must remain quiescent until completion. Remote-only entries are
-/// removed. Same-path, same-kind nodes keep their identities; rename detection
-/// is not attempted. Reuse the observation and commit ID for an uncertain retry.
-/// A conflict is returned without rebasing or overwriting the winner.
-pub async fn publish_directory(
+/// Prepare one complete replacement, including predicates over every observed
+/// node and directory. Keep the returned transaction to retry identical intent
+/// without scanning local files or uploading prepared content again.
+pub async fn prepare_directory(
     fs: &Fs,
-    observed: &Observation,
+    observed: &Snapshot,
     source: &Path,
     id: CommitId,
-) -> Result<CommitOutcome> {
+) -> Result<Transaction> {
     check_filesystem(fs, observed)?;
-    if observed.version().commits().contains(&id) {
-        return fs.commit(observed, id, observed.tree().clone()).await;
-    }
     let manifest = scan(source).await?;
-    let mut edit = observed.edit();
-    let old_paths = observed
-        .tree()
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
-    for path in old_paths
-        .into_iter()
-        .rev()
-        .filter(|path| path != &FsPath::root())
-    {
-        let old = edit.tree().get(&path).expect("observed entry exists");
-        if manifest
-            .get(&path)
-            .is_none_or(|entry| entry.directory != matches!(old.body(), NodeBody::Dir { .. }))
-        {
-            edit.remove(&path)?;
-        }
-    }
-    // Validate all portable names and kind changes before uploading any content.
-    for (path, entry) in &manifest {
-        if path == &FsPath::root() {
-            continue;
-        }
-        if edit.tree().get(path).is_none() {
-            if entry.directory {
-                edit.create_dir(path.clone(), false)?;
-            } else {
-                edit.create_file(path.clone(), empty_file(), entry.executable)?;
+    // Recover readiness under this process's authority, including after reopen.
+    let observed = fs.observe_revision(observed.revision()).await?;
+    let mut planner = Planner::new(&observed, id);
+    let mut remote = BTreeMap::<String, Node>::new();
+    let mut pending = vec![(String::new(), observed.root())];
+    while let Some((path, id)) = pending.pop() {
+        let node = planner
+            .node(id)
+            .await?
+            .ok_or_else(|| invalid("observed node disappeared"))?;
+        if node.is_directory() {
+            for entry in planner.scan(id).await? {
+                pending.push((join(&path, &entry.name), entry.node_id));
             }
         }
-        edit.set_executable(path, entry.executable)?;
+        remote.insert(path, node);
+    }
+    for (path, node) in remote.iter().rev().filter(|(path, _)| !path.is_empty()) {
+        if manifest
+            .get(path)
+            .is_none_or(|entry| entry.directory != node.is_directory())
+        {
+            planner.remove(node.id()).await?;
+        }
+    }
+    let empty = fs.data().prepare(&mut b"".as_slice()).await?;
+    let mut identities = BTreeMap::from([(String::new(), fs.root())]);
+    for (path, entry) in &manifest {
+        let id = if path.is_empty() {
+            fs.root()
+        } else if let Some(node) = remote
+            .get(path)
+            .filter(|n| n.is_directory() == entry.directory)
+        {
+            node.id()
+        } else {
+            let (parent, name) = split(path);
+            if entry.directory {
+                planner.create_directory(identities[parent], name).await?
+            } else {
+                planner
+                    .create_file(identities[parent], name, empty.clone(), entry.executable)
+                    .await?
+            }
+        };
+        identities.insert(path.clone(), id);
+        planner.set_executable(id, entry.executable).await?;
     }
     for (path, entry) in &manifest {
         if entry.directory {
             continue;
         }
-        let local = source.join(path.as_str());
+        let local = source.join(path);
         let mut input = tokio::fs::File::open(&local)
             .await
-            .map_err(|error| io_error(&local, error))?;
-        if fingerprint(
-            &input
-                .metadata()
-                .await
-                .map_err(|error| io_error(&local, error))?,
-        )? != *entry
-        {
+            .map_err(|e| io_error(&local, e))?;
+        if fingerprint(&input.metadata().await.map_err(|e| io_error(&local, e))?)? != *entry {
             return Err(source_changed());
         }
-        let old_file = observed
-            .tree()
-            .get(path)
-            .and_then(|node| match node.body() {
-                NodeBody::File(file) => Some(file),
-                NodeBody::Dir { .. } => None,
-            });
-        let content = if let Some(old) = old_file {
-            if hash_file(&mut input).await? == old.content() {
-                old.clone()
-            } else {
-                input
-                    .rewind()
-                    .await
-                    .map_err(|error| io_error(&local, error))?;
-                fs.write_file(&mut input).await?
+        let old = remote.get(path).and_then(|node| match node.kind() {
+            NodeKind::File(f) => Some(f),
+            _ => None,
+        });
+        let identity = ContentId::calculate(&mut input).await?;
+        if old.is_none_or(|f| f.content_id() != identity) {
+            input.rewind().await.map_err(|e| io_error(&local, e))?;
+            let prepared = fs.data().prepare(&mut input).await?;
+            if prepared.content_id() != identity {
+                return Err(source_changed());
             }
-        } else {
-            fs.write_file(&mut input).await?
-        };
-        if content.content().length() != entry.length
-            || fingerprint(
-                &input
-                    .metadata()
-                    .await
-                    .map_err(|error| io_error(&local, error))?,
-            )? != *entry
+            planner.set_content(identities[path], prepared).await?;
+        }
+        if identity.length() != entry.length
+            || fingerprint(&input.metadata().await.map_err(|e| io_error(&local, e))?)? != *entry
         {
             return Err(source_changed());
         }
-        edit.replace_file(path, content)?;
     }
     if scan(source).await? != manifest {
         return Err(source_changed());
     }
-    fs.commit(observed, id, edit.finish()?).await
+    planner.finish()
 }
 
-/// Restore exactly the supplied immutable observation into a new directory.
-///
-/// The destination must not exist, and callers must prevent concurrent local
-/// mutation. Each file is verified and synced before being installed without
-/// replacement. Failure can leave directories and already verified files;
-/// incomplete temporary files are removed on ordinary error. The whole tree
-/// is not installed atomically, and a crash may leave temporary files.
-pub async fn restore_directory(fs: &Fs, observed: &Observation, destination: &Path) -> Result<()> {
+/// One-shot convenience. For an uncertain retry, retain prepare_directory's
+/// Transaction and call Fs::commit again; do not replan under the same identity.
+pub async fn publish_directory(
+    fs: &Fs,
+    observed: &Snapshot,
+    source: &Path,
+    id: CommitId,
+) -> Result<CommitOutcome> {
+    let request = prepare_directory(fs, observed, source, id).await?;
+    fs.commit(&request).await
+}
+
+/// Materialize names only for a whole-directory operation, not core publication.
+pub async fn directory_nodes(observed: &Snapshot) -> Result<BTreeMap<String, Node>> {
+    let mut nodes = BTreeMap::new();
+    let mut pending = vec![(String::new(), observed.root())];
+    while let Some((path, id)) = pending.pop() {
+        let node = observed
+            .node(id)
+            .await?
+            .ok_or_else(|| invalid("observed node disappeared"))?;
+        if node.is_directory() {
+            let mut token = None;
+            loop {
+                let page = observed.scan(id, token.as_ref(), 4096).await?;
+                for entry in page.entries {
+                    pending.push((join(&path, &entry.name), entry.node_id));
+                }
+                token = page.next;
+                if token.is_none() {
+                    break;
+                }
+            }
+        }
+        nodes.insert(path, node);
+    }
+    Ok(nodes)
+}
+
+/// Restore a pinned snapshot into a new destination, installing each verified
+/// file without replacement. Whole-directory installation is not atomic.
+pub async fn restore_directory(fs: &Fs, observed: &Snapshot, destination: &Path) -> Result<()> {
     check_filesystem(fs, observed)?;
-    for (_, node) in observed.tree().iter() {
-        if node.executable() && (cfg!(not(unix)) || matches!(node.body(), NodeBody::Dir { .. })) {
+    let nodes = directory_nodes(observed).await?;
+    for node in nodes.values() {
+        if node.executable() && (cfg!(not(unix)) || node.is_directory()) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
                 "restore directory",
@@ -150,28 +174,28 @@ pub async fn restore_directory(fs: &Fs, observed: &Observation, destination: &Pa
     }
     tokio::fs::create_dir(destination)
         .await
-        .map_err(|error| io_error(destination, error))?;
-    for (path, node) in observed.tree().iter() {
-        if path == &FsPath::root() {
+        .map_err(|e| io_error(destination, e))?;
+    for (path, node) in nodes {
+        if path.is_empty() {
             continue;
         }
-        let target = destination.join(path.as_str());
-        match node.body() {
-            NodeBody::Dir { .. } => tokio::fs::create_dir(&target)
+        let target = destination.join(&path);
+        match node.kind() {
+            NodeKind::Directory { .. } => tokio::fs::create_dir(&target)
                 .await
-                .map_err(|error| io_error(&target, error))?,
-            NodeBody::File(file) => {
+                .map_err(|e| io_error(&target, e))?,
+            NodeKind::File(file) => {
                 let staged = tempfile::NamedTempFile::new_in(
                     target.parent().expect("non-root file has a parent"),
                 )
-                .map_err(|error| io_error(&target, error))?;
+                .map_err(|e| io_error(&target, e))?;
                 let (output, temporary) = staged.into_parts();
                 let mut output = tokio::fs::File::from_std(output);
-                let copied = fs.read_file(file, &mut output).await;
-                let flushed = output
-                    .flush()
-                    .await
-                    .map_err(|error| io_error(&target, error));
+                let copied = fs
+                    .data()
+                    .read_range(file, 0..file.content_id().length(), &mut output)
+                    .await;
+                let flushed = output.flush().await.map_err(|e| io_error(&target, e));
                 if let Err(error) = copied.and(flushed) {
                     drop(output);
                     return Err(error);
@@ -179,24 +203,43 @@ pub async fn restore_directory(fs: &Fs, observed: &Observation, destination: &Pa
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
-                    let mode = if node.executable() { 0o700 } else { 0o600 };
                     output
-                        .set_permissions(std::fs::Permissions::from_mode(mode))
+                        .set_permissions(std::fs::Permissions::from_mode(if node.executable() {
+                            0o700
+                        } else {
+                            0o600
+                        }))
                         .await
-                        .map_err(|error| io_error(&target, error))?;
+                        .map_err(|e| io_error(&target, e))?;
                 }
-                output
-                    .sync_all()
-                    .await
-                    .map_err(|error| io_error(&target, error))?;
+                output.sync_all().await.map_err(|e| io_error(&target, e))?;
                 drop(output);
                 temporary
                     .persist_noclobber(&target)
-                    .map_err(|error| io_error(&target, error.error))?;
+                    .map_err(|e| io_error(&target, e.error))?;
             }
         }
     }
     Ok(())
+}
+fn check_filesystem(fs: &Fs, observed: &Snapshot) -> Result<()> {
+    if fs.filesystem() != observed.filesystem() || fs.root() != observed.root() {
+        return Err(invalid("observation belongs to another filesystem"));
+    }
+    Ok(())
+}
+fn split(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
+}
+fn join(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+fn invalid(message: &str) -> Error {
+    Error::new(ErrorKind::Invalid, "transfer directory", message)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -207,7 +250,7 @@ struct LocalEntry {
     modified: SystemTime,
 }
 
-async fn scan(root: &Path) -> Result<BTreeMap<FsPath, LocalEntry>> {
+async fn scan(root: &Path) -> Result<BTreeMap<String, LocalEntry>> {
     let metadata = tokio::fs::symlink_metadata(root)
         .await
         .map_err(|error| io_error(root, error))?;
@@ -219,8 +262,9 @@ async fn scan(root: &Path) -> Result<BTreeMap<FsPath, LocalEntry>> {
             "source is not a directory",
         ));
     }
-    let mut manifest = BTreeMap::from([(FsPath::root(), entry)]);
+    let mut manifest = BTreeMap::from([(String::new(), entry)]);
     let mut pending = vec![(root.to_path_buf(), String::new())];
+    let mut slots = BTreeSet::new();
     while let Some((directory, relative)) = pending.pop() {
         let mut entries = tokio::fs::read_dir(&directory)
             .await
@@ -237,18 +281,22 @@ async fn scan(root: &Path) -> Result<BTreeMap<FsPath, LocalEntry>> {
                     "non-UTF-8 filename",
                 )
             })?;
-            let path = FsPath::new(if relative.is_empty() {
+            let folded = yinyang_core::namespace::name_key(&name)?;
+            if !slots.insert((relative.clone(), folded)) {
+                return Err(invalid("case-folded name collision"));
+            }
+            let path = if relative.is_empty() {
                 name
             } else {
                 format!("{relative}/{name}")
-            })?;
+            };
             let local = entry.path();
             let metadata = tokio::fs::symlink_metadata(&local)
                 .await
                 .map_err(|error| io_error(&local, error))?;
             let fingerprint = fingerprint(&metadata)?;
             if fingerprint.directory {
-                pending.push((local, path.as_str().to_owned()));
+                pending.push((local, path.clone()));
             }
             manifest.insert(path, fingerprint);
         }
@@ -279,45 +327,6 @@ fn fingerprint(metadata: &std::fs::Metadata) -> Result<LocalEntry> {
             .modified()
             .map_err(|error| Error::new(ErrorKind::Io, "scan directory", error.to_string()))?,
     })
-}
-
-async fn hash_file(input: &mut tokio::fs::File) -> Result<ContentId> {
-    let mut buffer = vec![0; 256 * 1024];
-    let mut hasher = blake3::Hasher::new();
-    let mut length = 0_u64;
-    loop {
-        let count = input
-            .read(&mut buffer)
-            .await
-            .map_err(|error| Error::new(ErrorKind::Io, "hash local file", error.to_string()))?;
-        if count == 0 {
-            break;
-        }
-        length = length
-            .checked_add(count as u64)
-            .ok_or_else(source_changed)?;
-        hasher.update(&buffer[..count]);
-    }
-    Ok(ContentId::new(hasher.finalize().into(), length))
-}
-
-fn check_filesystem(fs: &Fs, observed: &Observation) -> Result<()> {
-    if observed
-        .tree()
-        .get(&FsPath::root())
-        .is_none_or(|root| root.id() != fs.root())
-    {
-        return Err(Error::new(
-            ErrorKind::Invalid,
-            "transfer directory",
-            "observation belongs to another filesystem",
-        ));
-    }
-    Ok(())
-}
-
-fn empty_file() -> File {
-    File::new(ContentId::new(blake3::hash(&[]).into(), 0), Vec::new()).expect("valid empty content")
 }
 
 fn source_changed() -> Error {

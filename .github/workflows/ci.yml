@@ -115,6 +115,7 @@ jobs:
       YINYANG_S3_REGION: us-east-1
       YINYANG_S3_ACCESS_KEY_ID: yinyang-test
       YINYANG_S3_SECRET_ACCESS_KEY: yinyang-test-only
+      YINYANG_STORAGE_PROFILE: minio
     steps:
       - uses: actions/checkout@v7
 

@@ -17,11 +17,21 @@
 
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
-
 use std::path::Path;
 use support::TestBackend;
-use yinyang::core::{CommitId, CommitOutcome, ErrorKind, Fs, NodeBody, Path as FsPath};
+use yinyang::core::{BackendProfile, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
 
+async fn filesystem(backend: &TestBackend) -> Fs {
+    Fs::create(backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap()
+}
+fn committed(outcome: CommitOutcome) -> yinyang::core::Receipt {
+    match outcome {
+        CommitOutcome::Committed(r) => r,
+        v => panic!("{v:?}"),
+    }
+}
 async fn source(root: &Path) {
     tokio::fs::create_dir(root).await.unwrap();
     tokio::fs::create_dir(root.join("empty-dir")).await.unwrap();
@@ -41,25 +51,30 @@ async fn round_trip_replacement_retry_and_pinned_restore() {
     let input = temp.path().join("source");
     source(&input).await;
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let first = fs.observe().await.unwrap();
-    let id = CommitId::generate();
-    assert_eq!(
-        yinyang::publish_directory(&fs, &first, &input, id)
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-    let pinned = fs.observe().await.unwrap();
-    let first_node = pinned
-        .tree()
-        .get(&FsPath::new("nested/hello").unwrap())
-        .unwrap();
-    let same_id = CommitId::generate();
-    yinyang::publish_directory(&fs, &pinned, &input, same_id)
+    let fs = filesystem(&backend).await;
+    let first = fs.observe_latest().await.unwrap();
+    let request = yinyang::prepare_directory(&fs, &first, &input, CommitId::generate())
         .await
         .unwrap();
-    assert_eq!(fs.observe().await.unwrap().tree(), pinned.tree());
+    let receipt = committed(fs.commit(&request).await.unwrap());
+    let pinned = fs.observe_latest().await.unwrap();
+    let first_node = pinned.resolve("nested/hello").await.unwrap().unwrap();
+    let before = backend.state.lock().unwrap().objects.len();
+    let same = yinyang::prepare_directory(&fs, &pinned, &input, CommitId::generate())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.state.lock().unwrap().objects.len(),
+        before,
+        "unchanged content must not upload"
+    );
+    committed(fs.commit(&same).await.unwrap());
+    assert_eq!(
+        yinyang::directory_nodes(&fs.observe_latest().await.unwrap())
+            .await
+            .unwrap(),
+        yinyang::directory_nodes(&pinned).await.unwrap()
+    );
     tokio::fs::write(input.join("nested/hello"), b"updated")
         .await
         .unwrap();
@@ -71,34 +86,29 @@ async fn round_trip_replacement_retry_and_pinned_restore() {
     tokio::fs::write(input.join("empty/new"), b"new")
         .await
         .unwrap();
-    let before = fs.observe().await.unwrap();
-    let commit = CommitId::generate();
-    yinyang::publish_directory(&fs, &before, &input, commit)
+    committed(
+        yinyang::publish_directory(
+            &fs,
+            &fs.observe_latest().await.unwrap(),
+            &input,
+            CommitId::generate(),
+        )
+        .await
+        .unwrap(),
+    );
+    let latest = fs.observe_latest().await.unwrap();
+    let next_node = latest.resolve("nested/hello").await.unwrap().unwrap();
+    assert_eq!(next_node.id(), first_node.id());
+    assert_eq!(next_node.generation(), first_node.generation() + 1);
+    assert!(latest.resolve("empty-dir").await.unwrap().is_none());
+    assert_eq!(
+        committed(fs.commit(&request).await.unwrap()),
+        receipt,
+        "retry original plan after local mutation"
+    );
+    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
         .await
         .unwrap();
-    let latest = fs.observe().await.unwrap();
-    let next_node = latest
-        .tree()
-        .get(&FsPath::new("nested/hello").unwrap())
-        .unwrap();
-    assert_eq!(next_node.id(), first_node.id());
-    assert_eq!(
-        next_node.generation().value(),
-        first_node.generation().value() + 1
-    );
-    assert!(
-        latest
-            .tree()
-            .get(&FsPath::new("empty-dir").unwrap())
-            .is_none()
-    );
-    assert_eq!(
-        yinyang::publish_directory(&fs, &latest, &temp.path().join("missing"), commit)
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { version: 3 }
-    );
-    let reopened = Fs::open(backend.operator()).await.unwrap();
     let old_output = temp.path().join("old");
     yinyang::restore_directory(&reopened, &pinned, &old_output)
         .await
@@ -128,42 +138,40 @@ async fn round_trip_replacement_retry_and_pinned_restore() {
 }
 
 #[tokio::test]
-async fn failed_upload_and_stale_publication_preserve_remote_state() {
+async fn failed_upload_and_stale_scope_preserve_remote_state() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");
     source(&input).await;
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let first = fs.observe().await.unwrap();
+    let fs = filesystem(&backend).await;
+    let first = fs.observe_latest().await.unwrap();
     backend.state.lock().unwrap().fail_data_close = true;
     assert_eq!(
-        yinyang::publish_directory(&fs, &first, &input, CommitId::generate())
+        yinyang::prepare_directory(&fs, &first, &input, CommitId::generate())
             .await
             .unwrap_err()
             .kind(),
         ErrorKind::Storage
     );
-    assert_eq!(fs.observe().await.unwrap(), first);
+    assert_eq!(
+        fs.observe_latest().await.unwrap().revision(),
+        first.revision()
+    );
     backend.state.lock().unwrap().fail_data_close = false;
-    let mut winner = first.edit();
-    winner
-        .create_dir(FsPath::new("winner").unwrap(), false)
-        .unwrap();
-    fs.commit(&first, CommitId::generate(), winner.finish().unwrap())
+    let request = yinyang::prepare_directory(&fs, &first, &input, CommitId::generate())
         .await
         .unwrap();
-    assert_eq!(
-        yinyang::publish_directory(&fs, &first, &input, CommitId::generate())
-            .await
-            .unwrap(),
-        CommitOutcome::Conflict { current: 1 }
-    );
+    let mut winner = Planner::new(&first, CommitId::generate());
+    winner.create_directory(fs.root(), "winner").await.unwrap();
+    committed(fs.commit(&winner.finish().unwrap()).await.unwrap());
+    assert_eq!(fs.commit(&request).await.unwrap(), CommitOutcome::Conflict);
     assert!(
-        fs.observe()
+        fs.observe_latest()
             .await
             .unwrap()
-            .tree()
-            .get(&FsPath::new("winner").unwrap())
+            .resolve("winner")
+            .await
+            .unwrap()
             .is_some()
     );
 }
@@ -174,23 +182,25 @@ async fn source_mutation_during_upload_prevents_publication() {
     let source = temp.path().join("file");
     std::fs::write(&source, b"original").unwrap();
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let observed = fs.observe().await.unwrap();
+    let fs = filesystem(&backend).await;
+    let observed = fs.observe_latest().await.unwrap();
     backend.state.lock().unwrap().file_to_change_on_data_close = Some(source);
     let error = yinyang::publish_directory(&fs, &observed, temp.path(), CommitId::generate())
         .await
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Invalid);
-    assert_eq!(error.operation(), "publish directory");
     assert!(error.message().contains("source changed"));
-    assert_eq!(fs.observe().await.unwrap(), observed);
+    assert_eq!(
+        fs.observe_latest().await.unwrap().revision(),
+        observed.revision()
+    );
 }
 
 #[tokio::test]
-async fn rejects_observations_from_another_filesystem_before_local_io() {
-    let first = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let second = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let observed = first.observe().await.unwrap();
+async fn rejects_foreign_observations_before_local_io() {
+    let first = filesystem(&TestBackend::default()).await;
+    let second = filesystem(&TestBackend::default()).await;
+    let observed = first.observe_latest().await.unwrap();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("absent");
     assert_eq!(
@@ -211,7 +221,7 @@ async fn rejects_observations_from_another_filesystem_before_local_io() {
 }
 
 #[tokio::test]
-async fn restore_never_overwrites_and_does_not_install_corrupt_bytes() {
+async fn restore_never_overwrites_or_installs_corrupt_content() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");
     tokio::fs::create_dir(&input).await.unwrap();
@@ -219,16 +229,18 @@ async fn restore_never_overwrites_and_does_not_install_corrupt_bytes() {
         .await
         .unwrap();
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    yinyang::publish_directory(
-        &fs,
-        &fs.observe().await.unwrap(),
-        &input,
-        CommitId::generate(),
-    )
-    .await
-    .unwrap();
-    let observed = fs.observe().await.unwrap();
+    let fs = filesystem(&backend).await;
+    committed(
+        yinyang::publish_directory(
+            &fs,
+            &fs.observe_latest().await.unwrap(),
+            &input,
+            CommitId::generate(),
+        )
+        .await
+        .unwrap(),
+    );
+    let observed = fs.observe_latest().await.unwrap();
     assert_eq!(
         yinyang::restore_directory(&fs, &observed, &input)
             .await
@@ -240,23 +252,15 @@ async fn restore_never_overwrites_and_does_not_install_corrupt_bytes() {
         tokio::fs::read(input.join("file")).await.unwrap(),
         b"original"
     );
-    let NodeBody::File(file) = observed
-        .tree()
-        .get(&FsPath::new("file").unwrap())
-        .unwrap()
-        .body()
-    else {
-        panic!()
-    };
-    let key = std::str::from_utf8(file.parts()[0].blob().as_bytes()).unwrap();
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .objects
-        .get_mut(key)
-        .unwrap()
-        .bytes[0] ^= 1;
+    {
+        let mut state = backend.state.lock().unwrap();
+        let object = state
+            .objects
+            .values_mut()
+            .find(|v| v.bytes.starts_with(b"original"))
+            .unwrap();
+        object.bytes[0] ^= 1;
+    }
     let output = temp.path().join("failed");
     assert_eq!(
         yinyang::restore_directory(&fs, &observed, &output)
@@ -281,16 +285,18 @@ async fn preserves_executable_files_and_rejects_symlinks() {
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    let fs = Fs::create(TestBackend::default().operator()).await.unwrap();
-    yinyang::publish_directory(
-        &fs,
-        &fs.observe().await.unwrap(),
-        &input,
-        CommitId::generate(),
-    )
-    .await
-    .unwrap();
-    let observed = fs.observe().await.unwrap();
+    let fs = filesystem(&TestBackend::default()).await;
+    committed(
+        yinyang::publish_directory(
+            &fs,
+            &fs.observe_latest().await.unwrap(),
+            &input,
+            CommitId::generate(),
+        )
+        .await
+        .unwrap(),
+    );
+    let observed = fs.observe_latest().await.unwrap();
     let output = temp.path().join("restored");
     yinyang::restore_directory(&fs, &observed, &output)
         .await
@@ -324,7 +330,10 @@ async fn preserves_executable_files_and_rejects_symlinks() {
             .kind(),
         ErrorKind::Unsupported
     );
-    assert_eq!(fs.observe().await.unwrap(), observed);
+    assert_eq!(
+        fs.observe_latest().await.unwrap().revision(),
+        observed.revision()
+    );
 }
 
 #[cfg(unix)]
@@ -333,36 +342,29 @@ async fn invalid_names_fail_before_upload() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("CON"), b"not portable").unwrap();
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let observed = fs.observe().await.unwrap();
+    let fs = filesystem(&backend).await;
+    let observed = fs.observe_latest().await.unwrap();
+    let count = backend.state.lock().unwrap().objects.len();
     assert_eq!(
-        yinyang::publish_directory(&fs, &observed, temp.path(), CommitId::generate())
+        yinyang::prepare_directory(&fs, &observed, temp.path(), CommitId::generate())
             .await
             .unwrap_err()
             .kind(),
         ErrorKind::Invalid
     );
-    assert!(
-        !backend
-            .state
-            .lock()
-            .unwrap()
-            .objects
-            .keys()
-            .any(|key| key.starts_with(".yinyang/data/"))
-    );
+    assert_eq!(backend.state.lock().unwrap().objects.len(), count);
 }
 
 #[test]
-fn cli_help_lists_the_transfer_commands() {
+fn cli_help_lists_commands() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
         .arg("--help")
         .output()
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for command in ["create", "publish", "restore", "status"] {
-        assert!(text.contains(command));
+    for name in ["create", "publish", "restore", "status", "receipt"] {
+        assert!(text.contains(name));
     }
 }
 
@@ -381,6 +383,7 @@ fn s3_cli_directory_round_trip() {
         std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
             .args(args)
             .env("YINYANG_S3_ROOT", &root)
+            .env("YINYANG_STORAGE_PROFILE", "minio")
             .output()
             .unwrap()
     };
@@ -396,9 +399,14 @@ fn s3_cli_directory_round_trip() {
     success(&["create"]);
     let id = uuid::Uuid::new_v4().to_string();
     success(&["publish", input.to_str().unwrap(), "--commit-id", &id]);
-    // Retrying the same operation does not require replacement permission.
-    success(&["publish", input.to_str().unwrap(), "--commit-id", &id]);
-    assert!(success(&["status"]).contains("version: 1"));
+    // Querying the original receipt does not rescan or republish local files.
+    assert!(success(&["receipt", &id]).contains(&id));
+    assert!(
+        !run(&["publish", input.to_str().unwrap(), "--commit-id", &id])
+            .status
+            .success()
+    );
+    assert!(success(&["status"]).contains("files: 3"));
     assert!(!run(&["publish", input.to_str().unwrap()]).status.success());
     let output = temp.path().join("restored");
     success(&["restore", output.to_str().unwrap()]);
@@ -420,5 +428,5 @@ fn s3_cli_directory_round_trip() {
         b"updated"
     );
     assert!(!second.join("empty").exists());
-    assert!(success(&["status"]).contains("version: 2"));
+    assert!(success(&["status"]).contains("files: 2"));
 }
