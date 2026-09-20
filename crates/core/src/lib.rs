@@ -15,19 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! YinYang Format values, OpenDAL persistence, and publication state machine.
+//! Indexed transactional filesystem and authenticated immutable content.
 
-mod content;
 pub mod data;
 mod error;
-mod filesystem;
 mod identity;
-mod persistence;
-mod publication;
-mod version;
+mod index;
+pub mod namespace;
+pub mod object;
+pub mod transaction;
 
+pub use data::{ContentDescriptor, ContentId, DataStore, PreparedContent};
 pub use error::{Error, ErrorKind, Result};
-pub use filesystem::{BlobRef, ContentId, File, FilePart, Node, NodeBody, Path, Tree, TreeEdit};
-pub use identity::{CommitId, Generation, NodeId};
-pub use publication::{CommitOutcome, Fs, Observation};
-pub use version::FsVersion;
+pub use identity::{CommitId, NodeId};
+pub use namespace::{DirectoryEntry, Link, Node, NodeKind};
+pub use object::{
+    BackendProfile, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot,
+};
+pub use transaction::{Planner, Transaction};
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
