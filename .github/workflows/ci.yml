@@ -19,8 +19,6 @@ name: Apache OpenDAL™ YinYang CI
 
 on:
   pull_request:
-    branches:
-      - main
 
 permissions:
   contents: read

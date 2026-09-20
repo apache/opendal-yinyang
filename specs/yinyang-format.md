@@ -75,6 +75,7 @@ YinYang owns these paths below the operator root:
 ```text
 .yinyang/head
 .yinyang/versions/<object-id>
+.yinyang/data/<object-id>
 ```
 
 `<object-id>` is a generated UUID encoded as 32 lowercase hexadecimal
@@ -88,6 +89,34 @@ The head is created with create-if-absent and replaced with ETag if-match. A
 condition mismatch is a publication conflict. Missing, truncated,
 length-mismatched, or unverifiable referenced objects are corrupt data. Direct
 external writes under `.yinyang/` are outside the format contract.
+
+## File content IO
+
+`Fs::write_file` consumes an asynchronous byte source and returns a `File`
+only after the backend acknowledges the immutable data object. It writes raw
+bytes at a fresh UUID key while computing BLAKE3 and length with bounded
+buffers. A non-empty file has one part spanning that object; an empty file
+has the BLAKE3 digest of empty bytes and no parts or object. A failed upload
+returns no file and attempts to abort the writer. Cancellation or an ambiguous
+close failure may leave unreachable data, never a published namespace entry.
+
+`Fs::read_file` streams into a caller-owned destination. Each part reads and
+verifies its entire source blob, including bytes outside the selected range;
+the assembled logical file digest is also verified. Repeated references may
+read the same blob again. Memory use does not grow with file size. Missing
+data, invalid data keys, length mismatches, and digest mismatches are `Corrupt`;
+other backend failures are `Storage`, and source/destination IO failures are
+`Io`. Bytes delivered before successful completion are provisional. Callers
+must discard them on failure and own destination flushing and durability.
+
+Before publishing, `Fs::commit` reads and verifies each new or changed file
+representation. Unchanged file bodies under the same node identity need no
+new read. This includes files constructed by callers rather than uploaded
+through `write_file`, and prevents publication of incomplete references. The
+initial implementation trades an extra read of new data for this guarantee.
+The guarantee assumes immutable data is not externally modified or deleted.
+Head conflicts can leave complete but unreachable uploads. There is no garbage
+collection yet; callers must not delete objects referenced by older versions.
 
 ## Persistent encoding
 

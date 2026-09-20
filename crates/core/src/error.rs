@@ -25,6 +25,7 @@ pub enum ErrorKind {
     NotFound,
     Unsupported,
     Storage,
+    Io,
 }
 
 /// Error returned by the YinYang Format core.
@@ -70,6 +71,10 @@ impl Error {
 
     pub(crate) fn from_storage(operation: &'static str, error: opendal::Error) -> Self {
         Self::new(ErrorKind::Storage, operation, error.to_string())
+    }
+
+    pub(crate) fn from_io(operation: &'static str, error: std::io::Error) -> Self {
+        Self::new(ErrorKind::Io, operation, error.to_string())
     }
 }
 

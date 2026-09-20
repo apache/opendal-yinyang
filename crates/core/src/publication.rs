@@ -52,7 +52,7 @@ pub enum CommitOutcome {
 #[derive(Debug)]
 pub struct Fs {
     root: NodeId,
-    operator: opendal::Operator,
+    pub(crate) operator: opendal::Operator,
 }
 
 impl Fs {
@@ -137,6 +137,8 @@ impl Fs {
             .version
             .tree()
             .validate_successor(version.tree(), self.root)?;
+        self.verify_new_files(observed.tree(), version.tree())
+            .await?;
         let number = version.number();
         let blob = write_version(&self.operator, &version).await?;
         match replace_head(&self.operator, &observed.head, &blob).await {
