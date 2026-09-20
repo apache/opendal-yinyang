@@ -5,6 +5,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | Specification | Status |
 | --- | --- |
 | [YinYang Format core](yinyang-format.md) | Current implementation: materialized versions and OpenDAL head publication. |
+| [Authenticated content profile](content-profile.md) | Experimental range verification and trusted preparation; independent of publication authority. |
 | [Transactional filesystem](transactional-filesystem.md) | Target contract: shared filesystem and content semantics with object-storage and metadata-service publication. Not implemented; persistent encoding decisions remain open. |
 
 A specification describes the currently supported behavior, APIs, wire formats,
