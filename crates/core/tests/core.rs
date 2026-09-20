@@ -535,6 +535,23 @@ async fn indexed_prepared_commit_does_not_read_data_and_reopen_retains_history()
     let reopened = ObjectFs::open(backend.operator(), BackendProfile::Minio)
         .await
         .unwrap();
+    let saved_revision = yinyang_core::Revision::from_bytes(old.revision().to_bytes());
+    assert_eq!(
+        reopened
+            .observe_revision(saved_revision)
+            .await
+            .unwrap()
+            .revision(),
+        old.revision()
+    );
+    assert_eq!(
+        reopened
+            .observe_revision(yinyang_core::Revision::from_bytes([0; 24]))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
     assert_eq!(committed(reopened.commit(&request).await.unwrap()), receipt);
     let current = reopened.observe_latest().await.unwrap();
     assert!(matches!(

@@ -54,6 +54,14 @@ impl Revision {
         bytes[8..].copy_from_slice(&self.nonce);
         bytes
     }
+    /// Decode an untrusted locator. observe_revision checks that the token
+    /// identifies a retained snapshot in this filesystem's authority lineage.
+    pub fn from_bytes(bytes: [u8; 24]) -> Self {
+        Self {
+            sequence: u64::from_be_bytes(bytes[..8].try_into().expect("fixed revision prefix")),
+            nonce: bytes[8..].try_into().expect("fixed revision nonce"),
+        }
+    }
     fn wire(self) -> RevisionWire {
         (self.sequence, self.nonce)
     }
