@@ -32,7 +32,7 @@ const FILE_MAGIC: [u8; 8] = *b"YYFILE02";
 const NODE_MAGIC: [u8; 8] = *b"YYHASH02";
 const MAX_NODE_BYTES: u32 = 512;
 
-type RefWire = ([u8; 16], u64, u32, [u8; 32]);
+pub(crate) type RefWire = ([u8; 16], u64, u32, [u8; 32]);
 type ChildWire = ([u8; 32], RefWire);
 type FileWire = ([u8; 8], [u8; 16], u64, Option<ChildWire>);
 
@@ -486,6 +486,24 @@ impl DataStore {
         }
     }
 
+    pub(crate) fn published(&self, descriptor: ContentDescriptor) -> Result<PreparedContent> {
+        self.check(&descriptor)?;
+        Ok(self.seal(descriptor))
+    }
+
+    pub(crate) async fn put_metadata(&self, bytes: &[u8]) -> Result<PackedRef> {
+        let mut pack = Pack::new(self).await?;
+        let reference = match pack.append(bytes.to_vec()).await {
+            Ok(reference) => reference,
+            Err(error) => {
+                pack.abort().await;
+                return Err(error);
+            }
+        };
+        pack.finish().await?;
+        Ok(reference)
+    }
+
     pub(crate) async fn read_extent(&self, reference: &PackedRef, maximum: u32) -> Result<Vec<u8>> {
         let end = reference
             .offset
@@ -528,10 +546,10 @@ pub(crate) struct PackedRef {
 }
 
 impl PackedRef {
-    fn wire(&self) -> RefWire {
+    pub(crate) fn wire(&self) -> RefWire {
         (self.object, self.offset, self.length, self.digest)
     }
-    fn from_wire((object, offset, length, digest): RefWire) -> Result<Self> {
+    pub(crate) fn from_wire((object, offset, length, digest): RefWire) -> Result<Self> {
         if length == 0 || offset.checked_add(length as u64).is_none() {
             return Err(corrupt("invalid extent"));
         }

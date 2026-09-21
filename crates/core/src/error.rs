@@ -23,6 +23,7 @@ pub enum ErrorKind {
     Invalid,
     Corrupt,
     NotFound,
+    AlreadyExists,
     Unsupported,
     Storage,
     Io,

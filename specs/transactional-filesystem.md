@@ -1,8 +1,10 @@
 # Transactional Filesystem
 
-**Status: target contract, not implemented.** The persistent format profile is
-not frozen; [Open decisions](#open-decisions) identifies the remaining choices.
-The [current core specification](yinyang-format.md) describes existing behavior.
+**Status: shared target contract; object-storage binding implemented experimentally.**
+The [current object profile](yinyang-format.md) and [content profile](content-profile.md)
+describe implemented APIs and encodings. Metadata-service publication remains
+unimplemented. The persistent profile is not frozen for interoperable release;
+[Open decisions](#open-decisions) identifies the remaining evaluation work.
 
 ## Scope and cost model
 

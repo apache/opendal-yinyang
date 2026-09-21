@@ -48,8 +48,8 @@ clap = { version = "4.6.5", features = ["derive"] }
 futures-util = "0.3"
 opendal = { version = "0.58.2", default-features = false }
 tokio = { version = "1", features = ["io-util"] }
-unicode-casefold = "0.2"
-unicode-normalization = "0.1"
+unicode-casefold = "=0.2.0"
+unicode-normalization = "=0.1.25"
 uuid = { version = "1", features = ["v4"] }
 which = { version = "8.0.5" }
 

@@ -15,335 +15,655 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+mod support;
+use std::sync::Arc;
+use support::*;
+use yinyang_core::{CommitId, ErrorKind, NodeId};
 
-use opendal::raw::*;
-use opendal::services::Memory;
-use opendal::{Buffer, BytesRange, EntryMode, Metadata, OperationContext, Operator};
-use yinyang_core::{
-    BlobRef, CommitId, CommitOutcome, ContentId, ErrorKind, File, FilePart, Fs, Generation, Node,
-    NodeBody, NodeId, Path, Tree,
-};
+use yinyang_core::namespace::NodeKind as IndexedKind;
+use yinyang_core::object::{BackendProfile, ObjectFs, Outcome};
+use yinyang_core::transaction::Planner;
 
-#[derive(Clone, Debug, Default)]
-struct TestBackend {
-    state: Arc<Mutex<TestState>>,
+#[tokio::test]
+async fn indexed_disjoint_files_and_fenced_delayed_attempts() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut seed = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let empty = fs.data().prepare(&mut b"".as_slice()).await.unwrap();
+    let a = seed
+        .create_file(fs.root(), "a", empty.clone(), false)
+        .await
+        .unwrap();
+    let b = seed
+        .create_file(fs.root(), "b", empty, false)
+        .await
+        .unwrap();
+    let parent = seed.create_directory(fs.root(), "parent").await.unwrap();
+    committed(fs.commit(&seed.finish().unwrap()).await.unwrap());
+    let old = fs.observe_latest().await.unwrap();
+    let mut left = Planner::new(&old, CommitId::generate());
+    left.set_executable(a, true).await.unwrap();
+    let mut right = Planner::new(&old, CommitId::generate());
+    right.set_executable(b, true).await.unwrap();
+    let left = left.finish().unwrap();
+    let right = right.finish().unwrap();
+    backend.state.lock().unwrap().head_barrier = Some((Arc::new(tokio::sync::Barrier::new(2)), 2));
+    let (left, right) = tokio::join!(fs.commit(&left), fs.commit(&right));
+    committed(left.unwrap());
+    committed(right.unwrap());
+    let old = fs.observe_latest().await.unwrap();
+    let mut remove = Planner::new(&old, CommitId::generate());
+    remove.remove(parent).await.unwrap();
+    let remove = remove.finish().unwrap();
+    backend.state.lock().unwrap().delay_next_head = true;
+    assert_eq!(
+        fs.commit(&remove).await.unwrap(),
+        Outcome::Unknown(remove.id())
+    );
+    let mut create = Planner::new(&old, CommitId::generate());
+    create.create_directory(parent, "child").await.unwrap();
+    committed(fs.commit(&create.finish().unwrap()).await.unwrap());
+    assert_eq!(fs.commit(&remove).await.unwrap(), Outcome::Conflict);
+    let mut state = backend.state.lock().unwrap();
+    let (_, pending_condition) = state.pending_head.take().unwrap();
+    assert_ne!(
+        pending_condition,
+        Some(state.objects[".yinyang/head"].etag.clone())
+    );
 }
 
-#[derive(Debug, Default)]
-struct TestState {
-    objects: BTreeMap<String, StoredObject>,
-    next_revision: u64,
-    fail_after_head_write: bool,
-    stat_calls: u64,
-    version_write_calls: u64,
-    fail_data_close: bool,
-    data_aborts: u64,
-    data_read_bytes: u64,
-    data_reads: u64,
-    corrupt_pack_on_close: bool,
+#[tokio::test]
+async fn indexed_creation_recovers_lost_ack_and_digest_ignores_packing() {
+    let backend = TestBackend::default();
+    backend.fail_next_head_write_after_success();
+    let fs = object_fs(&backend).await;
+    let snapshot = fs.observe_latest().await.unwrap();
+    let id = CommitId::generate();
+    let mut left = Planner::new(&snapshot, id);
+    left.create_file(
+        fs.root(),
+        "file",
+        fs.data().prepare(&mut b"same".as_slice()).await.unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut right = Planner::new(&snapshot, id);
+    right
+        .create_file(
+            fs.root(),
+            "file",
+            fs.data().prepare(&mut b"same".as_slice()).await.unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    let left = left.finish().unwrap();
+    let right = right.finish().unwrap();
+    assert_eq!(left.digest(), right.digest());
+    let first = committed(fs.commit(&left).await.unwrap());
+    assert_eq!(committed(fs.commit(&right).await.unwrap()), first);
 }
 
-#[derive(Clone, Debug)]
-struct StoredObject {
-    bytes: Vec<u8>,
-    etag: String,
+#[tokio::test]
+async fn indexed_costs_follow_changed_paths_not_namespace_or_history_size() {
+    async fn measure(nodes: usize, history: usize) -> (u64, u64, usize) {
+        let backend = TestBackend::default();
+        let fs = object_fs(&backend).await;
+        let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        let anchor = plan.create_directory(fs.root(), "anchor").await.unwrap();
+        for i in 0..nodes {
+            plan.create_directory(anchor, &format!("child-{i:04}"))
+                .await
+                .unwrap();
+        }
+        committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+        for _ in 0..history {
+            let request = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate())
+                .finish()
+                .unwrap();
+            committed(fs.commit(&request).await.unwrap());
+        }
+        let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        plan.rename(anchor, fs.root(), "renamed").await.unwrap();
+        let request = plan.finish().unwrap();
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.written_bytes = 0;
+            state.data_read_bytes = 0;
+            state.read_paths.clear();
+        }
+        committed(fs.commit(&request).await.unwrap());
+        let state = backend.state.lock().unwrap();
+        (
+            state.written_bytes,
+            state.data_read_bytes,
+            state.read_paths.len(),
+        )
+    }
+    let small = measure(32, 16).await;
+    let large = measure(1024, 128).await;
+    println!(
+        "fixed directory rename: small={small:?}, large={large:?} (written bytes, read bytes, reads)"
+    );
+    assert!(large.0 < small.0 * 4);
+    assert!(large.1 < small.1 * 4);
+    assert!(large.2 < small.2 * 3);
 }
 
-impl TestBackend {
-    fn operator(&self) -> Operator {
-        self.operator_with_streaming_write(true)
+#[tokio::test]
+async fn indexed_deep_paths_names_and_invalid_profiles() {
+    use yinyang_core::namespace::name_key;
+    for name in [
+        "",
+        "..",
+        "a/b",
+        "a\\b",
+        "NUL.txt",
+        "LPT².log",
+        "bad.",
+        "e\u{0301}",
+    ] {
+        assert!(name_key(name).is_err(), "{name:?}");
     }
-
-    fn operator_without_streaming_write(&self) -> Operator {
-        self.operator_with_streaming_write(false)
+    assert_eq!(name_key("Straße").unwrap(), name_key("STRASSE").unwrap());
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let mut parent = fs.root();
+    let mut path = Vec::new();
+    for i in 0..24 {
+        let name = format!("{i:02}{}", "a".repeat(200));
+        parent = plan.create_directory(parent, &name).await.unwrap();
+        path.push(name);
     }
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+    assert!(path.join("/").len() > 4096);
+    assert_eq!(
+        fs.observe_latest()
+            .await
+            .unwrap()
+            .resolve(&path.join("/"))
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        parent
+    );
+    assert_eq!(
+        ObjectFs::open(
+            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
+            BackendProfile::Minio
+        )
+        .await
+        .unwrap_err()
+        .kind(),
+        ErrorKind::Unsupported
+    );
+    let legacy = TestBackend::default();
+    legacy.state.lock().unwrap().objects.insert(
+        ".yinyang/head".into(),
+        StoredObject {
+            bytes: b"YYHEAD01legacy".to_vec(),
+            etag: "legacy".into(),
+        },
+    );
+    assert_eq!(
+        ObjectFs::create(legacy.operator(), BackendProfile::Minio)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    assert_eq!(legacy.state.lock().unwrap().objects.len(), 1);
+}
 
-    fn operator_with_streaming_write(&self, write_can_multi: bool) -> Operator {
-        let service: Servicer = Arc::new(TestService {
-            state: self.state.clone(),
-            write_can_multi,
-        });
-        Operator::from_parts(OperationContext::default(), service)
+#[tokio::test]
+#[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
+async fn s3_indexed_publication_and_reopen() {
+    opendal::install_default();
+    let config = std::env::vars()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("YINYANG_S3_")
+                .filter(|k| *k != "PROFILE")
+                .map(|key| (key.to_ascii_lowercase(), value))
+        })
+        .collect::<Vec<_>>();
+    let operator = opendal::Operator::via_iter("s3", config).unwrap();
+    let fs = ObjectFs::create(operator.clone(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    let old = fs.observe_latest().await.unwrap();
+    let bytes = vec![37; 12 * 1024 * 1024 + 17];
+    let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
+    let changed = fs
+        .data()
+        .overwrite_prepared(&prepared, 65534..65538, b"test")
+        .await
+        .unwrap();
+    let mut plan = Planner::new(&old, CommitId::generate());
+    let name = format!("file-{}", uuid::Uuid::new_v4().simple());
+    let id = plan
+        .create_file(fs.root(), &name, changed, false)
+        .await
+        .unwrap();
+    let request = plan.finish().unwrap();
+    let receipt = committed(fs.commit(&request).await.unwrap());
+    let reopened = ObjectFs::open(operator, BackendProfile::Minio)
+        .await
+        .unwrap();
+    assert_eq!(committed(reopened.commit(&request).await.unwrap()), receipt);
+    let file = reopened
+        .observe_latest()
+        .await
+        .unwrap()
+        .content(id)
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    reopened
+        .data()
+        .read_range(file.descriptor(), 65533..65539, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, b"%test%");
+    assert!(
+        reopened
+            .observe_revision(old.revision())
+            .await
+            .unwrap()
+            .node(id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn object_fs(backend: &TestBackend) -> ObjectFs {
+    ObjectFs::create(backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap()
+}
+fn committed(outcome: Outcome) -> yinyang_core::object::Receipt {
+    match outcome {
+        Outcome::Committed(receipt) => receipt,
+        other => panic!("expected committed, got {other:?}"),
     }
+}
 
-    fn fail_next_head_write_after_success(&self) {
-        self.state.lock().unwrap().fail_after_head_write = true;
-    }
+#[tokio::test]
+async fn indexed_disjoint_creates_survive_cas_race_and_preserve_snapshots() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let old = fs.observe_latest().await.unwrap();
+    let mut left = Planner::new(&old, CommitId::generate());
+    let a = left.create_directory(fs.root(), "a").await.unwrap();
+    let left = left.finish().unwrap();
+    let mut right = Planner::new(&old, CommitId::generate());
+    let b = right.create_directory(fs.root(), "b").await.unwrap();
+    let right = right.finish().unwrap();
+    backend.state.lock().unwrap().head_barrier = Some((Arc::new(tokio::sync::Barrier::new(2)), 2));
+    let (l, r) = tokio::join!(fs.commit(&left), fs.commit(&right));
+    let l = committed(l.unwrap());
+    let r = committed(r.unwrap());
+    assert_ne!(l.cursor, r.cursor);
+    let latest = fs.observe_latest().await.unwrap();
+    assert_eq!(
+        latest
+            .lookup(fs.root(), "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_id,
+        a
+    );
+    assert_eq!(
+        latest
+            .lookup(fs.root(), "b")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_id,
+        b
+    );
+    assert!(old.lookup(fs.root(), "a").await.unwrap().is_none());
+    assert_eq!(
+        fs.observe_revision(old.revision())
+            .await
+            .unwrap()
+            .scan(fs.root(), None, 10)
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        0
+    );
+    assert_eq!(committed(fs.commit(&left).await.unwrap()), l);
+    let mut different = Planner::new(&old, left.id());
+    different
+        .create_directory(fs.root(), "different")
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.commit(&different.finish().unwrap())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Invalid
+    );
+    assert_eq!(backend.state.lock().unwrap().head_stat_calls, 0);
+}
 
-    fn stat_calls(&self) -> u64 {
-        self.state.lock().unwrap().stat_calls
-    }
+#[tokio::test]
+async fn indexed_conflicts_protect_content_emptiness_ancestry_and_scans() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let old = fs.observe_latest().await.unwrap();
+    let mut seed = Planner::new(&old, CommitId::generate());
+    let a = seed.create_directory(fs.root(), "a").await.unwrap();
+    let b = seed.create_directory(fs.root(), "b").await.unwrap();
+    let bytes = fs.data().prepare(&mut b"first".as_slice()).await.unwrap();
+    let file = seed
+        .create_file(fs.root(), "file", bytes, false)
+        .await
+        .unwrap();
+    committed(fs.commit(&seed.finish().unwrap()).await.unwrap());
+    let old = fs.observe_latest().await.unwrap();
+    let mut remove = Planner::new(&old, CommitId::generate());
+    remove.remove(a).await.unwrap();
+    let remove = remove.finish().unwrap();
+    let mut insert = Planner::new(&old, CommitId::generate());
+    insert.create_directory(a, "child").await.unwrap();
+    committed(fs.commit(&insert.finish().unwrap()).await.unwrap());
+    assert_eq!(fs.commit(&remove).await.unwrap(), Outcome::Conflict);
+    let old = fs.observe_latest().await.unwrap();
+    let mut move_a = Planner::new(&old, CommitId::generate());
+    move_a.rename(a, b, "a").await.unwrap();
+    let mut move_b = Planner::new(&old, CommitId::generate());
+    move_b.rename(b, a, "b").await.unwrap();
+    committed(fs.commit(&move_a.finish().unwrap()).await.unwrap());
+    assert_eq!(
+        fs.commit(&move_b.finish().unwrap()).await.unwrap(),
+        Outcome::Conflict
+    );
+    let old = fs.observe_latest().await.unwrap();
+    let mut l = Planner::new(&old, CommitId::generate());
+    l.set_content(
+        file,
+        fs.data().prepare(&mut b"left".as_slice()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut r = Planner::new(&old, CommitId::generate());
+    r.set_content(
+        file,
+        fs.data().prepare(&mut b"right".as_slice()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    committed(fs.commit(&l.finish().unwrap()).await.unwrap());
+    assert_eq!(
+        fs.commit(&r.finish().unwrap()).await.unwrap(),
+        Outcome::Conflict
+    );
+    let old = fs.observe_latest().await.unwrap();
+    let mut scan = Planner::new(&old, CommitId::generate());
+    scan.scan(fs.root()).await.unwrap();
+    let mut create = Planner::new(&old, CommitId::generate());
+    create.create_directory(fs.root(), "phantom").await.unwrap();
+    committed(fs.commit(&create.finish().unwrap()).await.unwrap());
+    assert_eq!(
+        fs.commit(&scan.finish().unwrap()).await.unwrap(),
+        Outcome::Conflict
+    );
+}
 
-    fn reset_version_write_calls(&self) {
-        self.state.lock().unwrap().version_write_calls = 0;
-    }
+#[tokio::test]
+async fn indexed_batch_receipts_generations_and_physical_repacking() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let old = fs.observe_latest().await.unwrap();
+    let mut seed = Planner::new(&old, CommitId::generate());
+    let file = seed
+        .create_file(
+            fs.root(),
+            "file",
+            fs.data().prepare(&mut b"hello".as_slice()).await.unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    committed(fs.commit(&seed.finish().unwrap()).await.unwrap());
+    let old = fs.observe_latest().await.unwrap();
+    let mut repack = Planner::new(&old, CommitId::generate());
+    repack
+        .set_content(
+            file,
+            fs.data().prepare(&mut b"hello".as_slice()).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut edit = Planner::new(&old, CommitId::generate());
+    edit.set_content(
+        file,
+        fs.data().prepare(&mut b"world".as_slice()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut disjoint = Planner::new(&old, CommitId::generate());
+    disjoint.create_directory(fs.root(), "dir").await.unwrap();
+    let requests = vec![
+        repack.finish().unwrap(),
+        edit.finish().unwrap(),
+        disjoint.finish().unwrap(),
+    ];
+    let results = fs.commit_batch(&requests).await.unwrap();
+    let receipts = results.into_iter().map(committed).collect::<Vec<_>>();
+    assert!(
+        receipts
+            .windows(2)
+            .all(|p| p[0].cursor.revision == p[1].cursor.revision
+                && p[0].cursor.ordinal + 1 == p[1].cursor.ordinal)
+    );
+    let latest = fs.observe_latest().await.unwrap();
+    assert_eq!(latest.node(file).await.unwrap().unwrap().generation(), 2);
+    assert_eq!(old.node(file).await.unwrap().unwrap().generation(), 1);
+    let mut noop = Planner::new(&latest, CommitId::generate());
+    noop.set_executable(file, true).await.unwrap();
+    noop.set_executable(file, false).await.unwrap();
+    committed(fs.commit(&noop.finish().unwrap()).await.unwrap());
+    assert_eq!(
+        fs.observe_latest()
+            .await
+            .unwrap()
+            .node(file)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation(),
+        2
+    );
+    let changes = latest.changes(None, 20).await.unwrap();
+    assert_eq!(changes.len(), 4);
+    assert_eq!(changes[2].receipt, receipts[1]);
+}
 
-    fn version_write_calls(&self) -> u64 {
-        self.state.lock().unwrap().version_write_calls
-    }
-
-    fn version_objects(&self) -> Vec<(String, Vec<u8>)> {
-        self.state
+#[tokio::test]
+async fn indexed_prepared_commit_does_not_read_data_and_reopen_retains_history() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let before = backend
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let prepared = fs
+        .data()
+        .prepare(&mut vec![11; 2 * 1024 * 1024].as_slice())
+        .await
+        .unwrap();
+    let data_keys = backend
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .keys()
+        .filter(|k| !before.contains(*k))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let old = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&old, CommitId::generate());
+    let id = plan
+        .create_file(fs.root(), "file", prepared, false)
+        .await
+        .unwrap();
+    backend.state.lock().unwrap().read_paths.clear();
+    let request = plan.finish().unwrap();
+    let receipt = committed(fs.commit(&request).await.unwrap());
+    assert!(
+        !backend
+            .state
             .lock()
             .unwrap()
-            .objects
+            .read_paths
             .iter()
-            .filter(|(path, _)| path.starts_with(".yinyang/versions/"))
-            .map(|(path, object)| (path.clone(), object.bytes.clone()))
-            .collect()
-    }
-
-    fn remove_current_version(&self) {
-        self.state
-            .lock()
+            .any(|k| data_keys.contains(k))
+    );
+    let reopened = ObjectFs::open(backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    let saved_revision = yinyang_core::Revision::from_bytes(old.revision().to_bytes());
+    assert_eq!(
+        reopened
+            .observe_revision(saved_revision)
+            .await
             .unwrap()
-            .objects
-            .retain(|path, _| !path.starts_with(".yinyang/versions/"));
-    }
-
-    fn corrupt_current_version(&self) {
-        let mut state = self.state.lock().unwrap();
-        let object = state
-            .objects
-            .iter_mut()
-            .find_map(|(path, object)| path.starts_with(".yinyang/versions/").then_some(object))
-            .expect("the test filesystem has a version object");
-        object.bytes[0] ^= 1;
-    }
-
-    fn corrupt_head(&self) {
-        let mut state = self.state.lock().unwrap();
-        let object = state
-            .objects
-            .get_mut(".yinyang/head")
-            .expect("the test filesystem has a head");
-        let checksum = object
-            .bytes
-            .last_mut()
-            .expect("the head contains a checksum");
-        *checksum ^= 1;
-    }
+            .revision(),
+        old.revision()
+    );
+    assert_eq!(
+        reopened
+            .observe_revision(yinyang_core::Revision::from_bytes([0; 24]))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert_eq!(committed(reopened.commit(&request).await.unwrap()), receipt);
+    let current = reopened.observe_latest().await.unwrap();
+    assert!(matches!(
+        current.node(id).await.unwrap().unwrap().kind(),
+        IndexedKind::File(_)
+    ));
+    assert!(
+        reopened
+            .observe_revision(old.revision())
+            .await
+            .unwrap()
+            .node(id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
-#[derive(Debug)]
-struct TestService {
-    state: Arc<Mutex<TestState>>,
-    write_can_multi: bool,
-}
-
-impl Service for TestService {
-    type Reader = TestReader;
-    type Writer = TestWriter;
-    type Lister = ();
-    type Deleter = ();
-    type Copier = ();
-
-    fn info(&self) -> ServiceInfo {
-        ServiceInfo::with_scheme("yinyang-test")
-    }
-
-    fn capability(&self) -> opendal::Capability {
-        opendal::Capability {
-            stat: true,
-            read: true,
-            write: true,
-            write_can_multi: self.write_can_multi,
-            write_can_empty: true,
-            write_with_if_match: true,
-            write_with_if_not_exists: true,
-            shared: true,
-            ..Default::default()
-        }
-    }
-
-    async fn create_dir(
-        &self,
-        _: &OperationContext,
-        _: &str,
-        _: OpCreateDir,
-    ) -> opendal::Result<RpCreateDir> {
-        Err(unsupported())
-    }
-
-    async fn stat(&self, _: &OperationContext, path: &str, _: OpStat) -> opendal::Result<RpStat> {
-        let mut state = self.state.lock().unwrap();
-        state.stat_calls += 1;
-        let object = state.objects.get(path).ok_or_else(not_found)?;
-        Ok(RpStat::new(metadata(object)))
-    }
-
-    fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> opendal::Result<Self::Reader> {
-        let state = self.state.lock().unwrap();
-        let object = state.objects.get(path).cloned().ok_or_else(not_found)?;
-        Ok(TestReader {
-            object,
-            state: self.state.clone(),
-            data: path.contains("/packs/"),
-        })
-    }
-
-    fn write(
-        &self,
-        _: &OperationContext,
-        path: &str,
-        args: OpWrite,
-    ) -> opendal::Result<Self::Writer> {
-        Ok(TestWriter {
-            state: self.state.clone(),
-            path: path.to_owned(),
-            if_match: args.if_match().map(str::to_owned),
-            if_not_exists: args.if_not_exists(),
-            bytes: Vec::new(),
-        })
-    }
-
-    fn delete(&self, _: &OperationContext) -> opendal::Result<Self::Deleter> {
-        Err(unsupported())
-    }
-
-    fn list(&self, _: &OperationContext, _: &str, _: OpList) -> opendal::Result<Self::Lister> {
-        Err(unsupported())
-    }
-
-    fn copy(
-        &self,
-        _: &OperationContext,
-        _: &str,
-        _: &str,
-        _: OpCopy,
-        _: OpCopier,
-    ) -> opendal::Result<Self::Copier> {
-        Err(unsupported())
-    }
-
-    async fn rename(
-        &self,
-        _: &OperationContext,
-        _: &str,
-        _: &str,
-        _: OpRename,
-    ) -> opendal::Result<RpRename> {
-        Err(unsupported())
-    }
-
-    async fn presign(
-        &self,
-        _: &OperationContext,
-        _: &str,
-        _: OpPresign,
-    ) -> opendal::Result<RpPresign> {
-        Err(unsupported())
-    }
-}
-
-#[derive(Debug)]
-struct TestReader {
-    object: StoredObject,
-    state: Arc<Mutex<TestState>>,
-    data: bool,
-}
-
-impl oio::Read for TestReader {
-    async fn open(
-        &self,
-        range: BytesRange,
-    ) -> opendal::Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
-        let (response, buffer) = self.read(range).await?;
-        Ok((response, Box::new(buffer)))
-    }
-
-    async fn read(&self, range: BytesRange) -> opendal::Result<(RpRead, Buffer)> {
-        let range = range.to_content_range(self.object.bytes.len())?;
-        if self.data {
-            let mut state = self.state.lock().unwrap();
-            state.data_read_bytes += range.len() as u64;
-            state.data_reads += 1;
-        }
-        Ok((
-            RpRead::new(metadata(&self.object)),
-            Buffer::from(self.object.bytes[range].to_vec()),
-        ))
-    }
-}
-
-#[derive(Debug)]
-struct TestWriter {
-    state: Arc<Mutex<TestState>>,
-    path: String,
-    if_match: Option<String>,
-    if_not_exists: bool,
-    bytes: Vec<u8>,
-}
-
-impl oio::Write for TestWriter {
-    async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
-        if self.path.starts_with(".yinyang/versions/") {
-            self.state.lock().unwrap().version_write_calls += 1;
-        }
-        for chunk in buffer {
-            self.bytes.extend_from_slice(&chunk);
-        }
-        Ok(())
-    }
-
-    async fn close(&mut self) -> opendal::Result<Metadata> {
-        let mut state = self.state.lock().unwrap();
-        if (self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/"))
-            && state.fail_data_close
-        {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "data close failed",
-            ));
-        }
-        let current = state.objects.get(&self.path);
-        if self.if_not_exists && current.is_some() {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::ConditionNotMatch,
-                "object already exists",
-            ));
-        }
-        if self
-            .if_match
-            .as_ref()
-            .is_some_and(|etag| current.is_none_or(|object| object.etag != *etag))
-        {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::ConditionNotMatch,
-                "ETag does not match",
-            ));
-        }
-
+#[tokio::test]
+async fn indexed_delayed_and_lost_publication_results_remain_resolvable() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let old = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&old, CommitId::generate());
+    plan.create_directory(fs.root(), "delayed").await.unwrap();
+    let request = plan.finish().unwrap();
+    backend.state.lock().unwrap().delay_next_head = true;
+    assert_eq!(
+        fs.commit(&request).await.unwrap(),
+        Outcome::Unknown(request.id())
+    );
+    assert!(
+        fs.observe_latest()
+            .await
+            .unwrap()
+            .receipt(request.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    {
+        let mut state = backend.state.lock().unwrap();
+        let (bytes, condition) = state.pending_head.take().unwrap();
+        assert_eq!(condition, Some(state.objects[".yinyang/head"].etag.clone()));
         state.next_revision += 1;
-        let mut object = StoredObject {
-            bytes: self.bytes.clone(),
-            etag: format!("\"{}\"", state.next_revision),
-        };
-        if self.path.contains("/packs/") && state.corrupt_pack_on_close && !object.bytes.is_empty()
-        {
-            object.bytes[0] ^= 1;
-        }
-        let metadata = metadata(&object);
-        state.objects.insert(self.path.clone(), object);
-        if self.path == ".yinyang/head" && state.fail_after_head_write {
-            state.fail_after_head_write = false;
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "publication response was lost",
-            ));
-        }
-        Ok(metadata)
+        let etag = format!("delayed-{}", state.next_revision);
+        state
+            .objects
+            .insert(".yinyang/head".into(), StoredObject { bytes, etag });
     }
+    let receipt = committed(fs.commit(&request).await.unwrap());
+    assert_eq!(committed(fs.commit(&request).await.unwrap()), receipt);
+    let old = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&old, CommitId::generate());
+    plan.create_directory(fs.root(), "lost").await.unwrap();
+    let request = plan.finish().unwrap();
+    backend.fail_next_head_write_after_success();
+    let receipt = committed(fs.commit(&request).await.unwrap());
+    assert_eq!(committed(fs.commit(&request).await.unwrap()), receipt);
+}
 
-    async fn abort(&mut self) -> opendal::Result<()> {
-        if self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/") {
-            self.state.lock().unwrap().data_aborts += 1;
-        }
-        self.bytes.clear();
-        Ok(())
+#[tokio::test]
+async fn indexed_pagination_binds_snapshot_and_ordering() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let old = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&old, CommitId::generate());
+    for i in 0..70 {
+        plan.create_directory(fs.root(), &format!("entry-{i:03}"))
+            .await
+            .unwrap();
     }
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+    let old = fs.observe_latest().await.unwrap();
+    let page = old.scan(fs.root(), None, 17).await.unwrap();
+    assert_eq!(page.entries.len(), 17);
+    let token = page.next.unwrap();
+    let mut plan = Planner::new(&old, CommitId::generate());
+    plan.create_directory(fs.root(), "another").await.unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+    let current = fs.observe_latest().await.unwrap();
+    assert_eq!(
+        current
+            .scan(fs.root(), Some(&token), 17)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Invalid
+    );
+    assert_eq!(
+        old.scan(fs.root(), Some(&token), 17).await.unwrap().entries[0].name,
+        "entry-017"
+    );
+    let mut plan = Planner::new(&current, CommitId::generate());
+    for entry in plan.scan(fs.root()).await.unwrap() {
+        plan.remove(entry.node_id).await.unwrap();
+    }
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+    assert!(
+        fs.observe_latest()
+            .await
+            .unwrap()
+            .scan(fs.root(), None, 17)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        old.scan(fs.root(), None, 100).await.unwrap().entries.len(),
+        70
+    );
 }
 
 #[tokio::test]
@@ -371,33 +691,6 @@ async fn content_preparation_requires_verified_storage_acknowledgement() {
             .kind(),
         ErrorKind::Corrupt
     );
-}
-
-fn metadata(object: &StoredObject) -> Metadata {
-    Metadata::new(EntryMode::FILE)
-        .with_content_length(object.bytes.len() as u64)
-        .with_etag(object.etag.clone())
-}
-
-fn not_found() -> opendal::Error {
-    opendal::Error::new(opendal::ErrorKind::NotFound, "object is missing")
-}
-
-fn unsupported() -> opendal::Error {
-    opendal::Error::new(
-        opendal::ErrorKind::Unsupported,
-        "operation is not supported by the test backend",
-    )
-}
-
-fn add_directory(tree: &Tree, name: &str, id: NodeId) -> Tree {
-    let mut successor = tree.clone();
-    advance_root_membership(&mut successor);
-    successor.insert(
-        Path::new(name).unwrap(),
-        Node::dir(id, Generation::FIRST, false, Generation::FIRST),
-    );
-    successor
 }
 
 #[tokio::test]
@@ -555,757 +848,4 @@ async fn content_profile_is_independent_of_input_chunking() {
             .unwrap();
         assert_eq!(bytes, read);
     }
-}
-
-fn advance_root_membership(tree: &mut Tree) {
-    let root_path = Path::root();
-    let root = tree
-        .get(&root_path)
-        .expect("a valid tree has a root")
-        .clone();
-    let NodeBody::Dir { entries_generation } = root.body() else {
-        panic!("the root is a directory");
-    };
-    tree.insert(
-        root_path,
-        Node::dir(
-            root.id(),
-            root.generation(),
-            root.executable(),
-            entries_generation.next().unwrap(),
-        ),
-    );
-}
-
-fn add_file(tree: &Tree, name: &str, file: File) -> Tree {
-    let mut tree = tree.clone();
-    advance_root_membership(&mut tree);
-    tree.insert(
-        Path::new(name).unwrap(),
-        Node::file(NodeId::generate(), Generation::FIRST, false, file),
-    );
-    tree
-}
-
-#[tokio::test]
-async fn persists_file_bytes_across_reopen_and_old_versions() {
-    let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let bytes = (0..900_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-    let file = fs.write_file(&mut bytes.as_slice()).await.unwrap();
-    let initial = fs.observe().await.unwrap();
-    let id = CommitId::generate();
-    let tree = add_file(initial.tree(), "large", file.clone());
-    backend.fail_next_head_write_after_success();
-    assert_eq!(
-        fs.commit(&initial, id, tree.clone()).await.unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-    assert_eq!(
-        fs.commit(&initial, id, tree).await.unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-    let reopened = Fs::open(backend.operator()).await.unwrap();
-    let observed = reopened.observe().await.unwrap();
-    let NodeBody::File(persisted) = observed
-        .tree()
-        .get(&Path::new("large").unwrap())
-        .unwrap()
-        .body()
-    else {
-        panic!()
-    };
-    let mut output = Vec::new();
-    reopened.read_file(persisted, &mut output).await.unwrap();
-    assert_eq!(output, bytes);
-    let replacement = fs.write_file(&mut &b"new"[..]).await.unwrap();
-    let old_node = observed.tree().get(&Path::new("large").unwrap()).unwrap();
-    let mut next = observed.tree().clone();
-    next.insert(
-        Path::new("large").unwrap(),
-        Node::file(
-            old_node.id(),
-            old_node.generation().next().unwrap(),
-            false,
-            replacement,
-        ),
-    );
-    fs.commit(&observed, CommitId::generate(), next)
-        .await
-        .unwrap();
-    output.clear();
-    reopened.read_file(&file, &mut output).await.unwrap();
-    assert_eq!(output, bytes);
-}
-
-#[tokio::test]
-async fn reads_parts_offsets_and_checks_the_logical_digest() {
-    let fs = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let source = fs.write_file(&mut &b"0123456789"[..]).await.unwrap();
-    let blob = source.parts()[0].blob().clone();
-    let parts = vec![
-        FilePart::new(0..3, 6, blob.clone()).unwrap(),
-        FilePart::new(3..5, 1, blob).unwrap(),
-    ];
-    let file = File::new(
-        ContentId::new(blake3::hash(b"67812").into(), 5),
-        parts.clone(),
-    )
-    .unwrap();
-    let mut output = Vec::new();
-    fs.read_file(&file, &mut output).await.unwrap();
-    assert_eq!(output, b"67812");
-    let wrong = File::new(ContentId::new([0; 32], 5), parts).unwrap();
-    assert_eq!(
-        fs.read_file(&wrong, &mut tokio::io::sink())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Corrupt
-    );
-}
-
-#[tokio::test]
-async fn empty_files_need_no_data_objects() {
-    let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let empty = fs.write_file(&mut &b""[..]).await.unwrap();
-    assert!(empty.parts().is_empty());
-    fs.read_file(&empty, &mut tokio::io::sink()).await.unwrap();
-    assert!(
-        !backend
-            .state
-            .lock()
-            .unwrap()
-            .objects
-            .keys()
-            .any(|path| path.starts_with(".yinyang/data/"))
-    );
-}
-
-#[tokio::test]
-async fn missing_or_corrupt_data_cannot_be_published() {
-    for corruption in ["missing", "digest", "short", "long"] {
-        let backend = TestBackend::default();
-        let fs = Fs::create(backend.operator()).await.unwrap();
-        let file = fs.write_file(&mut &b"content"[..]).await.unwrap();
-        let path = std::str::from_utf8(file.parts()[0].blob().as_bytes()).unwrap();
-        {
-            let mut state = backend.state.lock().unwrap();
-            if corruption == "missing" {
-                state.objects.remove(path);
-            } else {
-                let bytes = &mut state.objects.get_mut(path).unwrap().bytes;
-                match corruption {
-                    "digest" => bytes[0] ^= 1,
-                    "short" => {
-                        bytes.pop();
-                    }
-                    _ => bytes.push(0),
-                }
-            }
-        }
-        let observed = fs.observe().await.unwrap();
-        let error = fs
-            .commit(
-                &observed,
-                CommitId::generate(),
-                add_file(observed.tree(), "bad", file),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Corrupt, "{corruption}: {error}");
-        assert_eq!(fs.observe().await.unwrap(), observed);
-    }
-}
-
-#[tokio::test]
-async fn failed_upload_aborts_and_never_changes_head() {
-    let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let observed = fs.observe().await.unwrap();
-    backend.state.lock().unwrap().fail_data_close = true;
-    assert_eq!(
-        fs.write_file(&mut &b"content"[..])
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Storage
-    );
-    assert_eq!(backend.state.lock().unwrap().data_aborts, 1);
-    assert_eq!(fs.observe().await.unwrap(), observed);
-}
-
-#[tokio::test]
-async fn invalid_data_locations_are_rejected() {
-    let fs = Fs::create(TestBackend::default().operator()).await.unwrap();
-    for path in [".yinyang/head", ".yinyang/data/../head", "external"] {
-        let content = ContentId::new(blake3::hash(b"x").into(), 1);
-        let file = File::new(
-            content,
-            vec![FilePart::new(0..1, 0, BlobRef::new(path, content)).unwrap()],
-        )
-        .unwrap();
-        assert_eq!(
-            fs.read_file(&file, &mut tokio::io::sink())
-                .await
-                .unwrap_err()
-                .kind(),
-            ErrorKind::Corrupt
-        );
-    }
-}
-
-#[tokio::test]
-async fn verifies_unselected_blob_bytes_and_reports_destination_errors() {
-    let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    let uploaded = fs.write_file(&mut &b"abcdef"[..]).await.unwrap();
-    let blob = uploaded.parts()[0].blob().clone();
-    let file = File::new(
-        ContentId::new(blake3::hash(b"bc").into(), 2),
-        vec![FilePart::new(0..2, 1, blob.clone()).unwrap()],
-    )
-    .unwrap();
-    let (mut sink, peer) = tokio::io::duplex(1);
-    drop(peer);
-    assert_eq!(
-        fs.read_file(&file, &mut sink).await.unwrap_err().kind(),
-        ErrorKind::Io
-    );
-    backend
-        .state
-        .lock()
-        .unwrap()
-        .objects
-        .get_mut(std::str::from_utf8(blob.as_bytes()).unwrap())
-        .unwrap()
-        .bytes[5] ^= 1;
-    assert_eq!(
-        fs.read_file(&file, &mut tokio::io::sink())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Corrupt
-    );
-}
-
-#[tokio::test]
-async fn source_failure_after_upload_starts_aborts_the_writer() {
-    struct FailingSource(bool);
-    impl tokio::io::AsyncRead for FailingSource {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            buffer: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            if self.0 {
-                return std::task::Poll::Ready(Err(std::io::Error::other("source failed")));
-            }
-            self.0 = true;
-            buffer.put_slice(b"started");
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-    let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator()).await.unwrap();
-    assert_eq!(
-        fs.write_file(&mut FailingSource(false))
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Io
-    );
-    assert_eq!(backend.state.lock().unwrap().data_aborts, 1);
-    assert_eq!(fs.observe().await.unwrap().version().number(), 0);
-}
-
-#[tokio::test]
-#[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
-async fn s3_file_publication_and_reopen() {
-    opendal::install_default();
-    let config = std::env::vars()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("YINYANG_S3_")
-                .map(|key| (key.to_ascii_lowercase(), value))
-        })
-        .collect::<Vec<_>>();
-    let operator = Operator::via_iter("s3", config).unwrap();
-    let content = yinyang_core::data::DataStore::new(operator.clone(), NodeId::generate()).unwrap();
-    let original = vec![37; 12 * 1024 * 1024 + 17];
-    let prepared = content.prepare(&mut original.as_slice()).await.unwrap();
-    let changed = content
-        .overwrite_prepared(&prepared, 65534..65538, b"test")
-        .await
-        .unwrap();
-    let mut range = Vec::new();
-    content
-        .read_range(changed.descriptor(), 65533..65539, &mut range)
-        .await
-        .unwrap();
-    assert_eq!(range, b"%test%");
-    let mut entire = Vec::new();
-    content
-        .read_range(prepared.descriptor(), 0..original.len() as u64, &mut entire)
-        .await
-        .unwrap();
-    assert_eq!(entire, original);
-    let fs = Fs::create(operator.clone()).await.unwrap();
-    let bytes = vec![37; 12 * 1024 * 1024 + 17];
-    let file = fs.write_file(&mut bytes.as_slice()).await.unwrap();
-    let observed = fs.observe().await.unwrap();
-    let name = format!("file-{}", uuid::Uuid::new_v4().simple());
-    let tree = add_file(observed.tree(), &name, file);
-    let id = CommitId::generate();
-    assert!(matches!(
-        fs.commit(&observed, id, tree.clone()).await.unwrap(),
-        CommitOutcome::Committed { .. }
-    ));
-    assert!(matches!(
-        fs.commit(&observed, id, tree).await.unwrap(),
-        CommitOutcome::Committed { .. }
-    ));
-    assert!(matches!(
-        fs.commit(
-            &observed,
-            CommitId::generate(),
-            add_directory(observed.tree(), "loser", NodeId::generate())
-        )
-        .await
-        .unwrap(),
-        CommitOutcome::Conflict { .. }
-    ));
-    let reopened = Fs::open(operator).await.unwrap();
-    let current = reopened.observe().await.unwrap();
-    let NodeBody::File(file) = current
-        .tree()
-        .get(&Path::new(name).unwrap())
-        .unwrap()
-        .body()
-    else {
-        panic!()
-    };
-    let mut output = Vec::new();
-    reopened.read_file(file, &mut output).await.unwrap();
-    assert_eq!(output, bytes);
-}
-
-#[tokio::test]
-async fn creates_and_reopens_one_filesystem() {
-    let backend = TestBackend::default();
-    let (left, right) = tokio::join!(
-        Fs::create(backend.operator()),
-        Fs::create(backend.operator())
-    );
-    let left = left.unwrap();
-    let right = right.unwrap();
-
-    assert_eq!(left.root(), right.root());
-    let observed = Fs::open(backend.operator())
-        .await
-        .unwrap()
-        .observe()
-        .await
-        .unwrap();
-    assert_eq!(observed.version().number(), 0);
-    assert_eq!(
-        observed.tree().get(&Path::root()).unwrap().id(),
-        left.root()
-    );
-}
-
-#[tokio::test]
-async fn streams_versions_to_opaque_object_keys() {
-    let backend = TestBackend::default();
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let mut successor = observed.tree().clone();
-    advance_root_membership(&mut successor);
-    for index in 0..10_000 {
-        successor.insert(
-            Path::new(format!("dir-{index:05}")).unwrap(),
-            Node::dir(
-                NodeId::generate(),
-                Generation::FIRST,
-                false,
-                Generation::FIRST,
-            ),
-        );
-    }
-    backend.reset_version_write_calls();
-
-    filesystem
-        .commit(&observed, CommitId::generate(), successor)
-        .await
-        .unwrap();
-
-    assert!(backend.version_write_calls() > 1);
-    for (path, bytes) in backend.version_objects() {
-        let key = path.strip_prefix(".yinyang/versions/").unwrap();
-        assert_eq!(key.len(), 32);
-        assert!(
-            key.bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        );
-        assert_ne!(key, blake3::hash(&bytes).to_hex().as_str());
-    }
-}
-
-#[tokio::test]
-async fn resolves_a_lost_head_creation_response() {
-    let backend = TestBackend::default();
-    backend.fail_next_head_write_after_success();
-
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-
-    assert_eq!(filesystem.observe().await.unwrap().version().number(), 0);
-}
-
-#[tokio::test]
-async fn rejects_backends_without_conditional_head_replacement() {
-    let operator = Operator::new(Memory::default()).unwrap();
-
-    let error = Fs::create(operator).await.unwrap_err();
-
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-}
-
-#[tokio::test]
-async fn rejects_backends_without_streaming_write() {
-    let backend = TestBackend::default();
-
-    let error = Fs::create(backend.operator_without_streaming_write())
-        .await
-        .unwrap_err();
-
-    assert_eq!(error.kind(), ErrorKind::Unsupported);
-}
-
-#[tokio::test]
-async fn publishes_and_retries_one_commit() {
-    let backend = TestBackend::default();
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let commit = CommitId::generate();
-    let successor = add_directory(observed.tree(), "dir", NodeId::generate());
-
-    assert_eq!(
-        filesystem
-            .commit(&observed, commit, successor.clone())
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-    assert_eq!(
-        filesystem
-            .commit(&observed, commit, successor)
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-
-    let reopened = Fs::open(backend.operator()).await.unwrap();
-    let current = reopened.observe().await.unwrap();
-    assert!(current.tree().get(&Path::new("dir").unwrap()).is_some());
-    assert_eq!(current.version().commits().len(), 1);
-    assert_eq!(current.version().commits()[0], commit);
-}
-
-#[tokio::test]
-async fn uses_the_etag_from_the_same_head_read() {
-    let backend = TestBackend::default();
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let successor = add_directory(observed.tree(), "dir", NodeId::generate());
-
-    assert_eq!(
-        filesystem
-            .commit(&observed, CommitId::generate(), successor)
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-    assert_eq!(backend.stat_calls(), 0);
-}
-
-#[tokio::test]
-async fn reports_conflict_for_competing_observations() {
-    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let first = filesystem.observe().await.unwrap();
-    let second = filesystem.observe().await.unwrap();
-
-    let first_tree = add_directory(first.tree(), "first", NodeId::generate());
-    let second_tree = add_directory(second.tree(), "second", NodeId::generate());
-    assert!(matches!(
-        filesystem
-            .commit(&first, CommitId::generate(), first_tree)
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { .. }
-    ));
-    assert_eq!(
-        filesystem
-            .commit(&second, CommitId::generate(), second_tree)
-            .await
-            .unwrap(),
-        CommitOutcome::Conflict { current: 1 }
-    );
-}
-
-#[tokio::test]
-async fn resolves_a_lost_publication_response() {
-    let backend = TestBackend::default();
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let successor = add_directory(observed.tree(), "durable", NodeId::generate());
-    backend.fail_next_head_write_after_success();
-
-    assert_eq!(
-        filesystem
-            .commit(&observed, CommitId::generate(), successor)
-            .await
-            .unwrap(),
-        CommitOutcome::Committed { version: 1 }
-    );
-}
-
-#[tokio::test]
-async fn requires_directory_generation_for_membership_changes() {
-    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let mut invalid = observed.tree().clone();
-    invalid.insert(
-        Path::new("child").unwrap(),
-        Node::dir(
-            NodeId::generate(),
-            Generation::FIRST,
-            false,
-            Generation::FIRST,
-        ),
-    );
-
-    let error = filesystem
-        .commit(&observed, CommitId::generate(), invalid)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Invalid);
-}
-
-#[tokio::test]
-async fn rejects_duplicate_nodes_and_missing_parents() {
-    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let node = NodeId::generate();
-    let mut duplicate = add_directory(observed.tree(), "first", node);
-    duplicate.insert(
-        Path::new("second").unwrap(),
-        Node::dir(node, Generation::FIRST, false, Generation::FIRST),
-    );
-    assert_eq!(
-        filesystem
-            .commit(&observed, CommitId::generate(), duplicate)
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Invalid
-    );
-
-    let mut missing_parent = observed.tree().clone();
-    missing_parent.insert(
-        Path::new("missing/child").unwrap(),
-        Node::dir(
-            NodeId::generate(),
-            Generation::FIRST,
-            false,
-            Generation::FIRST,
-        ),
-    );
-    assert_eq!(
-        filesystem
-            .commit(&observed, CommitId::generate(), missing_parent)
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Invalid
-    );
-}
-
-#[tokio::test]
-async fn rejects_case_folding_collisions_within_a_directory() {
-    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let mut successor = observed.tree().clone();
-    advance_root_membership(&mut successor);
-    successor.insert(
-        Path::new("Readme").unwrap(),
-        Node::dir(
-            NodeId::generate(),
-            Generation::FIRST,
-            false,
-            Generation::FIRST,
-        ),
-    );
-    successor.insert(
-        Path::new("README").unwrap(),
-        Node::dir(
-            NodeId::generate(),
-            Generation::FIRST,
-            false,
-            Generation::FIRST,
-        ),
-    );
-
-    let error = filesystem
-        .commit(&observed, CommitId::generate(), successor)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Invalid);
-}
-
-#[tokio::test]
-async fn requires_node_generation_for_file_changes() {
-    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let genesis = filesystem.observe().await.unwrap();
-    let node = NodeId::generate();
-    let mut first = genesis.tree().clone();
-    advance_root_membership(&mut first);
-    first.insert(
-        Path::new("file").unwrap(),
-        Node::file(
-            node,
-            Generation::FIRST,
-            false,
-            filesystem.write_file(&mut &b"original"[..]).await.unwrap(),
-        ),
-    );
-    filesystem
-        .commit(&genesis, CommitId::generate(), first)
-        .await
-        .unwrap();
-
-    let observed = filesystem.observe().await.unwrap();
-    let mut changed = observed.tree().clone();
-    changed.insert(
-        Path::new("file").unwrap(),
-        Node::file(
-            node,
-            Generation::FIRST,
-            false,
-            File::new(ContentId::new([2; 32], 0), Vec::new()).unwrap(),
-        ),
-    );
-    assert_eq!(
-        filesystem
-            .commit(&observed, CommitId::generate(), changed)
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Invalid
-    );
-}
-
-#[tokio::test]
-async fn preserves_node_generation_across_rename() {
-    let filesystem = Fs::create(TestBackend::default().operator()).await.unwrap();
-    let genesis = filesystem.observe().await.unwrap();
-    let node_id = NodeId::generate();
-    filesystem
-        .commit(
-            &genesis,
-            CommitId::generate(),
-            add_directory(genesis.tree(), "before", node_id),
-        )
-        .await
-        .unwrap();
-    let observed = filesystem.observe().await.unwrap();
-    let mut renamed = observed.tree().clone();
-    let node = renamed
-        .remove(&Path::new("before").unwrap())
-        .expect("the committed directory exists");
-    renamed.insert(Path::new("after").unwrap(), node.clone());
-    let root = renamed.get(&Path::root()).unwrap().clone();
-    let NodeBody::Dir { entries_generation } = root.body() else {
-        panic!("the root is a directory");
-    };
-    renamed.insert(
-        Path::root(),
-        Node::dir(
-            root.id(),
-            root.generation(),
-            root.executable(),
-            entries_generation.next().unwrap(),
-        ),
-    );
-
-    filesystem
-        .commit(&observed, CommitId::generate(), renamed)
-        .await
-        .unwrap();
-    let current = filesystem.observe().await.unwrap();
-    assert_eq!(
-        current
-            .tree()
-            .get(&Path::new("after").unwrap())
-            .unwrap()
-            .generation(),
-        Generation::FIRST
-    );
-}
-
-#[test]
-fn validates_file_part_coverage_and_blobs() {
-    let blob = BlobRef::new(b"blob".to_vec(), ContentId::new([1; 32], 8));
-    let first = FilePart::new(0..4, 0, blob.clone()).unwrap();
-    let second = FilePart::new(5..8, 4, blob.clone()).unwrap();
-    let content = ContentId::new([2; 32], 8);
-
-    assert_eq!(
-        File::new(content, vec![first, second]).unwrap_err().kind(),
-        ErrorKind::Invalid
-    );
-    assert_eq!(
-        FilePart::new(0..5, 4, blob).unwrap_err().kind(),
-        ErrorKind::Invalid
-    );
-}
-
-#[test]
-fn accepts_only_canonical_portable_paths() {
-    assert_eq!(Path::new("").unwrap(), Path::root());
-    assert!(Path::new("dir/file").is_ok());
-    for invalid in ["/rooted", "trailing/", "double//slash", ".", "CON", "bad?"] {
-        assert_eq!(Path::new(invalid).unwrap_err().kind(), ErrorKind::Invalid);
-    }
-}
-
-#[tokio::test]
-async fn rejects_a_missing_referenced_version() {
-    let backend = TestBackend::default();
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-    backend.remove_current_version();
-
-    let error = filesystem.observe().await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Corrupt);
-}
-
-#[tokio::test]
-async fn rejects_a_version_that_does_not_match_its_reference() {
-    let backend = TestBackend::default();
-    let filesystem = Fs::create(backend.operator()).await.unwrap();
-    backend.corrupt_current_version();
-
-    let error = filesystem.observe().await.unwrap_err();
-
-    assert_eq!(error.kind(), ErrorKind::Corrupt);
-}
-
-#[tokio::test]
-async fn rejects_a_corrupt_head() {
-    let backend = TestBackend::default();
-    Fs::create(backend.operator()).await.unwrap();
-    backend.corrupt_head();
-
-    let error = Fs::open(backend.operator()).await.unwrap_err();
-
-    assert_eq!(error.kind(), ErrorKind::Corrupt);
 }
