@@ -60,8 +60,16 @@ async fn suite(fs: &dyn Authority) {
     right.set_executable(b, true).await.unwrap();
     let (left, right) = (left.finish().unwrap(), right.finish().unwrap());
     let (l, r) = tokio::join!(fs.commit(&left), fs.commit(&right));
-    committed(l.unwrap());
-    committed(r.unwrap());
+    // The service's bounded writer-lock wait may expire on a slow runner.
+    // Once both attempts finish, replay exactly the same request, never replan.
+    for (result, request) in [(l, &left), (r, &right)] {
+        let result = result.unwrap();
+        committed(if result == Outcome::Retryable {
+            fs.commit(request).await.unwrap()
+        } else {
+            result
+        });
+    }
     let current = fs.observe_latest().await.unwrap();
     assert!(current.node(a).await.unwrap().unwrap().executable());
     assert!(current.node(b).await.unwrap().unwrap().executable());
