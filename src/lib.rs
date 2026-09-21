@@ -17,5 +17,9 @@
 
 //! Apache OpenDAL™ YinYang.
 //!
-//! The filesystem architecture is being redesigned. This crate intentionally
-//! exposes no runtime API until the new contracts are ready for implementation.
+//! One-shot publication and restoration of local directories on a Managed filesystem.
+
+mod directory;
+
+pub use directory::{directory_nodes, prepare_directory, publish_directory, restore_directory};
+pub use yinyang_core as core;

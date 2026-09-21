@@ -5,6 +5,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | Specification | Status |
 | --- | --- |
 | [YinYang object profile](yinyang-format.md) | Experimental indexed transactions and OpenDAL head publication. |
+| [Directory transfer](directory-transfer.md) | One-shot local directory publication and restoration. |
 | [Authenticated content profile](content-profile.md) | Experimental range verification and trusted preparation; independent of publication authority. |
 | [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage binding implemented experimentally; metadata-service binding remains open. |
 

@@ -26,6 +26,10 @@ identifier is implicit in the `YYFILE02` descriptor. Packing and physical index
 bytes never enter these logical hashes. Fixed-offset replacement keeps length
 and block boundaries unchanged and only rebuilds affected leaves and hash paths.
 
+`ContentId::calculate` applies the same canonical profile to a local byte stream
+without writing storage. It uses one verification-unit buffer and a logarithmic
+hash frontier. Directory transfer uses this to reuse unchanged published content.
+
 Conformance vectors (lowercase hexadecimal):
 
 | Input | Hash |

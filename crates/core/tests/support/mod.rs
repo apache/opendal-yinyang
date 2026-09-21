@@ -34,7 +34,6 @@ pub struct TestState {
     pub fail_after_head_write: bool,
     pub stat_calls: u64,
     pub head_stat_calls: u64,
-    pub version_write_calls: u64,
     pub fail_data_close: bool,
     pub data_aborts: u64,
     pub data_read_bytes: u64,
@@ -45,6 +44,7 @@ pub struct TestState {
     pub head_barrier: Option<(Arc<tokio::sync::Barrier>, usize)>,
     pub delay_next_head: bool,
     pub pending_head: Option<(Vec<u8>, Option<String>)>,
+    pub file_to_change_on_data_close: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,43 +76,6 @@ impl TestBackend {
 
     pub fn stat_calls(&self) -> u64 {
         self.state.lock().unwrap().stat_calls
-    }
-
-    pub fn reset_version_write_calls(&self) {
-        self.state.lock().unwrap().version_write_calls = 0;
-    }
-
-    pub fn version_write_calls(&self) -> u64 {
-        self.state.lock().unwrap().version_write_calls
-    }
-
-    pub fn version_objects(&self) -> Vec<(String, Vec<u8>)> {
-        self.state
-            .lock()
-            .unwrap()
-            .objects
-            .iter()
-            .filter(|(path, _)| path.starts_with(".yinyang/versions/"))
-            .map(|(path, object)| (path.clone(), object.bytes.clone()))
-            .collect()
-    }
-
-    pub fn remove_current_version(&self) {
-        self.state
-            .lock()
-            .unwrap()
-            .objects
-            .retain(|path, _| !path.starts_with(".yinyang/versions/"));
-    }
-
-    pub fn corrupt_current_version(&self) {
-        let mut state = self.state.lock().unwrap();
-        let object = state
-            .objects
-            .iter_mut()
-            .find_map(|(path, object)| path.starts_with(".yinyang/versions/").then_some(object))
-            .expect("the test filesystem has a version object");
-        object.bytes[0] ^= 1;
     }
 
     pub fn corrupt_head(&self) {
@@ -285,9 +248,6 @@ pub struct TestWriter {
 
 impl oio::Write for TestWriter {
     async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
-        if self.path.starts_with(".yinyang/versions/") {
-            self.state.lock().unwrap().version_write_calls += 1;
-        }
         for chunk in buffer {
             self.bytes.extend_from_slice(&chunk);
         }
@@ -323,9 +283,7 @@ impl oio::Write for TestWriter {
                 "head completion is delayed",
             ));
         }
-        if (self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/"))
-            && state.fail_data_close
-        {
+        if self.path.contains("/packs/") && state.fail_data_close {
             return Err(opendal::Error::new(
                 opendal::ErrorKind::Unexpected,
                 "data close failed",
@@ -361,6 +319,12 @@ impl oio::Write for TestWriter {
         }
         let metadata = metadata(&object);
         state.objects.insert(self.path.clone(), object);
+        if self.path.contains("/packs/")
+            && let Some(path) = state.file_to_change_on_data_close.take()
+        {
+            std::fs::write(path, b"changed during upload")
+                .map_err(|e| opendal::Error::new(opendal::ErrorKind::Unexpected, e.to_string()))?;
+        }
         if self.path == ".yinyang/head" && state.fail_after_head_write {
             state.fail_after_head_write = false;
             return Err(opendal::Error::new(
@@ -372,7 +336,7 @@ impl oio::Write for TestWriter {
     }
 
     async fn abort(&mut self) -> opendal::Result<()> {
-        if self.path.starts_with(".yinyang/data/") || self.path.contains("/packs/") {
+        if self.path.contains("/packs/") {
             self.state.lock().unwrap().data_aborts += 1;
         }
         self.bytes.clear();

@@ -105,6 +105,36 @@ jobs:
       - name: Check licenses
         run: cargo x licenses
 
+  s3:
+    name: S3 transfer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      YINYANG_S3_BUCKET: yinyang-test
+      YINYANG_S3_ENDPOINT: http://127.0.0.1:9000
+      YINYANG_S3_REGION: us-east-1
+      YINYANG_S3_ACCESS_KEY_ID: yinyang-test
+      YINYANG_S3_SECRET_ACCESS_KEY: yinyang-test-only
+      YINYANG_STORAGE_PROFILE: minio
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start isolated S3-compatible storage
+        run: |
+          docker run -d --name yinyang-minio -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=yinyang-test -e MINIO_ROOT_PASSWORD=yinyang-test-only \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live; then break; fi
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:9000/minio/health/live
+          docker exec yinyang-minio mc alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
+          docker exec yinyang-minio mc mb local/yinyang-test
+
+      - name: Exercise core publication and CLI round trips
+        run: cargo test --workspace --all-targets s3_ -- --ignored --nocapture
+
   required:
     name: Required
     runs-on: ubuntu-24.04
@@ -114,6 +144,7 @@ jobs:
       - msrv
       - test
       - compliance
+      - s3
     steps:
       - name: Guardian
         run: |
@@ -122,6 +153,7 @@ jobs:
               && "${{ needs.msrv.result }}" == "success" \
               && "${{ needs.test.result }}" == "success" \
               && "${{ needs.compliance.result }}" == "success" \
+              && "${{ needs.s3.result }}" == "success" \
               ) ]]; then
             echo "Required jobs haven't been completed successfully."
             exit 1

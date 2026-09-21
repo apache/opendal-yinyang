@@ -30,6 +30,19 @@ publish = false
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "yy"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+clap.workspace = true
+opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
+uuid.workspace = true
+yinyang-core = { path = "crates/core" }
+
 [workspace]
 members = [".", "crates/core", "xtask"]
 resolver = "3"

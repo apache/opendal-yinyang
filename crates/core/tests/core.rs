@@ -841,6 +841,12 @@ async fn content_profile_is_independent_of_input_chunking() {
         let first = store.prepare(&mut bytes.as_slice()).await.unwrap();
         let second = store.prepare(&mut ShortReads(&bytes)).await.unwrap();
         assert_eq!(first.content_id(), second.content_id());
+        assert_eq!(
+            first.content_id(),
+            yinyang_core::ContentId::calculate(&mut ShortReads(&bytes))
+                .await
+                .unwrap()
+        );
         let mut read = Vec::new();
         store
             .read_range(first.descriptor(), 0..length as u64, &mut read)
