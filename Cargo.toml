@@ -36,8 +36,10 @@ path = "src/main.rs"
 
 [dependencies]
 blake3.workspace = true
+borsh.workspace = true
 clap.workspace = true
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
 uuid.workspace = true

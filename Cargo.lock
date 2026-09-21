@@ -2438,8 +2438,10 @@ name = "yinyang"
 version = "0.0.24"
 dependencies = [
  "blake3",
+ "borsh",
  "clap",
  "opendal",
+ "rusqlite",
  "tempfile",
  "tokio",
  "uuid",

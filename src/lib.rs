@@ -20,6 +20,7 @@
 //! One-shot publication and restoration of local directories on a Managed filesystem.
 
 mod directory;
+pub mod runtime;
 
 pub use directory::{directory_nodes, prepare_directory, publish_directory, restore_directory};
 pub use yinyang_core as core;
