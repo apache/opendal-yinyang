@@ -2442,6 +2442,8 @@ dependencies = [
  "clap",
  "opendal",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",

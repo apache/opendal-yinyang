@@ -21,9 +21,11 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 >
 > We are actively working on the design of the next Apache OpenDAL™ YinYang release under
 > [RFC-0016]. The core provides experimental indexed object-storage transactions,
-> retained snapshots, and authenticated range-verifiable content. The `yy` CLI
-> publishes and restores directories. Metadata-service publication, Mount, and
-> bidirectional Sync are not implemented yet.
+> retained snapshots, and authenticated range-verifiable content. A durable
+> metadata service and recoverable Managed file handles share the transaction
+> contract. The `yy` CLI publishes/restores directories and operates configured
+> volumes. OS Mount frontends, Direct volumes, and bidirectional Sync are not
+> implemented yet.
 
 ## Publish and restore a directory
 
@@ -60,6 +62,20 @@ leave a partial directory; inspect it and restore into a new destination to
 retry. This is one-shot transfer, not a background or bidirectional Sync engine.
 See the [directory transfer contract](specs/directory-transfer.md) for supported
 metadata, failure semantics, and limitations.
+
+## Metadata service and recoverable files
+
+The [metadata service](specs/metadata-service.md) provides an experimental local
+SQLite authority with authenticated loopback RPC. Start it with
+`yy serve --database metadata.db` and a separately supplied
+`YINYANG_SERVICE_TOKEN`; do not expose its unencrypted transport to a network.
+
+The [file runtime](specs/file-runtime.md) supports pinned handles, durable local
+write/append/truncate, conditional remote fsync, and restart recovery over either
+publication authority. Configure the [volume and required capabilities](specs/volume-capabilities.md),
+then use `yy --volume volume.json file ...` and `yy --volume volume.json status`.
+Local write acknowledgment and remote publication are reported separately.
+The library frontend does not install an OS mount or implement Sync.
 
 ## Previous releases
 

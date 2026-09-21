@@ -91,6 +91,7 @@ pub struct RuntimeStatus {
     pub errors: Vec<WritebackError>,
 }
 struct Inner {
+    read_only: bool,
     authority: Arc<dyn Authority>,
     stage: Stage,
     active: Mutex<BTreeSet<[u8; 16]>>,
@@ -104,9 +105,23 @@ pub struct Runtime {
 }
 impl Runtime {
     pub async fn open(authority: Arc<dyn Authority>, staging: impl AsRef<Path>) -> Result<Self> {
+        Self::open_mode(authority, staging, false).await
+    }
+    pub async fn open_read_only(
+        authority: Arc<dyn Authority>,
+        staging: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_mode(authority, staging, true).await
+    }
+    async fn open_mode(
+        authority: Arc<dyn Authority>,
+        staging: impl AsRef<Path>,
+        read_only: bool,
+    ) -> Result<Self> {
         let stage = Stage::open(staging.as_ref().to_owned(), authority.filesystem()).await?;
         Ok(Self {
             inner: Arc::new(Inner {
+                read_only,
                 authority,
                 stage,
                 active: Mutex::new(BTreeSet::new()),
@@ -116,6 +131,17 @@ impl Runtime {
     }
     pub fn authority(&self) -> &dyn Authority {
         self.inner.authority.as_ref()
+    }
+    fn require_write(&self) -> Result<()> {
+        if self.inner.read_only {
+            Err(Error::Invalid("volume is read-only"))
+        } else {
+            Ok(())
+        }
+    }
+    /// Read persisted staging status without taking the runtime lease or needing the remote service.
+    pub async fn inspect(staging: impl AsRef<Path>) -> Result<RuntimeStatus> {
+        Stage::inspect(staging.as_ref().join("staging.db")).await
     }
     pub async fn status(&self) -> Result<RuntimeStatus> {
         let mut status = self.inner.stage.status().await?;
@@ -174,6 +200,9 @@ impl Runtime {
     /// Opens one pinned node version and materializes verified bytes in bounded
     /// chunks. Subsequent opens observe latest; existing handles are never rebased.
     pub async fn open_file(&self, path: &str, writable: bool) -> Result<FileHandle> {
+        if writable {
+            self.require_write()?;
+        }
         let snapshot = self.authority().observe_latest().await?;
         let node = snapshot
             .resolve(path)
@@ -218,6 +247,7 @@ impl Runtime {
     /// Namespace operations publish explicit transactions. Unknown outcomes carry
     /// an identity and must be resolved through the authority's receipt API.
     pub async fn create_file(&self, parent: NodeId, name: &str) -> Result<Receipt> {
+        self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let empty = self.authority().prepare(&mut tokio::io::empty()).await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
@@ -225,18 +255,21 @@ impl Runtime {
         outcome(self.authority().commit(&plan.finish()?).await?)
     }
     pub async fn create_directory(&self, parent: NodeId, name: &str) -> Result<Receipt> {
+        self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
         plan.create_directory(parent, name).await?;
         outcome(self.authority().commit(&plan.finish()?).await?)
     }
     pub async fn rename(&self, node: NodeId, parent: NodeId, name: &str) -> Result<Receipt> {
+        self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
         plan.rename(node, parent, name).await?;
         outcome(self.authority().commit(&plan.finish()?).await?)
     }
     pub async fn unlink(&self, node: NodeId) -> Result<Receipt> {
+        self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
         plan.remove(node).await?;
@@ -294,6 +327,7 @@ impl FileHandle {
     }
     pub async fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         self.live()?;
+        self.runtime.require_write()?;
         let result = self
             .runtime
             .inner
@@ -307,6 +341,7 @@ impl FileHandle {
     /// conflict at publication rather than silently merging their appends.
     pub async fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         self.live()?;
+        self.runtime.require_write()?;
         let result = self
             .runtime
             .inner
@@ -317,6 +352,7 @@ impl FileHandle {
     }
     pub async fn truncate(&mut self, length: u64) -> Result<()> {
         self.live()?;
+        self.runtime.require_write()?;
         let result = self.runtime.inner.stage.truncate(self.id, length).await;
         self.report(result).await
     }
@@ -374,6 +410,7 @@ impl FileHandle {
             }
             return Ok(None);
         }
+        self.runtime.require_write()?;
         if r.conflict {
             return Err(Error::Conflict);
         }

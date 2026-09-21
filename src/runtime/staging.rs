@@ -141,6 +141,26 @@ fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
     .collect()
 }
 impl Stage {
+    pub async fn inspect(path: PathBuf) -> Result<RuntimeStatus> {
+        tokio::task::spawn_blocking(move || {
+            let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(local)?;
+            let profile: String = c
+                .query_row("SELECT profile FROM authority WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })
+                .map_err(local)?;
+            if profile != "yinyang-stage-1" {
+                return Err(Error::Invalid("unknown staging profile"));
+            }
+            Ok(RuntimeStatus {
+                handles: records(&c)?.iter().map(Record::status).collect(),
+                errors: errors(&c)?,
+            })
+        })
+        .await
+        .map_err(local)?
+    }
     pub async fn open(path: PathBuf, fs: NodeId) -> Result<Self> {
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&path).map_err(local)?;
