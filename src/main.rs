@@ -31,6 +31,13 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Run the authenticated loopback metadata authority with a local SQLite database.
+    Serve {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:7447")]
+        listen: std::net::SocketAddr,
+    },
     /// Create a filesystem, or validate an existing one.
     Create,
     /// Publish a complete directory, removing remote-only paths.
@@ -75,6 +82,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Vec<_>>();
     let operator = opendal::Operator::via_iter("s3", config)?;
+    if let Command::Serve { database, listen } = &cli.command {
+        let token = std::env::var("YINYANG_SERVICE_TOKEN").map_err(
+            |_| "set YINYANG_SERVICE_TOKEN to a random authentication token of at least 32 bytes",
+        )?;
+        if !listen.ip().is_loopback() || !(32..=1024).contains(&token.len()) {
+            return Err("metadata service requires loopback and a 32..=1024 byte token".into());
+        }
+        let service = yinyang::core::service::MetadataService::create(database, operator).await?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        println!("metadata service listening on {}", listener.local_addr()?);
+        yinyang::core::service::serve(listener, service, token).await?;
+        return Ok(());
+    }
     if matches!(cli.command, Command::Create) {
         let fs = Fs::create(operator, profile).await?;
         println!(
@@ -86,7 +106,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let fs = Fs::open(operator, profile).await?;
     let observed = fs.observe_latest().await?;
     match cli.command {
-        Command::Create => unreachable!(),
+        Command::Create | Command::Serve { .. } => unreachable!(),
         Command::Publish {
             source,
             replace,

@@ -7,7 +7,8 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [YinYang object profile](yinyang-format.md) | Experimental indexed transactions and OpenDAL head publication. |
 | [Directory transfer](directory-transfer.md) | One-shot local directory publication and restoration. |
 | [Authenticated content profile](content-profile.md) | Experimental range verification and trusted preparation; independent of publication authority. |
-| [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage binding implemented experimentally; metadata-service binding remains open. |
+| [Metadata service](metadata-service.md) | Experimental durable SQLite authority and authenticated loopback protocol. |
+| [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage and metadata-service bindings implemented experimentally. |
 
 A specification describes the currently supported behavior, APIs, wire formats,
 invariants, compatibility rules, and implementation boundaries. Specifications

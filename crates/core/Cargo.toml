@@ -30,7 +30,8 @@ blake3.workspace = true
 borsh.workspace = true
 futures-util.workspace = true
 opendal.workspace = true
-tokio.workspace = true
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 unicode-casefold.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true
@@ -41,6 +42,7 @@ opendal = { workspace = true, features = [
   "services-memory",
   "services-s3",
 ] }
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
