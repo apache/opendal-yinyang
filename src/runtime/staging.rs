@@ -21,7 +21,7 @@ use super::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs::File;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 pub(super) const CHUNK: u64 = 64 * 1024;
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
@@ -176,13 +176,13 @@ impl Stage {
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut c = db.lock().map_err(local)?;
-            f(&mut c)
-        })
-        .await
-        .map_err(local)?
+        // Acquire in submission order, before queueing blocking work. The worker
+        // owns the guard even if its caller is cancelled; a later fsync cannot
+        // overtake an already submitted write in the blocking thread pool.
+        let mut connection = self.db.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || f(&mut connection))
+            .await
+            .map_err(local)?
     }
     pub async fn load(&self, id: [u8; 16]) -> Result<Record> {
         self.call(move |c| record(c, id)).await
@@ -344,4 +344,59 @@ fn mutable(r: &Record) -> Result<()> {
         ));
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_write_keeps_its_place_before_later_reads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let stage = Stage::open(temp.path().to_owned(), NodeId::generate())
+                .await
+                .unwrap();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+            });
+            waiting.await.unwrap();
+            let writer = stage.clone();
+            let submitted = tokio::spawn(async move {
+                writer
+                    .call(|c| {
+                        c.execute(
+                            "INSERT INTO errors(handle,message) VALUES(?1,'accepted')",
+                            params![[0_u8; 16].as_slice()],
+                        )
+                        .map_err(local)?;
+                        Ok(())
+                    })
+                    .await
+            });
+            // The only blocking worker is occupied. Submission must hold the
+            // connection before its SQL closure can start.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while stage.db.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            submitted.abort();
+            let _ = submitted.await;
+            let reader = tokio::spawn(async move { stage.status().await.unwrap() });
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            assert_eq!(reader.await.unwrap().errors[0].message, "accepted");
+        });
+    }
 }

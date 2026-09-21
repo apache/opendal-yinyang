@@ -180,6 +180,9 @@ impl Runtime {
             .await?
             .ok_or(Error::Invalid("file does not exist"))?;
         let file = snapshot.content(node.id()).await?;
+        if file.descriptor().content_id().length() > i64::MAX as u64 {
+            return Err(Error::Invalid("file exceeds staging length limit"));
+        }
         let mut r = Record {
             id: *uuid::Uuid::new_v4().as_bytes(),
             node: *node.id().as_bytes(),
