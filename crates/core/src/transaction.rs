@@ -102,6 +102,7 @@ impl Condition {
 #[derive(Clone, Debug)]
 pub struct Transaction {
     filesystem: NodeId,
+    base: crate::Revision,
     id: CommitId,
     digest: [u8; 32],
     conditions: Vec<Condition>,
@@ -152,6 +153,234 @@ impl Transaction {
             work.apply(mutation).await?;
         }
         work.finish().await.map(Some)
+    }
+}
+
+type RequestWire = (
+    [u8; 8],
+    [u8; 16],
+    [u8; 16],
+    [u8; 24],
+    [u8; 32],
+    Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    Vec<Vec<u8>>,
+);
+
+impl Transaction {
+    /// Persist the exact plan, not permission to trust its content descriptors.
+    /// Restore through the selected authority before submitting after a restart.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mutations = self
+            .mutations
+            .iter()
+            .map(|m| {
+                Ok(match m {
+                    Mutation::Create {
+                        id,
+                        parent,
+                        name,
+                        file,
+                        executable,
+                    } => encode(&(
+                        0_u8,
+                        *id.as_bytes(),
+                        *parent.as_bytes(),
+                        name,
+                        file.as_ref().map(|f| f.descriptor().to_bytes()),
+                        executable,
+                    ))?,
+                    Mutation::Content(id, file) => {
+                        encode(&(1_u8, *id.as_bytes(), file.descriptor().to_bytes()))?
+                    }
+                    Mutation::Executable(id, value) => encode(&(2_u8, *id.as_bytes(), value))?,
+                    Mutation::Rename(id, parent, name) => {
+                        encode(&(3_u8, *id.as_bytes(), *parent.as_bytes(), name))?
+                    }
+                    Mutation::Remove(id) => encode(&(4_u8, *id.as_bytes()))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        encode(&(
+            *b"YYPLAN01",
+            *self.filesystem.as_bytes(),
+            *self.id.as_bytes(),
+            self.base.to_bytes(),
+            self.digest,
+            self.conditions
+                .iter()
+                .map(|c| (&c.key, &c.expected))
+                .collect::<Vec<_>>(),
+            mutations,
+        ))
+    }
+
+    pub(crate) fn inspect(
+        bytes: &[u8],
+    ) -> Result<(crate::Revision, Vec<crate::ContentDescriptor>)> {
+        let (_, _, _, revision, _, _, mutations) = Self::wire(bytes)?;
+        let mut files = Vec::new();
+        for bytes in mutations {
+            match bytes.first() {
+                Some(0) => {
+                    let (_, _, _, _, file, _): (
+                        u8,
+                        [u8; 16],
+                        [u8; 16],
+                        String,
+                        Option<Vec<u8>>,
+                        bool,
+                    ) = crate::namespace::decode(&bytes)?;
+                    if let Some(file) = file {
+                        files.push(crate::ContentDescriptor::from_bytes(&file)?);
+                    }
+                }
+                Some(1) => {
+                    let (_, _, file): (u8, [u8; 16], Vec<u8>) = crate::namespace::decode(&bytes)?;
+                    files.push(crate::ContentDescriptor::from_bytes(&file)?);
+                }
+                _ => {}
+            }
+        }
+        Ok((crate::Revision::from_bytes(revision), files))
+    }
+    fn wire(bytes: &[u8]) -> Result<RequestWire> {
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(Error::unsupported(
+                "restore transaction",
+                "plan exceeds 16 MiB",
+            ));
+        }
+        let wire: RequestWire = crate::namespace::decode(bytes)?;
+        if wire.0 != *b"YYPLAN01" {
+            return Err(Error::invalid(
+                "restore transaction",
+                "unknown plan profile",
+            ));
+        }
+        Ok(wire)
+    }
+    pub(crate) async fn restore(
+        bytes: &[u8],
+        snapshot: &Snapshot,
+        prepared: &[PreparedContent],
+    ) -> Result<Self> {
+        let (_, fs, id, revision, digest, conditions, encoded) = Self::wire(bytes)?;
+        if fs != *snapshot.filesystem.as_bytes() || revision != snapshot.revision().to_bytes() {
+            return Err(Error::invalid(
+                "restore transaction",
+                "wrong authority or base revision",
+            ));
+        }
+        let mut map = BTreeMap::new();
+        for (key, expected) in conditions {
+            if key.is_empty()
+                || key[0] > ENTRY
+                || (key[0] != ENTRY && key.len() != 17)
+                || (key[0] == ENTRY && key.len() < 18)
+                || map.contains_key(&key)
+            {
+                return Err(Error::invalid(
+                    "restore transaction",
+                    "invalid or duplicate predicate",
+                ));
+            }
+            let condition = Condition {
+                key: key.clone(),
+                expected,
+            };
+            if !condition.matches(snapshot).await? {
+                return Err(Error::invalid(
+                    "restore transaction",
+                    "predicate disagrees with original observation",
+                ));
+            }
+            map.insert(key, condition);
+        }
+        let find = |bytes: Vec<u8>| -> Result<PreparedContent> {
+            prepared
+                .iter()
+                .find(|p| p.descriptor().to_bytes() == bytes)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid("restore transaction", "content readiness not established")
+                })
+        };
+        let mut work = Working::new(snapshot.clone(), true);
+        let mut mutations = Vec::new();
+        for bytes in encoded {
+            let mutation = match bytes.first() {
+                Some(0) => {
+                    let (_, node, parent, name, file, executable): (
+                        u8,
+                        [u8; 16],
+                        [u8; 16],
+                        String,
+                        Option<Vec<u8>>,
+                        bool,
+                    ) = crate::namespace::decode(&bytes)?;
+                    let seed = encode(&(fs, id, mutations.len() as u64))?;
+                    let derived =
+                        blake3::derive_key("Apache OpenDAL YinYang node identity profile 2", &seed);
+                    if node != derived[..16] {
+                        return Err(Error::invalid(
+                            "restore transaction",
+                            "invalid creation identity",
+                        ));
+                    }
+                    Mutation::Create {
+                        id: NodeId::from_bytes(node),
+                        parent: NodeId::from_bytes(parent),
+                        name,
+                        file: file.map(&find).transpose()?,
+                        executable,
+                    }
+                }
+                Some(1) => {
+                    let (_, node, file): (u8, [u8; 16], Vec<u8>) =
+                        crate::namespace::decode(&bytes)?;
+                    Mutation::Content(NodeId::from_bytes(node), find(file)?)
+                }
+                Some(2) => {
+                    let (_, node, value): (u8, [u8; 16], bool) = crate::namespace::decode(&bytes)?;
+                    Mutation::Executable(NodeId::from_bytes(node), value)
+                }
+                Some(3) => {
+                    let (_, node, parent, name): (u8, [u8; 16], [u8; 16], String) =
+                        crate::namespace::decode(&bytes)?;
+                    Mutation::Rename(NodeId::from_bytes(node), NodeId::from_bytes(parent), name)
+                }
+                Some(4) => {
+                    let (_, node): (u8, [u8; 16]) = crate::namespace::decode(&bytes)?;
+                    Mutation::Remove(NodeId::from_bytes(node))
+                }
+                _ => return Err(Error::invalid("restore transaction", "unknown mutation")),
+            };
+            work.apply(&mutation).await?;
+            mutations.push(mutation);
+        }
+        // Lower-level clients may add dependencies, but cannot omit the guards
+        // required by the same planner used by trusted in-process callers.
+        for required in work.conditions.values() {
+            if map
+                .get(&required.key)
+                .is_none_or(|c| c.expected != required.expected)
+            {
+                return Err(Error::invalid(
+                    "restore transaction",
+                    "missing mandatory predicate",
+                ));
+            }
+        }
+        let request = Self {
+            filesystem: snapshot.filesystem,
+            base: snapshot.revision(),
+            id: CommitId::from_bytes(id),
+            digest,
+            conditions: map.into_values().collect(),
+            mutations,
+        };
+        request.validate(snapshot.filesystem)?;
+        Ok(request)
     }
 }
 
@@ -255,6 +484,7 @@ impl Planner {
     pub fn finish(self) -> Result<Transaction> {
         let mut request = Transaction {
             filesystem: self.work.base.filesystem,
+            base: self.work.base.revision(),
             id: self.id,
             digest: [0; 32],
             conditions: self.work.conditions.into_values().collect(),
@@ -623,6 +853,7 @@ mod tests {
     fn canonical_noop_request_vector() {
         let request = Transaction {
             filesystem: NodeId::from_bytes([1; 16]),
+            base: crate::Revision::new(0),
             id: CommitId::from_bytes([2; 16]),
             digest: [0; 32],
             conditions: vec![],

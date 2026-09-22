@@ -497,6 +497,12 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             bytes.extend_from_slice(&chunk);
         }
     }
+    if bytes.starts_with(b"YYSERV01") {
+        return Err(Error::unsupported(
+            "open filesystem",
+            "metadata-service authority required",
+        ));
+    }
     if bytes.starts_with(b"YYHEAD01") {
         return Err(Error::unsupported(
             "open filesystem",

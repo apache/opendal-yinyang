@@ -1,9 +1,9 @@
 # Transactional Filesystem
 
-**Status: shared target contract; object-storage binding implemented experimentally.**
-The [current object profile](yinyang-format.md) and [content profile](content-profile.md)
-describe implemented APIs and encodings. Metadata-service publication remains
-unimplemented. The persistent profile is not frozen for interoperable release;
+**Status: shared target contract; both publication bindings implemented experimentally.**
+The [object profile](yinyang-format.md), [metadata service](metadata-service.md),
+and [content profile](content-profile.md) describe implemented APIs and encodings.
+The persistent profiles are not frozen for interoperable release;
 [Open decisions](#open-decisions) identifies the remaining evaluation work.
 
 ## Scope and cost model

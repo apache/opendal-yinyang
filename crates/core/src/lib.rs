@@ -17,12 +17,15 @@
 
 //! Indexed transactional filesystem and authenticated immutable content.
 
+mod authority;
 pub mod data;
+pub use authority::Authority;
 mod error;
 mod identity;
 mod index;
 pub mod namespace;
 pub mod object;
+pub mod service;
 mod snapshot;
 pub mod transaction;
 
