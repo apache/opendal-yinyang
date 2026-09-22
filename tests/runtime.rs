@@ -23,7 +23,7 @@ use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
 use yinyang::runtime::{Error, Runtime};
 
-async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path) {
+async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend: &TestBackend) {
     let runtime = Runtime::open(authority.clone(), path).await.unwrap();
     runtime.create_file(authority.root(), "file").await.unwrap();
     let mut first = runtime.open_file("file", true).await.unwrap();
@@ -87,6 +87,97 @@ async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path) {
     runtime.acknowledge_errors(sequence).await.unwrap();
     assert!(runtime.status().await.unwrap().errors.is_empty());
     identity_access(&runtime).await;
+    version_reads(&runtime, backend).await;
+}
+
+async fn version_reads(runtime: &Runtime, backend: &TestBackend) {
+    let root = runtime.authority().root();
+    let bytes: Vec<u8> = (0..16 * 65536).map(|i| (i % 251) as u8).collect();
+    let snapshot = runtime.authority().observe_latest().await.unwrap();
+    let prepared = runtime
+        .authority()
+        .prepare(&mut bytes.as_slice())
+        .await
+        .unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let id = plan
+        .create_file(root, "large", prepared, false)
+        .await
+        .unwrap();
+    runtime
+        .authority()
+        .commit(&plan.finish().unwrap())
+        .await
+        .unwrap();
+    let snapshot = runtime.authority().observe_latest().await.unwrap();
+    let before = backend.state.lock().unwrap().data_read_bytes;
+    let file = snapshot.open_file(id).await.unwrap();
+    assert_eq!(file.node().id(), id);
+    assert_eq!(file.revision(), snapshot.revision());
+    // Metadata shares pack storage with content; opening may read metadata,
+    // but must not read the 1 MiB payload or create a stage record.
+    assert!(backend.state.lock().unwrap().data_read_bytes - before < 65536);
+    assert!(runtime.recoverable().await.unwrap().is_empty());
+    let before = backend.state.lock().unwrap().data_read_bytes;
+    assert_eq!(file.read(31, 10).await.unwrap(), bytes[31..41]);
+    let read_bytes = backend.state.lock().unwrap().data_read_bytes - before;
+    assert!((65536..2 * 65536).contains(&read_bytes));
+    let before = backend.state.lock().unwrap().data_read_bytes;
+    assert!(file.read(u64::MAX, 100).await.unwrap().is_empty());
+    assert!(file.read(31, 0).await.unwrap().is_empty());
+    assert!(
+        file.read_range(0..bytes.len() as u64 + 1, &mut Vec::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(backend.state.lock().unwrap().data_read_bytes, before);
+    let clone = file.clone();
+    let (a, b) = tokio::join!(
+        file.read(65530, 20),
+        clone.read(bytes.len() as u64 - 4, 100)
+    );
+    assert_eq!(a.unwrap(), bytes[65530..65550]);
+    assert_eq!(b.unwrap(), bytes[bytes.len() - 4..]);
+    let mut writer = runtime.open_node(id, true).await.unwrap();
+    writer.write(0, b"changed").await.unwrap();
+    writer.close().await.unwrap();
+    runtime.rename(id, root, "large-moved").await.unwrap();
+    let latest = runtime
+        .authority()
+        .observe_latest()
+        .await
+        .unwrap()
+        .open_file(id)
+        .await
+        .unwrap();
+    assert_eq!(latest.read(0, 7).await.unwrap(), b"changed");
+    runtime.unlink(id).await.unwrap();
+    assert_eq!(file.read(0, 10).await.unwrap(), bytes[..10]);
+    let retained = runtime
+        .authority()
+        .observe_revision(file.revision())
+        .await
+        .unwrap()
+        .open_file(id)
+        .await
+        .unwrap();
+    assert_eq!(retained.read(0, 10).await.unwrap(), bytes[..10]);
+    // Corrupt the exact packed bytes read by this version; verified data must
+    // not escape merely because a previous read of the same version succeeded.
+    {
+        let mut state = backend.state.lock().unwrap();
+        let object = state
+            .objects
+            .values_mut()
+            .find(|v| v.bytes.starts_with(&bytes[..65536]))
+            .unwrap();
+        object.bytes[0] ^= 1;
+    }
+    let mut destination = Vec::new();
+    let err = file.read_range(0..10, &mut destination).await.unwrap_err();
+    assert_eq!(err.kind(), yinyang::core::ErrorKind::Corrupt);
+    assert!(destination.is_empty());
+    assert!(file.read(0, 10).await.is_err());
 }
 
 async fn identity_access(runtime: &Runtime) {
@@ -149,7 +240,7 @@ async fn file_operations_share_object_and_service_contract() {
     let object = Fs::create(backend.operator(), BackendProfile::Minio)
         .await
         .unwrap();
-    exercise(Arc::new(object), &temp.path().join("object")).await;
+    exercise(Arc::new(object), &temp.path().join("object"), &backend).await;
     let backend = TestBackend::default();
     let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
         .await
@@ -161,7 +252,7 @@ async fn file_operations_share_object_and_service_contract() {
     let client = ServiceClient::connect(addr, token.into(), backend.operator())
         .await
         .unwrap();
-    exercise(Arc::new(client), &temp.path().join("service")).await;
+    exercise(Arc::new(client), &temp.path().join("service"), &backend).await;
     server.abort();
 }
 

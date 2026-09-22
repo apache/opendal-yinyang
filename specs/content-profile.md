@@ -69,6 +69,13 @@ Each unit's physical and logical hashes are checked before releasing its
 requested bytes. A failure in a later unit may leave a verified prefix. Unread
 units are not scrubbed as a side effect of a range read.
 
+`Snapshot::open_file(NodeId)` binds a `FileVersion` to published node metadata
+and its revision without fetching payload. Its range reads reuse this profile's
+verification and do not prepare content or materialize local staging. Content
+and metadata stay pinned across concurrent namespace and file changes; a fresh
+snapshot is required to observe a newer version. This is an immutable reader,
+not a writable file handle or an offline content cache.
+
 ## Preparation authority
 
 `ContentDescriptor` is serializable and untrusted. `PreparedContent` is not

@@ -241,7 +241,7 @@ impl Runtime {
         node: NodeId,
         writable: bool,
     ) -> Result<FileHandle> {
-        let file = snapshot.content(node).await?;
+        let file = snapshot.open_file(node).await?;
         if file.descriptor().content_id().length() > i64::MAX as u64 {
             return Err(Error::Invalid("file exceeds staging length limit"));
         }
@@ -263,10 +263,7 @@ impl Runtime {
         while offset < r.length {
             let end = (offset + CHUNK).min(r.length);
             let mut bytes = Vec::new();
-            self.authority()
-                .data()
-                .read_range(file.descriptor(), offset..end, &mut bytes)
-                .await?;
+            file.read_range(offset..end, &mut bytes).await?;
             self.inner
                 .stage
                 .initial_chunk(r.id, offset / CHUNK, bytes)
