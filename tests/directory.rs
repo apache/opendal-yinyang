@@ -350,7 +350,7 @@ async fn invalid_names_fail_before_upload() {
             .await
             .unwrap_err()
             .kind(),
-        ErrorKind::Invalid
+        ErrorKind::InvalidName
     );
     assert_eq!(backend.state.lock().unwrap().objects.len(), count);
 }

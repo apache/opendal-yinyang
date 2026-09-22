@@ -75,6 +75,7 @@ publication. Callers needing frozen namespace replay use Authority/Planner.
 | sync_local | Report local durable and remote published positions; does not publish. |
 | flush / fsync / commit | Prepare bytes and conditionally publish their metadata; success means remote durability, not just local acceptance. |
 | close | Publish dirty data, then release staging. Failure keeps the handle open/recoverable. |
+| release | Consume the caller's handle reference and return its recovery UUID. Do not publish, delete staging, acknowledge errors, or resolve a frozen request. |
 | abort | Discard a never-dispatched or definitively conflicted handle. Refuse an unresolved frozen request. |
 | drop | Release the in-process lease only. Neither publish nor discard staging. |
 
@@ -101,13 +102,51 @@ recovers by replaying the original request and reading its original receipt.
 
 ## Staging and errors
 
-The experimental local profile `yinyang-stage-1` stores filesystem binding,
+Local acceptance, remote completion and reference release are separate events.
+After release, a caller may immediately recover the UUID in the same runtime;
+after restart, the same ID recovers the durable state. Release initiates no
+publication or staging mutation and makes no remote completion claim. Even a clean released handle stays in
+staging until explicit close or abort. A failed close can be followed by release
+without losing bytes, the frozen request, or the error ledger.
+
+`Error::kind()` exposes domain categories, not platform status codes. Namespace
+failures distinguish NotFound, AlreadyExists, InvalidName, NotDirectory,
+IsDirectory and NotEmpty. Runtime failures distinguish ReadOnly, Busy, Closed,
+Frozen and TooLarge; publication distinguishes Conflict, Retryable and Unknown.
+Corrupt, Unsupported, Storage, Io, PermissionDenied and NoSpace preserve the
+available failure category without parsing messages. Invalid covers other
+contract violations; unknown backend failures remain Storage/Io rather than
+being guessed as conflicts or safe retries. `Error::commit_id()` retains the
+original Unknown publication identity.
+
+`HandleStatus::error` and `WritebackError::error` contain a typed `Failure`
+with kind, diagnostic message and optional commit ID. Clean fsync/close returns
+the retained category until acknowledgment. Clearing the volume ledger does not
+clear an active handle's error, pending data or frozen request.
+
+The experimental local profile `yinyang-stage-2` stores filesystem binding,
 handle records, chunk rows, and an error ledger in `staging.db` with WAL and
 `synchronous=FULL`. The process lock is `runtime.lock`. Keep WAL with the
 database; a copied live main database alone is not a supported backup.
 Incomplete opens were never exposed and are discarded on reopen. Completed
 handles and accepted writes survive process restart. There is no stable
 migration promise for this local experimental format.
+
+Opening stage-1 performs a single SQLite transaction that adds nullable
+`failure BLOB` columns to handles and errors and advances the profile to
+stage-2. Original handle records, chunks, frozen requests and ledger sequences
+are preserved. Inspect supports either profile without upgrading it. Old
+message-only failures report Unclassified; their kind and commit identity are
+not inferred from prose. Older binaries reject stage-2; downgrade is unsupported.
+The upgrade changes only local staging, not remote metadata or content.
+
+Failure blobs use Borsh `(kind: u8, message: String, commit: Option<[u8;16]>)`.
+Kind tags, in order from 0 through 21, are Invalid, InvalidName, NotFound,
+AlreadyExists, NotDirectory, IsDirectory, NotEmpty, ReadOnly, PermissionDenied,
+Busy, Closed, Frozen, TooLarge, Conflict, Retryable, Unknown, Corrupt, Unsupported,
+Storage, Io, NoSpace and Unclassified. New handle records keep the original
+message field as a diagnostic copy; typed details live in the adjacent column.
+An operation failure records both fields and its ledger entry atomically.
 
 Failures are returned immediately and retained on the handle and volume ledger.
 A successful retry clears the active handle error, not the ledger. A clean
@@ -128,6 +167,10 @@ The file-operation tests exercise public Runtime/FileHandle methods against
 object and authenticated service authorities. They cover sparse gaps, append,
 cross-chunk truncation/extension, pinned visibility, rename/unlink, conflicting
 writers, failed uploads/close, frozen unknown requests, and reopening staging.
+They also cover explicit reference release without publication, typed errors
+through both authorities, retained Unknown identity, and stage-1 upgrades with
+pending data and frozen requests. Range-reader tests verify bounded payload I/O
+and corruption rejection without staging.
 Production power-loss testing, capacity benchmarks, incremental upload
 optimization, OS-specific mount behavior, and Sync reconciliation remain
 separate work.

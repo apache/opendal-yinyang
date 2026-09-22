@@ -257,7 +257,11 @@ impl Snapshot {
             Error::new(ErrorKind::NotFound, "open file version", "node is absent")
         })?;
         if node.is_directory() {
-            return Err(Error::invalid("open file version", "node is a directory"));
+            return Err(Error::new(
+                ErrorKind::IsDirectory,
+                "open file version",
+                "node is a directory",
+            ));
         }
         Ok(FileVersion {
             data: self.data.clone(),
@@ -324,7 +328,11 @@ impl Snapshot {
             .await?
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "read directory", "node is absent"))?;
         if !node.is_directory() {
-            return Err(Error::invalid("read directory", "node is not a directory"));
+            return Err(Error::new(
+                ErrorKind::NotDirectory,
+                "read directory",
+                "node is not a directory",
+            ));
         }
         Ok(node)
     }
@@ -392,7 +400,11 @@ impl Snapshot {
             .kind
         {
             NodeKind::File(file) => self.data.published(file),
-            _ => Err(Error::invalid("read content", "node is a directory")),
+            _ => Err(Error::new(
+                ErrorKind::IsDirectory,
+                "read content",
+                "node is a directory",
+            )),
         }
     }
     pub async fn receipt(&self, id: CommitId) -> Result<Option<Receipt>> {

@@ -81,6 +81,13 @@ typed errors. Maximum batch size is 4096; scans request at most 4097 records.
 The server handles at most 32 active connections, each with a 60-second timeout.
 This wire profile is experimental and is not a stable interoperability promise.
 
+Error responses retain the existing tag order: Invalid=0, Corrupt=1,
+NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional
+domain tags are InvalidName=7, NotDirectory=8, IsDirectory=9, NotEmpty=10 and
+PermissionDenied=11. Diagnostics remain strings. Clients reject unknown tags;
+deploy matching client/server versions for these new categories. This extends
+error reporting, not the persisted metadata or transaction encoding.
+
 ## Failure and recovery
 
 Database contention before commit returns `Retryable`; replay the original

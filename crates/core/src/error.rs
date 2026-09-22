@@ -27,6 +27,11 @@ pub enum ErrorKind {
     Unsupported,
     Storage,
     Io,
+    InvalidName,
+    NotDirectory,
+    IsDirectory,
+    NotEmpty,
+    PermissionDenied,
 }
 
 /// Error returned by the YinYang Format core.
@@ -71,7 +76,11 @@ impl Error {
     }
 
     pub(crate) fn from_storage(operation: &'static str, error: opendal::Error) -> Self {
-        Self::new(ErrorKind::Storage, operation, error.to_string())
+        let kind = match error.kind() {
+            opendal::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+            _ => ErrorKind::Storage,
+        };
+        Self::new(kind, operation, error.to_string())
     }
 
     pub(crate) fn from_io(operation: &'static str, error: std::io::Error) -> Self {

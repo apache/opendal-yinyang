@@ -28,43 +28,8 @@ use yinyang_core::{
 mod staging;
 use staging::{CHUNK, Record, Stage};
 
-#[derive(Debug)]
-pub enum Error {
-    Core(yinyang_core::Error),
-    Local(String),
-    Invalid(&'static str),
-    Conflict,
-    Retryable,
-    Unknown(CommitId),
-}
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Core(e) => write!(f, "{e}"),
-            Self::Local(e) => write!(f, "local staging: {e}"),
-            Self::Invalid(e) => write!(f, "{e}"),
-            Self::Conflict => write!(
-                f,
-                "opened file state changed or was unlinked; staged bytes are retained"
-            ),
-            Self::Retryable => write!(
-                f,
-                "publication is retryable; the original request is retained"
-            ),
-            Self::Unknown(id) => write!(
-                f,
-                "publication outcome is unknown for {id:?}; the original request is retained"
-            ),
-        }
-    }
-}
-impl std::error::Error for Error {}
-impl From<yinyang_core::Error> for Error {
-    fn from(e: yinyang_core::Error) -> Self {
-        Self::Core(e)
-    }
-}
-pub type Result<T> = std::result::Result<T, Error>;
+mod error;
+pub use error::{Error, ErrorKind, Failure, Result};
 
 /// Local and remote positions are distinct; a local write is not a remote receipt.
 #[derive(Clone, Debug)]
@@ -78,13 +43,13 @@ pub struct HandleStatus {
     pub pending: bool,
     pub frozen: bool,
     pub conflict: bool,
-    pub error: Option<String>,
+    pub error: Option<Failure>,
 }
 #[derive(Clone, Debug)]
 pub struct WritebackError {
     pub sequence: u64,
     pub handle: uuid::Uuid,
-    pub message: String,
+    pub error: Failure,
     pub persisted: bool,
 }
 #[derive(Clone, Debug)]
@@ -97,7 +62,7 @@ struct Inner {
     authority: Arc<dyn Authority>,
     stage: Stage,
     active: Mutex<BTreeSet<[u8; 16]>>,
-    volatile_errors: Mutex<BTreeMap<[u8; 16], String>>,
+    volatile_errors: Mutex<BTreeMap<[u8; 16], Failure>>,
 }
 /// One staging directory per active runtime. Different clients may have separate
 /// staging directories against the same authority; generation checks arbitrate.
@@ -136,7 +101,7 @@ impl Runtime {
     }
     fn require_write(&self) -> Result<()> {
         if self.inner.read_only {
-            Err(Error::Invalid("volume is read-only"))
+            Err(Error::State(ErrorKind::ReadOnly, "volume is read-only"))
         } else {
             Ok(())
         }
@@ -152,7 +117,7 @@ impl Runtime {
                 status.errors.push(WritebackError {
                     sequence: 0,
                     handle: uuid::Uuid::from_bytes(*id),
-                    message: message.clone(),
+                    error: message.clone(),
                     persisted: false,
                 });
                 if let Some(handle) = status.handles.iter_mut().find(|h| h.id.as_bytes() == id) {
@@ -184,14 +149,8 @@ impl Runtime {
         self.claim(r.id)
     }
     fn claim(&self, id: [u8; 16]) -> Result<FileHandle> {
-        if !self
-            .inner
-            .active
-            .lock()
-            .map_err(|e| Error::Local(e.to_string()))?
-            .insert(id)
-        {
-            return Err(Error::Invalid("handle already active"));
+        if !self.inner.active.lock().map_err(Error::local)?.insert(id) {
+            return Err(Error::State(ErrorKind::Busy, "handle already active"));
         }
         Ok(FileHandle {
             runtime: self.clone(),
@@ -209,7 +168,7 @@ impl Runtime {
         let node = snapshot
             .resolve(path)
             .await?
-            .ok_or(Error::Invalid("file does not exist"))?;
+            .ok_or(Error::State(ErrorKind::NotFound, "file does not exist"))?;
         self.open_snapshot_node(snapshot, node.id(), writable).await
     }
     /// Opens a stable node identity at latest, independently of its current name.
@@ -243,7 +202,10 @@ impl Runtime {
     ) -> Result<FileHandle> {
         let file = snapshot.open_file(node).await?;
         if file.descriptor().content_id().length() > i64::MAX as u64 {
-            return Err(Error::Invalid("file exceeds staging length limit"));
+            return Err(Error::State(
+                ErrorKind::TooLarge,
+                "file exceeds staging length limit",
+            ));
         }
         let mut r = Record {
             id: *uuid::Uuid::new_v4().as_bytes(),
@@ -257,6 +219,7 @@ impl Runtime {
             plan: None,
             conflict: false,
             error: None,
+            failure: None,
         };
         self.inner.stage.save(r.clone()).await?;
         let mut offset = 0;
@@ -336,7 +299,7 @@ impl FileHandle {
     }
     fn live(&self) -> Result<()> {
         if self.closed {
-            Err(Error::Invalid("handle is closed"))
+            Err(Error::State(ErrorKind::Closed, "handle is closed"))
         } else {
             Ok(())
         }
@@ -353,37 +316,45 @@ impl FileHandle {
     }
     pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
         self.live()?;
-        self.runtime.inner.stage.read(self.id, offset, length).await
+        let result = self.runtime.inner.stage.read(self.id, offset, length).await;
+        self.report(result).await
     }
     pub async fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         self.live()?;
-        self.runtime.require_write()?;
-        let result = self
-            .runtime
-            .inner
-            .stage
-            .write(self.id, Some(offset), bytes.to_vec())
-            .await
-            .map(|_| ());
+        let result = async {
+            self.runtime.require_write()?;
+            self.runtime
+                .inner
+                .stage
+                .write(self.id, Some(offset), bytes.to_vec())
+                .await
+                .map(|_| ())
+        }
+        .await;
         self.report(result).await
     }
     /// Appends to this handle's private staged version; concurrent handles
     /// conflict at publication rather than silently merging their appends.
     pub async fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         self.live()?;
-        self.runtime.require_write()?;
-        let result = self
-            .runtime
-            .inner
-            .stage
-            .write(self.id, None, bytes.to_vec())
-            .await;
+        let result = async {
+            self.runtime.require_write()?;
+            self.runtime
+                .inner
+                .stage
+                .write(self.id, None, bytes.to_vec())
+                .await
+        }
+        .await;
         self.report(result).await
     }
     pub async fn truncate(&mut self, length: u64) -> Result<()> {
         self.live()?;
-        self.runtime.require_write()?;
-        let result = self.runtime.inner.stage.truncate(self.id, length).await;
+        let result = async {
+            self.runtime.require_write()?;
+            self.runtime.inner.stage.truncate(self.id, length).await
+        }
+        .await;
         self.report(result).await
     }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
@@ -393,12 +364,12 @@ impl FileHandle {
                 .runtime
                 .inner
                 .stage
-                .failure(self.id, error.to_string())
+                .failure(self.id, Failure::capture(error))
                 .await
                 .is_err()
                 && let Ok(mut errors) = self.runtime.inner.volatile_errors.lock()
             {
-                errors.insert(self.id, error.to_string());
+                errors.insert(self.id, Failure::capture(error));
             }
         }
         result
@@ -414,6 +385,7 @@ impl FileHandle {
         self.live()?;
         let mut record = self.runtime.inner.stage.load(self.id).await?;
         record.error = None;
+        record.failure = None;
         self.runtime.inner.stage.save(record).await?;
         if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
             errors.remove(&self.id);
@@ -436,7 +408,7 @@ impl FileHandle {
         let mut r = stage.load(self.id).await?;
         if r.local == r.remote {
             if let Some(error) = self.status().await?.error {
-                return Err(Error::Local(error));
+                return Err(Error::Retained(error));
             }
             return Ok(None);
         }
@@ -457,16 +429,14 @@ impl FileHandle {
                     if bytes.is_empty() {
                         return Err(Error::Invalid("staged data ended early"));
                     }
-                    sink.write_all(&bytes)
-                        .await
-                        .map_err(|e| Error::Local(e.to_string()))?;
+                    sink.write_all(&bytes).await.map_err(Error::local)?;
                     offset += bytes.len() as u64;
                 }
                 Ok::<_, Error>(())
             });
             let prepared = self.runtime.authority().prepare(&mut source).await;
             drop(source);
-            let produced = producer.await.map_err(|e| Error::Local(e.to_string()))?;
+            let produced = producer.await.map_err(Error::local)?;
             let prepared = prepared?;
             produced?;
             let snapshot = self
@@ -489,6 +459,7 @@ impl FileHandle {
                 r.remote = r.local;
                 r.plan = None;
                 r.error = None;
+                r.failure = None;
                 r.conflict = false;
                 stage.save(r).await?;
                 if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
@@ -511,18 +482,30 @@ impl FileHandle {
         self.live()?;
         let r = self.runtime.inner.stage.load(self.id).await?;
         if r.plan.is_some() && !r.conflict {
-            return Err(Error::Invalid("resolve the frozen request before aborting"));
+            return Err(Error::State(
+                ErrorKind::Frozen,
+                "resolve the frozen request before aborting",
+            ));
         }
-        self.runtime.inner.stage.remove(self.id).await?;
+        let result = self.runtime.inner.stage.remove(self.id).await;
+        self.report(result).await?;
         self.closed = true;
         Ok(())
     }
-    /// Failed close leaves the handle open and recoverable. Drop never swallows
-    /// the failure by retrying or silently discarding dirty state.
+    /// Release this caller's lease without publishing or deleting staging.
+    /// Returns the identity for recovery, including pending, frozen or failed
+    /// handles. Errors and data remain inspectable after the reference is gone.
+    pub fn release(self) -> Result<uuid::Uuid> {
+        self.live()?;
+        Ok(self.id())
+    }
+    /// Publish before deleting staging. Failure leaves the handle open and
+    /// recoverable; release or drop never retries or discards the failed data.
     pub async fn close(&mut self) -> Result<()> {
         self.live()?;
         self.fsync().await?;
-        self.runtime.inner.stage.remove(self.id).await?;
+        let result = self.runtime.inner.stage.remove(self.id).await;
+        self.report(result).await?;
         self.closed = true;
         Ok(())
     }

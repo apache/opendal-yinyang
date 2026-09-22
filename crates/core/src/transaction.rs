@@ -528,15 +528,23 @@ impl Working {
         self.original(id).await
     }
     async fn required(&mut self, id: NodeId) -> Result<Node> {
-        self.node(id)
-            .await?
-            .ok_or_else(|| Error::invalid("plan mutation", "node is absent"))
+        self.node(id).await?.ok_or_else(|| {
+            Error::new(
+                crate::ErrorKind::NotFound,
+                "plan mutation",
+                "node is absent",
+            )
+        })
     }
     async fn directory(&mut self, id: NodeId) -> Result<Node> {
         self.guard(id, KIND).await?;
         let node = self.required(id).await?;
         if !node.is_directory() {
-            return Err(Error::invalid("plan mutation", "parent is not a directory"));
+            return Err(Error::new(
+                crate::ErrorKind::NotDirectory,
+                "plan mutation",
+                "parent is not a directory",
+            ));
         }
         Ok(node)
     }
@@ -632,7 +640,11 @@ impl Working {
                 self.guard_entry(&key).await?;
                 self.guard(*id, KIND).await?;
                 if self.entry(&key).await?.is_some() || self.node(*id).await?.is_some() {
-                    return Err(Error::invalid("create node", "name or identity exists"));
+                    return Err(Error::new(
+                        crate::ErrorKind::AlreadyExists,
+                        "create node",
+                        "name or identity exists",
+                    ));
                 }
                 let kind = match file {
                     Some(file) => NodeKind::File(self.base.data.accept(file)?),
@@ -661,7 +673,11 @@ impl Working {
                 self.guard(*id, STATE).await?;
                 let mut node = self.required(*id).await?;
                 if node.is_directory() {
-                    return Err(Error::invalid("set content", "node is a directory"));
+                    return Err(Error::new(
+                        crate::ErrorKind::IsDirectory,
+                        "set content",
+                        "node is a directory",
+                    ));
                 }
                 node.kind = NodeKind::File(self.base.data.accept(file)?);
                 self.nodes.insert(*id, Some(node));
@@ -689,7 +705,11 @@ impl Working {
                     .await?
                     .is_some_and(|v| v.node_id != *id)
                 {
-                    return Err(Error::invalid("rename", "destination exists"));
+                    return Err(Error::new(
+                        crate::ErrorKind::AlreadyExists,
+                        "rename",
+                        "destination exists",
+                    ));
                 }
                 if node.is_directory() {
                     let mut ancestor = *parent;
@@ -732,7 +752,11 @@ impl Working {
                 if matches!(node.kind, NodeKind::Directory { .. }) {
                     self.guard(*id, MEMBERSHIP).await?;
                     if !self.list(*id).await?.is_empty() {
-                        return Err(Error::invalid("remove", "directory is not empty"));
+                        return Err(Error::new(
+                            crate::ErrorKind::NotEmpty,
+                            "remove",
+                            "directory is not empty",
+                        ));
                     }
                 }
                 self.nodes.insert(*id, None);
