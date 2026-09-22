@@ -9,6 +9,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Authenticated content profile](content-profile.md) | Experimental range verification and trusted preparation; independent of publication authority. |
 | [Metadata service](metadata-service.md) | Experimental durable SQLite authority and authenticated loopback protocol. |
 | [File-operation runtime](file-runtime.md) | Pinned Managed handles, durable staging, conditional fsync, and recovery. |
+| [Volume capabilities](volume-capabilities.md) | Configuration, four-layer admission, read-only enforcement, and CLI status. |
 | [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage and metadata-service bindings implemented experimentally. |
 
 A specification describes the currently supported behavior, APIs, wire formats,

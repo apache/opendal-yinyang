@@ -21,6 +21,7 @@
 
 mod directory;
 pub mod runtime;
+pub mod volume;
 
 pub use directory::{directory_nodes, prepare_directory, publish_directory, restore_directory};
 pub use yinyang_core as core;
