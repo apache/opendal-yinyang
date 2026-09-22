@@ -86,6 +86,61 @@ async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path) {
         .sequence;
     runtime.acknowledge_errors(sequence).await.unwrap();
     assert!(runtime.status().await.unwrap().errors.is_empty());
+    identity_access(&runtime).await;
+}
+
+async fn identity_access(runtime: &Runtime) {
+    let root = runtime.authority().root();
+    runtime.create_directory(root, "dir").await.unwrap();
+    let snapshot = runtime.authority().observe_latest().await.unwrap();
+    let dir = snapshot.lookup(root, "dir").await.unwrap().unwrap().node_id;
+    runtime.create_file(dir, "a").await.unwrap();
+    runtime.create_file(dir, "b").await.unwrap();
+    let mut file = runtime.open_file("dir/a", true).await.unwrap();
+    file.write(0, b"original").await.unwrap();
+    file.close().await.unwrap();
+    let pinned = runtime.authority().observe_latest().await.unwrap();
+    let first = pinned.scan(dir, None, 1).await.unwrap();
+    let node = first.entries[0].node_id;
+    assert_eq!(first.entries[0].name, "a");
+    assert_eq!(pinned.node(node).await.unwrap().unwrap().id(), node);
+    runtime.rename(node, root, "moved").await.unwrap();
+    runtime.create_file(dir, "a").await.unwrap();
+    let latest = runtime.authority().observe_latest().await.unwrap();
+    assert!(latest.scan(dir, first.next.as_ref(), 1).await.is_err());
+    let second = pinned.scan(dir, first.next.as_ref(), 1).await.unwrap();
+    assert_eq!(second.entries[0].name, "b");
+    assert!(second.next.is_none());
+    let mut by_id = runtime.open_node(node, true).await.unwrap();
+    assert_eq!(by_id.read(0, 20).await.unwrap(), b"original");
+    let mut replacement = runtime.open_file("dir/a", false).await.unwrap();
+    assert_ne!(replacement.status().await.unwrap().node, node);
+    assert!(replacement.read(0, 20).await.unwrap().is_empty());
+    replacement.close().await.unwrap();
+    by_id.write(0, b"modified").await.unwrap();
+    by_id.close().await.unwrap();
+    let mut historical = runtime
+        .open_node_at(pinned.revision(), node, true)
+        .await
+        .unwrap();
+    assert_eq!(historical.read(0, 20).await.unwrap(), b"original");
+    historical.write(0, b"obsolete").await.unwrap();
+    assert!(matches!(historical.fsync().await, Err(Error::Conflict)));
+    historical.abort().await.unwrap();
+    runtime.unlink(node).await.unwrap();
+    assert!(runtime.open_node(node, false).await.is_err());
+    let mut retained = runtime
+        .open_node_at(pinned.revision(), node, false)
+        .await
+        .unwrap();
+    assert_eq!(retained.read(0, 20).await.unwrap(), b"original");
+    retained.close().await.unwrap();
+    assert!(runtime.open_node(root, false).await.is_err());
+    let foreign = Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    let revision = foreign.observe_latest().await.unwrap().revision();
+    assert!(runtime.open_node_at(revision, node, false).await.is_err());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn file_operations_share_object_and_service_contract() {
