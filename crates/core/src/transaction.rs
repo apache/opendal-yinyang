@@ -16,9 +16,8 @@
 // under the License.
 
 use crate::data::PreparedContent;
-use crate::index::Index;
 use crate::namespace::{DirectoryEntry, Link, Node, NodeKind, encode, entry_key};
-use crate::object::{Change, ObjectFs, Snapshot};
+use crate::snapshot::{Change, Snapshot};
 use crate::{CommitId, Error, NodeId, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -133,8 +132,8 @@ impl Transaction {
             &bytes,
         ))
     }
-    pub(crate) fn validate(&self, fs: &ObjectFs) -> Result<()> {
-        if self.filesystem != fs.filesystem() || self.computed_digest()? != self.digest {
+    pub(crate) fn validate(&self, filesystem: NodeId) -> Result<()> {
+        if self.filesystem != filesystem || self.computed_digest()? != self.digest {
             return Err(Error::invalid(
                 "commit request",
                 "filesystem or canonical digest mismatch",
@@ -142,10 +141,7 @@ impl Transaction {
         }
         Ok(())
     }
-    pub(crate) async fn apply(
-        &self,
-        snapshot: &Snapshot,
-    ) -> Result<Option<(Index, Index, Vec<Change>)>> {
+    pub(crate) async fn apply(&self, snapshot: &Snapshot) -> Result<Option<Delta>> {
         for condition in &self.conditions {
             if !condition.matches(snapshot).await? {
                 return Ok(None);
@@ -515,7 +511,7 @@ impl Working {
         }
         Ok(())
     }
-    async fn finish(mut self) -> Result<(Index, Index, Vec<Change>)> {
+    async fn finish(mut self) -> Result<Delta> {
         let mut changed_parents = BTreeSet::new();
         for (key, entry) in &self.entries {
             if self
@@ -541,8 +537,8 @@ impl Working {
             }
         }
         let mut changes = Vec::new();
-        let mut nodes = self.base.nodes.clone();
-        let mut entries = self.base.entries.clone();
+        let mut nodes = Vec::new();
+        let mut entries = Vec::new();
         for (id, mut node) in self.nodes {
             let before = self.original_nodes.get(&id).cloned().flatten();
             if let (Some(old), Some(node)) = (&before, &mut node) {
@@ -559,13 +555,10 @@ impl Working {
                 }
             }
             if before != node {
-                nodes
-                    .set(
-                        &self.base.data,
-                        id.as_bytes().to_vec(),
-                        node.as_ref().map(Node::encode).transpose()?,
-                    )
-                    .await?;
+                nodes.push((
+                    id.as_bytes().to_vec(),
+                    node.as_ref().map(Node::encode).transpose()?,
+                ));
                 changes.push(Change {
                     before,
                     after: node,
@@ -574,16 +567,14 @@ impl Working {
         }
         for (key, entry) in self.entries {
             if self.original_entries.get(&key).unwrap() != &entry {
-                entries
-                    .set(
-                        &self.base.data,
-                        key,
-                        entry.as_ref().map(DirectoryEntry::encode).transpose()?,
-                    )
-                    .await?;
+                entries.push((key, entry.as_ref().map(DirectoryEntry::encode).transpose()?));
             }
         }
-        Ok((nodes, entries, changes))
+        Ok(Delta {
+            nodes,
+            entries,
+            changes,
+        })
     }
 }
 fn part(node: Option<&Node>, tag: u8) -> Result<Option<Vec<u8>>> {
@@ -616,6 +607,13 @@ fn increment(value: u64) -> Result<u64> {
     value
         .checked_add(1)
         .ok_or_else(|| Error::unsupported("commit", "generation space exhausted"))
+}
+
+/// Changed records, independent of an authority's physical index encoding.
+pub(crate) struct Delta {
+    pub nodes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub entries: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub changes: Vec<Change>,
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ mod identity;
 mod index;
 pub mod namespace;
 pub mod object;
+mod snapshot;
 pub mod transaction;
 
 pub use data::{ContentDescriptor, ContentId, DataStore, PreparedContent};

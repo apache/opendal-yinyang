@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::data::{DataStore, PackedRef, PreparedContent, RefWire};
+use crate::data::{DataStore, PackedRef, RefWire};
 use crate::index::Index;
-use crate::namespace::{
-    DirectoryEntry, Node, NodeKind, corrupt, decode, encode, entry_key, prefix_end,
-};
+use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
 use crate::transaction::Transaction;
-use crate::{CommitId, Error, ErrorKind, NodeId, Result};
+use crate::{Error, ErrorKind, NodeId, Result};
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
 
@@ -35,144 +33,23 @@ pub enum BackendProfile {
     Minio,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Revision {
-    sequence: u64,
-    nonce: [u8; 16],
-}
-type RevisionWire = (u64, [u8; 16]);
-impl Revision {
-    fn new(sequence: u64) -> Self {
-        Self {
-            sequence,
-            nonce: *uuid::Uuid::new_v4().as_bytes(),
-        }
-    }
-    pub fn to_bytes(self) -> [u8; 24] {
-        let mut bytes = [0; 24];
-        bytes[..8].copy_from_slice(&self.sequence.to_be_bytes());
-        bytes[8..].copy_from_slice(&self.nonce);
-        bytes
-    }
-    /// Decode an untrusted locator. observe_revision checks that the token
-    /// identifies a retained snapshot in this filesystem's authority lineage.
-    pub fn from_bytes(bytes: [u8; 24]) -> Self {
-        Self {
-            sequence: u64::from_be_bytes(bytes[..8].try_into().expect("fixed revision prefix")),
-            nonce: bytes[8..].try_into().expect("fixed revision nonce"),
-        }
-    }
-    fn wire(self) -> RevisionWire {
-        (self.sequence, self.nonce)
-    }
-    fn from_wire((sequence, nonce): RevisionWire) -> Self {
-        Self { sequence, nonce }
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Cursor {
-    pub revision: Revision,
-    pub ordinal: u32,
-}
-impl Cursor {
-    fn key(self) -> Vec<u8> {
-        let mut key = self.revision.to_bytes().to_vec();
-        key.extend(self.ordinal.to_be_bytes());
-        key
-    }
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Receipt {
-    pub commit_id: CommitId,
-    pub request_digest: [u8; 32],
-    pub cursor: Cursor,
-}
-type ReceiptWire = ([u8; 16], [u8; 32], RevisionWire, u32);
-impl Receipt {
-    fn encode(&self) -> Result<Vec<u8>> {
-        encode(&(
-            *self.commit_id.as_bytes(),
-            self.request_digest,
-            self.cursor.revision.wire(),
-            self.cursor.ordinal,
-        ))
-    }
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        let (id, request_digest, revision, ordinal): ReceiptWire = decode(bytes)?;
-        Ok(Self {
-            commit_id: CommitId::from_bytes(id),
-            request_digest,
-            cursor: Cursor {
-                revision: Revision::from_wire(revision),
-                ordinal,
-            },
-        })
-    }
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Outcome {
-    Committed(Receipt),
-    Conflict,
-    Retryable,
-    Unknown(CommitId),
-}
-#[derive(Clone, Debug)]
-pub struct Change {
-    pub before: Option<Node>,
-    pub after: Option<Node>,
-}
-#[derive(Clone, Debug)]
-pub struct ChangeRecord {
-    pub receipt: Receipt,
-    pub changes: Vec<Change>,
-}
-type ChangeWire = (Vec<u8>, Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>);
-impl ChangeRecord {
-    fn encode(&self) -> Result<Vec<u8>> {
-        encode(&(
-            self.receipt.encode()?,
-            self.changes
-                .iter()
-                .map(|v| {
-                    Ok((
-                        v.before.as_ref().map(Node::encode).transpose()?,
-                        v.after.as_ref().map(Node::encode).transpose()?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        ))
-    }
-    fn decode(bytes: &[u8], fs: NodeId) -> Result<Self> {
-        let (receipt, changes): ChangeWire = decode(bytes)?;
-        Ok(Self {
-            receipt: Receipt::decode(&receipt)?,
-            changes: changes
-                .into_iter()
-                .map(|(before, after)| {
-                    Ok(Change {
-                        before: before.map(|b| Node::decode(&b, fs)).transpose()?,
-                        after: after.map(|b| Node::decode(&b, fs)).transpose()?,
-                    })
-                })
-                .collect::<Result<_>>()?,
-        })
-    }
-}
-#[derive(Clone, Debug)]
-pub struct ScanToken {
-    descriptor: PackedRef,
-    directory: NodeId,
-    after: Vec<u8>,
-}
-#[derive(Clone, Debug)]
-pub struct DirectoryPage {
-    pub entries: Vec<DirectoryEntry>,
-    pub next: Option<ScanToken>,
-}
+// Kept available here for existing object-profile callers.
+pub use crate::snapshot::{
+    Change, ChangeRecord, Cursor, DirectoryPage, Outcome, Receipt, Revision, ScanToken, Snapshot,
+};
+use crate::snapshot::{RecordReader, RevisionWire, Rows, Table};
+use futures_util::future::BoxFuture;
+use std::sync::Arc;
 
-/// A pinned, lazily read snapshot. Its roots can only come from this authority.
+type SnapshotWire = (
+    [u8; 8],
+    [u8; 16],
+    [u8; 16],
+    RevisionWire,
+    [Option<RefWire>; 5],
+);
 #[derive(Clone, Debug)]
-pub struct Snapshot {
+struct ObjectState {
     pub(crate) data: DataStore,
     pub(crate) filesystem: NodeId,
     pub(crate) root: NodeId,
@@ -185,185 +62,23 @@ pub struct Snapshot {
     reference: PackedRef,
     etag: Option<String>,
 }
-type SnapshotWire = (
-    [u8; 8],
-    [u8; 16],
-    [u8; 16],
-    RevisionWire,
-    [Option<RefWire>; 5],
-);
-impl Snapshot {
-    pub const fn revision(&self) -> Revision {
-        self.revision
-    }
-    pub const fn root(&self) -> NodeId {
-        self.root
-    }
-    pub const fn filesystem(&self) -> NodeId {
-        self.filesystem
-    }
-    pub async fn node(&self, id: NodeId) -> Result<Option<Node>> {
-        let node = self
-            .nodes
-            .get(&self.data, id.as_bytes())
-            .await?
-            .map(|b| Node::decode(&b, self.filesystem))
-            .transpose()?;
-        if let Some(node) = &node
-            && (node.id != id
-                || (id == self.root) != node.link.is_none()
-                || (id == self.root && !node.is_directory()))
-        {
-            return Err(corrupt("node identity or root link disagrees"));
+impl ObjectState {
+    fn view(&self) -> Snapshot {
+        Snapshot {
+            data: self.data.clone(),
+            filesystem: self.filesystem,
+            root: self.root,
+            revision: self.revision,
+            reader: Arc::new(ObjectRecords {
+                data: self.data.clone(),
+                indexes: [
+                    self.nodes.clone(),
+                    self.entries.clone(),
+                    self.receipts.clone(),
+                    self.changes.clone(),
+                ],
+            }),
         }
-        Ok(node)
-    }
-    pub async fn lookup(&self, parent: NodeId, name: &str) -> Result<Option<DirectoryEntry>> {
-        self.require_directory(parent).await?;
-        self.entry(&entry_key(parent, name)?).await
-    }
-    pub(crate) async fn entry(&self, key: &[u8]) -> Result<Option<DirectoryEntry>> {
-        let entry = self
-            .entries
-            .get(&self.data, key)
-            .await?
-            .map(|b| DirectoryEntry::decode(&b))
-            .transpose()?;
-        if let Some(entry) = &entry {
-            let node = self
-                .node(entry.node_id)
-                .await?
-                .ok_or_else(|| corrupt("directory references missing node"))?;
-            let link = node
-                .link
-                .ok_or_else(|| corrupt("directory references root"))?;
-            if entry_key(link.parent, &entry.name)? != key || link.name != entry.name {
-                return Err(corrupt("parent link disagrees with directory entry"));
-            }
-        }
-        Ok(entry)
-    }
-    pub async fn resolve(&self, path: &str) -> Result<Option<Node>> {
-        let mut id = self.root;
-        if !path.is_empty() {
-            for name in path.split('/') {
-                let Some(entry) = self.lookup(id, name).await? else {
-                    return Ok(None);
-                };
-                id = entry.node_id;
-            }
-        }
-        self.node(id).await
-    }
-    async fn require_directory(&self, id: NodeId) -> Result<Node> {
-        let node = self
-            .node(id)
-            .await?
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "read directory", "node is absent"))?;
-        if !node.is_directory() {
-            return Err(Error::invalid("read directory", "node is not a directory"));
-        }
-        Ok(node)
-    }
-    pub async fn scan(
-        &self,
-        directory: NodeId,
-        token: Option<&ScanToken>,
-        limit: usize,
-    ) -> Result<DirectoryPage> {
-        if limit == 0 || limit > 4096 {
-            return Err(Error::unsupported(
-                "scan directory",
-                "page size must be 1..=4096",
-            ));
-        }
-        self.require_directory(directory).await?;
-        if token.is_some_and(|t| t.descriptor != self.reference || t.directory != directory) {
-            return Err(Error::invalid(
-                "scan directory",
-                "continuation belongs to another snapshot or directory",
-            ));
-        }
-        let upper = prefix_end(directory.as_bytes());
-        let mut rows = self
-            .entries
-            .scan(
-                &self.data,
-                directory.as_bytes(),
-                upper.as_deref(),
-                token.map(|t| t.after.as_slice()),
-                limit + 1,
-            )
-            .await?;
-        let more = rows.len() > limit;
-        rows.truncate(limit);
-        let next = if more {
-            Some(ScanToken {
-                descriptor: self.reference.clone(),
-                directory,
-                after: rows.last().unwrap().0.clone(),
-            })
-        } else {
-            None
-        };
-        let mut entries = Vec::new();
-        for (key, _) in rows {
-            entries.push(
-                self.entry(&key)
-                    .await?
-                    .ok_or_else(|| corrupt("scan lost entry"))?,
-            );
-        }
-        Ok(DirectoryPage { entries, next })
-    }
-    pub async fn content(&self, id: NodeId) -> Result<PreparedContent> {
-        match self
-            .node(id)
-            .await?
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "read content", "node is absent"))?
-            .kind
-        {
-            NodeKind::File(file) => self.data.published(file),
-            _ => Err(Error::invalid("read content", "node is a directory")),
-        }
-    }
-    pub async fn receipt(&self, id: CommitId) -> Result<Option<Receipt>> {
-        let value = self
-            .receipts
-            .get(&self.data, id.as_bytes())
-            .await?
-            .map(|b| Receipt::decode(&b))
-            .transpose()?;
-        if value
-            .as_ref()
-            .is_some_and(|r| r.commit_id != id || r.cursor.revision > self.revision)
-        {
-            return Err(corrupt("invalid receipt lineage"));
-        }
-        Ok(value)
-    }
-    pub async fn changes(&self, after: Option<Cursor>, limit: usize) -> Result<Vec<ChangeRecord>> {
-        if limit == 0 || limit > 4096 {
-            return Err(Error::unsupported(
-                "read changes",
-                "page size must be 1..=4096",
-            ));
-        }
-        let key = after.map(Cursor::key);
-        let rows = self
-            .changes
-            .scan(&self.data, &[], None, key.as_deref(), limit)
-            .await?;
-        let mut records = Vec::new();
-        for (key, bytes) in rows {
-            let record = ChangeRecord::decode(&bytes, self.filesystem)?;
-            if record.receipt.cursor.key() != key || record.receipt.cursor.revision > self.revision
-            {
-                return Err(corrupt("invalid change cursor"));
-            }
-            records.push(record);
-        }
-        Ok(records)
     }
     async fn persist(&mut self) -> Result<()> {
         let roots = [
@@ -388,6 +103,26 @@ impl Snapshot {
     }
 }
 
+#[derive(Debug)]
+struct ObjectRecords {
+    data: DataStore,
+    indexes: [Index; 4],
+}
+impl RecordReader for ObjectRecords {
+    fn get<'a>(&'a self, table: Table, key: &'a [u8]) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(self.indexes[table as usize].get(&self.data, key))
+    }
+    fn scan<'a>(
+        &'a self,
+        table: Table,
+        lower: &'a [u8],
+        upper: Option<&'a [u8]>,
+        after: Option<&'a [u8]>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Rows>> {
+        Box::pin(self.indexes[table as usize].scan(&self.data, lower, upper, after, limit))
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ObjectFs {
     operator: Operator,
@@ -430,7 +165,7 @@ impl ObjectFs {
             )
             .await?;
         let placeholder = nodes.0.clone().unwrap();
-        let mut snapshot = Snapshot {
+        let mut snapshot = ObjectState {
             data: data.clone(),
             filesystem,
             root,
@@ -474,7 +209,7 @@ impl ObjectFs {
         let snapshot = fs
             .load(head.reference, head.revision, Some(head.etag))
             .await?;
-        snapshot.require_directory(fs.root).await?;
+        snapshot.view().require_directory(fs.root).await?;
         Ok(fs)
     }
     pub fn data(&self) -> &DataStore {
@@ -487,6 +222,9 @@ impl ObjectFs {
         self.filesystem
     }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
+        Ok(self.observe_state().await?.view())
+    }
+    async fn observe_state(&self) -> Result<ObjectState> {
         let head = read_head(&self.operator)
             .await?
             .ok_or_else(|| corrupt("published head disappeared"))?;
@@ -501,7 +239,7 @@ impl ObjectFs {
         reference: PackedRef,
         revision: Revision,
         etag: Option<String>,
-    ) -> Result<Snapshot> {
+    ) -> Result<ObjectState> {
         let bytes = self.data.read_extent(&reference, 4096).await?;
         let (magic, fs, root, rev, roots): SnapshotWire = decode(&bytes)?;
         if magic != *b"YYSNAP02"
@@ -514,7 +252,7 @@ impl ObjectFs {
         let mut roots = roots
             .into_iter()
             .map(|r| r.map(PackedRef::from_wire).transpose().map(Index));
-        Ok(Snapshot {
+        Ok(ObjectState {
             data: self.data.clone(),
             filesystem: self.filesystem,
             root: self.root,
@@ -529,9 +267,9 @@ impl ObjectFs {
         })
     }
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
-        let latest = self.observe_latest().await?;
+        let latest = self.observe_state().await?;
         if latest.revision == revision {
-            return Ok(latest);
+            return Ok(latest.view());
         }
         let bytes = latest
             .history
@@ -544,8 +282,10 @@ impl ObjectFs {
                     "revision is not retained in this lineage",
                 )
             })?;
-        self.load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
-            .await
+        Ok(self
+            .load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
+            .await?
+            .view())
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
@@ -575,10 +315,10 @@ impl ObjectFs {
             ));
         }
         for request in requests {
-            request.validate(self)?;
+            request.validate(self.filesystem)?;
         }
         for _ in 0..8 {
-            let base = self.observe_latest().await?;
+            let base = self.observe_state().await?;
             let mut candidate = base.clone();
             candidate.revision = Revision::new(
                 base.revision
@@ -589,7 +329,7 @@ impl ObjectFs {
             let mut outcomes = Vec::new();
             let mut accepted = 0_u32;
             for request in requests {
-                if let Some(receipt) = candidate.receipt(request.id()).await? {
+                if let Some(receipt) = candidate.view().receipt(request.id()).await? {
                     if receipt.request_digest != request.digest() {
                         return Err(Error::invalid(
                             "commit",
@@ -599,12 +339,16 @@ impl ObjectFs {
                     outcomes.push(Outcome::Committed(receipt));
                     continue;
                 }
-                let Some((nodes, entries, changes)) = request.apply(&candidate).await? else {
+                let Some(delta) = request.apply(&candidate.view()).await? else {
                     outcomes.push(Outcome::Conflict);
                     continue;
                 };
-                candidate.nodes = nodes;
-                candidate.entries = entries;
+                for (key, value) in delta.nodes {
+                    candidate.nodes.set(&self.data, key, value).await?;
+                }
+                for (key, value) in delta.entries {
+                    candidate.entries.set(&self.data, key, value).await?;
+                }
                 let receipt = Receipt {
                     commit_id: request.id(),
                     request_digest: request.digest(),
@@ -629,7 +373,7 @@ impl ObjectFs {
                         Some(
                             ChangeRecord {
                                 receipt: receipt.clone(),
-                                changes,
+                                changes: delta.changes,
                             }
                             .encode()?,
                         ),
@@ -662,7 +406,7 @@ impl ObjectFs {
             {
                 Ok(_) => return Ok(outcomes),
                 Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => continue,
-                Err(_) => match self.observe_latest().await {
+                Err(_) => match self.observe_state().await {
                     Ok(current) if current.etag.as_ref() != Some(etag) => continue,
                     _ => return Ok(requests.iter().map(|r| Outcome::Unknown(r.id())).collect()),
                 },
@@ -704,7 +448,7 @@ fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()>
     }
     Ok(())
 }
-fn head_bytes(snapshot: &Snapshot) -> Result<Vec<u8>> {
+fn head_bytes(snapshot: &ObjectState) -> Result<Vec<u8>> {
     let mut bytes = encode(&(
         *b"YYHEAD02",
         0_u8,

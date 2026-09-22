@@ -9,6 +9,11 @@ release commitment.
 ## Public boundary
 
 `Fs` (`object::ObjectFs`) owns one filesystem and an OpenDAL operator.
+Snapshot reads and transaction evaluation share an authority-independent logical
+record boundary. Evaluation produces changed node and directory records; the
+object authority applies those changes to its copy-on-write indexes. Physical
+index writes are not part of logical predicate validation. This separation does
+not change the object encoding or publication point.
 `create` and `open` require an explicit `BackendProfile`: Amazon S3 or MinIO.
 The endpoint must provide that deployment's durable immutable writes, strongly
 consistent reads and atomic conditional writes. Selecting a profile is an
