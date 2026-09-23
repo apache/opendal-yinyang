@@ -21,7 +21,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use yinyang_core::{Authority, CommitId, CommitOutcome, NodeId, Planner, Receipt, Revision};
+use yinyang_core::{
+    Authority, CommitId, CommitOutcome, NodeId, Planner, Receipt, Revision, Snapshot,
+};
 
 mod staging;
 use staging::{CHUNK, Record, Stage};
@@ -197,8 +199,8 @@ impl Runtime {
             closed: false,
         })
     }
-    /// Opens one pinned node version and materializes verified bytes in bounded
-    /// chunks. Subsequent opens observe latest; existing handles are never rebased.
+    /// Resolves a path and opens its node in the same observation. Subsequent
+    /// opens observe latest; existing handles are never rebased.
     pub async fn open_file(&self, path: &str, writable: bool) -> Result<FileHandle> {
         if writable {
             self.require_write()?;
@@ -208,13 +210,44 @@ impl Runtime {
             .resolve(path)
             .await?
             .ok_or(Error::Invalid("file does not exist"))?;
-        let file = snapshot.content(node.id()).await?;
+        self.open_snapshot_node(snapshot, node.id(), writable).await
+    }
+    /// Opens a stable node identity at latest, independently of its current name.
+    /// Use the authority's Snapshot for identity queries, lookup and enumeration.
+    pub async fn open_node(&self, node: NodeId, writable: bool) -> Result<FileHandle> {
+        if writable {
+            self.require_write()?;
+        }
+        let snapshot = self.authority().observe_latest().await?;
+        self.open_snapshot_node(snapshot, node, writable).await
+    }
+    /// Opens a node in a retained revision of this runtime's authority. A write
+    /// from an old revision still checks its original predicates at publication.
+    pub async fn open_node_at(
+        &self,
+        revision: Revision,
+        node: NodeId,
+        writable: bool,
+    ) -> Result<FileHandle> {
+        if writable {
+            self.require_write()?;
+        }
+        let snapshot = self.authority().observe_revision(revision).await?;
+        self.open_snapshot_node(snapshot, node, writable).await
+    }
+    async fn open_snapshot_node(
+        &self,
+        snapshot: Snapshot,
+        node: NodeId,
+        writable: bool,
+    ) -> Result<FileHandle> {
+        let file = snapshot.content(node).await?;
         if file.descriptor().content_id().length() > i64::MAX as u64 {
             return Err(Error::Invalid("file exceeds staging length limit"));
         }
         let mut r = Record {
             id: *uuid::Uuid::new_v4().as_bytes(),
-            node: *node.id().as_bytes(),
+            node: *node.as_bytes(),
             base: snapshot.revision().to_bytes(),
             length: file.descriptor().content_id().length(),
             local: 0,

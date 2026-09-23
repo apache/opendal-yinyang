@@ -10,6 +10,18 @@ filesystem must honor file locks and SQLite synchronization.
 
 ## Handles and visibility
 
+Identity queries and enumeration use the authority's `Snapshot::node`, `lookup`
+and `scan` APIs. Keep one snapshot across directory pages: a continuation is
+bound to its filesystem, directory and revision, and cannot be applied to a
+fresh observation. NodeId is the identity; a path is only a convenience locator.
+
+`open_node(id, writable)` opens a node at latest, even after a rename.
+`open_node_at(revision, id, writable)` opens it in a retained revision validated
+by this runtime's authority. It can read a historical node after unlink; writes
+still conditionally publish against the original revision and cannot resurrect
+it. A revision from another filesystem is rejected. Reusing an old path for a
+new file never redirects an identity-based open to that new node.
+
 `open_file(path, writable)` observes latest once, resolves a stable NodeId, and
 materializes the pinned file into verified 64 KiB staging chunks. Memory used
 for materialization and upload is bounded by chunks; local disk use includes
