@@ -107,7 +107,7 @@ fn status(value: RuntimeStatus) {
     for e in value.errors {
         println!(
             "error {} handle {} persisted {}: {}",
-            e.sequence, e.handle, e.persisted, e.message
+            e.sequence, e.handle, e.persisted, e.error
         );
     }
 }

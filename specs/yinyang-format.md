@@ -77,6 +77,13 @@ not turn ambiguity into failure. Callers retain the request and commit identity.
 Invalid requests and malformed persistent state return typed errors, not
 semantic conflicts.
 
+Namespace errors distinguish an absent required node (NotFound), an occupied
+destination (AlreadyExists), a non-directory parent (NotDirectory), a directory
+used as a file (IsDirectory), a nonempty removal (NotEmpty), and an invalid
+portable component (InvalidName). Other structural violations remain Invalid.
+Missing optional lookup results remain None. These categories are shared with
+the service authority and do not change persisted node or transaction bytes.
+
 ## Names and ordering
 
 Components are NFC, 1–255 UTF-8 bytes, with no full-path length invariant.

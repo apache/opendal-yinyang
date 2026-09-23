@@ -163,7 +163,7 @@ impl Capabilities {
 impl VolumeConfig {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         serde_json::from_slice(bytes)
-            .map_err(|e| Error::Local(format!("volume configuration: {e}")))
+            .map_err(|e| Error::local(format!("volume configuration: {e}")))
     }
     /// Negotiation is read-only. Storage capabilities are semantic prerequisites
     /// for Managed operations, not claims that raw S3 implements atomic rename.

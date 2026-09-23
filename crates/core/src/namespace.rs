@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::data::ContentDescriptor;
-use crate::{Error, NodeId, Result};
+use crate::{Error, ErrorKind, NodeId, Result};
 use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
 
@@ -167,7 +167,8 @@ pub fn name_key(name: &str) -> Result<String> {
                 || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
         })
     {
-        return Err(Error::invalid(
+        return Err(Error::new(
+            ErrorKind::InvalidName,
             "validate name",
             "non-portable or non-NFC component",
         ));
@@ -184,7 +185,11 @@ pub fn name_key(name: &str) -> Result<String> {
             })
         })
     {
-        return Err(Error::invalid("validate name", "reserved device name"));
+        return Err(Error::new(
+            ErrorKind::InvalidName,
+            "validate name",
+            "reserved device name",
+        ));
     }
     Ok(folded)
 }

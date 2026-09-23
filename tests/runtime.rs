@@ -21,7 +21,7 @@ use std::sync::Arc;
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
-use yinyang::runtime::{Error, Runtime};
+use yinyang::runtime::{Error, ErrorKind, Runtime};
 
 async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend: &TestBackend) {
     let runtime = Runtime::open(authority.clone(), path).await.unwrap();
@@ -87,7 +87,109 @@ async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend
     runtime.acknowledge_errors(sequence).await.unwrap();
     assert!(runtime.status().await.unwrap().errors.is_empty());
     identity_access(&runtime).await;
+    completion_and_errors(&runtime, backend).await;
     version_reads(&runtime, backend).await;
+}
+
+async fn completion_and_errors(runtime: &Runtime, backend: &TestBackend) {
+    let root = runtime.authority().root();
+    assert_eq!(
+        runtime
+            .open_file("missing", false)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        runtime.open_node(root, false).await.err().unwrap().kind(),
+        ErrorKind::IsDirectory
+    );
+    assert_eq!(
+        runtime.create_file(root, "con").await.unwrap_err().kind(),
+        ErrorKind::InvalidName
+    );
+    runtime.create_file(root, "completion").await.unwrap();
+    assert_eq!(
+        runtime
+            .create_file(root, "completion")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::AlreadyExists
+    );
+    let mut file = runtime.open_file("completion", true).await.unwrap();
+    let node = file.status().await.unwrap().node;
+    assert_eq!(
+        runtime.create_file(node, "child").await.unwrap_err().kind(),
+        ErrorKind::NotDirectory
+    );
+    let snapshot = runtime.authority().observe_latest().await.unwrap();
+    let dir = snapshot.resolve("dir").await.unwrap().unwrap().id();
+    assert_eq!(
+        runtime.unlink(dir).await.unwrap_err().kind(),
+        ErrorKind::NotEmpty
+    );
+    assert_eq!(
+        runtime.recover(file.id()).await.err().unwrap().kind(),
+        ErrorKind::Busy
+    );
+    file.write(0, b"local only").await.unwrap();
+    let local = file.sync_local().await.unwrap();
+    assert!(local.pending);
+    assert_eq!(local.remote_generation, 0);
+    let writes = backend.state.lock().unwrap().written_bytes;
+    let id = file.release().unwrap();
+    assert_eq!(backend.state.lock().unwrap().written_bytes, writes);
+    assert!(
+        runtime
+            .authority()
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 20)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut file = runtime.recover(id).await.unwrap();
+    assert_eq!(file.read(0, 20).await.unwrap(), b"local only");
+    backend.state.lock().unwrap().fail_data_close = true;
+    assert_eq!(file.close().await.unwrap_err().kind(), ErrorKind::Storage);
+    let id = file.release().unwrap();
+    let status = runtime.status().await.unwrap();
+    let state = status.handles.iter().find(|s| s.id == id).unwrap();
+    assert!(state.pending);
+    assert_eq!(state.error.as_ref().unwrap().kind(), ErrorKind::Storage);
+    assert!(
+        status
+            .errors
+            .iter()
+            .any(|e| e.handle == id && e.error.kind() == ErrorKind::Storage)
+    );
+    backend.state.lock().unwrap().fail_data_close = false;
+    let mut file = runtime.recover(id).await.unwrap();
+    file.fsync().await.unwrap();
+    assert!(file.status().await.unwrap().error.is_none());
+    file.close().await.unwrap();
+    assert_eq!(file.read(0, 1).await.unwrap_err().kind(), ErrorKind::Closed);
+    let mut read_only = runtime.open_node(node, false).await.unwrap();
+    assert_eq!(
+        read_only.write(0, b"no").await.unwrap_err().kind(),
+        ErrorKind::ReadOnly
+    );
+    let id = read_only.release().unwrap();
+    let mut read_only = runtime.recover(id).await.unwrap();
+    assert_eq!(
+        read_only.close().await.unwrap_err().kind(),
+        ErrorKind::ReadOnly
+    );
+    read_only.acknowledge_error().await.unwrap();
+    read_only.close().await.unwrap();
 }
 
 async fn version_reads(runtime: &Runtime, backend: &TestBackend) {
@@ -331,12 +433,21 @@ async fn upload_failure_and_unknown_publication_keep_frozen_identity() {
     let Err(Error::Unknown(id)) = file.fsync().await else {
         panic!("expected unknown");
     };
+    let unknown = file.status().await.unwrap().error.unwrap();
+    assert_eq!(unknown.kind(), ErrorKind::Unknown);
+    assert_eq!(unknown.commit_id(), Some(id));
     assert!(file.status().await.unwrap().frozen);
     assert!(file.abort().await.is_err());
     assert!(file.write(0, b"different").await.is_err());
-    let handle = file.id();
-    drop(file);
+    let handle = file.release().unwrap();
     drop(runtime);
+    let inspected = Runtime::inspect(temp.path()).await.unwrap();
+    assert!(
+        inspected
+            .errors
+            .iter()
+            .any(|e| e.error.kind() == ErrorKind::Unknown && e.error.commit_id() == Some(id))
+    );
     // A later retry fences the delayed object CAS without changing the original request.
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     let mut file = runtime.recover(handle).await.unwrap();

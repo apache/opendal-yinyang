@@ -66,6 +66,11 @@ fn kind_tag(kind: ErrorKind) -> u8 {
         ErrorKind::Unsupported => 4,
         ErrorKind::Storage => 5,
         ErrorKind::Io => 6,
+        ErrorKind::InvalidName => 7,
+        ErrorKind::NotDirectory => 8,
+        ErrorKind::IsDirectory => 9,
+        ErrorKind::NotEmpty => 10,
+        ErrorKind::PermissionDenied => 11,
     }
 }
 fn tag_kind(tag: u8) -> Result<ErrorKind> {
@@ -77,8 +82,40 @@ fn tag_kind(tag: u8) -> Result<ErrorKind> {
         4 => ErrorKind::Unsupported,
         5 => ErrorKind::Storage,
         6 => ErrorKind::Io,
+        7 => ErrorKind::InvalidName,
+        8 => ErrorKind::NotDirectory,
+        9 => ErrorKind::IsDirectory,
+        10 => ErrorKind::NotEmpty,
+        11 => ErrorKind::PermissionDenied,
         _ => return Err(protocol()),
     })
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn domain_error_tags_round_trip_without_changing_existing_tags() {
+        let kinds = [
+            ErrorKind::Invalid,
+            ErrorKind::Corrupt,
+            ErrorKind::NotFound,
+            ErrorKind::AlreadyExists,
+            ErrorKind::Unsupported,
+            ErrorKind::Storage,
+            ErrorKind::Io,
+            ErrorKind::InvalidName,
+            ErrorKind::NotDirectory,
+            ErrorKind::IsDirectory,
+            ErrorKind::NotEmpty,
+            ErrorKind::PermissionDenied,
+        ];
+        for (tag, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(kind_tag(kind), tag as u8);
+            assert_eq!(tag_kind(tag as u8).unwrap(), kind);
+        }
+        assert!(tag_kind(255).is_err());
+    }
 }
 async fn read_frame<T: BorshDeserialize>(stream: &mut TcpStream) -> Result<T> {
     let length = stream.read_u32().await.map_err(io)? as usize;
