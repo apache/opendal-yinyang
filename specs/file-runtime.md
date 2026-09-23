@@ -10,6 +10,27 @@ filesystem must honor file locks and SQLite synchronization.
 
 ## Handles and visibility
 
+`Snapshot::open_file(NodeId)` returns an immutable `FileVersion`, independent of
+Runtime and staging. It reads only metadata when opening. `read(offset, length)`
+returns up to EOF, including an empty result for zero length or offsets beyond
+EOF. `read_range(range, destination)` streams an exact in-bounds range; invalid
+ranges fail before payload I/O. Only intersecting verification units and proof
+paths are read. Each unit is verified before delivery; a streaming error may
+leave a verified prefix. A Vec-returning read exposes no partial result on error.
+
+The version carries its observed node metadata, content descriptor and revision;
+clones read that same content even after remote writes, rename or unlink. It has
+no write methods, publication, staging lease or implicit rebasing. It needs
+access to the retained remote content, not a full local copy. Retain the NodeId
+and revision and reopen through the same authority to recover this observation.
+
+The recoverable `FileHandle` API below deliberately retains full materialization
+for both read-only and writable handles, including its offline staged reads.
+Use FileVersion for on-demand reads and provider downloads; use FileHandle for
+durable writable staging. Opening FileVersion does not create a staging record.
+Both paths use the same authenticated range reader. No remote format changes
+or local staging migrations are required.
+
 Identity queries and enumeration use the authority's `Snapshot::node`, `lookup`
 and `scan` APIs. Keep one snapshot across directory pages: a continuation is
 bound to its filesystem, directory and revision, and cannot be applied to a

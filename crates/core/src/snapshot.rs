@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::data::{DataStore, PreparedContent};
+use crate::data::{ContentDescriptor, DataStore, PreparedContent};
 use crate::namespace::{
     DirectoryEntry, Node, NodeKind, corrupt, decode, encode, entry_key, prefix_end,
 };
 use crate::{CommitId, Error, ErrorKind, NodeId, Result};
 use futures_util::future::BoxFuture;
+use std::ops::Range;
 use std::sync::Arc;
+use tokio::io::AsyncWrite;
 
 /// Logical record families shared by publication authorities.
 #[derive(Clone, Copy, Debug)]
@@ -182,6 +184,53 @@ pub struct DirectoryPage {
     pub next: Option<ScanToken>,
 }
 
+/// An immutable file observation. Opening reads metadata only; content is
+/// authenticated on demand without a local staging directory or write lease.
+#[derive(Clone, Debug)]
+pub struct FileVersion {
+    data: DataStore,
+    revision: Revision,
+    node: Node,
+}
+impl FileVersion {
+    /// The observation that selected this version, not the volume's latest revision.
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+    /// Metadata from the same observation as the content, including its NodeId.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+    pub fn descriptor(&self) -> &ContentDescriptor {
+        match self.node.kind() {
+            NodeKind::File(content) => content,
+            NodeKind::Directory { .. } => unreachable!("FileVersion requires a file node"),
+        }
+    }
+    /// Return up to EOF. Memory is proportional to returned bytes; use
+    /// read_range with a streaming destination for large transfers.
+    pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let size = self.descriptor().content_id().length();
+        let start = offset.min(size);
+        let end = offset.saturating_add(length as u64).min(size);
+        let mut bytes = Vec::new();
+        self.read_range(start..end, &mut bytes).await?;
+        Ok(bytes)
+    }
+    /// Authenticate intersecting units before delivering their bytes. The range
+    /// must lie within the file. A later error can leave a verified prefix in
+    /// the destination, but never an unverified unit or bytes from another version.
+    pub async fn read_range(
+        &self,
+        range: Range<u64>,
+        destination: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<()> {
+        self.data
+            .read_range(self.descriptor(), range, destination)
+            .await
+    }
+}
+
 /// A coherent, lazily read observation pinned to one retained revision.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -200,6 +249,21 @@ impl Snapshot {
     }
     pub const fn filesystem(&self) -> NodeId {
         self.filesystem
+    }
+    /// Pin a file's identity, metadata and content without reading its payload.
+    /// Clone the result for independent concurrent reads of this exact version.
+    pub async fn open_file(&self, id: NodeId) -> Result<FileVersion> {
+        let node = self.node(id).await?.ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "open file version", "node is absent")
+        })?;
+        if node.is_directory() {
+            return Err(Error::invalid("open file version", "node is a directory"));
+        }
+        Ok(FileVersion {
+            data: self.data.clone(),
+            revision: self.revision,
+            node,
+        })
     }
     pub async fn node(&self, id: NodeId) -> Result<Option<Node>> {
         let node = self
