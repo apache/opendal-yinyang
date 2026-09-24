@@ -1,0 +1,63 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: YinYang
+options:
+  deploymentTarget:
+    macOS: "27.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    MACOSX_DEPLOYMENT_TARGET: "27.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    GENERATE_INFOPLIST_FILE: YES
+    SWIFT_EMIT_LOC_STRINGS: NO
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0"
+targets:
+  YinYang:
+    type: application
+    platform: macOS
+    sources: [Host]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xuanwo.yinyang.prototype
+        CODE_SIGN_ENTITLEMENTS: "$(YINYANG_SOURCE_ROOT)/platforms/macos/Host/Host.entitlements"
+        INFOPLIST_KEY_CFBundleDisplayName: YinYang Prototype
+        PROVISIONING_PROFILE_SPECIFIER: ""
+    dependencies:
+      - target: YinYangFSKit
+        embed: true
+  YinYangFSKit:
+    type: extensionkit-extension
+    platform: macOS
+    sources: [Shared, FSKit]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xuanwo.yinyang.prototype.fskit
+        INFOPLIST_FILE: "$(YINYANG_SOURCE_ROOT)/platforms/macos/FSKit/Info.plist"
+        CODE_SIGN_ENTITLEMENTS: "$(YINYANG_SOURCE_ROOT)/platforms/macos/FSKit/FSKit.entitlements"
+        PROVISIONING_PROFILE_SPECIFIER: "$(YINYANG_FSKIT_PROFILE)"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(YINYANG_BRIDGING_HEADER)"
+        OTHER_LDFLAGS: ["$(inherited)", "$(YINYANG_NATIVE_LIBRARY)", "-framework", Security, "-framework", SystemConfiguration, "-lc++"]
+schemes:
+  YinYang:
+    build:
+      targets:
+        YinYang: all
