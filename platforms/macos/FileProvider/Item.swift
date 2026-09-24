@@ -15,27 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 import FileProvider
 import UniformTypeIdentifiers
 
 final class ProviderItem: NSObject, NSFileProviderItem {
-    let metadata: NativeItem
-    let root: String
-    init(_ metadata: NativeItem, root: String) { self.metadata = metadata; self.root = root }
-    var itemIdentifier: NSFileProviderItemIdentifier { metadata.node == root ? .rootContainer : NSFileProviderItemIdentifier(metadata.node) }
-    var parentItemIdentifier: NSFileProviderItemIdentifier {
-        guard let parent = metadata.parent, parent != root else { return .rootContainer }
-        return NSFileProviderItemIdentifier(parent)
-    }
-    var filename: String { metadata.name }
-    var contentType: UTType { metadata.directory ? .folder : .data }
-    var documentSize: NSNumber? { metadata.directory ? nil : NSNumber(value: metadata.size) }
-    var capabilities: NSFileProviderItemCapabilities {
-        metadata.directory ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading, .allowsWriting]
-    }
-    var itemVersion: NSFileProviderItemVersion {
-        NSFileProviderItemVersion(contentVersion: Data(metadata.revision.utf8), metadataVersion: Data(metadata.revision.utf8))
-    }
+  let metadata: NativeItem
+  let root: String
+  init(_ metadata: NativeItem, root: String) {
+    self.metadata = metadata
+    self.root = root
+  }
+  var itemIdentifier: NSFileProviderItemIdentifier {
+    metadata.node == root ? .rootContainer : NSFileProviderItemIdentifier(metadata.node)
+  }
+  var parentItemIdentifier: NSFileProviderItemIdentifier {
+    guard let parent = metadata.parent, parent != root else { return .rootContainer }
+    return NSFileProviderItemIdentifier(parent)
+  }
+  var filename: String { metadata.name }
+  var contentType: UTType { metadata.directory ? .folder : .data }
+  var documentSize: NSNumber? { metadata.directory ? nil : NSNumber(value: metadata.size) }
+  var capabilities: NSFileProviderItemCapabilities {
+    metadata.directory
+      ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading, .allowsWriting]
+  }
+  var itemVersion: NSFileProviderItemVersion {
+    NSFileProviderItemVersion(
+      contentVersion: Data(metadata.revision.utf8), metadataVersion: Data(metadata.revision.utf8))
+  }
 }
-
