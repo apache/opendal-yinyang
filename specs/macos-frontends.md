@@ -47,3 +47,47 @@ disk capacity claim. Unsupported metadata is not marked consumed.
 There is no conflict-resolution UI. Retained failures and bytes remain in the
 runtime staging journal; operators must not delete that directory to recover a
 failed write.
+
+## File Provider Sync
+
+`cargo x macos --file-provider` also embeds a replicated File Provider extension.
+The host registers generated UUID domains only after the operator selects an
+isolated resource. Host and extension share `group.com.xuanwo.yinyang.prototype`.
+Each domain stores a private copy of its native configuration and `sync-state`
+under its UUID directory. Credentials never travel through `domain.userInfo`.
+Removing a test domain retains this staging for recovery; the OS may remove its
+downloaded test copies. Existing domains from other providers are not touched.
+
+Item identity is the complete core NodeId. Content and metadata versions carry
+an immutable observation revision. Full and aligned partial downloads pin that
+revision for every chunk. Partial content is written at the original file offset
+in an OS-provided temporary file. Cancellation stops between chunks and removes
+unreturned downloads. The extension closes and synchronizes the file before its
+completion callback transfers ownership to the OS. Crash-orphan temporary-file
+cleanup has not been validated through the system lifecycle.
+
+Only replacement content of existing files is writable. Directory creation,
+deletion, rename, metadata mutation and conflict-resolution UI are unsupported;
+item capabilities do not advertise them. Upload stages a baseline-bound Sync
+edit and reports its accepted revision. Identical retries reuse the same edit;
+conflicts preserve both local bytes and remote state. The completion applies to
+the supplied OS version; it does not separately mark later local edits in sync.
+
+Directory pages pin one revision. The working set recursively includes the whole
+tree, including every materialized item. Page and change tokens bind domain and
+container and stay below the platform's 500-byte limit. They contain revision
+and ordinal offsets, never process-local references or a growing directory queue.
+Restart rewalks immutable pages; large-tree performance is not a supported claim.
+Change enumeration splits even a large commit across bounded callbacks while
+advancing the core receipt cursor only after all of its node changes are delivered.
+Malformed or foreign tokens expire rather than silently restarting midway.
+
+While the extension is alive, a five-second poll of the authoritative revision
+signals the working set and active enumerators. The host's Refresh action can
+wake an idle domain. There is no background push delivery guarantee while the
+extension is not running. File Provider local fsync remains an OS-local operation,
+not a Mount-style remote durability acknowledgment.
+
+Unsigned builds and real-core callback tests do not establish signed domain
+registration, Finder hydration, OS upload scheduling, OS-driven cancellation or
+extension restart acceptance. Those remain explicit platform validation gates.
