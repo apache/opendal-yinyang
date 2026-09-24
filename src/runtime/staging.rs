@@ -353,6 +353,12 @@ impl Stage {
         .await
     }
     pub async fn truncate(&self, id: [u8; 16], length: u64) -> Result<()> {
+        self.resize(id, length, false).await
+    }
+    pub async fn reset_content(&self, id: [u8; 16]) -> Result<()> {
+        self.resize(id, 0, true).await
+    }
+    async fn resize(&self, id: [u8; 16], length: u64, replacement: bool) -> Result<()> {
         self.call(move |c| {
             if length > i64::MAX as u64 {
                 return Err(Error::State(ErrorKind::TooLarge, "file length overflows"));
@@ -360,7 +366,7 @@ impl Stage {
             let tx = c.transaction().map_err(local)?;
             let mut r = record(&tx, id)?;
             mutable(&r)?;
-            if length == r.length {
+            if length == r.length && !replacement {
                 return Ok(());
             }
             if length < r.length {
