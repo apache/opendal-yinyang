@@ -64,6 +64,24 @@ Unknown includes the commit ID for receipt lookup. These convenience namespace
 methods do not persist a replay journal; durable replay applies to file-handle
 publication. Callers needing frozen namespace replay use Authority/Planner.
 
+`rename` never replaces a different destination node. `rename_replace` allows
+replacement of an observed destination of the same kind, with an empty
+directory required for directory replacement. Destination content, attributes,
+link and directory membership are guarded: a concurrent destination edit,
+replacement or new child conflicts. The source keeps its identity. Existing
+versions and staged handles of the replaced node retain their bytes, but cannot
+publish back to the removed identity. Same-node renames preserve identity and
+allow case-only spelling changes. Replacing a file with a directory returns
+NotDirectory; replacing a directory with a file returns IsDirectory.
+
+The planner composes a guarded remove and rename in one frozen transaction,
+without changing the request or remote storage format. No intermediate removal
+is published. A failed `Planner::rename_replace` leaves the planner unchanged.
+Like the other namespace conveniences, Runtime does not journal this operation
+for cross-process replay; a caller requiring that guarantee persists the frozen
+transaction before dispatch. This primitive supports safe-save adapters but
+does not by itself provide a mounted editor workflow.
+
 ## Local writes and remote publication
 
 | Operation | Contract |
