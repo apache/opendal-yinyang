@@ -11,6 +11,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [File-operation runtime](file-runtime.md) | Pinned Managed handles, durable staging, conditional fsync, and recovery. |
 | [Mount runtime](mount-runtime.md) | Instance-local shared nodes, explicit refresh, remote fsync, and retained failures. |
 | [Sync runtime](sync-runtime.md) | Baseline-bound local edits, conditional publication, conflict retention, and exact retry. |
+| [Native bridge](native-bridge.md) | In-process ownership and private adapter request semantics. |
 | [Volume capabilities](volume-capabilities.md) | Configuration, four-layer admission, read-only enforcement, and CLI status. |
 | [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage and metadata-service bindings implemented experimentally. |
 
