@@ -630,29 +630,25 @@ mod tests {
             });
             waiting.await.unwrap();
             let writer = stage.clone();
-            let submitted = tokio::spawn(async move {
-                writer
-                    .call(|c| {
-                        c.execute(
-                            "INSERT INTO errors(handle,message) VALUES(?1,'accepted')",
-                            params![[0_u8; 16].as_slice()],
-                        )
-                        .map_err(local)?;
-                        Ok(())
-                    })
-                    .await
-            });
+            let mut submitted = Box::pin(writer.call(|c| {
+                c.execute(
+                    "INSERT INTO errors(handle,message) VALUES(?1,'accepted')",
+                    params![[0_u8; 16].as_slice()],
+                )
+                .map_err(local)?;
+                Ok(())
+            }));
             // The only blocking worker is occupied. Submission must hold the
-            // connection before its SQL closure can start.
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while stage.db.try_lock().is_ok() {
-                    tokio::task::yield_now().await;
-                }
+            // connection before its SQL closure can start. Poll the call itself:
+            // try_lock alone can observe a reserved permit before the writer has
+            // resumed and submitted its blocking work.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(submitted.as_mut(), cx).is_pending());
+                assert!(stage.db.try_lock().is_err());
+                std::task::Poll::Ready(())
             })
-            .await
-            .unwrap();
-            submitted.abort();
-            let _ = submitted.await;
+            .await;
+            drop(submitted);
             let reader = tokio::spawn(async move { stage.status().await.unwrap() });
             release.send(()).unwrap();
             blocker.await.unwrap();
