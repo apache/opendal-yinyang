@@ -121,19 +121,26 @@ jobs:
 
       - name: Start isolated S3-compatible storage
         run: |
-          docker run -d --name yinyang-minio -p 127.0.0.1:9000:9000 \
+          docker run -d --name yinyang-silo -p 127.0.0.1:9000:9000 \
             -e MINIO_ROOT_USER=yinyang-test -e MINIO_ROOT_PASSWORD=yinyang-test-only \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/live; then break; fi
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then break; fi
             sleep 1
           done
-          curl --fail http://127.0.0.1:9000/minio/health/live
-          docker exec yinyang-minio mc alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
-          docker exec yinyang-minio mc mb local/yinyang-test
+          curl --fail http://127.0.0.1:9000/minio/health/ready
+          docker exec yinyang-silo mcli alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
+          docker exec yinyang-silo mcli mb local/yinyang-test
 
       - name: Exercise core publication and CLI round trips
         run: cargo test --workspace --all-targets s3_ -- --ignored --nocapture
+
+      - name: Show storage logs on failure
+        if: failure()
+        run: |
+          if docker container inspect yinyang-silo > /dev/null 2>&1; then
+            docker logs yinyang-silo
+          fi
 
   required:
     name: Required
