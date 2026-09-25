@@ -41,6 +41,7 @@ impl Command {
             SubCommand::Licenses(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
+            SubCommand::Macos(cmd) => cmd.run(),
         }
     }
 }
@@ -55,6 +56,78 @@ enum SubCommand {
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+    #[clap(about = "Build the macOS native prototypes (requires Xcode 27 and XcodeGen).")]
+    Macos(CommandMacos),
+}
+
+#[derive(Parser)]
+struct CommandMacos {
+    #[arg(long, default_value = "target/macos")]
+    output: std::path::PathBuf,
+    #[arg(long, requires_all = ["team", "fskit_profile"])]
+    identity: Option<String>,
+    #[arg(long, requires = "identity")]
+    team: Option<String>,
+    #[arg(long, requires = "identity")]
+    fskit_profile: Option<String>,
+}
+impl CommandMacos {
+    fn run(self) {
+        if !cfg!(target_os = "macos") {
+            panic!("native macOS build requires macOS");
+        }
+        let root = std::path::Path::new(env!("CARGO_WORKSPACE_DIR"));
+        let output = root.join(self.output);
+        let target =
+            root.join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
+        let mut cargo = find_command("cargo");
+        cargo.args(["build", "-p", "yinyang-native"]);
+        run_command(cargo);
+        std::fs::create_dir_all(&output).expect("create native build directory");
+        let mut generate = find_command("xcodegen");
+        generate.args([
+            "generate",
+            "--spec",
+            "platforms/macos/project.yml",
+            "--project",
+        ]);
+        generate.arg(&output);
+        run_command(generate);
+        let mut build = find_command("xcodebuild");
+        build.arg("-project").arg(output.join("YinYang.xcodeproj"));
+        build.args([
+            "-scheme",
+            "YinYang",
+            "-configuration",
+            "Debug",
+            "-derivedDataPath",
+        ]);
+        build.arg(output.join("DerivedData"));
+        build.args(["-destination", "platform=macOS", "build"]);
+        build.arg(format!("YINYANG_SOURCE_ROOT={}", root.display()));
+        build.arg(format!(
+            "YINYANG_NATIVE_LIBRARY={}",
+            target.join("debug/libyinyang_native.a").display()
+        ));
+        build.arg(format!(
+            "YINYANG_BRIDGING_HEADER={}",
+            root.join("crates/native/include/yinyang.h").display()
+        ));
+        if let Some(identity) = self.identity {
+            build.arg(format!("CODE_SIGN_IDENTITY={identity}"));
+            build.arg(format!(
+                "DEVELOPMENT_TEAM={}",
+                self.team.expect("team required")
+            ));
+            build.arg(format!(
+                "YINYANG_FSKIT_PROFILE={}",
+                self.fskit_profile.expect("profile required")
+            ));
+        } else {
+            build.arg("CODE_SIGNING_ALLOWED=NO");
+        }
+        run_command(build);
+    }
 }
 
 #[derive(Parser)]
