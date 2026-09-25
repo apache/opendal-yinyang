@@ -43,7 +43,7 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
 uuid.workspace = true
 yinyang-core = { path = "crates/core" }
 

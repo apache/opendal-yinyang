@@ -20,6 +20,7 @@
 //! One-shot publication and restoration of local directories on a Managed filesystem.
 
 mod directory;
+pub mod mount;
 pub mod runtime;
 pub mod volume;
 
