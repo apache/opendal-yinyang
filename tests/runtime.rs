@@ -89,6 +89,172 @@ async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend
     identity_access(&runtime).await;
     completion_and_errors(&runtime, backend).await;
     version_reads(&runtime, backend).await;
+    replace_rename(&runtime).await;
+}
+
+async fn replace_rename(runtime: &Runtime) {
+    let authority = runtime.authority();
+    let root = authority.root();
+    runtime.create_file(root, "safe-save").await.unwrap();
+    runtime.create_file(root, "save-temp").await.unwrap();
+    let mut old = runtime.open_file("safe-save", true).await.unwrap();
+    old.write(0, b"old").await.unwrap();
+    old.fsync().await.unwrap();
+    let mut new = runtime.open_file("save-temp", true).await.unwrap();
+    new.write(0, b"new").await.unwrap();
+    new.fsync().await.unwrap();
+    let source = new.status().await.unwrap().node;
+    let victim = old.status().await.unwrap().node;
+    assert_eq!(
+        runtime
+            .rename(source, root, "safe-save")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::AlreadyExists
+    );
+    let snapshot = authority.observe_latest().await.unwrap();
+    let pinned = snapshot.open_file(victim).await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    plan.rename_replace(source, root, "safe-save")
+        .await
+        .unwrap();
+    let request = plan.finish().unwrap();
+    let wire = request.to_bytes().unwrap();
+    let restored = authority.restore_transaction(&wire).await.unwrap();
+    assert_eq!(restored.digest(), request.digest());
+    let outcome = authority.commit(&restored).await.unwrap();
+    assert!(matches!(outcome, CommitOutcome::Committed(_)));
+    assert_eq!(authority.commit(&restored).await.unwrap(), outcome);
+    let latest = authority.observe_latest().await.unwrap();
+    assert_eq!(
+        latest.resolve("safe-save").await.unwrap().unwrap().id(),
+        source
+    );
+    assert!(latest.resolve("save-temp").await.unwrap().is_none());
+    assert!(latest.node(victim).await.unwrap().is_none());
+    assert_eq!(pinned.read(0, 10).await.unwrap(), b"old");
+    assert_eq!(old.read(0, 10).await.unwrap(), b"old");
+    old.write(0, b"stale").await.unwrap();
+    assert!(matches!(old.fsync().await, Err(Error::Conflict)));
+    old.abort().await.unwrap();
+    new.close().await.unwrap();
+    // The convenience entry also supports case-only moves and absent targets.
+    runtime
+        .rename_replace(source, root, "SAFE-SAVE")
+        .await
+        .unwrap();
+    runtime.rename_replace(source, root, "saved").await.unwrap();
+
+    runtime.create_file(root, "next-temp").await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let next = snapshot.resolve("next-temp").await.unwrap().unwrap().id();
+    let mut replace = Planner::new(&snapshot, CommitId::generate());
+    replace.rename_replace(next, root, "saved").await.unwrap();
+    let mut concurrent = runtime.open_node(source, true).await.unwrap();
+    concurrent.write(0, b"remote edit").await.unwrap();
+    concurrent.close().await.unwrap();
+    assert_eq!(
+        authority.commit(&replace.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Conflict
+    );
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(source)
+            .await
+            .unwrap()
+            .read(0, 20)
+            .await
+            .unwrap(),
+        b"remote edit"
+    );
+
+    runtime.create_directory(root, "replace-dir").await.unwrap();
+    runtime.create_directory(root, "empty-dir").await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let dir = snapshot.resolve("replace-dir").await.unwrap().unwrap().id();
+    let empty = snapshot.resolve("empty-dir").await.unwrap().unwrap().id();
+    assert_eq!(
+        runtime
+            .rename_replace(next, root, "empty-dir")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::IsDirectory
+    );
+    assert_eq!(
+        runtime
+            .rename_replace(dir, root, "next-temp")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotDirectory
+    );
+    let mut replace = Planner::new(&snapshot, CommitId::generate());
+    replace
+        .rename_replace(dir, root, "empty-dir")
+        .await
+        .unwrap();
+    runtime.create_file(empty, "child").await.unwrap();
+    assert_eq!(
+        authority.commit(&replace.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Conflict
+    );
+    assert_eq!(
+        runtime
+            .rename_replace(dir, root, "empty-dir")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotEmpty
+    );
+    let child = authority
+        .observe_latest()
+        .await
+        .unwrap()
+        .resolve("empty-dir/child")
+        .await
+        .unwrap()
+        .unwrap()
+        .id();
+    runtime.unlink(child).await.unwrap();
+    runtime
+        .rename_replace(dir, root, "empty-dir")
+        .await
+        .unwrap();
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .node(empty)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Cycle validation fails after removal in the tentative view. The caller
+    // may still finish this planner: no accidental deletion may survive.
+    runtime.create_directory(dir, "descendant").await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let descendant = snapshot
+        .resolve("empty-dir/descendant")
+        .await
+        .unwrap()
+        .unwrap()
+        .id();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    assert!(plan.rename_replace(dir, dir, "descendant").await.is_err());
+    assert!(matches!(
+        authority.commit(&plan.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+    let latest = authority.observe_latest().await.unwrap();
+    assert!(latest.node(dir).await.unwrap().is_some());
+    assert!(latest.node(descendant).await.unwrap().is_some());
 }
 
 async fn completion_and_errors(runtime: &Runtime, backend: &TestBackend) {

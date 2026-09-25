@@ -268,6 +268,20 @@ impl Runtime {
         plan.remove(node).await?;
         outcome(self.authority().commit(&plan.finish()?).await?)
     }
+    /// Replace the observed destination in one conditional transaction. The
+    /// replaced identity remains readable through existing pinned versions.
+    pub async fn rename_replace(
+        &self,
+        node: NodeId,
+        parent: NodeId,
+        name: &str,
+    ) -> Result<Receipt> {
+        self.require_write()?;
+        let snapshot = self.authority().observe_latest().await?;
+        let mut plan = Planner::new(&snapshot, CommitId::generate());
+        plan.rename_replace(node, parent, name).await?;
+        outcome(self.authority().commit(&plan.finish()?).await?)
+    }
 }
 fn outcome(outcome: CommitOutcome) -> Result<Receipt> {
     match outcome {

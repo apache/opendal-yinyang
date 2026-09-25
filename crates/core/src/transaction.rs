@@ -473,6 +473,43 @@ impl Planner {
         self.push(Mutation::Rename(id, parent, name.to_owned()))
             .await
     }
+    /// Atomically replace an observed destination of the same kind. Directories
+    /// must be empty. A failed plan leaves this planner unchanged.
+    pub async fn rename_replace(&mut self, id: NodeId, parent: NodeId, name: &str) -> Result<()> {
+        // Compose existing guarded mutations in a private working view. In
+        // particular, an invalid move must not leave a successful removal in
+        // the caller's plan. Publication still uses one frozen transaction.
+        let mut work = self.work.clone();
+        let source = work.required(id).await?;
+        let key = entry_key(parent, name)?;
+        work.directory(parent).await?;
+        let mut mutations = Vec::new();
+        if let Some(entry) = work.entry(&key).await?
+            && entry.node_id != id
+        {
+            let destination = work.required(entry.node_id).await?;
+            if source.is_directory() != destination.is_directory() {
+                return Err(Error::new(
+                    if destination.is_directory() {
+                        crate::ErrorKind::IsDirectory
+                    } else {
+                        crate::ErrorKind::NotDirectory
+                    },
+                    "replace rename",
+                    "source and destination kinds differ",
+                ));
+            }
+            let remove = Mutation::Remove(entry.node_id);
+            work.apply(&remove).await?;
+            mutations.push(remove);
+        }
+        let rename = Mutation::Rename(id, parent, name.to_owned());
+        work.apply(&rename).await?;
+        mutations.push(rename);
+        self.work = work;
+        self.mutations.extend(mutations);
+        Ok(())
+    }
     pub async fn remove(&mut self, id: NodeId) -> Result<()> {
         self.push(Mutation::Remove(id)).await
     }
@@ -494,6 +531,7 @@ impl Planner {
         Ok(request)
     }
 }
+#[derive(Clone)]
 struct Working {
     base: Snapshot,
     capture: bool,
