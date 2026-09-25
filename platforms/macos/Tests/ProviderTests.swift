@@ -70,6 +70,29 @@ final class ChangeObserver: NSObject, NSFileProviderChangeObserver {
 @main
 struct ProviderTests {
   static func main() throws {
+    let tiny = try providerContentRange(
+      size: 15, requested: NSRange(location: 0, length: 65536), alignment: 16384)
+    precondition(tiny == 0..<15)
+    let aligned = try providerContentRange(
+      size: 100_000, requested: NSRange(location: 17000, length: 1), alignment: 16384)
+    precondition(aligned == 16384..<32768)
+    let tail = try providerContentRange(
+      size: 100_000, requested: NSRange(location: 99000, length: Int.max), alignment: 16384)
+    precondition(tail == 98304..<100_000)
+    let empty = try providerContentRange(
+      size: 0, requested: NSRange(location: 0, length: 65536), alignment: 16384)
+    precondition(empty.isEmpty)
+    do {
+      _ = try providerContentRange(
+        size: 15, requested: NSRange(location: 16, length: 1), alignment: 16384)
+      preconditionFailure("a range starting past EOF must fail")
+    } catch {
+      precondition((error as NSError).domain == NSCocoaErrorDomain)
+    }
+    let wrapped = providerError(POSIXError(.EIO)) as NSError
+    precondition(wrapped.domain == NSFileProviderErrorDomain)
+    precondition((wrapped.userInfo[NSUnderlyingErrorKey] as? NSError)?.code == Int(EIO))
+    print("partial ranges clip at EOF without overflow and errors use supported domains PASS")
     precondition(CommandLine.arguments.count == 2, "an isolated native configuration is required")
     var config =
       try JSONSerialization.jsonObject(
@@ -160,6 +183,14 @@ struct ProviderTests {
     print("recursive working set, bounded anchors and split change receipts PASS")
 
     let adapter = FileProviderExtension(session: session)
+    do {
+      _ = try adapter.enumerator(for: .trashContainer, request: NSFileProviderRequest())
+      preconditionFailure("unsupported trash must not create an enumerator")
+    } catch {
+      let error = error as NSError
+      precondition(error.domain == NSCocoaErrorDomain && error.code == NSFeatureUnsupportedError)
+    }
+    print("trash enumeration reports the platform unsupported-feature error PASS")
     let item = try session.item(NSFileProviderItemIdentifier(files[0].node))
     let upload = staging.appendingPathComponent("upload")
     try Data("provider-upload".utf8).write(to: upload)

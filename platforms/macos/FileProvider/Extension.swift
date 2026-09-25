@@ -21,13 +21,35 @@ import Foundation
 let providerGroup = "group.com.xuanwo.yinyang.prototype"
 
 func providerError(_ error: Error) -> Error {
-  guard let error = error as? NativeFailure else { return error }
+  guard let error = error as? NativeFailure else {
+    let failure = error as NSError
+    if failure.domain == NSCocoaErrorDomain || failure.domain == NSFileProviderErrorDomain {
+      return error
+    }
+    return NSError(
+      domain: NSFileProviderErrorDomain, code: NSFileProviderError.cannotSynchronize.rawValue,
+      userInfo: [NSUnderlyingErrorKey: error])
+  }
   switch error.kind {
   case "NotFound": return NSFileProviderError(.noSuchItem)
   case "Conflict": return NSFileProviderError(.cannotSynchronize)
   case "Storage", "Io", "Retryable", "Unknown": return NSFileProviderError(.serverUnreachable)
   default: return NSFileProviderError(.cannotSynchronize)
   }
+}
+
+func providerContentRange(size: Int, requested: NSRange?, alignment: Int) throws -> Range<Int> {
+  guard size >= 0 else { throw CocoaError(.fileReadCorruptFile) }
+  guard let requested else { return 0..<size }
+  guard alignment > 0, requested.location >= 0, requested.location <= size,
+    requested.location != NSNotFound, requested.length >= 0
+  else { throw CocoaError(.fileReadCorruptFile) }
+  // The OS may request a page extending past EOF, including for a tiny file.
+  // Clip before adding so even a very large requested length cannot overflow.
+  let lower = requested.location / alignment * alignment
+  let end = requested.location + min(requested.length, size - requested.location)
+  let padding = (alignment - end % alignment) % alignment
+  return lower..<(end + min(padding, size - end))
 }
 final class ProviderSession {
   let queue = DispatchQueue(label: "org.apache.yinyang.provider")
@@ -141,20 +163,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
           throw POSIXError(.EFBIG)
         }
         let size = Int(item.metadata.size)
-        let lower: Int
-        let upper: Int
-        if let range {
-          guard alignment > 0, range.location != NSNotFound, range.location <= size,
-            range.length <= size - range.location
-          else { throw POSIXError(.EINVAL) }
-          lower = range.location / alignment * alignment
-          let end = range.location + range.length
-          let padding = (alignment - end % alignment) % alignment
-          upper = end + min(padding, size - end)
-        } else {
-          lower = 0
-          upper = size
-        }
+        let retrieved = try providerContentRange(size: size, requested: range, alignment: alignment)
+        let lower = retrieved.lowerBound
+        let upper = retrieved.upperBound
         guard let manager = NSFileProviderManager(for: self.session.domain) else {
           throw NSFileProviderError(.noSuchItem)
         }
@@ -269,6 +280,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
   func enumerator(
     for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest
   ) throws -> NSFileProviderEnumerator {
-    ProviderEnumerator(session: session, container: containerItemIdentifier)
+    guard containerItemIdentifier != .trashContainer else {
+      throw CocoaError(.featureUnsupported)
+    }
+    return ProviderEnumerator(session: session, container: containerItemIdentifier)
   }
 }

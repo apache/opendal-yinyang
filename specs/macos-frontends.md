@@ -62,14 +62,20 @@ Item identity is the complete core NodeId. Content and metadata versions carry
 an immutable observation revision. Full and aligned partial downloads pin that
 revision for every chunk. Partial content is written at the original file offset
 in an OS-provided temporary file. Cancellation stops between chunks and removes
-unreturned downloads. The extension closes and synchronizes the file before its
+unreturned downloads. Requested pages that extend beyond EOF are clipped to the
+pinned size before alignment arithmetic; the final extent need not end on an
+alignment boundary. Errors cross the platform boundary only in the Cocoa or
+File Provider domains, with other local errors retained as underlying causes.
+The extension closes and synchronizes the file before its
 completion callback transfers ownership to the OS. Crash-orphan temporary-file
 cleanup has not been validated through the system lifecycle.
 
 Only replacement content of existing files is writable. Directory creation,
 deletion, rename, metadata mutation and conflict-resolution UI are unsupported;
 item capabilities do not advertise them. Upload stages a baseline-bound Sync
-edit and reports its accepted revision. Identical retries reuse the same edit;
+edit and reports its accepted revision. Trash enumeration fails at enumerator
+creation with `NSFeatureUnsupportedError`; system trash identifiers are never
+passed to the core as node identifiers. Identical retries reuse the same edit;
 conflicts preserve both local bytes and remote state. The completion applies to
 the supplied OS version; it does not separately mark later local edits in sync.
 
@@ -88,6 +94,10 @@ wake an idle domain. There is no background push delivery guarantee while the
 extension is not running. File Provider local fsync remains an OS-local operation,
 not a Mount-style remote durability acknowledgment.
 
-Unsigned builds and real-core callback tests do not establish signed domain
-registration, Finder hydration, OS upload scheduling, OS-driven cancellation or
-extension restart acceptance. Those remain explicit platform validation gates.
+The signed prototype has been exercised through an enabled OS domain with
+POSIX-triggered hydration, daemon-scheduled content upload, backend outage and
+extension restart, remote content refresh after wake, and conflict preservation.
+This does not establish application safe-save compatibility, OS-driven download
+cancellation, crash-orphan temporary-file cleanup or background push delivery.
+Those remain explicit platform validation gates. Local fsync does not imply
+that a pending upload has reached the Authority.
