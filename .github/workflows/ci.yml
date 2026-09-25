@@ -119,33 +119,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.24.7"
-          cache: false
-
-      - name: Build pinned S3 test tools
-        env:
-          GOBIN: ${{ runner.temp }}/yinyang-s3-bin
-        run: |
-          # Build official source releases; the former prebuilt images are unavailable.
-          # MinIO RELEASE.2025-09-07T16-13-09Z; mc RELEASE.2025-08-13T08-35-41Z.
-          go install github.com/minio/minio@07c3a429bfed433e49018cb0f78a52145d4bedeb
-          go install github.com/minio/mc@7394ce0dd2a80935aded936b09fa12cbb3cb8096
-          echo "$GOBIN" >> "$GITHUB_PATH"
-
       - name: Start isolated S3-compatible storage
         run: |
-          MINIO_ROOT_USER=yinyang-test MINIO_ROOT_PASSWORD=yinyang-test-only \
-            minio server "$RUNNER_TEMP/yinyang-s3-data" --address 127.0.0.1:9000 \
-            --console-address 127.0.0.1:9001 > "$RUNNER_TEMP/yinyang-minio.log" 2>&1 &
+          docker run -d --name yinyang-silo -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=yinyang-test -e MINIO_ROOT_PASSWORD=yinyang-test-only \
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then break; fi
             sleep 1
           done
           curl --fail http://127.0.0.1:9000/minio/health/ready
-          mc --config-dir "$RUNNER_TEMP/yinyang-mc" alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
-          mc --config-dir "$RUNNER_TEMP/yinyang-mc" mb local/yinyang-test
+          docker exec yinyang-silo mcli alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
+          docker exec yinyang-silo mcli mb local/yinyang-test
 
       - name: Exercise core publication and CLI round trips
         run: cargo test --workspace --all-targets s3_ -- --ignored --nocapture
@@ -153,8 +138,8 @@ jobs:
       - name: Show storage logs on failure
         if: failure()
         run: |
-          if [[ -f "$RUNNER_TEMP/yinyang-minio.log" ]]; then
-            cat "$RUNNER_TEMP/yinyang-minio.log"
+          if docker container inspect yinyang-silo > /dev/null 2>&1; then
+            docker logs yinyang-silo
           fi
 
   required:
