@@ -70,11 +70,29 @@ struct CommandMacos {
     team: Option<String>,
     #[arg(long, requires = "identity")]
     fskit_profile: Option<String>,
+    #[arg(long)]
+    file_provider: bool,
+    #[arg(long, requires_all = ["identity", "file_provider"])]
+    host_profile: Option<String>,
+    #[arg(long, requires_all = ["identity", "file_provider"])]
+    provider_profile: Option<String>,
+    #[arg(
+        long,
+        requires = "file_provider",
+        help = "Run real-core Swift callbacks against an isolated native config (creates a test subtree)."
+    )]
+    test_config: Option<std::path::PathBuf>,
 }
 impl CommandMacos {
     fn run(self) {
         if !cfg!(target_os = "macos") {
             panic!("native macOS build requires macOS");
+        }
+        if self.file_provider && self.identity.is_some() {
+            assert!(
+                self.host_profile.is_some() && self.provider_profile.is_some(),
+                "signed File Provider builds require --host-profile and --provider-profile"
+            );
         }
         let root = std::path::Path::new(env!("CARGO_WORKSPACE_DIR"));
         let output = root.join(self.output);
@@ -88,7 +106,11 @@ impl CommandMacos {
         generate.args([
             "generate",
             "--spec",
-            "platforms/macos/project.yml",
+            if self.file_provider {
+                "platforms/macos/provider.yml"
+            } else {
+                "platforms/macos/project.yml"
+            },
             "--project",
         ]);
         generate.arg(&output);
@@ -123,10 +145,47 @@ impl CommandMacos {
                 "YINYANG_FSKIT_PROFILE={}",
                 self.fskit_profile.expect("profile required")
             ));
+            if self.file_provider {
+                build.arg(format!(
+                    "YINYANG_HOST_PROFILE={}",
+                    self.host_profile.unwrap()
+                ));
+                build.arg(format!(
+                    "YINYANG_PROVIDER_PROFILE={}",
+                    self.provider_profile.unwrap()
+                ));
+            }
         } else {
             build.arg("CODE_SIGNING_ALLOWED=NO");
         }
         run_command(build);
+        if let Some(config) = self.test_config {
+            let binary = output.join("provider-contract-tests");
+            let mut swift = find_command("xcrun");
+            swift.args(["swiftc", "-swift-version", "5", "-import-objc-header"]);
+            swift.arg(root.join("crates/native/include/yinyang.h"));
+            swift.args([
+                "platforms/macos/Shared/NativeBridge.swift",
+                "platforms/macos/FileProvider/Item.swift",
+                "platforms/macos/FileProvider/Extension.swift",
+                "platforms/macos/FileProvider/Enumerator.swift",
+                "platforms/macos/Tests/ProviderTests.swift",
+            ]);
+            swift.arg(target.join("debug/libyinyang_native.a"));
+            swift.args([
+                "-framework",
+                "Security",
+                "-framework",
+                "SystemConfiguration",
+                "-lc++",
+                "-o",
+            ]);
+            swift.arg(&binary);
+            run_command(swift);
+            let mut test = std::process::Command::new(binary);
+            test.arg(root.join(config));
+            run_command(test);
+        }
     }
 }
 

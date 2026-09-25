@@ -28,9 +28,11 @@ struct YinYangPrototype: App {
                 Text("Use an isolated directory containing volume.json. Enable the file system extension, then mount it with mount -F -t yinyang SOURCE TARGET.")
                     .textSelection(.enabled)
                 Button("Open File System Extensions") { _ = FSClient.shared.openFileSystemExtensionsSettings() }
+                #if YINYANG_FILE_PROVIDER
+                ProviderControls()
+                #endif
                 Text("Experimental: no production support or existing sync folders.").font(.caption)
             }.padding(24).frame(width: 540)
         }
     }
 }
-

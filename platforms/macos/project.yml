@@ -47,7 +47,10 @@ targets:
   YinYangFSKit:
     type: extensionkit-extension
     platform: macOS
-    sources: [Shared, FSKit]
+    sources:
+      - Shared
+      - path: FSKit
+        excludes: [Info.plist, FSKit.entitlements]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.xuanwo.yinyang.prototype.fskit
