@@ -371,6 +371,13 @@ impl FileHandle {
         .await;
         self.report(result).await
     }
+    /// A Sync replacement is a conditional edit even when both versions are empty.
+    pub(crate) async fn reset_content(&mut self) -> Result<()> {
+        self.live()?;
+        self.runtime.require_write()?;
+        let result = self.runtime.inner.stage.reset_content(self.id).await;
+        self.report(result).await
+    }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             // Keep the original failure even if the local disk cannot record it.
