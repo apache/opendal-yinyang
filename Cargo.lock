@@ -2467,6 +2467,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yinyang-native"
+version = "0.0.24"
+dependencies = [
+ "opendal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "yinyang",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

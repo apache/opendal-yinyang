@@ -48,7 +48,7 @@ uuid.workspace = true
 yinyang-core = { path = "crates/core" }
 
 [workspace]
-members = [".", "crates/core", "xtask"]
+members = [".", "crates/core", "crates/native", "xtask"]
 resolver = "3"
 
 [workspace.package]
