@@ -32,8 +32,10 @@
 //! reclaimed by the existing Mount recovery.
 //!
 //! The session mounts as `fuse.yinyang` and runs in the foreground. SIGINT and
-//! SIGTERM unmount the session and finish the process; dropping the session
-//! otherwise unmounts as well.
+//! SIGTERM detach the mount and wait briefly for the session. Lazy unmounting
+//! does not end the kernel connection while clients still hold open
+//! references, so a bounded wait is followed by process exit, which closes
+//! `/dev/fuse` and forces the kernel to abort every pending request.
 //!
 //! See `specs/linux-fuse.md` for the full read-only contract.
 
@@ -125,7 +127,20 @@ pub async fn run(
         }
         _ = shutdown_signal() => {
             let _ = teardown.send(());
-            join.await.map_err(blocking_error)??;
+            match tokio::time::timeout(TEARDOWN_GRACE, &mut join).await {
+                Ok(result) => result.map_err(blocking_error)??,
+                Err(_) => {
+                    // A lazy unmount keeps the session alive while clients hold
+                    // the mount; exiting closes /dev/fuse and the kernel aborts
+                    // every pending request (fs/fuse: fuse_dev_release ->
+                    // fuse_abort_conn), so clients cannot stay wedged forever.
+                    eprintln!(
+                        "yy: FUSE session did not end within {}s (clients may hold open references); exiting to abort the connection",
+                        TEARDOWN_GRACE.as_secs()
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
     }
     println!("yy: unmounted {}", mountpoint.display());
