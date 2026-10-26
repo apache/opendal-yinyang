@@ -1339,6 +1339,13 @@ impl DirectorySync {
                     LocalKind::Directory => None,
                 })
                 .unwrap_or(0);
+            // The moved root advances its namespace revision; an unchanged
+            // descendant keeps its own accepted revision and content.
+            let accepted_revision = if source == from {
+                revision
+            } else {
+                entry.revision
+            };
             self.replica.store_mut().save_baseline_entry(
                 &destination,
                 entry.node,
@@ -1347,7 +1354,7 @@ impl DirectorySync {
                 entry.digest,
                 length,
                 accepted.as_ref(),
-                revision,
+                accepted_revision,
             )?;
             self.replica.store_mut().remove_baseline_path(&source)?;
         }
@@ -1724,7 +1731,6 @@ impl<'a> Context<'a> {
         to: &str,
         revision: Revision,
     ) -> Result<()> {
-        self.mark_subtree(handled, from);
         handled.insert(from.to_owned());
         handled.insert(to.to_owned());
         let prefix = format!("{from}/");
@@ -1736,14 +1742,44 @@ impl<'a> Context<'a> {
             .cloned()
             .collect();
         for descendant in descendants {
-            if handled.contains(&descendant) {
-                continue;
-            }
             let destination = format!("{to}{}", &descendant[from.len()..]);
-            self.migrate_baseline_path(&descendant, &destination, revision)
+            // Descendants change their path only; their own accepted content,
+            // executable bit and revision stay anchored, so a namespace-only
+            // parent receipt can never fold unobserved child content or revision
+            // into the common baseline.
+            self.migrate_baseline_path_child(&descendant, &destination)
                 .await?;
+            handled.insert(descendant);
             handled.insert(destination);
         }
+        let _ = revision;
+        Ok(())
+    }
+
+    async fn migrate_baseline_path_child(&mut self, from: &str, to: &str) -> Result<()> {
+        let Some(entry) = self.baseline.remote.get(from).cloned() else {
+            return Ok(());
+        };
+        let previous = self.baseline.local.get(from).cloned();
+        let accepted = self.accepted_local_at(to, previous.as_ref())?;
+        let length = accepted
+            .as_ref()
+            .and_then(|node| match node.kind {
+                LocalKind::File { length, .. } => Some(length),
+                LocalKind::Directory => None,
+            })
+            .unwrap_or(0);
+        self.replica.store_mut().save_baseline_entry(
+            to,
+            entry.node,
+            entry.directory,
+            entry.executable,
+            entry.digest,
+            length,
+            accepted.as_ref(),
+            entry.revision,
+        )?;
+        self.replica.store_mut().remove_baseline_path(from)?;
         Ok(())
     }
 
@@ -2307,6 +2343,7 @@ impl<'a> Context<'a> {
         match self.sync.publish(edit).await {
             Ok(revision) => Ok(Some(revision)),
             Err(error) if error.kind() == crate::runtime::ErrorKind::Conflict => {
+                eprintln!("yy: publication conflict for {path}: {error}");
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
                     "conflict",
@@ -2317,6 +2354,7 @@ impl<'a> Context<'a> {
                 Ok(None)
             }
             Err(error) if error.kind() == crate::runtime::ErrorKind::Retryable => {
+                eprintln!("yy: publication retryable for {path}: {error}");
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
                     "retryable",

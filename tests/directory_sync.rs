@@ -755,6 +755,7 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
         },
         "the external remote edit must survive resolution"
     );
+    drop(resolver);
 
     let mut reopened = DirectorySync::open(authority.clone(), &state)
         .await
