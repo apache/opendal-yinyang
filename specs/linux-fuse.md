@@ -98,15 +98,17 @@ all still-pinned or dirty/frozen/error state.
 
 ## Writable callbacks
 
-`write` stages bytes in the shared per-NodeId Mount handle. Each request uses
-the file flags supplied by the kernel, so `fcntl(F_SETFL)` may toggle
-`O_APPEND` and `O_SYNC`/`O_DSYNC` for later writes. An append request uses the
-node's append path, which chooses its offset under the same per-node lock as
-other writes; a regular write uses the kernel offset. The writable access mode
-is fixed by the open request. `O_TRUNC` stages a zero length before the open
-reply. A write with `O_SYNC`/`O_DSYNC` in its current flags attempts
-publication before acknowledging the write. Unsupported write flags return an
-explicit error instead of silently changing semantics.
+`write` stages bytes in the shared per-NodeId Mount handle. Each request
+evaluates the file flags supplied by the kernel. `fcntl(F_SETFL)` can toggle
+`O_APPEND` for later writes. `O_SYNC`/`O_DSYNC` are set at open or carried as
+per-request IOCB sync markers; `F_SETFL` does not toggle them. An append
+request uses the node's append path, which chooses its offset under the same
+per-node lock as other writes; a regular write uses the kernel offset. The
+writable access mode is fixed by the open request. `O_TRUNC` stages a zero
+length before the open reply. A write whose current flags include
+`O_SYNC`/`O_DSYNC` attempts publication before acknowledging the write.
+Unsupported write flags return an explicit error instead of silently changing
+semantics.
 
 `flush` publishes a writable handle and reports the real remote outcome to the
 closing descriptor. `release` never publishes and never discards staging.
@@ -245,8 +247,9 @@ there is no mid-session cancellation signal.
   cross-mount or cross-client meaning; no distributed lock semantics are
   claimed. A writable mount must not claim that locking is rejected outright,
   because the kernel may return success for its own local lock manager.
-- The module keeps existing core Mount behavior, including the node-map lock
-  that already spans first materialization; the adapter adds no mount-wide
-  lock across authority or staging I/O.
+- Node cache lookup and open-gate registration share a short-lived node-map
+  critical section. First materialization is serialized per NodeId by that
+  gate; neither lock is held across remote observation or staging I/O, and
+  different nodes initialize independently.
 - The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
   there is no automatic external-change watch.

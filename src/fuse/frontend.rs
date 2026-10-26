@@ -530,8 +530,8 @@ impl Inner {
         if !open.writable {
             return reply.error(fuser::Errno::EBADF);
         }
-        // Linux may toggle these with fcntl(F_SETFL), so the flags on this
-        // WRITE request, not the ones captured by open, define its semantics.
+        // The kernel supplies current file flags on each WRITE. F_SETFL can
+        // toggle append, while sync flags may also be attached per request.
         let append = has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND);
         let sync = has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
             || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC);
