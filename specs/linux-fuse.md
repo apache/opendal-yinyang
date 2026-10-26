@@ -115,23 +115,34 @@ map to the narrow errno intended for each operation; unknown identity is
 
 ## Cancellation and exit
 
-The binding answers `FUSE_INTERRUPT` with `ENOSYS`; the kernel ignores that
-reply, so an interrupted syscall does not cancel in-flight remote work. Each
-operation still completes and replies exactly once. Interrupted callers may
-observe `EINTR` while the underlying read or scan runs to completion.
+The binding answers `FUSE_INTERRUPT` with `ENOSYS` (fuser 0.17
+`src/request.rs`), so an interrupted syscall does not cancel in-flight remote
+work. The Linux kernel waits out every request already delivered to the daemon
+(`fs/fuse/dev.c` `request_wait_answer`): a client terminated by a fatal signal
+while its request is in userspace stays in an uninterruptible wait until the
+reply arrives or the connection aborts, and only a request that was never
+delivered can be dropped with `-EINTR`. The daemon therefore replies to every
+request exactly once, and daemon termination is the abort guarantee: closing
+`/dev/fuse` makes the kernel end pending requests with `-ECONNABORTED`
+(`fuse_dev_release` -> `fuse_abort_conn`).
 
 The session runs in the foreground. Teardown waits on both the session end and
 SIGINT/SIGTERM: an external `fusermount3 -u` ends the session loop and the
-process exits on its own, while a signal unmounts and joins the session before
-exiting. `Session::spawn` moves the mount object into `BackgroundSession`, so a
-`SessionUnmounter` obtained before spawning would find an empty slot; instead
-one blocking owner holds the background session, polls its public thread guard
-for a natural end, and receives the local teardown request. Exactly one `join`
-or `umount_and_join` runs. Returning from `run` ends `main`, so the Tokio
-runtime shuts down; request tasks are detached and owned by that runtime, their
-unanswered replies are dropped on the closing channel, and the staging lease is
-released at process exit. In-flight tasks hold their `Arc<Mount>` for that
-window; there is no mid-session cancellation signal.
+process exits on its own, while a signal detaches the mount and waits up to a
+five-second grace period. `Session::spawn` moves the mount object into
+`BackgroundSession`, so a `SessionUnmounter` obtained before spawning would
+find an empty slot; one blocking owner holds the background session, polls its
+public thread guard for a natural end, and receives the local teardown
+request. Exactly one `join` or `umount_and_join` runs. A lazy unmount does not
+end the kernel connection while clients still hold open references or in-flight
+requests, so when the grace period expires the process exits: the closed
+`/dev/fuse` aborts the connection and every blocked client syscall returns an
+error instead of hanging. Returning from `run` ends `main`, so the Tokio
+runtime shuts down; request tasks are detached and owned by that runtime, and
+their unanswered replies are dropped on the closing channel. The staging lease
+is released at process exit (or immediately on OS file-descriptor close).
+In-flight tasks hold their `Arc<Mount>` for that window; there is no
+mid-session cancellation signal.
 
 ## Boundaries and known limits
 
