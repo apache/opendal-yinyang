@@ -1198,6 +1198,25 @@ impl Replica {
         }
     }
 
+    /// Read-only classification of a retained install inode: whether its
+    /// current bytes differ from the digest recorded when it was displaced.
+    /// This is the same evidence inspection uses, so a synthesized conflict can
+    /// be loaded later without a prior mutating status write.
+    pub(crate) fn retained_artifact_changed(&self, id: &str) -> Result<bool> {
+        let artifacts = self.store.artifacts()?;
+        let Some(artifact) = artifacts.iter().find(|artifact| artifact.id == id) else {
+            return Ok(false);
+        };
+        let installs = self.store.installs()?;
+        let Some(install) = installs
+            .iter()
+            .find(|install| install.artifact == artifact.name)
+        else {
+            return Ok(false);
+        };
+        Ok(!self.artifact_matches_expected(install)?)
+    }
+
     fn scan_directory(
         &self,
         directory: &OwnedFd,
