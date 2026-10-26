@@ -356,11 +356,12 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
 #[test]
 #[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
 fn managed_sync_resolve_content_preserves_concurrent_local_v4() {
-    resolve_content_preserves_concurrent_local_v4(false);
-    resolve_content_preserves_concurrent_local_v4(true);
+    resolve_content_preserves_concurrent_local(false, true);
+    resolve_content_preserves_concurrent_local(true, true);
+    resolve_content_preserves_concurrent_local(true, false);
 }
 
-fn resolve_content_preserves_concurrent_local_v4(drop_after_release: bool) {
+fn resolve_content_preserves_concurrent_local(drop_after_release: bool, write_v4: bool) {
     let fixture = Fixture::new(Publication::Service);
     fixture.remote_create_file("resolve-race.txt", b"base", false);
     let left = fixture.sync_client("resolve-race-left");
@@ -405,34 +406,60 @@ fn resolve_content_preserves_concurrent_local_v4(drop_after_release: bool) {
         "the original conflict must remain until its commit response is accepted: {during:#?}"
     );
 
-    write_local(&right_gated.directory.join("resolve-race.txt"), b"local-v4");
+    if write_v4 {
+        write_local(&right_gated.directory.join("resolve-race.txt"), b"local-v4");
+    }
     gate.release();
     let output = running.wait(Duration::from_secs(120));
-    assert_eq!(
-        fs::read(right_gated.directory.join("resolve-race.txt")).unwrap(),
-        b"local-v4",
-        "resolve completion must not overwrite the live v4 payload:\n{}",
-        captured_text(&output)
-    );
+    let live_after = fs::read(right_gated.directory.join("resolve-race.txt")).unwrap();
     let remote_after = remote_file_bytes(&fixture, "resolve-race.txt");
-    assert!(
-        remote_after.as_slice() == b"chosen-v3" || remote_after.as_slice() == b"local-v4",
-        "resolve may leave v3 remote with local pending, or converge v4: {remote_after:?}"
-    );
-    if remote_after.as_slice() == b"chosen-v3" {
-        let status = fixture.sync_status(&right_gated);
-        assert!(!status.summary.in_sync, "{status:#?}");
+    let selected = if write_v4 {
+        b"local-v4".as_slice()
+    } else {
+        b"chosen-v3".as_slice()
+    };
+    if write_v4 {
         assert_eq!(
-            status.entry("resolve-race.txt").state,
-            EntryState::LocalPending
+            live_after.as_slice(),
+            b"local-v4",
+            "resolve completion must not overwrite the live v4 payload:\n{}",
+            captured_text(&output)
         );
+        assert!(
+            remote_after.as_slice() == b"chosen-v3" || remote_after.as_slice() == b"local-v4",
+            "resolve may leave v3 remote with local pending, or converge v4: {remote_after:?}"
+        );
+        if remote_after.as_slice() == b"chosen-v3" {
+            let status = fixture.sync_status(&right_gated);
+            assert!(!status.summary.in_sync, "{status:#?}");
+            assert_eq!(
+                status.entry("resolve-race.txt").state,
+                EntryState::LocalPending
+            );
+        }
+    } else {
+        assert!(
+            live_after.as_slice() == b"right-v2" || live_after.as_slice() == b"chosen-v3",
+            "unchanged pre-dispatch payload must remain v2 or materialize the selected v3:\n{}",
+            captured_text(&output)
+        );
+        assert_eq!(remote_after.as_slice(), b"chosen-v3");
+        if live_after.as_slice() == b"right-v2" {
+            let status = fixture.sync_status(&right_gated);
+            assert!(!status.summary.in_sync, "{status:#?}");
+        }
     }
 
     fixture.sync_run_ok(&right_gated);
-    assert_eq!(remote_file_bytes(&fixture, "resolve-race.txt"), b"local-v4");
     assert_eq!(
-        fs::read(right_gated.directory.join("resolve-race.txt")).unwrap(),
-        b"local-v4"
+        remote_file_bytes(&fixture, "resolve-race.txt").as_slice(),
+        selected
+    );
+    assert_eq!(
+        fs::read(right_gated.directory.join("resolve-race.txt"))
+            .unwrap()
+            .as_slice(),
+        selected
     );
     assert_in_sync(&fixture, &right_gated);
     let converged = fixture.remote_file_version("resolve-race.txt");
