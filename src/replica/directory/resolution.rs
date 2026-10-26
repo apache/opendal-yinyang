@@ -881,7 +881,10 @@ impl DirectorySync {
             self.replica.create_directory_local(path)?;
         }
         let tree = self.recorded_subtree(snapshot, path).await?;
-        let mut pending: Vec<(String, Node)> = tree.into_iter().collect();
+        let mut pending: Vec<(String, Node)> = tree
+            .iter()
+            .map(|(entry, node)| (entry.clone(), node.clone()))
+            .collect();
         pending.sort_by_key(|(entry, _)| (entry.matches('/').count(), entry.clone()));
         for (entry, node) in &pending {
             if self.replica.scan()?.get(entry).is_some() {
@@ -951,10 +954,10 @@ impl DirectorySync {
         path: &str,
     ) -> Result<BTreeMap<String, Node>> {
         let mut map = BTreeMap::new();
-        let Some(root_id) = snapshot.resolve(path).await? else {
+        let Some(root) = snapshot.resolve(path).await? else {
             return Ok(map);
         };
-        let mut pending = vec![(String::new(), root_id)];
+        let mut pending = vec![(String::new(), root.id())];
         while let Some((rel, id)) = pending.pop() {
             let Some(node) = snapshot.node(id).await? else {
                 continue;
