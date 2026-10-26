@@ -37,6 +37,8 @@ struct Cli {
 enum Command {
     /// Inspect each capability layer and its effective intersection.
     Capabilities,
+    /// Mount a read-only Managed volume through the Linux FUSE frontend.
+    Mount { mountpoint: PathBuf },
     /// Operate recoverable file handles (requires --volume).
     File {
         #[command(subcommand)]
@@ -83,7 +85,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &cli.volume {
         return file_cli::run(path, cli.command).await;
     }
-    if matches!(cli.command, Command::File { .. } | Command::Capabilities) {
+    if matches!(
+        cli.command,
+        Command::File { .. } | Command::Capabilities | Command::Mount { .. }
+    ) {
         return Err("this command requires --volume CONFIG.json".into());
     }
     let profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
