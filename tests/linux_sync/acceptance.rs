@@ -232,6 +232,16 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
         let _ = fixture.sync_run(&right);
         let status = fixture.sync_status(&right);
         let conflict = status.conflict("shared.txt").clone();
+        assert_eq!(conflict.original_path.as_deref(), Some("shared.txt"));
+        assert_eq!(conflict.desired_path.as_deref(), Some("shared.txt"));
+        assert_eq!(
+            status.entry("shared.txt").original_path.as_deref(),
+            Some("shared.txt")
+        );
+        assert_eq!(
+            status.entry("shared.txt").desired_path.as_deref(),
+            Some("shared.txt")
+        );
         assert_eq!(status.entry("shared.txt").state, EntryState::Conflict);
         assert_eq!(
             status.entry("shared.txt").outcome.state,
@@ -523,6 +533,11 @@ fn managed_sync_create_create_and_delete_edit_conflicts_both_authorities() {
         let conflict = status.conflict("same.txt").clone();
         assert_eq!(conflict.original_path, None);
         assert_eq!(conflict.desired_path.as_deref(), Some("same.txt"));
+        assert_eq!(status.entry("same.txt").original_path, None);
+        assert_eq!(
+            status.entry("same.txt").desired_path.as_deref(),
+            Some("same.txt")
+        );
         assert_eq!(conflict.local, ConflictSide::CurrentFile);
         assert_eq!(conflict.remote, ConflictSide::CurrentFile);
         let local = fixture.path("create-local");
@@ -550,6 +565,14 @@ fn managed_sync_create_create_and_delete_edit_conflicts_both_authorities() {
         let conflict = status.conflict("victim.txt").clone();
         assert_eq!(conflict.original_path.as_deref(), Some("victim.txt"));
         assert_eq!(conflict.desired_path.as_deref(), Some("victim.txt"));
+        assert_eq!(
+            status.entry("victim.txt").original_path.as_deref(),
+            Some("victim.txt")
+        );
+        assert_eq!(
+            status.entry("victim.txt").desired_path.as_deref(),
+            Some("victim.txt")
+        );
         assert_eq!(conflict.local, ConflictSide::CurrentFile);
         assert_eq!(conflict.remote, ConflictSide::Deleted);
         assert_eq!(

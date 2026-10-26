@@ -41,10 +41,12 @@ Both publication authorities run the behavior-sensitive scenarios:
 | Invalid local input | Symlinks, unsupported special files and a missing local root fail with an explicit diagnostic and do not mutate remote state. |
 | Process boundary | Commands are distinct child processes. After each exits, the state lease is released and a fresh process can reopen the same state. |
 
-`yy status` must expose accepted, pending, remotely completed, failed,
-conflicted and uncertain states through a stable machine-readable form used by
-the suite. Conflict export must preserve exact bytes. Tests must not infer
-completion from local fsync or from a newer remote revision.
+`yy --volume CONFIG sync status --json` must expose accepted, pending, remotely
+completed, failed, conflicted and uncertain states through a stable
+machine-readable form used by the suite. The existing object-mode `yy status`
+continues to report only the remote namespace. Conflict export must preserve
+exact bytes. Tests must not infer completion from local fsync or from a newer
+remote revision.
 
 ### Status schema v1
 
