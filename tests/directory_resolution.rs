@@ -26,7 +26,6 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use support::TestBackend;
