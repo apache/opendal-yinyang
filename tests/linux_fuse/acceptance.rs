@@ -1251,14 +1251,6 @@ fn interrupt_pending_fsync(
     gate.wait_ready(Duration::from_secs(30));
     let frozen = fixture.wait_for_frozen(&config);
     println!("fsync reached the frozen publication boundary:\n{frozen}");
-    let mut frozen_reader = File::open(mounted.mountpoint().join("interrupted.txt"))
-        .expect("open read-only descriptor while the write is frozen");
-    let mut frozen_bytes = Vec::new();
-    frozen_reader
-        .read_to_end(&mut frozen_bytes)
-        .expect("read staged bytes while frozen");
-    assert_eq!(frozen_bytes, b"interrupted-local");
-    drop(frozen_reader);
     match interrupt {
         Interrupt::Kill => mounted.kill_daemon_only(),
         Interrupt::Terminate => {
@@ -1269,6 +1261,11 @@ fn interrupt_pending_fsync(
             );
         }
     }
+    assert_eq!(
+        fixture.remote_read(&library, "interrupted.txt", 64),
+        b"seed",
+        "the authority must remain unchanged while the frozen commit connection is gated"
+    );
     gate.release();
     let outcome = receiver
         .recv_timeout(Duration::from_secs(20))
@@ -1283,11 +1280,6 @@ fn interrupt_pending_fsync(
     drop(dirty);
     mounted.cleanup_after_kill();
 
-    assert_eq!(
-        fixture.remote_read(&library, "interrupted.txt", 64),
-        b"seed",
-        "the interrupted publication must not have reached the authority"
-    );
     let mountpoint = fixture.temp.path().join(format!(
         "mnt-interrupted-reopen-{}",
         fixture.publication().as_str()

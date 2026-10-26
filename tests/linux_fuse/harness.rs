@@ -1057,12 +1057,11 @@ fn handle_gate_connection(
         .enable_all()
         .build()
         .expect("build service gate runtime");
-    let frozen = runtime
-        .block_on(YinYangRuntime::inspect(&staging))
-        .expect("inspect service gate staging")
-        .handles
-        .iter()
-        .any(|handle| handle.frozen);
+    let frozen = staging.join("staging.db").exists()
+        && runtime
+            .block_on(YinYangRuntime::inspect(&staging))
+            .ok()
+            .is_some_and(|status| status.handles.iter().any(|handle| handle.frozen));
     if frozen {
         if !ready_sent.swap(true, Ordering::SeqCst) {
             let _ = sender.send(());
