@@ -342,7 +342,7 @@ impl DirectorySync {
         let executable = expected
             .as_ref()
             .filter(|node| matches!(node.kind, LocalKind::File { .. }))
-            .map_or(false, |node| node.executable);
+            .is_some_and(|node| node.executable);
         if record.remote == "deleted" {
             return self
                 .publish_keep_local_over_recorded_deletion(
@@ -376,7 +376,7 @@ impl DirectorySync {
         }
         let artifact = self.replica.retain_bytes(path, &bytes)?;
         let predicate = snapshot.revision();
-        let mut source = &bytes[..];
+        let mut source = bytes;
         let edit = self.sync.stage(node.id(), predicate, &mut source).await?;
         self.finish_keep_local_edit(
             record,
@@ -799,7 +799,7 @@ impl DirectorySync {
                     created.insert(path.to_string(), node_id);
                     self.confirm_baseline_for(path, local.as_ref(), node_id, published)
                         .await?;
-                    self.refresh_parent_baseline(*path, published).await?;
+                    self.refresh_parent_baseline(path, published).await?;
                     self.replica.store_mut().update_work(
                         edit.as_bytes(),
                         "committed",
@@ -969,7 +969,7 @@ impl DirectorySync {
                         .filter(|entry| {
                             entry.starts_with(&prefix)
                                 && !tree.contains_key(*entry)
-                                && fresh.get(*entry).is_none()
+                                && fresh.get(entry).is_none()
                         })
                         .cloned()
                         .collect()
