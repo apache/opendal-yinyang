@@ -198,7 +198,7 @@ impl Inner {
     /// Drop a stale clean version before opening. Busy means another reference
     /// still pins the shared version, or the node retains dirty/frozen/error
     /// state; both must be reused rather than reset.
-    async fn reclaim_clean_before_open(&self, id: NodeId) -> Result<(), fuser::Errno> {
+    async fn reclaim_clean_state(&self, id: NodeId) -> Result<(), fuser::Errno> {
         match self.mount.reclaim(id).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => Ok(()),
@@ -248,6 +248,7 @@ impl Inner {
     /// are read from that same revision, so path `stat` cannot disagree with
     /// `fstat`/read bytes while the node is pinned or dirty.
     async fn shared_attr(&self, id: NodeId) -> Result<Option<FileAttr>, fuser::Errno> {
+        self.reclaim_clean_state(id).await?;
         let status = match self.mount.node_status(id).await {
             Ok(Some(status)) => status,
             Ok(None) => return Ok(None),
@@ -350,7 +351,7 @@ impl Inner {
         if truncate && !writable {
             return reply.error(fuser::Errno::EINVAL);
         }
-        if let Err(errno) = self.reclaim_clean_before_open(id).await {
+        if let Err(errno) = self.reclaim_clean_state(id).await {
             return reply.error(errno);
         }
         match self.mount.open_node(id, writable).await {
@@ -492,7 +493,7 @@ impl Inner {
                     Err(errno) => return reply.error(errno),
                 }
             } else {
-                if let Err(errno) = self.reclaim_clean_before_open(id).await {
+                if let Err(errno) = self.reclaim_clean_state(id).await {
                     return reply.error(errno);
                 }
                 let file = match self.mount.open_node(id, true).await {
@@ -540,7 +541,7 @@ impl Inner {
                     };
                     open.file.set_executable(executable).await
                 } else {
-                    if let Err(errno) = self.reclaim_clean_before_open(id).await {
+                    if let Err(errno) = self.reclaim_clean_state(id).await {
                         return reply.error(errno);
                     }
                     let file = match self.mount.open_node(id, true).await {
@@ -619,7 +620,7 @@ impl Inner {
             Err(error) => return reply.error(runtime_errno(&error)),
         };
         let node = node.expect("create resolved a node id");
-        if let Err(errno) = self.reclaim_clean_before_open(node).await {
+        if let Err(errno) = self.reclaim_clean_state(node).await {
             return reply.error(errno);
         }
         let open = match self
@@ -1427,6 +1428,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_clean_path_attr_reclaims_to_latest() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
+            .await
+            .unwrap();
+        writer.create_file(authority.root(), "file").await.unwrap();
+        let mut file = writer.open_file("file", true).await.unwrap();
+        file.write(0, b"first").await.unwrap();
+        file.close().await.unwrap();
+        drop(writer);
+        let id = authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+
+        let mount = Mount::open(authority.clone(), temp.path().join("mount"), false)
+            .await
+            .unwrap();
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
+        let stale = inner.mount.open_node(id, false).await.unwrap();
+        drop(stale);
+
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer2"))
+            .await
+            .unwrap();
+        let mut file = writer.open_node(id, true).await.unwrap();
+        file.write(0, b"second").await.unwrap();
+        file.close().await.unwrap();
+
+        assert!(inner.shared_attr(id).await.unwrap().is_none());
+        let latest = authority.observe_latest().await.unwrap();
+        let attr = inner.snapshot_attr(&latest, id).await.unwrap();
+        assert_eq!(attr.size, 6);
+    }
+
+    #[tokio::test]
     async fn open_reclaims_stale_clean_version_after_transient_busy() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
@@ -1458,10 +1506,10 @@ mod tests {
             .unwrap();
         let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
         let pinned = inner.mount.open_node(id, false).await.unwrap();
-        inner.reclaim_clean_before_open(id).await.unwrap();
+        inner.reclaim_clean_state(id).await.unwrap();
         assert!(inner.mount.node_status(id).await.unwrap().is_some());
         drop(pinned);
-        inner.reclaim_clean_before_open(id).await.unwrap();
+        inner.reclaim_clean_state(id).await.unwrap();
         assert!(inner.mount.node_status(id).await.unwrap().is_none());
 
         let writer = Runtime::open(authority.clone(), temp.path().join("writer2"))
