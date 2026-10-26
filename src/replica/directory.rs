@@ -1012,58 +1012,50 @@ impl DirectorySync {
         record: &WorkRecord,
         revision: Revision,
     ) -> Result<bool> {
+        if record.source_artifact.is_some() {
+            // Explicit resolution receipt (content or create-file): the
+            // selected bytes live in the artifact, not in the work's local
+            // fingerprint. Install conditionally against the pre-dispatch
+            // version and acknowledge the selected fingerprint as the common
+            // baseline; a newer live version stays pending for the next run.
+            let Some(artifact) = &record.source_artifact else {
+                return Ok(true);
+            };
+            let mut file = self.replica.open_artifact(artifact)?;
+            let mut bytes = Vec::new();
+            std::io::copy(&mut file, &mut bytes).map_err(|error| error.to_string())?;
+            let expected = accepted_local(record)?;
+            let chosen = self.install_chosen_bytes(
+                &record.path,
+                &bytes,
+                record.local_executable.unwrap_or(false),
+                expected.as_ref(),
+            )?;
+            if let Some(node) = self.accepted_node_at(record, revision).await? {
+                self.replica.store_mut().save_baseline_path(
+                    &record.path,
+                    &node,
+                    chosen.as_ref(),
+                    revision,
+                )?;
+            }
+            if record.operation == "create-file" {
+                self.refresh_parent_baseline(&record.path, revision).await?;
+            }
+            return Ok(true);
+        }
         match record.operation.as_str() {
             "remove" => {
                 self.replica
                     .store_mut()
                     .remove_baseline_subtree(&record.path)?;
+                self.refresh_parent_baseline(&record.path, revision).await?;
             }
             "rename" => {
                 if let Some(from) = record.original_path.clone() {
                     self.migrate_baseline_from_work(&from, &record.path, revision)?;
-                }
-            }
-            "content" if record.source_artifact.is_some() => {
-                // A resolution receipt publishes selected bytes that are not
-                // necessarily the live local content. Install them only when the
-                // live file is still the version this decision was dispatched
-                // against, then confirm the baseline from the verified result.
-                let Some(artifact) = &record.source_artifact else {
-                    return Ok(false);
-                };
-                let mut file = self.replica.open_artifact(artifact)?;
-                let mut bytes = Vec::new();
-                std::io::copy(&mut file, &mut bytes).map_err(|e| e.to_string())?;
-                let expected = accepted_local(record)?;
-                self.install_chosen_bytes(
-                    &record.path,
-                    &bytes,
-                    record.local_executable.unwrap_or(false),
-                    expected.as_ref(),
-                )?;
-                let digest = ContentHash::from_bytes(*blake3::hash(&bytes).as_bytes());
-                let installed = self
-                    .replica
-                    .scan()?
-                    .get(&record.path)
-                    .cloned()
-                    .filter(|node| {
-                        matches!(node.kind, LocalKind::File { length, digest: live }
-                        if length == bytes.len() as u64 && live == digest)
-                    });
-                if let (Some(node), Some(installed)) =
-                    (self.accepted_node_at(record, revision).await?, installed)
-                {
-                    self.replica.store_mut().save_baseline_path(
-                        &record.path,
-                        &node,
-                        Some(&installed),
-                        revision,
-                    )?;
-                } else {
-                    // A newer local write or deletion stays live and pending;
-                    // keep the conflict active and retry later.
-                    return Ok(false);
+                    self.refresh_parent_baseline(&from, revision).await?;
+                    self.refresh_parent_baseline(&record.path, revision).await?;
                 }
             }
             _ => {
@@ -1075,6 +1067,12 @@ impl DirectorySync {
                         accepted.as_ref(),
                         revision,
                     )?;
+                }
+                if matches!(
+                    record.operation.as_str(),
+                    "create-file" | "create-directory"
+                ) {
+                    self.refresh_parent_baseline(&record.path, revision).await?;
                 }
             }
         }
@@ -1857,6 +1855,7 @@ impl<'a> Context<'a> {
         if let Some(local) = self.current.get(path) {
             self.accept_local(path, local, node_id, revision).await?;
         }
+        self.refresh_parent_baseline(path, revision).await?;
         self.replica
             .store_mut()
             .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
@@ -1906,6 +1905,7 @@ impl<'a> Context<'a> {
         self.revisions.insert(path.to_owned(), revision);
         self.mark_parent_dirty(path);
         self.accept_local(path, node, node_id, revision).await?;
+        self.refresh_parent_baseline(path, revision).await?;
         self.replica
             .store_mut()
             .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
@@ -1976,6 +1976,7 @@ impl<'a> Context<'a> {
         self.revisions.remove(path);
         self.mark_parent_dirty(path);
         self.replica.store_mut().remove_baseline_path(path)?;
+        self.refresh_parent_baseline(path, revision).await?;
         self.replica
             .store_mut()
             .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
@@ -2021,6 +2022,8 @@ impl<'a> Context<'a> {
         self.mark_parent_dirty(from);
         self.mark_parent_dirty(to);
         self.migrate_baseline_path(from, to, revision).await?;
+        self.refresh_parent_baseline(from, revision).await?;
+        self.refresh_parent_baseline(to, revision).await?;
         self.replica
             .store_mut()
             .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
@@ -2263,6 +2266,24 @@ impl<'a> Context<'a> {
     fn mark_parent_dirty(&mut self, path: &str) {
         let (parent, _) = split(path);
         self.dirty.insert(parent.to_owned());
+    }
+
+    /// A child creation/removal changes the parent directory's membership, so
+    /// the parent's accepted revision must advance to the receipt that reflects
+    /// it. Without this a later namespace predicate on the parent is planned
+    /// against a stale membership and conflicts spuriously.
+    async fn refresh_parent_baseline(&mut self, path: &str, revision: Revision) -> Result<()> {
+        let (parent, _) = split(path);
+        let snapshot = self.sync.authority().observe_revision(revision).await?;
+        let Some(node) = snapshot.resolve(parent).await? else {
+            return Ok(());
+        };
+        let accepted = self.current.get(parent).cloned();
+        self.replica
+            .store_mut()
+            .save_baseline_path(parent, &node, accepted.as_ref(), revision)?;
+        self.revisions.insert(parent.to_owned(), revision);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

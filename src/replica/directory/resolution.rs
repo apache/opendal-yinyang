@@ -176,7 +176,9 @@ impl DirectorySync {
         match (live, pre_dispatch) {
             (Some(live), Some(expected))
                 if matches!(live.kind, LocalKind::File { .. })
-                    && live.identity == expected.identity =>
+                    && live.identity == expected.identity
+                    && live.kind == expected.kind
+                    && live.executable == expected.executable =>
             {
                 if local_file_matches(&live, bytes)? {
                     // The live file already holds the chosen version.
@@ -185,7 +187,7 @@ impl DirectorySync {
                 // Same inode as dispatch time: replace its bytes with the
                 // explicit chosen version, then verify the installed result.
                 self.replica
-                    .install_bytes(path, &live, live.executable, None, bytes)?;
+                    .install_bytes(path, &live, executable, None, bytes)?;
                 self.verified_local_file(path, bytes)
             }
             (Some(_live), _) => {
