@@ -424,8 +424,6 @@ impl DirectorySync {
         let conflicts: Vec<Conflict> = status.conflicts.clone();
         let mut entries = Vec::with_capacity(paths.len());
         let mut pending = 0_u64;
-        let mut unknown = 0_u64;
-        let mut failed = 0_u64;
         for path in &paths {
             let local_node = snapshot.as_ref().and_then(|snapshot| snapshot.get(path));
             let remote_node = remote_map.as_ref().and_then(|remote| remote.get(path));
@@ -442,7 +440,7 @@ impl DirectorySync {
                     .unwrap_or(conflict.path.as_str())
                     == path
             });
-            let work_record = work.iter().find(|record| record.path == *path);
+            let work_record = select_work(&work, path, sync_inspect.as_ref());
             let intent = intent_evidence(work_record, sync_inspect.as_ref());
             let local = local_evidence(local_node);
             let remote = if remote_map.is_some() {
@@ -469,7 +467,6 @@ impl DirectorySync {
                     },
                 )
             } else if intent.state == Some(IntentState::Unknown) {
-                unknown += 1;
                 (
                     EntryState::Unknown,
                     OutcomeEvidence {
@@ -478,7 +475,6 @@ impl DirectorySync {
                     },
                 )
             } else if intent.state == Some(IntentState::Failed) {
-                failed += 1;
                 (
                     EntryState::Failed,
                     OutcomeEvidence {
@@ -535,25 +531,12 @@ impl DirectorySync {
             });
         }
         pending += status.pending_installs as u64;
-        let mut unknown = unknown;
-        for work in &work {
-            if work.state == "unknown" {
-                unknown += 1;
-            }
-        }
-        if let Some(sync_inspect) = &sync_inspect {
-            for status in &sync_inspect.namespace {
-                match status.state {
-                    NamespaceState::Unknown => unknown += 1,
-                    NamespaceState::Failed => failed += 1,
-                    _ => {}
-                }
-            }
-        }
+        let (unknown, failed) = associated_counts(&work, sync_inspect.as_ref());
         let in_sync = pending == 0
             && unknown == 0
             && failed == 0
             && conflicts.is_empty()
+            && baseline.is_some()
             && remote_status.availability == RemoteAvailability::Available
             && local_status.scan != LocalScanState::Failed;
         let summary = StatusSummary {
@@ -803,9 +786,10 @@ impl DirectorySync {
                 Ok(false)
             }
             Err(error) => {
+                let state = work_state_for(&error);
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
-                    "conflict",
+                    state,
                     None,
                     Some(&error.to_string()),
                 )?;
@@ -1053,29 +1037,15 @@ impl DirectorySync {
                 }
             }
         }
-        let mut unknown = 0_u64;
-        let mut failed = 0_u64;
-        for work in self.replica.store().work()? {
-            match work.state.as_str() {
-                "unknown" => unknown += 1,
-                "failed" => failed += 1,
-                _ => {}
-            }
-        }
-        for status in self.sync.namespace_intents().await? {
-            match status.state {
-                NamespaceState::Unknown => unknown += 1,
-                NamespaceState::Failed => failed += 1,
-                _ => {}
-            }
-        }
+        let work = self.replica.store().work()?;
+        let sync_inspect = Sync::inspect(self.replica.state()).await.ok();
+        let (unknown, failed) = associated_counts(&work, sync_inspect.as_ref());
         outcome.pending = outcome.pending.max(pending);
         outcome.unknown = outcome.unknown.max(unknown);
         outcome.in_sync = outcome.pending == 0
             && outcome.unknown == 0
             && failed == 0
             && outcome.conflicts.is_empty();
-        let _ = failed;
         Ok(())
     }
 
@@ -1122,12 +1092,15 @@ impl DirectorySync {
                     )?;
                 }
                 Err(error) => {
-                    let message = error.to_string();
+                    let state = work_state_for(&error);
+                    if state == "unknown" {
+                        outcome.unknown += 1;
+                    }
                     self.replica.store_mut().update_work(
                         &record.id,
-                        "conflict",
+                        state,
                         None,
-                        Some(&message),
+                        Some(&error.to_string()),
                     )?;
                 }
             }
@@ -2125,6 +2098,86 @@ fn local_kind_side(node: &LocalNode) -> &'static str {
     }
 }
 
+fn work_state_for(error: &crate::runtime::Error) -> &'static str {
+    match error.kind() {
+        crate::runtime::ErrorKind::Unknown => "unknown",
+        crate::runtime::ErrorKind::Retryable => "retryable",
+        crate::runtime::ErrorKind::Conflict => "conflict",
+        _ => "failed",
+    }
+}
+
+fn intent_priority(state: Option<IntentState>) -> u8 {
+    match state {
+        Some(IntentState::Unknown) => 6,
+        Some(IntentState::Prepared) => 5,
+        Some(IntentState::Retryable) => 4,
+        Some(IntentState::Conflict) => 3,
+        Some(IntentState::Failed) => 2,
+        Some(IntentState::Committed) => 1,
+        None => 0,
+    }
+}
+
+/// The durable state of one associated work record, preferring the Sync
+/// journal's own outcome when it is present.
+fn effective_intent_state(
+    record: &WorkRecord,
+    inspect: Option<&crate::sync::SyncInspect>,
+) -> Option<IntentState> {
+    if let Some(inspect) = inspect {
+        let edit = EditId::from_bytes(record.id);
+        if let Some(status) = inspect
+            .namespace
+            .iter()
+            .find(|status| status.intent.id == edit)
+        {
+            return Some(namespace_intent_state(&status.state));
+        }
+        if let Some(content) = inspect.content.iter().find(|content| content.id == edit) {
+            return Some(intent_state_from_handle(&content.handle));
+        }
+    }
+    Some(intent_state_from_work(&record.state))
+}
+
+/// Select the current work record for a path: an unsatisfied request takes
+/// priority over an older committed receipt so a newer pending or Unknown edit
+/// is never hidden by history.
+fn select_work<'a>(
+    work: &'a [WorkRecord],
+    path: &str,
+    inspect: Option<&crate::sync::SyncInspect>,
+) -> Option<&'a WorkRecord> {
+    let mut best: Option<&WorkRecord> = None;
+    let mut best_rank = 0_u8;
+    for record in work.iter().filter(|record| record.path == path) {
+        let rank = intent_priority(effective_intent_state(record, inspect));
+        if best.is_none() || rank > best_rank {
+            best = Some(record);
+            best_rank = rank;
+        }
+    }
+    best
+}
+
+/// Count each associated logical request once by its effective durable state.
+fn associated_counts(
+    work: &[WorkRecord],
+    inspect: Option<&crate::sync::SyncInspect>,
+) -> (u64, u64) {
+    let mut unknown = 0_u64;
+    let mut failed = 0_u64;
+    for record in work {
+        match effective_intent_state(record, inspect) {
+            Some(IntentState::Unknown) => unknown += 1,
+            Some(IntentState::Failed) => failed += 1,
+            _ => {}
+        }
+    }
+    (unknown, failed)
+}
+
 fn remote_action(baseline: Option<&BaselineNode>, current: Option<&Node>) -> Action {
     match (baseline, current) {
         (None, None) => Action::None,
@@ -2375,6 +2428,7 @@ fn intent_evidence(
             evidence.error = status.failure.as_ref().map(|failure| failure.to_string());
         } else if let Some(content) = inspect.content.iter().find(|content| content.id == edit) {
             evidence.state = Some(intent_state_from_handle(&content.handle));
+            evidence.commit_id = content.handle.frozen_commit_id;
             evidence.error = content
                 .handle
                 .error
