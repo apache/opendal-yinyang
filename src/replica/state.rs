@@ -377,7 +377,16 @@ impl Store {
                     entry.parent.map(|value| value.dev.to_be_bytes()),
                     entry.parent.map(|value| value.ino.to_be_bytes()),
                 ),
-                None => (0_i64, None, None, None, None, None, None, None),
+                None => (
+                    0_i64,
+                    None::<[u8; 32]>,
+                    None::<i64>,
+                    false,
+                    None::<[u8; 8]>,
+                    None::<[u8; 8]>,
+                    None::<[u8; 8]>,
+                    None::<[u8; 8]>,
+                ),
             };
             transaction
                 .execute(
@@ -523,7 +532,8 @@ impl Store {
         let Some(revision) = revision else {
             return Ok(None);
         };
-        let revision: [u8; 24] = fixed(&revision, "baseline revision")?;
+        let revision: [u8; 24] = fixed(&revision, "baseline revision")
+            .map_err(|e| Error::corrupt(format!("decode baseline revision: {e}")))?;
         let mut remote = BTreeMap::new();
         let mut local = BTreeMap::new();
         let mut statement = self

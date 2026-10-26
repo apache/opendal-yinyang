@@ -857,7 +857,7 @@ impl Replica {
         let mut record = InstallRecord {
             id,
             path: path.to_owned(),
-            parent,
+            parent: parent.to_owned(),
             name: name.to_owned(),
             temporary: temporary.clone(),
             temporary_dev: None,

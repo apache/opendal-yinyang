@@ -159,7 +159,7 @@ impl DirectorySync {
                     let observed = self.sync.authority().observe_latest().await?;
                     let remote = crate::directory_nodes(&observed).await?;
                     if let Some(node) = remote.get(&record.path) {
-                        let mut source = self.replica.open_artifact(&artifact)?;
+                        let source = self.replica.open_artifact(&artifact)?;
                         let mut source =
                             tokio::io::BufReader::new(tokio::fs::File::from_std(source));
                         self.sync
@@ -458,7 +458,7 @@ impl<'a> Context<'a> {
         for (path, node) in &self.baseline.remote {
             by_node.insert((node.node, node.directory), path.clone());
         }
-        for (path, node) in self.remote {
+        for (path, node) in self.remote.iter() {
             if let Some(old) = by_node
                 .get(&(node.id(), node.is_directory()))
                 .filter(|old| *old != path)
@@ -485,8 +485,8 @@ impl<'a> Context<'a> {
     async fn entry(
         &mut self,
         path: &str,
-        remote_moves: &BTreeMap<String, String>,
-        local_moves: &BTreeMap<String, String>,
+        _remote_moves: &BTreeMap<String, String>,
+        _local_moves: &BTreeMap<String, String>,
     ) -> Result<()> {
         let local = local_action(self.baseline.local.get(path), self.current.get(path));
         let remote = remote_action(self.baseline.remote.get(path), self.remote.get(path));
@@ -509,16 +509,16 @@ impl<'a> Context<'a> {
                 self.publish_modify(path, node).await
             }
             (Action::None, Action::Create) => {
-                let node = self.remote.get(path).ok_or_else(|| {
+                let node = self.remote.get(path).cloned().ok_or_else(|| {
                     crate::replica::Error::invalid("remote create disappeared").to_string()
                 })?;
-                self.materialize_create(path, node).await
+                self.materialize_create(path, &node).await
             }
             (Action::None, Action::Modify) => {
-                let node = self.remote.get(path).ok_or_else(|| {
+                let node = self.remote.get(path).cloned().ok_or_else(|| {
                     crate::replica::Error::invalid("remote modify disappeared").to_string()
                 })?;
-                self.materialize_modify(path, node).await
+                self.materialize_modify(path, &node).await
             }
             (Action::Delete, Action::Delete) => Ok(()),
             (Action::None, Action::Delete) => self.materialize_delete(path).await,
@@ -805,8 +805,8 @@ impl<'a> Context<'a> {
                     self.nodes.insert(to.to_owned(), node);
                 }
                 self.replica.store_mut().remove_baseline_path(from)?;
-                if let Some(remote_node) = self.remote.get(to) {
-                    self.accept_remote(to, remote_node).await?;
+                if let Some(remote_node) = self.remote.get(to).cloned() {
+                    self.accept_remote(to, &remote_node).await?;
                 }
                 self.outcome.materialized_remote += 1;
                 Ok(())
