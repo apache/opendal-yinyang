@@ -872,6 +872,7 @@ impl DirectorySync {
         };
         let expected_identity = self.replica.scan()?.get(&path).cloned();
         self.replica.store_mut().insert_work(&WorkRecord {
+            seq: 0,
             id: *edit.as_bytes(),
             path: path.clone(),
             original_path: record.original_path.clone(),
@@ -2284,6 +2285,7 @@ impl<'a> Context<'a> {
             None => (None, None, None, None),
         };
         self.replica.store_mut().insert_work(&WorkRecord {
+            seq: 0,
             id: *edit.as_bytes(),
             path: path.to_owned(),
             original_path: original_path.map(str::to_owned),
