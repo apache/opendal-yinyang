@@ -21,12 +21,14 @@
 //! binding, observation, fd-relative materialization and retained displaced
 //! bytes. It never recursively deletes a local path.
 
+pub mod directory;
 mod error;
-mod linux;
-mod state;
+pub(super) mod linux;
+pub(super) mod state;
 
+pub use directory::{DirectorySync, Resolution, RunOutcome};
 pub use error::{Error, ErrorKind, Result};
 pub use linux::{
-    Artifact, ArtifactKind, CapturedContent, InstallOutcome, LocalKind, LocalNode, LocalSnapshot,
-    Replica, ReplicaStatus,
+    Artifact, ArtifactKind, CapturedContent, Conflict, InstallOutcome, LocalKind, LocalNode,
+    LocalSnapshot, Replica, ReplicaStatus,
 };

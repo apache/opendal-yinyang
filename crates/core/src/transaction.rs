@@ -243,6 +243,17 @@ impl Transaction {
         }
         Ok((crate::Revision::from_bytes(revision), files))
     }
+    /// Read the durable identity of a persisted frozen request without
+    /// restoring it through an authority. This is a minimal inspection view:
+    /// readiness and predicates are established only by `restore`.
+    pub fn inspect_identity(bytes: &[u8]) -> Result<(crate::Revision, crate::CommitId, [u8; 32])> {
+        let (_, _, id, revision, digest, ..) = Self::wire(bytes)?;
+        Ok((
+            crate::Revision::from_bytes(revision),
+            crate::CommitId::from_bytes(id),
+            digest,
+        ))
+    }
     fn wire(bytes: &[u8]) -> Result<RequestWire> {
         if bytes.len() > 16 * 1024 * 1024 {
             return Err(Error::unsupported(

@@ -16,8 +16,8 @@
 // under the License.
 
 //! Durable conditional uploads for OS-managed or ordinary local replicas.
-use crate::runtime::{Error, HandleStatus, Result, Runtime};
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::runtime::{Error, ErrorKind, HandleStatus, Result, Runtime};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -228,9 +228,79 @@ impl Sync {
     /// Inspect either a content edit or a namespace intent.
     pub async fn edit_status(&self, edit: EditId) -> Result<EditStatus> {
         if let Some(status) = namespace::status(self, edit).await? {
-            return Ok(EditStatus::Namespace(status));
+            return Ok(EditStatus::Namespace(Box::new(status)));
         }
         Ok(EditStatus::Content(self.status(edit).await?))
+    }
+    /// Inspect durable Sync state without opening a writer or acquiring the
+    /// runtime lease. The journal and staging database are opened read-only.
+    pub async fn inspect(directory: impl AsRef<Path>) -> Result<SyncInspect> {
+        let directory = directory.as_ref().to_owned();
+        // Journal mappings are committed only after their staging records are
+        // durable. Read mappings first, then staging, so a concurrent stage
+        // cannot make this read-only join observe a mapping without its handle.
+        let journal_directory = directory.clone();
+        let (edits, namespace) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let path = journal_directory.join("sync.db");
+            let connection = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(Error::local)?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(1))
+                .map_err(Error::local)?;
+            let profile: Option<String> = connection
+                .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+                .optional()
+                .map_err(Error::local)?;
+            let namespaces = match profile.as_deref() {
+                Some("yinyang-sync-1") => Vec::new(),
+                Some("yinyang-sync-2") => namespace::inspect(&connection)?,
+                _ => {
+                    return Err(Error::Invalid(
+                        "sync journal belongs to another filesystem or profile",
+                    ));
+                }
+            };
+            let mut statement = connection
+                .prepare("SELECT id,handle FROM edits ORDER BY id")
+                .map_err(Error::local)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(Error::local)?;
+            let mut edits = Vec::new();
+            for row in rows {
+                let (id, handle) = row.map_err(Error::local)?;
+                let id = id
+                    .try_into()
+                    .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid edit identity"))
+                    .map(EditId::from_bytes)?;
+                let handle = uuid::Uuid::from_slice(&handle)
+                    .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid handle identity"))?;
+                edits.push((id, handle));
+            }
+            Ok((edits, namespaces))
+        })
+        .await
+        .map_err(Error::local)??;
+        let runtime = Runtime::inspect(directory.join("content")).await?;
+        let mut content = Vec::with_capacity(edits.len());
+        for (id, handle) in edits {
+            let status = runtime
+                .handles
+                .iter()
+                .find(|status| status.id == handle)
+                .cloned()
+                .ok_or(Error::State(
+                    ErrorKind::Corrupt,
+                    "sync journal references missing staged content",
+                ))?;
+            content.push(InspectedContent { id, handle: status });
+        }
+        Ok(SyncInspect { content, namespace })
     }
     pub async fn edits(&self) -> Result<Vec<EditId>> {
         self.call(|c| {
@@ -297,7 +367,7 @@ impl Sync {
     pub async fn namespace_status(&self, edit: EditId) -> Result<NamespaceStatus> {
         namespace::status(self, edit)
             .await?
-            .ok_or_else(|| Error::Invalid("unknown namespace intent"))
+            .ok_or(Error::Invalid("unknown namespace intent"))
     }
     /// List all durable namespace intents in stable identity order.
     pub async fn namespace_intents(&self) -> Result<Vec<NamespaceStatus>> {
@@ -348,5 +418,19 @@ impl Sync {
 #[derive(Clone, Debug)]
 pub enum EditStatus {
     Content(HandleStatus),
-    Namespace(NamespaceStatus),
+    Namespace(Box<NamespaceStatus>),
+}
+
+/// Read-only view of one content edit and its durable handle.
+#[derive(Clone, Debug)]
+pub struct InspectedContent {
+    pub id: EditId,
+    pub handle: HandleStatus,
+}
+
+/// Read-only Sync state available without acquiring the writer lease.
+#[derive(Clone, Debug)]
+pub struct SyncInspect {
+    pub content: Vec<InspectedContent>,
+    pub namespace: Vec<NamespaceStatus>,
 }

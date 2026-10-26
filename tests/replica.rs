@@ -58,6 +58,10 @@ fn state_lease_rejects_concurrent_processes_in_one_process_test() {
     let state = replica.state().to_owned();
     let error = Replica::open(&state, filesystem(7)).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Busy);
+    assert_eq!(
+        Replica::inspect(&state).unwrap().root,
+        replica.root().to_path_buf()
+    );
 }
 
 #[test]
@@ -80,6 +84,16 @@ fn scan_hashes_content_and_rejects_symlinks() {
 }
 
 #[test]
+fn scan_rejects_hard_links_with_the_existing_validation_path() {
+    let (_temp, root, replica) = setup();
+    fs::write(root.join("file"), b"content").unwrap();
+    fs::hard_link(root.join("file"), root.join("linked")).unwrap();
+    let error = replica.scan().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("hard-linked"));
+}
+
+#[test]
 fn exchange_retains_old_inode_for_open_writer() {
     let (temp, root, mut replica) = setup();
     fs::write(root.join("file"), b"old").unwrap();
@@ -98,6 +112,13 @@ fn exchange_retains_old_inode_for_open_writer() {
     drop(writer);
 
     assert_eq!(fs::read(root.join("file")).unwrap(), b"remote");
+    let status = replica.status().unwrap();
+    let artifact = status
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == outcome.artifact.id)
+        .unwrap();
+    assert_eq!(artifact.phase, "conflict");
     let mut retained = Vec::new();
     replica
         .export_artifact(&outcome.artifact.id, &mut retained)
@@ -168,7 +189,7 @@ fn restart_classifies_exchange_written_before_phase_update() {
     let state = replica.state().to_owned();
     drop(replica);
 
-    let replica = Replica::open(&state, filesystem(7)).unwrap();
+    let mut replica = Replica::open(&state, filesystem(7)).unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"remote");
     let artifact = replica
         .status()
