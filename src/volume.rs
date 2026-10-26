@@ -78,15 +78,9 @@ fn read_only() -> CapabilitySet {
 /// recoverable staging or any write-side operation.
 fn fuse() -> CapabilitySet {
     use Capability::*;
-    [
-        Read,
-        List,
-        StableIdentity,
-        PinnedReads,
-        RetainedUnlinkRead,
-    ]
-    .into_iter()
-    .collect()
+    [Read, List, StableIdentity, PinnedReads, RetainedUnlinkRead]
+        .into_iter()
+        .collect()
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
