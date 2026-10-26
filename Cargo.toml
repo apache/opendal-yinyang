@@ -58,6 +58,7 @@ yinyang-core = { path = "crates/core" }
 fuser = "0.17.0"
 libc = "0.2"
 nix = { version = "0.30.0", features = ["signal", "user"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }

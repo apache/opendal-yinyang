@@ -72,7 +72,7 @@ impl Failure {
             commit: None,
         }
     }
-    pub(super) fn capture(error: &Error) -> Self {
+    pub(crate) fn capture(error: &Error) -> Self {
         match error {
             Error::Retained(failure) | Error::Local(failure) => failure.clone(),
             _ => Self {
@@ -80,6 +80,15 @@ impl Failure {
                 message: error.to_string(),
                 commit: error.commit_id().map(|id| *id.as_bytes()),
             },
+        }
+    }
+    pub(crate) fn unknown_with(commit: CommitId, cause: impl std::fmt::Display) -> Self {
+        Self {
+            kind: ErrorKind::Unknown,
+            message: format!(
+                "{cause}; publication outcome is unknown, the frozen request is retained"
+            ),
+            commit: Some(*commit.as_bytes()),
         }
     }
 }

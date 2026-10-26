@@ -16,14 +16,19 @@
 // under the License.
 
 //! Durable conditional uploads for OS-managed or ordinary local replicas.
-use crate::runtime::{Error, HandleStatus, Result, Runtime};
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::runtime::{Error, ErrorKind, HandleStatus, Result, Runtime};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
-use yinyang_core::{Authority, NodeId, Revision};
+use yinyang_core::{Authority, NodeId, Receipt, Revision};
+
+mod namespace;
+pub use namespace::{
+    FileMetadata, NamespaceIntent, NamespaceOperation, NamespaceState, NamespaceStatus, RenameMode,
+};
 
 /// Content-addressed local intent, distinct from the frozen remote commit ID.
 /// It binds the filesystem, node, observed revision and exact replacement bytes.
@@ -59,11 +64,38 @@ impl Sync {
             c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
                 CREATE TABLE IF NOT EXISTS binding(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS edits(id BLOB PRIMARY KEY, handle BLOB NOT NULL UNIQUE);").map_err(Error::local)?;
+            namespace::initialize(&c)?;
             let tx = c.transaction().map_err(Error::local)?;
-            tx.execute("INSERT OR IGNORE INTO binding VALUES(1,'yinyang-sync-1',?1)", params![filesystem.as_slice()]).map_err(Error::local)?;
-            let (profile, bound): (String, Vec<u8>) = tx.query_row("SELECT profile,filesystem FROM binding", [], |r| Ok((r.get(0)?,r.get(1)?))).map_err(Error::local)?;
-            if profile != "yinyang-sync-1" || bound != filesystem {
-                return Err(Error::Invalid("sync journal belongs to another filesystem or profile"));
+            let binding: Option<(String, Vec<u8>)> = tx
+                .query_row("SELECT profile,filesystem FROM binding", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
+                .map_err(Error::local)?;
+            match binding {
+                None => {
+                    tx.execute(
+                        "INSERT INTO binding VALUES(1,'yinyang-sync-2',?1)",
+                        params![filesystem.as_slice()],
+                    )
+                    .map_err(Error::local)?;
+                }
+                Some((_profile, bound)) if bound != filesystem => {
+                    return Err(Error::Invalid(
+                        "sync journal belongs to another filesystem or profile",
+                    ));
+                }
+                Some((profile, _)) if profile == "yinyang-sync-1" => {
+                    tx.execute("UPDATE binding SET profile='yinyang-sync-2'", [])
+                        .map_err(Error::local)?;
+                }
+                Some((profile, _)) => {
+                    if profile != "yinyang-sync-2" {
+                        return Err(Error::Invalid(
+                            "sync journal belongs to another filesystem or profile",
+                        ));
+                    }
+                }
             }
             tx.commit().map_err(Error::local)?;
             Ok(c)
@@ -193,6 +225,83 @@ impl Sync {
             .status()
             .await
     }
+    /// Inspect either a content edit or a namespace intent.
+    pub async fn edit_status(&self, edit: EditId) -> Result<EditStatus> {
+        if let Some(status) = namespace::status(self, edit).await? {
+            return Ok(EditStatus::Namespace(Box::new(status)));
+        }
+        Ok(EditStatus::Content(self.status(edit).await?))
+    }
+    /// Inspect durable Sync state without opening a writer or acquiring the
+    /// runtime lease. The journal and staging database are opened read-only.
+    pub async fn inspect(directory: impl AsRef<Path>) -> Result<SyncInspect> {
+        let directory = directory.as_ref().to_owned();
+        // Journal mappings are committed only after their staging records are
+        // durable. Read mappings first, then staging, so a concurrent stage
+        // cannot make this read-only join observe a mapping without its handle.
+        let journal_directory = directory.clone();
+        let (edits, namespace) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let path = journal_directory.join("sync.db");
+            let connection = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(Error::local)?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(1))
+                .map_err(Error::local)?;
+            let profile: Option<String> = connection
+                .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+                .optional()
+                .map_err(Error::local)?;
+            let namespaces = match profile.as_deref() {
+                Some("yinyang-sync-1") => Vec::new(),
+                Some("yinyang-sync-2") => namespace::inspect(&connection)?,
+                _ => {
+                    return Err(Error::Invalid(
+                        "sync journal belongs to another filesystem or profile",
+                    ));
+                }
+            };
+            let mut statement = connection
+                .prepare("SELECT id,handle FROM edits ORDER BY id")
+                .map_err(Error::local)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(Error::local)?;
+            let mut edits = Vec::new();
+            for row in rows {
+                let (id, handle) = row.map_err(Error::local)?;
+                let id = id
+                    .try_into()
+                    .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid edit identity"))
+                    .map(EditId::from_bytes)?;
+                let handle = uuid::Uuid::from_slice(&handle)
+                    .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid handle identity"))?;
+                edits.push((id, handle));
+            }
+            Ok((edits, namespaces))
+        })
+        .await
+        .map_err(Error::local)??;
+        let runtime = Runtime::inspect(directory.join("content")).await?;
+        let mut content = Vec::with_capacity(edits.len());
+        for (id, handle) in edits {
+            let status = runtime
+                .handles
+                .iter()
+                .find(|status| status.id == handle)
+                .cloned()
+                .ok_or(Error::State(
+                    ErrorKind::Corrupt,
+                    "sync journal references missing staged content",
+                ))?;
+            content.push(InspectedContent { id, handle: status });
+        }
+        Ok(SyncInspect { content, namespace })
+    }
     pub async fn edits(&self) -> Result<Vec<EditId>> {
         self.call(|c| {
             let mut q = c
@@ -210,10 +319,73 @@ impl Sync {
         })
         .await
     }
+    /// Durably accept a file creation with its immutable prepared content.
+    pub async fn stage_create_file(
+        &self,
+        parent: NodeId,
+        name: &str,
+        baseline: Revision,
+        metadata: FileMetadata,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<EditId> {
+        namespace::stage_create_file(self, parent, name, baseline, metadata, source).await
+    }
+    /// Durably accept directory creation.
+    pub async fn stage_create_directory(
+        &self,
+        parent: NodeId,
+        name: &str,
+        baseline: Revision,
+    ) -> Result<EditId> {
+        namespace::stage_create_directory(self, parent, name, baseline).await
+    }
+    /// Durably accept removal of an observed stable identity.
+    pub async fn stage_remove(&self, node: NodeId, baseline: Revision) -> Result<EditId> {
+        namespace::stage_remove(self, node, baseline).await
+    }
+    /// Durably accept a rename with explicit destination replacement policy.
+    pub async fn stage_rename(
+        &self,
+        node: NodeId,
+        baseline: Revision,
+        new_parent: NodeId,
+        new_name: &str,
+        mode: RenameMode,
+    ) -> Result<EditId> {
+        namespace::stage_rename(self, node, baseline, new_parent, new_name, mode).await
+    }
+    /// Durably accept an executable-bit change to one observed file identity.
+    pub async fn stage_set_executable(
+        &self,
+        node: NodeId,
+        baseline: Revision,
+        executable: bool,
+    ) -> Result<EditId> {
+        namespace::stage_set_executable(self, node, baseline, executable).await
+    }
+    /// Inspect one durable namespace intent and its exact logical request.
+    pub async fn namespace_status(&self, edit: EditId) -> Result<NamespaceStatus> {
+        namespace::status(self, edit)
+            .await?
+            .ok_or(Error::Invalid("unknown namespace intent"))
+    }
+    /// List all durable namespace intents in stable identity order.
+    pub async fn namespace_intents(&self) -> Result<Vec<NamespaceStatus>> {
+        namespace::statuses(self).await
+    }
+    /// Resolve a namespace intent through the original commit receipt.
+    ///
+    /// Absence is not proof of failure. This method never dispatches or replans.
+    pub async fn resolve_namespace(&self, edit: EditId) -> Result<Option<Receipt>> {
+        namespace::resolve(self, edit).await
+    }
     /// Return the revision that accepted this edit, never a later observation.
     /// Conflicts and Unknown retain all bytes and their original frozen request.
     pub async fn publish(&self, edit: EditId) -> Result<Revision> {
         let _gate = self.inner.gate.lock().await;
+        if namespace::exists(self, edit).await? {
+            return namespace::publish(self, edit).await;
+        }
         let mut handle = self
             .inner
             .runtime
@@ -222,9 +394,17 @@ impl Sync {
         handle.fsync().await?;
         Ok(handle.status().await?.remote_revision)
     }
-    /// Export retained local bytes without claiming remote completion.
+    /// Export retained bytes without claiming remote completion.
+    ///
+    /// Content edits read their local staging. A file-creation namespace intent
+    /// reads its immutable prepared descriptor from the authority; other
+    /// namespace intents return Unsupported. Adapters that need offline export
+    /// of a creation conflict must retain their durable local input separately.
     pub async fn read(&self, edit: EditId, offset: u64, length: usize) -> Result<Vec<u8>> {
         let _gate = self.inner.gate.lock().await;
+        if let Some(bytes) = namespace::read(self, edit, offset, length).await? {
+            return Ok(bytes);
+        }
         self.inner
             .runtime
             .recover(self.handle_id(edit).await?)
@@ -232,4 +412,25 @@ impl Sync {
             .read(offset, length)
             .await
     }
+}
+
+/// Status of the two durable edit families supported by Sync.
+#[derive(Clone, Debug)]
+pub enum EditStatus {
+    Content(HandleStatus),
+    Namespace(Box<NamespaceStatus>),
+}
+
+/// Read-only view of one content edit and its durable handle.
+#[derive(Clone, Debug)]
+pub struct InspectedContent {
+    pub id: EditId,
+    pub handle: HandleStatus,
+}
+
+/// Read-only Sync state available without acquiring the writer lease.
+#[derive(Clone, Debug)]
+pub struct SyncInspect {
+    pub content: Vec<InspectedContent>,
+    pub namespace: Vec<NamespaceStatus>,
 }
