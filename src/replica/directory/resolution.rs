@@ -173,6 +173,16 @@ impl DirectorySync {
     ) -> Result<Option<LocalNode>> {
         let live = self.replica.scan()?.get(path).cloned();
         let chosen = chosen_file_local(path, bytes, executable, pre_dispatch);
+        // A crash after the selected bytes were already installed but before
+        // the baseline was saved leaves them on a new inode. Accept the actual
+        // live node so later move detection keeps the real identity.
+        if let Some(live) = &live
+            && matches!(live.kind, LocalKind::File { .. })
+            && local_file_matches(live, bytes)?
+            && live.executable == executable
+        {
+            return Ok(Some(live.clone()));
+        }
         match (live, pre_dispatch) {
             (Some(live), Some(expected))
                 if matches!(live.kind, LocalKind::File { .. })
@@ -180,10 +190,6 @@ impl DirectorySync {
                     && live.kind == expected.kind
                     && live.executable == expected.executable =>
             {
-                if local_file_matches(&live, bytes)? {
-                    // The live file already holds the chosen version.
-                    return Ok(Some(live));
-                }
                 // Same inode as dispatch time: replace its bytes with the
                 // explicit chosen version, then verify the installed result.
                 self.replica

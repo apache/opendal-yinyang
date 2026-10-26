@@ -95,12 +95,6 @@ impl Condition {
             );
             part(snapshot.node(id).await?.as_ref(), self.key[0])?
         };
-        if actual != self.expected {
-            eprintln!(
-                "yy-core: condition actual tag={} actual={actual:?} expected={:?}",
-                self.key[0], self.expected
-            );
-        }
         Ok(actual == self.expected)
     }
 }
@@ -151,12 +145,6 @@ impl Transaction {
     pub(crate) async fn apply(&self, snapshot: &Snapshot) -> Result<Option<Delta>> {
         for condition in &self.conditions {
             if !condition.matches(snapshot).await? {
-                eprintln!(
-                    "yy-core: condition mismatch tag={} key={:02x?} expected={:?}",
-                    condition.key.first().copied().unwrap_or(255),
-                    condition.key,
-                    condition.expected
-                );
                 return Ok(None);
             }
         }

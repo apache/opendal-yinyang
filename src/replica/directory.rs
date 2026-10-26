@@ -1003,6 +1003,26 @@ impl DirectorySync {
         Ok(observed.resolve(&record.path).await?)
     }
 
+    /// Retry-path counterpart of the reconciliation parent refresh: advance the
+    /// parent's accepted remote node/revision while preserving the previously
+    /// accepted local parent fingerprint.
+    async fn refresh_parent_baseline(&mut self, path: &str, revision: Revision) -> Result<()> {
+        let (parent, _) = split(path);
+        let snapshot = self.sync.authority().observe_revision(revision).await?;
+        let Some(node) = snapshot.resolve(parent).await? else {
+            return Ok(());
+        };
+        let accepted = self
+            .replica
+            .store()
+            .load_baseline()?
+            .and_then(|baseline| baseline.local.get(parent).cloned());
+        self.replica
+            .store_mut()
+            .save_baseline_path(parent, &node, accepted.as_ref(), revision)?;
+        Ok(())
+    }
+
     /// Apply an already-committed retry receipt to the common baseline by
     /// operation kind: a removal drops the subtree, a rename relocates the
     /// subtree preserving accepted fingerprints, and other edits save the
@@ -1308,7 +1328,6 @@ impl<'a> Context<'a> {
     async fn reconcile(&mut self) -> Result<()> {
         self.seed();
         let (remote_moves, local_moves) = self.detect_moves();
-        eprintln!("yy: moves remote={remote_moves:#?} local={local_moves:#?}");
         let mut handled: BTreeSet<String> = BTreeSet::new();
         self.apply_moves(&remote_moves, &local_moves, &mut handled)
             .await?;
@@ -1379,23 +1398,6 @@ impl<'a> Context<'a> {
     }
 
     fn detect_moves(&self) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-        eprintln!(
-            "yy: baseline-local {:?}",
-            self.baseline
-                .local
-                .nodes()
-                .iter()
-                .map(|(path, node)| (path.clone(), node.identity, node.is_directory()))
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "yy: current {:?}",
-            self.current
-                .nodes()
-                .iter()
-                .map(|(path, node)| (path.clone(), node.identity, node.is_directory()))
-                .collect::<Vec<_>>()
-        );
         let mut remote_moves = BTreeMap::new();
         let mut by_node = BTreeMap::new();
         for (path, node) in &self.baseline.remote {
@@ -1466,7 +1468,7 @@ impl<'a> Context<'a> {
                 }
                 (Some(_), Some(local_destination)) => {
                     let desired = local_destination.clone();
-                    self.mark_subtree(handled, &source);
+                    self.mark_subtree_pair(handled, &source, &desired);
                     self.conflict(&source, Some(&source), Some(&desired))
                         .await?;
                 }
@@ -1479,10 +1481,10 @@ impl<'a> Context<'a> {
                             self.migrate_subtree(handled, &source, destination, self.revision)
                                 .await?;
                         } else {
-                            self.mark_subtree(handled, &source);
+                            self.mark_subtree_pair(handled, &source, destination);
                         }
                     } else {
-                        self.mark_subtree(handled, &source);
+                        self.mark_subtree_pair(handled, &source, destination);
                         self.conflict(&source, Some(&source), Some(&source)).await?;
                     }
                 }
@@ -1495,10 +1497,10 @@ impl<'a> Context<'a> {
                             self.migrate_subtree(handled, &source, destination, revision)
                                 .await?;
                         } else {
-                            self.mark_subtree(handled, &source);
+                            self.mark_subtree_pair(handled, &source, destination);
                         }
                     } else {
-                        self.mark_subtree(handled, &source);
+                        self.mark_subtree_pair(handled, &source, destination);
                         self.conflict(&source, Some(&source), Some(&source)).await?;
                     }
                 }
@@ -1522,6 +1524,26 @@ impl<'a> Context<'a> {
             .cloned()
             .collect();
         handled.extend(targets);
+    }
+
+    /// Block both the source and destination subtrees when a rename cannot be
+    /// applied, so the same run never falls back to creating the destination.
+    fn mark_subtree_pair(&self, handled: &mut BTreeSet<String>, from: &str, to: &str) {
+        self.mark_subtree(handled, from);
+        handled.insert(from.to_owned());
+        let prefix = format!("{to}/");
+        let targets: Vec<String> = self
+            .current
+            .nodes()
+            .keys()
+            .chain(self.baseline.local.nodes().keys())
+            .chain(self.baseline.remote.keys())
+            .chain(self.remote.keys())
+            .filter(|path| *path == to || path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        handled.extend(targets);
+        handled.insert(to.to_owned());
     }
 
     /// Relocate every baseline entry under a renamed directory to its new path,
@@ -1822,7 +1844,6 @@ impl<'a> Context<'a> {
     }
 
     async fn publish_directory(&mut self, path: &str) -> Result<()> {
-        eprintln!("yy: publish_directory {path}");
         let (parent, name) = split(path);
         let parent_node = self
             .nodes
@@ -1865,7 +1886,6 @@ impl<'a> Context<'a> {
     }
 
     async fn publish_file(&mut self, path: &str, node: &LocalNode) -> Result<()> {
-        eprintln!("yy: publish_file {path}");
         let (parent, name) = split(path);
         let parent_node = self
             .nodes
@@ -1950,7 +1970,6 @@ impl<'a> Context<'a> {
     }
 
     async fn publish_remove(&mut self, path: &str) -> Result<()> {
-        eprintln!("yy: publish_remove {path}");
         let node = self
             .nodes
             .get(path)
@@ -1986,7 +2005,6 @@ impl<'a> Context<'a> {
     }
 
     async fn local_rename(&mut self, from: &str, to: &str) -> Result<Option<Revision>> {
-        eprintln!("yy: local_rename {from} -> {to}");
         let node = self
             .nodes
             .get(from)
@@ -2156,7 +2174,6 @@ impl<'a> Context<'a> {
         match self.sync.publish(edit).await {
             Ok(revision) => Ok(Some(revision)),
             Err(error) if error.kind() == crate::runtime::ErrorKind::Conflict => {
-                eprintln!("yy: publication conflict for {path}: {error}");
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
                     "conflict",
@@ -2167,7 +2184,6 @@ impl<'a> Context<'a> {
                 Ok(None)
             }
             Err(error) if error.kind() == crate::runtime::ErrorKind::Retryable => {
-                eprintln!("yy: publication retryable for {path}: {error}");
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
                     "retryable",
@@ -2278,7 +2294,15 @@ impl<'a> Context<'a> {
         let Some(node) = snapshot.resolve(parent).await? else {
             return Ok(());
         };
-        let accepted = self.current.get(parent).cloned();
+        // Only the remote parent node/revision advances here. Preserve the
+        // previously accepted local parent fingerprint so a pending local
+        // deletion or rename of the parent is not acknowledged by a child's
+        // receipt.
+        let accepted = self
+            .replica
+            .store()
+            .load_baseline()?
+            .and_then(|baseline| baseline.local.get(parent).cloned());
         self.replica
             .store_mut()
             .save_baseline_path(parent, &node, accepted.as_ref(), revision)?;
