@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek as _, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
-use yinyang_core::{Authority, Node, NodeId, NodeKind, Revision, Snapshot};
+use yinyang_core::{Authority, ContentId, Node, NodeId, NodeKind, Revision, Snapshot};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + std::marker::Sync>>;
 
@@ -266,7 +266,7 @@ impl DirectorySync {
                     outcome.materialized_remote += 1;
                     let fresh = self.replica.scan()?;
                     if let Some(local) = fresh.get(path) {
-                        if same_side(Some(local), Some(node)) {
+                        if canonical_matches(&mut self.replica, local, node).await? {
                             self.replica
                                 .store_mut()
                                 .save_baseline_path(path, node, Some(local))?;
@@ -526,7 +526,7 @@ impl<'a> Context<'a> {
             (Action::Create, Action::Create) => {
                 let local = self.current.get(path);
                 let remote = self.remote.get(path);
-                if same_side(local, remote) {
+                if canonical_matches(self.replica, local.unwrap(), remote.unwrap()).await? {
                     Ok(())
                 } else {
                     self.conflict(path, None, Some(path), "create", "create")
@@ -536,7 +536,7 @@ impl<'a> Context<'a> {
             (Action::Modify, Action::Modify) => {
                 let local = self.current.get(path);
                 let remote = self.remote.get(path);
-                if same_side(local, remote) {
+                if canonical_matches(self.replica, local.unwrap(), remote.unwrap()).await? {
                     Ok(())
                 } else {
                     self.conflict(path, Some(path), None, "modify", "modify")
@@ -899,7 +899,7 @@ impl<'a> Context<'a> {
         let Some(current) = fresh.get(path) else {
             return Ok(());
         };
-        if same_side(Some(current), Some(node)) {
+        if canonical_matches(self.replica, current, node).await? {
             self.replica
                 .store_mut()
                 .save_baseline_path(path, node, Some(current))?;
@@ -945,6 +945,24 @@ fn local_equal(left: &LocalNode, right: &LocalNode) -> bool {
     left.kind == right.kind && left.executable == right.executable
 }
 
+async fn canonical_matches(
+    replica: &mut Replica,
+    local: &LocalNode,
+    remote: &Node,
+) -> Result<bool> {
+    match (local.kind, remote.kind()) {
+        (LocalKind::Directory, NodeKind::Directory { .. }) => Ok(true),
+        (LocalKind::File { .. }, NodeKind::File(file)) => {
+            let captured = replica.capture_file(&local.path, local)?;
+            let mut source =
+                tokio::fs::File::from_std(replica.open_artifact(&captured.artifact.id)?);
+            let content = ContentId::calculate(&mut source).await?;
+            Ok(local.executable == remote.executable() && content == *file.content_id())
+        }
+        _ => Ok(false),
+    }
+}
+
 fn remote_equal(baseline: &crate::replica::state::BaselineNode, current: &Node) -> bool {
     let digest = match current.kind() {
         NodeKind::File(file) => Some(*file.content_id().digest()),
@@ -954,24 +972,6 @@ fn remote_equal(baseline: &crate::replica::state::BaselineNode, current: &Node) 
         && baseline.directory == current.is_directory()
         && baseline.executable == current.executable()
         && baseline.digest == digest
-}
-
-fn same_side(local: Option<&LocalNode>, remote: Option<&Node>) -> bool {
-    match (local, remote) {
-        (Some(local), Some(remote)) => {
-            let digest = match local.kind {
-                LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
-                LocalKind::Directory => None,
-            };
-            let remote_digest = match remote.kind() {
-                NodeKind::File(file) => Some(*file.content_id().digest()),
-                NodeKind::Directory { .. } => None,
-            };
-            local.executable == remote.executable() && digest == remote_digest
-        }
-        (None, None) => true,
-        _ => false,
-    }
 }
 
 fn record_conflict(
