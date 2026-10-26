@@ -412,6 +412,96 @@ impl Store {
         Ok(())
     }
 
+    pub fn save_baseline_path(
+        &mut self,
+        path: &str,
+        node: &Node,
+        local: Option<&LocalNode>,
+    ) -> Result<()> {
+        let (directory, length, digest) = match node.kind() {
+            NodeKind::Directory { .. } => (true, 0, None),
+            NodeKind::File(file) => (
+                false,
+                file.content_id().length(),
+                Some(*file.content_id().digest()),
+            ),
+        };
+        let (
+            present,
+            local_digest,
+            local_length,
+            local_mode,
+            local_dev,
+            local_ino,
+            parent_dev,
+            parent_ino,
+        ) = match local {
+            Some(entry) => (
+                1_i64,
+                match entry.kind {
+                    LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
+                    LocalKind::Directory => None,
+                },
+                match entry.kind {
+                    LocalKind::File { length, .. } => {
+                        Some(i64::try_from(length).map_err(|_| {
+                            Error::invalid("local baseline length exceeds SQLite range")
+                        })?)
+                    }
+                    LocalKind::Directory => None,
+                },
+                Some(entry.executable),
+                Some(entry.identity.dev.to_be_bytes()),
+                Some(entry.identity.ino.to_be_bytes()),
+                entry.parent.map(|value| value.dev.to_be_bytes()),
+                entry.parent.map(|value| value.ino.to_be_bytes()),
+            ),
+            None => (0_i64, None, None, None, None, None, None, None),
+        };
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO baseline
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    path,
+                    node.id().as_bytes().as_slice(),
+                    directory,
+                    node.executable(),
+                    digest.as_ref().map(|value| value.as_slice()),
+                    i64::try_from(length).map_err(|_| Error::invalid(
+                        "remote baseline length exceeds SQLite range"
+                    ))?,
+                    present,
+                    local_digest.as_ref().map(|value| value.as_slice()),
+                    local_length,
+                    local_mode,
+                    local_dev,
+                    local_ino,
+                    parent_dev,
+                    parent_ino,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("write baseline entry: {e}")))?;
+        Ok(())
+    }
+
+    pub fn remove_baseline_path(&mut self, path: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM baseline WHERE path=?1", params![path])
+            .map_err(|e| Error::corrupt(format!("remove baseline entry: {e}")))?;
+        Ok(())
+    }
+
+    pub fn set_baseline_revision(&mut self, revision: Revision) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO baseline_meta VALUES(1,?1)",
+                params![revision.to_bytes().as_slice()],
+            )
+            .map_err(|e| Error::corrupt(format!("write baseline revision: {e}")))?;
+        Ok(())
+    }
+
     pub fn load_baseline(&self) -> Result<Option<BaselineRecord>> {
         let revision: Option<Vec<u8>> = self
             .connection
