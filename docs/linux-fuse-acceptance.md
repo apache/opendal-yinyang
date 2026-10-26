@@ -42,10 +42,14 @@ cargo x test-linux-fuse --read-only
 
 - Read-only basic: mounted reads, and explicit rejection (`EROFS`/`EACCES`) of
   writable open, create, mkdir and rename.
+- Read-only directories: nested `read_dir` enumeration and stable inode numbers
+  across repeated stat calls, cached `readdir` after a file lookup/read, and a
+  520-entry bulk directory that crosses the adapter's 512-entry readdir page.
 - Basic writable I/O: create, write, remote `fsync` verified through an
   independent authority, append, truncate, and multiple descriptors on one file.
 - Safe-save rename replacement: `rename` replaces an observed destination
-  atomically and the independent authority observes the result.
+  atomically and the independent authority observes the result; plain rename
+  preserves the moved node's inode identity.
 - Retained unlink reads: bytes stay readable through an already-open descriptor
   after `unlink`.
 - Unsupported operations: symlink and hard link return an explicit OS error

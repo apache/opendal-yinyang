@@ -22,9 +22,12 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use yinyang::core::service::ServiceClient;
+use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
 
 /// The kernel filesystem type advertised by the YinYang FUSE adapter.
 pub const MOUNT_TYPE: &str = "fuse.yinyang";
@@ -389,6 +392,92 @@ impl Fixture {
         let path = self.temp.path().join(format!("{name}.json"));
         fs::write(&path, json).expect("write volume config");
         path
+    }
+
+    /// Seed a directory tree in one core transaction. The 520 entries in
+    /// `bulk` cross the adapter's 512-entry readdir page without launching one
+    /// CLI process per entry.
+    pub fn seed_read_only_tree(&self) {
+        let operator = self.operator();
+        let publication = self.publication();
+        let address = self.service.as_ref().map(|service| service.address);
+        let token = self.token.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build seed runtime");
+        runtime.block_on(async move {
+            let authority: Arc<dyn Authority> = match publication {
+                Publication::Object => Arc::new(
+                    Fs::open(operator, BackendProfile::Minio)
+                        .await
+                        .expect("open object authority for batch seed"),
+                ),
+                Publication::Service => Arc::new(
+                    ServiceClient::connect(address.expect("service address"), token, operator)
+                        .await
+                        .expect("connect service authority for batch seed"),
+                ),
+            };
+            let snapshot = authority.observe_latest().await.expect("observe seed base");
+            let mut empty_source: &[u8] = b"";
+            let empty = authority
+                .prepare(&mut empty_source)
+                .await
+                .expect("prepare empty file content");
+            let mut hello_source: &[u8] = b"hello from nested";
+            let hello = authority
+                .prepare(&mut hello_source)
+                .await
+                .expect("prepare nested file content");
+            let mut root_source: &[u8] = b"read-only bytes";
+            let root_file = authority
+                .prepare(&mut root_source)
+                .await
+                .expect("prepare root file content");
+            let mut plan = Planner::new(&snapshot, CommitId::generate());
+            let nested = plan
+                .create_directory(authority.root(), "nested")
+                .await
+                .expect("plan nested directory");
+            let inner = plan
+                .create_directory(nested, "inner")
+                .await
+                .expect("plan inner directory");
+            plan.create_file(inner, "hello.txt", hello, false)
+                .await
+                .expect("plan nested file");
+            plan.create_file(authority.root(), "readonly.txt", root_file, false)
+                .await
+                .expect("plan root file");
+            let bulk = plan
+                .create_directory(authority.root(), "bulk")
+                .await
+                .expect("plan bulk directory");
+            for index in 0..520 {
+                plan.create_file(bulk, &format!("entry-{index:04}"), empty.clone(), false)
+                    .await
+                    .expect("plan bulk entry");
+            }
+            let request = plan.finish().expect("finish batch seed");
+            let outcome = authority.commit(&request).await.expect("commit batch seed");
+            assert!(
+                matches!(&outcome, CommitOutcome::Committed(_)),
+                "batch seed did not commit: {outcome:?}"
+            );
+        });
+    }
+
+    fn operator(&self) -> opendal::Operator {
+        let config = self
+            .storage_env()
+            .into_iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("YINYANG_S3_")
+                    .map(|key| (key.to_ascii_lowercase(), value))
+            })
+            .collect::<Vec<_>>();
+        opendal::Operator::via_iter("s3", config).expect("construct S3 operator")
     }
 
     pub fn library_seed(&self, config: &Path, path: &str, bytes: &[u8]) {

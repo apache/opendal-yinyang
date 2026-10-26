@@ -22,7 +22,8 @@ use crate::harness::{
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::path::Path;
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -38,6 +39,105 @@ const EROFS: i32 = 30;
 fn fuse_read_only_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         read_only(&Fixture::new(publication));
+    }
+}
+
+fn names(path: &Path) -> std::collections::BTreeSet<String> {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("read directory {}: {error}", path.display()))
+        .map(|entry| {
+            entry
+                .expect("read directory entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8 directory entry")
+        })
+        .collect()
+}
+
+fn inode(path: &Path) -> u64 {
+    fs::metadata(path)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+        .ino()
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_read_only_cached_readdir_and_nested_inodes_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        fixture.seed_read_only_tree();
+        let config = fixture.volume_config(
+            &format!("stage-readdir-{}", fixture.publication().as_str()),
+            Frontend::Fuse,
+            true,
+        );
+        let mountpoint = fixture
+            .temp
+            .path()
+            .join(format!("mnt-readdir-{}", fixture.publication().as_str()));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let root = mounted.mountpoint();
+
+        let nested = root.join("nested");
+        let inner = nested.join("inner");
+        let file = inner.join("hello.txt");
+        assert_eq!(
+            fs::read(&file).expect("read nested file"),
+            b"hello from nested"
+        );
+        let nested_ino = inode(&nested);
+        let inner_ino = inode(&inner);
+        let file_ino = inode(&file);
+        assert_eq!(
+            inode(&nested),
+            nested_ino,
+            "nested inode changed across stat"
+        );
+        assert_eq!(
+            inode(&inner),
+            inner_ino,
+            "inner directory inode changed across stat"
+        );
+        assert_eq!(inode(&file), file_ino, "file inode changed across stat");
+
+        let root_first = names(root);
+        let root_second = names(root);
+        assert_eq!(root_first, root_second, "cached root readdir changed");
+        assert!(root_first.contains("nested"));
+        assert!(root_first.contains("bulk"));
+        assert!(root_first.contains("readonly.txt"));
+        let nested_first = names(&nested);
+        assert_eq!(
+            names(&nested),
+            nested_first,
+            "cached nested readdir changed"
+        );
+        let inner_first = names(&inner);
+        assert_eq!(
+            inner_first,
+            ["hello.txt"].into_iter().map(str::to_owned).collect()
+        );
+        assert_eq!(names(&inner), inner_first, "cached inner readdir changed");
+
+        let bulk = root.join("bulk");
+        assert_eq!(fs::read(bulk.join("entry-0000")).unwrap(), b"");
+        assert_eq!(
+            inode(&bulk.join("entry-0000")),
+            inode(&bulk.join("entry-0000"))
+        );
+        let bulk_first = names(&bulk);
+        let bulk_second = names(&bulk);
+        assert_eq!(bulk_first.len(), 520, "bulk directory entry count");
+        assert_eq!(bulk_first, bulk_second, "multi-page cached readdir changed");
+        for index in 0..520 {
+            assert!(
+                bulk_first.contains(&format!("entry-{index:04}")),
+                "missing bulk entry {index}"
+            );
+        }
+        mounted.unmount();
     }
 }
 
@@ -213,8 +313,28 @@ fn rename_and_unlink(fixture: &Fixture) {
     temp.write_all(b"new").expect("write rename source");
     temp.sync_all().expect("fsync rename source");
     drop(temp);
+    let source_inode = inode(&root.join("saved.txt.new"));
+    fs::rename(root.join("saved.txt.new"), root.join("renamed.txt"))
+        .expect("plain rename must preserve inode identity");
+    assert_eq!(
+        inode(&root.join("renamed.txt")),
+        source_inode,
+        "rename must not change the inode identity of the moved node"
+    );
+    fs::rename(root.join("renamed.txt"), root.join("saved.txt.new"))
+        .expect("rename back before safe-save");
+    let target_inode = inode(&root.join("saved.txt"));
     fs::rename(root.join("saved.txt.new"), root.join("saved.txt"))
         .expect("safe-save rename must atomically replace the target");
+    assert_eq!(
+        inode(&root.join("saved.txt")),
+        source_inode,
+        "safe-save replacement must keep the source identity"
+    );
+    assert_ne!(
+        target_inode, source_inode,
+        "safe-save replacement must replace the observed target node"
+    );
     assert!(!root.join("saved.txt.new").exists());
     assert_eq!(
         fs::read(root.join("saved.txt")).expect("read replaced target"),
