@@ -48,6 +48,7 @@ const STORAGE_VARIABLES: [&str; 5] = [
     "YINYANG_S3_ACCESS_KEY_ID",
     "YINYANG_S3_SECRET_ACCESS_KEY",
 ];
+const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Publication {
@@ -1239,15 +1240,28 @@ fn handle_service_connection(
 fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut length = [0_u8; 4];
     stream.read_exact(&mut length)?;
-    let mut frame = vec![0_u8; u32::from_le_bytes(length) as usize];
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame exceeds 16 MiB",
+        ));
+    }
+    let mut frame = vec![0_u8; length];
     stream.read_exact(&mut frame)?;
     Ok(frame)
 }
 
 fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    if frame.len() > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame exceeds 16 MiB",
+        ));
+    }
     let length = u32::try_from(frame.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"))?;
-    stream.write_all(&length.to_le_bytes())?;
+    stream.write_all(&length.to_be_bytes())?;
     stream.write_all(frame)
 }
 
