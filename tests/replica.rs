@@ -17,6 +17,7 @@
 
 #![cfg(target_os = "linux")]
 
+use rustix::fs::{CWD, RenameFlags, renameat_with};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt as _;
@@ -49,6 +50,14 @@ fn binding_rejects_root_and_filesystem_substitution() {
     let nested = root.join(".sync-state");
     let error = Replica::init(&nested, &root, filesystem(1)).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Invalid);
+}
+
+#[test]
+fn state_lease_rejects_concurrent_processes_in_one_process_test() {
+    let (_temp, _root, replica) = setup();
+    let state = replica.state().to_owned();
+    let error = Replica::open(&state, filesystem(7)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Busy);
 }
 
 #[test]
@@ -123,6 +132,56 @@ fn concurrent_in_place_edit_is_restored_atomically() {
     writer.sync_all().unwrap();
     drop(writer);
     assert_eq!(fs::read(root.join("file")).unwrap(), b"busy-later");
+}
+
+#[test]
+fn restart_classifies_exchange_written_before_phase_update() {
+    let (_temp, root, mut replica) = setup();
+    fs::write(root.join("file"), b"old").unwrap();
+    let snapshot = replica.scan().unwrap();
+    let expected = snapshot.get("file").unwrap();
+    let mut install = replica
+        .prepare_install("file", expected, false, None)
+        .unwrap();
+    install.write_all(b"remote").unwrap();
+    drop(install);
+
+    let temporary = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".yy-install-")
+        })
+        .unwrap();
+    let target = root.join("file");
+    renameat_with(
+        CWD,
+        temporary.as_path(),
+        CWD,
+        target.as_path(),
+        RenameFlags::EXCHANGE,
+    )
+    .unwrap();
+    let state = replica.state().to_owned();
+    drop(replica);
+
+    let replica = Replica::open(&state, filesystem(7)).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"remote");
+    let artifact = replica
+        .status()
+        .unwrap()
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.origin == "file")
+        .unwrap();
+    let mut retained = Vec::new();
+    replica
+        .export_artifact(&artifact.id, &mut retained)
+        .unwrap();
+    assert_eq!(retained, b"old");
 }
 
 #[test]

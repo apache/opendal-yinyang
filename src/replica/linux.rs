@@ -19,8 +19,8 @@ use super::state::{ArtifactRecord, InstallPhase, InstallRecord, Store};
 use super::{Error, Result};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat, fchmod, fstat, fsync, mkdirat, open,
-    openat, renameat_with, statat, unlinkat,
+    AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, fchmod, flock, fstat,
+    fsync, mkdirat, open, openat, renameat_with, statat, unlinkat,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -116,6 +116,7 @@ impl LocalSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactKind {
     ReplacedFile,
+    RollbackDisplaced,
     QuarantinedFile,
     QuarantinedDirectory,
 }
@@ -124,6 +125,7 @@ impl ArtifactKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::ReplacedFile => "replaced-file",
+            Self::RollbackDisplaced => "rollback-displaced",
             Self::QuarantinedFile => "quarantined-file",
             Self::QuarantinedDirectory => "quarantined-directory",
         }
@@ -163,6 +165,7 @@ pub struct Replica {
     root_fd: OwnedFd,
     state_fd: OwnedFd,
     quarantine_fd: OwnedFd,
+    _lease: std::fs::File,
     store: Store,
 }
 
@@ -207,6 +210,7 @@ impl Replica {
                 "local root and sync state must be on the same filesystem for atomic exchange and quarantine",
             ));
         }
+        let lease = acquire_state_lease(&state_fd, &state)?;
         let mut store = Store::open(&state.join("replica.db"))?;
         let requested = super::state::Binding {
             filesystem,
@@ -242,6 +246,7 @@ impl Replica {
             root_fd,
             state_fd,
             quarantine_fd,
+            _lease: lease,
             store,
         };
         replica.recover_incomplete()?;
@@ -252,6 +257,7 @@ impl Replica {
         let state =
             std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;
         let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
+        let lease = acquire_state_lease(&state_fd, &state)?;
         let store = Store::open(&state.join("replica.db"))?;
         let binding = store
             .binding()?
@@ -300,6 +306,7 @@ impl Replica {
             root_fd,
             state_fd,
             quarantine_fd,
+            _lease: lease,
             store,
         };
         replica.recover_incomplete()?;
@@ -621,6 +628,12 @@ impl Replica {
             if name == "." || name == ".." {
                 continue;
             }
+            if name.starts_with(".yy-install-") || name.starts_with(".yy-rollback-") {
+                return Err(Error::conflict(format!(
+                    "unrecovered internal installation entry is present: {}",
+                    join(prefix, name)
+                )));
+            }
             let folded = yinyang_core::namespace::name_key(name)
                 .map_err(|e| Error::invalid(format!("invalid local name {name:?}: {e}")))?;
             if !slots.insert(folded) {
@@ -785,22 +798,39 @@ impl Replica {
         Ok(fd)
     }
 
+    fn open_journal_parent(&self, install: &InstallRecord) -> Result<OwnedFd> {
+        if let Ok(parent) = self.open_relative_dir(&install.parent)
+            && let Ok(current) = identity(&parent, &self.root, "inspect install parent")
+            && current.dev == install.parent_dev
+            && current.ino == install.parent_ino
+        {
+            return Ok(parent);
+        }
+        find_directory(
+            &self.root_fd,
+            self.root_identity.dev,
+            Identity {
+                dev: install.parent_dev,
+                ino: install.parent_ino,
+            },
+            &self.root,
+        )?
+        .ok_or_else(|| {
+            Error::conflict(format!(
+                "cannot locate the journaled install parent {}/{} without following symlinks",
+                install.parent_dev, install.parent_ino
+            ))
+        })
+    }
+
     fn recover_incomplete(&mut self) -> Result<()> {
         for mut install in self.store.incomplete_installs()? {
             match install.phase {
                 InstallPhase::Creating => {
-                    self.remove_temporary_if_present(&install)?;
-                    install.phase = InstallPhase::Failed;
-                    install.error =
-                        Some("interrupted before replacement bytes were prepared".to_owned());
-                    self.store.update_install(&install)?;
-                    self.store
-                        .update_artifact(&install.id, "failed", install.error.as_deref())?;
+                    self.recover_creating(&mut install)?;
                 }
                 InstallPhase::Prepared => {
-                    // The replacement bytes remain in the temporary name and the
-                    // displaced local target has not been touched. Resume remains
-                    // an explicit higher-layer action.
+                    self.recover_prepared(&mut install)?;
                 }
                 InstallPhase::Exchanged => {
                     self.retain_exchanged(&mut install)?;
@@ -811,26 +841,166 @@ impl Replica {
         Ok(())
     }
 
-    fn remove_temporary_if_present(&self, install: &InstallRecord) -> Result<()> {
-        let parent = self.open_relative_dir(&install.parent)?;
-        match unlinkat(&parent, install.temporary.as_str(), AtFlags::empty()) {
-            Ok(()) => {
-                fsync(&parent).map_err(|e| {
-                    Error::errno("persist interrupted install cleanup", &self.root, e)
-                })?;
-                Ok(())
-            }
-            Err(rustix::io::Errno::NOENT) => Ok(()),
-            Err(error) => Err(Error::errno(
+    fn recover_creating(&mut self, install: &mut InstallRecord) -> Result<()> {
+        let parent = self.open_journal_parent(install)?;
+        let Some(stat) = optional_stat(&parent, &install.temporary, &self.root)? else {
+            install.phase = InstallPhase::Failed;
+            install.error = Some("interrupted before replacement bytes were prepared".to_owned());
+            self.store.update_install(install)?;
+            self.store
+                .update_artifact(&install.id, "failed", install.error.as_deref())?;
+            return Ok(());
+        };
+        let owned = install.temporary_dev == Some(stat.st_dev)
+            && install.temporary_ino == Some(stat.st_ino)
+            && FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile;
+        if !owned {
+            return self.retain_uncertain_temporary(
+                install,
+                "interrupted temporary identity cannot be proven; retained instead of deleting",
+            );
+        }
+        unlinkat(&parent, install.temporary.as_str(), AtFlags::empty()).map_err(|e| {
+            Error::errno(
                 "remove interrupted install temporary",
                 &self.root.join(&install.path),
-                error,
-            )),
+                e,
+            )
+        })?;
+        fsync(&parent)
+            .map_err(|e| Error::errno("persist interrupted install cleanup", &self.root, e))?;
+        install.phase = InstallPhase::Failed;
+        install.error = Some("interrupted before replacement bytes were prepared".to_owned());
+        self.store.update_install(install)?;
+        self.store
+            .update_artifact(&install.id, "failed", install.error.as_deref())?;
+        Ok(())
+    }
+
+    fn recover_prepared(&mut self, install: &mut InstallRecord) -> Result<()> {
+        let parent = self.open_journal_parent(install)?;
+        let artifact = optional_stat(&self.quarantine_fd, &install.artifact, &self.state)?;
+        let target = optional_stat(&parent, &install.name, &self.root.join(&install.path))?;
+        let temporary = optional_stat(&parent, &install.temporary, &self.root.join(&install.path))?;
+
+        if artifact.is_some() {
+            let matches = self.artifact_matches_expected(install)?;
+            if temporary.is_some() {
+                install.phase = InstallPhase::Conflict;
+                install.error = Some(
+                    "retained artifact and an unexplained temporary both exist after restart"
+                        .to_owned(),
+                );
+                self.store.update_install(install)?;
+                self.store
+                    .update_artifact(&install.id, "conflict", install.error.as_deref())?;
+                return Ok(());
+            }
+            install.phase = if matches {
+                InstallPhase::Retained
+            } else {
+                InstallPhase::Conflict
+            };
+            install.error = (!matches)
+                .then(|| "retained artifact differs from the scanned local version".to_owned());
+            self.store.update_install(install)?;
+            self.store.update_artifact(
+                &install.id,
+                install.phase.as_str(),
+                install.error.as_deref(),
+            )?;
+            return Ok(());
         }
+
+        let Some(temporary) = temporary else {
+            install.phase = InstallPhase::Conflict;
+            install.error =
+                Some("prepared replacement is absent without a retained artifact".to_owned());
+            self.store.update_install(install)?;
+            self.store
+                .update_artifact(&install.id, "conflict", install.error.as_deref())?;
+            return Ok(());
+        };
+        let exchange_completed = target.as_ref().is_some_and(|target| {
+            install.temporary_dev == Some(target.st_dev)
+                && install.temporary_ino == Some(target.st_ino)
+        });
+        if exchange_completed {
+            self.retain_exchanged(install)?;
+            return Ok(());
+        }
+
+        let temporary_is_ours = install.temporary_dev == Some(temporary.st_dev)
+            && install.temporary_ino == Some(temporary.st_ino)
+            && FileType::from_raw_mode(temporary.st_mode) == FileType::RegularFile
+            && self.temporary_matches_replacement(install)?;
+        if temporary_is_ours {
+            let target_unchanged = target.as_ref().is_some_and(|target| {
+                target.st_dev == install.expected_dev
+                    && target.st_ino == install.expected_ino
+                    && FileType::from_raw_mode(target.st_mode) == FileType::RegularFile
+            });
+            if target_unchanged {
+                // EXCHANGE did not execute. Keep the exact prepared replacement
+                // for an explicit retry; scanning rejects its reserved name.
+                return Ok(());
+            }
+            unlinkat(&parent, install.temporary.as_str(), AtFlags::empty()).map_err(|e| {
+                Error::errno(
+                    "remove unexposed replacement after target change",
+                    &self.root.join(&install.path),
+                    e,
+                )
+            })?;
+            fsync(&parent)
+                .map_err(|e| Error::errno("persist replacement cleanup", &self.root, e))?;
+            install.phase = InstallPhase::Conflict;
+            install.error = Some(
+                "install target changed before exchange; owned unexposed replacement was removed"
+                    .to_owned(),
+            );
+            self.store.update_install(install)?;
+            self.store
+                .update_artifact(&install.id, "conflict", install.error.as_deref())?;
+            return Ok(());
+        }
+
+        self.retain_uncertain_temporary(
+            install,
+            "prepared temporary is no longer the recorded unexposed inode; retained",
+        )
+    }
+
+    fn temporary_matches_replacement(&self, install: &InstallRecord) -> Result<bool> {
+        let (Some(expected_digest), Some(expected_length)) =
+            (install.replacement_digest, install.replacement_length)
+        else {
+            return Ok(false);
+        };
+        let parent = self.open_journal_parent(install)?;
+        let (length, digest, _) =
+            hash_file_at(&parent, &install.temporary, &self.root.join(&install.path))?;
+        Ok(length == expected_length && digest.as_bytes() == &expected_digest)
+    }
+
+    fn retain_uncertain_temporary(
+        &mut self,
+        install: &mut InstallRecord,
+        reason: &str,
+    ) -> Result<()> {
+        self.retain_exchanged(install)?;
+        if install.phase == InstallPhase::Retained {
+            install.phase = InstallPhase::Conflict;
+            install.error = Some(reason.to_owned());
+            self.store.update_install(install)?;
+            self.store
+                .update_artifact(&install.id, "conflict", install.error.as_deref())?;
+        }
+        Ok(())
     }
 
     fn retain_exchanged(&mut self, install: &mut InstallRecord) -> Result<()> {
-        let parent = self.open_relative_dir(&install.parent)?;
+        let parent = self.open_journal_parent(install)?;
         let temp_exists = statat(
             &parent,
             install.temporary.as_str(),
@@ -930,7 +1100,14 @@ impl PreparedInstall<'_> {
             .write_all(bytes)
     }
 
-    pub fn finish(mut self) -> Result<InstallOutcome> {
+    pub fn finish(self) -> Result<InstallOutcome> {
+        self.finish_with_hook(|_| {})
+    }
+
+    fn finish_with_hook<F>(mut self, after_exchange: F) -> Result<InstallOutcome>
+    where
+        F: FnOnce(&Self),
+    {
         let mut file = self.file.take().expect("prepared install is live");
         file.sync_all().map_err(|e| {
             Error::io(
@@ -1031,6 +1208,7 @@ impl PreparedInstall<'_> {
         })?;
         self.record.phase = InstallPhase::Exchanged;
         self.replica.store.update_install(&self.record)?;
+        after_exchange(&self);
 
         if let Err(error) = self.require_parent_unchanged() {
             self.retain_displaced(
@@ -1118,30 +1296,14 @@ impl PreparedInstall<'_> {
                         e,
                     )
                 })?;
-                unlinkat(
-                    &self.parent_fd,
-                    self.record.temporary.as_str(),
-                    AtFlags::empty(),
-                )
-                .map_err(|e| {
-                    Error::errno(
-                        "remove discarded remote replacement",
-                        &self.replica.root.join(&self.record.path),
-                        e,
-                    )
-                })?;
-                fsync(&self.parent_fd).map_err(|e| {
-                    Error::errno(
-                        "persist discarded remote replacement",
-                        &self.replica.root.join(&self.record.parent),
-                        e,
-                    )
-                })?;
+                let rollback = self.retain_rollback(
+                    "target displaced by the rollback exchange; retained for recovery",
+                )?;
                 self.record.phase = InstallPhase::Conflict;
-                self.record.error = Some(
-                    "local target changed concurrently; original local inode was restored"
-                        .to_owned(),
-                );
+                self.record.error = Some(format!(
+                    "local target changed concurrently; original local inode was restored and rollback-displaced bytes were retained as artifact {}",
+                    rollback.id
+                ));
                 self.replica.store.update_install(&self.record)?;
                 self.replica.store.update_artifact(
                     &self.record.id,
@@ -1167,6 +1329,52 @@ impl PreparedInstall<'_> {
                 )))
             }
         }
+    }
+
+    fn retain_rollback(&mut self, reason: &str) -> Result<Artifact> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = format!("rollback-{id}");
+        let mut record = ArtifactRecord {
+            id: id.clone(),
+            origin: self.record.path.clone(),
+            name: name.clone(),
+            kind: ArtifactKind::RollbackDisplaced.as_str().to_owned(),
+            reason: reason.to_owned(),
+            remote_revision: self.record.remote_revision,
+            phase: "prepared".to_owned(),
+            error: None,
+        };
+        self.replica.store.insert_artifact(&record)?;
+        renameat_with(
+            &self.parent_fd,
+            self.record.temporary.as_str(),
+            &self.replica.quarantine_fd,
+            name.as_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|e| {
+            Error::errno(
+                "retain rollback-displaced inode",
+                &self.replica.root.join(&self.record.path),
+                e,
+            )
+        })?;
+        fsync(&self.parent_fd).map_err(|e| {
+            Error::errno(
+                "persist rollback-displaced inode removal from payload",
+                &self.replica.root.join(&self.record.parent),
+                e,
+            )
+        })?;
+        fsync(&self.replica.quarantine_fd).map_err(|e| {
+            Error::errno("persist rollback-displaced inode", &self.replica.state, e)
+        })?;
+        record.phase = "conflict".to_owned();
+        record.error = Some(reason.to_owned());
+        self.replica
+            .store
+            .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
+        Ok(record.into())
     }
 
     fn retain_displaced(&mut self, reason: &str, phase: InstallPhase) -> Result<()> {
@@ -1319,9 +1527,88 @@ fn open_quarantine(state: &OwnedFd) -> Result<OwnedFd> {
     Ok(fd)
 }
 
+fn acquire_state_lease(state: &OwnedFd, path: &Path) -> Result<std::fs::File> {
+    let fd = openat(
+        state,
+        "replica.lock",
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|e| Error::errno("open replica lease", path, e))?;
+    match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            fsync(state).map_err(|e| Error::errno("persist replica lease", path, e))?;
+            Ok(std::fs::File::from(fd))
+        }
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(Error::busy(format!(
+            "another process holds the replica state lease at {}",
+            path.display()
+        ))),
+        Err(error) => Err(Error::errno("acquire replica state lease", path, error)),
+    }
+}
+
 fn identity(fd: &OwnedFd, path: &Path, operation: &str) -> Result<Identity> {
     let stat = fstat(fd).map_err(|e| Error::errno(operation, path, e))?;
     Ok(stat_identity(&stat))
+}
+
+fn optional_stat(parent: &OwnedFd, name: &str, path: &Path) -> Result<Option<Stat>> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(Error::errno("inspect local entry", path, error)),
+    }
+}
+
+fn find_directory(
+    directory: &OwnedFd,
+    filesystem_dev: u64,
+    target: Identity,
+    display_path: &Path,
+) -> Result<Option<OwnedFd>> {
+    let stat =
+        fstat(directory).map_err(|e| Error::errno("inspect bounded directory", display_path, e))?;
+    if stat.st_dev == target.dev && stat.st_ino == target.ino {
+        return openat(
+            directory,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(Some)
+        .map_err(|e| Error::errno("duplicate journaled parent", display_path, e));
+    }
+    let mut reader = Dir::read_from(directory)
+        .map_err(|e| Error::errno("read bounded directory", display_path, e))?;
+    while let Some(entry) = reader.read() {
+        let entry = entry.map_err(|e| Error::errno("read bounded directory", display_path, e))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| Error::unsupported("non-UTF-8 local filename"))?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| Error::errno("inspect bounded directory", display_path, e))?;
+        if FileType::from_raw_mode(child.st_mode) != FileType::Directory
+            || child.st_dev != filesystem_dev
+        {
+            continue;
+        }
+        let fd = openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::errno("open bounded directory", display_path, e))?;
+        if let Some(found) = find_directory(&fd, filesystem_dev, target, display_path)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 fn stat_identity(stat: &Stat) -> Identity {
@@ -1430,4 +1717,59 @@ fn join(parent: &str, name: &str) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replica::ErrorKind;
+    use std::os::unix::fs::FileExt as _;
+
+    #[test]
+    fn rollback_retains_replacement_inode_after_second_exchange() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("payload");
+        let state = temp.path().join("state");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), b"old").unwrap();
+        let mut replica = Replica::init(&state, &root, NodeId::from_bytes([9; 16])).unwrap();
+        let snapshot = replica.scan().unwrap();
+        let expected = snapshot.get("file").unwrap();
+        let mut local_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("file"))
+            .unwrap();
+        let mut install = replica
+            .prepare_install("file", expected, false, None)
+            .unwrap();
+        install.write_all(b"remote").unwrap();
+        local_writer.write_at(b"busy", 0).unwrap();
+
+        let target = root.join("file");
+        let error = install
+            .finish_with_hook(|_| {
+                let mut replacement_writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target)
+                    .unwrap();
+                replacement_writer.write_at(b"remote-late", 0).unwrap();
+                replacement_writer.sync_all().unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(std::fs::read(&target).unwrap(), b"busy");
+
+        let rollback = replica
+            .status()
+            .unwrap()
+            .artifacts
+            .into_iter()
+            .find(|artifact| artifact.kind == "rollback-displaced")
+            .unwrap();
+        let mut retained = Vec::new();
+        replica
+            .export_artifact(&rollback.id, &mut retained)
+            .unwrap();
+        assert_eq!(retained, b"remote-late");
+    }
 }

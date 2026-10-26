@@ -23,6 +23,7 @@ pub enum ErrorKind {
     Unsupported,
     Conflict,
     Corrupt,
+    Busy,
     Io,
 }
 
@@ -58,6 +59,10 @@ impl Error {
 
     pub fn corrupt(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Corrupt, message)
+    }
+
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Busy, message)
     }
 
     pub fn io(operation: &str, path: &Path, error: impl std::fmt::Display) -> Self {
