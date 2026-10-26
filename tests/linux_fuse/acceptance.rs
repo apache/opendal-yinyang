@@ -115,10 +115,8 @@ fn fuse_read_only_cached_readdir_and_nested_inodes_both_publications() {
             "cached nested readdir changed"
         );
         let inner_first = names(&inner);
-        assert_eq!(
-            inner_first,
-            ["hello.txt"].into_iter().map(str::to_owned).collect()
-        );
+        assert_eq!(inner_first.len(), 1);
+        assert!(inner_first.contains("hello.txt"));
         assert_eq!(names(&inner), inner_first, "cached inner readdir changed");
 
         let bulk = root.join("bulk");
