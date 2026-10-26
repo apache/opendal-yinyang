@@ -35,14 +35,15 @@ Instance-wide `fsync` visits all nodes, continues after individual failures, and
 returns the first failure. Every failure remains in runtime status. A successful
 local write or an OS close that cannot report errors is not remote completion.
 
-`flush` is the named publication attempt for a frontend close path that can
-report errors. It performs the same conditional publication as `fsync` and
-never reports success before the remote result is durable. Dropping or
-releasing the reference is different: it performs no I/O, publication or
-staging deletion. Pending, frozen and failed states remain recoverable, and
-`reclaim` rejects them. A frontend whose release callback cannot report errors
-must not use release as an implicit flush; if its kernel omits a reportable
-flush, the bytes remain staged rather than being acknowledged as remote.
+In OS mount adapters, a kernel close/flush callback is not a remote
+publication point. It must not call `MountFile::fsync`: close-on-exec and
+descriptor inheritance can make a child-process close flush a descriptor while
+the parent still owns dirty bytes. A frontend may report an already-retained
+failure or frozen state from flush, but dirty bytes remain staged. Explicit
+`fsync` (and an adapter's explicit O_SYNC policy) is the publication request.
+Dropping or releasing the reference performs no I/O, publication or staging
+deletion. Pending, frozen and failed states remain recoverable, and `reclaim`
+rejects them.
 
 `node_status` observes the shared staged metadata for one NodeId without
 opening another reference. It reports the same staged length and

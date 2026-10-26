@@ -286,7 +286,7 @@ async fn frozen_mount_write_recovers_original_request() {
 }
 
 #[tokio::test]
-async fn flush_publishes_but_reference_release_does_not() {
+async fn fsync_publishes_but_reference_release_does_not() {
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(
         Fs::create(backend.operator(), BackendProfile::Minio)
@@ -333,7 +333,7 @@ async fn flush_publishes_but_reference_release_does_not() {
 
     let file = mount.open_node(pending, true).await.unwrap();
     assert_eq!(file.read(0, 7).await.unwrap(), b"pending");
-    file.flush().await.unwrap().unwrap();
+    file.fsync().await.unwrap().unwrap();
     assert!(!mount.node_status(pending).await.unwrap().unwrap().pending);
     assert_eq!(
         authority

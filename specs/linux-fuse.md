@@ -32,8 +32,8 @@ Step 4 is the read-only dirty-data boundary. Recovered clean observations are
 disposable and reclaimed by existing Mount recovery, while unpublished staged
 bytes are never exposed as a remote snapshot: the mount fails with a
 diagnostic naming the handle instead. A writable mount instead serves recovered
-pending/frozen/error state through the shared Mount handles, so a later flush or
-fsync reports the real remote outcome. The lease is already held during the
+pending/frozen/error state through the shared Mount handles, so a later fsync
+reports the real remote outcome. The lease is already held during the
 inspection, so another client cannot interleave. Refusing a read-only startup
 changes no remote state.
 
@@ -105,12 +105,15 @@ per-node lock as other writes; a regular write uses the kernel offset.
 attempt publication before acknowledging the write. Unsupported write flags
 return an explicit error instead of silently changing semantics.
 
-`flush` publishes a writable handle and reports the real remote outcome to the
-closing descriptor. `release` never publishes and never discards staging.
-Flush or fsync on a read-only reference is a successful no-op even when another
-writable reference shares the node, so a reader close cannot publish somebody
-else's dirty bytes. A failed publication remains attached to the shared handle
-and volume ledger; later fsync/flush retries the original frozen request.
+`flush` is a kernel close notification, not a publication point. It may return
+an already-retained error or frozen state, but it never publishes staged bytes.
+This matters because a CLOEXEC descriptor can be flushed by a child process
+exec after fork while the parent still holds dirty data. `release` likewise
+never publishes and never discards staging. Only explicit `fsync` (or the
+documented O_SYNC write policy) publishes. Flush or fsync on a read-only
+reference is a successful no-op even when another writable reference shares the
+node. A failed publication remains attached to the shared handle and volume
+ledger; later fsync retries the original frozen request.
 
 `create` and `mkdir` use the Runtime helpers that return the NodeId produced by
 the committing Planner, avoiding a post-commit path lookup. `unlink`, `rmdir`,
@@ -120,7 +123,7 @@ share one guarded Snapshot. Plain `rename` replaces an existing destination;
 explicitly unsupported.
 
 `setattr` supports size and the core executable flag only. Size on an open
-descriptor is staged for that descriptor's later flush/fsync; path truncation
+descriptor is staged for that descriptor's later fsync; path truncation
 publishes before returning success. A mode request is accepted only when it is
 one of the synthesized modes above (`0444`/`0555` or `0644`/`0755` according to
 read-only policy and the executable bit); other permission combinations return

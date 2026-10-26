@@ -402,7 +402,7 @@ impl Inner {
         match staged {
             Ok(()) => {
                 if open.sync
-                    && let Err(error) = open.file.flush().await
+                    && let Err(error) = open.file.fsync().await
                 {
                     return reply.error(runtime_errno(&error));
                 }
@@ -421,8 +421,16 @@ impl Inner {
             // bytes through its close path.
             return reply.ok();
         }
-        match open.file.flush().await {
-            Ok(_) => reply.ok(),
+        match open.file.status().await {
+            Ok(status) => {
+                if let Some(error) = status.error {
+                    reply.error(runtime_errno(&crate::runtime::Error::Retained(error)));
+                } else if status.frozen {
+                    reply.error(fuser::Errno::EBUSY);
+                } else {
+                    reply.ok();
+                }
+            }
             Err(error) => reply.error(runtime_errno(&error)),
         }
     }
@@ -503,7 +511,7 @@ impl Inner {
                 if let Err(error) = file.truncate(length).await {
                     return reply.error(runtime_errno(&error));
                 }
-                if let Err(error) = file.flush().await {
+                if let Err(error) = file.fsync().await {
                     return reply.error(runtime_errno(&error));
                 }
                 let attr = match self.status_attr(id).await {
