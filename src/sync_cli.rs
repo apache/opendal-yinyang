@@ -120,8 +120,8 @@ impl SyncStatus {
                 state: BindingState::Unbound,
                 state_directory: state_directory.display().to_string(),
                 root: None,
-                volume: None,
-                same_volume: None,
+                filesystem: None,
+                same_filesystem: None,
             },
             remote: RemoteStatus {
                 availability: RemoteAvailability::NotChecked,
@@ -145,8 +145,8 @@ pub struct BindingStatus {
     pub state: BindingState,
     pub state_directory: String,
     pub root: Option<String>,
-    pub volume: Option<String>,
-    pub same_volume: Option<bool>,
+    pub filesystem: Option<String>,
+    pub same_filesystem: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
