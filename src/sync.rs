@@ -324,9 +324,17 @@ impl Sync {
         handle.fsync().await?;
         Ok(handle.status().await?.remote_revision)
     }
-    /// Export retained local bytes without claiming remote completion.
+    /// Export retained bytes without claiming remote completion.
+    ///
+    /// Content edits read their local staging. A file-creation namespace intent
+    /// reads its immutable prepared descriptor from the authority; other
+    /// namespace intents return Unsupported. Adapters that need offline export
+    /// of a creation conflict must retain their durable local input separately.
     pub async fn read(&self, edit: EditId, offset: u64, length: usize) -> Result<Vec<u8>> {
         let _gate = self.inner.gate.lock().await;
+        if let Some(bytes) = namespace::read(self, edit, offset, length).await? {
+            return Ok(bytes);
+        }
         self.inner
             .runtime
             .recover(self.handle_id(edit).await?)

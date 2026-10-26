@@ -236,6 +236,7 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
     );
     let status = sync.namespace_status(created).await.unwrap();
     assert_eq!(status.state, NamespaceState::Prepared);
+    assert_eq!(sync.read(created, 0, 64).await.unwrap(), b"created bytes");
     let NamespaceOperation::CreateFile {
         node: created_node,
         metadata,
@@ -326,6 +327,10 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
         .stage_remove(created_node, baseline.revision())
         .await
         .unwrap();
+    assert_eq!(
+        sync.read(remove, 0, 1).await.unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
     let revision = sync.publish(remove).await.unwrap();
     assert!(
         authority
@@ -636,4 +641,52 @@ async fn namespace_unknown_retries_the_original_request_after_restart() {
         sync.namespace_status(intent).await.unwrap().state,
         NamespaceState::Committed(_)
     ));
+}
+
+#[tokio::test]
+async fn namespace_unknown_survives_unavailable_recovery_and_resolves_once() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let intent = sync
+        .stage_create_directory(authority.root(), "published-then-lost", baseline.revision())
+        .await
+        .unwrap();
+    backend.lose_next_head_response_and_go_offline();
+    let error = sync.publish(intent).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    assert_eq!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Unknown
+    );
+    drop(sync);
+
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    assert!(sync.resolve_namespace(intent).await.is_err());
+    assert_eq!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Unknown
+    );
+
+    backend.state.lock().unwrap().offline = false;
+    let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
+    assert!(matches!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Committed(_)
+    ));
+    assert_eq!(
+        authority.observe_latest().await.unwrap().revision(),
+        receipt.cursor.revision
+    );
+    assert_eq!(sync.publish(intent).await.unwrap(), receipt.cursor.revision);
 }

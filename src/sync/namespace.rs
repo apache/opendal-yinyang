@@ -20,6 +20,7 @@ use super::{EditId, Sync};
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -886,12 +887,31 @@ pub(super) async fn statuses(sync: &Sync) -> Result<Vec<NamespaceStatus>> {
     rows.iter().map(IntentRow::status).collect()
 }
 
+async fn receipt_for(sync: &Sync, intent: &NamespaceIntent) -> Result<Option<Receipt>> {
+    let receipt = sync
+        .authority()
+        .observe_latest()
+        .await?
+        .receipt(intent.commit_id)
+        .await?;
+    if let Some(receipt) = &receipt
+        && receipt.request_digest != intent.request_digest
+    {
+        return Err(Error::local_kind(
+            ErrorKind::Corrupt,
+            "commit identity returned a different request",
+        ));
+    }
+    Ok(receipt)
+}
+
 pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
     let row = load_async(sync, id)
         .await?
         .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown namespace intent"))?;
     let status = row.status()?;
-    match status.state {
+    let state = status.state.clone();
+    match &state {
         NamespaceState::Committed(receipt) => return Ok(receipt.cursor.revision),
         NamespaceState::Conflict | NamespaceState::Failed => {
             return Err(Error::Retained(status.failure.ok_or_else(|| {
@@ -900,11 +920,35 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
         }
         NamespaceState::Prepared | NamespaceState::Unknown | NamespaceState::Retryable => {}
     }
+    if matches!(&state, NamespaceState::Unknown) {
+        match receipt_for(sync, &status.intent).await {
+            Ok(Some(receipt)) => {
+                let revision = receipt.cursor.revision;
+                save_state_async(sync, id, COMMITTED, Some(receipt), None).await?;
+                return Ok(revision);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let failure = Failure::capture(&error);
+                save_state_async(sync, id, UNKNOWN, None, Some(failure.clone())).await?;
+                return Err(Error::Retained(failure));
+            }
+        }
+    }
     let request = match sync.authority().restore_transaction(&row.request).await {
         Ok(request) => request,
         Err(error) => {
-            save_state_async(sync, id, FAILED, None, Some(Failure::capture(&error))).await?;
-            return Err(error);
+            let state = match state {
+                NamespaceState::Unknown => UNKNOWN,
+                NamespaceState::Prepared | NamespaceState::Retryable => match error.kind() {
+                    ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => FAILED,
+                    _ => RETRYABLE,
+                },
+                _ => unreachable!("terminal states returned above"),
+            };
+            let failure = Failure::capture(&error);
+            save_state_async(sync, id, state, None, Some(failure.clone())).await?;
+            return Err(Error::Retained(failure));
         }
     };
     // The original request is durable. Recording the possibly-dispatched state
@@ -956,20 +1000,36 @@ pub(super) async fn resolve(sync: &Sync, id: EditId) -> Result<Option<Receipt>> 
     if let NamespaceState::Committed(receipt) = status.state {
         return Ok(Some(receipt));
     }
-    let receipt = sync
-        .authority()
-        .observe_latest()
-        .await?
-        .receipt(status.intent.commit_id)
-        .await?;
+    let receipt = receipt_for(sync, &status.intent).await?;
     if let Some(receipt) = &receipt {
-        if receipt.request_digest != status.intent.request_digest {
-            return Err(Error::local_kind(
-                ErrorKind::Corrupt,
-                "commit identity returned a different request",
-            ));
-        }
         save_state_async(sync, id, COMMITTED, Some(receipt.clone()), None).await?;
     }
     Ok(receipt)
+}
+
+pub(super) async fn read(
+    sync: &Sync,
+    id: EditId,
+    offset: u64,
+    length: usize,
+) -> Result<Option<Vec<u8>>> {
+    let Some(row) = load_async(sync, id).await? else {
+        return Ok(None);
+    };
+    let status = row.status()?;
+    let NamespaceOperation::CreateFile { content, .. } = status.intent.operation else {
+        return Err(Error::State(
+            ErrorKind::Unsupported,
+            "namespace intent does not retain file bytes",
+        ));
+    };
+    let size = content.content_id().length();
+    let start = offset.min(size);
+    let end = offset.saturating_add(length as u64).min(size);
+    let mut bytes = Vec::new();
+    sync.authority()
+        .data()
+        .read_range(&content, Range { start, end }, &mut bytes)
+        .await?;
+    Ok(Some(bytes))
 }

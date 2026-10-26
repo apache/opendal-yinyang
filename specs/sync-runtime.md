@@ -55,7 +55,11 @@ Creation allocates its stable NodeId in the same Planner that produces the
 persisted transaction. The intent exposes that NodeId; callers must not resolve
 the path again and adopt a concurrent replacement. `CreateFile` also exposes
 the prepared `ContentDescriptor`, allowing a local adapter to compare its
-current bytes without a fresh remote lookup.
+current bytes without a fresh remote lookup. `read` on that intent reads the
+verified immutable descriptor from the authority, including before publication;
+this requires authority access. Other namespace intents return `Unsupported`
+for `read`. An adapter that needs offline export of a creation conflict must
+keep its durable local input separately from Sync.
 
 `FileMetadata` contains only the executable bit. File creation and subsequent
 `SetExecutable` support that bit. Directory modes, ownership, ACLs, timestamps,
@@ -130,6 +134,15 @@ request digest before attaching it. It never dispatches. Returning no receipt
 does not prove that a delayed attempt failed. Conflict resolution is explicit:
 keep or export the relevant local and pinned baseline bytes, then create a new
 intent with suitable current predicates.
+
+Recovery preserves what prior dispatch established. For `Unknown`, `publish`
+checks the original receipt first. If the authority is unavailable or restoring
+the retained transaction fails, the intent remains `Unknown` with the new
+diagnostic; failure to observe is not evidence that the commit failed. Once the
+authority recovers, receipt lookup can attach the original outcome without a
+second dispatch. A transient restore failure for `Prepared` or `Retryable`
+retains `Retryable`; only invalid, corrupt, or unsupported retained state becomes
+`Failed`.
 
 Operations within one Sync instance serialize to protect intent creation,
 staging leases, and state transitions. This is not a background worker,
