@@ -28,8 +28,9 @@
 //! Files pin the node's shared staged version. `fstat` on an open handle uses
 //! that staged record's length, and reads return staged bytes, so an old
 //! descriptor never mixes a newer remote length with older content. `release`
-//! reclaims a clean shared node, which makes the next open observe the
-//! current remote revision without rebasing live handles. Directory handles
+//! reclaims a clean shared node, and `open` first reclaims any clean record a
+//! raced release left behind, so a fresh open observes the current remote
+//! revision without rebasing live handles. Directory handles
 //! pin one `Snapshot` revision; readdir offsets are stable ordinal positions
 //! over pages of that pinned listing.
 //!
@@ -290,6 +291,15 @@ impl Inner {
 
     /// Materialize the shared staged version and capture its base observation.
     async fn prepare_open(&self, id: NodeId) -> Result<OpenFile, fuser::Errno> {
+        // A release whose reclaim raced an in-flight read leaves a clean,
+        // references-zero record behind. Reclaim it before materializing so a
+        // fresh open observes the current remote revision; an actively shared
+        // node reports Busy and is reused as before.
+        match self.mount.reclaim(id).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => {}
+            Err(error) => return Err(runtime_errno(&error)),
+        }
         let file = self
             .mount
             .open_node(id, false)
@@ -994,5 +1004,70 @@ mod tests {
         let latest = authority.observe_latest().await.unwrap();
         let refreshed = inner.attr_for(&latest, id).await.unwrap();
         assert_eq!(refreshed.size, "second version".len() as u64);
+    }
+
+    /// A clean record left by a release/reclaim race must not satisfy a later
+    /// open; prepare_open reclaims it first and materializes the latest
+    /// revision.
+    #[tokio::test]
+    async fn fresh_open_reclaims_a_stale_clean_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = support::TestBackend::default();
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::open(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let runtime = Runtime::open(authority.clone(), temp.path().join("published"))
+            .await
+            .unwrap();
+        runtime
+            .create_file(runtime.authority().root(), "file")
+            .await
+            .unwrap();
+        let id = authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        let mut first = runtime.open_file("file", true).await.unwrap();
+        first.write(0, b"old").await.unwrap();
+        first.fsync().await.unwrap();
+        first.close().await.unwrap();
+        drop(runtime);
+
+        let mount = Mount::open(authority.clone(), temp.path().join("ro"), true)
+            .await
+            .unwrap();
+        let inner = Inner::new(mount, tokio::runtime::Handle::current());
+        // Simulate a release whose reclaim raced a live read: the clean record
+        // stays in the Mount map with zero references after the clone drops.
+        let stale = inner.prepare_open(id).await.unwrap();
+        assert_eq!(inner.handle_attr(&stale).await.unwrap().size, 3);
+        drop(stale);
+
+        let writer = Runtime::open(authority.clone(), temp.path().join("other"))
+            .await
+            .unwrap();
+        let mut second = writer.open_file("file", true).await.unwrap();
+        second.write(0, b"fresh version").await.unwrap();
+        second.fsync().await.unwrap();
+        drop(second);
+        drop(writer);
+
+        let fresh = inner.prepare_open(id).await.unwrap();
+        assert_eq!(
+            inner.handle_attr(&fresh).await.unwrap().size,
+            "fresh version".len() as u64
+        );
+        drop(fresh);
+        inner.mount.reclaim(id).await.unwrap();
     }
 }

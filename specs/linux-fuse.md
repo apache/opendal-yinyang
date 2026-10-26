@@ -78,7 +78,10 @@ not cache file pages. Reads stream from the staged version. `getattr` with an
 open handle reports the staged record's length, so `fstat` and read bytes
 always describe the same pinned version even when the remote side changed;
 `release` drops the reference and then reclaims a clean node, so the next open
-materializes the current remote revision.
+materializes the current remote revision. A release whose reclaim loses to an
+interrupted read leaves a clean references-zero record; `open` reclaims such a
+record before materializing, so a fresh open still observes the current
+revision instead of reusing the stale clean snapshot.
 
 A clean node is only reclaimed when its last adapter reference is released. If
 an interrupted read still shares the node, reclaim reports busy and the pinned
