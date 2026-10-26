@@ -659,7 +659,7 @@ impl Fixture {
             .build()
             .expect("build in-process authority runtime");
         runtime.block_on(async move {
-            match publication {
+            let authority: Arc<dyn Authority> = match publication {
                 Publication::Object => Arc::new(
                     Fs::open(operator, BackendProfile::Minio)
                         .await
@@ -674,7 +674,8 @@ impl Fixture {
                     .await
                     .expect("connect in-process service authority"),
                 ),
-            }
+            };
+            authority
         })
     }
 

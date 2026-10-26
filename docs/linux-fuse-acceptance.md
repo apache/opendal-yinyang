@@ -63,8 +63,10 @@ cargo x test-linux-fuse --read-only
 - External rename and add refresh: after warming a dentry and opening an old
   descriptor, an independent in-process authority renames `a` to `b`, changes
   `b`, and adds `new.txt`; SIGHUP must emit a native invalidation notification,
-  the same mount must expose the new namespace, and the old descriptor must
-  retain its bytes and fstat until it is closed. The grounded
+  the same mount must expose the new namespace, and the old descriptor (and a
+  new open of the renamed path while it lives) must retain the shared pinned
+  bytes and fstat until the old descriptor is closed; only the fresh open after
+  that sees the independently observed longer payload. The grounded
   `yy: fuse refresh: done (inode=N entries=N errors=N)` line must report
   positive inode/entry counts and zero errors before namespace assertions;
   notification counts prove the native calls were accepted, while the

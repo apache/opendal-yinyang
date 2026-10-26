@@ -181,7 +181,7 @@ fn fuse_read_only_cached_readdir_and_nested_inodes_both_publications() {
             .join(format!("mnt-readdir-{}", fixture.publication().as_str()));
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let mut mounted = fixture.mount(&config, &mountpoint);
-        let root = mounted.mountpoint();
+        let root = mounted.mountpoint().to_path_buf();
 
         let nested = root.join("nested");
         let inner = nested.join("inner");
@@ -989,8 +989,9 @@ fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
         old.read_to_end(&mut old_bytes).expect("read old bytes");
         assert_eq!(old_bytes, b"old-content");
 
+        let new_payload = b"new-content-longer";
         fixture.remote_rename(&library, "a.txt", "b.txt");
-        fixture.remote_write(&library, "b.txt", b"new-content");
+        fixture.remote_write(&library, "b.txt", new_payload);
         fixture.remote_create(&library, "new.txt");
         fixture.remote_write(&library, "new.txt", b"added");
 
@@ -1013,9 +1014,18 @@ fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
             &[ENOENT],
             "stat renamed source after SIGHUP",
         );
+        let shared = fs::metadata(root.join("b.txt")).expect("stat renamed target after SIGHUP");
+        assert_eq!(shared.ino(), old_ino);
+        assert_eq!(shared.len(), old_len);
         assert_eq!(
             fs::read(root.join("b.txt")).expect("read renamed target after SIGHUP"),
-            b"new-content"
+            b"old-content",
+            "the live mount keeps the shared pinned view while the old descriptor is active"
+        );
+        assert_eq!(
+            fixture.remote_read(&library, "b.txt", 32),
+            new_payload,
+            "the independent authority sees the externally updated target"
         );
         assert_eq!(
             fs::read(root.join("new.txt")).expect("read externally added file after SIGHUP"),
@@ -1035,7 +1045,11 @@ fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
         fresh
             .read_to_end(&mut fresh_bytes)
             .expect("fresh read after old close");
-        assert_eq!(fresh_bytes, b"new-content");
+        assert_eq!(fresh_bytes, new_payload);
+        assert_eq!(
+            fresh.metadata().expect("fresh fstat after old close").len(),
+            new_payload.len() as u64
+        );
         drop(fresh);
         mounted.unmount();
     }
