@@ -355,6 +355,85 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
 
 #[test]
 #[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
+fn managed_sync_resolve_content_preserves_concurrent_local_v4() {
+    let fixture = Fixture::new(Publication::Service);
+    fixture.remote_create_file("resolve-race.txt", b"base", false);
+    let left = fixture.sync_client("resolve-race-left");
+    let right = fixture.sync_client("resolve-race-right");
+    fixture.sync_run_ok(&left);
+    fixture.sync_run_ok(&right);
+
+    write_local(&left.directory.join("resolve-race.txt"), b"left-v2");
+    write_local(&right.directory.join("resolve-race.txt"), b"right-v2");
+    fixture.sync_run_ok(&left);
+    let _ = fixture.sync_run(&right);
+    let status = fixture.sync_status(&right);
+    let conflict = status.conflict("resolve-race.txt").clone();
+
+    let gate = fixture.service_gate(false);
+    let right_gated = fixture.sync_paths_at("resolve-race-right", Some(gate.address()));
+    let chosen = fixture.path("resolve-race-chosen");
+    write_local(&chosen, b"chosen-v3");
+    let running = fixture.spawn_sync_resolve_content(&right_gated, &conflict.id, &chosen);
+    if let Err(error) = gate.wait_for_commit_response(Duration::from_secs(120)) {
+        let output = running.wait(Duration::from_secs(130));
+        panic!(
+            "gate did not observe the content-resolution commit ({error}):\n{}",
+            captured_text(&output)
+        );
+    }
+
+    assert_eq!(
+        remote_file_bytes(&fixture, "resolve-race.txt"),
+        b"chosen-v3"
+    );
+    let during = fixture.sync_status(&right_gated);
+    assert!(
+        during
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.id == status.conflict("resolve-race.txt").id),
+        "the original conflict must remain until its commit response is accepted: {during:#?}"
+    );
+
+    write_local(&right_gated.directory.join("resolve-race.txt"), b"local-v4");
+    gate.release();
+    let output = running.wait(Duration::from_secs(120));
+    assert_eq!(
+        fs::read(right_gated.directory.join("resolve-race.txt")).unwrap(),
+        b"local-v4",
+        "resolve completion must not overwrite the live v4 payload:\n{}",
+        captured_text(&output)
+    );
+    let remote_after = remote_file_bytes(&fixture, "resolve-race.txt");
+    assert!(
+        remote_after.as_slice() == b"chosen-v3" || remote_after.as_slice() == b"local-v4",
+        "resolve may leave v3 remote with local pending, or converge v4: {remote_after:?}"
+    );
+    if remote_after.as_slice() == b"chosen-v3" {
+        let status = fixture.sync_status(&right_gated);
+        assert!(!status.summary.in_sync, "{status:#?}");
+        assert_eq!(
+            status.entry("resolve-race.txt").state,
+            EntryState::LocalPending
+        );
+    }
+
+    fixture.sync_run_ok(&right_gated);
+    assert_eq!(remote_file_bytes(&fixture, "resolve-race.txt"), b"local-v4");
+    assert_eq!(
+        fs::read(right_gated.directory.join("resolve-race.txt")).unwrap(),
+        b"local-v4"
+    );
+    assert_in_sync(&fixture, &right_gated);
+    let converged = fixture.remote_file_version("resolve-race.txt");
+    fixture.sync_run_ok(&right_gated);
+    assert_eq!(fixture.remote_file_version("resolve-race.txt"), converged);
+    assert_in_sync(&fixture, &right_gated);
+}
+
+#[test]
+#[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
 fn managed_sync_offline_edits_survive_process_and_authority_restart() {
     {
         let fixture = Fixture::new(Publication::Object);

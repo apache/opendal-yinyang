@@ -647,8 +647,8 @@ impl Fixture {
         self.yy_with_env(&["--volume", text(&paths.config), "sync", "run"], overrides)
     }
 
-    pub fn spawn_sync_run(&self, paths: &SyncPaths) -> RunningSync {
-        let mut command = self.yy_command(&["--volume", text(&paths.config), "sync", "run"]);
+    pub fn spawn_yy(&self, args: &[&str]) -> RunningSync {
+        let mut command = self.yy_command(args);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -663,6 +663,10 @@ impl Fixture {
             stdout: Some(thread::spawn(move || read_all(stdout))),
             stderr: Some(thread::spawn(move || read_all(stderr))),
         }
+    }
+
+    pub fn spawn_sync_run(&self, paths: &SyncPaths) -> RunningSync {
+        self.spawn_yy(&["--volume", text(&paths.config), "sync", "run"])
     }
 
     pub fn sync_run_ok(&self, paths: &SyncPaths) -> Captured {
@@ -783,6 +787,23 @@ impl Fixture {
             "--content",
             text(content),
         ]);
+    }
+
+    pub fn spawn_sync_resolve_content(
+        &self,
+        paths: &SyncPaths,
+        conflict: &str,
+        content: &Path,
+    ) -> RunningSync {
+        self.spawn_yy(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "resolve",
+            conflict,
+            "--content",
+            text(content),
+        ])
     }
 
     fn spawn_service(&mut self) {
