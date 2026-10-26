@@ -801,6 +801,34 @@ impl Store {
         Ok(())
     }
 
+    /// Refresh volatile evidence of an active conflict without replacing its
+    /// retained local artifact or changing its stable identity.
+    pub fn refresh_conflict(&mut self, conflict: &ConflictRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE conflicts SET
+                   path=?2,original_path=?3,desired_path=?4,local=?5,remote=?6,
+                   remote_node=?7,remote_revision=?8,error=?9
+                 WHERE id=?1",
+                params![
+                    conflict.id,
+                    conflict.path,
+                    conflict.original_path,
+                    conflict.desired_path,
+                    conflict.local,
+                    conflict.remote,
+                    conflict.remote_node.as_ref().map(|value| value.as_slice()),
+                    conflict
+                        .remote_revision
+                        .as_ref()
+                        .map(|value| value.as_slice()),
+                    conflict.error,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("refresh conflict: {e}")))?;
+        Ok(())
+    }
+
     /// Persist the directory association for a staged edit before dispatch.
     pub fn insert_work(&mut self, work: &WorkRecord) -> Result<()> {
         self.connection
