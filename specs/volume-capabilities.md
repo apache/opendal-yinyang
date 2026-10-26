@@ -1,9 +1,11 @@
 # Volume admission and capabilities
 
-**Status: experimental Managed volume, Mount durability policy, library frontend.**
-This is a headless runtime/CLI combination, not an OS mount. Direct, Sync
-reconciliation, FUSE, macOS, and Windows frontends are recognized configuration
-choices but are rejected as unimplemented before startup.
+**Status: experimental Managed volume, Mount durability policy, library and
+read-only Linux FUSE frontends.**
+Direct, Sync reconciliation, writable FUSE, macOS, and Windows frontends are
+recognized configuration choices but are rejected as unimplemented before
+startup. The read-only Linux FUSE frontend is specified separately in
+[`linux-fuse.md`](linux-fuse.md).
 
 ## Configuration
 
@@ -38,6 +40,9 @@ The config contains no service secret or storage credentials.
 `access=mount` selects online remote-fsync semantics. `frontend=library`
 executes these semantics through Runtime/FileHandle and the CLI without
 installing a mount point. It does not claim an OS frontend or offline Sync.
+`frontend=fuse` requires Linux and `read_only=true`; the mount command hands
+the same validated configuration to the Linux FUSE frontend, which adds its
+own staged-state admission before serving reads.
 
 ## Negotiation and enforcement
 
@@ -47,6 +52,14 @@ The effective capability set is the intersection of:
 2. the storage prerequisites for that model and publication authority;
 3. the access model and read-only policy;
 4. the implemented frontend.
+
+Startup also requires the intersection of the volume, access, and frontend
+contracts (the combination baseline) to survive the storage intersection, so a
+frontend cannot silently weaken the model. The library frontend claims the full
+implemented runtime set. The Linux FUSE frontend claims read, list,
+stable-identity, pinned-reads, and retained-unlink-read; its read-only mount
+does not claim recoverable staging or any write-side operation. Every other
+frontend claims an empty set and is rejected by its own admission rule.
 
 The storage layer reports whether its primitives can support the Managed
 contract. It does not require raw S3 to implement filesystem rename. Read,
@@ -78,6 +91,7 @@ Initialize an object authority with the existing `yy create`, or a service
 authority with `yy serve --database metadata.db`. Then:
 
 ```shell
+yy --volume volume.json mount /mnt/workspace
 yy --volume volume.json capabilities
 yy --volume volume.json file create hello
 yy --volume volume.json file open hello --write

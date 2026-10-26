@@ -14,6 +14,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Native bridge](native-bridge.md) | In-process ownership and private adapter request semantics. |
 | [Experimental macOS frontends](macos-frontends.md) | Native FSKit and File Provider integration boundaries. |
 | [Volume capabilities](volume-capabilities.md) | Configuration, four-layer admission, read-only enforcement, and CLI status. |
+| [Linux FUSE frontend](linux-fuse.md) | Read-only Managed mount: FUSE binding, inode mapping, pinned handles, directory cursors, and teardown. |
 | [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage and metadata-service bindings implemented experimentally. |
 
 A specification describes the currently supported behavior, APIs, wire formats,
