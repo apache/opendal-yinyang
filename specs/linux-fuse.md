@@ -88,7 +88,10 @@ version remains coherent until a later release becomes the final reference;
 that open's metadata and content never disagree. The frontend does not call
 `Mount::refresh` while references exist, because refresh rebases live handles;
 a writable layer that in-place refreshes must first define its open-fd and
-kernel-cache invalidation policy.
+kernel-cache invalidation policy. Before a new open, the adapter retries
+reclaiming a clean unreferenced NodeId; a successful reclaim makes that open
+materialize the latest remote version, while Busy retains all still-pinned or
+dirty/frozen/error state.
 
 ## Writable callbacks
 
@@ -118,7 +121,13 @@ descriptor is staged for that descriptor's later flush/fsync; path truncation
 publishes before returning success. A mode request is accepted only when it is
 one of the synthesized modes above (`0444`/`0555` or `0644`/`0755` according to
 read-only policy and the executable bit); other permission combinations return
-`EOPNOTSUPP`. Before changing the executable flag, the shared node lock
+`EOPNOTSUPP`. Linux may include `S_IFREG`/`S_IFDIR` type bits in the mode;
+they are accepted when they match the node, while setuid/setgid/sticky and
+other permission combinations are rejected. Kernel bookkeeping timestamps
+attached to a chmod or truncate request are accepted and ignored, and the reply
+always carries revision-derived timestamps. Standalone timestamp changes and
+ownership changes remain explicitly unsupported. Before changing the
+executable flag, the shared node lock
 publishes dirty content, commits a Planner based on the handle's recorded
 content revision, and advances only that clean handle to the receipt revision.
 An external content change therefore produces Conflict rather than rebasing
@@ -163,16 +172,24 @@ only stops the request channel at process exit.
 
 The session runs in the foreground. Teardown waits on both the session end and
 SIGINT/SIGTERM: an external `fusermount3 -u` ends the session loop and the
-process exits on its own, while a signal unmounts and joins the session before
-exiting. `Session::spawn` moves the mount object into `BackgroundSession`, so a
-`SessionUnmounter` obtained before spawning would find an empty slot; instead
-one blocking owner holds the background session, polls its public thread guard
-for a natural end, and receives the local teardown request. Exactly one `join`
-or `umount_and_join` runs. Returning from `run` ends `main`, so the Tokio
-runtime shuts down; request tasks are detached and owned by that runtime, their
-unanswered replies are dropped on the closing channel, and the staging lease is
-released at process exit. In-flight tasks hold their `Arc<Mount>` for that
-window; there is no mid-session cancellation signal.
+process exits on its own, while a signal detaches the mount and waits up to a
+five-second grace period. `Session::spawn` moves the mount object into
+`BackgroundSession`, so a `SessionUnmounter` obtained before spawning would
+find an empty slot; one blocking owner holds the background session, polls its
+public thread guard for a natural end, and receives the local teardown
+request. Exactly one `join` or `umount_and_join` runs. A lazy unmount does not
+end the kernel connection while clients still hold open references or in-flight
+requests, so when the grace period expires the mount entry returns an explicit
+teardown-expired outcome instead of returning into a runtime shutdown that
+would wait for the blocked session task. The CLI prints a diagnostic to stderr
+and exits non-zero; the process exit closes `/dev/fuse`, the kernel aborts the
+connection, and every blocked client syscall returns an error instead of
+hanging. Forced termination is a crash-equivalent recovery boundary, not a
+graceful unmount: the staging lease is released by the OS and the next start
+recovers local state through the normal crash-recovery path. Request tasks are
+detached and owned by the CLI runtime; their unanswered replies are dropped on
+the closing channel. In-flight tasks hold their `Arc<Mount>` for that window;
+there is no mid-session cancellation signal.
 
 ## Boundaries and known limits
 

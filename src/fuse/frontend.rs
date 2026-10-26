@@ -96,7 +96,15 @@ fn representable_mode(
     directory: bool,
     executable: bool,
 ) -> bool {
-    if mode & !0o777 != 0 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    let file_type = mode & S_IFMT;
+    let type_ok = file_type == 0
+        || (directory && file_type == S_IFDIR)
+        || (!directory && file_type == S_IFREG);
+    let special_bits = mode & !(S_IFMT | 0o777);
+    if !type_ok || special_bits != 0 {
         return false;
     }
     let effective = mode & !umask & 0o777;
@@ -185,6 +193,17 @@ impl Inner {
             .observe_latest()
             .await
             .map_err(|e| core_errno(&e))
+    }
+
+    /// Drop a stale clean version before opening. Busy means another reference
+    /// still pins the shared version, or the node retains dirty/frozen/error
+    /// state; both must be reused rather than reset.
+    async fn reclaim_clean_before_open(&self, id: NodeId) -> Result<(), fuser::Errno> {
+        match self.mount.reclaim(id).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => Ok(()),
+            Err(error) => Err(runtime_errno(&error)),
+        }
     }
 
     /// Attributes and size from one pinned observation.
@@ -331,6 +350,9 @@ impl Inner {
         if truncate && !writable {
             return reply.error(fuser::Errno::EINVAL);
         }
+        if let Err(errno) = self.reclaim_clean_before_open(id).await {
+            return reply.error(errno);
+        }
         match self.mount.open_node(id, writable).await {
             Ok(file) => {
                 if truncate && let Err(error) = file.truncate(0).await {
@@ -439,15 +461,17 @@ impl Inner {
         fh: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
-        if uid.is_some()
-            || gid.is_some()
-            || atime.is_some()
+        let supported_mutation = size.is_some() || mode.is_some();
+        let kernel_timestamps = atime.is_some()
             || mtime.is_some()
             || ctime.is_some()
             || crtime.is_some()
             || chgtime.is_some()
-            || bkuptime.is_some()
+            || bkuptime.is_some();
+        if uid.is_some()
+            || gid.is_some()
             || flags.is_some()
+            || (!supported_mutation && kernel_timestamps)
             || (size.is_some() && mode.is_some())
         {
             return reply.error(fuser::Errno::EOPNOTSUPP);
@@ -468,6 +492,9 @@ impl Inner {
                     Err(errno) => return reply.error(errno),
                 }
             } else {
+                if let Err(errno) = self.reclaim_clean_before_open(id).await {
+                    return reply.error(errno);
+                }
                 let file = match self.mount.open_node(id, true).await {
                     Ok(file) => file,
                     Err(error) => return reply.error(runtime_errno(&error)),
@@ -503,14 +530,7 @@ impl Inner {
                 Err(error) => return reply.error(core_errno(&error)),
             };
             let executable = mode & 0o111 != 0;
-            let expected = if current.is_directory() {
-                if self.read_only { 0o555 } else { 0o755 }
-            } else if executable {
-                if self.read_only { 0o555 } else { 0o755 }
-            } else {
-                if self.read_only { 0o444 } else { 0o644 }
-            };
-            if mode & !0o777 != 0 || mode & 0o777 != expected {
+            if !representable_mode(mode, 0, self.read_only, current.is_directory(), executable) {
                 return reply.error(fuser::Errno::EOPNOTSUPP);
             }
             if !current.is_directory() {
@@ -520,6 +540,9 @@ impl Inner {
                     };
                     open.file.set_executable(executable).await
                 } else {
+                    if let Err(errno) = self.reclaim_clean_before_open(id).await {
+                        return reply.error(errno);
+                    }
                     let file = match self.mount.open_node(id, true).await {
                         Ok(file) => file,
                         Err(error) => return reply.error(runtime_errno(&error)),
@@ -596,6 +619,9 @@ impl Inner {
             Err(error) => return reply.error(runtime_errno(&error)),
         };
         let node = node.expect("create resolved a node id");
+        if let Err(errno) = self.reclaim_clean_before_open(node).await {
+            return reply.error(errno);
+        }
         let open = match self
             .mount
             .open_node(node, writable_open(OpenFlags(flags)))
@@ -1346,9 +1372,28 @@ impl Filesystem for FuseFrontend {
 mod tests {
     use super::*;
     use crate::core::{BackendProfile, Fs};
+    use crate::runtime::Runtime;
     use crate::support::TestBackend;
     use std::sync::Arc;
     use yinyang_core::Authority;
+
+    #[test]
+    fn representable_mode_accepts_linux_file_type_bits() {
+        assert!(representable_mode(0o100644, 0, false, false, false));
+        assert!(representable_mode(0o100755, 0, false, false, true));
+        assert!(representable_mode(0o40755, 0, false, true, false));
+        assert!(representable_mode(0o100644, 0o022, false, false, false));
+        assert!(!representable_mode(0o100600, 0, false, false, false));
+        assert!(!representable_mode(
+            0o100644 | 0o4000,
+            0,
+            false,
+            false,
+            false
+        ));
+        assert!(!representable_mode(0o020000, 0, false, false, false));
+        assert!(!representable_mode(0o40755, 0, false, false, false));
+    }
 
     #[tokio::test]
     async fn dirty_shared_node_reports_staged_size_in_path_attrs() {
@@ -1379,5 +1424,53 @@ mod tests {
         assert_eq!(attr.size, status.length);
         assert_eq!(attr.size, 5);
         assert_eq!(attr.ino, inner.inode_for(id, None).unwrap());
+    }
+
+    #[tokio::test]
+    async fn open_reclaims_stale_clean_version_after_transient_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
+            .await
+            .unwrap();
+        writer.create_file(authority.root(), "file").await.unwrap();
+        let mut file = writer.open_file("file", true).await.unwrap();
+        file.write(0, b"first").await.unwrap();
+        file.close().await.unwrap();
+        drop(writer);
+        let id = authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+
+        let mount = Mount::open(authority.clone(), temp.path().join("mount"), false)
+            .await
+            .unwrap();
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
+        let pinned = inner.mount.open_node(id, false).await.unwrap();
+        inner.reclaim_clean_before_open(id).await.unwrap();
+        assert!(inner.mount.node_status(id).await.unwrap().is_some());
+        drop(pinned);
+        inner.reclaim_clean_before_open(id).await.unwrap();
+        assert!(inner.mount.node_status(id).await.unwrap().is_none());
+
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer2"))
+            .await
+            .unwrap();
+        let mut file = writer.open_node(id, true).await.unwrap();
+        file.write(0, b"second").await.unwrap();
+        file.close().await.unwrap();
+        let fresh = inner.mount.open_node(id, false).await.unwrap();
+        assert_eq!(fresh.read(0, 6).await.unwrap(), b"second");
     }
 }

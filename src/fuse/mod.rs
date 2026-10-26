@@ -32,8 +32,11 @@
 //! reclaimed by the existing Mount recovery.
 //!
 //! The session mounts as `fuse.yinyang` and runs in the foreground. SIGINT and
-//! SIGTERM unmount the session and finish the process; dropping the session
-//! otherwise unmounts as well.
+//! SIGTERM detach the mount and wait briefly for the session. Lazy unmounting
+//! does not end the kernel connection while clients still hold open
+//! references, so the entry point returns [`Outcome::TeardownExpired`] when a
+//! bounded wait expires. The CLI handles that outcome by exiting non-zero,
+//! which closes `/dev/fuse` and makes the kernel abort every pending request.
 //!
 //! See `specs/linux-fuse.md` for the full read-only contract.
 
@@ -47,6 +50,22 @@ use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// How long a signal-initiated teardown waits after a lazy unmount before it
+/// reports that the caller must terminate the process.
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Result of a foreground mount run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    /// The session ended on its own or a signal-initiated unmount finished.
+    Unmounted,
+    /// A lazy unmount left the kernel connection alive past the grace period
+    /// because clients still hold references. The caller must terminate the
+    /// process so the OS closes `/dev/fuse` and the kernel aborts pending
+    /// requests (equivalent to crash recovery, not a graceful unmount).
+    TeardownExpired { grace: std::time::Duration },
+}
+
 /// Mount a validated read-only or writable FUSE volume in the foreground.
 ///
 /// `staging` must already be resolved to an absolute path by the CLI.
@@ -55,7 +74,7 @@ pub async fn run(
     operator: opendal::Operator,
     token: Option<String>,
     mountpoint: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let read_only = config.read_only;
     let authority = Volume::connect(&config, operator, token).await?;
     let mount = Mount::open(authority, &config.staging, read_only).await?;
@@ -116,20 +135,36 @@ pub async fn run(
         }
     });
     tokio::pin!(join);
-    tokio::select! {
+    let outcome = tokio::select! {
         result = &mut join => {
             // The session ended on its own, for example through an external
             // `fusermount3 -u`. Returning now lets the process exit and release
             // the staging lease instead of waiting for a signal forever.
             result.map_err(blocking_error)??;
+            Outcome::Unmounted
         }
         _ = shutdown_signal() => {
             let _ = teardown.send(());
-            join.await.map_err(blocking_error)??;
+            match tokio::time::timeout(TEARDOWN_GRACE, &mut join).await {
+                Ok(result) => {
+                    result.map_err(blocking_error)??;
+                    Outcome::Unmounted
+                }
+                // A lazy unmount keeps the session alive while clients hold
+                // the mount. Report it to the CLI instead of returning into a
+                // runtime shutdown that would wait for the blocked session
+                // task; the CLI exits the process so the kernel aborts the
+                // connection.
+                Err(_) => Outcome::TeardownExpired {
+                    grace: TEARDOWN_GRACE,
+                },
+            }
         }
+    };
+    if matches!(outcome, Outcome::Unmounted) {
+        println!("yy: unmounted {}", mountpoint.display());
     }
-    println!("yy: unmounted {}", mountpoint.display());
-    Ok(())
+    Ok(outcome)
 }
 
 fn blocking_error(error: tokio::task::JoinError) -> std::io::Error {
