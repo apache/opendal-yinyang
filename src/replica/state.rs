@@ -112,13 +112,11 @@ pub(super) struct BaselineNode {
     pub node: NodeId,
     pub directory: bool,
     pub executable: bool,
-    pub length: u64,
     pub digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct BaselineRecord {
-    pub revision: Revision,
     pub remote: BTreeMap<String, BaselineNode>,
     pub local: LocalSnapshot,
 }
@@ -325,6 +323,7 @@ impl Store {
         Ok(matches)
     }
 
+    #[allow(dead_code)]
     pub fn save_baseline(
         &mut self,
         revision: Revision,
@@ -605,7 +604,7 @@ impl Store {
                 directory,
                 executable,
                 remote_digest,
-                remote_length,
+                _remote_length,
                 local_present,
                 local_digest,
                 local_length,
@@ -621,7 +620,6 @@ impl Store {
                     node,
                     directory,
                     executable,
-                    length: remote_length.unwrap_or(0),
                     digest: remote_digest,
                 },
             );
@@ -661,7 +659,6 @@ impl Store {
             }
         }
         Ok(Some(BaselineRecord {
-            revision: Revision::from_bytes(revision),
             remote,
             local: LocalSnapshot::from_nodes(local),
         }))

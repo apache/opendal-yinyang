@@ -190,7 +190,6 @@ pub struct Replica {
     root_identity: Identity,
     state_identity: Identity,
     root_fd: OwnedFd,
-    state_fd: OwnedFd,
     quarantine_fd: OwnedFd,
     _lease: std::fs::File,
     store: Store,
@@ -271,7 +270,6 @@ impl Replica {
             root_identity,
             state_identity,
             root_fd,
-            state_fd,
             quarantine_fd,
             _lease: lease,
             store,
@@ -331,7 +329,6 @@ impl Replica {
             root_identity,
             state_identity,
             root_fd,
-            state_fd,
             quarantine_fd,
             _lease: lease,
             store,
@@ -358,18 +355,6 @@ impl Replica {
 
     pub(super) fn store_mut(&mut self) -> &mut Store {
         &mut self.store
-    }
-
-    pub(super) fn state_fd(&self) -> &OwnedFd {
-        &self.state_fd
-    }
-
-    pub(super) fn quarantine_fd(&self) -> &OwnedFd {
-        &self.quarantine_fd
-    }
-
-    pub(super) fn root_identity(&self) -> Identity {
-        self.root_identity
     }
 
     pub fn status(&mut self) -> Result<ReplicaStatus> {
