@@ -376,7 +376,7 @@ impl DirectorySync {
         }
         let artifact = self.replica.retain_bytes(path, &bytes)?;
         let predicate = snapshot.revision();
-        let mut source = bytes;
+        let mut source = bytes.as_slice();
         let edit = self.sync.stage(node.id(), predicate, &mut source).await?;
         self.finish_keep_local_edit(
             record,
@@ -477,7 +477,7 @@ impl DirectorySync {
             (node, predicate)
         };
         let artifact = self.replica.retain_bytes(path, bytes)?;
-        let mut source = &bytes[..];
+        let mut source = bytes;
         let edit = self
             .sync
             .stage_create_file(
