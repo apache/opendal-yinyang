@@ -286,7 +286,7 @@ async fn service_authority() -> (
         .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let token = "directory-sync-service-token".to_owned();
+    let token = "directory-sync-service-auth-token-0123456789abcdef".to_owned();
     let server = tokio::spawn(serve(listener, service, token.clone()));
     let client = ServiceClient::connect(address, token, backend.operator())
         .await
