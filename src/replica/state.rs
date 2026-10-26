@@ -996,17 +996,17 @@ impl Store {
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
         query
             .query_map([], |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let local_digest: Option<Vec<u8>> = row.get(6)?;
-                let local_length: Option<i64> = row.get(7)?;
-                let local_dev: Option<Vec<u8>> = row.get(9)?;
-                let local_ino: Option<Vec<u8>> = row.get(10)?;
-                let local_parent_dev: Option<Vec<u8>> = row.get(11)?;
-                let local_parent_ino: Option<Vec<u8>> = row.get(12)?;
-                let baseline_node: Option<Vec<u8>> = row.get(13)?;
-                let baseline_revision: Vec<u8> = row.get(14)?;
-                let remote_revision: Option<Vec<u8>> = row.get(15)?;
-                let commit_id: Option<Vec<u8>> = row.get(16)?;
+                let id: Vec<u8> = row.get(1)?;
+                let local_digest: Option<Vec<u8>> = row.get(7)?;
+                let local_length: Option<i64> = row.get(8)?;
+                let local_dev: Option<Vec<u8>> = row.get(10)?;
+                let local_ino: Option<Vec<u8>> = row.get(11)?;
+                let local_parent_dev: Option<Vec<u8>> = row.get(12)?;
+                let local_parent_ino: Option<Vec<u8>> = row.get(13)?;
+                let baseline_node: Option<Vec<u8>> = row.get(14)?;
+                let baseline_revision: Vec<u8> = row.get(15)?;
+                let remote_revision: Option<Vec<u8>> = row.get(16)?;
+                let commit_id: Option<Vec<u8>> = row.get(17)?;
                 Ok(WorkRecord {
                     seq: u64::try_from(row.get::<_, i64>(0)?)
                         .map_err(|_| corrupt_sql("negative work sequence"))?,
@@ -1055,10 +1055,10 @@ impl Store {
                         .as_deref()
                         .map(|value| fixed(value, "work commit id"))
                         .transpose()?,
-                    conflict: row.get(17)?,
-                    source_artifact: row.get(18)?,
-                    state: row.get(19)?,
-                    error: row.get(20)?,
+                    conflict: row.get(18)?,
+                    source_artifact: row.get(19)?,
+                    state: row.get(20)?,
+                    error: row.get(21)?,
                 })
             })
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?
