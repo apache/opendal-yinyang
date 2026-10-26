@@ -398,7 +398,7 @@ fn managed_sync_offline_edits_survive_process_and_authority_restart() {
 
 #[test]
 #[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
-fn managed_sync_completion_race_and_unknown_retry_use_real_service_processes() {
+fn managed_sync_v1_completion_preserves_local_v2() {
     {
         let fixture = Fixture::new(Publication::Service);
         fixture.remote_create_file("race.txt", b"remote-base", false);
@@ -461,68 +461,70 @@ fn managed_sync_completion_race_and_unknown_retry_use_real_service_processes() {
         assert!(v2_version.1 > v1_version.1, "{v2_version:?}");
         assert_in_sync(&fixture, &client);
     }
+}
 
-    {
-        let fixture = Fixture::new(Publication::Service);
-        fixture.remote_create_file("unknown.txt", b"remote-base", false);
-        let initial = fixture.sync_paths("unknown-retry");
-        fs::create_dir(&initial.directory).unwrap();
-        fixture.sync_init(&initial);
-        fixture.sync_run_ok(&initial);
-        let gate = fixture.service_gate(true);
-        let client = fixture.sync_paths_at("unknown-retry", Some(gate.address()));
-        let base_version = fixture.remote_file_version("unknown.txt");
+#[test]
+#[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
+fn managed_sync_unknown_retry_reuses_the_exact_service_commit() {
+    let fixture = Fixture::new(Publication::Service);
+    fixture.remote_create_file("unknown.txt", b"remote-base", false);
+    let initial = fixture.sync_paths("unknown-retry");
+    fs::create_dir(&initial.directory).unwrap();
+    fixture.sync_init(&initial);
+    fixture.sync_run_ok(&initial);
+    let gate = fixture.service_gate(true);
+    let client = fixture.sync_paths_at("unknown-retry", Some(gate.address()));
+    let base_version = fixture.remote_file_version("unknown.txt");
 
-        write_local(&client.directory.join("unknown.txt"), b"exactly-once");
-        let running = fixture.spawn_sync_run(&client);
-        if let Err(error) = gate.wait_for_commit_response(Duration::from_secs(120)) {
-            let output = running.wait(Duration::from_secs(130));
-            panic!(
-                "gate did not observe the unknown-outcome commit response ({error}):\n{}",
-                captured_text(&output)
-            );
-        }
-        let output = running.wait(Duration::from_secs(120));
-        assert_failure(&output, "sync with a lost commit response");
-
-        assert_eq!(remote_file_bytes(&fixture, "unknown.txt"), b"exactly-once");
-        let committed = fixture.remote_file_version("unknown.txt");
-        assert_eq!(committed.0, base_version.0);
-        assert!(committed.1 > base_version.1, "{committed:?}");
-        assert_eq!(
-            fs::read(client.directory.join("unknown.txt")).unwrap(),
-            b"exactly-once"
-        );
-        let status = fixture.sync_status(&client);
-        let entry = status.entry("unknown.txt");
-        let commit_id = entry
-            .intent
-            .commit_id
-            .clone()
-            .expect("unknown outcome retains its original commit ID");
-        assert_eq!(entry.outcome.state, OutcomeState::Unknown);
-        assert_eq!(
-            entry.intent.state,
-            Some(crate::linux_sync::harness::IntentState::Unknown)
-        );
-        assert_eq!(status.summary.unknown, 1, "{status:#?}");
-        assert_eq!(status.summary.failed, 0);
-        assert_eq!(status.summary.conflicts, 0);
-        assert!(!status.summary.in_sync);
-
-        fixture.sync_run_ok(&client);
-        let status = assert_in_sync(&fixture, &client);
-        assert_eq!(
-            status.entry("unknown.txt").intent.commit_id.as_deref(),
-            Some(commit_id.as_str())
-        );
-        assert_eq!(remote_file_bytes(&fixture, "unknown.txt"), b"exactly-once");
-        assert_eq!(
-            fixture.remote_file_version("unknown.txt"),
-            committed,
-            "retry of the exact unknown request must not publish a second commit"
+    write_local(&client.directory.join("unknown.txt"), b"exactly-once");
+    let running = fixture.spawn_sync_run(&client);
+    if let Err(error) = gate.wait_for_commit_response(Duration::from_secs(120)) {
+        let output = running.wait(Duration::from_secs(130));
+        panic!(
+            "gate did not observe the unknown-outcome commit response ({error}):\n{}",
+            captured_text(&output)
         );
     }
+    let output = running.wait(Duration::from_secs(120));
+    assert_failure(&output, "sync with a lost commit response");
+
+    assert_eq!(remote_file_bytes(&fixture, "unknown.txt"), b"exactly-once");
+    let committed = fixture.remote_file_version("unknown.txt");
+    assert_eq!(committed.0, base_version.0);
+    assert!(committed.1 > base_version.1, "{committed:?}");
+    assert_eq!(
+        fs::read(client.directory.join("unknown.txt")).unwrap(),
+        b"exactly-once"
+    );
+    let status = fixture.sync_status(&client);
+    let entry = status.entry("unknown.txt");
+    let commit_id = entry
+        .intent
+        .commit_id
+        .clone()
+        .expect("unknown outcome retains its original commit ID");
+    assert_eq!(entry.outcome.state, OutcomeState::Unknown);
+    assert_eq!(
+        entry.intent.state,
+        Some(crate::linux_sync::harness::IntentState::Unknown)
+    );
+    assert_eq!(status.summary.unknown, 1, "{status:#?}");
+    assert_eq!(status.summary.failed, 0);
+    assert_eq!(status.summary.conflicts, 0);
+    assert!(!status.summary.in_sync);
+
+    fixture.sync_run_ok(&client);
+    let status = assert_in_sync(&fixture, &client);
+    assert_eq!(
+        status.entry("unknown.txt").intent.commit_id.as_deref(),
+        Some(commit_id.as_str())
+    );
+    assert_eq!(remote_file_bytes(&fixture, "unknown.txt"), b"exactly-once");
+    assert_eq!(
+        fixture.remote_file_version("unknown.txt"),
+        committed,
+        "retry of the exact unknown request must not publish a second commit"
+    );
 }
 
 #[test]
