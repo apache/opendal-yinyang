@@ -84,13 +84,6 @@ pub enum SyncSide {
 }
 
 impl SyncSide {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote => "remote",
-        }
-    }
-
     fn domain_keep(self) -> domain::Resolution {
         match self {
             Self::Local => domain::Resolution::KeepLocal,
@@ -531,14 +524,12 @@ async fn export(
         // Retained bytes are local; export must not require remote connectivity.
         export_artifact_local(config, id, &mut file).await
     } else {
-        export_conflict(
-            config,
-            operator,
-            conflict.as_deref().expect("conflict selector present"),
-            side.expect("conflict side present").as_str(),
-            &mut file,
-        )
-        .await
+        let id = conflict.as_deref().expect("conflict selector present");
+        match side.expect("conflict side present") {
+            // The local side is durable local bytes; no authority is needed.
+            SyncSide::Local => export_conflict_local(config, id, &mut file),
+            SyncSide::Remote => export_conflict_remote(config, operator, id, &mut file).await,
+        }
     };
     drop(file);
     if let Err(error) = outcome {
@@ -568,13 +559,22 @@ async fn export_artifact_local(
     Ok(())
 }
 
-/// Exports one side of a conflict. The remote side reads the retained revision,
-/// so this path needs the publication authority.
-async fn export_conflict(
+/// Exports a conflict's local side through the authority-free local reader.
+fn export_conflict_local(
+    config: &VolumeConfig,
+    id: &str,
+    output: &mut dyn std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    yinyang::replica::export_conflict_local(&config.staging, id, output).map_err(fatal)?;
+    Ok(())
+}
+
+/// Exports a conflict's remote side. It reads a retained revision, so this path
+/// needs the publication authority.
+async fn export_conflict_remote(
     config: &VolumeConfig,
     operator: opendal::Operator,
     id: &str,
-    side: &str,
     output: &mut dyn std::io::Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let authority = connect(config, operator).await?;
@@ -582,7 +582,7 @@ async fn export_conflict(
         .await
         .map_err(fatal)?;
     directory
-        .export_conflict_side(id, side, output)
+        .export_conflict_side(id, "remote", output)
         .await
         .map_err(fatal)?;
     Ok(())
@@ -666,7 +666,7 @@ fn project(inspection: &domain::Inspection) -> Result<SyncStatus, String> {
     let artifacts = inspection
         .artifacts
         .iter()
-        .map(|artifact| project_artifact(artifact, &inspection.binding.state_directory))
+        .map(project_artifact)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SyncStatus {
         schema: SyncStatus::SCHEMA.to_owned(),
@@ -869,7 +869,7 @@ fn conflict_side(side: &str) -> ConflictSide {
     }
 }
 
-fn project_artifact(artifact: &domain::Artifact, state: &Path) -> Result<ArtifactRecord, String> {
+fn project_artifact(artifact: &domain::Artifact) -> Result<ArtifactRecord, String> {
     let kind = match artifact.kind.as_str() {
         "replaced-file" => ArtifactKind::ReplacedFile,
         "rollback-displaced" => ArtifactKind::RollbackDisplaced,
@@ -892,15 +892,8 @@ fn project_artifact(artifact: &domain::Artifact, state: &Path) -> Result<Artifac
         origin: artifact.origin.clone(),
         kind,
         phase,
-        // Retained bytes live under the state directory's quarantine. The
-        // domain record exposes the file name; the adapter composes the public
-        // path the operator and export use.
-        path: state
-            .join("quarantine")
-            .join(&artifact.name)
-            .display()
-            .to_string(),
-        exportable: kind != ArtifactKind::QuarantinedDirectory,
+        path: artifact.path.display().to_string(),
+        exportable: artifact.exportable,
         error: artifact.error.clone(),
     })
 }

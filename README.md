@@ -42,11 +42,12 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   [frontend contract](specs/linux-fuse.md) and
   [acceptance guide](docs/linux-fuse-acceptance.md). This is experimental
   native validation, not release support.
-- **Managed Sync:** The [Sync runtime](specs/sync-runtime.md) coordinates pinned
-  downloads and baseline-bound replacement content for existing files. It does
-  not coordinate namespace mutations, reconcile an ordinary local directory, or
-  provide a complete progress/conflict-resolution workflow. There is no
-  automatic watcher or daemon.
+- **Managed Sync:** The Linux ordinary-directory frontend reconciles a directory
+  with a Managed volume through `yy --volume CONFIG sync init|run|status|export|resolve`
+  and a versioned `yinyang.sync.status.v1` document. See the
+  [Linux Managed Sync contract](specs/linux-sync.md) and the
+  [Sync runtime](specs/sync-runtime.md). It stays experimental, runs only on
+  Linux, and installs no automatic watcher or daemon.
 - **macOS prototypes:** The experimental FSKit and File Provider frontends are
   isolated macOS 27 / Xcode 27 prototypes. They share the native bridge and
   runtimes, but ordinary volume CLI admission does not select them. See the
@@ -107,8 +108,9 @@ write/append/truncate, conditional remote fsync, and restart recovery over eithe
 publication authority. Configure the [volume and required capabilities](specs/volume-capabilities.md),
 then use `yy --volume volume.json file ...` and `yy --volume volume.json status`.
 Local write acknowledgment and remote publication are reported separately.
-The library frontend does not install a mount or reconcile local directories.
-The separate Linux FUSE frontend exposes Managed Mount, not Sync.
+The file runtime's library frontend installs no mount; directory reconciliation
+is the separate [Managed Sync](specs/linux-sync.md) frontend, and the
+[Linux FUSE frontend](specs/linux-fuse.md) exposes Managed Mount instead.
 
 ## Previous releases
 
