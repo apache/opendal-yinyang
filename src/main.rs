@@ -85,11 +85,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &cli.volume {
         return file_cli::run(path, cli.command).await;
     }
-    if matches!(
-        cli.command,
-        Command::File { .. } | Command::Capabilities | Command::Mount { .. }
-    ) {
-        return Err("this command requires --volume CONFIG.json".into());
+    match cli.command {
+        Command::Mount { .. } => {
+            return Err(
+                "mount requires --volume CONFIG.json with frontend=fuse and read_only=true".into(),
+            );
+        }
+        Command::File { .. } | Command::Capabilities => {
+            return Err("this command requires --volume CONFIG.json".into());
+        }
+        _ => {}
     }
     let profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
         Ok("amazon-s3") => BackendProfile::AmazonS3,
@@ -128,9 +133,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let fs = Fs::open(operator, profile).await?;
     let observed = fs.observe_latest().await?;
     match cli.command {
-        Command::Create | Command::Serve { .. } | Command::File { .. } | Command::Capabilities => {
-            unreachable!()
-        }
+        Command::Create
+        | Command::Serve { .. }
+        | Command::File { .. }
+        | Command::Capabilities
+        | Command::Mount { .. } => unreachable!(),
         Command::Publish {
             source,
             replace,
