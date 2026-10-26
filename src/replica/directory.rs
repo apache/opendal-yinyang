@@ -408,7 +408,45 @@ impl DirectorySync {
         }
         paths.remove("");
 
-        let conflicts: Vec<Conflict> = status.conflicts.clone();
+        let mut conflicts: Vec<Conflict> = status.conflicts.clone();
+        // A retained install inode that gained late writer bytes is an
+        // unresolved conflict even though nothing durable was written before.
+        for artifact in &status.artifacts {
+            let install_kind =
+                artifact.kind == "replaced-file" || artifact.kind == "rollback-displaced";
+            if artifact.phase != "conflict"
+                || !install_kind
+                || artifact.origin.is_empty()
+                || conflicts.iter().any(|conflict| {
+                    conflict.local_artifact.as_deref() == Some(artifact.id.as_str())
+                })
+            {
+                continue;
+            }
+            let path = artifact.origin.clone();
+            let remote = match remote_map.and_then(|map| map.get(&path)) {
+                Some(node) if node.is_directory() => "current_directory",
+                Some(_) => "current_file",
+                None => "deleted",
+            };
+            conflicts.push(Conflict {
+                id: artifact.id.clone(),
+                path: path.clone(),
+                original_path: Some(path.clone()),
+                desired_path: Some(path),
+                local: "retained_artifact".to_owned(),
+                remote: remote.to_owned(),
+                local_artifact: Some(artifact.id.clone()),
+                remote_node: remote_map
+                    .and_then(|map| map.get(&artifact.origin))
+                    .map(Node::id),
+                remote_revision: remote_status.revision.map(Revision::to_bytes),
+                error: artifact
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
+            });
+        }
         let mut entries = Vec::with_capacity(paths.len());
         let mut pending = 0_u64;
         for path in &paths {
@@ -658,13 +696,16 @@ impl DirectorySync {
     /// Apply one durable decision to an active conflict, then reconcile again.
     /// The conflict stays active until its derived request actually commits.
     pub async fn resolve(&mut self, conflict_id: &str, decision: Resolution) -> Result<RunOutcome> {
-        let record = self
+        let record = match self
             .replica
             .store()
             .conflicts()?
             .into_iter()
             .find(|record| record.id == conflict_id)
-            .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+        {
+            Some(record) => record,
+            None => self.synthetic_conflict(conflict_id)?,
+        };
         let observed = self.sync.authority().observe_latest().await?;
         let remote = crate::directory_nodes(&observed).await?;
         let baseline = self.replica.store().load_baseline()?;
@@ -679,9 +720,51 @@ impl DirectorySync {
             }
         };
         if applied {
-            self.replica.store_mut().remove_conflict(conflict_id)?;
+            let is_artifact = self
+                .replica
+                .store()
+                .artifacts()?
+                .iter()
+                .any(|artifact| artifact.id == conflict_id);
+            if is_artifact {
+                self.replica.acknowledge_retained_artifact(conflict_id)?;
+            } else {
+                self.replica.store_mut().remove_conflict(conflict_id)?;
+            }
         }
         self.run().await
+    }
+
+    /// Build the conflict record for a retained install inode that gained late
+    /// writer bytes. This conflict is reported by inspection but is not durable
+    /// until an explicit decision is applied.
+    fn synthetic_conflict(&self, artifact_id: &str) -> Result<ConflictRecord> {
+        let artifact = self
+            .replica
+            .store()
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == artifact_id)
+            .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+        if artifact.phase != "conflict" || artifact.origin.is_empty() {
+            return Err(crate::replica::Error::invalid("unknown conflict")
+                .to_string()
+                .into());
+        }
+        Ok(ConflictRecord {
+            id: artifact.id.clone(),
+            path: artifact.origin.clone(),
+            original_path: Some(artifact.origin.clone()),
+            desired_path: Some(artifact.origin.clone()),
+            local: "retained_artifact".to_owned(),
+            remote: "current_file".to_owned(),
+            local_artifact: Some(artifact.id),
+            remote_node: None,
+            remote_revision: None,
+            error: artifact
+                .error
+                .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
+        })
     }
 
     /// Publish the chosen local bytes through the same durable work/receipt

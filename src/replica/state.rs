@@ -1004,6 +1004,26 @@ impl Store {
         Ok(())
     }
 
+    /// Re-baseline the expected inode digest of a retained install so a late
+    /// writer into a retained inode can be explicitly acknowledged.
+    pub fn retarget_install(&mut self, install: &InstallRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE installs SET expected_digest=?2,expected_length=?3,
+                   phase=?4,error=?5 WHERE id=?1",
+                params![
+                    install.id,
+                    install.expected_digest.as_slice(),
+                    i64::try_from(install.expected_length)
+                        .map_err(|_| Error::invalid("install length exceeds SQLite range"))?,
+                    install.phase.as_str(),
+                    install.error,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("retarget install journal: {e}")))?;
+        Ok(())
+    }
+
     pub fn incomplete_installs(&self) -> Result<Vec<InstallRecord>> {
         self.installs_where("WHERE phase NOT IN ('retained','conflict','failed')")
     }

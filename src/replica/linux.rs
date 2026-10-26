@@ -775,6 +775,32 @@ impl Replica {
         }
     }
 
+    /// Acknowledge a retained install artifact whose inode gained late writer
+    /// bytes: re-baseline its expected digest to the current bytes so a
+    /// deliberate keep-local resolution is no longer reported as a conflict.
+    pub fn acknowledge_retained_artifact(&mut self, id: &str) -> Result<()> {
+        let artifacts = self.store.artifacts()?;
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.id == id)
+            .ok_or_else(|| Error::invalid("unknown retained artifact"))?;
+        let installs = self.store.installs()?;
+        if let Some(mut install) = installs
+            .into_iter()
+            .find(|install| install.artifact == artifact.name)
+        {
+            let (length, digest, _, _) =
+                hash_file_at(&self.quarantine_fd, &artifact.name, &self.state)?;
+            install.expected_digest = *digest.as_bytes();
+            install.expected_length = length;
+            install.phase = InstallPhase::Retained;
+            install.error = None;
+            self.store.retarget_install(&install)?;
+        }
+        self.store.update_artifact(id, "retained", None)?;
+        Ok(())
+    }
+
     /// Create one local directory with a no-replace mkdirat; the entry only
     /// becomes visible after a successful directory entry creation.
     pub(super) fn create_directory_local(&self, path: &str) -> Result<()> {
