@@ -96,7 +96,15 @@ fn representable_mode(
     directory: bool,
     executable: bool,
 ) -> bool {
-    if mode & !0o777 != 0 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    let file_type = mode & S_IFMT;
+    let type_ok = file_type == 0
+        || (directory && file_type == S_IFDIR)
+        || (!directory && file_type == S_IFREG);
+    let special_bits = mode & !(S_IFMT | 0o777);
+    if !type_ok || special_bits != 0 {
         return false;
     }
     let effective = mode & !umask & 0o777;
@@ -453,15 +461,17 @@ impl Inner {
         fh: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
-        if uid.is_some()
-            || gid.is_some()
-            || atime.is_some()
+        let supported_mutation = size.is_some() || mode.is_some();
+        let kernel_timestamps = atime.is_some()
             || mtime.is_some()
             || ctime.is_some()
             || crtime.is_some()
             || chgtime.is_some()
-            || bkuptime.is_some()
+            || bkuptime.is_some();
+        if uid.is_some()
+            || gid.is_some()
             || flags.is_some()
+            || (!supported_mutation && kernel_timestamps)
             || (size.is_some() && mode.is_some())
         {
             return reply.error(fuser::Errno::EOPNOTSUPP);
@@ -520,14 +530,7 @@ impl Inner {
                 Err(error) => return reply.error(core_errno(&error)),
             };
             let executable = mode & 0o111 != 0;
-            let expected = if current.is_directory() {
-                if self.read_only { 0o555 } else { 0o755 }
-            } else if executable {
-                if self.read_only { 0o555 } else { 0o755 }
-            } else {
-                if self.read_only { 0o444 } else { 0o644 }
-            };
-            if mode & !0o777 != 0 || mode & 0o777 != expected {
+            if !representable_mode(mode, 0, self.read_only, current.is_directory(), executable) {
                 return reply.error(fuser::Errno::EOPNOTSUPP);
             }
             if !current.is_directory() {
@@ -1373,6 +1376,24 @@ mod tests {
     use crate::support::TestBackend;
     use std::sync::Arc;
     use yinyang_core::Authority;
+
+    #[test]
+    fn representable_mode_accepts_linux_file_type_bits() {
+        assert!(representable_mode(0o100644, 0, false, false, false));
+        assert!(representable_mode(0o100755, 0, false, false, true));
+        assert!(representable_mode(0o40755, 0, false, true, false));
+        assert!(representable_mode(0o100644, 0o022, false, false, false));
+        assert!(!representable_mode(0o100600, 0, false, false, false));
+        assert!(!representable_mode(
+            0o100644 | 0o4000,
+            0,
+            false,
+            false,
+            false
+        ));
+        assert!(!representable_mode(0o020000, 0, false, false, false));
+        assert!(!representable_mode(0o40755, 0, false, false, false));
+    }
 
     #[tokio::test]
     async fn dirty_shared_node_reports_staged_size_in_path_attrs() {

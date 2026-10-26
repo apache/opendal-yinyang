@@ -121,7 +121,13 @@ descriptor is staged for that descriptor's later flush/fsync; path truncation
 publishes before returning success. A mode request is accepted only when it is
 one of the synthesized modes above (`0444`/`0555` or `0644`/`0755` according to
 read-only policy and the executable bit); other permission combinations return
-`EOPNOTSUPP`. Before changing the executable flag, the shared node lock
+`EOPNOTSUPP`. Linux may include `S_IFREG`/`S_IFDIR` type bits in the mode;
+they are accepted when they match the node, while setuid/setgid/sticky and
+other permission combinations are rejected. Kernel bookkeeping timestamps
+attached to a chmod or truncate request are accepted and ignored, and the reply
+always carries revision-derived timestamps. Standalone timestamp changes and
+ownership changes remain explicitly unsupported. Before changing the
+executable flag, the shared node lock
 publishes dirty content, commits a Planner based on the handle's recorded
 content revision, and advances only that clean handle to the receipt revision.
 An external content change therefore produces Conflict rather than rebasing
