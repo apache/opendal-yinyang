@@ -116,6 +116,12 @@ impl InodeTable {
     pub fn cached(&self, id: NodeId) -> Option<CachedInfo> {
         self.info.get(&id).copied()
     }
+
+    /// Inode numbers mapped so far; used by the explicit refresh to invalidate
+    /// only the attributes the kernel may cache.
+    pub fn inodes(&self) -> Vec<u64> {
+        self.by_inode.keys().copied().collect()
+    }
 }
 
 fn derive(id: NodeId) -> Result<u64, &'static str> {

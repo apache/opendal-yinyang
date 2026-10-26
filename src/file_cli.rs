@@ -185,8 +185,10 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
                 yinyang::fuse::Outcome::Unmounted => Ok(()),
                 yinyang::fuse::Outcome::TeardownExpired { grace } => {
                     eprintln!(
-                        "yy: FUSE session did not end within {}s because clients still hold references; \
-                         exiting non-zero to abort the connection (equivalent to crash recovery)",
+                        "yy: FUSE mount did not finish teardown within {}s (the session or the \
+                         refresh task is still running, for example clients holding references or a \
+                         refresh blocked on remote I/O); exiting non-zero to abort the connection \
+                         (equivalent to crash recovery)",
                         grace.as_secs()
                     );
                     std::process::exit(1);

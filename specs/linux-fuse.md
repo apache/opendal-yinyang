@@ -140,6 +140,41 @@ An external content change therefore produces Conflict rather than rebasing
 old staged bytes onto new content. Ownership, timestamps and other mode bits
 are not persisted.
 
+## Explicit refresh
+
+`SIGHUP` triggers one explicit refresh; this is a manual invalidation entry
+point, not an automatic change watch. There is no background polling, no
+change-feed watcher, and no whole-tree enumeration. The refresh observes the
+latest snapshot once and then:
+
+- reclaims every clean, unreferenced node through the shared `Mount` contract,
+  so the next open materializes the current remote revision; nodes with live
+  references or retained state are left pinned (`Busy`);
+- invalidates known inode attributes with `inval_inode(ino, -1, 0)` and
+  replied dentries with `inval_entry(parent, name)` through the fuser
+  `Notifier`. Only dentries this adapter actually replied to the kernel are
+  recorded: successful `LOOKUP` results. Negative lookups carry no timeout in
+  FUSE replies and are not recorded, and plain `READDIR` does not install
+  dentries without `READDIRPLUS`, so directory names are not recorded.
+
+The adapter never calls `Mount::refresh`, because that replaces the shared
+staged handle and would rebase open file descriptors. The refresh must also
+hold no adapter lock while reclaiming nodes or sending notifications; targets
+are collected under short locks, then the sends run on a blocking thread. At
+most one refresh runs at a time and duplicate `SIGHUP`s while one is running
+are coalesced by the signal stream. The SIGHUP loop is a tracked Tokio task:
+the signal handler is registered synchronously before the mount becomes
+visible, teardown sends it a stop signal, and the session join and the refresh
+task share the same five-second grace period; a refresh already in progress
+may finish inside that window. A `NotFound` notification result is expected
+(the kernel already dropped the entry or inode) and is counted separately, so
+only explicit connection-ended errors (`ENODEV`, `ENOTCONN`, `EPIPE`,
+`ECONNRESET`, `ESHUTDOWN`) stop the batch before it would otherwise finish.
+
+Stable `yy: fuse refresh:` log lines report the observed revision, the
+reclaimed/active node counts, and the native notification counts at
+completion, so an acceptance harness can confirm a refresh finished.
+
 ## Pinned directory cursors
 
 `opendir` pins one `Snapshot` revision and one directory identity. `readdir`
@@ -210,9 +245,8 @@ there is no mid-session cancellation signal.
   cross-mount or cross-client meaning; no distributed lock semantics are
   claimed. A writable mount must not claim that locking is rejected outright,
   because the kernel may return success for its own local lock manager.
-- The shared Mount node map is not held across first materialization or other
-  authority/staging I/O; the adapter adds no mount-wide lock across those
-  awaits.
-- Extension points for the next layer are the runtime namespace operations,
-  `Mount::refresh` guarded by reference counts, and the session `Notifier`
-  for kernel entry/inode invalidation once an in-place refresh policy exists.
+- The module keeps existing core Mount behavior, including the node-map lock
+  that already spans first materialization; the adapter adds no mount-wide
+  lock across authority or staging I/O.
+- The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
+  there is no automatic external-change watch.

@@ -46,11 +46,12 @@ use super::inode::{CachedInfo, InodeTable};
 use crate::mount::{Mount, MountFile};
 use fuser::{
     AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,10 @@ pub(super) struct Inner {
     inodes: Mutex<InodeTable>,
     files: Mutex<BTreeMap<u64, Arc<OpenFile>>>,
     dirs: Mutex<BTreeMap<u64, Arc<AsyncMutex<DirCursor>>>>,
+    /// Dentry names this adapter actually replied to the kernel; only those
+    /// can be cached and invalidated by an explicit refresh.
+    dentries: Mutex<BTreeSet<(u64, String)>>,
+    notifier: Mutex<Option<Notifier>>,
     next_handle: AtomicU64,
     runtime: Handle,
     read_only: bool,
@@ -141,6 +146,8 @@ impl Inner {
             inodes: Mutex::new(InodeTable::new(root)),
             files: Mutex::new(BTreeMap::new()),
             dirs: Mutex::new(BTreeMap::new()),
+            dentries: Mutex::new(BTreeSet::new()),
+            notifier: Mutex::new(None),
             next_handle: AtomicU64::new(0),
             runtime,
             read_only,
@@ -153,6 +160,130 @@ impl Inner {
 
     fn next_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Install the kernel notification handle once the session is spawned.
+    pub(super) fn install_notifier(&self, notifier: Notifier) {
+        guard(&self.notifier).replace(notifier);
+    }
+
+    /// Remember a dentry this adapter replied to the kernel.
+    fn record_dentry(&self, parent: INodeNo, name: &str) {
+        guard(&self.dentries).insert((parent.0, name.to_owned()));
+    }
+
+    /// Serve explicit refresh requests. The signal stream was registered
+    /// before the mount became visible; SIGHUPs arriving while a refresh runs
+    /// are coalesced by the stream, and `stop` ends the loop so the caller can
+    /// bound the task with the session teardown deadline.
+    pub(super) async fn serve_hup(
+        self: Arc<Self>,
+        mut signal: tokio::signal::unix::Signal,
+        mut stop: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop => return,
+                event = signal.recv() => match event {
+                    Some(()) => self.refresh_once().await,
+                    // The signal stream cannot be re-established; stop rather
+                    // than spin on a closed stream.
+                    None => return,
+                },
+            }
+        }
+    }
+
+    /// One explicit refresh: re-observe latest, reclaim clean unreferenced
+    /// nodes, and invalidate known inode attributes and replied dentries.
+    async fn refresh_once(&self) {
+        let snapshot = match self.observe().await {
+            Ok(snapshot) => snapshot,
+            Err(errno) => {
+                eprintln!("yy: fuse refresh: cannot observe latest: {errno:?}");
+                return;
+            }
+        };
+        let revision = revision_hex(snapshot.revision());
+        let inodes = { guard(&self.inodes).inodes() };
+        let dentries = { guard(&self.dentries).iter().cloned().collect::<Vec<_>>() };
+        eprintln!(
+            "yy: fuse refresh: revision {revision} over {} inodes and {} dentries",
+            inodes.len(),
+            dentries.len()
+        );
+        let (mut reclaimed, mut active, mut failures) = (0usize, 0usize, 0usize);
+        for inode in &inodes {
+            let Some(id) = self.node(INodeNo(*inode)) else {
+                continue;
+            };
+            // Busy means live references or retained state: keep the pinned
+            // version. Mount::refresh is never used here because it rebases
+            // live open handles.
+            match self.mount.reclaim(id).await {
+                Ok(()) => reclaimed += 1,
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => active += 1,
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("yy: fuse refresh: reclaim {id:?}: {error}");
+                }
+            }
+        }
+        eprintln!(
+            "yy: fuse refresh: reclaimed {reclaimed} clean nodes ({active} active, {failures} failed)"
+        );
+        let Some(notifier) = guard(&self.notifier).clone() else {
+            eprintln!("yy: fuse refresh: notifier not installed; skipping kernel invalidation");
+            return;
+        };
+        // fuser's send_inval already treats NotFound/ENOENT as an accepted
+        // notification, so Ok below means the kernel accepted the send, not
+        // that the inode or entry was still cached. Only explicit
+        // connection-ended errors stop the batch; other failures are counted
+        // and skipped so one vanished inode cannot abort the whole refresh.
+        let attempts = inodes.len() + dentries.len();
+        let (inode_ok, entry_ok, errors, ended) = tokio::task::spawn_blocking(move || {
+            let mut inode_ok = 0usize;
+            let mut entry_ok = 0usize;
+            let mut errors = 0usize;
+            let mut ended = false;
+            for inode in inodes.iter() {
+                match notifier.inval_inode(INodeNo(*inode), -1, 0) {
+                    Ok(()) => inode_ok += 1,
+                    Err(error) if is_connection_ended(&error) => {
+                        // The session is gone; stop instead of spamming.
+                        errors += 1;
+                        ended = true;
+                        return (inode_ok, entry_ok, errors, ended);
+                    }
+                    Err(_) => errors += 1,
+                }
+            }
+            for (parent, name) in dentries.iter() {
+                match notifier.inval_entry(INodeNo(*parent), OsStr::new(name)) {
+                    Ok(()) => entry_ok += 1,
+                    Err(error) if is_connection_ended(&error) => {
+                        errors += 1;
+                        ended = true;
+                        return (inode_ok, entry_ok, errors, ended);
+                    }
+                    Err(_) => errors += 1,
+                }
+            }
+            (inode_ok, entry_ok, errors, ended)
+        })
+        .await
+        .unwrap_or((0, 0, attempts, false));
+        if ended {
+            eprintln!(
+                "yy: fuse refresh: channel ended; sent {inode_ok} inode and {entry_ok} entry invalidations before {errors} errors"
+            );
+        } else {
+            eprintln!(
+                "yy: fuse refresh: done (inode={inode_ok} entries={entry_ok} errors={errors})"
+            );
+        }
     }
 
     fn inode_for(&self, id: NodeId, info: Option<CachedInfo>) -> Result<INodeNo, fuser::Errno> {
@@ -290,6 +421,11 @@ impl Inner {
             Ok(None) => return reply.error(fuser::Errno::ENOENT),
             Err(error) => return reply.error(core_errno(&error)),
         };
+        // A positive LOOKUP reply may install a kernel dentry; remember it
+        // for the explicit refresh. Negative results carry no timeout and are
+        // skipped, and a plain READDIR does not install positive dentries
+        // (that is READDIRPLUS), so scanned names are not recorded.
+        self.record_dentry(parent, &name);
         match self.shared_attr(entry.node_id).await {
             Ok(Some(attr)) => {
                 self.remember_lookup(attr.ino);
@@ -937,6 +1073,27 @@ fn entry_kind(directory: bool) -> FileType {
     } else {
         FileType::RegularFile
     }
+}
+
+fn revision_hex(revision: yinyang_core::Revision) -> String {
+    revision
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Explicit connection-ended errnos. ENOENT is not one of them: fuser already
+/// treats a missing inode or entry as an accepted invalidation.
+fn is_connection_ended(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if matches!(
+                code,
+                libc::ENODEV | libc::ENOTCONN | libc::EPIPE | libc::ECONNRESET | libc::ESHUTDOWN
+            )
+    )
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
