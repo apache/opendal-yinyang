@@ -967,7 +967,7 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
     let local1 = local_tree(&root);
     let remote1 = remote_tree(&authority).await;
     assert!(
-        remote1.get("dir").is_none(),
+        !remote1.contains_key("dir"),
         "the accepted rename must move the directory out of the old name"
     );
     assert_eq!(
@@ -1018,7 +1018,7 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
             bytes: b"v2-was-never-seen-locally".to_vec(),
         }
     );
-    assert!(local2.get("dir").is_none());
+    assert!(!local2.contains_key("dir"));
 
     let outcome3 = reopened.run().await.unwrap();
     assert_eq!(outcome3.published_local, 0);
