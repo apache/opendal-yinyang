@@ -33,7 +33,7 @@ use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
     Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction,
 };
-use yinyang::replica::DirectorySync;
+use yinyang::replica::{DirectorySync, Resolution};
 use yinyang::sync::{FileMetadata, Sync};
 
 /// An independent snapshot of a real tree on one side of a sync.
@@ -725,6 +725,49 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
             .iter()
             .all(|conflict| !conflict.id.is_empty())
     );
+
+    // The conflict is resolvable: keeping the remote side adopts the external
+    // bytes locally, preserves them remotely, and returns to in_sync.
+    let conflict = inspected.conflicts[0].clone();
+    let mut resolver = DirectorySync::open(authority.clone(), &state)
+        .await
+        .unwrap();
+    resolver
+        .resolve(&conflict.id, Resolution::KeepRemote)
+        .await
+        .unwrap();
+    let local = local_tree(&root);
+    let remote = remote_tree(&authority).await;
+    assert_eq!(
+        local["b"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"external-b".to_vec(),
+        },
+        "keep-remote must adopt the external bytes locally"
+    );
+    assert_eq!(
+        remote["b"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"external-b".to_vec(),
+        },
+        "the external remote edit must survive resolution"
+    );
+
+    let mut reopened = DirectorySync::open(authority.clone(), &state)
+        .await
+        .unwrap();
+    let stable = reopened.run().await.unwrap();
+    assert!(
+        stable.in_sync,
+        "a resolved interleaving must reach in_sync on the next run"
+    );
+    let final_status = DirectorySync::inspect(authority.clone(), &state)
+        .await
+        .unwrap();
+    assert!(final_status.conflicts.is_empty());
+    assert!(final_status.summary.in_sync);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

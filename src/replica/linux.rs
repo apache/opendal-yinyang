@@ -394,7 +394,7 @@ impl Replica {
         Self::open_read_only(state)?.scan()
     }
 
-    fn open_read_only(state: &Path) -> Result<Self> {
+    pub(crate) fn open_read_only(state: &Path) -> Result<Self> {
         let state =
             std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;
         let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;

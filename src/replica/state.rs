@@ -526,6 +526,33 @@ impl Store {
                 Some(*file.content_id().digest()),
             ),
         };
+        self.save_baseline_entry(
+            path,
+            node.id(),
+            directory,
+            node.executable(),
+            digest,
+            length,
+            local,
+            revision,
+        )
+    }
+
+    /// Write one baseline entry with explicit accepted remote facts. A
+    /// namespace-only receipt advances path/revision but keeps the previously
+    /// accepted content digest and executable bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_baseline_entry(
+        &mut self,
+        path: &str,
+        node: NodeId,
+        directory: bool,
+        executable: bool,
+        digest: Option<[u8; 32]>,
+        length: u64,
+        local: Option<&LocalNode>,
+        revision: Revision,
+    ) -> Result<()> {
         let (
             present,
             local_digest,
@@ -567,9 +594,9 @@ impl Store {
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     path,
-                    node.id().as_bytes().as_slice(),
+                    node.as_bytes().as_slice(),
                     directory,
-                    node.executable(),
+                    executable,
                     digest.as_ref().map(|value| value.as_slice()),
                     i64::try_from(length).map_err(|_| Error::invalid(
                         "remote baseline length exceeds SQLite range"

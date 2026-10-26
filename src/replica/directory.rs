@@ -675,17 +675,7 @@ impl DirectorySync {
     /// it keeps working offline.
     pub fn export_conflict_local(&self, conflict_id: &str, output: &mut dyn Write) -> Result<()> {
         let record = self.load_conflict_record(conflict_id)?;
-        if let Some(artifact) = record.local_artifact {
-            return Ok(self.replica.export_artifact(&artifact, output)?);
-        }
-        let path = record
-            .desired_path
-            .as_deref()
-            .unwrap_or(record.path.as_str());
-        let file = self.replica.open_local_file(path)?;
-        let mut file = file;
-        std::io::copy(&mut file, output).map_err(|error| error.to_string())?;
-        Ok(())
+        export_local_side(&self.replica, &record, output)
     }
 
     fn load_conflict_record(&self, conflict_id: &str) -> Result<ConflictRecord> {
@@ -1223,15 +1213,7 @@ impl DirectorySync {
                     // Apply baseline and clear the linked conflict before
                     // marking the work complete. Publication is idempotent, so
                     // a crash here is recovered by re-running this retry.
-                    if let Some(node) = self.accepted_node_at(&record, revision).await? {
-                        let accepted = accepted_local(&record)?;
-                        self.replica.store_mut().save_baseline_path(
-                            &record.path,
-                            &node,
-                            accepted.as_ref(),
-                            revision,
-                        )?;
-                    }
+                    self.apply_retry_receipt(&record, revision).await?;
                     if let Some(conflict) = &record.conflict {
                         self.clear_resolved_conflict(conflict)?;
                     }
@@ -1281,6 +1263,179 @@ impl DirectorySync {
         let observed = self.sync.authority().observe_revision(revision).await?;
         Ok(observed.resolve(&record.path).await?)
     }
+
+    /// Apply an already-committed retry receipt to the common baseline by
+    /// operation kind: a removal drops the subtree, a rename relocates the
+    /// subtree preserving accepted fingerprints, and other edits save the
+    /// accepted version at the path.
+    async fn apply_retry_receipt(&mut self, record: &WorkRecord, revision: Revision) -> Result<()> {
+        match record.operation.as_str() {
+            "remove" => {
+                self.replica
+                    .store_mut()
+                    .remove_baseline_subtree(&record.path)?;
+            }
+            "rename" => {
+                if let Some(from) = record.original_path.clone() {
+                    self.migrate_baseline_from_work(&from, &record.path, revision)?;
+                }
+            }
+            _ => {
+                if let Some(node) = self.accepted_node_at(record, revision).await? {
+                    let accepted = accepted_local(record)?;
+                    self.replica.store_mut().save_baseline_path(
+                        &record.path,
+                        &node,
+                        accepted.as_ref(),
+                        revision,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Relocate a whole subtree recorded by a committed rename receipt without
+    /// re-reading content: the receipt proves the namespace move only.
+    fn migrate_baseline_from_work(
+        &mut self,
+        from: &str,
+        to: &str,
+        revision: Revision,
+    ) -> Result<()> {
+        let Some(baseline) = self.replica.store().load_baseline()? else {
+            return Ok(());
+        };
+        let prefix = format!("{from}/");
+        let moves: Vec<(
+            String,
+            String,
+            crate::replica::state::BaselineNode,
+            Option<LocalNode>,
+        )> = baseline
+            .remote
+            .iter()
+            .filter(|(path, _)| *path == from || path.starts_with(&prefix))
+            .map(|(path, entry)| {
+                let destination = if path == from {
+                    to.to_owned()
+                } else {
+                    format!("{to}{}", &path[from.len()..])
+                };
+                (
+                    path.clone(),
+                    destination,
+                    entry.clone(),
+                    baseline.local.get(path).cloned(),
+                )
+            })
+            .collect();
+        for (source, destination, entry, previous) in moves {
+            let accepted = accepted_local_before(&self.replica, &destination, previous.as_ref())?;
+            let length = accepted
+                .as_ref()
+                .and_then(|node| match node.kind {
+                    LocalKind::File { length, .. } => Some(length),
+                    LocalKind::Directory => None,
+                })
+                .unwrap_or(0);
+            self.replica.store_mut().save_baseline_entry(
+                &destination,
+                entry.node,
+                entry.directory,
+                entry.executable,
+                entry.digest,
+                length,
+                accepted.as_ref(),
+                revision,
+            )?;
+            self.replica.store_mut().remove_baseline_path(&source)?;
+        }
+        Ok(())
+    }
+}
+
+/// Export only the local side of a conflict without constructing an Authority.
+/// `conflict_id` is the identity reported by inspection, including a conflict
+/// synthesized from a retained install inode that gained late writer bytes.
+pub fn export_conflict_local(
+    state: &Path,
+    conflict_id: &str,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let replica = Replica::open_read_only(state)?;
+    let record = match replica
+        .store()
+        .conflicts()?
+        .into_iter()
+        .find(|record| record.id == conflict_id)
+    {
+        Some(record) => record,
+        None => {
+            let artifact = replica
+                .store()
+                .artifacts()?
+                .into_iter()
+                .find(|artifact| {
+                    artifact_conflict_identity(&artifact.id) == conflict_id
+                        && artifact.phase == "conflict"
+                })
+                .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+            ConflictRecord {
+                id: conflict_id.to_owned(),
+                path: artifact.origin.clone(),
+                original_path: Some(artifact.origin.clone()),
+                desired_path: Some(artifact.origin.clone()),
+                local: "retained_artifact".to_owned(),
+                remote: "current_file".to_owned(),
+                local_artifact: Some(artifact.id),
+                remote_node: None,
+                remote_revision: None,
+                error: artifact
+                    .error
+                    .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
+            }
+        }
+    };
+    export_local_side(&replica, &record, output)
+}
+
+fn export_local_side(
+    replica: &Replica,
+    record: &ConflictRecord,
+    output: &mut dyn Write,
+) -> Result<()> {
+    if let Some(artifact) = &record.local_artifact {
+        return Ok(replica.export_artifact(artifact, output)?);
+    }
+    let path = record
+        .desired_path
+        .as_deref()
+        .unwrap_or(record.path.as_str());
+    let mut file = replica.open_local_file(path)?;
+    std::io::copy(&mut file, output).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn accepted_local_before(
+    replica: &Replica,
+    to: &str,
+    previous: Option<&LocalNode>,
+) -> Result<Option<LocalNode>> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let fresh = replica.scan()?;
+    let Some(current) = fresh.get(to) else {
+        return Ok(None);
+    };
+    Ok(Some(LocalNode {
+        path: to.to_owned(),
+        kind: previous.kind,
+        executable: previous.executable,
+        identity: current.identity,
+        parent: current.parent,
+    }))
 }
 
 fn accepted_local(record: &WorkRecord) -> Result<Option<LocalNode>> {
@@ -1601,15 +1756,27 @@ impl<'a> Context<'a> {
         let Some(entry) = self.baseline.remote.get(from).cloned() else {
             return Ok(());
         };
-        let snapshot = self.sync.authority().observe_revision(revision).await?;
-        let Some(node) = snapshot.node(entry.node).await? else {
-            return Ok(());
-        };
         let previous = self.baseline.local.get(from).cloned();
         let accepted = self.accepted_local_at(to, previous.as_ref())?;
-        self.replica
-            .store_mut()
-            .save_baseline_path(to, &node, accepted.as_ref(), revision)?;
+        let length = accepted
+            .as_ref()
+            .and_then(|node| match node.kind {
+                LocalKind::File { length, .. } => Some(length),
+                LocalKind::Directory => None,
+            })
+            .unwrap_or(0);
+        // The rename receipt proves the namespace move, not descendant content.
+        // Keep the previously accepted remote digest and executable bit.
+        self.replica.store_mut().save_baseline_entry(
+            to,
+            entry.node,
+            entry.directory,
+            entry.executable,
+            entry.digest,
+            length,
+            accepted.as_ref(),
+            revision,
+        )?;
         self.replica.store_mut().remove_baseline_path(from)?;
         self.nodes.remove(from);
         self.nodes.insert(to.to_owned(), entry.node);
