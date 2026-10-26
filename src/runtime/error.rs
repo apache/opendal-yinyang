@@ -72,7 +72,7 @@ impl Failure {
             commit: None,
         }
     }
-    pub(super) fn capture(error: &Error) -> Self {
+    pub(crate) fn capture(error: &Error) -> Self {
         match error {
             Error::Retained(failure) | Error::Local(failure) => failure.clone(),
             _ => Self {

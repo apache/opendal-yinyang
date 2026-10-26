@@ -45,6 +45,8 @@ pub struct TestState {
     pub delay_next_head: bool,
     pub pending_head: Option<(Vec<u8>, Option<String>)>,
     pub file_to_change_on_data_close: Option<std::path::PathBuf>,
+    pub offline: bool,
+    pub fail_next_head_write_and_go_offline: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,13 @@ impl TestBackend {
 
     pub fn fail_next_head_write_after_success(&self) {
         self.state.lock().unwrap().fail_after_head_write = true;
+    }
+
+    pub fn lose_next_head_response_and_go_offline(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .fail_next_head_write_and_go_offline = true;
     }
 
     pub fn stat_calls(&self) -> u64 {
@@ -134,6 +143,9 @@ impl Service for TestService {
 
     async fn stat(&self, _: &OperationContext, path: &str, _: OpStat) -> opendal::Result<RpStat> {
         let mut state = self.state.lock().unwrap();
+        if state.offline {
+            return Err(unavailable());
+        }
         state.stat_calls += 1;
         if path == ".yinyang/head" {
             state.head_stat_calls += 1;
@@ -144,6 +156,9 @@ impl Service for TestService {
 
     fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> opendal::Result<Self::Reader> {
         let mut state = self.state.lock().unwrap();
+        if state.offline {
+            return Err(unavailable());
+        }
         state.read_paths.push(path.to_owned());
         let object = state.objects.get(path).cloned().ok_or_else(not_found)?;
         Ok(TestReader {
@@ -332,6 +347,14 @@ impl oio::Write for TestWriter {
                 "publication response was lost",
             ));
         }
+        if self.path == ".yinyang/head" && state.fail_next_head_write_and_go_offline {
+            state.fail_next_head_write_and_go_offline = false;
+            state.offline = true;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "publication response was lost and authority went offline",
+            ));
+        }
         Ok(metadata)
     }
 
@@ -359,4 +382,8 @@ fn unsupported() -> opendal::Error {
         opendal::ErrorKind::Unsupported,
         "operation is not supported by the test backend",
     )
+}
+
+fn unavailable() -> opendal::Error {
+    opendal::Error::new(opendal::ErrorKind::Unexpected, "test authority is offline")
 }
