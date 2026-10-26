@@ -96,7 +96,10 @@ cargo x test-linux-fuse --read-only
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits
   on its own, removes the mount entry, and releases the staging lease. A
-  separate SIGTERM scenario verifies the same process and lease lifecycle.
+  separate clean SIGTERM scenario verifies the same process and lease
+  lifecycle. Busy SIGTERM with an open descriptor or a pending fsync must exit
+  through the forced non-zero grace path within 10s, leave the held descriptor
+  with I/O errors, release the lease, and allow the same staging to remount.
 
 The assertions follow the core specs. They do not add POSIX guarantees that the
 transactional filesystem does not provide; for example symlinks are rejected,

@@ -718,6 +718,19 @@ impl Mounted {
         self.assert_staging_lease_released();
     }
 
+    /// SIGTERM with open descriptors or a pending fsync must exit under the
+    /// forced non-zero grace path and release the staging lease. No success
+    /// assertion is made here; the caller requires the busy exit contract.
+    pub fn terminate_busy(&mut self) -> ExitStatus {
+        let pid = self.child.id().to_string();
+        let output = run_external("kill", &["-TERM", &pid], Duration::from_secs(30));
+        output.success_or("send SIGTERM to yy mount");
+        let status = self.wait_exit(Duration::from_secs(10));
+        self.unmount_force();
+        self.assert_staging_lease_released();
+        status
+    }
+
     pub fn unmount(&mut self) {
         let mountpoint = self.mountpoint.to_str().expect("UTF-8 mountpoint");
         let output = run_external("fusermount3", &["-u", mountpoint], Duration::from_secs(30));

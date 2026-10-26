@@ -18,7 +18,7 @@
 //! Real /dev/fuse acceptance scenarios for the YinYang mount adapter.
 
 use crate::harness::{
-    Fixture, Frontend, Publication, assert_errno, run_external, sync_all_with_deadline,
+    Fixture, Frontend, Mounted, Publication, assert_errno, run_external, sync_all_with_deadline,
 };
 use nix::unistd::truncate;
 use std::fs::{self, File, OpenOptions};
@@ -36,7 +36,15 @@ const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
 const EROFS: i32 = 30;
 const EINVAL: i32 = 22;
+const ENOTCONN: i32 = 107;
+const EIO: i32 = 5;
 const ATTR_TTL_WAIT: Duration = Duration::from_millis(1500);
+
+#[derive(Clone, Copy)]
+enum Interrupt {
+    Kill,
+    Terminate,
+}
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
@@ -718,6 +726,19 @@ fn external_changes(fixture: &Fixture) {
         "pread past the old EOF must not leak bytes from the externally grown file"
     );
     drop(old);
+    let mut fresh = File::open(mounted.mountpoint().join("external.txt"))
+        .expect("reopen externally grown file on the live mount");
+    let mut fresh_bytes = Vec::new();
+    fresh
+        .read_to_end(&mut fresh_bytes)
+        .expect("read externally grown file on the live mount");
+    assert_eq!(fresh_bytes, b"BBBBBBBB");
+    assert_eq!(
+        fresh.metadata().expect("fstat fresh grow").len(),
+        8,
+        "fresh open must materialize the external grow length"
+    );
+    drop(fresh);
 
     let dirty_path = mounted.mountpoint().join("dirty.txt");
     let mut dirty = OpenOptions::new()
@@ -783,6 +804,19 @@ fn external_changes(fixture: &Fixture) {
     );
     assert_eq!(&tail, b"89");
     drop(old_shrink);
+    let mut fresh_shrink = File::open(reopen.mountpoint().join("shrink.txt"))
+        .expect("reopen externally shrunk file on the live mount");
+    let mut fresh_shrink_bytes = Vec::new();
+    fresh_shrink
+        .read_to_end(&mut fresh_shrink_bytes)
+        .expect("read externally shrunk file on the live mount");
+    assert_eq!(fresh_shrink_bytes, b"0123");
+    assert_eq!(
+        fresh_shrink.metadata().expect("fstat fresh shrink").len(),
+        4,
+        "fresh open must materialize the external shrink length"
+    );
+    drop(fresh_shrink);
     reopen.unmount();
 
     let mountpoint = fixture
@@ -973,8 +1007,30 @@ fn fuse_daemon_crash_interrupts_pending_fsync_service() {
     let config = fixture.volume_config("stage-interrupted", Frontend::Fuse, false);
     let mountpoint = fixture.temp.path().join("mnt-interrupted");
     fs::create_dir(&mountpoint).expect("create mountpoint");
-    let mut mounted = fixture.mount(&config, &mountpoint);
+    let mounted = fixture.mount(&config, &mountpoint);
+    interrupt_pending_fsync(&fixture, &library, &config, mounted, Interrupt::Kill);
+}
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_sigterm_pending_fsync_service_exits_after_grace() {
+    let fixture = Fixture::new(Publication::Service);
+    let library = fixture.volume_config("lib-sigterm-fsync", Frontend::Library, false);
+    fixture.library_seed(&library, "interrupted.txt", b"seed");
+    let config = fixture.volume_config("stage-sigterm-fsync", Frontend::Fuse, false);
+    let mountpoint = fixture.temp.path().join("mnt-sigterm-fsync");
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+    let mounted = fixture.mount(&config, &mountpoint);
+    interrupt_pending_fsync(&fixture, &library, &config, mounted, Interrupt::Terminate);
+}
+
+fn interrupt_pending_fsync(
+    fixture: &Fixture,
+    library: &Path,
+    config: &Path,
+    mut mounted: Mounted,
+    interrupt: Interrupt,
+) {
     let mut dirty = OpenOptions::new()
         .read(true)
         .write(true)
@@ -999,16 +1055,25 @@ fn fuse_daemon_crash_interrupts_pending_fsync_service() {
         .expect("read staged bytes while frozen");
     assert_eq!(frozen_bytes, b"interrupted-local");
     drop(frozen_reader);
-    mounted.kill();
+    match interrupt {
+        Interrupt::Kill => mounted.kill(),
+        Interrupt::Terminate => {
+            let status = mounted.terminate_busy();
+            assert!(
+                !status.success(),
+                "SIGTERM with a pending fsync must force a non-zero exit after grace"
+            );
+        }
+    }
     let outcome = receiver
         .recv_timeout(Duration::from_secs(20))
         .unwrap_or_else(|error| {
-            panic!("fsync did not return after the mount daemon was killed: {error}")
+            panic!("fsync did not return after the mount daemon stopped: {error}")
         });
     caller.join().expect("fsync caller panicked");
     assert!(
         outcome.is_err(),
-        "an fsync interrupted by killing the mount daemon must fail, not report remote durability"
+        "an fsync interrupted by stopping the mount daemon must fail, not report remote durability"
     );
     drop(dirty);
 
@@ -1018,7 +1083,10 @@ fn fuse_daemon_crash_interrupts_pending_fsync_service() {
         b"seed",
         "the interrupted publication must not have reached the authority"
     );
-    let mountpoint = fixture.temp.path().join("mnt-interrupted-reopen");
+    let mountpoint = fixture.temp.path().join(format!(
+        "mnt-interrupted-reopen-{}",
+        fixture.publication().as_str()
+    ));
     fs::create_dir(&mountpoint).expect("create reopen mountpoint");
     let mut reopened = fixture.mount(&config, &mountpoint);
     assert_eq!(
@@ -1098,6 +1166,58 @@ fn fuse_delayed_completion_survives_client_interruption_service() {
         "the daemon must remain available after delayed completion"
     );
     mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_sigterm_with_open_fd_exits_and_releases_lease_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library = fixture.volume_config(
+            &format!("lib-sigterm-open-{suffix}"),
+            Frontend::Library,
+            false,
+        );
+        fixture.library_seed(&library, "sigterm-open.txt", b"seed");
+        let config = fixture.volume_config(
+            &format!("stage-sigterm-open-{suffix}"),
+            Frontend::Fuse,
+            false,
+        );
+        let mountpoint = fixture
+            .temp
+            .path()
+            .join(format!("mnt-sigterm-open-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let path = mounted.mountpoint().join("sigterm-open.txt");
+        let mut held = File::open(&path).expect("hold a descriptor across SIGTERM");
+        let status = mounted.terminate_busy();
+        assert!(
+            !status.success(),
+            "SIGTERM with an open descriptor must exit through the forced non-zero path"
+        );
+        let mut after = Vec::new();
+        let error = held
+            .read_to_end(&mut after)
+            .expect_err("a held descriptor must report an I/O error after daemon exit");
+        assert_errno(error, &[ENOTCONN, EIO], "read after busy SIGTERM");
+        drop(held);
+
+        let mountpoint = fixture
+            .temp
+            .path()
+            .join(format!("mnt-sigterm-open-reopen-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create reopen mountpoint");
+        let mut reopened = fixture.mount(&config, &mountpoint);
+        assert_eq!(
+            fs::read(reopened.mountpoint().join("sigterm-open.txt"))
+                .expect("read after SIGTERM remount"),
+            b"seed"
+        );
+        reopened.unmount();
+    }
 }
 
 #[test]
