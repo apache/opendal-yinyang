@@ -668,6 +668,7 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     .await
     .expect("the interleaved run must finish within the timeout")
     .0;
+    drop(sync);
     match run_result {
         Ok(outcome) => assert!(
             !outcome.in_sync,
@@ -956,6 +957,7 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
     .0;
 
     if let Ok(outcome) = &run_result {
+        let remote_after = remote_tree(&authority).await;
         // Core invariant: in_sync may only ever claim byte-identical real
         // trees, so the namespace rename receipt cannot fold the unobserved
         // v2 into a common baseline with the local v1.
@@ -965,11 +967,11 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
             "in_sync must imply identical real trees"
         );
         assert!(
-            remote_tree(&authority).await.get("dir").is_none(),
-            "the accepted rename must move the directory out of the old name"
+            remote_after.get("dir").is_none(),
+            "the accepted rename must move the directory out of the old name: {remote_after:#?}"
         );
         assert_eq!(
-            remote_tree(&authority).await["moved/file"],
+            remote_after["moved/file"],
             TreeEntry::File {
                 executable: false,
                 bytes: b"v2-was-never-seen-locally".to_vec(),
