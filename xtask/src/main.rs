@@ -21,14 +21,28 @@ use std::process::Command as StdCommand;
 
 use clap::Parser;
 use clap::Subcommand;
+use clap::error::ErrorKind;
 
 fn main() {
-    let cmd = Command::parse();
+    let cmd = match Command::try_parse() {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            let _ = error.print();
+            std::process::exit(parse_error_exit_code(error.kind()));
+        }
+    };
     cmd.run();
 }
 
+fn parse_error_exit_code(kind: ErrorKind) -> i32 {
+    match kind {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+        _ => 2,
+    }
+}
+
 #[derive(Parser)]
-#[clap(about = "Run repository tasks.")]
+#[clap(about = "Run repository tasks.", version, propagate_version = true)]
 struct Command {
     #[clap(subcommand)]
     sub: SubCommand,
@@ -391,4 +405,17 @@ fn make_cargo_deny_cmd() -> StdCommand {
     let mut cmd = find_command("cargo");
     cmd.args(["deny", "check", "licenses"]);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_error_exit_code;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn parse_errors_are_nonzero_except_help_and_version() {
+        assert_eq!(parse_error_exit_code(ErrorKind::DisplayHelp), 0);
+        assert_eq!(parse_error_exit_code(ErrorKind::DisplayVersion), 0);
+        assert_eq!(parse_error_exit_code(ErrorKind::UnknownArgument), 2);
+    }
 }

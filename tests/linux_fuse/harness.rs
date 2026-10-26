@@ -469,6 +469,7 @@ impl Fixture {
     }
 
     fn operator(&self) -> opendal::Operator {
+        opendal::install_default();
         let config = self
             .storage_env()
             .into_iter()
