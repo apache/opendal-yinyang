@@ -50,7 +50,7 @@ pub enum LocalKind {
     File { length: u64, digest: ContentHash },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Identity {
     pub dev: u64,
     pub ino: u64,
@@ -190,9 +190,8 @@ pub struct Replica {
     root_identity: Identity,
     state_identity: Identity,
     root_fd: OwnedFd,
-    state_fd: OwnedFd,
     quarantine_fd: OwnedFd,
-    _lease: std::fs::File,
+    _lease: Option<std::fs::File>,
     store: Store,
 }
 
@@ -271,9 +270,8 @@ impl Replica {
             root_identity,
             state_identity,
             root_fd,
-            state_fd,
             quarantine_fd,
-            _lease: lease,
+            _lease: Some(lease),
             store,
         };
         replica.recover_incomplete()?;
@@ -331,9 +329,8 @@ impl Replica {
             root_identity,
             state_identity,
             root_fd,
-            state_fd,
             quarantine_fd,
-            _lease: lease,
+            _lease: Some(lease),
             store,
         };
         replica.recover_incomplete()?;
@@ -358,18 +355,6 @@ impl Replica {
 
     pub(super) fn store_mut(&mut self) -> &mut Store {
         &mut self.store
-    }
-
-    pub(super) fn state_fd(&self) -> &OwnedFd {
-        &self.state_fd
-    }
-
-    pub(super) fn quarantine_fd(&self) -> &OwnedFd {
-        &self.quarantine_fd
-    }
-
-    pub(super) fn root_identity(&self) -> Identity {
-        self.root_identity
     }
 
     pub fn status(&mut self) -> Result<ReplicaStatus> {
@@ -398,6 +383,16 @@ impl Replica {
     /// Read-only bound status. No exclusive lease, no recovery and no writes,
     /// so progress remains inspectable while another process runs.
     pub fn inspect(state: &Path) -> Result<ReplicaStatus> {
+        Self::open_read_only(state)?.inspect_status_readonly()
+    }
+
+    /// Read-only local scan without acquiring the writer lease or performing
+    /// recovery, so a bound root stays inspectable while a writer runs.
+    pub fn scan_read_only(state: &Path) -> Result<LocalSnapshot> {
+        Self::open_read_only(state)?.scan()
+    }
+
+    fn open_read_only(state: &Path) -> Result<Self> {
         let state =
             std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;
         let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
@@ -408,6 +403,17 @@ impl Replica {
         if binding.state_dev != state_identity.dev || binding.state_ino != state_identity.ino {
             return Err(Error::invalid("sync state identity changed"));
         }
+        let root = PathBuf::from(&binding.root);
+        let (root_fd, root_identity) = open_bound_directory(&root, "open bound local root")
+            .map_err(|error| Error::invalid(format!("bound local root is unavailable: {error}")))?;
+        if root_identity.dev != binding.root_dev || root_identity.ino != binding.root_ino {
+            return Err(Error::invalid("bound local root identity changed"));
+        }
+        if root_identity.dev != state_identity.dev {
+            return Err(Error::invalid(
+                "bound local root and sync state no longer share a filesystem",
+            ));
+        }
         let quarantine_fd = openat(
             &state_fd,
             "quarantine",
@@ -415,31 +421,38 @@ impl Replica {
             Mode::empty(),
         )
         .map_err(|e| Error::errno("open retained artifact directory", &state, e))?;
-        let mut artifacts: Vec<Artifact> =
-            store.artifacts()?.into_iter().map(Artifact::from).collect();
-        for mut artifact in artifacts.iter_mut() {
-            let record = store
-                .artifacts()?
-                .into_iter()
-                .find(|record| record.name == artifact.name)
-                .ok_or_else(|| Error::corrupt("artifact record vanished during inspection"))?;
-            let install = store
-                .installs()?
-                .into_iter()
+        Ok(Self {
+            root,
+            state,
+            filesystem: binding.filesystem,
+            root_identity,
+            state_identity,
+            root_fd,
+            quarantine_fd,
+            _lease: None,
+            store,
+        })
+    }
+
+    fn inspect_status_readonly(&self) -> Result<ReplicaStatus> {
+        let records = self.store.artifacts()?;
+        let installs = self.store.installs()?;
+        let mut artifacts: Vec<Artifact> = records.iter().cloned().map(Artifact::from).collect();
+        for (artifact, record) in artifacts.iter_mut().zip(records) {
+            let install = installs
+                .iter()
                 .find(|install| install.artifact == record.name);
             if let Some(install) = install
                 && (install.phase == InstallPhase::Retained
                     || install.phase == InstallPhase::Conflict)
             {
-                let matches = match hash_artifact_matches(
-                    &quarantine_fd,
+                let matches = hash_artifact_matches(
+                    &self.quarantine_fd,
                     &record.name,
                     &install.expected_digest,
                     install.expected_length,
-                ) {
-                    Ok(matches) => matches,
-                    Err(_) => false,
-                };
+                )
+                .unwrap_or_default();
                 if !matches {
                     artifact.phase = "conflict".to_owned();
                     artifact.error = Some(
@@ -449,12 +462,16 @@ impl Replica {
                 }
             }
         }
-        let conflicts = store.conflicts()?.into_iter().map(Conflict::from).collect();
-        let root = PathBuf::from(&binding.root);
+        let conflicts = self
+            .store
+            .conflicts()?
+            .into_iter()
+            .map(Conflict::from)
+            .collect();
         Ok(ReplicaStatus {
-            root,
-            filesystem: binding.filesystem,
-            pending_installs: store.incomplete_installs()?.len(),
+            root: self.root.clone(),
+            filesystem: self.filesystem,
+            pending_installs: self.store.incomplete_installs()?.len(),
             artifacts,
             conflicts,
         })
@@ -545,7 +562,7 @@ impl Replica {
             ));
         }
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(&parent_fd, &self.root, "inspect upload parent")?;
         if let Some(expected_parent) = expected.parent
             && parent_identity != expected_parent
@@ -577,7 +594,7 @@ impl Replica {
             let source = openat(
                 &parent_fd,
                 name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|e| Error::errno("open upload source", &self.root.join(path), e))?;
@@ -679,6 +696,85 @@ impl Replica {
         Ok(std::fs::File::from(fd))
     }
 
+    /// Open one live local file without following symlinks and without blocking
+    /// on a FIFO: used to export the current local side of a conflict.
+    pub fn open_local_file(&self, path: &str) -> Result<std::fs::File> {
+        validate_path(path)?;
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        let fd = openat(
+            &parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::errno("open local file", &self.root.join(path), e))?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    /// Retain an arbitrary byte stream as an immutable artifact so an explicit
+    /// conflict resolution input survives a crash, export and a later path
+    /// change.
+    pub fn retain_bytes(&mut self, origin: &str, bytes: &[u8]) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = format!("resolve-{id}");
+        let mut record = ArtifactRecord {
+            id: id.clone(),
+            origin: origin.to_owned(),
+            name: name.clone(),
+            kind: "upload-retained".to_owned(),
+            reason: "explicit conflict resolution input retained for publication and export"
+                .to_owned(),
+            remote_revision: None,
+            phase: "preparing".to_owned(),
+            error: None,
+        };
+        self.store.insert_artifact(&record)?;
+        let fd = openat(
+            &self.quarantine_fd,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| Error::errno("create retained resolution input", &self.state, e))?;
+        let written = (|| -> Result<()> {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(bytes).map_err(|e| {
+                Error::io(
+                    "write retained resolution input",
+                    &self.state.join(&name),
+                    e,
+                )
+            })?;
+            file.sync_all().map_err(|e| {
+                Error::io(
+                    "persist retained resolution input",
+                    &self.state.join(&name),
+                    e,
+                )
+            })?;
+            fsync(&self.quarantine_fd).map_err(|e| {
+                Error::errno("persist retained resolution directory", &self.state, e)
+            })?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                record.phase = "retained".to_owned();
+                self.store
+                    .update_artifact(&record.id, &record.phase, None)?;
+                Ok(id)
+            }
+            Err(error) => {
+                record.phase = "failed".to_owned();
+                record.error = Some(error.to_string());
+                self.store
+                    .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
+                Err(error)
+            }
+        }
+    }
+
     /// Create one local directory with a no-replace mkdirat; the entry only
     /// becomes visible after a successful directory entry creation.
     pub(super) fn create_directory_local(&self, path: &str) -> Result<()> {
@@ -687,7 +783,7 @@ impl Replica {
             return Err(Error::invalid("the synchronized root already exists"));
         }
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         match mkdirat(&parent_fd, name, Mode::RWXU) {
             Ok(()) => {}
             Err(rustix::io::Errno::EXIST) => {
@@ -704,7 +800,7 @@ impl Replica {
             }
         }
         fsync(&parent_fd)
-            .map_err(|e| Error::errno("persist local directory", &self.root.join(&parent), e))
+            .map_err(|e| Error::errno("persist local directory", &self.root.join(parent), e))
     }
 
     /// Atomically install a complete file at an absent name. The file becomes
@@ -720,8 +816,8 @@ impl Replica {
         let (parent, name) = split_path(path)?;
         let name_check = yinyang_core::namespace::name_key(name)
             .map_err(|e| Error::invalid(format!("invalid local name {name:?}: {e}")))?;
-        let parent_fd = self.open_relative_dir(&parent)?;
-        if let Some(stat) = optional_stat(&parent_fd, name, &self.root.join(path))? {
+        let parent_fd = self.open_relative_dir(parent)?;
+        if optional_stat(&parent_fd, name, &self.root.join(path))?.is_some() {
             return Err(Error::conflict(format!(
                 "{} already exists before remote creation could install",
                 path
@@ -775,7 +871,7 @@ impl Replica {
             ));
         }
         fsync(&parent_fd).map_err(|e| {
-            Error::errno("persist remote file creation", &self.root.join(&parent), e)
+            Error::errno("persist remote file creation", &self.root.join(parent), e)
         })?;
         fsync(&self.quarantine_fd)
             .map_err(|e| Error::errno("persist staged file removal", &self.state, e))?;
@@ -790,8 +886,8 @@ impl Replica {
         validate_path(destination)?;
         let (source_parent, source_name) = split_path(source)?;
         let (destination_parent, destination_name) = split_path(destination)?;
-        let source_fd = self.open_relative_dir(&source_parent)?;
-        let destination_fd = self.open_relative_dir(&destination_parent)?;
+        let source_fd = self.open_relative_dir(source_parent)?;
+        let destination_fd = self.open_relative_dir(destination_parent)?;
         renameat_with(
             &source_fd,
             source_name,
@@ -806,13 +902,12 @@ impl Replica {
                 e,
             )
         })?;
-        fsync(&source_fd).map_err(|e| {
-            Error::errno("persist local rename", &self.root.join(&source_parent), e)
-        })?;
+        fsync(&source_fd)
+            .map_err(|e| Error::errno("persist local rename", &self.root.join(source_parent), e))?;
         fsync(&destination_fd).map_err(|e| {
             Error::errno(
                 "persist local rename destination",
-                &self.root.join(&destination_parent),
+                &self.root.join(destination_parent),
                 e,
             )
         })
@@ -834,7 +929,7 @@ impl Replica {
             ));
         }
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(&parent_fd, &self.root, "inspect install parent")?;
         if let Some(expected_parent) = expected.parent
             && parent_identity != expected_parent
@@ -857,7 +952,7 @@ impl Replica {
         let mut record = InstallRecord {
             id,
             path: path.to_owned(),
-            parent,
+            parent: parent.to_owned(),
             name: name.to_owned(),
             temporary: temporary.clone(),
             temporary_dev: None,
@@ -929,7 +1024,7 @@ impl Replica {
             .get(path)
             .ok_or_else(|| Error::invalid("quarantine target is absent from the observation"))?;
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(&parent_fd, &self.root, "inspect quarantine parent")?;
         if let Some(expected_parent) = expected_node.parent
             && parent_identity != expected_parent
@@ -1012,7 +1107,7 @@ impl Replica {
         Ok(record.into())
     }
 
-    pub fn export_artifact(&self, id: &str, output: &mut impl Write) -> Result<()> {
+    pub fn export_artifact(&self, id: &str, output: &mut (impl Write + ?Sized)) -> Result<()> {
         let artifact = self
             .store
             .artifacts()?
@@ -1551,7 +1646,7 @@ impl PreparedInstall<'_> {
     where
         F: FnOnce(&Self),
     {
-        let mut file = self.file.take().expect("prepared install is live");
+        let file = self.file.take().expect("prepared install is live");
         file.sync_all().map_err(|e| {
             Error::io(
                 "persist replacement file",
@@ -1660,10 +1755,7 @@ impl PreparedInstall<'_> {
             )?;
             return Err(error);
         }
-        let displaced_matches = match self.displaced_matches_expected() {
-            Ok(matches) => matches,
-            Err(_) => false,
-        };
+        let displaced_matches = self.displaced_matches_expected().unwrap_or_default();
         if !displaced_matches {
             return self.recover_concurrent_change();
         }
@@ -2102,7 +2194,7 @@ fn hash_file_at(
     let fd = openat(
         parent,
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| Error::errno("open local file", path, e))?;
@@ -2238,7 +2330,7 @@ mod tests {
         let mut replica = Replica::init(&state, &root, NodeId::from_bytes([9; 16])).unwrap();
         let snapshot = replica.scan().unwrap();
         let expected = snapshot.get("file").unwrap();
-        let mut local_writer = std::fs::OpenOptions::new()
+        let local_writer = std::fs::OpenOptions::new()
             .write(true)
             .open(root.join("file"))
             .unwrap();
@@ -2251,7 +2343,7 @@ mod tests {
         let target = root.join("file");
         let error = install
             .finish_with_hook(|_| {
-                let mut replacement_writer = std::fs::OpenOptions::new()
+                let replacement_writer = std::fs::OpenOptions::new()
                     .write(true)
                     .open(&target)
                     .unwrap();

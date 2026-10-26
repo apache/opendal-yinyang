@@ -19,7 +19,6 @@
 
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use std::fs;
-use std::io::Write as _;
 use std::os::unix::fs::FileExt as _;
 use yinyang::core::NodeId;
 use yinyang::replica::{ErrorKind, Replica};
@@ -65,6 +64,16 @@ fn state_lease_rejects_concurrent_processes_in_one_process_test() {
 }
 
 #[test]
+fn read_only_inspection_rejects_a_replaced_root() {
+    let (temp, root, replica) = setup();
+    let state = replica.state().to_owned();
+    drop(replica);
+    fs::rename(&root, temp.path().join("moved-root")).unwrap();
+    let error = Replica::inspect(&state).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+}
+
+#[test]
 fn scan_hashes_content_and_rejects_symlinks() {
     let (_temp, root, replica) = setup();
     fs::create_dir(root.join("directory")).unwrap();
@@ -99,7 +108,7 @@ fn exchange_retains_old_inode_for_open_writer() {
     fs::write(root.join("file"), b"old").unwrap();
     let snapshot = replica.scan().unwrap();
     let expected = snapshot.get("file").unwrap();
-    let mut writer = fs::OpenOptions::new()
+    let writer = fs::OpenOptions::new()
         .write(true)
         .open(root.join("file"))
         .unwrap();
@@ -140,7 +149,7 @@ fn concurrent_in_place_edit_is_restored_atomically() {
         .prepare_install("file", expected, false, None)
         .unwrap();
     install.write_all(b"remote").unwrap();
-    let mut writer = fs::OpenOptions::new()
+    let writer = fs::OpenOptions::new()
         .write(true)
         .open(root.join("file"))
         .unwrap();
