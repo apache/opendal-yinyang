@@ -940,16 +940,28 @@ impl DirectorySync {
                     // Apply baseline and clear the linked conflict before
                     // marking the work complete. Publication is idempotent, so
                     // a crash here is recovered by re-running this retry.
-                    self.apply_retry_receipt(&record, revision).await?;
-                    if let Some(conflict) = &record.conflict {
-                        self.clear_resolved_conflict(conflict)?;
+                    let applied = self.apply_retry_receipt(&record, revision).await?;
+                    if applied {
+                        if let Some(conflict) = &record.conflict {
+                            self.clear_resolved_conflict(conflict)?;
+                        }
+                        self.replica.store_mut().update_work(
+                            &record.id,
+                            "committed",
+                            Some(revision),
+                            None,
+                        )?;
+                    } else {
+                        // The remote receipt committed but the live local
+                        // version moved on. Keep the association unresolved so
+                        // the next run retries the idempotent decision.
+                        self.replica.store_mut().update_work(
+                            &record.id,
+                            "prepared",
+                            Some(revision),
+                            None,
+                        )?;
                     }
-                    self.replica.store_mut().update_work(
-                        &record.id,
-                        "committed",
-                        Some(revision),
-                        None,
-                    )?;
                 }
                 Err(error) if error.kind() == crate::runtime::ErrorKind::Unknown => {
                     outcome.unknown += 1;
@@ -995,7 +1007,11 @@ impl DirectorySync {
     /// operation kind: a removal drops the subtree, a rename relocates the
     /// subtree preserving accepted fingerprints, and other edits save the
     /// accepted version at the path.
-    async fn apply_retry_receipt(&mut self, record: &WorkRecord, revision: Revision) -> Result<()> {
+    async fn apply_retry_receipt(
+        &mut self,
+        record: &WorkRecord,
+        revision: Revision,
+    ) -> Result<bool> {
         match record.operation.as_str() {
             "remove" => {
                 self.replica
@@ -1005,6 +1021,49 @@ impl DirectorySync {
             "rename" => {
                 if let Some(from) = record.original_path.clone() {
                     self.migrate_baseline_from_work(&from, &record.path, revision)?;
+                }
+            }
+            "content" if record.source_artifact.is_some() => {
+                // A resolution receipt publishes selected bytes that are not
+                // necessarily the live local content. Install them only when the
+                // live file is still the version this decision was dispatched
+                // against, then confirm the baseline from the verified result.
+                let Some(artifact) = &record.source_artifact else {
+                    return Ok(false);
+                };
+                let mut file = self.replica.open_artifact(artifact)?;
+                let mut bytes = Vec::new();
+                std::io::copy(&mut file, &mut bytes).map_err(|e| e.to_string())?;
+                let expected = accepted_local(record)?;
+                self.install_chosen_bytes(
+                    &record.path,
+                    &bytes,
+                    record.local_executable.unwrap_or(false),
+                    expected.as_ref(),
+                )?;
+                let digest = ContentHash::from_bytes(*blake3::hash(&bytes).as_bytes());
+                let installed = self
+                    .replica
+                    .scan()?
+                    .get(&record.path)
+                    .cloned()
+                    .filter(|node| {
+                        matches!(node.kind, LocalKind::File { length, digest: live }
+                        if length == bytes.len() as u64 && live == digest)
+                    });
+                if let (Some(node), Some(installed)) =
+                    (self.accepted_node_at(record, revision).await?, installed)
+                {
+                    self.replica.store_mut().save_baseline_path(
+                        &record.path,
+                        &node,
+                        Some(&installed),
+                        revision,
+                    )?;
+                } else {
+                    // A newer local write or deletion stays live and pending;
+                    // keep the conflict active and retry later.
+                    return Ok(false);
                 }
             }
             _ => {
@@ -1019,7 +1078,7 @@ impl DirectorySync {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Relocate a whole subtree recorded by a committed rename receipt without

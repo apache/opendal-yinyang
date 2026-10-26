@@ -110,15 +110,16 @@ async fn remote_tree(authority: &Arc<dyn Authority>) -> BTreeMap<String, TreeEnt
 }
 
 /// A short-lived public Sync journal used for an independent remote edit.
-async fn remote_client(authority: &Arc<dyn Authority>) -> Sync {
+async fn remote_client(authority: &Arc<dyn Authority>) -> (Sync, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
-    Sync::open(authority.clone(), temp.path().join("seed"))
+    let sync = Sync::open(authority.clone(), temp.path().join("seed"))
         .await
-        .unwrap()
+        .unwrap();
+    (sync, temp)
 }
 
 async fn remote_write(authority: &Arc<dyn Authority>, path: &str, bytes: &[u8]) {
-    let sync = remote_client(authority).await;
+    let (sync, _temp) = remote_client(authority).await;
     let baseline = authority.observe_latest().await.unwrap();
     let node = baseline.resolve(path).await.unwrap().unwrap().id();
     let edit = sync
@@ -129,7 +130,7 @@ async fn remote_write(authority: &Arc<dyn Authority>, path: &str, bytes: &[u8]) 
 }
 
 async fn remote_create_file(authority: &Arc<dyn Authority>, path: &str, bytes: &[u8]) {
-    let sync = remote_client(authority).await;
+    let (sync, _temp) = remote_client(authority).await;
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
     let baseline = authority.observe_latest().await.unwrap();
     let parent_node = baseline.resolve(parent).await.unwrap().unwrap().id();
@@ -147,7 +148,7 @@ async fn remote_create_file(authority: &Arc<dyn Authority>, path: &str, bytes: &
 }
 
 async fn remote_remove(authority: &Arc<dyn Authority>, path: &str) {
-    let sync = remote_client(authority).await;
+    let (sync, _temp) = remote_client(authority).await;
     let baseline = authority.observe_latest().await.unwrap();
     let node = baseline.resolve(path).await.unwrap().unwrap().id();
     let edit = sync.stage_remove(node, baseline.revision()).await.unwrap();
@@ -155,7 +156,7 @@ async fn remote_remove(authority: &Arc<dyn Authority>, path: &str) {
 }
 
 async fn remote_create_directory(authority: &Arc<dyn Authority>, path: &str) {
-    let sync = remote_client(authority).await;
+    let (sync, _temp) = remote_client(authority).await;
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
     let baseline = authority.observe_latest().await.unwrap();
     let parent_node = baseline.resolve(parent).await.unwrap().unwrap().id();

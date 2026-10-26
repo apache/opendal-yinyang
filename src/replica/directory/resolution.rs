@@ -164,7 +164,7 @@ impl DirectorySync {
     /// version this decision was dispatched against. A newer local write stays
     /// live and pending; it is never overwritten by the chosen version.
     /// Returns the local fingerprint the baseline may accept for this path.
-    fn install_chosen_bytes(
+    pub(super) fn install_chosen_bytes(
         &mut self,
         path: &str,
         bytes: &[u8],
