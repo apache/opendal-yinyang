@@ -23,14 +23,16 @@
 
 #![allow(dead_code)]
 
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read};
-use std::net::SocketAddr;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
@@ -89,6 +91,54 @@ impl Captured {
     }
 }
 
+pub struct RunningSync {
+    child: Child,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl RunningSync {
+    pub fn wait(mut self, timeout: Duration) -> Captured {
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("yy sync run did not exit within {timeout:?}");
+                }
+                Err(error) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("wait for yy sync run: {error}");
+                }
+            }
+        };
+        Captured {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap_or_default(),
+            stderr: self.stderr.take().unwrap().join().unwrap_or_default(),
+        }
+    }
+}
+
+impl Drop for RunningSync {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub fn require_acceptance() {
     for name in STORAGE_VARIABLES {
         if std::env::var_os(name).is_none() {
@@ -104,6 +154,7 @@ pub struct Fixture {
     token: String,
     service: Option<ServiceProcess>,
     last_service_address: Option<SocketAddr>,
+    service_database: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +162,337 @@ pub struct SyncPaths {
     pub config: PathBuf,
     pub directory: PathBuf,
     pub state: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct SyncStatus {
+    pub schema: String,
+    pub binding: BindingStatus,
+    pub remote: RemoteStatus,
+    pub local: LocalStatus,
+    pub summary: StatusSummary,
+    pub entries: Vec<SyncEntry>,
+    pub conflicts: Vec<ConflictRecord>,
+    pub artifacts: Vec<ArtifactRecord>,
+}
+
+impl SyncStatus {
+    pub fn validate(&self) {
+        assert_eq!(self.schema, "yinyang.sync.status.v1");
+        assert!(
+            self.entries
+                .windows(2)
+                .all(|pair| pair[0].path < pair[1].path),
+            "sync status entries must be strictly sorted by path"
+        );
+        assert_eq!(
+            self.summary.conflicts,
+            self.conflicts.len(),
+            "summary.conflicts must equal the top-level conflict count"
+        );
+        assert_eq!(
+            self.summary.retained_artifacts,
+            self.artifacts.len() as u64,
+            "summary.retained_artifacts must equal the top-level artifact count"
+        );
+        if self.summary.in_sync {
+            assert_eq!(
+                self.remote.availability,
+                RemoteAvailability::Available,
+                "in_sync requires an observed remote"
+            );
+            assert_eq!(self.summary.pending, 0);
+            assert_eq!(self.summary.unknown, 0);
+            assert_eq!(self.summary.conflicts, 0);
+            assert_eq!(self.summary.failed, 0);
+        }
+        for conflict in &self.conflicts {
+            assert_eq!(conflict.id.len(), 32, "conflict id must be 16-byte hex");
+            if let Some(revision) = &conflict.remote_revision {
+                assert_eq!(
+                    revision.len(),
+                    48,
+                    "conflict remote revision must be 24-byte hex"
+                );
+            }
+            let entry = self
+                .entries
+                .iter()
+                .find(|entry| entry.path == conflict.path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "conflict {} path {} has no matching entry",
+                        conflict.id, conflict.path
+                    )
+                });
+            assert_eq!(
+                entry.state,
+                EntryState::Conflict,
+                "conflict path {} must have entry state conflict",
+                conflict.path
+            );
+            let nested = entry
+                .conflict
+                .as_ref()
+                .unwrap_or_else(|| panic!("conflict path {} has no entry conflict", conflict.path));
+            assert_eq!(nested.id, conflict.id);
+            if let Some(original) = &conflict.original_path {
+                assert_eq!(conflict.path, *original);
+            }
+        }
+    }
+
+    pub fn conflict(&self, path: &str) -> &ConflictRecord {
+        self.conflicts
+            .iter()
+            .find(|conflict| conflict.path == path)
+            .unwrap_or_else(|| panic!("sync status has no conflict for {path}: {self:#?}"))
+    }
+
+    pub fn entry(&self, path: &str) -> &SyncEntry {
+        self.entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("sync status has no entry for {path}: {self:#?}"))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct BindingStatus {
+    pub state: BindingState,
+    pub state_directory: String,
+    pub root: Option<String>,
+    pub filesystem: Option<String>,
+    pub same_filesystem: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingState {
+    Unbound,
+    Bound,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RemoteStatus {
+    pub availability: RemoteAvailability,
+    pub revision: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAvailability {
+    NotChecked,
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct LocalStatus {
+    pub scan: LocalScanState,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalScanState {
+    NotScanned,
+    Clean,
+    Changed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct StatusSummary {
+    pub in_sync: bool,
+    pub pending: u64,
+    pub unknown: u64,
+    pub conflicts: usize,
+    pub failed: u64,
+    pub retained_artifacts: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct SyncEntry {
+    pub path: String,
+    pub original_path: Option<String>,
+    pub desired_path: Option<String>,
+    pub state: EntryState,
+    pub local: LocalEvidence,
+    pub remote: RemoteEvidence,
+    pub baseline: BaselineEvidence,
+    pub intent: IntentStatus,
+    pub outcome: OutcomeStatus,
+    pub conflict: Option<EntryConflict>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryState {
+    InSync,
+    LocalPending,
+    RemotePending,
+    Conflict,
+    Unknown,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct LocalEvidence {
+    pub kind: Option<EntryKind>,
+    pub length: Option<u64>,
+    pub digest: Option<String>,
+    pub executable: Option<bool>,
+    pub presence: Presence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct RemoteEvidence {
+    pub kind: Option<EntryKind>,
+    pub length: Option<u64>,
+    pub digest: Option<String>,
+    pub executable: Option<bool>,
+    pub presence: Presence,
+    pub node: Option<String>,
+    pub revision: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Presence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct BaselineEvidence {
+    pub node: Option<String>,
+    pub revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct IntentStatus {
+    pub id: Option<String>,
+    pub operation: Option<IntentOperation>,
+    pub state: Option<IntentState>,
+    pub commit_id: Option<String>,
+    pub receipt_revision: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentOperation {
+    Content,
+    CreateFile,
+    CreateDirectory,
+    Remove,
+    Rename,
+    SetExecutable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentState {
+    Prepared,
+    Unknown,
+    Committed,
+    Conflict,
+    Retryable,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct OutcomeStatus {
+    pub state: OutcomeState,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeState {
+    Pending,
+    RemoteCompleted,
+    Conflict,
+    Unknown,
+    Retryable,
+    Failed,
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct EntryConflict {
+    pub id: String,
+    pub local: ConflictSide,
+    pub remote: ConflictSide,
+    pub local_artifact: Option<String>,
+    pub remote_artifact: Option<String>,
+    pub remote_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ConflictRecord {
+    pub id: String,
+    pub path: String,
+    pub original_path: Option<String>,
+    pub desired_path: Option<String>,
+    pub local: ConflictSide,
+    pub remote: ConflictSide,
+    pub local_artifact: Option<String>,
+    pub remote_artifact: Option<String>,
+    pub remote_revision: Option<String>,
+    pub error: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictSide {
+    CurrentFile,
+    CurrentDirectory,
+    RetainedArtifact,
+    Deleted,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ArtifactRecord {
+    pub id: String,
+    pub origin: String,
+    pub kind: ArtifactKind,
+    pub phase: ArtifactPhase,
+    pub path: String,
+    pub exportable: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    ReplacedFile,
+    RollbackDisplaced,
+    QuarantinedFile,
+    QuarantinedDirectory,
+    UploadRetained,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPhase {
+    Preparing,
+    Prepared,
+    Moved,
+    Retained,
+    Conflict,
+    Failed,
 }
 
 impl Fixture {
@@ -129,6 +511,7 @@ impl Fixture {
             token: "managed-sync-acceptance-token-000000000000".to_owned(),
             service: None,
             last_service_address: None,
+            service_database: None,
         };
         match publication {
             Publication::Object => {
@@ -170,6 +553,14 @@ impl Fixture {
         run_timeout(self.yy_command(args), Duration::from_secs(180))
     }
 
+    pub fn yy_with_env(&self, args: &[&str], overrides: &[(&str, &str)]) -> Captured {
+        let mut command = self.yy_command(args);
+        for (name, value) in overrides {
+            command.env(name, value);
+        }
+        run_timeout(command, Duration::from_secs(180))
+    }
+
     pub fn yy_ok(&self, args: &[&str]) -> Captured {
         let output = self.yy(args);
         output.success_or(&format!("yy {args:?}"));
@@ -177,6 +568,10 @@ impl Fixture {
     }
 
     pub fn sync_paths(&self, name: &str) -> SyncPaths {
+        self.sync_paths_at(name, None)
+    }
+
+    pub fn sync_paths_at(&self, name: &str, service_address: Option<SocketAddr>) -> SyncPaths {
         let directory = self.path(format!("{name}-root"));
         let state = self.path(format!("{name}-state"));
         let config = self.path(format!("{name}.json"));
@@ -192,8 +587,11 @@ impl Fixture {
             "require": [],
         });
         if self.publication == Publication::Service {
-            value["service_address"] =
-                serde_json::Value::String(self.service_address().to_string());
+            value["service_address"] = serde_json::Value::String(
+                service_address
+                    .unwrap_or_else(|| self.service_address())
+                    .to_string(),
+            );
         }
         fs::write(
             &config,
@@ -231,35 +629,101 @@ impl Fixture {
         self.yy(&["--volume", text(&paths.config), "sync", "run"])
     }
 
+    pub fn sync_run_with_env(&self, paths: &SyncPaths, overrides: &[(&str, &str)]) -> Captured {
+        self.yy_with_env(&["--volume", text(&paths.config), "sync", "run"], overrides)
+    }
+
+    pub fn spawn_sync_run(&self, paths: &SyncPaths) -> RunningSync {
+        let mut command = self.yy_command(&["--volume", text(&paths.config), "sync", "run"]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn yy sync run: {error}"));
+        let stdout = child.stdout.take().expect("sync stdout is piped");
+        let stderr = child.stderr.take().expect("sync stderr is piped");
+        RunningSync {
+            child,
+            stdout: Some(thread::spawn(move || read_all(stdout))),
+            stderr: Some(thread::spawn(move || read_all(stderr))),
+        }
+    }
+
     pub fn sync_run_ok(&self, paths: &SyncPaths) -> Captured {
         let output = self.sync_run(paths);
         output.success_or(&format!("yy sync run for {}", paths.directory.display()));
         output
     }
 
-    pub fn sync_status(&self, paths: &SyncPaths) -> serde_json::Value {
+    pub fn sync_status(&self, paths: &SyncPaths) -> SyncStatus {
         let output = self.yy_ok(&["--volume", text(&paths.config), "sync", "status", "--json"]);
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-            panic!(
-                "parse sync status JSON for {}: {error}\nstdout:\n{}",
-                paths.directory.display(),
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })
+        parse_status(paths, &output.stdout)
     }
 
-    pub fn sync_export(&self, paths: &SyncPaths, conflict: &str, side: &str, output: &Path) {
+    pub fn sync_status_any_exit(&self, paths: &SyncPaths) -> (i32, SyncStatus) {
+        let output = self.yy(&["--volume", text(&paths.config), "sync", "status", "--json"]);
+        let status = parse_status(paths, &output.stdout);
+        (
+            output
+                .status
+                .code()
+                .expect("sync status terminated by signal"),
+            status,
+        )
+    }
+
+    pub fn sync_export_conflict(
+        &self,
+        paths: &SyncPaths,
+        conflict: &str,
+        side: &str,
+        output: &Path,
+    ) {
         self.yy_ok(&[
             "--volume",
             text(&paths.config),
             "sync",
             "export",
+            "--conflict",
             conflict,
             "--side",
             side,
             "--output",
             text(output),
         ]);
+    }
+
+    pub fn sync_export_artifact(&self, paths: &SyncPaths, artifact: &str, output: &Path) {
+        self.yy_ok(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "export",
+            "--artifact",
+            artifact,
+            "--output",
+            text(output),
+        ]);
+    }
+
+    pub fn sync_export_artifact_output(
+        &self,
+        paths: &SyncPaths,
+        artifact: &str,
+        output: &Path,
+    ) -> Captured {
+        self.yy(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "export",
+            "--artifact",
+            artifact,
+            "--output",
+            text(output),
+        ])
     }
 
     pub fn sync_resolve_keep(&self, paths: &SyncPaths, conflict: &str, side: &str) {
@@ -290,7 +754,13 @@ impl Fixture {
         let address = self
             .last_service_address
             .unwrap_or_else(|| "127.0.0.1:0".parse().expect("loopback wildcard"));
-        let database = self.path(format!("metadata-{}.db", uuid::Uuid::new_v4().simple()));
+        if self.service_database.is_none() {
+            self.service_database = Some(self.path("metadata.db"));
+        }
+        let database = self
+            .service_database
+            .clone()
+            .expect("service database path initialized");
         let mut command = self.yy_command(&[
             "serve",
             "--database",
@@ -386,6 +856,19 @@ impl Fixture {
             .expect("service publication needs a loopback metadata address")
     }
 
+    pub fn service_gate(&self, drop_commit_response: bool) -> ServiceGate {
+        assert_eq!(
+            self.publication,
+            Publication::Service,
+            "service races require service publication"
+        );
+        ServiceGate::new(
+            self.service_address(),
+            self.token.clone(),
+            drop_commit_response,
+        )
+    }
+
     pub fn remote_tree(&self) -> CoreResult<Tree> {
         let authority = self.remote_authority();
         runtime().block_on(async {
@@ -394,13 +877,32 @@ impl Fixture {
         })
     }
 
+    pub fn remote_file_version(
+        &self,
+        path: &str,
+    ) -> (yinyang::core::NodeId, u64, yinyang::core::Revision) {
+        let authority = self.remote_authority();
+        runtime()
+            .block_on(async {
+                let snapshot = authority.observe_latest().await?;
+                let node = snapshot
+                    .resolve(path)
+                    .await?
+                    .ok_or_else(|| invalid(format!("remote file {path} is missing")))?;
+                if !matches!(node.kind(), NodeKind::File(_)) {
+                    return Err(invalid(format!("remote path {path} is not a file")));
+                }
+                Ok((node.id(), node.generation(), snapshot.revision()))
+            })
+            .unwrap_or_else(|error| panic!("observe remote version {path}: {error}"))
+    }
+
     pub fn wait_remote_tree(&self, expected: &Tree, timeout: Duration) -> Tree {
         let deadline = Instant::now() + timeout;
         loop {
             match self.remote_tree() {
                 Ok(actual) if &actual == expected => return actual,
-                Ok(actual) if Instant::now() < deadline => {
-                    let _ = actual;
+                Ok(_) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(100));
                 }
                 Ok(actual) => {
@@ -408,8 +910,7 @@ impl Fixture {
                         "remote state did not converge within {timeout:?}\nexpected:\n{expected:#?}\nactual:\n{actual:#?}"
                     );
                 }
-                Err(error) if Instant::now() < deadline => {
-                    let _ = error;
+                Err(_) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(100));
                 }
                 Err(error) => panic!("observe remote state within {timeout:?}: {error}"),
@@ -498,6 +999,46 @@ impl Fixture {
             .unwrap_or_else(|error| panic!("remove remote path {path}: {error}"))
     }
 
+    pub fn remote_remove_tree(&self, path: &str) -> Receipt {
+        let authority = self.remote_authority();
+        runtime()
+            .block_on(async {
+                let snapshot = authority.observe_latest().await?;
+                let root = snapshot
+                    .resolve(path)
+                    .await?
+                    .ok_or_else(|| invalid(format!("remote path {path} is missing")))?;
+                let mut pending = vec![root.id()];
+                let mut nodes = Vec::new();
+                while let Some(id) = pending.pop() {
+                    let node = snapshot
+                        .node(id)
+                        .await?
+                        .ok_or_else(|| invalid("remote subtree node disappeared"))?;
+                    if node.is_directory() {
+                        let mut token = None;
+                        loop {
+                            let page = snapshot.scan(id, token.as_ref(), 4096).await?;
+                            for entry in page.entries {
+                                pending.push(entry.node_id);
+                            }
+                            token = page.next;
+                            if token.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    nodes.push(id);
+                }
+                let mut plan = Planner::new(&snapshot, yinyang::core::CommitId::generate());
+                for id in nodes.into_iter().rev() {
+                    plan.remove(id).await?;
+                }
+                commit(&authority, plan).await
+            })
+            .unwrap_or_else(|error| panic!("remove remote subtree {path}: {error}"))
+    }
+
     fn remote_authority(&self) -> Arc<dyn Authority> {
         let operator = self.operator();
         runtime().block_on(async {
@@ -528,6 +1069,182 @@ impl Fixture {
             .collect::<Vec<_>>();
         opendal::Operator::via_iter("s3", config).expect("construct independent S3 operator")
     }
+}
+
+fn parse_status(paths: &SyncPaths, stdout: &[u8]) -> SyncStatus {
+    let status: SyncStatus = serde_json::from_slice(stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse sync status JSON for {}: {error}\nstdout:\n{}",
+            paths.directory.display(),
+            String::from_utf8_lossy(stdout)
+        )
+    });
+    status.validate();
+    status
+}
+
+pub struct ServiceGate {
+    address: SocketAddr,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    ready: mpsc::Receiver<()>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ServiceGate {
+    pub fn new(upstream: SocketAddr, token: String, drop_commit_response: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Managed Sync service gate");
+        let address = listener
+            .local_addr()
+            .expect("Managed Sync service gate address");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let ready = Arc::new(AtomicBool::new(false));
+        let intercepted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let thread_release = release.clone();
+        let thread_ready = ready.clone();
+        let thread_intercepted = intercepted.clone();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(client) = incoming else {
+                    break;
+                };
+                let release = thread_release.clone();
+                let ready = thread_ready.clone();
+                let intercepted = thread_intercepted.clone();
+                let sender = sender.clone();
+                let token = token.clone();
+                thread::spawn(move || {
+                    handle_service_connection(
+                        client,
+                        upstream,
+                        &token,
+                        drop_commit_response,
+                        release,
+                        ready,
+                        intercepted,
+                        sender,
+                    );
+                });
+            }
+        });
+        Self {
+            address,
+            release,
+            ready: receiver,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn wait_for_commit_response(&self, timeout: Duration) {
+        self.ready
+            .recv_timeout(timeout)
+            .expect("Managed Sync gate did not observe a commit response");
+    }
+
+    pub fn release(&self) {
+        let (released, condvar) = &*self.release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        condvar.notify_all();
+    }
+}
+
+impl Drop for ServiceGate {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.release();
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_service_connection(
+    mut client: TcpStream,
+    upstream: SocketAddr,
+    token: &str,
+    drop_commit_response: bool,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    ready: Arc<AtomicBool>,
+    intercepted: Arc<AtomicBool>,
+    sender: mpsc::Sender<()>,
+) {
+    let Ok(request) = read_frame(&mut client) else {
+        return;
+    };
+    let Ok(mut server) = TcpStream::connect(upstream) else {
+        return;
+    };
+    if write_frame(&mut server, &request).is_err() {
+        return;
+    }
+    let Ok(response) = read_frame(&mut server) else {
+        return;
+    };
+    if !is_commit(&request, token) || intercepted.swap(true, Ordering::SeqCst) {
+        let _ = write_frame(&mut client, &response);
+        let _ = client.shutdown(Shutdown::Write);
+        return;
+    }
+    if drop_commit_response {
+        if !ready.swap(true, Ordering::SeqCst) {
+            let _ = sender.send(());
+        }
+        return;
+    }
+    if !ready.swap(true, Ordering::SeqCst) {
+        let _ = sender.send(());
+    }
+    let (released, condvar) = &*release;
+    let mut released = released
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while !*released {
+        released = condvar
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    drop(released);
+    let _ = write_frame(&mut client, &response);
+    let _ = client.shutdown(Shutdown::Write);
+}
+
+fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length)?;
+    let mut frame = vec![0_u8; u32::from_le_bytes(length) as usize];
+    stream.read_exact(&mut frame)?;
+    Ok(frame)
+}
+
+fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    let length = u32::try_from(frame.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"))?;
+    stream.write_all(&length.to_le_bytes())?;
+    stream.write_all(frame)
+}
+
+fn is_commit(request: &[u8], token: &str) -> bool {
+    const COMMIT: u8 = 4;
+    if request.first() != Some(&1) || request.len() < 5 {
+        return false;
+    }
+    let length = u32::from_le_bytes(request[1..5].try_into().expect("four-byte token length"));
+    let command = 5_usize.saturating_add(length as usize);
+    request.get(5..command) == Some(token.as_bytes()) && request.get(command) == Some(&COMMIT)
 }
 
 impl Drop for Fixture {
