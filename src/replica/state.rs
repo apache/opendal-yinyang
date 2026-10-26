@@ -144,6 +144,8 @@ pub(super) struct ConflictRecord {
 /// associated work and keep orphaned staging unpublished.
 #[derive(Clone, Debug)]
 pub(super) struct WorkRecord {
+    /// Monotonic insertion order, used to select the current request.
+    pub seq: u64,
     pub id: [u8; 32],
     pub path: String,
     pub original_path: Option<String>,
@@ -258,6 +260,7 @@ impl Store {
                  );
                  CREATE TABLE IF NOT EXISTS work(
                    id BLOB PRIMARY KEY,
+                   seq INTEGER NOT NULL DEFAULT 0,
                    path TEXT NOT NULL,
                    original_path TEXT,
                    desired_path TEXT,
@@ -283,6 +286,8 @@ impl Store {
             .map_err(|e| Error::io("initialize replica state", path, e))?;
         ensure_column(&connection, "baseline", "remote_revision", "BLOB")
             .map_err(|e| Error::io("migrate replica baseline", path, e))?;
+        ensure_column(&connection, "work", "seq", "INTEGER NOT NULL DEFAULT 0")
+            .map_err(|e| Error::io("migrate replica work", path, e))?;
         ensure_column(&connection, "work", "conflict", "TEXT")
             .map_err(|e| Error::io("migrate replica work", path, e))?;
         ensure_column(&connection, "work", "source_artifact", "TEXT")
@@ -521,6 +526,33 @@ impl Store {
                 Some(*file.content_id().digest()),
             ),
         };
+        self.save_baseline_entry(
+            path,
+            node.id(),
+            directory,
+            node.executable(),
+            digest,
+            length,
+            local,
+            revision,
+        )
+    }
+
+    /// Write one baseline entry with explicit accepted remote facts. A
+    /// namespace-only receipt advances path/revision but keeps the previously
+    /// accepted content digest and executable bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_baseline_entry(
+        &mut self,
+        path: &str,
+        node: NodeId,
+        directory: bool,
+        executable: bool,
+        digest: Option<[u8; 32]>,
+        length: u64,
+        local: Option<&LocalNode>,
+        revision: Revision,
+    ) -> Result<()> {
         let (
             present,
             local_digest,
@@ -562,9 +594,9 @@ impl Store {
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     path,
-                    node.id().as_bytes().as_slice(),
+                    node.as_bytes().as_slice(),
                     directory,
-                    node.executable(),
+                    executable,
                     digest.as_ref().map(|value| value.as_slice()),
                     i64::try_from(length).map_err(|_| Error::invalid(
                         "remote baseline length exceeds SQLite range"
@@ -588,6 +620,19 @@ impl Store {
         self.connection
             .execute("DELETE FROM baseline WHERE path=?1", params![path])
             .map_err(|e| Error::corrupt(format!("remove baseline entry: {e}")))?;
+        Ok(())
+    }
+
+    /// Remove a baseline directory entry and every entry below it, used when a
+    /// whole unchanged subtree is quarantined as one unit.
+    pub fn remove_baseline_subtree(&mut self, path: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM baseline
+                 WHERE path=?1 OR substr(path,1,length(?1)+1)=?1||'/'",
+                params![path],
+            )
+            .map_err(|e| Error::corrupt(format!("remove baseline subtree: {e}")))?;
         Ok(())
     }
 
@@ -822,6 +867,18 @@ impl Store {
         Ok(())
     }
 
+    /// Retire work that belonged to a resolved conflict while keeping its
+    /// history for audit; a later request at the path becomes the current one.
+    pub fn supersede_conflict_work(&mut self, conflict: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE work SET state='superseded' WHERE conflict=?1 AND state!='committed'",
+                params![conflict],
+            )
+            .map_err(|e| Error::corrupt(format!("supersede conflict work: {e}")))?;
+        Ok(())
+    }
+
     /// Refresh volatile evidence of an active conflict without replacing its
     /// retained local artifact or changing its stable identity.
     pub fn refresh_conflict(&mut self, conflict: &ConflictRecord) -> Result<()> {
@@ -855,11 +912,12 @@ impl Store {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO work
-                 (id,path,original_path,desired_path,operation,local_kind,local_digest,
+                 (seq,id,path,original_path,desired_path,operation,local_kind,local_digest,
                   local_length,local_executable,local_dev,local_ino,local_parent_dev,
                   local_parent_ino,baseline_node,baseline_revision,remote_revision,
                   commit_id,conflict,source_artifact,state,error)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                 VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM work),
+                        ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                         ?16,?17,?18,?19,?20,?21)",
                 params![
                     work.id.as_slice(),
@@ -929,7 +987,7 @@ impl Store {
         let mut query = self
             .connection
             .prepare(
-                "SELECT id,path,original_path,desired_path,operation,local_kind,local_digest,
+                "SELECT seq,id,path,original_path,desired_path,operation,local_kind,local_digest,
                         local_length,local_executable,local_dev,local_ino,local_parent_dev,
                         local_parent_ino,baseline_node,baseline_revision,remote_revision,
                         commit_id,conflict,source_artifact,state,error
@@ -938,24 +996,26 @@ impl Store {
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
         query
             .query_map([], |row| {
-                let id: Vec<u8> = row.get(0)?;
-                let local_digest: Option<Vec<u8>> = row.get(6)?;
-                let local_length: Option<i64> = row.get(7)?;
-                let local_dev: Option<Vec<u8>> = row.get(9)?;
-                let local_ino: Option<Vec<u8>> = row.get(10)?;
-                let local_parent_dev: Option<Vec<u8>> = row.get(11)?;
-                let local_parent_ino: Option<Vec<u8>> = row.get(12)?;
-                let baseline_node: Option<Vec<u8>> = row.get(13)?;
-                let baseline_revision: Vec<u8> = row.get(14)?;
-                let remote_revision: Option<Vec<u8>> = row.get(15)?;
-                let commit_id: Option<Vec<u8>> = row.get(16)?;
+                let id: Vec<u8> = row.get(1)?;
+                let local_digest: Option<Vec<u8>> = row.get(7)?;
+                let local_length: Option<i64> = row.get(8)?;
+                let local_dev: Option<Vec<u8>> = row.get(10)?;
+                let local_ino: Option<Vec<u8>> = row.get(11)?;
+                let local_parent_dev: Option<Vec<u8>> = row.get(12)?;
+                let local_parent_ino: Option<Vec<u8>> = row.get(13)?;
+                let baseline_node: Option<Vec<u8>> = row.get(14)?;
+                let baseline_revision: Vec<u8> = row.get(15)?;
+                let remote_revision: Option<Vec<u8>> = row.get(16)?;
+                let commit_id: Option<Vec<u8>> = row.get(17)?;
                 Ok(WorkRecord {
+                    seq: u64::try_from(row.get::<_, i64>(0)?)
+                        .map_err(|_| corrupt_sql("negative work sequence"))?,
                     id: fixed(&id, "work id")?,
-                    path: row.get(1)?,
-                    original_path: row.get(2)?,
-                    desired_path: row.get(3)?,
-                    operation: row.get(4)?,
-                    local_kind: row.get(5)?,
+                    path: row.get(2)?,
+                    original_path: row.get(3)?,
+                    desired_path: row.get(4)?,
+                    operation: row.get(5)?,
+                    local_kind: row.get(6)?,
                     local_digest: local_digest
                         .as_deref()
                         .map(|value| fixed(value, "work local digest"))
@@ -965,7 +1025,7 @@ impl Store {
                             u64::try_from(value).map_err(|_| corrupt_sql("negative work length"))
                         })
                         .transpose()?,
-                    local_executable: row.get(8)?,
+                    local_executable: row.get(9)?,
                     local_dev: local_dev
                         .as_deref()
                         .map(|value| number(value, "work local device"))
@@ -995,10 +1055,10 @@ impl Store {
                         .as_deref()
                         .map(|value| fixed(value, "work commit id"))
                         .transpose()?,
-                    conflict: row.get(17)?,
-                    source_artifact: row.get(18)?,
-                    state: row.get(19)?,
-                    error: row.get(20)?,
+                    conflict: row.get(18)?,
+                    source_artifact: row.get(19)?,
+                    state: row.get(20)?,
+                    error: row.get(21)?,
                 })
             })
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?
