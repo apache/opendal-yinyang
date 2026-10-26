@@ -59,6 +59,21 @@ fn assert_tree(root: &Path, expected: &Tree, context: &str) {
 fn assert_in_sync(fixture: &Fixture, paths: &crate::linux_sync::harness::SyncPaths) -> SyncStatus {
     let status = fixture.sync_status(paths);
     assert_eq!(status.binding.state, BindingState::Bound, "{status:#?}");
+    assert_eq!(
+        status.binding.root.as_deref(),
+        Some(
+            fs::canonicalize(&paths.directory)
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ),
+        "{status:#?}"
+    );
+    assert_eq!(
+        status.binding.state_directory,
+        fs::canonicalize(&paths.state).unwrap().to_str().unwrap(),
+        "{status:#?}"
+    );
     assert_eq!(status.binding.same_filesystem, Some(true), "{status:#?}");
     assert_eq!(status.remote.availability, RemoteAvailability::Available);
     assert_eq!(status.local.scan, LocalScanState::Clean, "{status:#?}");
