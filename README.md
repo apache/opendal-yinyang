@@ -23,9 +23,33 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 > [RFC-0016]. The core provides experimental indexed object-storage transactions,
 > retained snapshots, and authenticated range-verifiable content. A durable
 > metadata service and recoverable Managed file handles share the transaction
-> contract. The `yy` CLI publishes/restores directories and operates configured
-> volumes. OS Mount frontends, Direct volumes, and bidirectional Sync are not
-> implemented yet.
+> contract. The `yy` CLI publishes and restores directories, operates configured
+> Managed volumes, and provides a Linux FUSE Managed Mount.
+
+## Current support
+
+- **Managed Mount:** The experimental Linux FUSE frontend supports read-only and
+  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`. PRs
+  #83, #84, and #85 added the frontend, writable callbacks, and native
+  acceptance on 2026-10-27. All 22 real-mount scenarios passed on an isolated
+  Ubuntu 24.04 AWS host and in GitHub Linux CI, covering both publication
+  authorities, saves, failure retention, refresh, crash recovery, and teardown.
+  See the [frontend contract](specs/linux-fuse.md) and
+  [acceptance guide](docs/linux-fuse-acceptance.md). This is experimental
+  native validation, not release support.
+- **Managed Sync:** The [Sync runtime](specs/sync-runtime.md) coordinates pinned
+  downloads and baseline-bound replacement content for existing files. It does
+  not coordinate namespace mutations, reconcile an ordinary local directory, or
+  provide a complete progress/conflict-resolution workflow. There is no
+  automatic watcher or daemon.
+- **macOS prototypes:** The experimental FSKit and File Provider frontends are
+  isolated macOS 27 / Xcode 27 prototypes. They share the native bridge and
+  runtimes, but ordinary volume CLI admission does not select them. See the
+  [macOS frontend contract](specs/macos-frontends.md).
+- **Direct:** Direct volumes are not implemented in the current architecture.
+
+The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
+tracks the remaining integration and platform work.
 
 ## Publish and restore a directory
 
@@ -75,7 +99,8 @@ write/append/truncate, conditional remote fsync, and restart recovery over eithe
 publication authority. Configure the [volume and required capabilities](specs/volume-capabilities.md),
 then use `yy --volume volume.json file ...` and `yy --volume volume.json status`.
 Local write acknowledgment and remote publication are reported separately.
-The library frontend does not install an OS mount or implement Sync.
+The library frontend does not install a mount or reconcile local directories.
+The separate Linux FUSE frontend exposes Managed Mount, not Sync.
 
 ## Previous releases
 
