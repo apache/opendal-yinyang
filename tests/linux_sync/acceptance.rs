@@ -820,7 +820,10 @@ fn managed_sync_retained_artifacts_export_post_install_writes_both_authorities()
             let replaced = status
                 .artifacts
                 .iter()
-                .find(|artifact| artifact.origin == "watched.txt")
+                .find(|artifact| {
+                    artifact.origin == "watched.txt"
+                        && artifact.kind == crate::linux_sync::harness::ArtifactKind::ReplacedFile
+                })
                 .unwrap_or_else(|| panic!("missing replaced-file artifact: {status:#?}"));
             assert_eq!(
                 replaced.kind,
@@ -836,7 +839,11 @@ fn managed_sync_retained_artifacts_export_post_install_writes_both_authorities()
             let directory = status
                 .artifacts
                 .iter()
-                .find(|artifact| artifact.origin == "gone")
+                .find(|artifact| {
+                    artifact.origin == "gone"
+                        && artifact.kind
+                            == crate::linux_sync::harness::ArtifactKind::QuarantinedDirectory
+                })
                 .unwrap_or_else(|| panic!("missing quarantined-directory artifact: {status:#?}"));
             assert_eq!(
                 directory.kind,
