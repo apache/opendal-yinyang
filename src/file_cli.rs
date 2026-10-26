@@ -178,8 +178,31 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
         );
         return Ok(());
     }
+    if let Command::Mount { mountpoint } = command {
+        #[cfg(target_os = "linux")]
+        {
+            return match yinyang::fuse::run(config, operator, token, mountpoint).await? {
+                yinyang::fuse::Outcome::Unmounted => Ok(()),
+                yinyang::fuse::Outcome::TeardownExpired { grace } => {
+                    eprintln!(
+                        "yy: FUSE mount did not finish teardown within {}s (the session or the \
+                         refresh task is still running, for example clients holding references or a \
+                         refresh blocked on remote I/O); exiting non-zero to abort the connection \
+                         (equivalent to crash recovery)",
+                        grace.as_secs()
+                    );
+                    std::process::exit(1);
+                }
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (operator, token, mountpoint);
+            return Err("the fuse frontend is implemented only on Linux".into());
+        }
+    }
     let Command::File { command } = command else {
-        return Err("with --volume use file, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve".into());
+        return Err("with --volume use mount, file, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve".into());
     };
     let volume = Volume::open(config, operator, token).await?;
     let runtime = volume.runtime();
