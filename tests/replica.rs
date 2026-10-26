@@ -64,6 +64,16 @@ fn state_lease_rejects_concurrent_processes_in_one_process_test() {
 }
 
 #[test]
+fn read_only_inspection_rejects_a_replaced_root() {
+    let (temp, root, replica) = setup();
+    let state = replica.state().to_owned();
+    drop(replica);
+    fs::rename(&root, temp.path().join("moved-root")).unwrap();
+    let error = Replica::inspect(&state).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+}
+
+#[test]
 fn scan_hashes_content_and_rejects_symlinks() {
     let (_temp, root, replica) = setup();
     fs::create_dir(root.join("directory")).unwrap();
