@@ -293,6 +293,15 @@ impl Volume {
         operator: Operator,
         token: Option<String>,
     ) -> Result<Self> {
+        // The file runtime installs recoverable handles; it does not own the
+        // ordinary-directory reconciliation of a Sync volume. Admission accepts
+        // `access: sync` for `Volume::connect`, so reject it here before this
+        // opener creates any staging or reads storage.
+        if config.access == Access::Sync {
+            return Err(Error::Invalid(
+                "managed sync volumes are operated through the sync frontend, not the file runtime",
+            ));
+        }
         let capabilities = config.validate(&operator)?;
         let authority = Self::connect(&config, operator, token).await?;
         let runtime = if config.read_only {
