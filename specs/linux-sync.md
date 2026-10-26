@@ -48,16 +48,19 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
 {
   "model": "managed",
   "access": "sync",
-  "frontend": "library"
+  "frontend": "library",
+  "read_only": false
 }
 ```
 
 It runs the shared four-layer capability admission as every other volume
 command and additionally pins this Managed + Sync combination, so a valid Mount
 package or a Direct volume is rejected rather than silently reinterpreted. The
-frontend is the library frontend, not an OS mount. Storage credentials and the
-`--volume` configuration are supplied exactly as for the other volume commands;
-the JSON document never carries secrets.
+frontend is the library frontend, not an OS mount. The frontend performs
+bidirectional reconciliation, so `read_only: true` is rejected for `access:
+sync` instead of being silently ignored while the volume still published writes.
+Storage credentials and the `--volume` configuration are supplied exactly as for
+the other volume commands; the JSON document never carries secrets.
 
 ## Exit codes
 

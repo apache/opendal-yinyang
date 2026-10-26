@@ -259,6 +259,14 @@ impl VolumeConfig {
                         "managed sync uses the library frontend, not an OS mount frontend",
                     ));
                 }
+                // The frontend implements bidirectional reconciliation. A
+                // read-only flag would be silently ignored while the volume
+                // still published writes, so refuse it explicitly.
+                if self.read_only {
+                    return Err(Error::Invalid(
+                        "managed sync is bidirectional; read_only must be false for access=sync",
+                    ));
+                }
             }
         }
         match (self.publication, self.service_address) {
