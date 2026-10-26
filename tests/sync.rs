@@ -858,10 +858,12 @@ async fn namespace_post_dispatch_error_stays_unknown_and_resolves() {
         .unwrap();
     fault.fail_next_response();
     let error = sync.publish(intent).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Invalid);
+    assert_eq!(error.kind(), ErrorKind::Unknown);
     let status = sync.namespace_status(intent).await.unwrap();
     assert_eq!(status.state, NamespaceState::Unknown);
-    assert_eq!(status.failure.unwrap().kind(), ErrorKind::Invalid);
+    let failure = status.failure.clone().unwrap();
+    assert_eq!(failure.kind(), ErrorKind::Unknown);
+    assert_eq!(failure.commit_id(), Some(status.intent.commit_id));
     let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
     assert_eq!(
         authority.observe_latest().await.unwrap().revision(),
