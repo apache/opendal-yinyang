@@ -714,6 +714,69 @@ impl Replica {
         Ok(std::fs::File::from(fd))
     }
 
+    /// Retain an arbitrary byte stream as an immutable artifact so an explicit
+    /// conflict resolution input survives a crash, export and a later path
+    /// change.
+    pub fn retain_bytes(&mut self, origin: &str, bytes: &[u8]) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = format!("resolve-{id}");
+        let mut record = ArtifactRecord {
+            id: id.clone(),
+            origin: origin.to_owned(),
+            name: name.clone(),
+            kind: "upload-retained".to_owned(),
+            reason: "explicit conflict resolution input retained for publication and export"
+                .to_owned(),
+            remote_revision: None,
+            phase: "preparing".to_owned(),
+            error: None,
+        };
+        self.store.insert_artifact(&record)?;
+        let fd = openat(
+            &self.quarantine_fd,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| Error::errno("create retained resolution input", &self.state, e))?;
+        let written = (|| -> Result<()> {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(bytes).map_err(|e| {
+                Error::io(
+                    "write retained resolution input",
+                    &self.state.join(&name),
+                    e,
+                )
+            })?;
+            file.sync_all().map_err(|e| {
+                Error::io(
+                    "persist retained resolution input",
+                    &self.state.join(&name),
+                    e,
+                )
+            })?;
+            fsync(&self.quarantine_fd).map_err(|e| {
+                Error::errno("persist retained resolution directory", &self.state, e)
+            })?;
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                record.phase = "retained".to_owned();
+                self.store
+                    .update_artifact(&record.id, &record.phase, None)?;
+                Ok(id)
+            }
+            Err(error) => {
+                record.phase = "failed".to_owned();
+                record.error = Some(error.to_string());
+                self.store
+                    .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
+                Err(error)
+            }
+        }
+    }
+
     /// Create one local directory with a no-replace mkdirat; the entry only
     /// becomes visible after a successful directory entry creation.
     pub(super) fn create_directory_local(&self, path: &str) -> Result<()> {

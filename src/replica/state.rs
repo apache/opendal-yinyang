@@ -156,6 +156,10 @@ pub(super) struct WorkRecord {
     pub baseline_node: Option<[u8; 16]>,
     pub baseline_revision: [u8; 24],
     pub remote_revision: Option<[u8; 24]>,
+    /// Conflict this edit resolves, if it was created by an explicit decision.
+    pub conflict: Option<String>,
+    /// Retained artifact holding the exact local input published by this edit.
+    pub source_artifact: Option<String>,
     pub state: String,
     pub error: Option<String>,
 }
@@ -259,6 +263,8 @@ impl Store {
                    baseline_node BLOB,
                    baseline_revision BLOB NOT NULL,
                    remote_revision BLOB,
+                   conflict TEXT,
+                   source_artifact TEXT,
                    state TEXT NOT NULL,
                    error TEXT
                  );",
@@ -266,6 +272,10 @@ impl Store {
             .map_err(|e| Error::io("initialize replica state", path, e))?;
         ensure_column(&connection, "baseline", "remote_revision", "BLOB")
             .map_err(|e| Error::io("migrate replica baseline", path, e))?;
+        ensure_column(&connection, "work", "conflict", "TEXT")
+            .map_err(|e| Error::io("migrate replica work", path, e))?;
+        ensure_column(&connection, "work", "source_artifact", "TEXT")
+            .map_err(|e| Error::io("migrate replica work", path, e))?;
         Ok(Self { connection })
     }
 
@@ -798,8 +808,8 @@ impl Store {
                 "INSERT OR REPLACE INTO work
                  (id,path,original_path,desired_path,operation,local_kind,local_digest,
                   local_length,local_executable,baseline_node,baseline_revision,
-                  remote_revision,state,error)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                  remote_revision,conflict,source_artifact,state,error)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     work.id.as_slice(),
                     work.path,
@@ -816,6 +826,8 @@ impl Store {
                     work.baseline_node.as_ref().map(|v| v.as_slice()),
                     work.baseline_revision.as_slice(),
                     work.remote_revision.as_ref().map(|v| v.as_slice()),
+                    work.conflict,
+                    work.source_artifact,
                     work.state,
                     work.error,
                 ],
@@ -851,7 +863,7 @@ impl Store {
             .prepare(
                 "SELECT id,path,original_path,desired_path,operation,local_kind,local_digest,
                         local_length,local_executable,baseline_node,baseline_revision,
-                        remote_revision,state,error
+                        remote_revision,conflict,source_artifact,state,error
                  FROM work ORDER BY path,id",
             )
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
@@ -889,8 +901,10 @@ impl Store {
                         .as_deref()
                         .map(|value| fixed(value, "work remote revision"))
                         .transpose()?,
-                    state: row.get(12)?,
-                    error: row.get(13)?,
+                    conflict: row.get(12)?,
+                    source_artifact: row.get(13)?,
+                    state: row.get(14)?,
+                    error: row.get(15)?,
                 })
             })
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?
