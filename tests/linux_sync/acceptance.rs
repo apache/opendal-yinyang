@@ -356,6 +356,11 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
 #[test]
 #[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
 fn managed_sync_resolve_content_preserves_concurrent_local_v4() {
+    resolve_content_preserves_concurrent_local_v4(false);
+    resolve_content_preserves_concurrent_local_v4(true);
+}
+
+fn resolve_content_preserves_concurrent_local_v4(drop_after_release: bool) {
     let fixture = Fixture::new(Publication::Service);
     fixture.remote_create_file("resolve-race.txt", b"base", false);
     let left = fixture.sync_client("resolve-race-left");
@@ -370,7 +375,11 @@ fn managed_sync_resolve_content_preserves_concurrent_local_v4() {
     let status = fixture.sync_status(&right);
     let conflict = status.conflict("resolve-race.txt").clone();
 
-    let gate = fixture.service_gate(false);
+    let gate = if drop_after_release {
+        fixture.service_gate_drop_after_release()
+    } else {
+        fixture.service_gate(false)
+    };
     let right_gated = fixture.sync_paths_at("resolve-race-right", Some(gate.address()));
     let chosen = fixture.path("resolve-race-chosen");
     write_local(&chosen, b"chosen-v3");

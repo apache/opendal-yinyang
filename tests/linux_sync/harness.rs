@@ -925,6 +925,15 @@ impl Fixture {
         )
     }
 
+    pub fn service_gate_drop_after_release(&self) -> ServiceGate {
+        assert_eq!(
+            self.publication,
+            Publication::Service,
+            "service races require service publication"
+        );
+        ServiceGate::new_drop_after_release(self.service_address(), self.token.clone())
+    }
+
     pub fn remote_tree(&self) -> CoreResult<Tree> {
         let authority = self.remote_authority();
         runtime().block_on(async {
@@ -1147,8 +1156,31 @@ pub struct ServiceGate {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+enum CommitAction {
+    ForwardAfterRelease,
+    DropImmediately,
+    DropAfterRelease,
+}
+
 impl ServiceGate {
     pub fn new(upstream: SocketAddr, token: String, drop_commit_response: bool) -> Self {
+        Self::new_with_action(
+            upstream,
+            token,
+            if drop_commit_response {
+                CommitAction::DropImmediately
+            } else {
+                CommitAction::ForwardAfterRelease
+            },
+        )
+    }
+
+    pub fn new_drop_after_release(upstream: SocketAddr, token: String) -> Self {
+        Self::new_with_action(upstream, token, CommitAction::DropAfterRelease)
+    }
+
+    fn new_with_action(upstream: SocketAddr, token: String, action: CommitAction) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind Managed Sync service gate");
         let address = listener
             .local_addr()
@@ -1180,7 +1212,7 @@ impl ServiceGate {
                         client,
                         upstream,
                         &token,
-                        drop_commit_response,
+                        action,
                         release,
                         ready,
                         intercepted,
@@ -1233,7 +1265,7 @@ fn handle_service_connection(
     mut client: TcpStream,
     upstream: SocketAddr,
     token: &str,
-    drop_commit_response: bool,
+    action: CommitAction,
     release: Arc<(Mutex<bool>, Condvar)>,
     ready: Arc<AtomicBool>,
     intercepted: Arc<AtomicBool>,
@@ -1256,14 +1288,11 @@ fn handle_service_connection(
         let _ = client.shutdown(Shutdown::Write);
         return;
     }
-    if drop_commit_response {
-        if !ready.swap(true, Ordering::SeqCst) {
-            let _ = sender.send(());
-        }
-        return;
-    }
     if !ready.swap(true, Ordering::SeqCst) {
         let _ = sender.send(());
+    }
+    if matches!(action, CommitAction::DropImmediately) {
+        return;
     }
     let (released, condvar) = &*release;
     let mut released = released
@@ -1275,6 +1304,9 @@ fn handle_service_connection(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
     drop(released);
+    if matches!(action, CommitAction::DropAfterRelease) {
+        return;
+    }
     let _ = write_frame(&mut client, &response);
     let _ = client.shutdown(Shutdown::Write);
 }
