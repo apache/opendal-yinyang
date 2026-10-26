@@ -245,7 +245,7 @@ fn managed_sync_local_and_remote_namespace_both_authorities() {
 #[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
 fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authorities() {
     for_each_authority(|publication| {
-        let fixture = Fixture::new(publication);
+        let mut fixture = Fixture::new(publication);
         fixture.remote_create_file("shared.txt", b"base", false);
         let left = fixture.sync_client("left");
         let right = fixture.sync_client("right");
