@@ -669,12 +669,11 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     .expect("the interleaved run must finish within the timeout")
     .0;
     drop(sync);
-    match run_result {
-        Ok(outcome) => assert!(
+    if let Ok(outcome) = run_result {
+        assert!(
             !outcome.in_sync,
             "a run observing a competing remote edit must not report in sync"
-        ),
-        Err(_) => {}
+        );
     }
 
     // Data safety: a's own edit landed, external-b survived, local b is kept.
