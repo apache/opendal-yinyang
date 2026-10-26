@@ -13,9 +13,13 @@ truncate, append and fsync are serialized per node; append chooses its offset
 under the same lock. Different nodes do not share an I/O lock. Initial
 materialization is serialized per NodeId by a short-lived open gate, and the
 instance node map is not held during a remote observation or staging read.
-Different nodes can therefore complete their first opens independently. Refresh
-and reclaim use the map for lookup and reference accounting; data-plane calls
-keep per-node locks. Cancelling a first open releases its gate; an incomplete
+The node lookup and gate registration share one critical section, so a
+completion cannot slip between them and start a second materialization.
+Success, failure and cancellation close the gate to wake every waiter for a
+retry; a retry rechecks the node map and either joins the materialized node or
+becomes the next single owner. Different nodes can therefore complete their
+first opens independently. Refresh and reclaim use the map for lookup and
+reference accounting; data-plane calls keep per-node locks. An incomplete
 local open is never exposed and is discarded when staging is reopened. Both
 read-only and writable references currently use full-file staging.
 

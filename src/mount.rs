@@ -38,7 +38,8 @@ impl Drop for OpenGate {
         if let Ok(mut opening) = self.inner.opening.lock() {
             opening.remove(&self.id);
         }
-        self.ready.add_permits(1);
+        // Close wakes every waiter; a single permit would strand later waiters.
+        self.ready.close();
     }
 }
 struct NodeGuard {
@@ -58,7 +59,7 @@ impl Drop for NodeGuard {
 struct Inner {
     runtime: Runtime,
     read_only: bool,
-    nodes: Mutex<BTreeMap<NodeId, Arc<Node>>>,
+    nodes: StdMutex<BTreeMap<NodeId, Arc<Node>>>,
     opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
 }
 /// A mount instance owns one recoverable staged version per node, not per open.
@@ -103,7 +104,7 @@ impl Mount {
             inner: Arc::new(Inner {
                 runtime,
                 read_only,
-                nodes: Mutex::new(nodes),
+                nodes: StdMutex::new(nodes),
                 opening: StdMutex::new(BTreeMap::new()),
             }),
         })
@@ -118,7 +119,7 @@ impl Mount {
     /// `None` means this mount has no shared handle for the node.
     pub async fn node_status(&self, id: NodeId) -> Result<Option<HandleStatus>> {
         let guard = {
-            let nodes = self.inner.nodes.lock().await;
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
             nodes.get(&id).cloned().map(NodeGuard::new)
         };
         let Some(guard) = guard else {
@@ -136,34 +137,32 @@ impl Mount {
             return Err(Error::State(ErrorKind::ReadOnly, "mount is read-only"));
         }
         loop {
-            let existing = {
-                let nodes = self.inner.nodes.lock().await;
-                nodes.get(&id).map(|node| {
+            // Cache lookup and gate registration must be one critical section.
+            // Always take nodes then opening, and never hold either across await.
+            let (existing, gate) = {
+                let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+                if let Some(node) = nodes.get(&id) {
                     node.references.fetch_add(1, Ordering::Relaxed);
-                    node.clone()
-                })
+                    (Some(node.clone()), None)
+                } else {
+                    let mut opening = self.inner.opening.lock().map_err(Error::local)?;
+                    match opening.get(&id) {
+                        Some(ready) => (None, Some((ready.clone(), true))),
+                        None => {
+                            let ready = Arc::new(Semaphore::new(0));
+                            opening.insert(id, ready.clone());
+                            (None, Some((ready, false)))
+                        }
+                    }
+                }
             };
             if let Some(node) = existing {
                 return Ok(MountFile { node, writable });
             }
-
-            let (waiting, ready) = {
-                let mut opening = self.inner.opening.lock().map_err(Error::local)?;
-                match opening.get(&id) {
-                    Some(ready) => (true, ready.clone()),
-                    None => {
-                        let ready = Arc::new(Semaphore::new(0));
-                        opening.insert(id, ready.clone());
-                        (false, ready)
-                    }
-                }
-            };
+            let (ready, waiting) = gate.expect("a waiter or owner always carries the node gate");
             if waiting {
-                ready
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::local("mount open coordination closed"))?
-                    .forget();
+                // Closing the gate is a broadcast completion signal, not an error.
+                let _ = ready.acquire().await;
                 continue;
             }
 
@@ -184,7 +183,7 @@ impl Mount {
                 references: AtomicUsize::new(0),
             });
             {
-                let mut nodes = self.inner.nodes.lock().await;
+                let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
                 nodes.insert(id, node.clone());
                 node.references.fetch_add(1, Ordering::Relaxed);
             }
@@ -197,7 +196,7 @@ impl Mount {
     /// OS cache invalidation outside this call; no OS callbacks run under locks.
     pub async fn refresh(&self, id: NodeId) -> Result<()> {
         let guard = {
-            let nodes = self.inner.nodes.lock().await;
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
             nodes.get(&id).cloned().map(NodeGuard::new)
         };
         let Some(guard) = guard else {
@@ -225,7 +224,7 @@ impl Mount {
     /// so independent nodes can finish; the original failures remain in status.
     pub async fn fsync(&self) -> Result<()> {
         let nodes: Vec<_> = {
-            let nodes = self.inner.nodes.lock().await;
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
             nodes.values().cloned().map(NodeGuard::new).collect()
         };
         let mut failure = None;
@@ -239,28 +238,42 @@ impl Mount {
     /// Forget only an unreferenced, clean node. Failed and pending nodes remain
     /// recoverable even after the OS releases all references.
     pub async fn reclaim(&self, id: NodeId) -> Result<()> {
-        let mut nodes = self.inner.nodes.lock().await;
-        let Some(node) = nodes.get(&id) else {
+        let node = {
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            let Some(node) = nodes.get(&id) else {
+                return Ok(());
+            };
+            if node.references.load(Ordering::Relaxed) != 0 {
+                return Err(Error::State(
+                    ErrorKind::Busy,
+                    "node still has open references",
+                ));
+            }
+            node.clone()
+        };
+        {
+            let mut handle = node.handle.lock().await;
+            let state = handle.status().await?;
+            if state.pending || state.frozen || state.error.is_some() {
+                return Err(Error::State(
+                    ErrorKind::Busy,
+                    "node has retained writes or failures",
+                ));
+            }
+        }
+        let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
+        let current = nodes.get(&id).cloned();
+        let Some(current) = current else {
             return Ok(());
         };
-        if node.references.load(Ordering::Relaxed) != 0 {
+        if current.references.load(Ordering::Relaxed) != 0 || !Arc::ptr_eq(&current, &node) {
             return Err(Error::State(
                 ErrorKind::Busy,
-                "node still has open references",
+                "node state changed during reclaim",
             ));
         }
-        let handle = node.handle.lock().await;
-        let state = handle.status().await?;
-        if state.pending || state.frozen || state.error.is_some() {
-            return Err(Error::State(
-                ErrorKind::Busy,
-                "node has retained writes or failures",
-            ));
-        }
-        drop(handle);
-        let node = nodes
-            .remove(&id)
-            .expect("node exists under the namespace lock");
+        let _ = nodes.remove(&id);
+        drop(nodes);
         node.handle.lock().await.close().await
     }
 }

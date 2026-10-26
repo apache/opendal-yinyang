@@ -36,6 +36,7 @@ struct PausingObserveAuthority {
     entered: Semaphore,
     release: Semaphore,
     pause_next_observe: AtomicBool,
+    fail_next_observe: AtomicBool,
 }
 impl PausingObserveAuthority {
     fn new(inner: Arc<dyn Authority>) -> Self {
@@ -44,10 +45,14 @@ impl PausingObserveAuthority {
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
             pause_next_observe: AtomicBool::new(false),
+            fail_next_observe: AtomicBool::new(false),
         }
     }
     fn pause_next_observe(&self) {
         self.pause_next_observe.store(true, Ordering::SeqCst);
+    }
+    fn fail_next_observe(&self) {
+        self.fail_next_observe.store(true, Ordering::SeqCst);
     }
 }
 impl std::fmt::Debug for PausingObserveAuthority {
@@ -73,6 +78,13 @@ impl Authority for PausingObserveAuthority {
             if self.pause_next_observe.swap(false, Ordering::SeqCst) {
                 self.entered.add_permits(1);
                 self.release.acquire().await.unwrap().forget();
+            }
+            if self.fail_next_observe.swap(false, Ordering::SeqCst) {
+                return Err(yinyang::core::Error::new(
+                    yinyang::core::ErrorKind::Storage,
+                    "test observe",
+                    "injected first-open failure",
+                ));
             }
             self.inner.observe_latest().await
         })
@@ -306,8 +318,14 @@ async fn flush_publishes_but_reference_release_does_not() {
     assert!(mount.node_status(pending).await.unwrap().is_none());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn independent_node_opens_do_not_share_the_namespace_lock() {
+async fn pausing_mount() -> (
+    Arc<PausingObserveAuthority>,
+    Mount,
+    yinyang::core::NodeId,
+    yinyang::core::NodeId,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let backend = TestBackend::default();
     let inner: Arc<dyn Authority> = Arc::new(
         Fs::create(backend.operator(), BackendProfile::Minio)
@@ -334,77 +352,124 @@ async fn independent_node_opens_do_not_share_the_namespace_lock() {
     let mount = Mount::open(authority, mount_temp.path(), false)
         .await
         .unwrap();
+    (pausing, mount, a, b, setup_temp, mount_temp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_materialization_is_independent_and_broadcasts_completion() {
+    let (pausing, mount, a, b, _setup_temp, _mount_temp) = pausing_mount().await;
     pausing.pause_next_observe();
-    let a_task = {
+    let owner = {
         let mount = mount.clone();
         tokio::spawn(async move { mount.open_node(a, false).await })
     };
     pausing.entered.acquire().await.unwrap().forget();
-    let mut b_task = {
+    let b_file = tokio::time::timeout(Duration::from_secs(5), async {
         let mount = mount.clone();
-        tokio::spawn(async move { mount.open_node(b, false).await })
-    };
-    let b_file = tokio::time::timeout(Duration::from_secs(5), &mut b_task)
-        .await
-        .expect("opening an independent node waited for another node's remote observation")
-        .unwrap()
-        .unwrap();
+        mount.open_node(b, false).await
+    })
+    .await
+    .expect("opening an independent node waited for another node's remote observation")
+    .unwrap();
     drop(b_file);
-    let a_second = {
-        let mount = mount.clone();
-        tokio::spawn(async move { mount.open_node(a, false).await })
-    };
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let mount = mount.clone();
+            tokio::spawn(async move { mount.open_node(a, false).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     pausing.release.add_permits(1);
-    let a_file = a_task.await.unwrap().unwrap();
-    let a_second = a_second.await.unwrap().unwrap();
-    assert_eq!(
-        a_file.status().await.unwrap().id,
-        a_second.status().await.unwrap().id
-    );
-    drop(a_second);
+    let a_file = tokio::time::timeout(Duration::from_secs(5), owner)
+        .await
+        .expect("first open did not complete after the observation was released")
+        .unwrap()
+        .unwrap();
+    let first_id = a_file.status().await.unwrap().id;
+    for waiter in waiters {
+        let file = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a same-node waiter was not broadcast awake")
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.status().await.unwrap().id, first_id);
+    }
     drop(a_file);
-    assert!(mount.node_status(a).await.unwrap().is_some());
-    assert!(mount.node_status(b).await.unwrap().is_some());
+    assert_eq!(mount.status().await.unwrap().handles.len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancelled_first_open_releases_the_node_gate() {
-    let backend = TestBackend::default();
-    let inner: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
-    let setup_temp = tempfile::tempdir().unwrap();
-    let setup = Runtime::open(inner.clone(), setup_temp.path())
+async fn failed_first_open_broadcasts_retry_to_all_waiters() {
+    let (pausing, mount, a, _b, _setup_temp, _mount_temp) = pausing_mount().await;
+    pausing.pause_next_observe();
+    pausing.fail_next_observe();
+    let owner = {
+        let mount = mount.clone();
+        tokio::spawn(async move { mount.open_node(a, false).await })
+    };
+    pausing.entered.acquire().await.unwrap().forget();
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let mount = mount.clone();
+            tokio::spawn(async move { mount.open_node(a, false).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    pausing.release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(5), owner)
         .await
-        .unwrap();
-    let (a, _) = setup
-        .create_file_with_node(inner.root(), "a", false)
+        .expect("failed owner did not finish")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Storage);
+    let mut waiters = waiters.into_iter();
+    let first = tokio::time::timeout(Duration::from_secs(5), waiters.next().unwrap())
         .await
+        .expect("first waiter did not retry after owner failure")
+        .unwrap()
         .unwrap();
-    drop(setup);
+    let first_id = first.status().await.unwrap().id;
+    let second = tokio::time::timeout(Duration::from_secs(5), waiters.next().unwrap())
+        .await
+        .expect("second waiter did not retry after owner failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.status().await.unwrap().id, first_id);
+    assert_eq!(mount.status().await.unwrap().handles.len(), 1);
+}
 
-    let pausing = Arc::new(PausingObserveAuthority::new(inner));
-    let authority: Arc<dyn Authority> = pausing.clone();
-    let mount_temp = tempfile::tempdir().unwrap();
-    let mount = Mount::open(authority, mount_temp.path(), false)
-        .await
-        .unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_first_open_broadcasts_retry_to_all_waiters() {
+    let (pausing, mount, a, _b, _setup_temp, _mount_temp) = pausing_mount().await;
     pausing.pause_next_observe();
     let cancelled = {
         let mount = mount.clone();
         tokio::spawn(async move { mount.open_node(a, false).await })
     };
     pausing.entered.acquire().await.unwrap().forget();
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let mount = mount.clone();
+            tokio::spawn(async move { mount.open_node(a, false).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(250)).await;
     cancelled.abort();
     assert!(cancelled.await.unwrap_err().is_cancelled());
 
-    let file = tokio::time::timeout(Duration::from_secs(5), mount.open_node(a, false))
+    let mut waiters = waiters.into_iter();
+    let first = tokio::time::timeout(Duration::from_secs(5), waiters.next().unwrap())
         .await
-        .expect("cancelled open left the per-node gate claimed")
+        .expect("first waiter did not retry after cancellation")
+        .unwrap()
         .unwrap();
-    assert!(mount.node_status(a).await.unwrap().is_some());
-    drop(file);
+    let first_id = first.status().await.unwrap().id;
+    let second = tokio::time::timeout(Duration::from_secs(5), waiters.next().unwrap())
+        .await
+        .expect("second waiter did not retry after cancellation")
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.status().await.unwrap().id, first_id);
+    assert_eq!(mount.status().await.unwrap().handles.len(), 1);
 }
