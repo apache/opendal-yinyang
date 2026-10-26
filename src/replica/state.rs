@@ -784,16 +784,6 @@ impl Store {
             .collect()
     }
 
-    pub fn update_conflict_error(&mut self, id: &str, error: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE conflicts SET error=?2 WHERE id=?1",
-                params![id, error],
-            )
-            .map_err(|e| Error::corrupt(format!("update conflict: {e}")))?;
-        Ok(())
-    }
-
     pub fn remove_conflict(&mut self, id: &str) -> Result<()> {
         self.connection
             .execute("DELETE FROM conflicts WHERE id=?1", params![id])
@@ -852,13 +842,6 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("update work association: {e}")))?;
-        Ok(())
-    }
-
-    pub fn remove_work(&mut self, id: &[u8; 32]) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM work WHERE id=?1", params![id.as_slice()])
-            .map_err(|e| Error::corrupt(format!("remove work association: {e}")))?;
         Ok(())
     }
 
