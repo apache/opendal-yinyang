@@ -130,9 +130,6 @@ struct DirCursor {
 }
 
 impl Inner {
-    pub(super) fn new(mount: Mount, runtime: Handle) -> Self {
-        Self::with_read_only(mount, runtime, true)
-    }
     pub(super) fn with_read_only(mount: Mount, runtime: Handle, read_only: bool) -> Self {
         let root = mount.authority().root();
         Self {
