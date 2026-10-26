@@ -252,7 +252,7 @@ impl Mount {
             node.clone()
         };
         {
-            let mut handle = node.handle.lock().await;
+            let handle = node.handle.lock().await;
             let state = handle.status().await?;
             if state.pending || state.frozen || state.error.is_some() {
                 return Err(Error::State(

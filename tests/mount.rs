@@ -421,7 +421,8 @@ async fn failed_first_open_broadcasts_retry_to_all_waiters() {
         .await
         .expect("failed owner did not finish")
         .unwrap()
-        .unwrap_err();
+        .err()
+        .expect("failed owner returned a file");
     assert_eq!(error.kind(), ErrorKind::Storage);
     let mut waiters = waiters.into_iter();
     let first = tokio::time::timeout(Duration::from_secs(5), waiters.next().unwrap())
