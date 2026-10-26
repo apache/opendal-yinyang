@@ -27,6 +27,6 @@ mod state;
 
 pub use error::{Error, ErrorKind, Result};
 pub use linux::{
-    Artifact, ArtifactKind, InstallOutcome, LocalKind, LocalNode, LocalSnapshot, Replica,
-    ReplicaStatus,
+    Artifact, ArtifactKind, CapturedContent, InstallOutcome, LocalKind, LocalNode, LocalSnapshot,
+    Replica, ReplicaStatus,
 };

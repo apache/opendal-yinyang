@@ -149,6 +149,14 @@ pub struct InstallOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedContent {
+    pub artifact: Artifact,
+    pub length: u64,
+    pub digest: ContentHash,
+    pub executable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaStatus {
     pub root: PathBuf,
     pub filesystem: NodeId,
@@ -372,6 +380,156 @@ impl Replica {
             .write_all(bytes)
             .map_err(|e| Error::invalid(format!("write replacement: {e}")))?;
         install.finish()
+    }
+
+    /// Copy one observed local file into retained state before an upload. The
+    /// capture is immutable and remains exportable after the local path changes.
+    pub fn capture_file(&mut self, path: &str, expected: &LocalNode) -> Result<CapturedContent> {
+        let LocalKind::File {
+            length: expected_length,
+            digest: expected_digest,
+        } = expected.kind
+        else {
+            return Err(Error::invalid("captured content must be a regular file"));
+        };
+        if expected.path != path {
+            return Err(Error::invalid(
+                "captured content path does not match observation",
+            ));
+        }
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_identity = identity(&parent_fd, &self.root, "inspect upload parent")?;
+        if let Some(expected_parent) = expected.parent
+            && parent_identity != expected_parent
+        {
+            return Err(Error::conflict("upload parent identity changed"));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let artifact_name = format!("upload-{id}");
+        let mut artifact = ArtifactRecord {
+            id: id.clone(),
+            origin: path.to_owned(),
+            name: artifact_name.clone(),
+            kind: "upload-retained".to_owned(),
+            reason: "durable local input retained for publication and export".to_owned(),
+            remote_revision: None,
+            phase: "preparing".to_owned(),
+            error: None,
+        };
+        self.store.insert_artifact(&artifact)?;
+        let output = openat(
+            &self.quarantine_fd,
+            artifact_name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| Error::errno("create retained upload", &self.state, e))?;
+        let output_identity = identity(&output, &self.state, "inspect retained upload")?;
+        let capture = (|| -> Result<CapturedContent> {
+            let source = openat(
+                &parent_fd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| Error::errno("open upload source", &self.root.join(path), e))?;
+            let before = fstat(&source)
+                .map_err(|e| Error::errno("inspect upload source", &self.root.join(path), e))?;
+            if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+                || before.st_dev != expected.identity.dev
+                || before.st_ino != expected.identity.ino
+            {
+                return Err(Error::conflict(
+                    "upload source identity changed before capture",
+                ));
+            }
+            let mut source = std::fs::File::from(source);
+            let mut output = std::fs::File::from(output);
+            let mut hasher = blake3::Hasher::new();
+            let mut length = 0_u64;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let count = source
+                    .read(&mut buffer)
+                    .map_err(|e| Error::io("read upload source", &self.root.join(path), e))?;
+                if count == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..count]).map_err(|e| {
+                    Error::io("write retained upload", &self.state.join(&artifact_name), e)
+                })?;
+                hasher.update(&buffer[..count]);
+                length = length
+                    .checked_add(count as u64)
+                    .ok_or_else(|| Error::invalid("upload length overflowed"))?;
+            }
+            let after = fstat(&source)
+                .map_err(|e| Error::errno("recheck upload source", &self.root.join(path), e))?;
+            if !same_stable_stat(&before, &after) {
+                return Err(Error::conflict(
+                    "upload source changed during durable capture",
+                ));
+            }
+            output.sync_all().map_err(|e| {
+                Error::io(
+                    "persist retained upload",
+                    &self.state.join(&artifact_name),
+                    e,
+                )
+            })?;
+            let digest = ContentHash(*hasher.finalize().as_bytes());
+            if length != expected_length || digest.as_bytes() != expected_digest.as_bytes() {
+                return Err(Error::conflict(
+                    "durable upload capture does not match the scanned local version",
+                ));
+            }
+            fsync(&self.quarantine_fd)
+                .map_err(|e| Error::errno("persist retained upload directory", &self.state, e))?;
+            artifact.phase = "retained".to_owned();
+            self.store
+                .update_artifact(&artifact.id, &artifact.phase, artifact.error.as_deref())?;
+            Ok(CapturedContent {
+                artifact: artifact.clone().into(),
+                length,
+                digest,
+                executable: expected.executable,
+            })
+        })();
+        if capture.is_err() {
+            let current = optional_stat(&self.quarantine_fd, &artifact_name, &self.state)?;
+            if current.as_ref().is_some_and(|stat| {
+                stat.st_dev == output_identity.dev && stat.st_ino == output_identity.ino
+            }) {
+                let _ = unlinkat(
+                    &self.quarantine_fd,
+                    artifact_name.as_str(),
+                    AtFlags::empty(),
+                );
+            }
+            artifact.phase = "failed".to_owned();
+            artifact.error = Some("capture did not establish a stable local version".to_owned());
+            self.store
+                .update_artifact(&artifact.id, &artifact.phase, artifact.error.as_deref())?;
+        }
+        capture
+    }
+
+    pub fn open_artifact(&self, id: &str) -> Result<std::fs::File> {
+        let artifact = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == id)
+            .ok_or_else(|| Error::invalid("unknown retained artifact"))?;
+        let fd = openat(
+            &self.quarantine_fd,
+            artifact.name.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::errno("open retained artifact", &self.state, e))?;
+        Ok(std::fs::File::from(fd))
     }
 
     pub fn prepare_install(
