@@ -47,6 +47,9 @@ cargo x test-linux-fuse --read-only
   520-entry bulk directory that crosses the adapter's 512-entry readdir page.
 - Basic writable I/O: create, write, remote `fsync` verified through an
   independent authority, append, truncate, and multiple descriptors on one file.
+- Append flag toggling: one descriptor opened with `O_APPEND`, then cleared and
+  restored via `fcntl(F_SETFL)`, must overwrite at an explicit offset while
+  cleared and append only while restored; both remote results are verified.
 - Dirty descriptor isolation: a read-only descriptor closed while another
   descriptor is dirty must not publish the dirty or frozen state; explicit
   `fsync` on the dirty descriptor establishes the remote result.

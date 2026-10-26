@@ -21,6 +21,7 @@ use crate::harness::{
     Fixture, Frontend, Mounted, Publication, ServiceGate, assert_errno, run_external,
     sync_all_with_deadline,
 };
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::unistd::truncate;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -487,6 +488,60 @@ fn fuse_cloexec_child_close_flushes_dirty_fd_both_publications() {
             Duration::from_secs(15),
         );
         drop(dirty);
+        mounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_append_flag_toggle_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-append-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "append-toggle.txt", b"0123456789");
+        let config =
+            fixture.volume_config(&format!("stage-append-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-append-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let path = mounted.mountpoint().join("append-toggle.txt");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&path)
+            .expect("open with O_APPEND");
+        let flags = fcntl(&file, FcntlArg::F_GETFL).expect("read open flags");
+        let flags = OFlag::from_bits_truncate(flags);
+        assert!(flags.contains(OFlag::O_APPEND));
+        fcntl(&file, FcntlArg::F_SETFL(flags.difference(OFlag::O_APPEND)))
+            .expect("clear O_APPEND with fcntl");
+        file.seek(SeekFrom::Start(0))
+            .expect("seek after clearing O_APPEND");
+        file.write_all(b"AB")
+            .expect("write after clearing O_APPEND");
+        file.sync_all().expect("fsync overwrite without O_APPEND");
+        assert_eq!(
+            fixture.remote_read(&library, "append-toggle.txt", 16),
+            b"AB23456789",
+            "cleared O_APPEND must honor the explicit offset"
+        );
+
+        fcntl(&file, FcntlArg::F_SETFL(flags)).expect("restore O_APPEND with fcntl");
+        file.seek(SeekFrom::Start(0))
+            .expect("seek is ignored when O_APPEND is restored");
+        file.write_all(b"CD")
+            .expect("write after restoring O_APPEND");
+        file.sync_all().expect("fsync appended write");
+        assert_eq!(
+            fixture.remote_read(&library, "append-toggle.txt", 16),
+            b"AB23456789CD",
+            "restored O_APPEND must append at the current EOF"
+        );
+        drop(file);
         mounted.unmount();
     }
 }
