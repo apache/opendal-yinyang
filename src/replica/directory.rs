@@ -373,27 +373,47 @@ impl DirectorySync {
             error: None,
         };
 
-        let (snapshot, local_status) = match Replica::scan_read_only(state) {
-            Ok(snapshot) => (
-                Some(snapshot),
-                LocalStatus {
-                    scan: LocalScanState::Clean,
-                    error: None,
-                },
-            ),
-            Err(error) => (
-                None,
-                LocalStatus {
-                    scan: LocalScanState::Failed,
-                    error: Some(error.to_string()),
-                },
-            ),
+        let (snapshot, scan_error) = match Replica::scan_read_only(state) {
+            Ok(snapshot) => (Some(snapshot), None),
+            Err(error) => (None, Some(error.to_string())),
         };
 
         let store = crate::replica::state::Store::open_read_only(&state.join("replica.db"))?;
         let baseline = store.load_baseline()?;
         let work = store.work()?;
         let sync_inspect = Sync::inspect(state).await.ok();
+
+        // Local scan state is classified against the stored common baseline so
+        // it stays truthful even while the remote is unavailable.
+        let local_status = match (&snapshot, &scan_error) {
+            (Some(snapshot), _) => {
+                let changed = match &baseline {
+                    Some(baseline) => {
+                        let mut probe: BTreeSet<String> = BTreeSet::new();
+                        probe.extend(baseline.local.nodes().keys().cloned());
+                        probe.extend(snapshot.nodes().keys().cloned());
+                        probe.iter().any(|path| {
+                            !path.is_empty()
+                                && local_action(baseline.local.get(path), snapshot.get(path))
+                                    != Action::None
+                        })
+                    }
+                    None => snapshot.len() > 1,
+                };
+                LocalStatus {
+                    scan: if changed {
+                        LocalScanState::Changed
+                    } else {
+                        LocalScanState::Clean
+                    },
+                    error: None,
+                }
+            }
+            (None, error) => LocalStatus {
+                scan: LocalScanState::Failed,
+                error: error.clone(),
+            },
+        };
 
         let mut paths: BTreeSet<String> = BTreeSet::new();
         if let Some(baseline) = &baseline {
@@ -1765,6 +1785,7 @@ impl<'a> Context<'a> {
             parent_revision,
         )?;
         let revision = self.sync.publish(edit).await?;
+        self.revision = revision;
         let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
@@ -1811,6 +1832,7 @@ impl<'a> Context<'a> {
             parent_revision,
         )?;
         let revision = self.sync.publish(edit).await?;
+        self.revision = revision;
         let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
@@ -1845,6 +1867,7 @@ impl<'a> Context<'a> {
             predicate,
         )?;
         let revision = self.sync.publish(edit).await?;
+        self.revision = revision;
         self.revisions.insert(path.to_owned(), revision);
         self.accept_local(path, node, remote_node, revision).await?;
         self.replica
@@ -1874,6 +1897,7 @@ impl<'a> Context<'a> {
             predicate,
         )?;
         let revision = self.sync.publish(edit).await?;
+        self.revision = revision;
         self.nodes.remove(path);
         self.revisions.remove(path);
         self.replica.store_mut().remove_baseline_path(path)?;
@@ -1913,6 +1937,7 @@ impl<'a> Context<'a> {
             predicate,
         )?;
         let revision = self.sync.publish(edit).await?;
+        self.revision = revision;
         // The rename receipt proves the namespace move, never a concurrent
         // content edit. Preserve the previously accepted fingerprint for `to`.
         self.migrate_baseline_path(from, to, revision).await?;
@@ -2042,13 +2067,11 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn entry_revision(&self, path: &str) -> Revision {
-        self.baseline
-            .remote
-            .get(path)
-            .map(|entry| entry.revision)
-            .or_else(|| self.revisions.get(path).copied())
-            .unwrap_or(self.revision)
+    fn entry_revision(&self, _path: &str) -> Revision {
+        // Stage against the coherent state observed (or produced) earlier in
+        // this run. Sequential namespace work such as a subtree removal needs
+        // its parent predicate to reflect the already-applied child removals.
+        self.revision
     }
 
     #[allow(clippy::too_many_arguments)]
