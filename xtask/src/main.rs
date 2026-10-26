@@ -56,6 +56,7 @@ impl Command {
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
             SubCommand::Macos(cmd) => cmd.run(),
+            SubCommand::TestManagedSync(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
         }
     }
@@ -71,6 +72,10 @@ enum SubCommand {
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+    #[clap(
+        about = "Run real Linux Managed Sync acceptance through yy and ordinary directories (requires isolated S3 settings)."
+    )]
+    TestManagedSync(CommandTestManagedSync),
     #[clap(
         about = "Run real Linux FUSE acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
@@ -256,6 +261,43 @@ struct CommandTest {
 impl CommandTest {
     fn run(self) {
         run_command(make_test_cmd(self.no_capture));
+    }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-managed-sync")]
+struct CommandTestManagedSync {}
+
+impl CommandTestManagedSync {
+    fn run(self) {
+        if !cfg!(target_os = "linux") {
+            panic!("Managed Sync acceptance requires Linux");
+        }
+        for name in [
+            "YINYANG_S3_BUCKET",
+            "YINYANG_S3_ENDPOINT",
+            "YINYANG_S3_REGION",
+            "YINYANG_S3_ACCESS_KEY_ID",
+            "YINYANG_S3_SECRET_ACCESS_KEY",
+        ] {
+            if std::env::var_os(name).is_none() {
+                panic!("{name} is unset; Managed Sync acceptance fails hard instead of skipping");
+            }
+        }
+        let mut cmd = find_command("cargo");
+        cmd.args([
+            "test",
+            "-p",
+            "yinyang",
+            "--test",
+            "linux_sync",
+            "managed_sync_",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        run_command(cmd);
     }
 }
 
