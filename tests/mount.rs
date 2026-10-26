@@ -459,8 +459,10 @@ async fn set_executable_conflicts_if_content_changes_after_publish() {
     file.write(0, b"staged").await.unwrap();
     pausing.pause_after_commits(2);
     let mut task = Box::pin(file.set_executable(true));
-    assert_pending(&mut task);
-    pausing.commit_entered.acquire().await.unwrap().forget();
+    tokio::select! {
+        _ = pausing.commit_entered.acquire() => {}
+        _ = &mut task => panic!("mode commit completed before the gate paused"),
+    }
 
     let other_temp = tempfile::tempdir().unwrap();
     let other = Runtime::open(pausing.inner.clone(), other_temp.path())

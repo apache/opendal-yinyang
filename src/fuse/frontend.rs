@@ -221,17 +221,44 @@ impl Inner {
     /// Attributes for an open handle: the staged length is authoritative so
     /// `fstat` and read bytes describe the same pinned version.
     async fn handle_attr(&self, open: &OpenFile) -> Result<FileAttr, fuser::Errno> {
-        let status = open.file.status().await.map_err(|e| runtime_errno(&e))?;
-        let cached = { guard(&self.inodes).cached(open.node) };
-        let ino = self.inode_for(open.node, None)?;
-        Ok(attribute(
+        self.shared_attr(open.node).await?.ok_or(fuser::Errno::EIO)
+    }
+
+    /// Attributes for a node with a shared Mount handle. The staged length and
+    /// the handle's base revision come from the same record, and kind/executable
+    /// are read from that same revision, so path `stat` cannot disagree with
+    /// `fstat`/read bytes while the node is pinned or dirty.
+    async fn shared_attr(&self, id: NodeId) -> Result<Option<FileAttr>, fuser::Errno> {
+        let status = match self.mount.node_status(id).await {
+            Ok(Some(status)) => status,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(runtime_errno(&error)),
+        };
+        let snapshot = self
+            .mount
+            .authority()
+            .observe_revision(status.remote_revision)
+            .await
+            .map_err(|e| core_errno(&e))?;
+        let node = snapshot
+            .node(id)
+            .await
+            .map_err(|e| core_errno(&e))?
+            .ok_or(fuser::Errno::EIO)?;
+        let info = CachedInfo {
+            directory: node.is_directory(),
+            executable: node.executable(),
+            generation: node.generation(),
+        };
+        let ino = self.inode_for(id, Some(info))?;
+        Ok(Some(attribute(
             ino,
-            cached.is_some_and(|info| info.directory),
-            cached.is_some_and(|info| info.executable),
+            info.directory,
+            info.executable,
             status.length,
             status.remote_revision,
             self.read_only,
-        ))
+        )))
     }
 
     async fn lookup(&self, parent: INodeNo, name: String, reply: ReplyEntry) {
@@ -247,11 +274,18 @@ impl Inner {
             Ok(None) => return reply.error(fuser::Errno::ENOENT),
             Err(error) => return reply.error(core_errno(&error)),
         };
-        match self.snapshot_attr(&snapshot, entry.node_id).await {
-            Ok(attr) => {
+        match self.shared_attr(entry.node_id).await {
+            Ok(Some(attr)) => {
                 self.remember_lookup(attr.ino);
                 reply.entry(&ATTR_TTL, &attr, Generation(0));
             }
+            Ok(None) => match self.snapshot_attr(&snapshot, entry.node_id).await {
+                Ok(attr) => {
+                    self.remember_lookup(attr.ino);
+                    reply.entry(&ATTR_TTL, &attr, Generation(0));
+                }
+                Err(errno) => reply.error(errno),
+            },
             Err(errno) => reply.error(errno),
         }
     }
@@ -272,8 +306,12 @@ impl Inner {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),
         };
-        match self.snapshot_attr(&snapshot, id).await {
-            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+        match self.shared_attr(id).await {
+            Ok(Some(attr)) => reply.attr(&ATTR_TTL, &attr),
+            Ok(None) => match self.snapshot_attr(&snapshot, id).await {
+                Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+                Err(errno) => reply.error(errno),
+            },
             Err(errno) => reply.error(errno),
         }
     }
@@ -380,41 +418,7 @@ impl Inner {
     }
 
     async fn status_attr(&self, id: NodeId) -> Result<FileAttr, fuser::Errno> {
-        let status = self
-            .mount
-            .node_status(id)
-            .await
-            .map_err(|e| runtime_errno(&e))?
-            .ok_or(fuser::Errno::ESTALE)?;
-        let cached = { guard(&self.inodes).cached(id) };
-        let (directory, executable, ino) = if let Some(info) = cached {
-            (info.directory, info.executable, self.inode_for(id, None)?)
-        } else {
-            let snapshot = self.observe().await?;
-            let node = snapshot
-                .node(id)
-                .await
-                .map_err(|e| core_errno(&e))?
-                .ok_or(fuser::Errno::ESTALE)?;
-            let info = CachedInfo {
-                directory: node.is_directory(),
-                executable: node.executable(),
-                generation: node.generation(),
-            };
-            (
-                info.directory,
-                info.executable,
-                self.inode_for(id, Some(info))?,
-            )
-        };
-        Ok(attribute(
-            ino,
-            directory,
-            executable,
-            status.length,
-            status.remote_revision,
-            self.read_only,
-        ))
+        self.shared_attr(id).await?.ok_or(fuser::Errno::ESTALE)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1335,5 +1339,45 @@ impl Filesystem for FuseFrontend {
         reply: fuser::ReplyLseek,
     ) {
         reply.error(fuser::Errno::ENOSYS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BackendProfile, Fs};
+    use crate::support::TestBackend;
+    use std::sync::Arc;
+    use yinyang_core::Authority;
+
+    #[tokio::test]
+    async fn dirty_shared_node_reports_staged_size_in_path_attrs() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let mount = Mount::open(authority.clone(), temp.path(), false)
+            .await
+            .unwrap();
+        let (id, _) = mount
+            .namespace()
+            .create_file_with_node(authority.root(), "file", false)
+            .await
+            .unwrap();
+        let file = mount.open_node(id, true).await.unwrap();
+        file.write(0, b"dirty").await.unwrap();
+        let inner = Arc::new(Inner::with_read_only(
+            mount,
+            tokio::runtime::Handle::current(),
+            false,
+        ));
+        let status = file.status().await.unwrap();
+        let attr = inner.shared_attr(id).await.unwrap().unwrap();
+        assert_eq!(attr.size, status.length);
+        assert_eq!(attr.size, 5);
+        assert_eq!(attr.ino, inner.inode_for(id, None).unwrap());
     }
 }

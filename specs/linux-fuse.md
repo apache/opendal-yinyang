@@ -152,10 +152,14 @@ map to the narrow errno intended for each operation; unknown identity is
 
 ## Cancellation and exit
 
-The binding answers `FUSE_INTERRUPT` with `ENOSYS`; the kernel ignores that
-reply, so an interrupted syscall does not cancel in-flight remote work. Each
-operation still completes and replies exactly once. Interrupted callers may
-observe `EINTR` while the underlying read or scan runs to completion.
+The binding answers `FUSE_INTERRUPT` with `ENOSYS`, and the frontend does not
+negotiate any per-request cancellation extension. There is therefore no
+per-request cancellation: once a FUSE request has been delivered to this
+daemon, the kernel keeps waiting for its reply until it is answered or the
+connection aborts, regardless of signals such as `SIGKILL` on the caller.
+This frontend does not promise `EINTR` or that an interrupted caller returns
+promptly. Each operation still completes and replies exactly once; teardown
+only stops the request channel at process exit.
 
 The session runs in the foreground. Teardown waits on both the session end and
 SIGINT/SIGTERM: an external `fusermount3 -u` ends the session loop and the
