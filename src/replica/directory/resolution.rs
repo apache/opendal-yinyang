@@ -304,6 +304,7 @@ impl DirectorySync {
                         .store_mut()
                         .remove_baseline_subtree(&record.path)?;
                 }
+                self.refresh_parent_baseline(path, revision).await?;
                 self.clear_resolved_conflict(&record.id)?;
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
@@ -501,6 +502,7 @@ impl DirectorySync {
         match self.sync.publish(edit).await {
             Ok(published) => {
                 let accepted = self.install_chosen_bytes(path, bytes, executable, local)?;
+                self.refresh_parent_baseline(path, published).await?;
                 if self
                     .apply_resolved_baseline(
                         record,
@@ -560,6 +562,7 @@ impl DirectorySync {
         match self.sync.publish(edit).await {
             Ok(revision) => {
                 let accepted = self.install_chosen_bytes(path, bytes, executable, local)?;
+                self.refresh_parent_baseline(path, revision).await?;
                 if self
                     .apply_resolved_baseline(
                         record,
@@ -672,6 +675,7 @@ impl DirectorySync {
                         created.insert(entry.clone(), node_id);
                         self.confirm_baseline(entry, &local, node_id, published)
                             .await?;
+                        self.refresh_parent_baseline(entry, published).await?;
                         self.replica.store_mut().update_work(
                             edit.as_bytes(),
                             "committed",
@@ -719,6 +723,7 @@ impl DirectorySync {
                         running = published;
                         self.confirm_baseline(entry, &local, node_id, published)
                             .await?;
+                        self.refresh_parent_baseline(entry, published).await?;
                         self.replica.store_mut().update_work(
                             edit.as_bytes(),
                             "committed",
@@ -794,6 +799,7 @@ impl DirectorySync {
                     created.insert(path.to_string(), node_id);
                     self.confirm_baseline_for(path, local.as_ref(), node_id, published)
                         .await?;
+                    self.refresh_parent_baseline(*path, published).await?;
                     self.replica.store_mut().update_work(
                         edit.as_bytes(),
                         "committed",
