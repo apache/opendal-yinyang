@@ -705,6 +705,7 @@ impl DirectorySync {
                 revision: observed.revision(),
                 nodes: BTreeMap::new(),
                 revisions: BTreeMap::new(),
+                dirty: BTreeSet::new(),
             };
             ctx.reconcile().await?;
         }
@@ -1298,6 +1299,9 @@ struct Context<'a> {
     revision: Revision,
     nodes: BTreeMap<String, NodeId>,
     revisions: BTreeMap<String, Revision>,
+    /// Paths whose remote namespace we changed earlier in this run; their
+    /// staging predicate must reflect those receipts.
+    dirty: BTreeSet<String>,
 }
 
 impl<'a> Context<'a> {
@@ -1789,6 +1793,7 @@ impl<'a> Context<'a> {
         let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
+        self.mark_parent_dirty(path);
         if let Some(local) = self.current.get(path) {
             self.accept_local(path, local, node_id, revision).await?;
         }
@@ -1836,6 +1841,7 @@ impl<'a> Context<'a> {
         let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
+        self.mark_parent_dirty(path);
         self.accept_local(path, node, node_id, revision).await?;
         self.replica
             .store_mut()
@@ -1900,6 +1906,7 @@ impl<'a> Context<'a> {
         self.revision = revision;
         self.nodes.remove(path);
         self.revisions.remove(path);
+        self.mark_parent_dirty(path);
         self.replica.store_mut().remove_baseline_path(path)?;
         self.replica
             .store_mut()
@@ -1940,6 +1947,8 @@ impl<'a> Context<'a> {
         self.revision = revision;
         // The rename receipt proves the namespace move, never a concurrent
         // content edit. Preserve the previously accepted fingerprint for `to`.
+        self.mark_parent_dirty(from);
+        self.mark_parent_dirty(to);
         self.migrate_baseline_path(from, to, revision).await?;
         self.replica
             .store_mut()
@@ -2067,11 +2076,25 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn entry_revision(&self, _path: &str) -> Revision {
-        // Stage against the coherent state observed (or produced) earlier in
-        // this run. Sequential namespace work such as a subtree removal needs
-        // its parent predicate to reflect the already-applied child removals.
-        self.revision
+    fn entry_revision(&self, path: &str) -> Revision {
+        // Preserve each path's own accepted revision, except where our earlier
+        // namespace receipts in this run changed that path; then stage against
+        // the running revision. This keeps unrelated paths from being rebased
+        // onto a newer global revision (which could hide an external edit).
+        if self.dirty.contains(path) {
+            return self.revision;
+        }
+        self.revisions
+            .get(path)
+            .copied()
+            .or_else(|| self.baseline.remote.get(path).map(|entry| entry.revision))
+            .unwrap_or(self.revision)
+    }
+
+    /// A path whose parent directory entry list we changed this run.
+    fn mark_parent_dirty(&mut self, path: &str) {
+        let (parent, _) = split(path);
+        self.dirty.insert(parent.to_owned());
     }
 
     #[allow(clippy::too_many_arguments)]
