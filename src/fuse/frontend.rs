@@ -42,7 +42,7 @@
 //! exit is the actual point where remaining tasks are dropped.
 
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE, attribute};
-use super::inode::{CachedInfo, InodeTable, ROOT_INODE};
+use super::inode::{CachedInfo, InodeTable};
 use crate::mount::{Mount, MountFile};
 use fuser::{
     AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -122,19 +122,19 @@ impl Inner {
         if let Some(info) = info {
             inodes.cache(id, info);
         }
-        inodes.inode(id).map_err(|_| fuser::Errno::EIO)
+        inodes.inode(id).map(INodeNo).map_err(|_| fuser::Errno::EIO)
     }
 
     fn node(&self, ino: INodeNo) -> Option<NodeId> {
-        guard(&self.inodes).node(ino)
+        guard(&self.inodes).node(ino.0)
     }
 
     fn remember_lookup(&self, ino: INodeNo) {
-        guard(&self.inodes).remember_lookup(ino);
+        guard(&self.inodes).remember_lookup(ino.0);
     }
 
     fn forget(&self, ino: INodeNo, count: u64) {
-        guard(&self.inodes).forget(ino, count);
+        guard(&self.inodes).forget(ino.0, count);
     }
 
     fn open_file(&self, fh: FileHandle) -> Option<Arc<OpenFile>> {
@@ -187,7 +187,7 @@ impl Inner {
     /// `fstat` and read bytes describe the same pinned version.
     async fn handle_attr(&self, open: &OpenFile) -> Result<FileAttr, fuser::Errno> {
         let status = open.file.status().await.map_err(|e| runtime_errno(&e))?;
-        let cached = guard(&self.inodes).cached(open.node);
+        let cached = { guard(&self.inodes).cached(open.node) };
         let ino = self.inode_for(open.node, None)?;
         Ok(attribute(
             ino,
@@ -315,7 +315,7 @@ impl Inner {
                 Err(errno) => return reply.error(errno),
             },
             // The root's "." and ".." both denote itself.
-            None => ROOT_INODE,
+            None => INodeNo::ROOT,
         };
         guard(&self.inodes).cache(
             id,
@@ -423,7 +423,10 @@ impl Inner {
         snapshot: &Snapshot,
         id: NodeId,
     ) -> Result<(INodeNo, FileType), fuser::Errno> {
-        if let Some(info) = guard(&self.inodes).cached(id) {
+        // Release the inode-table guard before `inode_for` reacquires it;
+        // an `if let` scrutinee would keep the temporary guard alive.
+        let cached = { guard(&self.inodes).cached(id) };
+        if let Some(info) = cached {
             let ino = self.inode_for(id, None)?;
             return Ok((ino, entry_kind(info.directory)));
         }
