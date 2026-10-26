@@ -49,6 +49,8 @@ use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Mount a validated read-only or writable FUSE volume in the foreground.
 ///
 /// `staging` must already be resolved to an absolute path by the CLI.
