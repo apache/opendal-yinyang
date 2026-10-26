@@ -106,6 +106,13 @@ pub struct Fixture {
     last_service_address: Option<SocketAddr>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SyncPaths {
+    pub config: PathBuf,
+    pub directory: PathBuf,
+    pub state: PathBuf,
+}
+
 impl Fixture {
     pub fn new(publication: Publication) -> Self {
         require_acceptance();
@@ -124,7 +131,9 @@ impl Fixture {
             last_service_address: None,
         };
         match publication {
-            Publication::Object => fixture.yy_ok(&["create"]),
+            Publication::Object => {
+                fixture.yy_ok(&["create"]);
+            }
             Publication::Service => fixture.spawn_service(),
         };
         fixture
@@ -165,6 +174,116 @@ impl Fixture {
         let output = self.yy(args);
         output.success_or(&format!("yy {args:?}"));
         output
+    }
+
+    pub fn sync_paths(&self, name: &str) -> SyncPaths {
+        let directory = self.path(format!("{name}-root"));
+        let state = self.path(format!("{name}-state"));
+        let config = self.path(format!("{name}.json"));
+        let mut value = serde_json::json!({
+            "name": name,
+            "model": "managed",
+            "access": "sync",
+            "frontend": "library",
+            "publication": self.publication.as_str(),
+            "storage_profile": "minio",
+            "staging": state,
+            "read_only": false,
+            "require": [],
+        });
+        if self.publication == Publication::Service {
+            value["service_address"] =
+                serde_json::Value::String(self.service_address().to_string());
+        }
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(&value).expect("serialize sync volume config"),
+        )
+        .unwrap_or_else(|error| panic!("write sync config {}: {error}", config.display()));
+        SyncPaths {
+            config,
+            directory,
+            state,
+        }
+    }
+
+    pub fn sync_client(&self, name: &str) -> SyncPaths {
+        let paths = self.sync_paths(name);
+        fs::create_dir(&paths.directory).unwrap_or_else(|error| {
+            panic!("create local root {}: {error}", paths.directory.display())
+        });
+        self.sync_init(&paths);
+        paths
+    }
+
+    pub fn sync_init(&self, paths: &SyncPaths) {
+        self.yy_ok(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "init",
+            "--directory",
+            text(&paths.directory),
+        ]);
+    }
+
+    pub fn sync_run(&self, paths: &SyncPaths) -> Captured {
+        self.yy(&["--volume", text(&paths.config), "sync", "run"])
+    }
+
+    pub fn sync_run_ok(&self, paths: &SyncPaths) -> Captured {
+        let output = self.sync_run(paths);
+        output.success_or(&format!("yy sync run for {}", paths.directory.display()));
+        output
+    }
+
+    pub fn sync_status(&self, paths: &SyncPaths) -> serde_json::Value {
+        let output = self.yy_ok(&["--volume", text(&paths.config), "sync", "status", "--json"]);
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "parse sync status JSON for {}: {error}\nstdout:\n{}",
+                paths.directory.display(),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    }
+
+    pub fn sync_export(&self, paths: &SyncPaths, conflict: &str, side: &str, output: &Path) {
+        self.yy_ok(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "export",
+            conflict,
+            "--side",
+            side,
+            "--output",
+            text(output),
+        ]);
+    }
+
+    pub fn sync_resolve_keep(&self, paths: &SyncPaths, conflict: &str, side: &str) {
+        self.yy_ok(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "resolve",
+            conflict,
+            "--keep",
+            side,
+        ]);
+    }
+
+    pub fn sync_resolve_content(&self, paths: &SyncPaths, conflict: &str, content: &Path) {
+        self.yy_ok(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "resolve",
+            conflict,
+            "--content",
+            text(content),
+        ]);
     }
 
     fn spawn_service(&mut self) {
@@ -311,7 +430,7 @@ impl Fixture {
             .unwrap_or_else(|error| panic!("create remote directory {path}: {error}"))
     }
 
-    pub fn remote_create_file(&self, path: &str, bytes: &[u8], executable: bool) -> Receipt {
+    pub fn remote_create_file(&self, path: &str, mut bytes: &[u8], executable: bool) -> Receipt {
         let authority = self.remote_authority();
         runtime()
             .block_on(async {
@@ -326,7 +445,7 @@ impl Fixture {
             .unwrap_or_else(|error| panic!("create remote file {path}: {error}"))
     }
 
-    pub fn remote_write_file(&self, path: &str, bytes: &[u8]) -> Receipt {
+    pub fn remote_write_file(&self, path: &str, mut bytes: &[u8]) -> Receipt {
         let authority = self.remote_authority();
         runtime()
             .block_on(async {
@@ -346,7 +465,7 @@ impl Fixture {
             .unwrap_or_else(|error| panic!("write remote file {path}: {error}"))
     }
 
-    pub fn remote_rename(&self, source: &str, destination: &str) -> Receipt {
+    pub fn remote_rename(&self, source: &str, target: &str) -> Receipt {
         let authority = self.remote_authority();
         runtime()
             .block_on(async {
@@ -355,12 +474,12 @@ impl Fixture {
                     .resolve(source)
                     .await?
                     .ok_or_else(|| invalid(format!("remote source {source} is missing")))?;
-                let (parent, name) = destination(&snapshot, destination).await?;
+                let (parent, name) = destination(&snapshot, target).await?;
                 let mut plan = Planner::new(&snapshot, yinyang::core::CommitId::generate());
                 plan.rename(node.id(), parent, &name).await?;
                 commit(&authority, plan).await
             })
-            .unwrap_or_else(|error| panic!("rename remote {source} to {destination}: {error}"))
+            .unwrap_or_else(|error| panic!("rename remote {source} to {target}: {error}"))
     }
 
     pub fn remote_remove(&self, path: &str) -> Receipt {
@@ -578,7 +697,7 @@ async fn destination(
     Ok((parent.id(), name.to_owned()))
 }
 
-async fn commit(authority: &Arc<dyn Authority>, plan: Planner<'_>) -> CoreResult<Receipt> {
+async fn commit(authority: &Arc<dyn Authority>, plan: Planner) -> CoreResult<Receipt> {
     match authority.commit(&plan.finish()?).await? {
         CommitOutcome::Committed(receipt) => Ok(receipt),
         CommitOutcome::Conflict => Err(invalid("independent remote mutation conflicted")),
@@ -606,6 +725,11 @@ fn join(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+fn text(path: &Path) -> &str {
+    path.to_str()
+        .unwrap_or_else(|| panic!("acceptance path is not UTF-8: {}", path.display()))
 }
 
 fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
