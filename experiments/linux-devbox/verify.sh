@@ -24,7 +24,7 @@ state_dir="$HOME/.local/state/yinyang-devbox"
 mkdir -p "$state_dir"
 exec > >(tee -a "$state_dir/verify.log") 2>&1
 finish() {
-    result=$?
+    result=${1:-$?}
     printf '%s\n' "$result" > "$state_dir/verify.exit.tmp"
     mv "$state_dir/verify.exit.tmp" "$state_dir/verify.exit"
 }
@@ -62,7 +62,7 @@ cleanup_fuse() {
     wait "$fuse_pid" || true
     rmdir "$mount_dir"
 }
-trap 'cleanup_fuse; finish' EXIT
+trap 'exit_code=$?; cleanup_fuse; finish "$exit_code"' EXIT
 for attempt in {1..30}; do
     if mountpoint -q "$mount_dir"; then break; fi
     sleep 1
