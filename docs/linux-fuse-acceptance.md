@@ -85,6 +85,13 @@ cargo x test-linux-fuse --read-only
   until the handle reports `frozen: true`, then killing the mount daemon
   interrupts that pending publication. The authority is untouched and a
   reopened mount replays the frozen request and publishes the staged bytes.
+- Delayed completion with client interruption: a separate Python client opens
+  and writes through `stdin`/`stdout` barriers, the metadata service is paused,
+  `fsync` reaches the frozen boundary, and the client is SIGKILLed. After
+  service recovery the independent authority sees the delayed completion and
+  the daemon remains usable and unmounts normally. This verifies the
+  adapter's ignored interrupt/delayed completion behavior, not real
+  cancellation.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits

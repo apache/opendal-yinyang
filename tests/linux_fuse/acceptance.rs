@@ -22,12 +22,13 @@ use crate::harness::{
 };
 use nix::unistd::truncate;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const EACCES: i32 = 13;
 const ENOSYS: i32 = 38;
@@ -88,6 +89,43 @@ fn assert_staged_size(path: &Path, file: &File, expected: u64, phase: &str) {
         expected,
         "{phase}: path stat must use the same staged length"
     );
+}
+
+fn wait_child(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("wait for helper client: {error}"))
+        {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "helper client did not exit within {timeout:?}; waiting while the service is paused is not allowed"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_remote_bytes(
+    fixture: &Fixture,
+    library: &Path,
+    path: &str,
+    expected: &[u8],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fixture.remote_read(library, path, 128) == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("remote bytes did not reach the delayed completion within {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[test]
@@ -998,6 +1036,68 @@ fn fuse_daemon_crash_interrupts_pending_fsync_service() {
         b"interrupted-local"
     );
     reopened.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_delayed_completion_survives_client_interruption_service() {
+    let fixture = Fixture::new(Publication::Service);
+    let library = fixture.volume_config("lib-delayed", Frontend::Library, false);
+    fixture.library_seed(&library, "delayed.txt", b"seed");
+    let config = fixture.volume_config("stage-delayed", Frontend::Fuse, false);
+    let mountpoint = fixture.temp.path().join("mnt-delayed");
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("delayed.txt");
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/linux_fuse/delayed_client.py");
+    let mut client = Command::new("python3")
+        .arg(script)
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn delayed completion client");
+    let stdout = client.stdout.take().expect("client stdout is piped");
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut line = String::new();
+        if BufReader::new(stdout).read_line(&mut line).is_ok() {
+            let _ = sender.send(line);
+        }
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("client did not reach its write barrier: {error}"));
+    assert_eq!(line.trim(), "READY", "unexpected client barrier: {line:?}");
+
+    fixture.pause_service();
+    client
+        .stdin
+        .as_mut()
+        .expect("client stdin is piped")
+        .write_all(b"FSYNC\n")
+        .expect("send fsync command");
+    let frozen = fixture.wait_for_frozen(&config);
+    println!("delayed fsync reached the frozen publication boundary:\n{frozen}");
+    client.kill().expect("SIGKILL the blocked client");
+    fixture.resume_service();
+    let _ = wait_child(&mut client, Duration::from_secs(30));
+    let _ = reader.join();
+
+    wait_remote_bytes(
+        &fixture,
+        &library,
+        "delayed.txt",
+        b"delayed-payload",
+        Duration::from_secs(60),
+    );
+    assert!(
+        names(mounted.mountpoint()).contains("delayed.txt"),
+        "the daemon must remain available after delayed completion"
+    );
+    mounted.unmount();
 }
 
 #[test]
