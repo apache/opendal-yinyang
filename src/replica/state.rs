@@ -204,7 +204,7 @@ impl Store {
                    replacement_digest BLOB,
                    replacement_length INTEGER,
                    remote_revision BLOB,
-                   artifact TEXT NOT NULL REFERENCES artifacts(id),
+                   artifact TEXT NOT NULL,
                    phase TEXT NOT NULL,
                    error TEXT
                  );
