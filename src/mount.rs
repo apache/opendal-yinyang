@@ -85,6 +85,18 @@ impl Mount {
     pub async fn status(&self) -> Result<RuntimeStatus> {
         self.inner.runtime.status().await
     }
+    /// Observe staged metadata for one shared node without opening a reference.
+    /// `None` means this mount has no shared handle for the node.
+    pub async fn node_status(&self, id: NodeId) -> Result<Option<HandleStatus>> {
+        let node = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes.get(&id).cloned()
+        };
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        node.handle.lock().await.status().await.map(Some)
+    }
     /// Namespace operations use the same conditional runtime contract. Do not
     /// open private FileHandles through this runtime alongside Mount references.
     pub fn namespace(&self) -> &Runtime {
@@ -222,5 +234,10 @@ impl MountFile {
     }
     pub async fn fsync(&self) -> Result<Option<Receipt>> {
         self.node.handle.lock().await.fsync().await
+    }
+    /// Publish staged bytes for a FUSE flush or close that can report errors.
+    /// Dropping or releasing the reference never performs this operation.
+    pub async fn flush(&self) -> Result<Option<Receipt>> {
+        self.fsync().await
     }
 }

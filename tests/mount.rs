@@ -168,3 +168,73 @@ async fn frozen_mount_write_recovers_original_request() {
     mount.reclaim(id).await.unwrap();
     assert!(mount.status().await.unwrap().handles.is_empty());
 }
+
+#[tokio::test]
+async fn flush_publishes_but_reference_release_does_not() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority.clone(), temp.path(), false)
+        .await
+        .unwrap();
+    let (pending, _) = mount
+        .namespace()
+        .create_file_with_node(authority.root(), "pending", false)
+        .await
+        .unwrap();
+    assert!(mount.node_status(pending).await.unwrap().is_none());
+
+    let file = mount.open_node(pending, true).await.unwrap();
+    file.write(0, b"pending").await.unwrap();
+    let state = mount.node_status(pending).await.unwrap().unwrap();
+    assert_eq!(state.length, 7);
+    assert!(state.pending);
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(pending)
+            .await
+            .unwrap()
+            .read(0, 7)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Releasing the shared reference performs no remote publication.
+    drop(file);
+    assert!(mount.node_status(pending).await.unwrap().unwrap().pending);
+    assert_eq!(
+        mount.reclaim(pending).await.unwrap_err().kind(),
+        ErrorKind::Busy
+    );
+
+    let file = mount.open_node(pending, true).await.unwrap();
+    assert_eq!(file.read(0, 7).await.unwrap(), b"pending");
+    file.flush().await.unwrap().unwrap();
+    assert!(!mount.node_status(pending).await.unwrap().unwrap().pending);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(pending)
+            .await
+            .unwrap()
+            .read(0, 7)
+            .await
+            .unwrap(),
+        b"pending"
+    );
+
+    drop(file);
+    assert!(mount.node_status(pending).await.unwrap().is_some());
+    mount.reclaim(pending).await.unwrap();
+    assert!(mount.node_status(pending).await.unwrap().is_none());
+}

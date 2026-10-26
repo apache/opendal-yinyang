@@ -26,6 +26,20 @@ Instance-wide `fsync` visits all nodes, continues after individual failures, and
 returns the first failure. Every failure remains in runtime status. A successful
 local write or an OS close that cannot report errors is not remote completion.
 
+`flush` is the named publication attempt for a frontend close path that can
+report errors. It performs the same conditional publication as `fsync` and
+never reports success before the remote result is durable. Dropping or
+releasing the reference is different: it performs no I/O, publication or
+staging deletion. Pending, frozen and failed states remain recoverable, and
+`reclaim` rejects them. A frontend whose release callback cannot report errors
+must not use release as an implicit flush; if its kernel omits a reportable
+flush, the bytes remain staged rather than being acknowledged as remote.
+
+`node_status` observes the shared staged metadata for one NodeId without
+opening another reference. It reports the same staged length and
+pending/frozen/error state used by reads, so attribute paths do not have to
+materialize or refresh a file merely to inspect its accepted local state.
+
 `refresh` replaces a clean staged observation with a fresh remote version for
 all references. It rejects pending, frozen and failed states; it never silently
 rebases writes. Failure to fetch leaves the old version available. Interrupted
