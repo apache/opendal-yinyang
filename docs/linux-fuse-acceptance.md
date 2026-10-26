@@ -61,7 +61,11 @@ cargo x test-linux-fuse --read-only
   descriptor, an independent in-process authority renames `a` to `b`, changes
   `b`, and adds `new.txt`; SIGHUP must emit a native invalidation notification,
   the same mount must expose the new namespace, and the old descriptor must
-  retain its bytes and fstat until it is closed.
+  retain its bytes and fstat until it is closed. The grounded
+  `yy: fuse refresh: done (inode=N entries=N errors=N)` line must report
+  positive inode/entry counts and zero errors before namespace assertions;
+  notification counts prove the native calls were accepted, while the
+  namespace and pinned-fd assertions prove their effect.
 - Path truncate: real `truncate(2)` without an open descriptor commits its
   shrink/extend result to the independent authority at an explicit boundary.
 - Limited chmod: `0644 <-> 0755` is observable, while non-representable modes

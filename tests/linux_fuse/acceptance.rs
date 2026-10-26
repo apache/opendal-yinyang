@@ -138,6 +138,31 @@ fn wait_remote_bytes(
     }
 }
 
+fn refresh_counts(line: &str) -> (u64, u64, u64) {
+    let fields = line
+        .split_once("done (")
+        .and_then(|(_, rest)| rest.trim().strip_suffix(')'))
+        .expect("refresh completion line has counts");
+    let mut inode = None;
+    let mut entries = None;
+    let mut errors = None;
+    for field in fields.split_whitespace() {
+        let (key, value) = field.split_once('=').expect("refresh count field");
+        let value = value.parse::<u64>().expect("numeric refresh count");
+        match key {
+            "inode" => inode = Some(value),
+            "entries" => entries = Some(value),
+            "errors" => errors = Some(value),
+            other => panic!("unexpected refresh count field {other}"),
+        }
+    }
+    (
+        inode.expect("inode count"),
+        entries.expect("entries count"),
+        errors.expect("errors count"),
+    )
+}
+
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
 fn fuse_read_only_cached_readdir_and_nested_inodes_both_publications() {
@@ -915,11 +940,17 @@ fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
         fixture.remote_write(&library, "new.txt", b"added");
 
         mounted.refresh_sighup();
-        let refresh_log = mounted.wait_for_output("refresh", Duration::from_secs(30));
-        let lower = refresh_log.to_ascii_lowercase();
+        let refresh_log =
+            mounted.wait_for_output_line("yy: fuse refresh: done (", Duration::from_secs(30));
+        let completion = refresh_log
+            .lines()
+            .find(|line| line.contains("yy: fuse refresh: done ("))
+            .expect("refresh completion line");
+        let (inode_count, entry_count, error_count) = refresh_counts(completion);
         assert!(
-            lower.contains("notif") || lower.contains("inval"),
-            "refresh must report the native invalidation notification, not just a TTL result:\n{refresh_log}"
+            inode_count > 0 && entry_count > 0 && error_count == 0,
+            "refresh must acknowledge native notifications (inode={inode_count} \
+             entries={entry_count} errors={error_count}):\n{refresh_log}"
         );
 
         assert_errno(

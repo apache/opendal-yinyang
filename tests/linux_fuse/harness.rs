@@ -847,11 +847,14 @@ impl Mounted {
         kill(pid, Signal::SIGHUP).expect("send SIGHUP without exec");
     }
 
-    pub fn wait_for_output(&self, needle: &str, timeout: Duration) -> String {
+    pub fn wait_for_output_line(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
             let output = self.output_text();
-            if output.contains(needle) {
+            if output
+                .lines()
+                .any(|line| line.contains(needle) && line.trim_end().ends_with(')'))
+            {
                 return output;
             }
             if Instant::now() >= deadline {
