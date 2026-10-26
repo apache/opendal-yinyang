@@ -95,6 +95,48 @@ async fn capability_intersection_and_startup_rejection_precede_visibility() {
     assert!(VolumeConfig::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
 }
 #[tokio::test]
+async fn fuse_frontend_admits_only_read_only_managed_mounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let cfg = VolumeConfig {
+        frontend: Frontend::Fuse,
+        read_only: true,
+        require: BTreeSet::new(),
+        ..config(temp.path().join("state"))
+    };
+    let caps = cfg.capabilities(&backend.operator());
+    let expected: CapabilitySet = [
+        Capability::Read,
+        Capability::List,
+        Capability::StableIdentity,
+        Capability::PinnedReads,
+        Capability::RetainedUnlinkRead,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(caps.frontend, expected);
+    assert_eq!(caps.effective, expected);
+    assert!(!caps.effective.contains(&Capability::RecoverableStaging));
+    if cfg!(target_os = "linux") {
+        assert!(cfg.validate(&backend.operator()).is_ok());
+    } else {
+        assert!(cfg.validate(&backend.operator()).is_err());
+    }
+    for invalid in [
+        VolumeConfig {
+            read_only: false,
+            ..cfg.clone()
+        },
+        VolumeConfig {
+            service_address: Some("0.0.0.0:7447".parse().unwrap()),
+            publication: Publication::Service,
+            ..cfg.clone()
+        },
+    ] {
+        assert!(invalid.validate(&backend.operator()).is_err());
+    }
+}
+#[tokio::test]
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
