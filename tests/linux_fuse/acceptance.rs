@@ -510,7 +510,6 @@ fn fuse_append_flag_toggle_both_publications() {
 
         let mut file = OpenOptions::new()
             .read(true)
-            .write(true)
             .append(true)
             .open(&path)
             .expect("open with O_APPEND");
@@ -1318,7 +1317,7 @@ fn interrupt_pending_fsync(
         let _ = sender.send(in_flight.sync_all());
     });
     gate.wait_ready(Duration::from_secs(30));
-    let frozen = fixture.wait_for_frozen(&config);
+    let frozen = fixture.wait_for_frozen(config);
     println!("fsync reached the frozen publication boundary:\n{frozen}");
     match interrupt {
         Interrupt::Kill => mounted.kill_daemon_only(),
@@ -1331,7 +1330,7 @@ fn interrupt_pending_fsync(
         }
     }
     assert_eq!(
-        fixture.remote_read(&library, "interrupted.txt", 64),
+        fixture.remote_read(library, "interrupted.txt", 64),
         b"seed",
         "the authority must remain unchanged while the frozen commit connection is gated"
     );
@@ -1354,7 +1353,7 @@ fn interrupt_pending_fsync(
         fixture.publication().as_str()
     ));
     fs::create_dir(&mountpoint).expect("create reopen mountpoint");
-    let mut reopened = fixture.mount(&config, &mountpoint);
+    let mut reopened = fixture.mount(config, &mountpoint);
     assert_eq!(
         fs::read(reopened.mountpoint().join("interrupted.txt")).expect("read staged recovery"),
         b"interrupted-local"
@@ -1366,7 +1365,7 @@ fn interrupt_pending_fsync(
     publish.sync_all().expect("recovered handle publishes");
     drop(publish);
     assert_eq!(
-        fixture.remote_read(&library, "interrupted.txt", 64),
+        fixture.remote_read(library, "interrupted.txt", 64),
         b"interrupted-local"
     );
     reopened.unmount();

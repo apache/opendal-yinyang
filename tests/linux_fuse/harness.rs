@@ -57,10 +57,6 @@ pub struct Captured {
 }
 
 impl Captured {
-    pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).trim().to_owned()
-    }
-
     pub fn success_or(&self, context: &str) {
         assert!(
             self.status.success(),
@@ -322,28 +318,6 @@ impl Fixture {
             .map(|service| service.address)
             .or(self.last_service_address)
             .expect("service publication requires a running metadata service")
-    }
-
-    pub fn pause_service(&self) {
-        let pid = self
-            .service
-            .as_ref()
-            .expect("service publication requires a running metadata service")
-            .child
-            .id();
-        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP)
-            .expect("pause metadata service without exec");
-    }
-
-    pub fn resume_service(&self) {
-        let pid = self
-            .service
-            .as_ref()
-            .expect("service publication requires a running metadata service")
-            .child
-            .id();
-        kill(Pid::from_raw(pid as i32), Signal::SIGCONT)
-            .expect("resume metadata service without exec");
     }
 
     /// Polls the existing no-lease status entry until a handle reports the
@@ -796,13 +770,6 @@ impl Mounted {
             }
             thread::sleep(Duration::from_millis(50));
         }
-    }
-
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.wait_exit(Duration::from_secs(30));
-        self.unmount_force();
-        self.assert_staging_lease_released();
     }
 
     /// Stop the daemon without spawning a cleanup helper while a dirty FUSE
