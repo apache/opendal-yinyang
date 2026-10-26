@@ -35,8 +35,10 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
   path must not exist.
 - `resolve` applies one durable decision to an active conflict: `--keep` selects
   the local or remote observation, `--content` adopts explicit bytes from a file.
-  The decision is durable and is published through the same work/receipt path as
-  an ordinary edit.
+  A decision that publishes local bytes goes through the same work/receipt path
+  as an ordinary edit; keeping the remote observation applies the recorded remote
+  state locally without a new publish, and an already-matching choice can be a
+  no-op.
 
 ## Admission
 
