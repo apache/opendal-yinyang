@@ -75,6 +75,9 @@ pub(super) struct Inner {
 struct OpenFile {
     node: NodeId,
     file: MountFile,
+    /// Metadata from the exact observation the staged version was
+    /// materialized from, so path stats and fstat agree with read bytes.
+    base: CachedInfo,
 }
 
 #[derive(Clone)]
@@ -141,6 +144,15 @@ impl Inner {
         guard(&self.files).get(&fh.0).cloned()
     }
 
+    /// Any active open for a node. `Mount::open_node` reuses the node's shared
+    /// staged version, so all handles for one node report the same base.
+    fn open_for_node(&self, id: NodeId) -> Option<Arc<OpenFile>> {
+        guard(&self.files)
+            .values()
+            .find(|open| open.node == id)
+            .cloned()
+    }
+
     fn dir_cursor(&self, fh: FileHandle) -> Option<Arc<AsyncMutex<DirCursor>>> {
         guard(&self.dirs).get(&fh.0).cloned()
     }
@@ -183,19 +195,30 @@ impl Inner {
         ))
     }
 
-    /// Attributes for an open handle: the staged length is authoritative so
-    /// `fstat` and read bytes describe the same pinned version.
+    /// Attributes for an open handle: the staged length and the base
+    /// observation are authoritative, so `fstat`, path stats and read bytes
+    /// describe the same pinned version.
     async fn handle_attr(&self, open: &OpenFile) -> Result<FileAttr, fuser::Errno> {
         let status = open.file.status().await.map_err(|e| runtime_errno(&e))?;
-        let cached = { guard(&self.inodes).cached(open.node) };
         let ino = self.inode_for(open.node, None)?;
         Ok(attribute(
             ino,
-            cached.is_some_and(|info| info.directory),
-            cached.is_some_and(|info| info.executable),
+            open.base.directory,
+            open.base.executable,
             status.length,
             status.remote_revision,
         ))
+    }
+
+    /// Metadata for one inode. While any open handle exists, the staged/base
+    /// version wins over the latest remote observation so the kernel attr
+    /// cache cannot mix an external size with staged bytes for the same inode.
+    async fn attr_for(&self, snapshot: &Snapshot, id: NodeId) -> Result<FileAttr, fuser::Errno> {
+        if let Some(open) = self.open_for_node(id) {
+            self.handle_attr(&open).await
+        } else {
+            self.snapshot_attr(snapshot, id).await
+        }
     }
 
     async fn lookup(&self, parent: INodeNo, name: String, reply: ReplyEntry) {
@@ -211,7 +234,7 @@ impl Inner {
             Ok(None) => return reply.error(fuser::Errno::ENOENT),
             Err(error) => return reply.error(core_errno(&error)),
         };
-        match self.snapshot_attr(&snapshot, entry.node_id).await {
+        match self.attr_for(&snapshot, entry.node_id).await {
             Ok(attr) => {
                 self.remember_lookup(attr.ino);
                 reply.entry(&ATTR_TTL, &attr, Generation(0));
@@ -236,7 +259,7 @@ impl Inner {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),
         };
-        match self.snapshot_attr(&snapshot, id).await {
+        match self.attr_for(&snapshot, id).await {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(errno) => reply.error(errno),
         }
@@ -255,14 +278,72 @@ impl Inner {
         {
             return reply.error(fuser::Errno::EISDIR);
         }
-        match self.mount.open_node(id, false).await {
-            Ok(file) => {
+        match self.prepare_open(id).await {
+            Ok(open) => {
                 let fh = self.next_handle();
-                guard(&self.files).insert(fh, Arc::new(OpenFile { node: id, file }));
+                guard(&self.files).insert(fh, Arc::new(open));
                 reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
             }
-            Err(error) => reply.error(runtime_errno(&error)),
+            Err(errno) => reply.error(errno),
         }
+    }
+
+    /// Materialize the shared staged version and capture its base observation.
+    async fn prepare_open(&self, id: NodeId) -> Result<OpenFile, fuser::Errno> {
+        let file = self
+            .mount
+            .open_node(id, false)
+            .await
+            .map_err(|e| runtime_errno(&e))?;
+        let status = match file.status().await {
+            Ok(status) => status,
+            Err(error) => {
+                drop(file);
+                let _ = self.mount.reclaim(id).await;
+                return Err(runtime_errno(&error));
+            }
+        };
+        let snapshot = match self
+            .mount
+            .authority()
+            .observe_revision(status.remote_revision)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                drop(file);
+                let _ = self.mount.reclaim(id).await;
+                return Err(core_errno(&error));
+            }
+        };
+        let node = match snapshot.node(id).await {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                drop(file);
+                let _ = self.mount.reclaim(id).await;
+                return Err(fuser::Errno::ENOENT);
+            }
+            Err(error) => {
+                drop(file);
+                let _ = self.mount.reclaim(id).await;
+                return Err(core_errno(&error));
+            }
+        };
+        let base = CachedInfo {
+            directory: node.is_directory(),
+            executable: node.executable(),
+            generation: node.generation(),
+        };
+        if base.directory {
+            drop(file);
+            let _ = self.mount.reclaim(id).await;
+            return Err(fuser::Errno::EISDIR);
+        }
+        Ok(OpenFile {
+            node: id,
+            file,
+            base,
+        })
     }
 
     async fn read(&self, fh: FileHandle, offset: u64, size: u32, reply: ReplyData) {
@@ -832,5 +913,85 @@ impl Filesystem for FuseFrontend {
         reply: fuser::ReplyLseek,
     ) {
         reply.error(fuser::Errno::ENOSYS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Inner, guard};
+    use crate::core::{BackendProfile, Fs};
+    use crate::mount::Mount;
+    use crate::runtime::Runtime;
+    use crate::support;
+    use std::sync::Arc;
+    use yinyang_core::Authority;
+
+    /// An open read-only handle pins the staged version: while the file table
+    /// holds a reference, path stats and fstat both report the base length,
+    /// and a later external version is only visible after release.
+    #[tokio::test]
+    async fn active_handle_pins_metadata_until_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = support::TestBackend::default();
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::open(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+
+        let published = temp.path().join("published");
+        let runtime = Runtime::open(authority.clone(), &published).await.unwrap();
+        runtime
+            .create_file(runtime.authority().root(), "file")
+            .await
+            .unwrap();
+        let id = authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        let mut first = runtime.open_file("file", true).await.unwrap();
+        first.write(0, b"first version").await.unwrap();
+        first.fsync().await.unwrap();
+        first.close().await.unwrap();
+        drop(runtime);
+
+        let mount = Mount::open(authority.clone(), temp.path().join("ro"), true)
+            .await
+            .unwrap();
+        let inner = Inner::new(mount, tokio::runtime::Handle::current());
+        let fh = inner.next_handle();
+        guard(&inner.files).insert(fh, Arc::new(inner.prepare_open(id).await.unwrap()));
+
+        let other = temp.path().join("other");
+        let writer = Runtime::open(authority.clone(), &other).await.unwrap();
+        let mut second = writer.open_file("file", true).await.unwrap();
+        second.write(0, b"second version").await.unwrap();
+        second.fsync().await.unwrap();
+
+        let latest = authority.observe_latest().await.unwrap();
+        let pinned = inner.attr_for(&latest, id).await.unwrap();
+        assert_eq!(pinned.size, "first version".len() as u64);
+        let open = inner.open_for_node(id).unwrap();
+        assert_eq!(inner.handle_attr(&open).await.unwrap().size, pinned.size);
+        assert_eq!(inner.handle_attr(&open).await.unwrap().perm, 0o444);
+
+        // Release the only reference: clean staging is reclaimed and the next
+        // observation reports the externally published second version.
+        drop(second);
+        drop(writer);
+        drop(open);
+        drop(guard(&inner.files).remove(&fh).unwrap());
+        inner.mount.reclaim(id).await.unwrap();
+        let latest = authority.observe_latest().await.unwrap();
+        let refreshed = inner.attr_for(&latest, id).await.unwrap();
+        assert_eq!(refreshed.size, "second version".len() as u64);
     }
 }
