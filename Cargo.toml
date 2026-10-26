@@ -57,7 +57,11 @@ yinyang-core = { path = "crates/core" }
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17.0"
 libc = "0.2"
-nix = { version = "0.30.0", features = ["user"] }
+nix = { version = "0.30.0", features = ["signal", "user"] }
+
+[dev-dependencies]
+opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
+tempfile = "3"
 
 [workspace]
 members = [".", "crates/core", "crates/native", "xtask"]

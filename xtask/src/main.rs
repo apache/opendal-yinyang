@@ -21,14 +21,28 @@ use std::process::Command as StdCommand;
 
 use clap::Parser;
 use clap::Subcommand;
+use clap::error::ErrorKind;
 
 fn main() {
-    let cmd = Command::parse();
+    let cmd = match Command::try_parse() {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            let _ = error.print();
+            std::process::exit(parse_error_exit_code(error.kind()));
+        }
+    };
     cmd.run();
 }
 
+fn parse_error_exit_code(kind: ErrorKind) -> i32 {
+    match kind {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+        _ => 2,
+    }
+}
+
 #[derive(Parser)]
-#[clap(about = "Run repository tasks.")]
+#[clap(about = "Run repository tasks.", version, propagate_version = true)]
 struct Command {
     #[clap(subcommand)]
     sub: SubCommand,
@@ -42,6 +56,7 @@ impl Command {
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
             SubCommand::Macos(cmd) => cmd.run(),
+            SubCommand::TestLinuxFuse(cmd) => cmd.run(),
         }
     }
 }
@@ -56,6 +71,10 @@ enum SubCommand {
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+    #[clap(
+        about = "Run real Linux FUSE acceptance through yy and /dev/fuse (requires isolated S3 settings)."
+    )]
+    TestLinuxFuse(CommandTestLinuxFuse),
     #[clap(about = "Build the macOS native prototypes (requires Xcode 27 and XcodeGen).")]
     Macos(CommandMacos),
 }
@@ -240,6 +259,54 @@ impl CommandTest {
     }
 }
 
+#[derive(Parser)]
+#[clap(name = "test-linux-fuse")]
+struct CommandTestLinuxFuse {
+    #[arg(
+        long,
+        help = "Run only the read-only acceptance stage for independent first-layer validation."
+    )]
+    read_only: bool,
+}
+
+impl CommandTestLinuxFuse {
+    fn run(self) {
+        if !cfg!(target_os = "linux") {
+            panic!("Linux FUSE acceptance requires Linux");
+        }
+        if !std::path::Path::new("/dev/fuse").exists() {
+            panic!(
+                "/dev/fuse is unavailable; refusing to report a green acceptance run without a real mount"
+            );
+        }
+        if which::which("fusermount3").is_err() {
+            panic!(
+                "fusermount3 is unavailable; install fuse3 before running Linux FUSE acceptance"
+            );
+        }
+        for name in [
+            "YINYANG_S3_BUCKET",
+            "YINYANG_S3_ENDPOINT",
+            "YINYANG_S3_REGION",
+            "YINYANG_S3_ACCESS_KEY_ID",
+            "YINYANG_S3_SECRET_ACCESS_KEY",
+        ] {
+            if std::env::var_os(name).is_none() {
+                panic!("{name} is unset; Linux FUSE acceptance fails hard instead of skipping");
+            }
+        }
+        let mut cmd = find_command("cargo");
+        cmd.args(["test", "-p", "yinyang", "--test", "linux_fuse"]);
+        if self.read_only {
+            cmd.arg("fuse_read_only_");
+        } else {
+            cmd.arg("fuse_");
+        }
+        cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
+        run_command(cmd);
+    }
+}
+
 fn find_command(cmd: &str) -> StdCommand {
     match which::which(cmd) {
         Ok(exe) => {
@@ -338,4 +405,17 @@ fn make_cargo_deny_cmd() -> StdCommand {
     let mut cmd = find_command("cargo");
     cmd.args(["deny", "check", "licenses"]);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_error_exit_code;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn parse_errors_are_nonzero_except_help_and_version() {
+        assert_eq!(parse_error_exit_code(ErrorKind::DisplayHelp), 0);
+        assert_eq!(parse_error_exit_code(ErrorKind::DisplayVersion), 0);
+        assert_eq!(parse_error_exit_code(ErrorKind::UnknownArgument), 2);
+    }
 }
