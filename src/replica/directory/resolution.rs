@@ -730,7 +730,7 @@ impl DirectorySync {
                 }
             }
         }
-        self.clear_conflicts_under(path)?;
+        self.clear_conflicts_under(path).await?;
         Ok(true)
     }
 
@@ -966,7 +966,7 @@ impl DirectorySync {
         for entry in stale {
             self.replica.store_mut().remove_baseline_path(&entry)?;
         }
-        self.clear_conflicts_under(path)?;
+        self.clear_conflicts_under(path).await?;
         Ok(true)
     }
 
@@ -1204,7 +1204,7 @@ async fn matching_remote_file(
         return Ok(None);
     }
     let content = ContentId::calculate(&mut &bytes[..]).await?;
-    if *file.content_id() == content {
+    if file.content_id() == content {
         Ok(Some((snapshot, node)))
     } else {
         Ok(None)
