@@ -403,16 +403,19 @@ async fn renamed_and_re_edited_local_file_converges() {
     .await;
 }
 
-/// Delegating authority that completes the real commit and then delays the
-/// successful response until the test releases it. The original commit
-/// outcomes are returned unchanged; lost or Unknown responses are a separate
-/// acceptance concern.
+/// Delegating authority with two explicit hold points. The after-commit mode
+/// completes the real commit and then delays the successful response until the
+/// test releases it; the before-commit mode parks the request before the real
+/// commit so an external edit can land on the authority in between. The
+/// original commit outcomes are returned unchanged; lost or Unknown responses
+/// are a separate acceptance concern.
 #[derive(Debug)]
 struct HeldAuthority {
     inner: Arc<dyn Authority>,
     committed: tokio::sync::mpsc::UnboundedSender<()>,
     release: Arc<tokio::sync::Notify>,
     hold_next: Arc<AtomicBool>,
+    hold_before_next: Arc<AtomicBool>,
 }
 
 impl HeldAuthority {
@@ -426,6 +429,21 @@ impl HeldAuthority {
             committed,
             release,
             hold_next: Arc::new(AtomicBool::new(true)),
+            hold_before_next: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn new_before_commit(
+        inner: Arc<dyn Authority>,
+        committed: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            inner,
+            committed,
+            release,
+            hold_next: Arc::new(AtomicBool::new(false)),
+            hold_before_next: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -456,6 +474,10 @@ impl Authority for HeldAuthority {
         requests: &'a [Transaction],
     ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
         Box::pin(async move {
+            if self.hold_before_next.swap(false, Ordering::SeqCst) {
+                self.committed.send(()).ok();
+                self.release.notified().await;
+            }
             let outcomes = self.inner.commit_batch(requests).await?;
             if self.hold_next.swap(false, Ordering::SeqCst) {
                 self.committed.send(()).ok();
@@ -569,6 +591,138 @@ async fn local_edit_during_delayed_publication_receipt_stays_pending() {
     assert!(outcome3.conflicts.is_empty());
     assert!(outcome3.in_sync);
     assert_eq!(local_tree(&root), remote);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("payload");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a"), b"local-a").unwrap();
+    std::fs::write(root.join("b"), b"local-b").unwrap();
+
+    // A common baseline first, without any held commit.
+    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
+        .await
+        .unwrap();
+    let first = sync.run().await.unwrap();
+    assert_eq!(first.published_local, 2);
+    assert!(first.conflicts.is_empty());
+    assert_eq!(local_tree(&root), remote_tree(&authority).await);
+    drop(sync);
+
+    // The next run stages local edits while the remote is observed unchanged,
+    // then parks a's commit before it reaches the real authority.
+    std::fs::write(root.join("a"), b"local-a2").unwrap();
+    std::fs::write(root.join("b"), b"local-b2").unwrap();
+    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = Arc::new(HeldAuthority::new_before_commit(
+        authority.clone(),
+        committed_tx,
+        release.clone(),
+    ));
+    let mut sync = DirectorySync::open(held.clone(), &state).await.unwrap();
+    let run = sync.run();
+    let writer = async {
+        committed_rx
+            .recv()
+            .await
+            .expect("a commit must reach the pre-commit barrier");
+        // The external edit goes through a public Sync journal on the
+        // independent raw authority while a's commit is parked.
+        let external = tempfile::tempdir().unwrap();
+        let seed = Sync::open(authority.clone(), external.path().join("seed"))
+            .await
+            .unwrap();
+        let baseline = authority.observe_latest().await.unwrap();
+        let b = baseline.resolve("b").await.unwrap().unwrap().id();
+        assert_eq!(
+            baseline
+                .open_file(b)
+                .await
+                .unwrap()
+                .read(0, 64)
+                .await
+                .unwrap(),
+            b"local-b",
+            "the run must observe the remote unchanged before the interleave"
+        );
+        let edit = seed
+            .stage(b, baseline.revision(), &mut &b"external-b"[..])
+            .await
+            .unwrap();
+        seed.publish(edit).await.unwrap();
+        release.notify_one();
+    };
+    let run_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(run, writer)
+    })
+    .await
+    .expect("the interleaved run must finish within the timeout")
+    .0;
+    match run_result {
+        Ok(outcome) => assert!(
+            !outcome.in_sync,
+            "a run observing a competing remote edit must not report in sync"
+        ),
+        Err(_) => {}
+    }
+
+    // Data safety: a's own edit landed, external-b survived, local b is kept.
+    let local = local_tree(&root);
+    let remote = remote_tree(&authority).await;
+    assert_eq!(
+        remote["a"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"local-a2".to_vec(),
+        },
+        "the local a edit must be published"
+    );
+    assert_eq!(
+        remote["b"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"external-b".to_vec(),
+        },
+        "the interleaved external edit must not be overwritten"
+    );
+    assert_eq!(
+        local["a"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"local-a2".to_vec(),
+        }
+    );
+    assert_eq!(
+        local["b"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"local-b2".to_vec(),
+        },
+        "the local b edit must survive the interleaved run"
+    );
+
+    // Read-only inspection must expose a resolvable conflict, never in-sync.
+    let inspected = DirectorySync::inspect(&state).unwrap();
+    assert!(
+        !inspected.conflicts.is_empty(),
+        "the competing external edit must surface as a resolvable conflict"
+    );
+    assert!(
+        inspected
+            .conflicts
+            .iter()
+            .all(|conflict| !conflict.id.is_empty())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
