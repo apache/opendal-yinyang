@@ -1143,22 +1143,6 @@ impl DirectorySync {
         let observed = self.sync.authority().observe_revision(revision).await?;
         Ok(observed.resolve(&record.path).await?)
     }
-
-    async fn stage_remote_file(&self, node: &Node) -> Result<std::fs::File> {
-        let observed = self.sync.authority().observe_latest().await?;
-        let version = observed.open_file(node.id()).await?;
-        let length = version.descriptor().content_id().length();
-        let mut output = tokio::fs::File::from_std(tempfile::tempfile()?);
-        let mut position = 0;
-        while position < length {
-            let end = (position + 64 * 1024).min(length);
-            version.read_range(position..end, &mut output).await?;
-            position = end;
-        }
-        let mut spool = output.into_std().await;
-        spool.seek(SeekFrom::Start(0))?;
-        Ok(spool)
-    }
 }
 
 fn accepted_local(replica: &Replica, record: &WorkRecord) -> Result<Option<LocalNode>> {
