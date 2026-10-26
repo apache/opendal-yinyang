@@ -55,5 +55,8 @@ export YINYANG_S3_REGION=us-east-1
 export YINYANG_S3_ACCESS_KEY_ID=yinyang-test
 export YINYANG_S3_SECRET_ACCESS_KEY=yinyang-test-only
 export YINYANG_STORAGE_PROFILE=minio
+# Native create probes exercise the supported 0644 mode. Keep evidence files
+# private above, but run the workload with the normal Linux development mask.
+umask 022
 "$@"
 date -Is
