@@ -1186,6 +1186,31 @@ impl<'a> Context<'a> {
         paths.extend(self.current.nodes().keys().cloned());
         paths.extend(self.remote.keys().cloned());
 
+        // Quarantine a remote-deleted directory as a single unit before
+        // per-entry handling, so its descendants are never removed one by one.
+        let mut dirs: Vec<String> = paths.iter().cloned().collect();
+        dirs.sort_by_key(|path| (depth(path), path.clone()));
+        for path in &dirs {
+            if path.is_empty() || handled.contains(path) || under_any_inclusive(&retained, path) {
+                continue;
+            }
+            let is_remote_deleted_dir = self
+                .baseline
+                .remote
+                .get(path)
+                .is_some_and(|entry| entry.directory)
+                && !self.remote.contains_key(path);
+            if !is_remote_deleted_dir {
+                continue;
+            }
+            if local_action(self.baseline.local.get(path), self.current.get(path)) != Action::None {
+                continue;
+            }
+            self.materialize_delete(path).await?;
+            self.mark_subtree(&mut handled, path);
+            handled.insert(path.clone());
+        }
+
         let mut ascending: Vec<String> = paths.iter().cloned().collect();
         ascending.sort_by_key(|path| (depth(path), path.clone()));
         for path in &ascending {
