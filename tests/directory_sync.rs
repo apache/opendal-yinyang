@@ -570,3 +570,107 @@ async fn local_edit_during_delayed_publication_receipt_stays_pending() {
     assert!(outcome3.in_sync);
     assert_eq!(local_tree(&root), remote);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_deletion_during_delayed_publication_receipt_stays_pending() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = Arc::new(HeldAuthority::new(
+        authority.clone(),
+        committed_tx,
+        release.clone(),
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("payload");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("file");
+    std::fs::write(&file, b"version one").unwrap();
+
+    let mut sync = DirectorySync::init(held.clone(), &state, &root)
+        .await
+        .unwrap();
+    let run1 = sync.run();
+    let writer = async {
+        committed_rx
+            .recv()
+            .await
+            .expect("v1 commit must complete before the local delete");
+        std::fs::remove_file(&file).expect("local delete");
+        release.notify_one();
+    };
+    let outcome1 = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(run1, writer)
+    })
+    .await
+    .expect("v1 publication must commit and release its receipt in time")
+    .0
+    .unwrap();
+
+    assert_eq!(outcome1.published_local, 1);
+    assert!(
+        outcome1.conflicts.is_empty(),
+        "v1 run conflicts: {:?}",
+        outcome1.conflicts
+    );
+    assert!(
+        !outcome1.in_sync,
+        "the local deletion must not be marked in sync behind a delayed receipt"
+    );
+    assert!(
+        outcome1.pending > 0,
+        "the local deletion must remain pending until it is published"
+    );
+    assert!(
+        !file.exists(),
+        "the delayed receipt must not resurrect the deleted local file"
+    );
+    let remote = remote_tree(&authority).await;
+    assert_eq!(
+        remote["file"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"version one".to_vec(),
+        },
+        "the remote must still hold only the uploaded v1"
+    );
+    drop(sync);
+
+    // The accepted v1 baseline must survive the delayed receipt so the next
+    // run publishes the local deletion instead of materializing v1 back.
+    let mut reopened = DirectorySync::open(held.clone(), &state).await.unwrap();
+    let outcome2 = reopened.run().await.unwrap();
+    assert!(
+        outcome2.published_local >= 1,
+        "the next run must publish the local deletion"
+    );
+    assert!(
+        outcome2.conflicts.is_empty(),
+        "deletion publish conflicts: {:?}",
+        outcome2.conflicts
+    );
+    let remote = remote_tree(&authority).await;
+    assert_eq!(
+        remote.get("file"),
+        None,
+        "the published deletion must remove the remote file"
+    );
+    assert!(!file.exists());
+
+    let outcome3 = reopened.run().await.unwrap();
+    assert_eq!(outcome3.published_local, 0);
+    assert_eq!(outcome3.materialized_remote, 0);
+    assert!(outcome3.conflicts.is_empty());
+    assert!(
+        outcome3.in_sync,
+        "a converged run after the published deletion must report in sync"
+    );
+    assert_eq!(local_tree(&root), remote);
+}
