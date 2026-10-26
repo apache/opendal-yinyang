@@ -281,15 +281,6 @@ impl Runtime {
         let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
         Ok((node, receipt))
     }
-    /// Persist the core executable flag. Permission bits other than executable
-    /// state, ownership and timestamps have no durable core representation.
-    pub async fn set_executable(&self, node: NodeId, executable: bool) -> Result<Receipt> {
-        self.require_write()?;
-        let snapshot = self.authority().observe_latest().await?;
-        let mut plan = Planner::new(&snapshot, CommitId::generate());
-        plan.set_executable(node, executable).await?;
-        outcome(self.authority().commit(&plan.finish()?).await?)
-    }
     pub async fn rename(&self, node: NodeId, parent: NodeId, name: &str) -> Result<Receipt> {
         self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;

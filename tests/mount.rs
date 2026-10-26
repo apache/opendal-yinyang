@@ -109,12 +109,22 @@ impl Authority for PausingObserveAuthority {
         requests: &'a [Transaction],
     ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
         Box::pin(async move {
-            let pause = self
-                .pause_after_commits
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .ok();
+            let mut remaining = self.pause_after_commits.load(Ordering::SeqCst);
+            let mut pause = None;
+            while remaining > 0 {
+                match self.pause_after_commits.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(previous) => {
+                        pause = Some(previous);
+                        break;
+                    }
+                    Err(actual) => remaining = actual,
+                }
+            }
             if pause == Some(1) {
                 self.commit_entered.add_permits(1);
                 self.commit_release.acquire().await.unwrap().forget();
@@ -403,6 +413,11 @@ async fn set_executable_serializes_with_dirty_mount_handle() {
             .await
             .unwrap(),
         b"dirtymore"
+    );
+    let read_only = mount.open_node(node, false).await.unwrap();
+    assert_eq!(
+        read_only.set_executable(false).await.unwrap_err().kind(),
+        ErrorKind::ReadOnly
     );
 
     let (retry, _) = mount

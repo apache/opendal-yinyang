@@ -327,6 +327,7 @@ impl MountFile {
     /// Publish this node's dirty content first, then update the executable
     /// flag and advance the shared clean handle to the metadata revision.
     pub async fn set_executable(&self, executable: bool) -> Result<Receipt> {
+        self.require_write()?;
         self.node
             .handle
             .lock()

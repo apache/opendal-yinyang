@@ -781,19 +781,6 @@ async fn create_results_keep_the_committed_node_identity() {
             .node_id,
         child
     );
-
-    runtime.set_executable(first, false).await.unwrap();
-    assert!(
-        !authority
-            .observe_latest()
-            .await
-            .unwrap()
-            .node(first)
-            .await
-            .unwrap()
-            .unwrap()
-            .executable()
-    );
 }
 
 #[tokio::test]
