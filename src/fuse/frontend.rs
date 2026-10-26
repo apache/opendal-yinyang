@@ -149,8 +149,14 @@ impl Inner {
     ) {
         loop {
             tokio::select! {
-                _ = signal.recv() => self.refresh_once().await,
+                biased;
                 _ = &mut stop => return,
+                event = signal.recv() => match event {
+                    Some(()) => self.refresh_once().await,
+                    // The signal stream cannot be re-established; stop rather
+                    // than spin on a closed stream.
+                    None => return,
+                },
             }
         }
     }

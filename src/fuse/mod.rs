@@ -145,25 +145,31 @@ pub async fn run(
         }
     });
     tokio::pin!(join);
-    tokio::select! {
-        result = &mut join => {
-            // The session ended on its own, for example through an external
-            // `fusermount3 -u`; fall through to bounded teardown.
-            result.map_err(blocking_error)??;
-        }
+    // A JoinHandle must not be polled after completion: remember a natural
+    // session end here and only await it in finalize when the signal path ran.
+    let joined = tokio::select! {
+        result = &mut join => Some(result),
         _ = shutdown_signal() => {
             let _ = teardown.send(());
+            None
         }
-    }
+    };
     // One grace period covers the session teardown and the SIGHUP loop: stop
     // the refresh task, then wait for both. A refresh in progress may finish
-    // inside this window; no cancellation is needed.
+    // inside this window; no cancellation is needed. Both waits happen before
+    // either result is propagated so an error cannot skip the other cleanup.
     let _ = stop_refresh.send(());
     match tokio::time::timeout(TEARDOWN_GRACE, async {
-        join.await.map_err(blocking_error)??;
-        if let Some(task) = refresh_task {
-            task.await.map_err(blocking_error)?;
-        }
+        let session = match joined {
+            Some(result) => result,
+            None => join.await,
+        };
+        let refresh = match refresh_task {
+            Some(task) => task.await,
+            None => Ok(()),
+        };
+        session.map_err(blocking_error)??;
+        refresh.map_err(blocking_error)?;
         Ok(())
     })
     .await
