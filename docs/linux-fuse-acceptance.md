@@ -50,6 +50,9 @@ cargo x test-linux-fuse --read-only
 - Dirty descriptor isolation: a read-only descriptor closed while another
   descriptor is dirty must not publish the dirty or frozen state; explicit
   `fsync` on the dirty descriptor establishes the remote result.
+  Path stat and fd fstat both report the staged size after dirty grow/truncate
+  across the attribute TTL, and an external grow/shrink cannot overwrite the
+  same inode's staged size while an old descriptor is retained.
 - Path truncate: real `truncate(2)` without an open descriptor commits its
   shrink/extend result to the independent authority at an explicit boundary.
 - Limited chmod: `0644 <-> 0755` is observable, while non-representable modes

@@ -35,6 +35,7 @@ const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
 const EROFS: i32 = 30;
 const EINVAL: i32 = 22;
+const ATTR_TTL_WAIT: Duration = Duration::from_millis(1500);
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
@@ -69,6 +70,24 @@ fn mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o7777
+}
+
+fn assert_staged_size(path: &Path, file: &File, expected: u64, phase: &str) {
+    let fd = file
+        .metadata()
+        .unwrap_or_else(|error| panic!("fstat {phase}: {error}"));
+    let by_path = fs::metadata(path).unwrap_or_else(|error| panic!("stat {phase}: {error}"));
+    assert_eq!(
+        by_path.ino(),
+        fd.ino(),
+        "{phase}: path lookup resolved a different inode"
+    );
+    assert_eq!(fd.len(), expected, "{phase}: fstat staged length");
+    assert_eq!(
+        by_path.len(),
+        expected,
+        "{phase}: path stat must use the same staged length"
+    );
 }
 
 #[test]
@@ -315,23 +334,44 @@ fn fuse_dirty_fd_readonly_close_keeps_remote_unchanged_both_publications() {
             .write(true)
             .open(mounted.mountpoint().join("flush.txt"))
             .expect("open write descriptor");
-        dirty.write_all(b"dirty").expect("stage dirty bytes");
+        dirty.write_all(b"dirty!!!").expect("stage dirty bytes");
         let mut reader =
             File::open(mounted.mountpoint().join("flush.txt")).expect("open read-only descriptor");
         let mut staged = Vec::new();
         reader
             .read_to_end(&mut staged)
             .expect("read through the read-only descriptor");
-        assert_eq!(staged, b"dirty");
+        assert_eq!(staged, b"dirty!!!");
         drop(reader);
         assert_eq!(
             fixture.remote_read(&library, "flush.txt", 16),
             b"original",
             "closing a read-only descriptor must not publish another descriptor's dirty bytes"
         );
+
+        let path = mounted.mountpoint().join("flush.txt");
+        assert_staged_size(&path, &dirty, 8, "same-length dirty write");
+        dirty.set_len(12).expect("grow the staged file");
+        thread::sleep(ATTR_TTL_WAIT);
+        assert_staged_size(&path, &dirty, 12, "dirty grow after attr TTL");
+        dirty.seek(SeekFrom::Start(0)).expect("rewind grown file");
+        let mut grown = Vec::new();
+        dirty
+            .read_to_end(&mut grown)
+            .expect("read grown staged bytes");
+        assert_eq!(grown, b"dirty!!!\0\0\0\0");
+        dirty.set_len(4).expect("shrink the staged file");
+        thread::sleep(ATTR_TTL_WAIT);
+        assert_staged_size(&path, &dirty, 4, "dirty shrink after attr TTL");
+        dirty.seek(SeekFrom::Start(0)).expect("rewind shrunk file");
+        let mut shrunk = Vec::new();
+        dirty
+            .read_to_end(&mut shrunk)
+            .expect("read shrunk staged bytes");
+        assert_eq!(shrunk, b"dirt");
         dirty.sync_all().expect("explicit dirty fsync publishes");
         drop(dirty);
-        assert_eq!(fixture.remote_read(&library, "flush.txt", 16), b"dirty");
+        assert_eq!(fixture.remote_read(&library, "flush.txt", 16), b"dirt");
         mounted.unmount();
     }
 }
@@ -619,6 +659,13 @@ fn external_changes(fixture: &Fixture) {
         b"BBBBBBBB",
         "independent external growth must be authoritative"
     );
+    thread::sleep(ATTR_TTL_WAIT);
+    assert_staged_size(
+        &mounted.mountpoint().join("external.txt"),
+        &old,
+        4,
+        "external growth with a retained descriptor",
+    );
     assert_eq!(
         old.metadata().expect("stat old descriptor").len(),
         4,
@@ -675,6 +722,13 @@ fn external_changes(fixture: &Fixture) {
     assert_eq!(before, b"0123456789");
     assert_eq!(old_shrink.metadata().expect("stat original").len(), 10);
     fixture.remote_truncate(&library, "shrink.txt", 4);
+    thread::sleep(ATTR_TTL_WAIT);
+    assert_staged_size(
+        &reopen.mountpoint().join("shrink.txt"),
+        &old_shrink,
+        10,
+        "external shrink with a retained descriptor",
+    );
     assert_eq!(
         old_shrink.metadata().expect("stat old descriptor").len(),
         10,
