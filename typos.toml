@@ -17,6 +17,8 @@
 
 [default.extend-words]
 OpenDAL = "OpenDAL"
+# `OFlags::WRONLY` is a rustix constant, not a misspelling of `WRONGLY`.
+WRONLY = "WRONLY"
 
 [files]
 extend-exclude = ["Cargo.lock"]
