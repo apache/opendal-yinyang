@@ -215,29 +215,42 @@ impl SyncStatus {
                     "conflict remote revision must be 24-byte hex"
                 );
             }
-            let entry = self
+            let matches = self
                 .entries
                 .iter()
-                .find(|entry| entry.path == conflict.path)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "conflict {} path {} has no matching entry",
-                        conflict.id, conflict.path
-                    )
-                });
+                .filter(|entry| {
+                    entry
+                        .conflict
+                        .as_ref()
+                        .is_some_and(|nested| nested.id == conflict.id)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "conflict {} must reference exactly one entry",
+                conflict.id
+            );
+            let entry = matches[0];
             assert_eq!(
                 entry.state,
                 EntryState::Conflict,
-                "conflict path {} must have entry state conflict",
-                conflict.path
+                "conflict {} entry must have state conflict",
+                conflict.id
             );
             let nested = entry
                 .conflict
                 .as_ref()
-                .unwrap_or_else(|| panic!("conflict path {} has no entry conflict", conflict.path));
+                .unwrap_or_else(|| panic!("conflict {} has no nested evidence", conflict.id));
             assert_eq!(nested.id, conflict.id);
-            if let Some(original) = &conflict.original_path {
-                assert_eq!(conflict.path, *original);
+            assert_eq!(entry.original_path, conflict.original_path);
+            assert_eq!(entry.desired_path, conflict.desired_path);
+            match &conflict.original_path {
+                Some(original) => assert_eq!(conflict.path, *original),
+                None => assert_eq!(
+                    conflict.desired_path.as_deref(),
+                    Some(conflict.path.as_str())
+                ),
             }
         }
     }
