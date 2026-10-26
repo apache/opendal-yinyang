@@ -218,6 +218,10 @@ async fn exercise_initial_pull(authority: Arc<dyn Authority>) {
         "unchanged pull must not materialize"
     );
     assert!(second.conflicts.is_empty());
+    assert!(
+        second.in_sync,
+        "a converged unchanged pull must report in sync"
+    );
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
 
     drop(sync);
@@ -228,6 +232,10 @@ async fn exercise_initial_pull(authority: Arc<dyn Authority>) {
     assert_eq!(third.published_local, 0);
     assert_eq!(third.materialized_remote, 0);
     assert!(third.conflicts.is_empty());
+    assert!(
+        third.in_sync,
+        "a reopened converged sync must report in sync"
+    );
     assert_eq!(
         local_tree(&root),
         remote_tree(&authority).await,
@@ -271,6 +279,10 @@ async fn exercise_initial_push(authority: Arc<dyn Authority>) {
         "unchanged push must not materialize"
     );
     assert!(second.conflicts.is_empty());
+    assert!(
+        second.in_sync,
+        "a converged unchanged push must report in sync"
+    );
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
 }
 
@@ -331,6 +343,7 @@ async fn exercise_rename_with_edit(authority: Arc<dyn Authority>) {
         "converged run must not materialize"
     );
     assert!(stable.conflicts.is_empty());
+    assert!(stable.in_sync, "a converged stable run must report in sync");
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
 }
 
