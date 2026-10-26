@@ -1522,6 +1522,7 @@ impl<'a> Context<'a> {
     async fn reconcile(&mut self) -> Result<()> {
         self.seed();
         let (remote_moves, local_moves) = self.detect_moves();
+        eprintln!("yy: moves remote={remote_moves:#?} local={local_moves:#?}");
         let mut handled: BTreeSet<String> = BTreeSet::new();
         self.apply_moves(&remote_moves, &local_moves, &mut handled)
             .await?;
@@ -1592,6 +1593,23 @@ impl<'a> Context<'a> {
     }
 
     fn detect_moves(&self) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        eprintln!(
+            "yy: baseline-local {:?}",
+            self.baseline
+                .local
+                .nodes()
+                .iter()
+                .map(|(path, node)| (path.clone(), node.identity, node.is_directory()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "yy: current {:?}",
+            self.current
+                .nodes()
+                .iter()
+                .map(|(path, node)| (path.clone(), node.identity, node.is_directory()))
+                .collect::<Vec<_>>()
+        );
         let mut remote_moves = BTreeMap::new();
         let mut by_node = BTreeMap::new();
         for (path, node) in &self.baseline.remote {
@@ -2018,6 +2036,7 @@ impl<'a> Context<'a> {
     }
 
     async fn publish_directory(&mut self, path: &str) -> Result<()> {
+        eprintln!("yy: publish_directory {path}");
         let (parent, name) = split(path);
         let parent_node = self
             .nodes
@@ -2059,6 +2078,7 @@ impl<'a> Context<'a> {
     }
 
     async fn publish_file(&mut self, path: &str, node: &LocalNode) -> Result<()> {
+        eprintln!("yy: publish_file {path}");
         let (parent, name) = split(path);
         let parent_node = self
             .nodes
@@ -2142,6 +2162,7 @@ impl<'a> Context<'a> {
     }
 
     async fn publish_remove(&mut self, path: &str) -> Result<()> {
+        eprintln!("yy: publish_remove {path}");
         let node = self
             .nodes
             .get(path)
@@ -2176,6 +2197,7 @@ impl<'a> Context<'a> {
     }
 
     async fn local_rename(&mut self, from: &str, to: &str) -> Result<Option<Revision>> {
+        eprintln!("yy: local_rename {from} -> {to}");
         let node = self
             .nodes
             .get(from)
