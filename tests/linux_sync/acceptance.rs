@@ -266,6 +266,32 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
         assert_eq!(conflict.remote, ConflictSide::CurrentFile);
         assert!(conflict.remote_revision.is_some());
 
+        let _ = fixture.sync_run(&right);
+        let repeated = fixture.sync_status(&right);
+        assert_eq!(
+            repeated.conflicts.len(),
+            1,
+            "a repeated conflict detection must not create another active conflict: {repeated:#?}"
+        );
+        let repeated_conflict = repeated.conflict("shared.txt");
+        assert_eq!(
+            repeated_conflict.id, conflict.id,
+            "the active conflict ID changed after a repeated sync run"
+        );
+        let repeated_entry = repeated.entry("shared.txt");
+        assert_eq!(repeated_entry.state, EntryState::Conflict);
+        assert_eq!(
+            repeated_entry
+                .conflict
+                .as_ref()
+                .expect("conflict entry retains nested evidence")
+                .id,
+            conflict.id
+        );
+        assert_eq!(repeated_entry.original_path, conflict.original_path);
+        assert_eq!(repeated_entry.desired_path, conflict.desired_path);
+        assert_eq!(remote_file_bytes(&fixture, "shared.txt"), b"left");
+
         let local_export = fixture.path("content-local");
         let remote_export = fixture.path("content-remote");
         fixture.sync_export_conflict(&right, &conflict.id, "local", &local_export);
