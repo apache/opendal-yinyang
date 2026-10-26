@@ -406,6 +406,66 @@ fn fuse_chmod_limits_to_executable_bit_both_publications() {
                 "failed chmod {unsupported_mode:o} must not change the previous attributes"
             );
         }
+
+        let directory = mounted.mountpoint().join("fixed-directory");
+        fs::create_dir(&directory).expect("create directory through the writable mount");
+        assert_eq!(mode(&directory), 0o755, "directories are fixed at 0755");
+        let error = fs::set_permissions(&directory, fs::Permissions::from_mode(0o644))
+            .expect_err("directory chmod 0644 must not report success");
+        assert_errno(error, &[ENOSYS, EOPNOTSUPP, EINVAL], "chmod directory 0644");
+        assert_eq!(
+            mode(&directory),
+            0o755,
+            "a rejected directory chmod must leave 0755 unchanged"
+        );
+        mounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_dirty_fd_and_executable_chmod_do_not_self_conflict_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library = fixture.volume_config(
+            &format!("lib-chmod-dirty-{suffix}"),
+            Frontend::Library,
+            false,
+        );
+        fixture.library_seed(&library, "chmod-dirty.txt", b"base");
+        let config = fixture.volume_config(
+            &format!("stage-chmod-dirty-{suffix}"),
+            Frontend::Fuse,
+            false,
+        );
+        let mountpoint = fixture
+            .temp
+            .path()
+            .join(format!("mnt-chmod-dirty-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let path = mounted.mountpoint().join("chmod-dirty.txt");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open descriptor before chmod");
+        file.write_all(b"first").expect("stage first dirty write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("path chmod executable while the descriptor is dirty");
+        file.write_all(b"-tail")
+            .expect("continue writing through the same descriptor");
+        file.sync_all()
+            .expect("the mount's own metadata generation change must not self-conflict");
+        drop(file);
+        assert_eq!(mode(&path), 0o755);
+        assert_eq!(
+            fixture.remote_read(&library, "chmod-dirty.txt", 32),
+            b"first-tail",
+            "continued writes and executable metadata must publish together"
+        );
         mounted.unmount();
     }
 }
