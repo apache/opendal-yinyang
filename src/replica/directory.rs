@@ -2062,11 +2062,10 @@ impl<'a> Context<'a> {
             .filter(|node| matches!(node.kind, LocalKind::File { .. }))
             .and_then(|node| self.replica.capture_file(path, node).ok());
         let remote_node = self.remote.get(path).map(Node::id);
-        let local = if captured.is_some() {
-            "retained_artifact"
-        } else {
-            self.local_side(path)
-        };
+        // The observable local side is classified by presence. A preserved
+        // backup is reported separately as `local_artifact` and does not turn
+        // an ordinary content divergence into a retained-artifact side.
+        let local = self.local_side(path);
         let remote = self.remote_side(path);
         record_conflict(
             self.outcome,
