@@ -77,8 +77,6 @@ struct OpenFile {
     node: NodeId,
     file: MountFile,
     writable: bool,
-    append: bool,
-    sync: bool,
 }
 
 fn has_open_flag(flags: i32, flag: nix::fcntl::OFlag) -> bool {
@@ -364,9 +362,6 @@ impl Inner {
                         node: id,
                         file,
                         writable,
-                        append: has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND),
-                        sync: has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
-                            || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC),
                     }),
                 );
                 reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
@@ -385,23 +380,33 @@ impl Inner {
         }
     }
 
-    async fn write(&self, fh: FileHandle, offset: u64, data: Vec<u8>, reply: ReplyWrite) {
+    async fn write(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        data: Vec<u8>,
+        flags: OpenFlags,
+        reply: ReplyWrite,
+    ) {
         let Some(open) = self.open_file(fh) else {
             return reply.error(fuser::Errno::EBADF);
         };
         if !open.writable {
             return reply.error(fuser::Errno::EBADF);
         }
-        let staged = if open.append {
+        // Linux may toggle these with fcntl(F_SETFL), so the flags on this
+        // WRITE request, not the ones captured by open, define its semantics.
+        let append = has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND);
+        let sync = has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
+            || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC);
+        let staged = if append {
             open.file.append(&data).await.map(|_| ())
         } else {
             open.file.write(offset, &data).await
         };
         match staged {
             Ok(()) => {
-                if open.sync
-                    && let Err(error) = open.file.flush().await
-                {
+                if sync && let Err(error) = open.file.flush().await {
                     return reply.error(runtime_errno(&error));
                 }
                 reply.written(data.len() as u32);
@@ -653,9 +658,6 @@ impl Inner {
                 node,
                 file: open,
                 writable: writable_open(OpenFlags(flags)),
-                append: has_open_flag(flags, nix::fcntl::OFlag::O_APPEND),
-                sync: has_open_flag(flags, nix::fcntl::OFlag::O_SYNC)
-                    || has_open_flag(flags, nix::fcntl::OFlag::O_DSYNC),
             }),
         );
         reply.created(
@@ -1173,14 +1175,14 @@ impl Filesystem for FuseFrontend {
         offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let data = data.to_vec();
         let inner = self.inner.clone();
         self.inner
-            .spawn(async move { inner.write(fh, offset, data, reply).await });
+            .spawn(async move { inner.write(fh, offset, data, flags, reply).await });
     }
 
     fn flush(

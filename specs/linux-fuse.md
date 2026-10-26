@@ -98,12 +98,15 @@ all still-pinned or dirty/frozen/error state.
 
 ## Writable callbacks
 
-`write` stages bytes in the shared per-NodeId Mount handle. A handle opened with
-`O_APPEND` uses the node's append path, which chooses its offset under the same
-per-node lock as other writes; a regular write uses the kernel offset.
-`O_TRUNC` stages a zero length before the open reply. `O_SYNC`/`O_DSYNC` writes
-attempt publication before acknowledging the write. Unsupported write flags
-return an explicit error instead of silently changing semantics.
+`write` stages bytes in the shared per-NodeId Mount handle. Each request uses
+the file flags supplied by the kernel, so `fcntl(F_SETFL)` may toggle
+`O_APPEND` and `O_SYNC`/`O_DSYNC` for later writes. An append request uses the
+node's append path, which chooses its offset under the same per-node lock as
+other writes; a regular write uses the kernel offset. The writable access mode
+is fixed by the open request. `O_TRUNC` stages a zero length before the open
+reply. A write with `O_SYNC`/`O_DSYNC` in its current flags attempts
+publication before acknowledging the write. Unsupported write flags return an
+explicit error instead of silently changing semantics.
 
 `flush` publishes a writable handle and reports the real remote outcome to the
 closing descriptor. `release` never publishes and never discards staging.
