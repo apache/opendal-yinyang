@@ -22,6 +22,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -33,7 +34,7 @@ use yinyang::core::{
     Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction,
 };
 use yinyang::replica::DirectorySync;
-use yinyang::sync::{FileMetadata, NamespaceOperation, Sync};
+use yinyang::sync::{FileMetadata, Sync};
 
 /// An independent snapshot of a real tree on one side of a sync.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,8 +320,10 @@ async fn initial_nested_sync_converges_in_object_and_service_modes() {
     drop(temp);
 }
 
-/// Delegating authority that completes the real commit and then parks the
-/// response until the test releases it, modeling a lost publication receipt.
+/// Delegating authority that completes the real commit and then delays the
+/// successful response until the test releases it. The original commit
+/// outcomes are returned unchanged; lost or Unknown responses are a separate
+/// acceptance concern.
 #[derive(Debug)]
 struct HeldAuthority {
     inner: Arc<dyn Authority>,
@@ -381,7 +384,7 @@ impl Authority for HeldAuthority {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_edit_during_lost_publication_receipt_stays_pending() {
+async fn local_edit_during_delayed_publication_receipt_stays_pending() {
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(
         Fs::create(backend.operator(), BackendProfile::Minio)
@@ -415,14 +418,28 @@ async fn local_edit_during_lost_publication_receipt_stays_pending() {
         std::fs::write(&file, b"version two").expect("local v2 write");
         release.notify_one();
     };
-    let (outcome1, ()) = tokio::join!(run1, writer);
-    let outcome1 = outcome1.unwrap();
+    let outcome1 = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::join!(run1, writer),
+    )
+    .await
+    .expect("v1 publication must commit and release its receipt in time")
+    .0
+    .unwrap();
 
     assert_eq!(outcome1.published_local, 1);
     assert!(
         outcome1.conflicts.is_empty(),
         "v1 run conflicts: {:?}",
         outcome1.conflicts
+    );
+    assert!(
+        !outcome1.in_sync,
+        "the local v2 edit must not be marked in sync behind a delayed receipt"
+    );
+    assert!(
+        outcome1.pending > 0,
+        "the local v2 edit must remain pending until it is published"
     );
     assert_eq!(
         local_tree(&root)["file"],
@@ -442,7 +459,7 @@ async fn local_edit_during_lost_publication_receipt_stays_pending() {
     );
     drop(sync);
 
-    // The local edit must survive the parked receipt: a fresh sync publishes v2.
+    // The local edit must survive the delayed receipt: a fresh sync publishes v2.
     let mut reopened = DirectorySync::open(held.clone(), &state).await.unwrap();
     let outcome2 = reopened.run().await.unwrap();
     assert!(
@@ -454,6 +471,7 @@ async fn local_edit_during_lost_publication_receipt_stays_pending() {
         "v2 publish conflicts: {:?}",
         outcome2.conflicts
     );
+    assert!(outcome2.in_sync);
     let remote = remote_tree(&authority).await;
     assert_eq!(
         remote["file"],
@@ -467,5 +485,6 @@ async fn local_edit_during_lost_publication_receipt_stays_pending() {
     assert_eq!(outcome3.published_local, 0);
     assert_eq!(outcome3.materialized_remote, 0);
     assert!(outcome3.conflicts.is_empty());
+    assert!(outcome3.in_sync);
     assert_eq!(local_tree(&root), remote);
 }
