@@ -236,9 +236,12 @@ impl Sync {
     /// runtime lease. The journal and staging database are opened read-only.
     pub async fn inspect(directory: impl AsRef<Path>) -> Result<SyncInspect> {
         let directory = directory.as_ref().to_owned();
-        let runtime = Runtime::inspect(directory.join("content")).await?;
+        // Journal mappings are committed only after their staging records are
+        // durable. Read mappings first, then staging, so a concurrent stage
+        // cannot make this read-only join observe a mapping without its handle.
+        let journal_directory = directory.clone();
         let (edits, namespace) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let path = directory.join("sync.db");
+            let path = journal_directory.join("sync.db");
             let connection = Connection::open_with_flags(
                 &path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -283,6 +286,7 @@ impl Sync {
         })
         .await
         .map_err(Error::local)??;
+        let runtime = Runtime::inspect(directory.join("content")).await?;
         let mut content = Vec::with_capacity(edits.len());
         for (id, handle) in edits {
             let status = runtime

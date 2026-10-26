@@ -130,7 +130,10 @@ writer or acquiring the runtime lease. It opens `sync.db` and the content
 staging database read-only, returns each content EditId with its
 `HandleStatus`, and returns every namespace intent. This supports progress and
 failure inspection while another process or task holds the publication lease.
-It performs no recovery, mutation, or remote request.
+It performs no recovery, mutation, or remote request. Inspection reads the
+journal mappings before the staging database, relying on the existing invariant
+that a mapping is committed only after its staging record is durable; this
+ordering avoids a false missing-handle result during concurrent staging.
 
 Before dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a durable
 SQLite transaction. A crash or lost response therefore cannot turn a possibly
