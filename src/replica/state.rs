@@ -401,9 +401,7 @@ impl Store {
                             "remote baseline length exceeds SQLite range"
                         ))?,
                         present,
-                        local_digest
-                            .as_ref()
-                            .map(|value| value.as_bytes().as_slice()),
+                        local_digest.as_ref().map(|value| value.as_slice()),
                         local_length,
                         local_mode,
                         local_dev,
