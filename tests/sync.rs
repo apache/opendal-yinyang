@@ -17,10 +17,13 @@
 
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, Fs, NodeId, Revision};
+use yinyang::core::{Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Transaction};
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::sync::{
     EditStatus, FileMetadata, NamespaceOperation, NamespaceState, RenameMode, Sync,
@@ -199,6 +202,67 @@ fn assert_conflict(result: yinyang::runtime::Result<Revision>) {
     assert_eq!(result.unwrap_err().kind(), ErrorKind::Conflict);
 }
 
+/// Delegating authority that substitutes a non-Unknown error after the inner
+/// authority already published, modeling a lost or malformed response.
+#[derive(Debug)]
+struct FaultAuthority {
+    inner: Arc<dyn Authority>,
+    fail_next: Arc<AtomicBool>,
+}
+
+impl FaultAuthority {
+    fn new(inner: Arc<dyn Authority>) -> Self {
+        Self {
+            inner,
+            fail_next: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_next_response(&self) {
+        self.fail_next.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Authority for FaultAuthority {
+    fn data(&self) -> &yinyang::core::DataStore {
+        self.inner.data()
+    }
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+    fn observe_latest<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<yinyang::core::Snapshot>> + Send + 'a>>
+    {
+        self.inner.observe_latest()
+    }
+    fn observe_revision<'a>(
+        &'a self,
+        revision: Revision,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<yinyang::core::Snapshot>> + Send + 'a>>
+    {
+        self.inner.observe_revision(revision)
+    }
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
+        Box::pin(async move {
+            let outcomes = self.inner.commit_batch(requests).await?;
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(
+                    yinyang::core::ContentDescriptor::from_bytes(b"malformed response")
+                        .unwrap_err(),
+                );
+            }
+            Ok(outcomes)
+        })
+    }
+}
+
 async fn exercise_namespace(authority: Arc<dyn Authority>) {
     let temp = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
@@ -254,6 +318,13 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
         sync.namespace_intents()
             .await
             .unwrap()
+            .iter()
+            .any(|intent| intent.intent.id == created)
+    );
+    let inspect = Sync::inspect(temp.path().join("sync")).await.unwrap();
+    assert!(
+        inspect
+            .namespace
             .iter()
             .any(|intent| intent.intent.id == created)
     );
@@ -467,6 +538,47 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
     assert_eq!(
         sync.namespace_status(rename).await.unwrap().state,
         NamespaceState::Conflict
+    );
+
+    // Rename-first is safe: the same baseline content edit still commits under
+    // the moved identity because its content predicates were unchanged.
+    let (baseline, always_safe) =
+        create_file(&authority, &runtime, root, "moved-then-edited").await;
+    let content = sync
+        .stage(always_safe, baseline, &mut &b"moved edit"[..])
+        .await
+        .unwrap();
+    let rename = sync
+        .stage_rename(
+            always_safe,
+            baseline,
+            root,
+            "moved-then-edited-2",
+            RenameMode::NoReplace,
+        )
+        .await
+        .unwrap();
+    sync.publish(rename).await.unwrap();
+    let revision = sync.publish(content).await.unwrap();
+    let observed = authority.observe_revision(revision).await.unwrap();
+    assert_eq!(
+        observed
+            .resolve("moved-then-edited-2")
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        always_safe
+    );
+    assert_eq!(
+        observed
+            .open_file(always_safe)
+            .await
+            .unwrap()
+            .read(0, 64)
+            .await
+            .unwrap(),
+        b"moved edit"
     );
 
     // Delete/edit conflicts in both orders. Neither the local replacement nor
@@ -724,4 +836,91 @@ async fn namespace_restore_failure_keeps_a_prepared_intent_retryable() {
         sync.namespace_status(intent).await.unwrap().state,
         NamespaceState::Committed(_)
     ));
+}
+
+#[tokio::test]
+async fn namespace_post_dispatch_error_stays_unknown_and_resolves() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let fault = Arc::new(FaultAuthority::new(authority.clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let baseline = fault.observe_latest().await.unwrap();
+    let intent = sync
+        .stage_create_directory(fault.root(), "lost-malformed", baseline.revision())
+        .await
+        .unwrap();
+    fault.fail_next_response();
+    let error = sync.publish(intent).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    let status = sync.namespace_status(intent).await.unwrap();
+    assert_eq!(status.state, NamespaceState::Unknown);
+    let failure = status.failure.clone().unwrap();
+    assert_eq!(failure.kind(), ErrorKind::Unknown);
+    assert_eq!(failure.commit_id(), Some(status.intent.commit_id));
+    let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
+    assert_eq!(
+        authority.observe_latest().await.unwrap().revision(),
+        receipt.cursor.revision
+    );
+}
+
+#[tokio::test]
+async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let editor = Runtime::open(authority.clone(), temp.path().join("editor"))
+        .await
+        .unwrap();
+    editor.create_file(authority.root(), "file").await.unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let node = baseline.resolve("file").await.unwrap().unwrap().id();
+
+    let fault = Arc::new(FaultAuthority::new(authority.clone()));
+    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let edit = sync
+        .stage(node, baseline.revision(), &mut &b"content"[..])
+        .await
+        .unwrap();
+    fault.fail_next_response();
+    let error = sync.publish(edit).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    let commit = error.commit_id().unwrap();
+    let status = sync.status(edit).await.unwrap();
+    assert!(status.frozen);
+    assert_eq!(status.frozen_commit_id, Some(commit));
+    assert_eq!(status.error.unwrap().commit_id(), Some(commit));
+
+    // Read-only inspection succeeds while the writer still owns the lease.
+    let inspect = Sync::inspect(temp.path().join("sync")).await.unwrap();
+    let inspected = inspect
+        .content
+        .iter()
+        .find(|inspected| inspected.id == edit)
+        .unwrap_or_else(|| panic!("missing inspected edit"));
+    assert_eq!(inspected.handle.frozen_commit_id, Some(commit));
+    drop(sync);
+
+    backend.state.lock().unwrap().offline = true;
+    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let status = sync.status(edit).await.unwrap();
+    assert_eq!(status.frozen_commit_id, Some(commit));
+    assert_eq!(status.error.unwrap().commit_id(), Some(commit));
+    backend.state.lock().unwrap().offline = false;
+    sync.publish(edit).await.unwrap();
 }

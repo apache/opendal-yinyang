@@ -887,6 +887,35 @@ pub(super) async fn statuses(sync: &Sync) -> Result<Vec<NamespaceStatus>> {
     rows.iter().map(IntentRow::status).collect()
 }
 
+pub(super) fn inspect(connection: &Connection) -> Result<Vec<NamespaceStatus>> {
+    let has_namespaces: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='namespaces'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Error::local)?;
+    if !has_namespaces {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id,intent_key,baseline,commit_id,request_digest,operation,request,
+                    state,receipt_revision,receipt_ordinal,failure
+             FROM namespaces ORDER BY id",
+        )
+        .map_err(Error::local)?;
+    let rows = statement
+        .query_map([], row_from_sql)
+        .map_err(Error::local)?;
+    let rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Error::local)?;
+    rows.iter().map(IntentRow::status).collect()
+}
+
 async fn receipt_for(sync: &Sync, intent: &NamespaceIntent) -> Result<Option<Receipt>> {
     let receipt = sync
         .authority()
@@ -983,14 +1012,12 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
             Err(Error::Retained(failure))
         }
         Err(error) => {
-            let (state, failure) = match error.kind() {
-                ErrorKind::Retryable => (RETRYABLE, Error::Retryable),
-                ErrorKind::Unknown => (UNKNOWN, error),
-                ErrorKind::Conflict => (CONFLICT, Error::Conflict),
-                _ => (FAILED, error),
-            };
-            let failure = Failure::capture(&failure);
-            save_state_async(sync, id, state, None, Some(failure.clone())).await?;
+            // A response or transport error after dispatch cannot prove that
+            // the commit did not publish. Only an authoritative outcome below
+            // the wrapper can establish Conflict/Retryable; anything else stays
+            // Unknown so the original receipt can resolve it later.
+            let failure = Failure::unknown_with(request.id(), error);
+            save_state_async(sync, id, UNKNOWN, None, Some(failure.clone())).await?;
             Err(Error::Retained(failure))
         }
     }
