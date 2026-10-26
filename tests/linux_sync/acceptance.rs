@@ -49,6 +49,15 @@ fn assert_failure(output: &Captured, context: &str) {
     );
 }
 
+fn captured_text(output: &Captured) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 fn assert_tree(root: &Path, expected: &Tree, context: &str) {
     let actual = local_tree(root).unwrap_or_else(|error| {
         panic!("scan local tree {} for {context}: {error}", root.display())
@@ -403,7 +412,13 @@ fn managed_sync_completion_race_and_unknown_retry_use_real_service_processes() {
 
         write_local(&client.directory.join("race.txt"), b"local-v1");
         let running = fixture.spawn_sync_run(&client);
-        gate.wait_for_commit_response(Duration::from_secs(120));
+        if let Err(error) = gate.wait_for_commit_response(Duration::from_secs(120)) {
+            let output = running.wait(Duration::from_secs(130));
+            panic!(
+                "gate did not observe the v1 commit response ({error}):\n{}",
+                captured_text(&output)
+            );
+        }
         let v1_version = fixture.remote_file_version("race.txt");
         assert_eq!(v1_version.0, base_version.0);
         assert!(v1_version.1 > base_version.1, "{v1_version:?}");
@@ -460,7 +475,13 @@ fn managed_sync_completion_race_and_unknown_retry_use_real_service_processes() {
 
         write_local(&client.directory.join("unknown.txt"), b"exactly-once");
         let running = fixture.spawn_sync_run(&client);
-        gate.wait_for_commit_response(Duration::from_secs(120));
+        if let Err(error) = gate.wait_for_commit_response(Duration::from_secs(120)) {
+            let output = running.wait(Duration::from_secs(130));
+            panic!(
+                "gate did not observe the unknown-outcome commit response ({error}):\n{}",
+                captured_text(&output)
+            );
+        }
         let output = running.wait(Duration::from_secs(120));
         assert_failure(&output, "sync with a lost commit response");
 

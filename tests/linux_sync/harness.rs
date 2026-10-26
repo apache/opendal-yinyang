@@ -1159,10 +1159,11 @@ impl ServiceGate {
         self.address
     }
 
-    pub fn wait_for_commit_response(&self, timeout: Duration) {
-        self.ready
-            .recv_timeout(timeout)
-            .expect("Managed Sync gate did not observe a commit response");
+    pub fn wait_for_commit_response(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), mpsc::RecvTimeoutError> {
+        self.ready.recv_timeout(timeout)
     }
 
     pub fn release(&self) {
