@@ -230,10 +230,14 @@ impl Fixture {
     }
 
     fn spawn_service(&mut self) {
+        self.spawn_service_on("127.0.0.1:0".parse().expect("loopback wildcard"));
+    }
+
+    fn spawn_service_on(&mut self, listen: SocketAddr) {
         let database = self.temp.path().join("metadata.db");
         let database = database.to_str().expect("UTF-8 database path");
-        let mut cmd =
-            self.yy_command(&["serve", "--database", database, "--listen", "127.0.0.1:0"]);
+        let listen = listen.to_string();
+        let mut cmd = self.yy_command(&["serve", "--database", database, "--listen", &listen]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
@@ -290,8 +294,9 @@ impl Fixture {
     }
 
     pub fn restart_service(&mut self) {
+        let address = self.service_address();
         self.stop_service();
-        self.spawn_service();
+        self.spawn_service_on(address);
     }
 
     pub fn service_address(&self) -> SocketAddr {
@@ -301,8 +306,37 @@ impl Fixture {
             .address
     }
 
+    pub fn pause_service(&self) {
+        let pid = self
+            .service
+            .as_ref()
+            .expect("service publication requires a running metadata service")
+            .child
+            .id();
+        let output = run_timeout(
+            Command::new("kill").args(["-STOP", &pid.to_string()]),
+            Duration::from_secs(30),
+        );
+        output.success_or("pause metadata service");
+    }
+
+    pub fn resume_service(&self) {
+        let pid = self
+            .service
+            .as_ref()
+            .expect("service publication requires a running metadata service")
+            .child
+            .id();
+        let output = run_timeout(
+            Command::new("kill").args(["-CONT", &pid.to_string()]),
+            Duration::from_secs(30),
+        );
+        output.success_or("resume metadata service");
+    }
+
     /// Writes a strict volume config and returns its path. Rewriting the same
-    /// path is intentional: a restarted service gets a fresh loopback address.
+    /// path is intentional: a restarted service keeps its original loopback
+    /// address, so an unchanged config keeps working.
     pub fn volume_config(&self, name: &str, frontend: Frontend, read_only: bool) -> PathBuf {
         let staging = self.temp.path().join(name);
         let mut json = format!(
@@ -382,6 +416,10 @@ impl Fixture {
     }
 
     pub fn mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
+        let staging = self
+            .temp
+            .path()
+            .join(config.file_stem().expect("volume config has a file stem"));
         let mountpoint = mountpoint.to_str().expect("UTF-8 mountpoint");
         let config = config.to_str().expect("UTF-8 config path");
         let mut cmd = self.yy_command(&["--volume", config, "mount", mountpoint]);
@@ -398,6 +436,7 @@ impl Fixture {
             stdout: Some(stdout_thread),
             stderr: Some(stderr_thread),
             mountpoint: PathBuf::from(mountpoint),
+            staging,
         };
         mounted.wait_mounted();
         mounted
@@ -431,6 +470,7 @@ pub struct Mounted {
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
     mountpoint: PathBuf,
+    staging: PathBuf,
 }
 
 impl Mounted {
@@ -478,8 +518,29 @@ impl Mounted {
 
     pub fn kill(&mut self) {
         let _ = self.child.kill();
-        self.wait_exit(Duration::from_secs(30));
+        let _ = self.wait_exit(Duration::from_secs(30));
         self.unmount_force();
+        self.assert_staging_lease_released();
+    }
+
+    pub fn terminate(&mut self) {
+        let pid = self.child.id().to_string();
+        let output = run_timeout(
+            Command::new("kill").args(["-TERM", &pid]),
+            Duration::from_secs(30),
+        );
+        output.success_or("send SIGTERM to yy mount");
+        let status = self.wait_exit(Duration::from_secs(30));
+        assert!(
+            status.success(),
+            "yy mount did not exit cleanly after SIGTERM: {status}"
+        );
+        assert!(
+            mount_fs_type(&self.mountpoint).is_none(),
+            "yy did not remove {} after a graceful SIGTERM",
+            self.mountpoint.display()
+        );
+        self.assert_staging_lease_released();
     }
 
     pub fn unmount(&mut self) {
@@ -489,7 +550,17 @@ impl Mounted {
             Duration::from_secs(30),
         );
         output.success_or(&format!("fusermount3 -u {mountpoint}"));
-        self.wait_exit(Duration::from_secs(30));
+        let status = self.wait_exit(Duration::from_secs(30));
+        assert!(
+            status.success(),
+            "yy mount did not exit cleanly after external unmount: {status}"
+        );
+        assert!(
+            mount_fs_type(&self.mountpoint).is_none(),
+            "external unmount left {} in /proc/mounts",
+            self.mountpoint.display()
+        );
+        self.assert_staging_lease_released();
     }
 
     fn unmount_force(&mut self) {
@@ -503,13 +574,13 @@ impl Mounted {
         );
     }
 
-    fn wait_exit(&mut self, timeout: Duration) {
+    fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.child.try_wait().expect("wait for yy mount").is_some() {
+            if let Some(status) = self.child.try_wait().expect("wait for yy mount") {
                 let _ = self.stdout.take().map(JoinHandle::join);
                 let _ = self.stderr.take().map(JoinHandle::join);
-                return;
+                return status;
             }
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
@@ -530,6 +601,23 @@ impl Mounted {
             .take()
             .and_then(|thread| thread.join().ok())
             .unwrap_or_default()
+    }
+
+    fn assert_staging_lease_released(&self) {
+        let path = self.staging.join("runtime.lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("open staging lock {}: {error}", path.display()));
+        lock.try_lock().unwrap_or_else(|error| {
+            panic!(
+                "yy mount still holds the staging lease {} after process exit: {error}",
+                path.display()
+            )
+        });
     }
 }
 
@@ -586,29 +674,15 @@ pub fn assert_errno(error: std::io::Error, allowed: &[i32], operation: &str) {
     );
 }
 
-pub fn sync_all_bounded(path: &Path, timeout: Duration) -> std::io::Result<()> {
-    // Run fsync in a fresh subprocess so a hung FUSE request cannot wedge the
-    // test process; timeout(1) gives a bounded, explicit failure.
-    let script = "import os, sys\nfd = os.open(sys.argv[1], os.O_RDWR)\nos.fsync(fd)\nos.close(fd)";
-    let output = run_timeout(
-        Command::new("timeout")
-            .arg(timeout.as_secs().to_string())
-            .arg("python3")
-            .arg("-c")
-            .arg(script)
-            .arg(path),
-        timeout + Duration::from_secs(5),
-    );
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "fsync helper for {} failed with {}",
-                path.display(),
-                output.status
-            ),
-        ))
-    }
+pub fn sync_all_with_deadline(file: &fs::File, timeout: Duration) -> std::io::Result<()> {
+    let clone = file.try_clone()?;
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = sender.send(clone.sync_all());
+    });
+    let result = receiver.recv_timeout(timeout).unwrap_or_else(|error| {
+        panic!("fsync did not complete within {timeout:?}; a hang is not acceptance: {error}")
+    });
+    worker.join().expect("fsync worker panicked");
+    result
 }

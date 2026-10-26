@@ -50,18 +50,27 @@ cargo x test-linux-fuse --read-only
   after `unlink`.
 - Unsupported operations: symlink and hard link return an explicit OS error
   instead of advertising POSIX links.
-- External changes and dirty refresh: independent external growth/shrink is
-  authoritative on reopen, while a dirty descriptor keeps its staged bytes and
-  `fsync` reports failure instead of silently rebasing.
+- External changes and dirty refresh: a descriptor opened before an external
+  grow/shrink keeps its pinned size, EOF and pread results, a fresh reopen
+  reflects the authoritative size, and a dirty descriptor keeps its staged
+  bytes while `fsync` reports failure instead of silently rebasing.
 - Concurrent mounts: two live `yy mount` processes on separate staging
-  directories publish and read distinct files concurrently.
+  directories publish distinct files concurrently under a barrier, then read
+  across each other's mounts.
 - Process kill recovery: `SIGKILL` of the mount process retains staged bytes
-  through persistent staging; a reopened mount can read and publish them.
+  through persistent staging while the descriptor is still open; a reopened
+  mount can read and publish them.
 - Fsync/network failure retention: stopping the metadata service makes
   `fsync` fail within a bound; staged bytes survive, the service restarts, and
-  a reopened mount publishes them.
+  a reopened mount publishes them through the unchanged service address.
+- Interrupted call retention: a `fsync` left in flight against a paused
+  metadata service is interrupted by killing the mount daemon, the authority is
+  untouched, and a reopened mount publishes the staged bytes.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
+- Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits
+  on its own, removes the mount entry, and releases the staging lease. A
+  separate SIGTERM scenario verifies the same process and lease lifecycle.
 
 The assertions follow the core specs. They do not add POSIX guarantees that the
 transactional filesystem does not provide; for example symlinks are rejected,

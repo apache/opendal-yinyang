@@ -17,9 +17,12 @@
 
 //! Real /dev/fuse acceptance scenarios for the YinYang mount adapter.
 
-use crate::harness::{Fixture, Frontend, Publication, assert_errno, sync_all_bounded};
+use crate::harness::{Fixture, Frontend, Publication, assert_errno, sync_all_with_deadline};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
+use std::sync::{Arc, Barrier, mpsc};
+use std::thread;
 use std::time::Duration;
 
 const EACCES: i32 = 13;
@@ -294,34 +297,57 @@ fn external_changes(fixture: &Fixture) {
         fixture.volume_config(&format!("lib-external-{suffix}"), Frontend::Library, false);
     fixture.library_seed(&library, "external.txt", b"AAAA");
     fixture.library_seed(&library, "shrink.txt", b"0123456789");
+    fixture.library_seed(&library, "dirty.txt", b"BBBBBBBB");
     let config = fixture.volume_config(&format!("stage-external-{suffix}"), Frontend::Fuse, false);
     let mountpoint = fixture.temp.path().join(format!("mnt-external-{suffix}"));
     fs::create_dir(&mountpoint).expect("create mountpoint");
     let mut mounted = fixture.mount(&config, &mountpoint);
 
+    let mut old = File::open(mounted.mountpoint().join("external.txt"))
+        .expect("open descriptor before external growth");
+    let mut initial = Vec::new();
+    old.read_to_end(&mut initial).expect("read original bytes");
+    assert_eq!(initial, b"AAAA");
+    assert_eq!(old.metadata().expect("stat original").len(), 4);
     fixture.remote_write(&library, "external.txt", b"BBBBBBBB");
     assert_eq!(
         fixture.remote_read(&library, "external.txt", 16),
         b"BBBBBBBB",
         "independent external growth must be authoritative"
     );
+    assert_eq!(
+        old.metadata().expect("stat old descriptor").len(),
+        4,
+        "external growth must not resize a descriptor that was opened before the change"
+    );
+    let mut beyond_old_eof = [0u8; 4];
+    let count = old
+        .read_at(&mut beyond_old_eof, 4)
+        .expect("pread beyond the old EOF");
+    assert_eq!(
+        count, 0,
+        "pread past the old EOF must not leak bytes from the externally grown file"
+    );
+    drop(old);
 
+    let dirty_path = mounted.mountpoint().join("dirty.txt");
     let mut dirty = OpenOptions::new()
+        .read(true)
         .write(true)
-        .open(mounted.mountpoint().join("external.txt"))
+        .open(&dirty_path)
         .expect("open file for dirty write");
     dirty.write_all(b"LOCAL").expect("stage dirty write");
-    fixture.remote_write(&library, "external.txt", b"ZZZZZZZZZZ");
+    fixture.remote_write(&library, "dirty.txt", b"ZZZZZZZZZZ");
     dirty.seek(SeekFrom::Start(0)).expect("rewind dirty file");
     let mut local = Vec::new();
     dirty
         .read_to_end(&mut local)
         .expect("read dirty staged bytes");
     assert_eq!(
-        local, b"LOCAL",
+        local, b"LOCALBBB",
         "an external change must not silently rebase a dirty descriptor"
     );
-    let conflict = sync_all_bounded(dirty.path(), Duration::from_secs(30));
+    let conflict = dirty.sync_all();
     assert!(
         conflict.is_err(),
         "fsync of a stale dirty base must report failure instead of claiming remote durability"
@@ -336,11 +362,31 @@ fn external_changes(fixture: &Fixture) {
         .join(format!("mnt-external-reopen-{suffix}"));
     fs::create_dir(&mountpoint).expect("create reopen mountpoint");
     let mut reopen = fixture.mount(&config, &mountpoint);
-    assert_eq!(
-        fs::read(reopen.mountpoint().join("shrink.txt")).expect("read shrunk file"),
-        b"0123456789"
-    );
+    let mut old_shrink = File::open(reopen.mountpoint().join("shrink.txt"))
+        .expect("open descriptor before external shrink");
+    let mut before = Vec::new();
+    old_shrink
+        .read_to_end(&mut before)
+        .expect("read original shrink file");
+    assert_eq!(before, b"0123456789");
+    assert_eq!(old_shrink.metadata().expect("stat original").len(), 10);
     fixture.remote_truncate(&library, "shrink.txt", 4);
+    assert_eq!(
+        old_shrink.metadata().expect("stat old descriptor").len(),
+        10,
+        "external shrink must not resize a descriptor that was opened before the change"
+    );
+    let mut tail = [0u8; 2];
+    let count = old_shrink
+        .read_at(&mut tail, 8)
+        .expect("pread within the old EOF");
+    assert_eq!(
+        count,
+        tail.len(),
+        "pread at the old EOF must still return pinned bytes"
+    );
+    assert_eq!(&tail, b"89");
+    drop(old_shrink);
     reopen.unmount();
 
     let mountpoint = fixture
@@ -349,6 +395,15 @@ fn external_changes(fixture: &Fixture) {
         .join(format!("mnt-external-final-{suffix}"));
     fs::create_dir(&mountpoint).expect("create final mountpoint");
     let mut final_mount = fixture.mount(&config, &mountpoint);
+    assert_eq!(
+        final_mount
+            .mountpoint()
+            .join("shrink.txt")
+            .metadata()
+            .expect("stat externally shrunk file")
+            .len(),
+        4
+    );
     assert_eq!(
         fs::read(final_mount.mountpoint().join("shrink.txt")).expect("read externally shrunk file"),
         b"0123"
@@ -370,14 +425,32 @@ fn fuse_concurrent_mounts_object() {
     let mut a = fixture.mount(&config_a, &mount_a);
     let mut b = fixture.mount(&config_b, &mount_b);
 
-    let mut file_a = File::create(a.mountpoint().join("from-a.txt")).expect("create on mount A");
-    file_a.write_all(b"a").expect("write via mount A");
-    file_a.sync_all().expect("fsync via mount A");
-    drop(file_a);
-    let mut file_b = File::create(b.mountpoint().join("from-b.txt")).expect("create on mount B");
-    file_b.write_all(b"b").expect("write via mount B");
-    file_b.sync_all().expect("fsync via mount B");
-    drop(file_b);
+    let start = Arc::new(Barrier::new(3));
+    let publish = Arc::new(Barrier::new(3));
+    let path_a = a.mountpoint().join("from-a.txt");
+    let path_b = b.mountpoint().join("from-b.txt");
+    let start_a = start.clone();
+    let start_b = start.clone();
+    let publish_a = publish.clone();
+    let publish_b = publish.clone();
+    let writer_a = thread::spawn(move || {
+        start_a.wait();
+        let mut file = File::create(&path_a).expect("create on mount A");
+        file.write_all(b"a").expect("write via mount A");
+        publish_a.wait();
+        file.sync_all().expect("fsync via mount A");
+    });
+    let writer_b = thread::spawn(move || {
+        start_b.wait();
+        let mut file = File::create(&path_b).expect("create on mount B");
+        file.write_all(b"b").expect("write via mount B");
+        publish_b.wait();
+        file.sync_all().expect("fsync via mount B");
+    });
+    start.wait();
+    publish.wait();
+    writer_a.join().expect("mount A writer panicked");
+    writer_b.join().expect("mount B writer panicked");
 
     assert_eq!(
         fs::read(a.mountpoint().join("from-b.txt")).expect("cross read"),
@@ -409,8 +482,13 @@ fn fuse_process_kill_recovery_object() {
         .open(mounted.mountpoint().join("recover.txt"))
         .expect("open file for staged write");
     dirty.write_all(b"dirty-local").expect("stage dirty write");
-    drop(dirty);
+    assert_eq!(
+        fixture.remote_read(&library, "recover.txt", 64),
+        b"seed",
+        "an un-fsynced mounted write must not publish before the daemon is interrupted"
+    );
     mounted.kill();
+    drop(dirty);
 
     let mountpoint = fixture.temp.path().join("mnt-kill-reopen");
     fs::create_dir(&mountpoint).expect("create reopen mountpoint");
@@ -446,12 +524,13 @@ fn fuse_fsync_failure_retention_service() {
     let mut mounted = fixture.mount(&config, &mountpoint);
 
     let mut dirty = OpenOptions::new()
+        .read(true)
         .write(true)
         .open(mounted.mountpoint().join("network.txt"))
         .expect("open file for staged write");
     dirty.write_all(b"survives").expect("stage dirty write");
     fixture.stop_service();
-    let failure = sync_all_bounded(dirty.path(), Duration::from_secs(20));
+    let failure = sync_all_with_deadline(&dirty, Duration::from_secs(20));
     assert!(
         failure.is_err(),
         "fsync must fail while the metadata service is unavailable"
@@ -469,7 +548,6 @@ fn fuse_fsync_failure_retention_service() {
     mounted.kill();
 
     fixture.restart_service();
-    let config = fixture.volume_config("stage-network", Frontend::Fuse, false);
     let mountpoint = fixture.temp.path().join("mnt-network-reopen");
     fs::create_dir(&mountpoint).expect("create reopen mountpoint");
     let mut reopened = fixture.mount(&config, &mountpoint);
@@ -486,6 +564,71 @@ fn fuse_fsync_failure_retention_service() {
     assert_eq!(
         fixture.remote_read(&library, "network.txt", 64),
         b"survives"
+    );
+    reopened.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_interrupted_call_retention_service() {
+    let fixture = Fixture::new(Publication::Service);
+    let library = fixture.volume_config("lib-interrupted", Frontend::Library, false);
+    fixture.library_seed(&library, "interrupted.txt", b"seed");
+    let config = fixture.volume_config("stage-interrupted", Frontend::Fuse, false);
+    let mountpoint = fixture.temp.path().join("mnt-interrupted");
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+
+    let mut dirty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mounted.mountpoint().join("interrupted.txt"))
+        .expect("open file for staged write");
+    dirty
+        .write_all(b"interrupted-local")
+        .expect("stage dirty write");
+    let in_flight = dirty.try_clone().expect("duplicate descriptor");
+    fixture.pause_service();
+    let (sender, receiver) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let _ = sender.send(in_flight.sync_all());
+    });
+    thread::sleep(Duration::from_millis(200));
+    mounted.kill();
+    let outcome = receiver
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|error| {
+            panic!("fsync did not return after the mount daemon was killed: {error}")
+        });
+    caller.join().expect("fsync caller panicked");
+    assert!(
+        outcome.is_err(),
+        "an fsync interrupted by killing the mount daemon must fail, not report remote durability"
+    );
+    drop(dirty);
+
+    fixture.resume_service();
+    assert_eq!(
+        fixture.remote_read(&library, "interrupted.txt", 64),
+        b"seed",
+        "the interrupted publication must not have reached the authority"
+    );
+    let mountpoint = fixture.temp.path().join("mnt-interrupted-reopen");
+    fs::create_dir(&mountpoint).expect("create reopen mountpoint");
+    let mut reopened = fixture.mount(&config, &mountpoint);
+    assert_eq!(
+        fs::read(reopened.mountpoint().join("interrupted.txt")).expect("read staged recovery"),
+        b"interrupted-local"
+    );
+    let mut publish = OpenOptions::new()
+        .write(true)
+        .open(reopened.mountpoint().join("interrupted.txt"))
+        .expect("reopen recovered file");
+    publish.sync_all().expect("recovered handle publishes");
+    drop(publish);
+    assert_eq!(
+        fixture.remote_read(&library, "interrupted.txt", 64),
+        b"interrupted-local"
     );
     reopened.unmount();
 }
@@ -514,4 +657,15 @@ fn fuse_busy_unmount_object() {
     );
     drop(file);
     mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_sigterm_lifecycle_object() {
+    let fixture = Fixture::new(Publication::Object);
+    let config = fixture.volume_config("stage-sigterm", Frontend::Fuse, false);
+    let mountpoint = fixture.temp.path().join("mnt-sigterm");
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    mounted.terminate();
 }
