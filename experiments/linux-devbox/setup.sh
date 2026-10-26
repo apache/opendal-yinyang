@@ -51,7 +51,8 @@ sudo ln -sf /usr/bin/fdfind /usr/local/bin/fd
 sudo hostnamectl set-hostname lance-fuse-demo
 
 if ! test -x "$HOME/.cargo/bin/rustup"; then
-    rustup_binary=$(mktemp)
+    rustup_dir=$(mktemp -d)
+    rustup_binary="$rustup_dir/rustup-init"
     curl --fail --location --retry 3 \
         https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
         --output "$rustup_binary"
