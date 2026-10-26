@@ -26,9 +26,14 @@ mod error;
 pub(super) mod linux;
 pub(super) mod state;
 
-pub use directory::{DirectorySync, Resolution, RunOutcome};
+pub use directory::{
+    BaselineEvidence, BindingEvidence, BindingState, DirectorySync, EntryEvidence, EntryKind,
+    EntryState, Inspection, IntentEvidence, IntentOperation, IntentState, LocalEvidence,
+    LocalScanState, LocalStatus, OutcomeEvidence, OutcomeState, Presence, RemoteAvailability,
+    RemoteEvidence, RemoteStatus, Resolution, RunOutcome, StatusSummary,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use linux::{
-    Artifact, ArtifactKind, CapturedContent, Conflict, InstallOutcome, LocalKind, LocalNode,
-    LocalSnapshot, Replica, ReplicaStatus,
+    Artifact, ArtifactKind, CapturedContent, Conflict, ContentHash, InstallOutcome, LocalKind,
+    LocalNode, LocalSnapshot, Replica, ReplicaStatus,
 };

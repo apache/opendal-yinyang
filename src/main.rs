@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
 mod file_cli;
+#[cfg(target_os = "linux")]
 mod sync_cli;
 
 #[derive(Parser)]
@@ -46,6 +47,7 @@ enum Command {
         command: file_cli::FileCommand,
     },
     /// Reconcile a bound ordinary directory with the Managed volume (requires --volume).
+    #[cfg(target_os = "linux")]
     Sync {
         #[command(subcommand)]
         command: sync_cli::SyncCommand,
@@ -90,6 +92,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     opendal::install_default();
     if let Some(path) = &cli.volume {
         return match cli.command {
+            #[cfg(target_os = "linux")]
             Command::Sync { command } => sync_cli::run(path, command).await,
             command => {
                 file_cli::run(path, command).await?;
@@ -101,7 +104,11 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Mount { .. } => {
             return Err("mount requires --volume CONFIG.json with frontend=fuse".into());
         }
-        Command::File { .. } | Command::Capabilities | Command::Sync { .. } => {
+        Command::File { .. } | Command::Capabilities => {
+            return Err("this command requires --volume CONFIG.json".into());
+        }
+        #[cfg(target_os = "linux")]
+        Command::Sync { .. } => {
             return Err("this command requires --volume CONFIG.json".into());
         }
         _ => {}
@@ -147,8 +154,9 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         | Command::Serve { .. }
         | Command::File { .. }
         | Command::Capabilities
-        | Command::Sync { .. }
         | Command::Mount { .. } => unreachable!(),
+        #[cfg(target_os = "linux")]
+        Command::Sync { .. } => unreachable!(),
         Command::Publish {
             source,
             replace,
