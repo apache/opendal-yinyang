@@ -84,13 +84,6 @@ pub enum SyncSide {
 }
 
 impl SyncSide {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote => "remote",
-        }
-    }
-
     fn domain_keep(self) -> domain::Resolution {
         match self {
             Self::Local => domain::Resolution::KeepLocal,
