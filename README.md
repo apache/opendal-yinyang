@@ -29,12 +29,17 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 ## Current support
 
 - **Managed Mount:** The experimental Linux FUSE frontend supports read-only and
-  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`. PRs
-  #83, #84, and #85 added the frontend, writable callbacks, and native
-  acceptance on 2026-10-27. All 22 real-mount scenarios passed on an isolated
-  Ubuntu 24.04 AWS host and in GitHub Linux CI, covering both publication
-  authorities, saves, failure retention, refresh, crash recovery, and teardown.
-  See the [frontend contract](specs/linux-fuse.md) and
+  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`.
+  [PR #83](https://github.com/apache/opendal-yinyang/pull/83),
+  [PR #84](https://github.com/apache/opendal-yinyang/pull/84), and
+  [PR #85](https://github.com/apache/opendal-yinyang/pull/85) added the
+  frontend, writable callbacks, and native acceptance on 2026-10-27. The
+  [PR #85 record](https://github.com/apache/opendal-yinyang/pull/85) documents
+  all 22 real-mount scenarios passing on an isolated Ubuntu 24.04 AWS host;
+  the [GitHub Linux FUSE job](https://github.com/apache/opendal-yinyang/actions/runs/40312762537/job/121539655561)
+  also passed all 22. Both publication authorities are exercised, covering
+  saves, failure retention, refresh, crash recovery, and teardown. See the
+  [frontend contract](specs/linux-fuse.md) and
   [acceptance guide](docs/linux-fuse-acceptance.md). This is experimental
   native validation, not release support.
 - **Managed Sync:** The [Sync runtime](specs/sync-runtime.md) coordinates pinned
@@ -50,6 +55,9 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 
 The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
 tracks the remaining integration and platform work.
+The closed historical umbrella
+[PR #26](https://github.com/apache/opendal-yinyang/pull/26) explicitly was not
+intended to merge and is not the active implementation stack.
 
 ## Publish and restore a directory
 

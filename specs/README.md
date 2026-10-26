@@ -22,11 +22,15 @@ invariants, compatibility rules, and implementation boundaries. Specifications
 evolve with the implementation and must be updated in the same change as the
 contract they describe.
 
-On 2026-10-27, PRs #83, #84, and #85 established the Linux Managed Mount and
-its native acceptance suite. All 22 real-mount scenarios passed on an isolated
-Ubuntu 24.04 AWS host and in GitHub Linux CI, using both publication
-authorities. See the [acceptance guide](../docs/linux-fuse-acceptance.md). This
-evidence does not make the frontend a release-supported combination.
+On 2026-10-27,
+[PR #83](https://github.com/apache/opendal-yinyang/pull/83),
+[PR #84](https://github.com/apache/opendal-yinyang/pull/84), and
+[PR #85](https://github.com/apache/opendal-yinyang/pull/85) established the
+Linux Managed Mount and its native acceptance suite. All 22 real-mount
+scenarios passed on an isolated Ubuntu 24.04 AWS host and in GitHub Linux CI,
+using both publication authorities. See the
+[acceptance guide](../docs/linux-fuse-acceptance.md). This evidence does not
+make the frontend a release-supported combination.
 
 The transactional filesystem specification is an explicit design-ahead
 exception. It defines the replacement contract without requiring compatibility
