@@ -189,7 +189,7 @@ impl Inner {
         let snapshot = match self.observe().await {
             Ok(snapshot) => snapshot,
             Err(errno) => {
-                eprintln!("yy: fuse refresh: cannot observe latest: {errno}");
+                eprintln!("yy: fuse refresh: cannot observe latest: {errno:?}");
                 return;
             }
         };
@@ -214,7 +214,7 @@ impl Inner {
                 Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => active += 1,
                 Err(error) => {
                     failures += 1;
-                    eprintln!("yy: fuse refresh: reclaim {}: {error}", id);
+                    eprintln!("yy: fuse refresh: reclaim {id:?}: {error}");
                 }
             }
         }
