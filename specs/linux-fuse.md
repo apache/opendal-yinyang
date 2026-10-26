@@ -1,6 +1,6 @@
-# Read-only Linux FUSE frontend
+# Linux FUSE frontend
 
-**Status: experimental read-only Managed mount; protocol transport is the
+**Status: experimental Managed mount; protocol transport is the
 `fuser` 0.17 binding, not a YinYang FUSE implementation.**
 
 The Linux frontend mounts one Managed volume through the kernel FUSE ABI with
@@ -11,34 +11,35 @@ the Linux path.
 
 ## Startup and admission
 
-The volume configuration must declare `model = "managed"`, `access = "mount"`,
-`frontend = "fuse"` and `read_only = true`. The shared admission rules in
-[`volume-capabilities.md`](volume-capabilities.md) reject every other
-combination before an authority connection or staging lease exists, and reject
-the FUSE frontend entirely on non-Linux targets. Object and service publication
-authorities are both accepted through `Volume::connect`.
+The volume configuration must declare `model = "managed"`, `access = "mount"`
+and `frontend = "fuse"`. Both read-only and writable mounts use the shared
+admission rules in [`volume-capabilities.md`](volume-capabilities.md); the
+frontend is rejected entirely on non-Linux targets. Object and service
+publication authorities are both accepted through `Volume::connect`.
 
 Startup order:
 
 1. validate the configuration and the storage capability intersection;
 2. connect the object or service authority;
-3. open the shared [`Mount`](mount-runtime.md) read-only (acquires the staging
-   lease and runs the existing recovery);
-4. inspect the recovered runtime status and refuse the mount if any handle is
-   pending, frozen, conflicted or failed;
+3. open the shared [`Mount`](mount-runtime.md) using the configured write
+   policy (acquires the staging lease and runs the existing recovery);
+4. for a read-only mount, inspect the recovered runtime status and refuse the
+   mount if any handle is pending, frozen, conflicted or failed;
 5. observe the latest remote snapshot and verify the root is a directory;
 6. handshake with the kernel as `fuse.yinyang` and serve requests.
 
 Step 4 is the read-only dirty-data boundary. Recovered clean observations are
 disposable and reclaimed by existing Mount recovery, while unpublished staged
 bytes are never exposed as a remote snapshot: the mount fails with a
-diagnostic naming the handle instead. The lease is already held during the
-inspection, so another client cannot interleave. Refusing startup changes no
-remote state.
+diagnostic naming the handle instead. A writable mount instead serves recovered
+pending/frozen/error state through the shared Mount handles, so a later flush or
+fsync reports the real remote outcome. The lease is already held during the
+inspection, so another client cannot interleave. Refusing a read-only startup
+changes no remote state.
 
-The mount is owner-only (`SessionACL::Owner`) and advertised as `ro` with
-`fsname=yinyang-<name>` and `subtype=yinyang`, so the kernel reports
-`fuse.yinyang` as the filesystem type.
+The mount is owner-only (`SessionACL::Owner`) with `fsname=yinyang-<name>` and
+`subtype=yinyang`, so the kernel reports `fuse.yinyang` as the filesystem type.
+Only the read-only policy adds the kernel `ro` option.
 
 ## Identity and lookup references
 
@@ -64,15 +65,16 @@ reply per request and replaces a dropped unanswered reply with `EIO`.
 
 `lookup` and non-handle `getattr` observe the latest snapshot for metadata and
 use that same snapshot's revision for timestamps, so a reply never mixes
-metadata from two observations. Attributes are synthesized: directories
-`0555`, files `0444` (readable plus the core executable bit), the mounting
-user's uid/gid, size from the content descriptor or a fixed directory size,
-and timestamps encoding the revision sequence rather than wall-clock time.
-`getxattr`, `listxattr`, `readlink` and options outside the read-only contract
-return explicit errors; mutations return `EROFS`.
+metadata from two observations. Attributes are synthesized: read-only
+directories are `0555` and files are `0444`; writable directories are `0755`
+and files are `0644` or `0755` according to the core executable bit. The
+mounting user's uid/gid, size from the content descriptor or a fixed directory
+size, and revision-derived timestamps are synthesized. `getxattr`,
+`listxattr`, `readlink`, links and special nodes return explicit unsupported
+errors.
 
-`open` requires a read-only access mode, rejects cached directories with
-`EISDIR`, and takes one reference on the node's shared staged version through
+`open` validates the access mode, rejects cached directories with `EISDIR`, and
+takes one reference on the node's shared staged version through
 `Mount::open_node`. The reply opens with `FOPEN_DIRECT_IO`, so the kernel does
 not cache file pages. Reads stream from the staged version. `getattr` with an
 open handle reports the staged record's length, so `fstat` and read bytes
@@ -89,7 +91,56 @@ version remains coherent until a later release becomes the final reference;
 that open's metadata and content never disagree. The frontend does not call
 `Mount::refresh` while references exist, because refresh rebases live handles;
 a writable layer that in-place refreshes must first define its open-fd and
-kernel-cache invalidation policy.
+kernel-cache invalidation policy. Before a new open or a path attribute, the
+adapter retries reclaiming a clean unreferenced NodeId; a successful reclaim
+makes the next observation use the latest remote version, while Busy retains
+all still-pinned or dirty/frozen/error state.
+
+## Writable callbacks
+
+`write` stages bytes in the shared per-NodeId Mount handle. Each request
+evaluates the file flags supplied by the kernel. `fcntl(F_SETFL)` can toggle
+`O_APPEND` for later writes. `O_SYNC`/`O_DSYNC` are set at open or carried as
+per-request IOCB sync markers; `F_SETFL` does not toggle them. An append
+request uses the node's append path, which chooses its offset under the same
+per-node lock as other writes; a regular write uses the kernel offset. The
+writable access mode is fixed by the open request. `O_TRUNC` stages a zero
+length before the open reply. A write whose current flags include
+`O_SYNC`/`O_DSYNC` attempts publication before acknowledging the write.
+Unsupported write flags return an explicit error instead of silently changing
+semantics.
+
+`flush` publishes a writable handle and reports the real remote outcome to the
+closing descriptor. `release` never publishes and never discards staging.
+Flush or fsync on a read-only reference is a successful no-op even when another
+writable reference shares the node, so a reader close cannot publish somebody
+else's dirty bytes. A failed publication remains attached to the shared handle
+and volume ledger; later fsync/flush retries the original frozen request.
+
+`create` and `mkdir` use the Runtime helpers that return the NodeId produced by
+the committing Planner, avoiding a post-commit path lookup. `unlink`, `rmdir`,
+and path renames use the path-addressed Runtime methods, so lookup and commit
+share one guarded Snapshot. Plain `rename` replaces an existing destination;
+`RENAME_NOREPLACE` uses the no-replace form. Exchange and whiteout renames are
+explicitly unsupported.
+
+`setattr` supports size and the core executable flag only. Size on an open
+descriptor is staged for that descriptor's later flush/fsync; path truncation
+publishes before returning success. A mode request is accepted only when it is
+one of the synthesized modes above (`0444`/`0555` or `0644`/`0755` according to
+read-only policy and the executable bit); other permission combinations return
+`EOPNOTSUPP`. Linux may include `S_IFREG`/`S_IFDIR` type bits in the mode;
+they are accepted when they match the node, while setuid/setgid/sticky and
+other permission combinations are rejected. Kernel bookkeeping timestamps
+attached to a chmod or truncate request are accepted and ignored, and the reply
+always carries revision-derived timestamps. Standalone timestamp changes and
+ownership changes remain explicitly unsupported. Before changing the
+executable flag, the shared node lock
+publishes dirty content, commits a Planner based on the handle's recorded
+content revision, and advances only that clean handle to the receipt revision.
+An external content change therefore produces Conflict rather than rebasing
+old staged bytes onto new content. Ownership, timestamps and other mode bits
+are not persisted.
 
 ## Explicit refresh
 
@@ -153,16 +204,14 @@ map to the narrow errno intended for each operation; unknown identity is
 
 ## Cancellation and exit
 
-The binding answers `FUSE_INTERRUPT` with `ENOSYS` (fuser 0.17
-`src/request.rs`), so an interrupted syscall does not cancel in-flight remote
-work. The Linux kernel waits out every request already delivered to the daemon
-(`fs/fuse/dev.c` `request_wait_answer`): a client terminated by a fatal signal
-while its request is in userspace stays in an uninterruptible wait until the
-reply arrives or the connection aborts, and only a request that was never
-delivered can be dropped with `-EINTR`. The daemon therefore replies to every
-request exactly once, and daemon termination is the abort guarantee: closing
-`/dev/fuse` makes the kernel end pending requests with `-ECONNABORTED`
-(`fuse_dev_release` -> `fuse_abort_conn`).
+The binding answers `FUSE_INTERRUPT` with `ENOSYS`, and the frontend does not
+negotiate any per-request cancellation extension. There is therefore no
+per-request cancellation: once a FUSE request has been delivered to this
+daemon, the kernel keeps waiting for its reply until it is answered or the
+connection aborts, regardless of signals such as `SIGKILL` on the caller.
+This frontend does not promise `EINTR` or that an interrupted caller returns
+promptly. Each operation still completes and replies exactly once; teardown
+only stops the request channel at process exit.
 
 The session runs in the foreground. Teardown waits on both the session end and
 SIGINT/SIGTERM: an external `fusermount3 -u` ends the session loop and the
@@ -190,15 +239,17 @@ there is no mid-session cancellation signal.
 - Every open materializes the complete file through the existing shared Mount
   staging contract; there is no partial-download or mmap coherence claim, and
   `FOPEN_DIRECT_IO` does not provide page-cache-backed mmap behavior.
-- Writes, create, mkdir, unlink, rename, links, xattrs, ioctl, poll, locking
-  and capacity accounting are not implemented; the kernel read-only mount and
-  the callback errno policy reject them.
-- The module keeps existing core Mount behavior, including the node-map lock
-  that already spans first materialization; the adapter adds no mount-wide
-  lock across authority or staging I/O.
+- Hard links, symlinks, mknod, xattrs, ioctl, poll, fallocate and capacity
+  accounting are not implemented and return explicit `EOPNOTSUPP`/`ENOSYS`.
+- The frontend does not negotiate `FUSE_POSIX_LOCKS` or `FLOCK_LOCKS`, and its
+  getlk/setlk/flock callbacks are not implemented. If the kernel still provides
+  POSIX or flock locks, they are local to this mount instance and carry no
+  cross-mount or cross-client meaning; no distributed lock semantics are
+  claimed. A writable mount must not claim that locking is rejected outright,
+  because the kernel may return success for its own local lock manager.
+- Node cache lookup and open-gate registration share a short-lived node-map
+  critical section. First materialization is serialized per NodeId by that
+  gate; neither lock is held across remote observation or staging I/O, and
+  different nodes initialize independently.
 - The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
-  there is no automatic external-change watch, and its capability set does
-  not claim recoverable staging or any write-side operation beyond the
-  read-only contract. Remaining extension points for the next layer are the
-  runtime namespace operations and `Mount::refresh` guarded by reference
-  counts.
+  there is no automatic external-change watch.

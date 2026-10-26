@@ -28,9 +28,8 @@
 //! Files pin the node's shared staged version. `fstat` on an open handle uses
 //! that staged record's length, and reads return staged bytes, so an old
 //! descriptor never mixes a newer remote length with older content. `release`
-//! reclaims a clean shared node, and `open` first reclaims any clean record a
-//! raced release left behind, so a fresh open observes the current remote
-//! revision without rebasing live handles. Directory handles
+//! reclaims a clean shared node, which makes the next open observe the
+//! current remote revision without rebasing live handles. Directory handles
 //! pin one `Snapshot` revision; readdir offsets are stable ordinal positions
 //! over pages of that pinned listing.
 //!
@@ -47,9 +46,9 @@ use super::inode::{CachedInfo, InodeTable};
 use crate::mount::{Mount, MountFile};
 use fuser::{
     AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, TimeOrNow, WriteFlags,
+    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -75,15 +74,49 @@ pub(super) struct Inner {
     notifier: Mutex<Option<Notifier>>,
     next_handle: AtomicU64,
     runtime: Handle,
+    read_only: bool,
 }
 
 /// One kernel open maps to one reference on the node's shared staged version.
 struct OpenFile {
     node: NodeId,
     file: MountFile,
-    /// Metadata from the exact observation the staged version was
-    /// materialized from, so path stats and fstat agree with read bytes.
-    base: CachedInfo,
+    writable: bool,
+}
+
+fn has_open_flag(flags: i32, flag: nix::fcntl::OFlag) -> bool {
+    flags & flag.bits() != 0
+}
+
+fn writable_open(flags: OpenFlags) -> bool {
+    flags.acc_mode() != OpenAccMode::O_RDONLY
+}
+
+fn representable_mode(
+    mode: u32,
+    umask: u32,
+    read_only: bool,
+    directory: bool,
+    executable: bool,
+) -> bool {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    let file_type = mode & S_IFMT;
+    let type_ok = file_type == 0
+        || (directory && file_type == S_IFDIR)
+        || (!directory && file_type == S_IFREG);
+    let special_bits = mode & !(S_IFMT | 0o777);
+    if !type_ok || special_bits != 0 {
+        return false;
+    }
+    let effective = mode & !umask & 0o777;
+    let expected = if directory || executable {
+        if read_only { 0o555 } else { 0o755 }
+    } else {
+        if read_only { 0o444 } else { 0o644 }
+    };
+    effective == expected
 }
 
 #[derive(Clone)]
@@ -106,7 +139,7 @@ struct DirCursor {
 }
 
 impl Inner {
-    pub(super) fn new(mount: Mount, runtime: Handle) -> Self {
+    pub(super) fn with_read_only(mount: Mount, runtime: Handle, read_only: bool) -> Self {
         let root = mount.authority().root();
         Self {
             mount,
@@ -117,6 +150,7 @@ impl Inner {
             notifier: Mutex::new(None),
             next_handle: AtomicU64::new(0),
             runtime,
+            read_only,
         }
     }
 
@@ -276,15 +310,6 @@ impl Inner {
         guard(&self.files).get(&fh.0).cloned()
     }
 
-    /// Any active open for a node. `Mount::open_node` reuses the node's shared
-    /// staged version, so all handles for one node report the same base.
-    fn open_for_node(&self, id: NodeId) -> Option<Arc<OpenFile>> {
-        guard(&self.files)
-            .values()
-            .find(|open| open.node == id)
-            .cloned()
-    }
-
     fn dir_cursor(&self, fh: FileHandle) -> Option<Arc<AsyncMutex<DirCursor>>> {
         guard(&self.dirs).get(&fh.0).cloned()
     }
@@ -295,6 +320,17 @@ impl Inner {
             .observe_latest()
             .await
             .map_err(|e| core_errno(&e))
+    }
+
+    /// Drop a stale clean version before opening. Busy means another reference
+    /// still pins the shared version, or the node retains dirty/frozen/error
+    /// state; both must be reused rather than reset.
+    async fn reclaim_clean_state(&self, id: NodeId) -> Result<(), fuser::Errno> {
+        match self.mount.reclaim(id).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => Ok(()),
+            Err(error) => Err(runtime_errno(&error)),
+        }
     }
 
     /// Attributes and size from one pinned observation.
@@ -324,33 +360,52 @@ impl Inner {
             info.executable,
             size,
             snapshot.revision(),
+            self.read_only,
         ))
     }
 
-    /// Attributes for an open handle: the staged length and the base
-    /// observation are authoritative, so `fstat`, path stats and read bytes
-    /// describe the same pinned version.
+    /// Attributes for an open handle: the staged length is authoritative so
+    /// `fstat` and read bytes describe the same pinned version.
     async fn handle_attr(&self, open: &OpenFile) -> Result<FileAttr, fuser::Errno> {
-        let status = open.file.status().await.map_err(|e| runtime_errno(&e))?;
-        let ino = self.inode_for(open.node, None)?;
-        Ok(attribute(
+        self.shared_attr(open.node).await?.ok_or(fuser::Errno::EIO)
+    }
+
+    /// Attributes for a node with a shared Mount handle. The staged length and
+    /// the handle's base revision come from the same record, and kind/executable
+    /// are read from that same revision, so path `stat` cannot disagree with
+    /// `fstat`/read bytes while the node is pinned or dirty.
+    async fn shared_attr(&self, id: NodeId) -> Result<Option<FileAttr>, fuser::Errno> {
+        self.reclaim_clean_state(id).await?;
+        let status = match self.mount.node_status(id).await {
+            Ok(Some(status)) => status,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(runtime_errno(&error)),
+        };
+        let snapshot = self
+            .mount
+            .authority()
+            .observe_revision(status.remote_revision)
+            .await
+            .map_err(|e| core_errno(&e))?;
+        let node = snapshot
+            .node(id)
+            .await
+            .map_err(|e| core_errno(&e))?
+            .ok_or(fuser::Errno::EIO)?;
+        let info = CachedInfo {
+            directory: node.is_directory(),
+            executable: node.executable(),
+            generation: node.generation(),
+        };
+        let ino = self.inode_for(id, Some(info))?;
+        Ok(Some(attribute(
             ino,
-            open.base.directory,
-            open.base.executable,
+            info.directory,
+            info.executable,
             status.length,
             status.remote_revision,
-        ))
-    }
-
-    /// Metadata for one inode. While any open handle exists, the staged/base
-    /// version wins over the latest remote observation so the kernel attr
-    /// cache cannot mix an external size with staged bytes for the same inode.
-    async fn attr_for(&self, snapshot: &Snapshot, id: NodeId) -> Result<FileAttr, fuser::Errno> {
-        if let Some(open) = self.open_for_node(id) {
-            self.handle_attr(&open).await
-        } else {
-            self.snapshot_attr(snapshot, id).await
-        }
+            self.read_only,
+        )))
     }
 
     async fn lookup(&self, parent: INodeNo, name: String, reply: ReplyEntry) {
@@ -371,11 +426,18 @@ impl Inner {
         // skipped, and a plain READDIR does not install positive dentries
         // (that is READDIRPLUS), so scanned names are not recorded.
         self.record_dentry(parent, &name);
-        match self.attr_for(&snapshot, entry.node_id).await {
-            Ok(attr) => {
+        match self.shared_attr(entry.node_id).await {
+            Ok(Some(attr)) => {
                 self.remember_lookup(attr.ino);
                 reply.entry(&ATTR_TTL, &attr, Generation(0));
             }
+            Ok(None) => match self.snapshot_attr(&snapshot, entry.node_id).await {
+                Ok(attr) => {
+                    self.remember_lookup(attr.ino);
+                    reply.entry(&ATTR_TTL, &attr, Generation(0));
+                }
+                Err(errno) => reply.error(errno),
+            },
             Err(errno) => reply.error(errno),
         }
     }
@@ -396,16 +458,17 @@ impl Inner {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),
         };
-        match self.attr_for(&snapshot, id).await {
-            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+        match self.shared_attr(id).await {
+            Ok(Some(attr)) => reply.attr(&ATTR_TTL, &attr),
+            Ok(None) => match self.snapshot_attr(&snapshot, id).await {
+                Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+                Err(errno) => reply.error(errno),
+            },
             Err(errno) => reply.error(errno),
         }
     }
 
     async fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        if flags.acc_mode() != OpenAccMode::O_RDONLY {
-            return reply.error(fuser::Errno::EROFS);
-        }
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
@@ -415,81 +478,32 @@ impl Inner {
         {
             return reply.error(fuser::Errno::EISDIR);
         }
-        match self.prepare_open(id).await {
-            Ok(open) => {
+        let writable = writable_open(flags);
+        let truncate = has_open_flag(flags.0, nix::fcntl::OFlag::O_TRUNC);
+        if truncate && !writable {
+            return reply.error(fuser::Errno::EINVAL);
+        }
+        if let Err(errno) = self.reclaim_clean_state(id).await {
+            return reply.error(errno);
+        }
+        match self.mount.open_node(id, writable).await {
+            Ok(file) => {
+                if truncate && let Err(error) = file.truncate(0).await {
+                    return reply.error(runtime_errno(&error));
+                }
                 let fh = self.next_handle();
-                guard(&self.files).insert(fh, Arc::new(open));
+                guard(&self.files).insert(
+                    fh,
+                    Arc::new(OpenFile {
+                        node: id,
+                        file,
+                        writable,
+                    }),
+                );
                 reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
             }
-            Err(errno) => reply.error(errno),
+            Err(error) => reply.error(runtime_errno(&error)),
         }
-    }
-
-    /// Materialize the shared staged version and capture its base observation.
-    async fn prepare_open(&self, id: NodeId) -> Result<OpenFile, fuser::Errno> {
-        // A release whose reclaim raced an in-flight read leaves a clean,
-        // references-zero record behind. Reclaim it before materializing so a
-        // fresh open observes the current remote revision; an actively shared
-        // node reports Busy and is reused as before.
-        match self.mount.reclaim(id).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => {}
-            Err(error) => return Err(runtime_errno(&error)),
-        }
-        let file = self
-            .mount
-            .open_node(id, false)
-            .await
-            .map_err(|e| runtime_errno(&e))?;
-        let status = match file.status().await {
-            Ok(status) => status,
-            Err(error) => {
-                drop(file);
-                let _ = self.mount.reclaim(id).await;
-                return Err(runtime_errno(&error));
-            }
-        };
-        let snapshot = match self
-            .mount
-            .authority()
-            .observe_revision(status.remote_revision)
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                drop(file);
-                let _ = self.mount.reclaim(id).await;
-                return Err(core_errno(&error));
-            }
-        };
-        let node = match snapshot.node(id).await {
-            Ok(Some(node)) => node,
-            Ok(None) => {
-                drop(file);
-                let _ = self.mount.reclaim(id).await;
-                return Err(fuser::Errno::ENOENT);
-            }
-            Err(error) => {
-                drop(file);
-                let _ = self.mount.reclaim(id).await;
-                return Err(core_errno(&error));
-            }
-        };
-        let base = CachedInfo {
-            directory: node.is_directory(),
-            executable: node.executable(),
-            generation: node.generation(),
-        };
-        if base.directory {
-            drop(file);
-            let _ = self.mount.reclaim(id).await;
-            return Err(fuser::Errno::EISDIR);
-        }
-        Ok(OpenFile {
-            node: id,
-            file,
-            base,
-        })
     }
 
     async fn read(&self, fh: FileHandle, offset: u64, size: u32, reply: ReplyData) {
@@ -498,6 +512,387 @@ impl Inner {
         };
         match open.file.read(offset, size as usize).await {
             Ok(bytes) => reply.data(&bytes),
+            Err(error) => reply.error(runtime_errno(&error)),
+        }
+    }
+
+    async fn write(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        data: Vec<u8>,
+        flags: OpenFlags,
+        reply: ReplyWrite,
+    ) {
+        let Some(open) = self.open_file(fh) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        if !open.writable {
+            return reply.error(fuser::Errno::EBADF);
+        }
+        // The kernel supplies current file flags on each WRITE. F_SETFL can
+        // toggle append, while sync flags may also be attached per request.
+        let append = has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND);
+        let sync = has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
+            || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC);
+        let staged = if append {
+            open.file.append(&data).await.map(|_| ())
+        } else {
+            open.file.write(offset, &data).await
+        };
+        match staged {
+            Ok(()) => {
+                if sync && let Err(error) = open.file.flush().await {
+                    return reply.error(runtime_errno(&error));
+                }
+                reply.written(data.len() as u32);
+            }
+            Err(error) => reply.error(runtime_errno(&error)),
+        }
+    }
+
+    async fn flush(&self, fh: FileHandle, reply: ReplyEmpty) {
+        let Some(open) = self.open_file(fh) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        if !open.writable {
+            // A read-only reference must not publish another writer's staged
+            // bytes through its close path.
+            return reply.ok();
+        }
+        match open.file.flush().await {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(runtime_errno(&error)),
+        }
+    }
+
+    async fn fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
+        let Some(open) = self.open_file(fh) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        if !open.writable {
+            return reply.ok();
+        }
+        match open.file.fsync().await {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(runtime_errno(&error)),
+        }
+    }
+
+    async fn status_attr(&self, id: NodeId) -> Result<FileAttr, fuser::Errno> {
+        self.shared_attr(id).await?.ok_or(fuser::Errno::ESTALE)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn setattr(
+        &self,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<BsdFileFlags>,
+        fh: Option<FileHandle>,
+        reply: ReplyAttr,
+    ) {
+        let supported_mutation = size.is_some() || mode.is_some();
+        let kernel_timestamps = atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some()
+            || bkuptime.is_some();
+        if uid.is_some()
+            || gid.is_some()
+            || flags.is_some()
+            || (!supported_mutation && kernel_timestamps)
+            || (size.is_some() && mode.is_some())
+        {
+            return reply.error(fuser::Errno::EOPNOTSUPP);
+        }
+        let Some(id) = self.node(ino) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        if let Some(length) = size {
+            let attr = if let Some(fh) = fh {
+                let Some(open) = self.open_file(fh) else {
+                    return reply.error(fuser::Errno::EBADF);
+                };
+                if let Err(error) = open.file.truncate(length).await {
+                    return reply.error(runtime_errno(&error));
+                }
+                match self.handle_attr(&open).await {
+                    Ok(attr) => attr,
+                    Err(errno) => return reply.error(errno),
+                }
+            } else {
+                if let Err(errno) = self.reclaim_clean_state(id).await {
+                    return reply.error(errno);
+                }
+                let file = match self.mount.open_node(id, true).await {
+                    Ok(file) => file,
+                    Err(error) => return reply.error(runtime_errno(&error)),
+                };
+                if let Err(error) = file.truncate(length).await {
+                    return reply.error(runtime_errno(&error));
+                }
+                if let Err(error) = file.flush().await {
+                    return reply.error(runtime_errno(&error));
+                }
+                let attr = match self.status_attr(id).await {
+                    Ok(attr) => attr,
+                    Err(errno) => return reply.error(errno),
+                };
+                drop(file);
+                if let Err(error) = self.mount.reclaim(id).await
+                    && error.kind() != crate::runtime::ErrorKind::Busy
+                {
+                    eprintln!("yy: fuse truncate cleanup inode {}: {error}", ino.0);
+                }
+                attr
+            };
+            return reply.attr(&ATTR_TTL, &attr);
+        }
+        if let Some(mode) = mode {
+            let snapshot = match self.observe().await {
+                Ok(snapshot) => snapshot,
+                Err(errno) => return reply.error(errno),
+            };
+            let current = match snapshot.node(id).await {
+                Ok(Some(node)) => node,
+                Ok(None) => return reply.error(fuser::Errno::ENOENT),
+                Err(error) => return reply.error(core_errno(&error)),
+            };
+            let executable = mode & 0o111 != 0;
+            if !representable_mode(mode, 0, self.read_only, current.is_directory(), executable) {
+                return reply.error(fuser::Errno::EOPNOTSUPP);
+            }
+            if !current.is_directory() {
+                let result = if let Some(fh) = fh {
+                    let Some(open) = self.open_file(fh) else {
+                        return reply.error(fuser::Errno::EBADF);
+                    };
+                    open.file.set_executable(executable).await
+                } else {
+                    if let Err(errno) = self.reclaim_clean_state(id).await {
+                        return reply.error(errno);
+                    }
+                    let file = match self.mount.open_node(id, true).await {
+                        Ok(file) => file,
+                        Err(error) => return reply.error(runtime_errno(&error)),
+                    };
+                    let result = file.set_executable(executable).await;
+                    drop(file);
+                    if let Err(error) = self.mount.reclaim(id).await
+                        && error.kind() != crate::runtime::ErrorKind::Busy
+                    {
+                        eprintln!("yy: fuse chmod cleanup inode {}: {error}", ino.0);
+                    }
+                    result
+                };
+                if let Err(error) = result {
+                    return reply.error(runtime_errno(&error));
+                }
+            }
+            let snapshot = match self.observe().await {
+                Ok(snapshot) => snapshot,
+                Err(errno) => return reply.error(errno),
+            };
+            return match self.snapshot_attr(&snapshot, id).await {
+                Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+                Err(errno) => reply.error(errno),
+            };
+        }
+        // A no-op setattr is valid and reports current attributes.
+        let snapshot = match self.observe().await {
+            Ok(snapshot) => snapshot,
+            Err(errno) => return reply.error(errno),
+        };
+        match self.snapshot_attr(&snapshot, id).await {
+            Ok(attr) => reply.attr(&ATTR_TTL, &attr),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    async fn create(
+        &self,
+        parent: INodeNo,
+        name: String,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let Some(parent_id) = self.node(parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        if !representable_mode(mode, umask, self.read_only, false, mode & 0o111 != 0) {
+            return reply.error(fuser::Errno::EOPNOTSUPP);
+        }
+        let exclusive = has_open_flag(flags, nix::fcntl::OFlag::O_EXCL);
+        let node = match self
+            .mount
+            .namespace()
+            .create_file_with_node(parent_id, &name, mode & 0o111 != 0)
+            .await
+        {
+            Ok((node, _)) => Some(node),
+            Err(error)
+                if !exclusive && error.kind() == crate::runtime::ErrorKind::AlreadyExists =>
+            {
+                let snapshot = match self.observe().await {
+                    Ok(snapshot) => snapshot,
+                    Err(errno) => return reply.error(errno),
+                };
+                match snapshot.lookup(parent_id, &name).await {
+                    Ok(Some(entry)) => Some(entry.node_id),
+                    Ok(None) => return reply.error(fuser::Errno::EEXIST),
+                    Err(error) => return reply.error(core_errno(&error)),
+                }
+            }
+            Err(error) => return reply.error(runtime_errno(&error)),
+        };
+        let node = node.expect("create resolved a node id");
+        if let Err(errno) = self.reclaim_clean_state(node).await {
+            return reply.error(errno);
+        }
+        let open = match self
+            .mount
+            .open_node(node, writable_open(OpenFlags(flags)))
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => return reply.error(runtime_errno(&error)),
+        };
+        if has_open_flag(flags, nix::fcntl::OFlag::O_TRUNC) && !writable_open(OpenFlags(flags)) {
+            return reply.error(fuser::Errno::EINVAL);
+        }
+        if has_open_flag(flags, nix::fcntl::OFlag::O_TRUNC)
+            && let Err(error) = open.truncate(0).await
+        {
+            return reply.error(runtime_errno(&error));
+        }
+        let snapshot = match self.observe().await {
+            Ok(snapshot) => snapshot,
+            Err(errno) => return reply.error(errno),
+        };
+        let attr = match self.snapshot_attr(&snapshot, node).await {
+            Ok(attr) => attr,
+            Err(errno) => return reply.error(errno),
+        };
+        self.remember_lookup(attr.ino);
+        let fh = self.next_handle();
+        guard(&self.files).insert(
+            fh,
+            Arc::new(OpenFile {
+                node,
+                file: open,
+                writable: writable_open(OpenFlags(flags)),
+            }),
+        );
+        reply.created(
+            &ATTR_TTL,
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::FOPEN_DIRECT_IO,
+        );
+    }
+
+    async fn mkdir(&self, parent: INodeNo, name: String, mode: u32, umask: u32, reply: ReplyEntry) {
+        let Some(parent_id) = self.node(parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        if !representable_mode(mode, umask, self.read_only, true, false) {
+            return reply.error(fuser::Errno::EOPNOTSUPP);
+        }
+        let node = match self
+            .mount
+            .namespace()
+            .create_directory_with_node(parent_id, &name)
+            .await
+        {
+            Ok((node, _)) => node,
+            Err(error) => return reply.error(runtime_errno(&error)),
+        };
+        let snapshot = match self.observe().await {
+            Ok(snapshot) => snapshot,
+            Err(errno) => return reply.error(errno),
+        };
+        match self.snapshot_attr(&snapshot, node).await {
+            Ok(attr) => {
+                self.remember_lookup(attr.ino);
+                reply.entry(&ATTR_TTL, &attr, Generation(0));
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    async fn unlink(&self, parent: INodeNo, name: String, reply: ReplyEmpty) {
+        let Some(parent_id) = self.node(parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        match self.mount.namespace().unlink_path(parent_id, &name).await {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(runtime_errno(&error)),
+        }
+    }
+
+    async fn rmdir(&self, parent: INodeNo, name: String, reply: ReplyEmpty) {
+        let Some(parent_id) = self.node(parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        match self.mount.namespace().rmdir_path(parent_id, &name).await {
+            Ok(_) => reply.ok(),
+            Err(error) => reply.error(runtime_errno(&error)),
+        }
+    }
+
+    async fn rename(
+        &self,
+        parent: INodeNo,
+        name: String,
+        new_parent: INodeNo,
+        new_name: String,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let known = RenameFlags::RENAME_NOREPLACE
+            | RenameFlags::RENAME_EXCHANGE
+            | RenameFlags::RENAME_WHITEOUT;
+        if flags.bits() & !known.bits() != 0 {
+            return reply.error(fuser::Errno::EINVAL);
+        }
+        if flags.contains(RenameFlags::RENAME_EXCHANGE)
+            || flags.contains(RenameFlags::RENAME_WHITEOUT)
+        {
+            return reply.error(fuser::Errno::EOPNOTSUPP);
+        }
+        let Some(parent_id) = self.node(parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        let Some(new_parent_id) = self.node(new_parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        let result = if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+            self.mount
+                .namespace()
+                .rename_path(parent_id, &name, new_parent_id, &new_name)
+                .await
+        } else {
+            self.mount
+                .namespace()
+                .rename_path_replace(parent_id, &name, new_parent_id, &new_name)
+                .await
+        };
+        match result {
+            Ok(_) => reply.ok(),
             Err(error) => reply.error(runtime_errno(&error)),
         }
     }
@@ -782,22 +1177,30 @@ impl Filesystem for FuseFrontend {
     fn setattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<BsdFileFlags>,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let inner = self.inner.clone();
+        self.inner.spawn(async move {
+            inner
+                .setattr(
+                    ino, mode, uid, gid, size, atime, mtime, ctime, crtime, chgtime, bkuptime,
+                    flags, fh, reply,
+                )
+                .await
+        });
     }
 
     fn readlink(&self, _req: &Request, _ino: INodeNo, reply: ReplyData) {
@@ -814,27 +1217,45 @@ impl Filesystem for FuseFrontend {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(fuser::Errno::EOPNOTSUPP);
     }
 
     fn mkdir(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &std::ffi::OsStr,
-        _mode: u32,
-        _umask: u32,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let name = name.to_owned();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.mkdir(parent, name, mode, umask, reply).await });
     }
 
-    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &std::ffi::OsStr, reply: ReplyEmpty) {
-        reply.error(fuser::Errno::EROFS);
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let name = name.to_owned();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.unlink(parent, name, reply).await });
     }
 
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &std::ffi::OsStr, reply: ReplyEmpty) {
-        reply.error(fuser::Errno::EROFS);
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let name = name.to_owned();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.rmdir(parent, name, reply).await });
     }
 
     fn symlink(
@@ -845,20 +1266,29 @@ impl Filesystem for FuseFrontend {
         _target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(fuser::Errno::EOPNOTSUPP);
     }
 
     fn rename(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &std::ffi::OsStr,
-        _newparent: INodeNo,
-        _newname: &std::ffi::OsStr,
-        _flags: fuser::RenameFlags,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        newparent: INodeNo,
+        newname: &std::ffi::OsStr,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let (name, newname) = (name.to_owned(), newname.to_owned());
+        let inner = self.inner.clone();
+        self.inner.spawn(async move {
+            inner
+                .rename(parent, name, newparent, newname, flags, reply)
+                .await
+        });
     }
 
     fn link(
@@ -869,7 +1299,7 @@ impl Filesystem for FuseFrontend {
         _newname: &std::ffi::OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(fuser::Errno::EOPNOTSUPP);
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -898,37 +1328,44 @@ impl Filesystem for FuseFrontend {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: u64,
-        _data: &[u8],
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
         _write_flags: WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let data = data.to_vec();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.write(fh, offset, data, flags, reply).await });
     }
 
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.flush(fh, reply).await });
     }
 
     fn fsync(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.fsync(fh, reply).await });
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -989,7 +1426,7 @@ impl Filesystem for FuseFrontend {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(fuser::Errno::EOPNOTSUPP);
     }
 
     fn getxattr(
@@ -1014,11 +1451,11 @@ impl Filesystem for FuseFrontend {
         _name: &std::ffi::OsStr,
         reply: ReplyEmpty,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(fuser::Errno::EOPNOTSUPP);
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        if mask.contains(AccessFlags::W_OK) {
+        if self.inner.read_only && mask.contains(AccessFlags::W_OK) {
             reply.error(fuser::Errno::EROFS);
         } else {
             reply.ok();
@@ -1028,14 +1465,20 @@ impl Filesystem for FuseFrontend {
     fn create(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &std::ffi::OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: fuser::ReplyCreate,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let name = name.to_owned();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.create(parent, name, mode, umask, flags, reply).await });
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
@@ -1067,7 +1510,7 @@ impl Filesystem for FuseFrontend {
         _mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(fuser::Errno::EOPNOTSUPP);
     }
 
     fn lseek(
@@ -1085,106 +1528,79 @@ impl Filesystem for FuseFrontend {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inner, guard};
+    use super::*;
     use crate::core::{BackendProfile, Fs};
-    use crate::mount::Mount;
     use crate::runtime::Runtime;
-    use crate::support;
+    use crate::support::TestBackend;
     use std::sync::Arc;
     use yinyang_core::Authority;
 
-    /// An open read-only handle pins the staged version: while the file table
-    /// holds a reference, path stats and fstat both report the base length,
-    /// and a later external version is only visible after release.
-    #[tokio::test]
-    async fn active_handle_pins_metadata_until_release() {
-        let temp = tempfile::tempdir().unwrap();
-        let backend = support::TestBackend::default();
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::open(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
-
-        let published = temp.path().join("published");
-        let runtime = Runtime::open(authority.clone(), &published).await.unwrap();
-        runtime
-            .create_file(runtime.authority().root(), "file")
-            .await
-            .unwrap();
-        let id = authority
-            .observe_latest()
-            .await
-            .unwrap()
-            .resolve("file")
-            .await
-            .unwrap()
-            .unwrap()
-            .id();
-        let mut first = runtime.open_file("file", true).await.unwrap();
-        first.write(0, b"first version").await.unwrap();
-        first.fsync().await.unwrap();
-        first.close().await.unwrap();
-        drop(runtime);
-
-        let mount = Mount::open(authority.clone(), temp.path().join("ro"), true)
-            .await
-            .unwrap();
-        let inner = Inner::new(mount, tokio::runtime::Handle::current());
-        let fh = inner.next_handle();
-        let open = inner.prepare_open(id).await.unwrap();
-        guard(&inner.files).insert(fh, Arc::new(open));
-
-        let other = temp.path().join("other");
-        let writer = Runtime::open(authority.clone(), &other).await.unwrap();
-        let mut second = writer.open_file("file", true).await.unwrap();
-        second.write(0, b"second version").await.unwrap();
-        second.fsync().await.unwrap();
-
-        let latest = authority.observe_latest().await.unwrap();
-        let pinned = inner.attr_for(&latest, id).await.unwrap();
-        assert_eq!(pinned.size, "first version".len() as u64);
-        let open = inner.open_for_node(id).unwrap();
-        assert_eq!(inner.handle_attr(&open).await.unwrap().size, pinned.size);
-        assert_eq!(inner.handle_attr(&open).await.unwrap().perm, 0o444);
-
-        // Release the only reference: clean staging is reclaimed and the next
-        // observation reports the externally published second version.
-        drop(second);
-        drop(writer);
-        drop(open);
-        drop(guard(&inner.files).remove(&fh).unwrap());
-        inner.mount.reclaim(id).await.unwrap();
-        let latest = authority.observe_latest().await.unwrap();
-        let refreshed = inner.attr_for(&latest, id).await.unwrap();
-        assert_eq!(refreshed.size, "second version".len() as u64);
+    #[test]
+    fn representable_mode_accepts_linux_file_type_bits() {
+        assert!(representable_mode(0o100644, 0, false, false, false));
+        assert!(representable_mode(0o100755, 0, false, false, true));
+        assert!(representable_mode(0o40755, 0, false, true, false));
+        assert!(representable_mode(0o100644, 0o022, false, false, false));
+        assert!(!representable_mode(0o100600, 0, false, false, false));
+        assert!(!representable_mode(
+            0o100644 | 0o4000,
+            0,
+            false,
+            false,
+            false
+        ));
+        assert!(!representable_mode(0o020000, 0, false, false, false));
+        assert!(!representable_mode(0o40755, 0, false, false, false));
     }
 
-    /// A clean record left by a release/reclaim race must not satisfy a later
-    /// open; prepare_open reclaims it first and materializes the latest
-    /// revision.
     #[tokio::test]
-    async fn fresh_open_reclaims_a_stale_clean_record() {
+    async fn dirty_shared_node_reports_staged_size_in_path_attrs() {
         let temp = tempfile::tempdir().unwrap();
-        let backend = support::TestBackend::default();
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
+        let backend = TestBackend::default();
         let authority: Arc<dyn Authority> = Arc::new(
-            Fs::open(backend.operator(), BackendProfile::Minio)
+            Fs::create(backend.operator(), BackendProfile::Minio)
                 .await
                 .unwrap(),
         );
-        let runtime = Runtime::open(authority.clone(), temp.path().join("published"))
+        let mount = Mount::open(authority.clone(), temp.path(), false)
             .await
             .unwrap();
-        runtime
-            .create_file(runtime.authority().root(), "file")
+        let (id, _) = mount
+            .namespace()
+            .create_file_with_node(authority.root(), "file", false)
             .await
             .unwrap();
+        let file = mount.open_node(id, true).await.unwrap();
+        file.write(0, b"dirty").await.unwrap();
+        let inner = Arc::new(Inner::with_read_only(
+            mount,
+            tokio::runtime::Handle::current(),
+            false,
+        ));
+        let status = file.status().await.unwrap();
+        let attr = inner.shared_attr(id).await.unwrap().unwrap();
+        assert_eq!(attr.size, status.length);
+        assert_eq!(attr.size, 5);
+        assert_eq!(attr.ino, inner.inode_for(id, None).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_clean_path_attr_reclaims_to_latest() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
+            .await
+            .unwrap();
+        writer.create_file(authority.root(), "file").await.unwrap();
+        let mut file = writer.open_file("file", true).await.unwrap();
+        file.write(0, b"first").await.unwrap();
+        file.close().await.unwrap();
+        drop(writer);
         let id = authority
             .observe_latest()
             .await
@@ -1194,37 +1610,72 @@ mod tests {
             .unwrap()
             .unwrap()
             .id();
-        let mut first = runtime.open_file("file", true).await.unwrap();
-        first.write(0, b"old").await.unwrap();
-        first.fsync().await.unwrap();
-        first.close().await.unwrap();
-        drop(runtime);
 
-        let mount = Mount::open(authority.clone(), temp.path().join("ro"), true)
+        let mount = Mount::open(authority.clone(), temp.path().join("mount"), false)
             .await
             .unwrap();
-        let inner = Inner::new(mount, tokio::runtime::Handle::current());
-        // Simulate a release whose reclaim raced a live read: the clean record
-        // stays in the Mount map with zero references after the clone drops.
-        let stale = inner.prepare_open(id).await.unwrap();
-        assert_eq!(inner.handle_attr(&stale).await.unwrap().size, 3);
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
+        let stale = inner.mount.open_node(id, false).await.unwrap();
         drop(stale);
 
-        let writer = Runtime::open(authority.clone(), temp.path().join("other"))
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer2"))
             .await
             .unwrap();
-        let mut second = writer.open_file("file", true).await.unwrap();
-        second.write(0, b"fresh version").await.unwrap();
-        second.fsync().await.unwrap();
-        drop(second);
-        drop(writer);
+        let mut file = writer.open_node(id, true).await.unwrap();
+        file.write(0, b"second").await.unwrap();
+        file.close().await.unwrap();
 
-        let fresh = inner.prepare_open(id).await.unwrap();
-        assert_eq!(
-            inner.handle_attr(&fresh).await.unwrap().size,
-            "fresh version".len() as u64
+        assert!(inner.shared_attr(id).await.unwrap().is_none());
+        let latest = authority.observe_latest().await.unwrap();
+        let attr = inner.snapshot_attr(&latest, id).await.unwrap();
+        assert_eq!(attr.size, 6);
+    }
+
+    #[tokio::test]
+    async fn open_reclaims_stale_clean_version_after_transient_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
         );
-        drop(fresh);
-        inner.mount.reclaim(id).await.unwrap();
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
+            .await
+            .unwrap();
+        writer.create_file(authority.root(), "file").await.unwrap();
+        let mut file = writer.open_file("file", true).await.unwrap();
+        file.write(0, b"first").await.unwrap();
+        file.close().await.unwrap();
+        drop(writer);
+        let id = authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+
+        let mount = Mount::open(authority.clone(), temp.path().join("mount"), false)
+            .await
+            .unwrap();
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
+        let pinned = inner.mount.open_node(id, false).await.unwrap();
+        inner.reclaim_clean_state(id).await.unwrap();
+        assert!(inner.mount.node_status(id).await.unwrap().is_some());
+        drop(pinned);
+        inner.reclaim_clean_state(id).await.unwrap();
+        assert!(inner.mount.node_status(id).await.unwrap().is_none());
+
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer2"))
+            .await
+            .unwrap();
+        let mut file = writer.open_node(id, true).await.unwrap();
+        file.write(0, b"second").await.unwrap();
+        file.close().await.unwrap();
+        let fresh = inner.mount.open_node(id, false).await.unwrap();
+        assert_eq!(fresh.read(0, 6).await.unwrap(), b"second");
     }
 }

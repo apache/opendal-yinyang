@@ -211,7 +211,8 @@ impl VolumeConfig {
     fn frontend_capabilities(&self) -> CapabilitySet {
         match self.frontend {
             Frontend::Library => managed(),
-            Frontend::Fuse => fuse(),
+            Frontend::Fuse if self.read_only => fuse(),
+            Frontend::Fuse => managed(),
             Frontend::Macos | Frontend::Windows => CapabilitySet::new(),
         }
     }
@@ -243,11 +244,6 @@ impl VolumeConfig {
             Frontend::Fuse if !cfg!(target_os = "linux") => {
                 return Err(Error::Invalid(
                     "the fuse frontend is implemented only on Linux",
-                ));
-            }
-            Frontend::Fuse if !self.read_only => {
-                return Err(Error::Invalid(
-                    "the Linux FUSE frontend is read-only in this release",
                 ));
             }
             Frontend::Fuse => {}

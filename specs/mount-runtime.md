@@ -11,8 +11,17 @@ Do not mix private library handles into this staging directory.
 writes from other references immediately after local acceptance. Writes,
 truncate, append and fsync are serialized per node; append chooses its offset
 under the same lock. Different nodes do not share an I/O lock. Initial
-materialization, refresh and reclaim serialize through the instance node map.
-Both read-only and writable references currently use full-file staging.
+materialization is serialized per NodeId by a short-lived open gate, and the
+instance node map is not held during a remote observation or staging read.
+The node lookup and gate registration share one critical section, so a
+completion cannot slip between them and start a second materialization.
+Success, failure and cancellation close the gate to wake every waiter for a
+retry; a retry rechecks the node map and either joins the materialized node or
+becomes the next single owner. Different nodes can therefore complete their
+first opens independently. Refresh and reclaim use the map for lookup and
+reference accounting; data-plane calls keep per-node locks. An incomplete
+local open is never exposed and is discarded when staging is reopened. Both
+read-only and writable references currently use full-file staging.
 
 Dropping a reference performs no I/O and never publishes or deletes data.
 `reclaim` rejects referenced, pending, frozen or failed nodes. Clean unreferenced
@@ -25,6 +34,20 @@ silently merged. No distributed lease or writable anonymous inode is provided.
 Instance-wide `fsync` visits all nodes, continues after individual failures, and
 returns the first failure. Every failure remains in runtime status. A successful
 local write or an OS close that cannot report errors is not remote completion.
+
+`flush` is the named publication attempt for a frontend close path that can
+report errors. It performs the same conditional publication as `fsync` and
+never reports success before the remote result is durable. Dropping or
+releasing the reference is different: it performs no I/O, publication or
+staging deletion. Pending, frozen and failed states remain recoverable, and
+`reclaim` rejects them. A frontend whose release callback cannot report errors
+must not use release as an implicit flush; if its kernel omits a reportable
+flush, the bytes remain staged rather than being acknowledged as remote.
+
+`node_status` observes the shared staged metadata for one NodeId without
+opening another reference. It reports the same staged length and
+pending/frozen/error state used by reads, so attribute paths do not have to
+materialize or refresh a file merely to inspect its accepted local state.
 
 `refresh` replaces a clean staged observation with a fresh remote version for
 all references. It rejects pending, frozen and failed states; it never silently
