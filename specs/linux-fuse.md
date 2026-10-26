@@ -135,14 +135,17 @@ find an empty slot; one blocking owner holds the background session, polls its
 public thread guard for a natural end, and receives the local teardown
 request. Exactly one `join` or `umount_and_join` runs. A lazy unmount does not
 end the kernel connection while clients still hold open references or in-flight
-requests, so when the grace period expires the process exits: the closed
-`/dev/fuse` aborts the connection and every blocked client syscall returns an
-error instead of hanging. Returning from `run` ends `main`, so the Tokio
-runtime shuts down; request tasks are detached and owned by that runtime, and
-their unanswered replies are dropped on the closing channel. The staging lease
-is released at process exit (or immediately on OS file-descriptor close).
-In-flight tasks hold their `Arc<Mount>` for that window; there is no
-mid-session cancellation signal.
+requests, so when the grace period expires the mount entry returns an explicit
+teardown-expired outcome instead of returning into a runtime shutdown that
+would wait for the blocked session task. The CLI prints a diagnostic to stderr
+and exits non-zero; the process exit closes `/dev/fuse`, the kernel aborts the
+connection, and every blocked client syscall returns an error instead of
+hanging. Forced termination is a crash-equivalent recovery boundary, not a
+graceful unmount: the staging lease is released by the OS and the next start
+recovers local state through the normal crash-recovery path. Request tasks are
+detached and owned by the CLI runtime; their unanswered replies are dropped on
+the closing channel. In-flight tasks hold their `Arc<Mount>` for that window;
+there is no mid-session cancellation signal.
 
 ## Boundaries and known limits
 

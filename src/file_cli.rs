@@ -181,7 +181,17 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
     if let Command::Mount { mountpoint } = command {
         #[cfg(target_os = "linux")]
         {
-            return yinyang::fuse::run(config, operator, token, mountpoint).await;
+            return match yinyang::fuse::run(config, operator, token, mountpoint).await? {
+                yinyang::fuse::Outcome::Unmounted => Ok(()),
+                yinyang::fuse::Outcome::TeardownExpired { grace } => {
+                    eprintln!(
+                        "yy: FUSE session did not end within {}s because clients still hold references; \
+                         exiting non-zero to abort the connection (equivalent to crash recovery)",
+                        grace.as_secs()
+                    );
+                    std::process::exit(1);
+                }
+            };
         }
         #[cfg(not(target_os = "linux"))]
         {
