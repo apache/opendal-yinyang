@@ -77,11 +77,15 @@ retained state, such as a displaced inode written after an atomic exchange; an
 ordinary content divergence is `current_file` on both sides even when a backup
 copy is preserved separately.
 
-Resolution is durable and conditional: `KeepLocal`, `KeepRemote` and explicit
-`Content` retain the chosen input as an artifact, stage the derived request
-against the recorded predicate, apply the resulting baseline, and clear the
-conflict only after the receipt commits. A stale remote predicate produces a
-new conflict rather than overwriting the remote.
+Resolution is durable and choice-specific. `KeepLocal` and explicit `Content`
+retain the chosen input as an artifact and stage a durable conditional request
+against the recorded predicate; the conflict clears only after the receipt
+commits, and a stale predicate produces a new conflict rather than overwriting
+the remote. When the chosen state already matches, that request may be a no-op
+and the conflict clears without a remote mutation. `KeepRemote` issues no new
+remote request: it materializes or quarantines the local path from the recorded
+remote evidence (the recorded node version or deletion), applies the resulting
+baseline, and clears the conflict once the local result is durable.
 
 ## Read-only inspection
 
