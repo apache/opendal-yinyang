@@ -2625,6 +2625,7 @@ dependencies = [
  "nix",
  "opendal",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
