@@ -367,6 +367,7 @@ async fn service_authority() -> (
     (Arc::new(client), temp, server)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn initial_nested_sync_converges_in_object_and_service_modes() {
     exercise_initial_pull(Arc::new(
         Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
