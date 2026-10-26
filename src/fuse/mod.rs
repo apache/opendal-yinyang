@@ -89,7 +89,9 @@ pub async fn run(
         mount,
         tokio::runtime::Handle::current(),
     ));
-    let filesystem = frontend::FuseFrontend { inner };
+    let filesystem = frontend::FuseFrontend {
+        inner: inner.clone(),
+    };
     let mut options = Config::default();
     options.mount_options = vec![
         MountOption::RO,
@@ -110,6 +112,9 @@ pub async fn run(
     // and receives the local teardown request. Exactly one `join` or
     // `umount_and_join` runs.
     let background = session.spawn()?;
+    inner.install_notifier(background.notifier());
+    let refresh = inner.clone();
+    tokio::runtime::Handle::current().spawn(async move { refresh.serve_hup().await });
     let (teardown, teardown_rx) = std::sync::mpsc::channel();
     let join = tokio::task::spawn_blocking(move || {
         loop {

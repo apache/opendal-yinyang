@@ -47,13 +47,14 @@ use super::inode::{CachedInfo, InodeTable};
 use crate::mount::{Mount, MountFile};
 use fuser::{
     AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request, TimeOrNow, WriteFlags,
+    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::runtime::Handle;
@@ -68,6 +69,12 @@ pub(super) struct Inner {
     inodes: Mutex<InodeTable>,
     files: Mutex<BTreeMap<u64, Arc<OpenFile>>>,
     dirs: Mutex<BTreeMap<u64, Arc<AsyncMutex<DirCursor>>>>,
+    /// Dentry names this adapter actually replied to the kernel; only those
+    /// can be cached and invalidated by an explicit refresh.
+    dentries: Mutex<BTreeSet<(u64, String)>>,
+    notifier: Mutex<Option<Notifier>>,
+    refresh_inflight: AtomicBool,
+    refresh_pending: AtomicBool,
     next_handle: AtomicU64,
     runtime: Handle,
 }
@@ -108,6 +115,10 @@ impl Inner {
             inodes: Mutex::new(InodeTable::new(root)),
             files: Mutex::new(BTreeMap::new()),
             dirs: Mutex::new(BTreeMap::new()),
+            dentries: Mutex::new(BTreeSet::new()),
+            notifier: Mutex::new(None),
+            refresh_inflight: AtomicBool::new(false),
+            refresh_pending: AtomicBool::new(false),
             next_handle: AtomicU64::new(0),
             runtime,
         }
@@ -119,6 +130,142 @@ impl Inner {
 
     fn next_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Install the kernel notification handle once the session is spawned.
+    pub(super) fn install_notifier(&self, notifier: Notifier) {
+        guard(&self.notifier).replace(notifier);
+    }
+
+    /// Remember a dentry this adapter replied to the kernel.
+    fn record_dentry(&self, parent: INodeNo, name: &str) {
+        guard(&self.dentries).insert((parent.0, name.to_owned()));
+    }
+
+    /// Serve explicit refresh requests. This watches only SIGHUP; there is no
+    /// background polling or change-feed watch.
+    pub(super) async fn serve_hup(self: Arc<Self>) {
+        let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("yy: fuse refresh: cannot install SIGHUP handler: {error}");
+                return;
+            }
+        };
+        loop {
+            signal.recv().await;
+            self.request_refresh();
+        }
+    }
+
+    /// Start one refresh run; duplicate requests while one is in flight are
+    /// merged into a single trailing run instead of queued.
+    fn request_refresh(self: &Arc<Self>) {
+        if self.refresh_inflight.swap(true, Ordering::Acquire) {
+            self.refresh_pending.store(true, Ordering::Release);
+            return;
+        }
+        let inner = self.clone();
+        self.runtime
+            .spawn(async move { inner.refresh_runner().await });
+    }
+
+    async fn refresh_runner(self: Arc<Self>) {
+        loop {
+            self.refresh_once().await;
+            // Another request arrived while this run was in flight: run once
+            // more so the newer known set is invalidated too.
+            if !self.refresh_pending.swap(false, Ordering::AcqRel) {
+                self.refresh_inflight.store(false, Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    /// One explicit refresh: re-observe latest, reclaim clean unreferenced
+    /// nodes, and invalidate known inode attributes and replied dentries.
+    async fn refresh_once(&self) {
+        let snapshot = match self.observe().await {
+            Ok(snapshot) => snapshot,
+            Err(errno) => {
+                eprintln!("yy: fuse refresh: cannot observe latest: {errno}");
+                return;
+            }
+        };
+        let revision = revision_hex(snapshot.revision());
+        let inodes = { guard(&self.inodes).inodes() };
+        let dentries = { guard(&self.dentries).iter().cloned().collect::<Vec<_>>() };
+        eprintln!(
+            "yy: fuse refresh: revision {revision} over {} inodes and {} dentries",
+            inodes.len(),
+            dentries.len()
+        );
+        let (mut reclaimed, mut active, mut failures) = (0usize, 0usize, 0usize);
+        for inode in &inodes {
+            let Some(id) = self.node(INodeNo(*inode)) else {
+                continue;
+            };
+            // Busy means live references or retained state: keep the pinned
+            // version. Mount::refresh is never used here because it rebases
+            // live open handles.
+            match self.mount.reclaim(id).await {
+                Ok(()) => reclaimed += 1,
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => active += 1,
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("yy: fuse refresh: reclaim {}: {error}", id);
+                }
+            }
+        }
+        eprintln!(
+            "yy: fuse refresh: reclaimed {reclaimed} clean nodes ({active} active, {failures} failed)"
+        );
+        let Some(notifier) = guard(&self.notifier).clone() else {
+            eprintln!("yy: fuse refresh: notifier not installed; skipping kernel invalidation");
+            return;
+        };
+        let attempts = inodes.len() + dentries.len();
+        let (inode_ok, entry_ok, errors, ended) = tokio::task::spawn_blocking(move || {
+            let mut inode_ok = 0usize;
+            let mut entry_ok = 0usize;
+            let mut errors = 0usize;
+            let mut ended = false;
+            for inode in &inodes {
+                match notifier.inval_inode(INodeNo(*inode), -1, 0) {
+                    Ok(()) => inode_ok += 1,
+                    Err(_) => {
+                        // After unmount every send fails; stop instead of
+                        // spamming a closing channel.
+                        errors += 1;
+                        ended = true;
+                        return (inode_ok, entry_ok, errors, ended);
+                    }
+                }
+            }
+            for (parent, name) in &dentries {
+                match notifier.inval_entry(INodeNo(*parent), OsStr::new(name)) {
+                    Ok(()) => entry_ok += 1,
+                    Err(_) => {
+                        errors += 1;
+                        ended = true;
+                        return (inode_ok, entry_ok, errors, ended);
+                    }
+                }
+            }
+            (inode_ok, entry_ok, errors, ended)
+        })
+        .await
+        .unwrap_or((0, 0, attempts, false));
+        if ended {
+            eprintln!(
+                "yy: fuse refresh: channel ended; invalidated {inode_ok} inode attrs and {entry_ok} dentries before {errors} errors"
+            );
+        } else {
+            eprintln!(
+                "yy: fuse refresh: done (inode={inode_ok} entries={entry_ok} errors={errors})"
+            );
+        }
     }
 
     fn inode_for(&self, id: NodeId, info: Option<CachedInfo>) -> Result<INodeNo, fuser::Errno> {
@@ -235,6 +382,9 @@ impl Inner {
             Ok(None) => return reply.error(fuser::Errno::ENOENT),
             Err(error) => return reply.error(core_errno(&error)),
         };
+        // Successful LOOKUP installs a kernel dentry; remember it for the
+        // explicit refresh. Negative results carry no timeout and are skipped.
+        self.record_dentry(parent, &name);
         match self.attr_for(&snapshot, entry.node_id).await {
             Ok(attr) => {
                 self.remember_lookup(attr.ino);
@@ -500,6 +650,8 @@ impl Inner {
         cursor.complete = cursor.token.is_none();
         for entry in page.entries {
             let (ino, kind) = self.resolve_entry(&cursor.snapshot, entry.node_id).await?;
+            // readdir replies install kernel dentries; remember them too.
+            self.record_dentry(cursor.ino, &entry.name);
             cursor.entries.push(DirItem {
                 ino,
                 kind,
@@ -542,6 +694,14 @@ fn entry_kind(directory: bool) -> FileType {
     } else {
         FileType::RegularFile
     }
+}
+
+fn revision_hex(revision: yinyang_core::Revision) -> String {
+    revision
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -933,7 +1093,9 @@ mod tests {
     use crate::mount::Mount;
     use crate::runtime::Runtime;
     use crate::support;
+    use fuser::INodeNo;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use yinyang_core::Authority;
 
     /// An open read-only handle pins the staged version: while the file table
@@ -1069,5 +1231,36 @@ mod tests {
         );
         drop(fresh);
         inner.mount.reclaim(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_runner_completes_and_dentries_deduplicate() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = support::TestBackend::default();
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::open(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let mount = Mount::open(authority, temp.path().join("ro"), true)
+            .await
+            .unwrap();
+        let inner = Arc::new(Inner::new(mount, tokio::runtime::Handle::current()));
+        inner.record_dentry(INodeNo(2), "a");
+        inner.record_dentry(INodeNo(2), "a");
+        inner.record_dentry(INodeNo(3), "b");
+        assert_eq!(guard(&inner.dentries).len(), 2);
+
+        inner.request_refresh();
+        for _ in 0..200 {
+            if !inner.refresh_inflight.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!inner.refresh_inflight.load(Ordering::Relaxed));
     }
 }

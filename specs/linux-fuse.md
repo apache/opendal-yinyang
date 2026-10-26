@@ -91,6 +91,35 @@ that open's metadata and content never disagree. The frontend does not call
 a writable layer that in-place refreshes must first define its open-fd and
 kernel-cache invalidation policy.
 
+## Explicit refresh
+
+`SIGHUP` triggers one explicit refresh; this is a manual invalidation entry
+point, not an automatic change watch. There is no background polling, no
+change-feed watcher, and no whole-tree enumeration. The refresh observes the
+latest snapshot once and then:
+
+- reclaims every clean, unreferenced node through the shared `Mount` contract,
+  so the next open materializes the current remote revision; nodes with live
+  references or retained state are left pinned (`Busy`);
+- invalidates known inode attributes with `inval_inode(ino, -1, 0)` and
+  replied dentries with `inval_entry(parent, name)` through the fuser
+  `Notifier`. Only dentries this adapter actually replied to the kernel are
+  recorded: successful `LOOKUP` results and `READDIR` entries. Negative
+  lookups carry no timeout in FUSE replies and are not recorded.
+
+The adapter never calls `Mount::refresh`, because that replaces the shared
+staged handle and would rebase open file descriptors. The refresh must also
+hold no adapter lock while reclaiming nodes or sending notifications; targets
+are collected under short locks, then the sends run on a blocking thread. At
+most one refresh run is in flight; duplicate `SIGHUP`s while one is running
+are merged into a single trailing run. The refresh task is concurrent with
+teardown and its lifetime sits inside the same bounded grace period: after
+unmount, notification sends fail and the refresh stops without retrying.
+
+Stable `yy: fuse refresh:` log lines report the observed revision, the
+reclaimed/active node counts, and the native notification counts at
+completion, so an acceptance harness can confirm a refresh finished.
+
 ## Pinned directory cursors
 
 `opendir` pins one `Snapshot` revision and one directory identity. `readdir`
@@ -161,8 +190,9 @@ there is no mid-session cancellation signal.
 - The module keeps existing core Mount behavior, including the node-map lock
   that already spans first materialization; the adapter adds no mount-wide
   lock across authority or staging I/O.
-- Extension points for the next layer are the runtime namespace operations,
-  `Mount::refresh` guarded by reference counts, and the session `Notifier`
-  for kernel entry/inode invalidation once an in-place refresh policy exists.
-None of those operations are exposed by this layer, and its capability set does
-not claim recoverable staging or any write-side operation.
+- The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
+  there is no automatic external-change watch, and its capability set does
+  not claim recoverable staging or any write-side operation beyond the
+  read-only contract. Remaining extension points for the next layer are the
+  runtime namespace operations and `Mount::refresh` guarded by reference
+  counts.
