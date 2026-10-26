@@ -393,6 +393,17 @@ impl Replica {
         if binding.state_dev != state_identity.dev || binding.state_ino != state_identity.ino {
             return Err(Error::invalid("sync state identity changed"));
         }
+        let root = PathBuf::from(&binding.root);
+        let (_root_fd, root_identity) = open_bound_directory(&root, "open bound local root")
+            .map_err(|error| Error::invalid(format!("bound local root is unavailable: {error}")))?;
+        if root_identity.dev != binding.root_dev || root_identity.ino != binding.root_ino {
+            return Err(Error::invalid("bound local root identity changed"));
+        }
+        if root_identity.dev != state_identity.dev {
+            return Err(Error::invalid(
+                "bound local root and sync state no longer share a filesystem",
+            ));
+        }
         let quarantine_fd = openat(
             &state_fd,
             "quarantine",
@@ -400,17 +411,12 @@ impl Replica {
             Mode::empty(),
         )
         .map_err(|e| Error::errno("open retained artifact directory", &state, e))?;
-        let mut artifacts: Vec<Artifact> =
-            store.artifacts()?.into_iter().map(Artifact::from).collect();
-        for artifact in artifacts.iter_mut() {
-            let record = store
-                .artifacts()?
-                .into_iter()
-                .find(|record| record.name == artifact.name)
-                .ok_or_else(|| Error::corrupt("artifact record vanished during inspection"))?;
-            let install = store
-                .installs()?
-                .into_iter()
+        let records = store.artifacts()?;
+        let installs = store.installs()?;
+        let mut artifacts: Vec<Artifact> = records.iter().cloned().map(Artifact::from).collect();
+        for (artifact, record) in artifacts.iter_mut().zip(records) {
+            let install = installs
+                .iter()
                 .find(|install| install.artifact == record.name);
             if let Some(install) = install
                 && (install.phase == InstallPhase::Retained
@@ -435,7 +441,6 @@ impl Replica {
             }
         }
         let conflicts = store.conflicts()?.into_iter().map(Conflict::from).collect();
-        let root = PathBuf::from(&binding.root);
         Ok(ReplicaStatus {
             root,
             filesystem: binding.filesystem,
