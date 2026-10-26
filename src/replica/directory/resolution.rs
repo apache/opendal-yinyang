@@ -116,7 +116,7 @@ impl DirectorySync {
         };
         let revision = snapshot.revision();
         if node.is_directory() {
-            self.materialize_remote_subtree(record, &path, &snapshot, revision)
+            self.materialize_remote_subtree(&path, &snapshot, revision)
                 .await
         } else {
             self.materialize_remote_file(record, &path, &snapshot, revision, node)
@@ -886,7 +886,6 @@ impl DirectorySync {
     /// recorded remote tree.
     async fn materialize_remote_subtree(
         &mut self,
-        record: &ConflictRecord,
         path: &str,
         snapshot: &Snapshot,
         revision: Revision,
