@@ -331,7 +331,7 @@ impl Transaction {
                         id: NodeId::from_bytes(node),
                         parent: NodeId::from_bytes(parent),
                         name,
-                        file: file.map(&find).transpose()?,
+                        file: file.map(find).transpose()?,
                         executable,
                     }
                 }
