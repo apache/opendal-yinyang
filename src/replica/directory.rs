@@ -818,6 +818,7 @@ impl DirectorySync {
                     .await?
             }
         };
+        let expected_identity = self.replica.scan()?.get(&path).cloned();
         self.replica.store_mut().insert_work(&WorkRecord {
             id: *edit.as_bytes(),
             path: path.clone(),
@@ -828,25 +829,13 @@ impl DirectorySync {
             local_digest: Some(*blake3::hash(&bytes).as_bytes()),
             local_length: Some(bytes.len() as u64),
             local_executable: Some(false),
-            local_dev: self
-                .replica
-                .scan()?
-                .get(&path)
-                .map(|node| node.identity.dev),
-            local_ino: self
-                .replica
-                .scan()?
-                .get(&path)
-                .map(|node| node.identity.ino),
-            local_parent_dev: self
-                .replica
-                .scan()?
-                .get(&path)
+            local_dev: expected_identity.as_ref().map(|node| node.identity.dev),
+            local_ino: expected_identity.as_ref().map(|node| node.identity.ino),
+            local_parent_dev: expected_identity
+                .as_ref()
                 .and_then(|node| node.parent.map(|parent| parent.dev)),
-            local_parent_ino: self
-                .replica
-                .scan()?
-                .get(&path)
+            local_parent_ino: expected_identity
+                .as_ref()
                 .and_then(|node| node.parent.map(|parent| parent.ino)),
             baseline_node: remote.get(&path).map(|node| *node.id().as_bytes()),
             baseline_revision: predicate.to_bytes(),
