@@ -26,7 +26,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -291,12 +291,12 @@ fn basic_io(fixture: &Fixture) {
         .write(true)
         .open(root.join("basic.txt"))
         .expect("open mounted file for write");
-    file.write_all(b"hello").expect("write mounted file");
+    file.write_all(b"hello!!").expect("write mounted file");
     file.sync_all().expect("remote fsync through FUSE");
     drop(file);
     assert_eq!(
         fixture.remote_read(&library, "basic.txt", 8),
-        b"hello",
+        b"hello!!",
         "independent authority must observe a successful FUSE fsync"
     );
 
@@ -307,7 +307,7 @@ fn basic_io(fixture: &Fixture) {
     append.write_all(b"!").expect("append through FUSE");
     append.sync_all().expect("remote fsync after append");
     drop(append);
-    assert_eq!(fixture.remote_read(&library, "basic.txt", 8), b"hello!");
+    assert_eq!(fixture.remote_read(&library, "basic.txt", 8), b"hello!!!");
 
     let truncate = OpenOptions::new()
         .write(true)
@@ -855,32 +855,67 @@ fn fuse_concurrent_mounts_object() {
     let mut a = fixture.mount(&config_a, &mount_a);
     let mut b = fixture.mount(&config_b, &mount_b);
 
-    let start = Arc::new(Barrier::new(3));
-    let publish = Arc::new(Barrier::new(3));
     let path_a = a.mountpoint().join("from-a.txt");
     let path_b = b.mountpoint().join("from-b.txt");
-    let start_a = start.clone();
-    let start_b = start.clone();
-    let publish_a = publish.clone();
-    let publish_b = publish.clone();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let (go_a_tx, go_a_rx) = mpsc::channel();
+    let (go_b_tx, go_b_rx) = mpsc::channel();
+    let ready_a = ready_tx.clone();
     let writer_a = thread::spawn(move || {
-        start_a.wait();
-        let mut file = File::create(&path_a).expect("create on mount A");
-        file.write_all(b"a").expect("write via mount A");
-        publish_a.wait();
-        file.sync_all().expect("fsync via mount A");
+        let prepared = (|| -> std::io::Result<File> {
+            let mut file = File::create(&path_a)?;
+            file.write_all(b"a")?;
+            Ok(file)
+        })();
+        match prepared {
+            Ok(mut file) => {
+                ready_a
+                    .send(Ok(()))
+                    .expect("send mount A preparation barrier");
+                let _ = go_a_rx.recv();
+                file.sync_all()
+            }
+            Err(error) => {
+                let _ = ready_a.send(Err(format!("mount A prepare failed: {error}")));
+                Err(error)
+            }
+        }
     });
+    let ready_b = ready_tx;
     let writer_b = thread::spawn(move || {
-        start_b.wait();
-        let mut file = File::create(&path_b).expect("create on mount B");
-        file.write_all(b"b").expect("write via mount B");
-        publish_b.wait();
-        file.sync_all().expect("fsync via mount B");
+        let prepared = (|| -> std::io::Result<File> {
+            let mut file = File::create(&path_b)?;
+            file.write_all(b"b")?;
+            Ok(file)
+        })();
+        match prepared {
+            Ok(mut file) => {
+                ready_b
+                    .send(Ok(()))
+                    .expect("send mount B preparation barrier");
+                let _ = go_b_rx.recv();
+                file.sync_all()
+            }
+            Err(error) => {
+                let _ = ready_b.send(Err(format!("mount B prepare failed: {error}")));
+                Err(error)
+            }
+        }
     });
-    start.wait();
-    publish.wait();
-    writer_a.join().expect("mount A writer panicked");
-    writer_b.join().expect("mount B writer panicked");
+    let first = ready_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("mount A did not reach its preparation barrier");
+    let second = ready_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("mount B did not reach its preparation barrier");
+    let _ = go_a_tx.send(());
+    let _ = go_b_tx.send(());
+    let result_a = writer_a.join().expect("mount A writer panicked");
+    let result_b = writer_b.join().expect("mount B writer panicked");
+    assert!(first.is_ok(), "{first:?}");
+    assert!(second.is_ok(), "{second:?}");
+    result_a.expect("fsync via mount A");
+    result_b.expect("fsync via mount B");
 
     assert_eq!(
         fs::read(a.mountpoint().join("from-b.txt")).expect("cross read"),
