@@ -20,9 +20,11 @@ mod support;
 use std::sync::Arc;
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, Fs};
+use yinyang::core::{Authority, BackendProfile, Fs, NodeId, Revision};
 use yinyang::runtime::{ErrorKind, Runtime};
-use yinyang::sync::Sync;
+use yinyang::sync::{
+    EditStatus, FileMetadata, NamespaceOperation, NamespaceState, RenameMode, Sync,
+};
 
 async fn exercise(authority: Arc<dyn Authority>) {
     let temp = tempfile::tempdir().unwrap();
@@ -163,4 +165,475 @@ async fn original_upload_survives_unknown_and_restart() {
         .unwrap()
         .unwrap();
     assert_eq!(revision, receipt.cursor.revision);
+}
+
+async fn create_file(
+    authority: &Arc<dyn Authority>,
+    runtime: &Runtime,
+    parent: NodeId,
+    name: &str,
+) -> (Revision, NodeId) {
+    let (node, _) = runtime
+        .create_file_with_node(parent, name, false)
+        .await
+        .unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    (baseline.revision(), node)
+}
+
+async fn create_directory(
+    authority: &Arc<dyn Authority>,
+    runtime: &Runtime,
+    parent: NodeId,
+    name: &str,
+) -> (Revision, NodeId) {
+    let (node, _) = runtime
+        .create_directory_with_node(parent, name)
+        .await
+        .unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    (baseline.revision(), node)
+}
+
+fn assert_conflict(result: yinyang::runtime::Result<Revision>) {
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::Conflict);
+}
+
+async fn exercise_namespace(authority: Arc<dyn Authority>) {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
+        .await
+        .unwrap();
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let root = authority.root();
+
+    // Create with bytes and executable metadata. The durable identity survives
+    // restart and the exact intent resolves to the same commit.
+    let baseline = authority.observe_latest().await.unwrap();
+    let created = sync
+        .stage_create_file(
+            root,
+            "created",
+            baseline.revision(),
+            FileMetadata::new(true),
+            &mut &b"created bytes"[..],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sync.stage_create_file(
+            root,
+            "created",
+            baseline.revision(),
+            FileMetadata::new(true),
+            &mut &b"created bytes"[..],
+        )
+        .await
+        .unwrap(),
+        created
+    );
+    let status = sync.namespace_status(created).await.unwrap();
+    assert_eq!(status.state, NamespaceState::Prepared);
+    let NamespaceOperation::CreateFile {
+        node: created_node,
+        metadata,
+        ..
+    } = status.intent.operation
+    else {
+        panic!("expected file creation intent");
+    };
+    assert!(metadata.executable);
+    assert!(matches!(
+        sync.edit_status(created).await.unwrap(),
+        EditStatus::Namespace(_)
+    ));
+    assert!(
+        sync.namespace_intents()
+            .await
+            .unwrap()
+            .iter()
+            .any(|intent| intent.intent.id == created)
+    );
+    let revision = sync.publish(created).await.unwrap();
+    let committed = authority.observe_revision(revision).await.unwrap();
+    let file = committed.open_file(created_node).await.unwrap();
+    assert!(file.node().executable());
+    assert_eq!(file.read(0, 64).await.unwrap(), b"created bytes");
+    let status = sync.namespace_status(created).await.unwrap();
+    assert!(matches!(status.state, NamespaceState::Committed(_)));
+    drop(sync);
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        sync.namespace_status(created).await.unwrap().state,
+        NamespaceState::Committed(_)
+    ));
+    assert_eq!(sync.publish(created).await.unwrap(), revision);
+
+    // Directory creation and a stable-identity rename.
+    let baseline = authority.observe_latest().await.unwrap();
+    let directory = sync
+        .stage_create_directory(root, "dir", baseline.revision())
+        .await
+        .unwrap();
+    let revision = sync.publish(directory).await.unwrap();
+    let directory_node = match sync
+        .namespace_status(directory)
+        .await
+        .unwrap()
+        .intent
+        .operation
+    {
+        NamespaceOperation::CreateDirectory { node, .. } => node,
+        operation => panic!("expected directory creation, got {operation:?}"),
+    };
+    assert!(
+        authority
+            .observe_revision(revision)
+            .await
+            .unwrap()
+            .node(directory_node)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_directory()
+    );
+    let baseline = authority.observe_latest().await.unwrap();
+    let rename = sync
+        .stage_rename(
+            created_node,
+            baseline.revision(),
+            directory_node,
+            "moved",
+            RenameMode::NoReplace,
+        )
+        .await
+        .unwrap();
+    let revision = sync.publish(rename).await.unwrap();
+    let observed = authority.observe_revision(revision).await.unwrap();
+    assert_eq!(
+        observed.resolve("dir/moved").await.unwrap().unwrap().id(),
+        created_node
+    );
+    assert!(observed.resolve("created").await.unwrap().is_none());
+
+    // Removing a live file cannot make its pinned baseline disappear.
+    let baseline = authority.observe_latest().await.unwrap();
+    let remove = sync
+        .stage_remove(created_node, baseline.revision())
+        .await
+        .unwrap();
+    let revision = sync.publish(remove).await.unwrap();
+    assert!(
+        authority
+            .observe_revision(revision)
+            .await
+            .unwrap()
+            .resolve("dir/moved")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        baseline
+            .open_file(created_node)
+            .await
+            .unwrap()
+            .read(0, 64)
+            .await
+            .unwrap(),
+        b"created bytes"
+    );
+
+    // No-replace rejects an occupied destination while replace removes exactly
+    // the observed destination and keeps its old version readable.
+    let (_, source) = create_file(&authority, &runtime, root, "source").await;
+    let (baseline, target) = create_file(&authority, &runtime, root, "target").await;
+    let baseline = authority.observe_revision(baseline).await.unwrap();
+    assert_eq!(
+        sync.stage_rename(
+            source,
+            baseline.revision(),
+            root,
+            "target",
+            RenameMode::NoReplace,
+        )
+        .await
+        .unwrap_err()
+        .kind(),
+        ErrorKind::AlreadyExists
+    );
+    let replace = sync
+        .stage_rename(
+            source,
+            baseline.revision(),
+            root,
+            "target",
+            RenameMode::Replace,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        sync.namespace_status(replace).await.unwrap().intent.operation,
+        NamespaceOperation::Rename {
+            replaced: Some(id),
+            ..
+        } if id == target
+    ));
+    let revision = sync.publish(replace).await.unwrap();
+    let observed = authority.observe_revision(revision).await.unwrap();
+    assert_eq!(
+        observed.resolve("target").await.unwrap().unwrap().id(),
+        source
+    );
+    baseline.open_file(target).await.unwrap();
+
+    // Executable changes use a baseline-bound metadata transaction.
+    let (baseline, executable) = create_file(&authority, &runtime, root, "executable").await;
+    let set_executable = sync
+        .stage_set_executable(executable, baseline, true)
+        .await
+        .unwrap();
+    let revision = sync.publish(set_executable).await.unwrap();
+    assert!(
+        authority
+            .observe_revision(revision)
+            .await
+            .unwrap()
+            .node(executable)
+            .await
+            .unwrap()
+            .unwrap()
+            .executable()
+    );
+
+    // Create/create: the second intent keeps its conflict.
+    let baseline = authority.observe_latest().await.unwrap();
+    let first = sync
+        .stage_create_file(
+            root,
+            "same",
+            baseline.revision(),
+            FileMetadata::new(false),
+            &mut &b"first"[..],
+        )
+        .await
+        .unwrap();
+    let second = sync
+        .stage_create_file(
+            root,
+            "same",
+            baseline.revision(),
+            FileMetadata::new(false),
+            &mut &b"second"[..],
+        )
+        .await
+        .unwrap();
+    sync.publish(first).await.unwrap();
+    assert_conflict(sync.publish(second).await);
+    assert_eq!(
+        sync.namespace_status(second).await.unwrap().state,
+        NamespaceState::Conflict
+    );
+    assert_conflict(sync.publish(second).await);
+
+    // Content/edit -> rename conflict. The rename guards the source's complete
+    // logical state rather than only its old parent/name topology.
+    let (baseline, renamed) = create_file(&authority, &runtime, root, "renamed").await;
+    let content = sync
+        .stage(renamed, baseline, &mut &b"new content"[..])
+        .await
+        .unwrap();
+    let rename = sync
+        .stage_rename(
+            renamed,
+            baseline,
+            root,
+            "renamed-new",
+            RenameMode::NoReplace,
+        )
+        .await
+        .unwrap();
+    sync.publish(content).await.unwrap();
+    assert_conflict(sync.publish(rename).await);
+    assert_eq!(
+        sync.namespace_status(rename).await.unwrap().state,
+        NamespaceState::Conflict
+    );
+
+    // Delete/edit conflicts in both orders. Neither the local replacement nor
+    // the pinned pre-delete version can be silently discarded.
+    let (baseline, deleted) = create_file(&authority, &runtime, root, "deleted-first").await;
+    let content = sync
+        .stage(deleted, baseline, &mut &b"edit before remove"[..])
+        .await
+        .unwrap();
+    let remove = sync.stage_remove(deleted, baseline).await.unwrap();
+    sync.publish(content).await.unwrap();
+    assert_conflict(sync.publish(remove).await);
+
+    let (baseline, deleted) = create_file(&authority, &runtime, root, "removed-first").await;
+    let content = sync
+        .stage(deleted, baseline, &mut &b"edit after remove"[..])
+        .await
+        .unwrap();
+    let remove = sync.stage_remove(deleted, baseline).await.unwrap();
+    sync.publish(remove).await.unwrap();
+    assert_conflict(sync.publish(content).await);
+    assert_eq!(
+        sync.read(content, 0, 64).await.unwrap(),
+        b"edit after remove"
+    );
+
+    // Rename/rename: only one move of the common baseline may publish.
+    let (baseline, moved) = create_file(&authority, &runtime, root, "moved-twice").await;
+    let left = sync
+        .stage_rename(moved, baseline, root, "left", RenameMode::NoReplace)
+        .await
+        .unwrap();
+    let right = sync
+        .stage_rename(moved, baseline, root, "right", RenameMode::NoReplace)
+        .await
+        .unwrap();
+    sync.publish(left).await.unwrap();
+    assert_conflict(sync.publish(right).await);
+
+    // Parent removal versus child creation, in both publication orders.
+    let (baseline, parent) = create_directory(&authority, &runtime, root, "parent-a").await;
+    let remove = sync.stage_remove(parent, baseline).await.unwrap();
+    let child = sync
+        .stage_create_file(
+            parent,
+            "child",
+            baseline,
+            FileMetadata::new(false),
+            &mut &b""[..],
+        )
+        .await
+        .unwrap();
+    sync.publish(child).await.unwrap();
+    assert_conflict(sync.publish(remove).await);
+
+    let (baseline, parent) = create_directory(&authority, &runtime, root, "parent-b").await;
+    let remove = sync.stage_remove(parent, baseline).await.unwrap();
+    let child = sync
+        .stage_create_file(
+            parent,
+            "child",
+            baseline,
+            FileMetadata::new(false),
+            &mut &b""[..],
+        )
+        .await
+        .unwrap();
+    sync.publish(remove).await.unwrap();
+    assert_conflict(sync.publish(child).await);
+
+    // A content edit conflicts with an executable change against the same
+    // baseline; the executable intent remains inspectable.
+    let (baseline, metadata) = create_file(&authority, &runtime, root, "metadata-race").await;
+    let content = sync
+        .stage(metadata, baseline, &mut &b"edited"[..])
+        .await
+        .unwrap();
+    let mode = sync
+        .stage_set_executable(metadata, baseline, true)
+        .await
+        .unwrap();
+    sync.publish(content).await.unwrap();
+    assert_conflict(sync.publish(mode).await);
+    assert_eq!(
+        sync.namespace_status(mode).await.unwrap().state,
+        NamespaceState::Conflict
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn namespace_intents_are_durable_and_conflict_safe_in_both_modes() {
+    let backend = TestBackend::default();
+    exercise_namespace(Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    ))
+    .await;
+
+    let backend = TestBackend::default();
+    let temp = tempfile::tempdir().unwrap();
+    let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let token = "sync-test-only-service-token-at-least-32-bytes";
+    let server = tokio::spawn(serve(listener, service, token.into()));
+    let client = ServiceClient::connect(address, token.into(), backend.operator())
+        .await
+        .unwrap();
+    exercise_namespace(Arc::new(client)).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn namespace_unknown_retries_the_original_request_after_restart() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let intent = sync
+        .stage_create_directory(authority.root(), "uncertain", baseline.revision())
+        .await
+        .unwrap();
+    let node = sync
+        .namespace_status(intent)
+        .await
+        .unwrap()
+        .intent
+        .operation
+        .node_id();
+    backend.state.lock().unwrap().delay_next_head = true;
+    let error = sync.publish(intent).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    let status = sync.namespace_status(intent).await.unwrap();
+    assert_eq!(status.state, NamespaceState::Unknown);
+    assert_eq!(status.failure.unwrap().commit_id(), error.commit_id());
+    drop(sync);
+
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Unknown
+    );
+    assert!(sync.resolve_namespace(intent).await.unwrap().is_none());
+    let revision = sync.publish(intent).await.unwrap();
+    let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
+    assert_eq!(receipt.cursor.revision, revision);
+    assert_eq!(
+        authority
+            .observe_revision(revision)
+            .await
+            .unwrap()
+            .node(node)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        node
+    );
+    assert!(matches!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Committed(_)
+    ));
 }

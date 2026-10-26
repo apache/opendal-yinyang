@@ -23,7 +23,12 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
-use yinyang_core::{Authority, NodeId, Revision};
+use yinyang_core::{Authority, NodeId, Receipt, Revision};
+
+mod namespace;
+pub use namespace::{
+    FileMetadata, NamespaceIntent, NamespaceOperation, NamespaceState, NamespaceStatus, RenameMode,
+};
 
 /// Content-addressed local intent, distinct from the frozen remote commit ID.
 /// It binds the filesystem, node, observed revision and exact replacement bytes.
@@ -59,11 +64,38 @@ impl Sync {
             c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
                 CREATE TABLE IF NOT EXISTS binding(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS edits(id BLOB PRIMARY KEY, handle BLOB NOT NULL UNIQUE);").map_err(Error::local)?;
+            namespace::initialize(&c)?;
             let tx = c.transaction().map_err(Error::local)?;
-            tx.execute("INSERT OR IGNORE INTO binding VALUES(1,'yinyang-sync-1',?1)", params![filesystem.as_slice()]).map_err(Error::local)?;
-            let (profile, bound): (String, Vec<u8>) = tx.query_row("SELECT profile,filesystem FROM binding", [], |r| Ok((r.get(0)?,r.get(1)?))).map_err(Error::local)?;
-            if profile != "yinyang-sync-1" || bound != filesystem {
-                return Err(Error::Invalid("sync journal belongs to another filesystem or profile"));
+            let binding: Option<(String, Vec<u8>)> = tx
+                .query_row("SELECT profile,filesystem FROM binding", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
+                .map_err(Error::local)?;
+            match binding {
+                None => {
+                    tx.execute(
+                        "INSERT INTO binding VALUES(1,'yinyang-sync-2',?1)",
+                        params![filesystem.as_slice()],
+                    )
+                    .map_err(Error::local)?;
+                }
+                Some((profile, bound)) if bound != filesystem => {
+                    return Err(Error::Invalid(
+                        "sync journal belongs to another filesystem or profile",
+                    ));
+                }
+                Some((profile, _)) if profile == "yinyang-sync-1" => {
+                    tx.execute("UPDATE binding SET profile='yinyang-sync-2'", [])
+                        .map_err(Error::local)?;
+                }
+                Some((profile, _)) => {
+                    if profile != "yinyang-sync-2" {
+                        return Err(Error::Invalid(
+                            "sync journal belongs to another filesystem or profile",
+                        ));
+                    }
+                }
             }
             tx.commit().map_err(Error::local)?;
             Ok(c)
@@ -193,6 +225,13 @@ impl Sync {
             .status()
             .await
     }
+    /// Inspect either a content edit or a namespace intent.
+    pub async fn edit_status(&self, edit: EditId) -> Result<EditStatus> {
+        if let Some(status) = namespace::status(self, edit).await? {
+            return Ok(EditStatus::Namespace(status));
+        }
+        Ok(EditStatus::Content(self.status(edit).await?))
+    }
     pub async fn edits(&self) -> Result<Vec<EditId>> {
         self.call(|c| {
             let mut q = c
@@ -210,10 +249,73 @@ impl Sync {
         })
         .await
     }
+    /// Durably accept a file creation with its immutable prepared content.
+    pub async fn stage_create_file(
+        &self,
+        parent: NodeId,
+        name: &str,
+        baseline: Revision,
+        metadata: FileMetadata,
+        source: &mut (dyn AsyncRead + Unpin + Send),
+    ) -> Result<EditId> {
+        namespace::stage_create_file(self, parent, name, baseline, metadata, source).await
+    }
+    /// Durably accept directory creation.
+    pub async fn stage_create_directory(
+        &self,
+        parent: NodeId,
+        name: &str,
+        baseline: Revision,
+    ) -> Result<EditId> {
+        namespace::stage_create_directory(self, parent, name, baseline).await
+    }
+    /// Durably accept removal of an observed stable identity.
+    pub async fn stage_remove(&self, node: NodeId, baseline: Revision) -> Result<EditId> {
+        namespace::stage_remove(self, node, baseline).await
+    }
+    /// Durably accept a rename with explicit destination replacement policy.
+    pub async fn stage_rename(
+        &self,
+        node: NodeId,
+        baseline: Revision,
+        new_parent: NodeId,
+        new_name: &str,
+        mode: RenameMode,
+    ) -> Result<EditId> {
+        namespace::stage_rename(self, node, baseline, new_parent, new_name, mode).await
+    }
+    /// Durably accept an executable-bit change to one observed file identity.
+    pub async fn stage_set_executable(
+        &self,
+        node: NodeId,
+        baseline: Revision,
+        executable: bool,
+    ) -> Result<EditId> {
+        namespace::stage_set_executable(self, node, baseline, executable).await
+    }
+    /// Inspect one durable namespace intent and its exact logical request.
+    pub async fn namespace_status(&self, edit: EditId) -> Result<NamespaceStatus> {
+        namespace::status(self, edit)
+            .await?
+            .ok_or_else(|| Error::Invalid("unknown namespace intent"))
+    }
+    /// List all durable namespace intents in stable identity order.
+    pub async fn namespace_intents(&self) -> Result<Vec<NamespaceStatus>> {
+        namespace::statuses(self).await
+    }
+    /// Resolve a namespace intent through the original commit receipt.
+    ///
+    /// Absence is not proof of failure. This method never dispatches or replans.
+    pub async fn resolve_namespace(&self, edit: EditId) -> Result<Option<Receipt>> {
+        namespace::resolve(self, edit).await
+    }
     /// Return the revision that accepted this edit, never a later observation.
     /// Conflicts and Unknown retain all bytes and their original frozen request.
     pub async fn publish(&self, edit: EditId) -> Result<Revision> {
         let _gate = self.inner.gate.lock().await;
+        if namespace::exists(self, edit).await? {
+            return namespace::publish(self, edit).await;
+        }
         let mut handle = self
             .inner
             .runtime
@@ -232,4 +334,11 @@ impl Sync {
             .read(offset, length)
             .await
     }
+}
+
+/// Status of the two durable edit families supported by Sync.
+#[derive(Clone, Debug)]
+pub enum EditStatus {
+    Content(HandleStatus),
+    Namespace(NamespaceStatus),
 }
