@@ -181,7 +181,7 @@ fn fuse_read_only_cached_readdir_and_nested_inodes_both_publications() {
             .join(format!("mnt-readdir-{}", fixture.publication().as_str()));
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let mut mounted = fixture.mount(&config, &mountpoint);
-        let root = mounted.mountpoint().to_path_buf();
+        let root = mounted.mountpoint();
 
         let nested = root.join("nested");
         let inner = nested.join("inner");
@@ -979,7 +979,7 @@ fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
         let mountpoint = fixture.temp.path().join(format!("mnt-sighup-{suffix}"));
         fs::create_dir(&mountpoint).expect("create mountpoint");
         let mut mounted = fixture.mount(&config, &mountpoint);
-        let root = mounted.mountpoint();
+        let root = mounted.mountpoint().to_path_buf();
 
         let old_path = root.join("a.txt");
         let mut old = File::open(&old_path).expect("open old descriptor before refresh");
