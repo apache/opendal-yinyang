@@ -80,7 +80,7 @@ impl Sync {
                     )
                     .map_err(Error::local)?;
                 }
-                Some((profile, bound)) if bound != filesystem => {
+                Some((_profile, bound)) if bound != filesystem => {
                     return Err(Error::Invalid(
                         "sync journal belongs to another filesystem or profile",
                     ));

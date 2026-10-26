@@ -935,7 +935,12 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
             }
         }
     }
-    let request = match sync.authority().restore_transaction(&row.request).await {
+    let request = match sync
+        .authority()
+        .restore_transaction(&row.request)
+        .await
+        .map_err(Error::from)
+    {
         Ok(request) => request,
         Err(error) => {
             let state = match state {
@@ -954,7 +959,7 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
     // The original request is durable. Recording the possibly-dispatched state
     // before dispatch means a process crash cannot turn this into a safe abort.
     save_state_async(sync, id, UNKNOWN, None, None).await?;
-    match sync.authority().commit(&request).await {
+    match sync.authority().commit(&request).await.map_err(Error::from) {
         Ok(yinyang_core::CommitOutcome::Committed(receipt)) => {
             save_state_async(sync, id, COMMITTED, Some(receipt.clone()), None).await?;
             Ok(receipt.cursor.revision)
