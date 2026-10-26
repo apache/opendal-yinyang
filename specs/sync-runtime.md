@@ -84,8 +84,11 @@ The required interleavings are:
 - Concurrent creates of one name publish at most one intent; the other is
   `Conflict`.
 - A delete or rename conflicts when a content/executable edit against its
-  baseline publishes first. If the namespace operation publishes first, a later
-  content edit conflicts because its original node state is no longer live.
+  baseline publishes first, because the edit changes the source node state the
+  namespace operation guards. The reverse order is safe for rename: the moved
+  identity keeps its content, so a same-baseline edit still commits under the
+  new name. Delete first makes the later edit conflict because its node is no
+  longer live.
 - Concurrent renames of one source publish at most one move.
 - Child creation and removal of its observed empty parent publish at most one
   operation.

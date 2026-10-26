@@ -297,7 +297,7 @@ impl Sync {
     pub async fn namespace_status(&self, edit: EditId) -> Result<NamespaceStatus> {
         namespace::status(self, edit)
             .await?
-            .ok_or_else(|| Error::Invalid("unknown namespace intent"))
+            .ok_or(Error::Invalid("unknown namespace intent"))
     }
     /// List all durable namespace intents in stable identity order.
     pub async fn namespace_intents(&self) -> Result<Vec<NamespaceStatus>> {
@@ -348,5 +348,5 @@ impl Sync {
 #[derive(Clone, Debug)]
 pub enum EditStatus {
     Content(HandleStatus),
-    Namespace(NamespaceStatus),
+    Namespace(Box<NamespaceStatus>),
 }

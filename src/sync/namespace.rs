@@ -983,12 +983,11 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
             Err(Error::Retained(failure))
         }
         Err(error) => {
-            let (state, failure) = match error.kind() {
-                ErrorKind::Retryable => (RETRYABLE, Error::Retryable),
-                ErrorKind::Unknown => (UNKNOWN, error),
-                ErrorKind::Conflict => (CONFLICT, Error::Conflict),
-                _ => (FAILED, error),
-            };
+            // A response or transport error after dispatch cannot prove that
+            // the commit did not publish. Only an authoritative outcome below
+            // the wrapper can establish Conflict/Retryable; anything else stays
+            // Unknown so the original receipt can resolve it later.
+            let (state, failure) = (UNKNOWN, error);
             let failure = Failure::capture(&failure);
             save_state_async(sync, id, state, None, Some(failure.clone())).await?;
             Err(Error::Retained(failure))
