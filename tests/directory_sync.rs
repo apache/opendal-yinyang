@@ -62,7 +62,7 @@ fn local_tree(root: &Path) -> BTreeMap<String, TreeEntry> {
             tree.insert(
                 rel.to_owned(),
                 TreeEntry::File {
-                    executable: metadata.mode() & 0o111 != 0,
+                    executable: metadata.st_mode() & 0o111 != 0,
                     bytes: std::fs::read(path).expect("tree file bytes"),
                 },
             );
