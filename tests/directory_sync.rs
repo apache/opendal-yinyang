@@ -418,10 +418,9 @@ async fn local_edit_during_delayed_publication_receipt_stays_pending() {
         std::fs::write(&file, b"version two").expect("local v2 write");
         release.notify_one();
     };
-    let outcome1 = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        tokio::join!(run1, writer),
-    )
+    let outcome1 = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(run1, writer)
+    })
     .await
     .expect("v1 publication must commit and release its receipt in time")
     .0
