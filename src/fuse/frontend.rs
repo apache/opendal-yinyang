@@ -968,7 +968,8 @@ mod tests {
             .unwrap();
         let inner = Inner::new(mount, tokio::runtime::Handle::current());
         let fh = inner.next_handle();
-        guard(&inner.files).insert(fh, Arc::new(inner.prepare_open(id).await.unwrap()));
+        let open = inner.prepare_open(id).await.unwrap();
+        guard(&inner.files).insert(fh, Arc::new(open));
 
         let other = temp.path().join("other");
         let writer = Runtime::open(authority.clone(), &other).await.unwrap();
