@@ -21,11 +21,12 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
@@ -378,6 +379,16 @@ impl Fixture {
     /// path is intentional: a restarted service keeps its original loopback
     /// address, so an unchanged config keeps working.
     pub fn volume_config(&self, name: &str, frontend: Frontend, read_only: bool) -> PathBuf {
+        self.volume_config_with_service(name, frontend, read_only, None)
+    }
+
+    pub fn volume_config_with_service(
+        &self,
+        name: &str,
+        frontend: Frontend,
+        read_only: bool,
+        service_address: Option<SocketAddr>,
+    ) -> PathBuf {
         let staging = self.temp.path().join(name);
         let mut json = format!(
             "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {},\n  \"require\": []",
@@ -390,7 +401,7 @@ impl Fixture {
         if self.publication() == Publication::Service {
             json.push_str(&format!(
                 ",\n  \"service_address\": \"{}\"",
-                self.service_address()
+                service_address.unwrap_or_else(|| self.service_address())
             ));
         }
         json.push_str("\n}");
@@ -951,6 +962,139 @@ fn read_all_logged(mut reader: impl Read, log: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
         output.extend_from_slice(&bytes);
     }
     bytes
+}
+
+/// A loopback TCP gate used only by the mounting volume. It watches the
+/// no-lease staging status and blocks the first connection observed after a
+/// frozen publication is persisted. Service clients used by the test itself
+/// connect directly to the real service.
+pub struct ServiceGate {
+    address: SocketAddr,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    ready: mpsc::Receiver<()>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ServiceGate {
+    pub fn new(staging: PathBuf, upstream: SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind service gate");
+        let address = listener.local_addr().expect("service gate address");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready_sent = Arc::new(AtomicBool::new(false));
+        let (sender, ready) = mpsc::channel();
+        let thread_release = release.clone();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                let Ok((client, _)) = listener.accept() else {
+                    break;
+                };
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let staging = staging.clone();
+                let release = thread_release.clone();
+                let ready_sent = ready_sent.clone();
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    handle_gate_connection(client, upstream, staging, release, ready_sent, sender);
+                });
+            }
+        });
+        Self {
+            address,
+            release,
+            ready,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn wait_ready(&self, timeout: Duration) {
+        self.ready
+            .recv_timeout(timeout)
+            .expect("service gate did not observe a frozen commit connection");
+    }
+
+    pub fn release(&self) {
+        let (released, condvar) = &*self.release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        condvar.notify_all();
+    }
+}
+
+impl Drop for ServiceGate {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.release();
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_gate_connection(
+    client: TcpStream,
+    upstream: SocketAddr,
+    staging: PathBuf,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    ready_sent: Arc<AtomicBool>,
+    sender: mpsc::Sender<()>,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build service gate runtime");
+    let frozen = runtime
+        .block_on(YinYangRuntime::inspect(&staging))
+        .expect("inspect service gate staging")
+        .handles
+        .iter()
+        .any(|handle| handle.frozen);
+    if frozen {
+        if !ready_sent.swap(true, Ordering::SeqCst) {
+            let _ = sender.send(());
+        }
+        let (released, condvar) = &*release;
+        let mut released = released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = condvar
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+    let Ok(server) = TcpStream::connect(upstream) else {
+        return;
+    };
+    let (Ok(mut client_read), Ok(mut client_write)) = (client.try_clone(), client.try_clone())
+    else {
+        return;
+    };
+    let (Ok(mut server_read), Ok(mut server_write)) = (server.try_clone(), server.try_clone())
+    else {
+        return;
+    };
+    let client_to_server = thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut server_write);
+        let _ = server_write.shutdown(std::net::Shutdown::Write);
+    });
+    let server_to_client = thread::spawn(move || {
+        let _ = std::io::copy(&mut server_read, &mut client_write);
+        let _ = client_write.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = client_to_server.join();
+    let _ = server_to_client.join();
 }
 
 impl Drop for Mounted {

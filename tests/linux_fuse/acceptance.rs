@@ -18,7 +18,8 @@
 //! Real /dev/fuse acceptance scenarios for the YinYang mount adapter.
 
 use crate::harness::{
-    Fixture, Frontend, Mounted, Publication, assert_errno, run_external, sync_all_with_deadline,
+    Fixture, Frontend, Mounted, Publication, ServiceGate, assert_errno, run_external,
+    sync_all_with_deadline,
 };
 use nix::unistd::truncate;
 use std::fs::{self, File, OpenOptions};
@@ -420,6 +421,47 @@ fn fuse_dirty_fd_readonly_close_keeps_remote_unchanged_both_publications() {
         dirty.sync_all().expect("explicit dirty fsync publishes");
         drop(dirty);
         assert_eq!(fixture.remote_read(&library, "flush.txt", 16), b"dirt");
+        mounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_cloexec_child_close_flushes_dirty_fd_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-cloexec-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "cloexec.txt", b"original");
+        let config =
+            fixture.volume_config(&format!("stage-cloexec-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-cloexec-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+
+        let mut dirty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mounted.mountpoint().join("cloexec.txt"))
+            .expect("open dirty descriptor");
+        dirty.write_all(b"dirty!!!").expect("stage dirty bytes");
+        assert_eq!(
+            fixture.remote_read(&library, "cloexec.txt", 16),
+            b"original",
+            "an in-process independent read must not close the dirty FUSE descriptor"
+        );
+        Command::new("/bin/true")
+            .status()
+            .expect("spawn a child that exec-closes the inherited dirty descriptor");
+        wait_remote_bytes(
+            &fixture,
+            &library,
+            "cloexec.txt",
+            b"dirty!!!",
+            Duration::from_secs(15),
+        );
+        drop(dirty);
         mounted.unmount();
     }
 }
@@ -1113,11 +1155,18 @@ fn fuse_daemon_crash_interrupts_pending_fsync_service() {
     let fixture = Fixture::new(Publication::Service);
     let library = fixture.volume_config("lib-interrupted", Frontend::Library, false);
     fixture.library_seed(&library, "interrupted.txt", b"seed");
-    let config = fixture.volume_config("stage-interrupted", Frontend::Fuse, false);
+    let staging = fixture.temp.path().join("stage-interrupted");
+    let gate = ServiceGate::new(staging, fixture.service_address());
+    let config = fixture.volume_config_with_service(
+        "stage-interrupted",
+        Frontend::Fuse,
+        false,
+        Some(gate.address()),
+    );
     let mountpoint = fixture.temp.path().join("mnt-interrupted");
     fs::create_dir(&mountpoint).expect("create mountpoint");
     let mounted = fixture.mount(&config, &mountpoint);
-    interrupt_pending_fsync(&fixture, &library, &config, mounted, Interrupt::Kill);
+    interrupt_pending_fsync(&fixture, &library, &config, mounted, &gate, Interrupt::Kill);
 }
 
 #[test]
@@ -1126,11 +1175,25 @@ fn fuse_sigterm_pending_fsync_service_exits_after_grace() {
     let fixture = Fixture::new(Publication::Service);
     let library = fixture.volume_config("lib-sigterm-fsync", Frontend::Library, false);
     fixture.library_seed(&library, "interrupted.txt", b"seed");
-    let config = fixture.volume_config("stage-sigterm-fsync", Frontend::Fuse, false);
+    let staging = fixture.temp.path().join("stage-sigterm-fsync");
+    let gate = ServiceGate::new(staging, fixture.service_address());
+    let config = fixture.volume_config_with_service(
+        "stage-sigterm-fsync",
+        Frontend::Fuse,
+        false,
+        Some(gate.address()),
+    );
     let mountpoint = fixture.temp.path().join("mnt-sigterm-fsync");
     fs::create_dir(&mountpoint).expect("create mountpoint");
     let mounted = fixture.mount(&config, &mountpoint);
-    interrupt_pending_fsync(&fixture, &library, &config, mounted, Interrupt::Terminate);
+    interrupt_pending_fsync(
+        &fixture,
+        &library,
+        &config,
+        mounted,
+        &gate,
+        Interrupt::Terminate,
+    );
 }
 
 fn interrupt_pending_fsync(
@@ -1138,6 +1201,7 @@ fn interrupt_pending_fsync(
     library: &Path,
     config: &Path,
     mut mounted: Mounted,
+    gate: &ServiceGate,
     interrupt: Interrupt,
 ) {
     let mut dirty = OpenOptions::new()
@@ -1149,11 +1213,11 @@ fn interrupt_pending_fsync(
         .write_all(b"interrupted-local")
         .expect("stage dirty write");
     let in_flight = dirty.try_clone().expect("duplicate descriptor");
-    fixture.pause_service();
     let (sender, receiver) = mpsc::channel();
     let caller = thread::spawn(move || {
         let _ = sender.send(in_flight.sync_all());
     });
+    gate.wait_ready(Duration::from_secs(30));
     let frozen = fixture.wait_for_frozen(&config);
     println!("fsync reached the frozen publication boundary:\n{frozen}");
     let mut frozen_reader = File::open(mounted.mountpoint().join("interrupted.txt"))
@@ -1174,6 +1238,7 @@ fn interrupt_pending_fsync(
             );
         }
     }
+    gate.release();
     let outcome = receiver
         .recv_timeout(Duration::from_secs(20))
         .unwrap_or_else(|error| {
@@ -1187,7 +1252,6 @@ fn interrupt_pending_fsync(
     drop(dirty);
     mounted.cleanup_after_kill();
 
-    fixture.resume_service();
     assert_eq!(
         fixture.remote_read(&library, "interrupted.txt", 64),
         b"seed",
@@ -1222,7 +1286,14 @@ fn fuse_delayed_completion_survives_client_interruption_service() {
     let fixture = Fixture::new(Publication::Service);
     let library = fixture.volume_config("lib-delayed", Frontend::Library, false);
     fixture.library_seed(&library, "delayed.txt", b"seed");
-    let config = fixture.volume_config("stage-delayed", Frontend::Fuse, false);
+    let staging = fixture.temp.path().join("stage-delayed");
+    let gate = ServiceGate::new(staging, fixture.service_address());
+    let config = fixture.volume_config_with_service(
+        "stage-delayed",
+        Frontend::Fuse,
+        false,
+        Some(gate.address()),
+    );
     let mountpoint = fixture.temp.path().join("mnt-delayed");
     fs::create_dir(&mountpoint).expect("create mountpoint");
     let mut mounted = fixture.mount(&config, &mountpoint);
@@ -1250,17 +1321,17 @@ fn fuse_delayed_completion_survives_client_interruption_service() {
         .unwrap_or_else(|error| panic!("client did not reach its write barrier: {error}"));
     assert_eq!(line.trim(), "READY", "unexpected client barrier: {line:?}");
 
-    fixture.pause_service();
     client
         .stdin
         .as_mut()
         .expect("client stdin is piped")
         .write_all(b"FSYNC\n")
         .expect("send fsync command");
+    gate.wait_ready(Duration::from_secs(30));
     let frozen = fixture.wait_for_frozen(&config);
     println!("delayed fsync reached the frozen publication boundary:\n{frozen}");
     client.kill().expect("SIGKILL the blocked client");
-    fixture.resume_service();
+    gate.release();
     let _ = wait_child(&mut client, Duration::from_secs(30));
     let _ = reader.join();
 

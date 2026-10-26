@@ -53,6 +53,10 @@ cargo x test-linux-fuse --read-only
   Path stat and fd fstat both report the staged size after dirty grow/truncate
   across the attribute TTL, and an external grow/shrink cannot overwrite the
   same inode's staged size while an old descriptor is retained.
+- CLOEXEC/flush boundary: while a parent keeps a dirty descriptor open, an
+  in-process independent authority read still sees the old bytes; spawning
+  `/bin/true` explicitly exec-closes the inherited descriptor and the next
+  independent read observes the newly published bytes.
 - External rename and add refresh: after warming a dentry and opening an old
   descriptor, an independent in-process authority renames `a` to `b`, changes
   `b`, and adds `new.txt`; SIGHUP must emit a native invalidation notification,
@@ -86,17 +90,17 @@ cargo x test-linux-fuse --read-only
 - Fsync/network failure retention: stopping the metadata service makes
   `fsync` fail within a bound; staged bytes survive, the service restarts, and
   a reopened mount publishes them through the unchanged service address.
-- Pending fsync interruption: `yy status` (no lease, no remote access) is polled
-  until the handle reports `frozen: true`, then killing the mount daemon
-  interrupts that pending publication. The authority is untouched and a
-  reopened mount replays the frozen request and publishes the staged bytes.
+- Pending fsync interruption: a loopback TCP gate used only by the mount blocks
+  the first connection observed after `Runtime::inspect` reports
+  `frozen: true`. Killing the mount daemon then interrupts that pending
+  publication, the authority is untouched, and a reopened mount replays the
+  frozen request and publishes the staged bytes.
 - Delayed completion with client interruption: a separate Python client opens
-  and writes through `stdin`/`stdout` barriers, the metadata service is paused,
-  `fsync` reaches the frozen boundary, and the client is SIGKILLed. After
-  service recovery the independent authority sees the delayed completion and
-  the daemon remains usable and unmounts normally. This verifies the
-  adapter's ignored interrupt/delayed completion behavior, not real
-  cancellation.
+  and writes through `stdin`/`stdout` barriers, the gate blocks the frozen
+  commit connection, and the client is SIGKILLed. After gate release the
+  independent authority sees the delayed completion and the daemon remains
+  usable and unmounts normally. This verifies the adapter's ignored
+  interrupt/delayed completion behavior, not real cancellation.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits
