@@ -416,6 +416,7 @@ async fn local_edit_during_lost_publication_receipt_stays_pending() {
         release.notify_one();
     };
     let (outcome1, ()) = tokio::join!(run1, writer);
+    let outcome1 = outcome1.unwrap();
 
     assert_eq!(outcome1.published_local, 1);
     assert!(
