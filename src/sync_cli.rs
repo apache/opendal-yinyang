@@ -30,7 +30,7 @@ use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use yinyang::core::Authority;
 use yinyang::replica as domain;
-use yinyang::replica::DirectorySync;
+use yinyang::replica::{DirectorySync, Replica};
 use yinyang::volume::{Access, Model, Volume, VolumeConfig};
 
 /// Managed Sync subcommands. Every subcommand requires `--volume CONFIG`.
@@ -515,30 +515,77 @@ async fn export(
             return Err("export requires exactly one of --artifact or --conflict".into());
         }
     };
+    // `create_new` refuses to clobber an existing path, so a failed export can
+    // only ever remove the output this command created.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|error| {
+            format!(
+                "create export {} (refusing to overwrite an existing path): {error}",
+                output.display()
+            )
+        })?;
+    let outcome: Result<(), Box<dyn std::error::Error>> = if let Some(id) = &artifact {
+        // Retained bytes are local; export must not require remote connectivity.
+        export_artifact_local(config, id, &mut file).await
+    } else {
+        export_conflict(
+            config,
+            operator,
+            conflict.as_deref().expect("conflict selector present"),
+            side.expect("conflict side present").as_str(),
+            &mut file,
+        )
+        .await
+    };
+    drop(file);
+    if let Err(error) = outcome {
+        // A failed export must not leave a pseudo artifact behind.
+        let _ = std::fs::remove_file(output);
+        return Err(error);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Exports a retained artifact through the local replica, without connecting to
+/// the publication authority.
+async fn export_artifact_local(
+    config: &VolumeConfig,
+    id: &str,
+    output: &mut dyn std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inspection = DirectorySync::inspect_local(&config.staging, None)
+        .await
+        .map_err(fatal)?;
+    let volume = inspection
+        .binding
+        .volume
+        .ok_or("sync state is not bound; run sync init")?;
+    let replica = Replica::open(&config.staging, volume).map_err(fatal)?;
+    replica.export_artifact(id, output).map_err(fatal)?;
+    Ok(())
+}
+
+/// Exports one side of a conflict. The remote side reads the retained revision,
+/// so this path needs the publication authority.
+async fn export_conflict(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+    id: &str,
+    side: &str,
+    output: &mut dyn std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
     let authority = connect(config, operator).await?;
     let directory = DirectorySync::open(authority, &config.staging)
         .await
         .map_err(fatal)?;
-    let mut file = std::fs::File::create(output)
-        .map_err(|error| format!("create export {}: {error}", output.display()))?;
-    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = if let Some(id) = &artifact {
-        directory.export_artifact(id, &mut file)
-    } else {
-        directory
-            .export_conflict_side(
-                conflict.as_deref().expect("conflict selector present"),
-                side.expect("conflict side present").as_str(),
-                &mut file,
-            )
-            .await
-    };
-    drop(file);
-    if let Err(error) = result {
-        // A failed export must not leave a pseudo artifact behind.
-        let _ = std::fs::remove_file(output);
-        return Err(fatal(error));
-    }
-    Ok(ExitCode::SUCCESS)
+    directory
+        .export_conflict_side(id, side, output)
+        .await
+        .map_err(fatal)?;
+    Ok(())
 }
 
 async fn resolve(
