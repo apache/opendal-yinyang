@@ -17,17 +17,20 @@
 
 //! Harness for real Linux FUSE acceptance against the yy CLI.
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
 use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
+use yinyang::runtime::Runtime as YinYangRuntime;
 
 /// The kernel filesystem type advertised by the YinYang FUSE adapter.
 pub const MOUNT_TYPE: &str = "fuse.yinyang";
@@ -327,12 +330,8 @@ impl Fixture {
             .expect("service publication requires a running metadata service")
             .child
             .id();
-        let output = run_external(
-            "kill",
-            &["-STOP", &pid.to_string()],
-            Duration::from_secs(30),
-        );
-        output.success_or("pause metadata service");
+        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP)
+            .expect("pause metadata service without exec");
     }
 
     pub fn resume_service(&self) {
@@ -342,27 +341,28 @@ impl Fixture {
             .expect("service publication requires a running metadata service")
             .child
             .id();
-        let output = run_external(
-            "kill",
-            &["-CONT", &pid.to_string()],
-            Duration::from_secs(30),
-        );
-        output.success_or("resume metadata service");
+        kill(Pid::from_raw(pid as i32), Signal::SIGCONT)
+            .expect("resume metadata service without exec");
     }
 
     /// Polls the existing no-lease status entry until a handle reports the
     /// frozen publication boundary. A hang is a hard failure, not a skip.
     pub fn wait_for_frozen(&self, config: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(30);
-        let config = config.to_str().expect("UTF-8 volume config");
+        let staging = self
+            .temp
+            .path()
+            .join(config.file_stem().expect("volume config has a file stem"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build status runtime");
         loop {
-            let output = self.yy(&["--volume", config, "status"]);
-            output.success_or("yy status");
-            let text = String::from_utf8_lossy(&output.stdout).into_owned();
-            if text
-                .lines()
-                .any(|line| line.starts_with("handle: ") && line.contains("frozen: true"))
-            {
+            let status = runtime
+                .block_on(YinYangRuntime::inspect(&staging))
+                .expect("inspect staging without the runtime lease");
+            let text = format!("{status:#?}");
+            if status.handles.iter().any(|handle| handle.frozen) {
                 return text;
             }
             if Instant::now() >= deadline {
@@ -497,105 +497,184 @@ impl Fixture {
         self.remote_write(config, path, bytes);
     }
 
-    pub fn remote_write(&self, config: &Path, path: &str, bytes: &[u8]) {
-        let handle = self
-            .yy_ok(&[
-                "--volume",
-                config.to_str().expect("UTF-8 volume config"),
-                "file",
-                "open",
-                path,
-                "--write",
-            ])
-            .text();
-        let source = self.temp.path().join("remote-write-source");
-        fs::write(&source, bytes).expect("write remote source");
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "write",
-            &handle,
-            source.to_str().expect("UTF-8 source path"),
-        ]);
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "fsync",
-            &handle,
-        ]);
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "close",
-            &handle,
-        ]);
+    pub fn remote_write(&self, _config: &Path, path: &str, bytes: &[u8]) {
+        let authority = self.in_process_authority();
+        let staging = self.in_process_staging("write");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process write runtime");
+        runtime.block_on(async move {
+            let runtime = YinYangRuntime::open(authority, staging)
+                .await
+                .expect("open in-process write runtime");
+            let mut file = runtime
+                .open_file(path, true)
+                .await
+                .expect("open in-process write handle");
+            file.write(0, bytes)
+                .await
+                .expect("write through in-process authority");
+            file.fsync()
+                .await
+                .expect("fsync in-process authority write");
+            file.close().await.expect("close in-process write handle");
+        });
     }
 
-    pub fn remote_truncate(&self, config: &Path, path: &str, length: u64) {
-        let handle = self
-            .yy_ok(&[
-                "--volume",
-                config.to_str().expect("UTF-8 volume config"),
-                "file",
-                "open",
-                path,
-                "--write",
-            ])
-            .text();
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "truncate",
-            &handle,
-            &length.to_string(),
-        ]);
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "fsync",
-            &handle,
-        ]);
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "close",
-            &handle,
-        ]);
+    pub fn remote_truncate(&self, _config: &Path, path: &str, length: u64) {
+        let authority = self.in_process_authority();
+        let staging = self.in_process_staging("truncate");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process truncate runtime");
+        runtime.block_on(async move {
+            let runtime = YinYangRuntime::open(authority, staging)
+                .await
+                .expect("open in-process truncate runtime");
+            let mut file = runtime
+                .open_file(path, true)
+                .await
+                .expect("open in-process truncate handle");
+            file.truncate(length)
+                .await
+                .expect("truncate through in-process authority");
+            file.fsync()
+                .await
+                .expect("fsync in-process authority truncate");
+            file.close()
+                .await
+                .expect("close in-process truncate handle");
+        });
     }
 
-    pub fn remote_read(&self, config: &Path, path: &str, length: usize) -> Vec<u8> {
-        let handle = self
-            .yy_ok(&[
-                "--volume",
-                config.to_str().expect("UTF-8 volume config"),
-                "file",
-                "open",
-                path,
-            ])
-            .text();
-        let output = self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "read",
-            &handle,
-            "--length",
-            &length.to_string(),
-        ]);
-        self.yy_ok(&[
-            "--volume",
-            config.to_str().expect("UTF-8 volume config"),
-            "file",
-            "close",
-            &handle,
-        ]);
-        output.stdout
+    pub fn remote_create(&self, _config: &Path, path: &str) {
+        let authority = self.in_process_authority();
+        let staging = self.in_process_staging("create");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process create runtime");
+        runtime.block_on(async move {
+            let runtime = YinYangRuntime::open(authority, staging)
+                .await
+                .expect("open in-process create runtime");
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let snapshot = runtime
+                .authority()
+                .observe_latest()
+                .await
+                .expect("observe in-process create parent");
+            let parent = snapshot
+                .resolve(parent)
+                .await
+                .expect("resolve in-process create parent")
+                .expect("in-process create parent exists");
+            runtime
+                .create_file(parent.id(), name)
+                .await
+                .expect("create through in-process authority");
+        });
+    }
+
+    pub fn remote_rename(&self, _config: &Path, source: &str, destination: &str) {
+        let authority = self.in_process_authority();
+        let staging = self.in_process_staging("rename");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process rename runtime");
+        runtime.block_on(async move {
+            let runtime = YinYangRuntime::open(authority, staging)
+                .await
+                .expect("open in-process rename runtime");
+            let snapshot = runtime
+                .authority()
+                .observe_latest()
+                .await
+                .expect("observe in-process rename source");
+            let source = snapshot
+                .resolve(source)
+                .await
+                .expect("resolve in-process rename source")
+                .expect("in-process rename source exists");
+            let (parent, name) = destination.rsplit_once('/').unwrap_or(("", destination));
+            let parent = snapshot
+                .resolve(parent)
+                .await
+                .expect("resolve in-process rename parent")
+                .expect("in-process rename parent exists");
+            runtime
+                .rename(source.id(), parent.id(), name)
+                .await
+                .expect("rename through in-process authority");
+        });
+    }
+
+    pub fn remote_read(&self, _config: &Path, path: &str, length: usize) -> Vec<u8> {
+        let authority = self.in_process_authority();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process read runtime");
+        runtime.block_on(async move {
+            let snapshot = authority
+                .observe_latest()
+                .await
+                .expect("observe in-process read");
+            let node = snapshot
+                .resolve(path)
+                .await
+                .expect("resolve in-process read")
+                .expect("in-process read path exists");
+            snapshot
+                .open_file(node.id())
+                .await
+                .expect("open in-process read version")
+                .read(0, length)
+                .await
+                .expect("read through in-process authority")
+        })
+    }
+
+    fn in_process_authority(&self) -> Arc<dyn Authority> {
+        let operator = self.operator();
+        let publication = self.publication();
+        let address = self.last_service_address;
+        let token = self.token.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process authority runtime");
+        runtime.block_on(async move {
+            match publication {
+                Publication::Object => Arc::new(
+                    Fs::open(operator, BackendProfile::Minio)
+                        .await
+                        .expect("open in-process object authority"),
+                ),
+                Publication::Service => Arc::new(
+                    ServiceClient::connect(
+                        address.expect("in-process service address"),
+                        token,
+                        operator,
+                    )
+                    .await
+                    .expect("connect in-process service authority"),
+                ),
+            }
+        })
+    }
+
+    fn in_process_staging(&self, operation: &str) -> PathBuf {
+        self.temp.path().join(format!(
+            "inproc-{operation}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
     }
 
     pub fn mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
@@ -612,14 +691,20 @@ impl Fixture {
         });
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
-        let stdout_thread = thread::spawn(move || read_all(stdout));
-        let stderr_thread = thread::spawn(move || read_all(stderr));
+        let stdout_log = Arc::new(Mutex::new(Vec::new()));
+        let stderr_log = Arc::new(Mutex::new(Vec::new()));
+        let log = stdout_log.clone();
+        let stdout_thread = thread::spawn(move || read_all_logged(stdout, log));
+        let log = stderr_log.clone();
+        let stderr_thread = thread::spawn(move || read_all_logged(stderr, log));
         let mut mounted = Mounted {
             child,
             stdout: Some(stdout_thread),
             stderr: Some(stderr_thread),
             mountpoint: PathBuf::from(mountpoint),
             staging,
+            stdout_log,
+            stderr_log,
         };
         mounted.wait_mounted();
         mounted
@@ -654,6 +739,8 @@ pub struct Mounted {
     stderr: Option<JoinHandle<Vec<u8>>>,
     mountpoint: PathBuf,
     staging: PathBuf,
+    stdout_log: Arc<Mutex<Vec<u8>>>,
+    stderr_log: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Mounted {
@@ -706,10 +793,21 @@ impl Mounted {
         self.assert_staging_lease_released();
     }
 
+    /// Stop the daemon without spawning a cleanup helper while a dirty FUSE
+    /// descriptor is still owned by the test process.
+    pub fn kill_daemon_only(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.wait_exit(Duration::from_secs(30));
+    }
+
+    pub fn cleanup_after_kill(&mut self) {
+        self.unmount_force();
+        self.assert_staging_lease_released();
+    }
+
     pub fn terminate(&mut self) {
-        let pid = self.child.id().to_string();
-        let output = run_external("kill", &["-TERM", &pid], Duration::from_secs(30));
-        output.success_or("send SIGTERM to yy mount");
+        let pid = Pid::from_raw(self.child.id() as i32);
+        kill(pid, Signal::SIGTERM).expect("send SIGTERM without exec");
         let status = self.wait_exit(Duration::from_secs(30));
         assert!(
             status.success(),
@@ -727,13 +825,47 @@ impl Mounted {
     /// forced non-zero grace path and release the staging lease. No success
     /// assertion is made here; the caller requires the busy exit contract.
     pub fn terminate_busy(&mut self) -> ExitStatus {
-        let pid = self.child.id().to_string();
-        let output = run_external("kill", &["-TERM", &pid], Duration::from_secs(30));
-        output.success_or("send SIGTERM to yy mount");
-        let status = self.wait_exit(Duration::from_secs(10));
-        self.unmount_force();
-        self.assert_staging_lease_released();
-        status
+        let pid = Pid::from_raw(self.child.id() as i32);
+        kill(pid, Signal::SIGTERM).expect("send SIGTERM without exec");
+        self.wait_exit(Duration::from_secs(10))
+    }
+
+    /// Ask the live daemon for the explicit SIGHUP refresh path.
+    pub fn refresh_sighup(&mut self) {
+        let pid = Pid::from_raw(self.child.id() as i32);
+        kill(pid, Signal::SIGHUP).expect("send SIGHUP without exec");
+    }
+
+    pub fn wait_for_output(&self, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = self.output_text();
+            if output.contains(needle) {
+                return output;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "yy mount did not emit expected output {needle:?} within {timeout:?}:\n{output}"
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn output_text(&self) -> String {
+        let stdout = self
+            .stdout_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stderr = self
+            .stderr_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        )
     }
 
     pub fn unmount(&mut self) {
@@ -810,6 +942,15 @@ impl Mounted {
             )
         });
     }
+}
+
+fn read_all_logged(mut reader: impl Read, log: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    if let Ok(mut output) = log.lock() {
+        output.extend_from_slice(&bytes);
+    }
+    bytes
 }
 
 impl Drop for Mounted {

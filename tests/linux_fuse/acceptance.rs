@@ -38,6 +38,7 @@ const EROFS: i32 = 30;
 const EINVAL: i32 = 22;
 const ENOTCONN: i32 = 107;
 const EIO: i32 = 5;
+const ENOENT: i32 = 2;
 const ATTR_TTL_WAIT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy)]
@@ -844,6 +845,76 @@ fn external_changes(fixture: &Fixture) {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-sighup-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "a.txt", b"old-content");
+        let config =
+            fixture.volume_config(&format!("stage-sighup-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-sighup-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let root = mounted.mountpoint();
+
+        let old_path = root.join("a.txt");
+        let mut old = File::open(&old_path).expect("open old descriptor before refresh");
+        let old_ino = inode(&old_path);
+        let old_len = fs::metadata(&old_path).expect("warm old dentry").len();
+        let mut old_bytes = Vec::new();
+        old.read_to_end(&mut old_bytes).expect("read old bytes");
+        assert_eq!(old_bytes, b"old-content");
+
+        fixture.remote_rename(&library, "a.txt", "b.txt");
+        fixture.remote_write(&library, "b.txt", b"new-content");
+        fixture.remote_create(&library, "new.txt");
+        fixture.remote_write(&library, "new.txt", b"added");
+
+        mounted.refresh_sighup();
+        let refresh_log = mounted.wait_for_output("refresh", Duration::from_secs(30));
+        let lower = refresh_log.to_ascii_lowercase();
+        assert!(
+            lower.contains("notif") || lower.contains("inval"),
+            "refresh must report the native invalidation notification, not just a TTL result:\n{refresh_log}"
+        );
+
+        assert_errno(
+            fs::metadata(&old_path).expect_err("renamed source must disappear after SIGHUP"),
+            &[ENOENT],
+            "stat renamed source after SIGHUP",
+        );
+        assert_eq!(
+            fs::read(root.join("b.txt")).expect("read renamed target after SIGHUP"),
+            b"new-content"
+        );
+        assert_eq!(
+            fs::read(root.join("new.txt")).expect("read externally added file after SIGHUP"),
+            b"added"
+        );
+        assert_eq!(old.metadata().expect("fstat old descriptor").ino(), old_ino);
+        assert_eq!(old.metadata().expect("fstat old descriptor").len(), old_len);
+        old.seek(SeekFrom::Start(0)).expect("rewind old descriptor");
+        let mut pinned = Vec::new();
+        old.read_to_end(&mut pinned)
+            .expect("read old descriptor after SIGHUP");
+        assert_eq!(pinned, b"old-content");
+        drop(old);
+
+        let mut fresh = File::open(root.join("b.txt")).expect("fresh open after old close");
+        let mut fresh_bytes = Vec::new();
+        fresh
+            .read_to_end(&mut fresh_bytes)
+            .expect("fresh read after old close");
+        assert_eq!(fresh_bytes, b"new-content");
+        drop(fresh);
+        mounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
 fn fuse_concurrent_mounts_object() {
     let fixture = Fixture::new(Publication::Object);
     let library = fixture.volume_config("lib-concurrent", Frontend::Library, false);
@@ -953,8 +1024,9 @@ fn fuse_process_kill_recovery_object() {
         b"seed",
         "an un-fsynced mounted write must not publish before the daemon is interrupted"
     );
-    mounted.kill();
+    mounted.kill_daemon_only();
     drop(dirty);
+    mounted.cleanup_after_kill();
 
     let mountpoint = fixture.temp.path().join("mnt-kill-reopen");
     fs::create_dir(&mountpoint).expect("create reopen mountpoint");
@@ -1010,8 +1082,9 @@ fn fuse_fsync_failure_retention_service() {
         retained, b"survives",
         "a failed fsync must not discard staged bytes"
     );
+    mounted.kill_daemon_only();
     drop(dirty);
-    mounted.kill();
+    mounted.cleanup_after_kill();
 
     fixture.restart_service();
     let mountpoint = fixture.temp.path().join("mnt-network-reopen");
@@ -1092,7 +1165,7 @@ fn interrupt_pending_fsync(
     assert_eq!(frozen_bytes, b"interrupted-local");
     drop(frozen_reader);
     match interrupt {
-        Interrupt::Kill => mounted.kill(),
+        Interrupt::Kill => mounted.kill_daemon_only(),
         Interrupt::Terminate => {
             let status = mounted.terminate_busy();
             assert!(
@@ -1112,6 +1185,7 @@ fn interrupt_pending_fsync(
         "an fsync interrupted by stopping the mount daemon must fail, not report remote durability"
     );
     drop(dirty);
+    mounted.cleanup_after_kill();
 
     fixture.resume_service();
     assert_eq!(
@@ -1240,6 +1314,7 @@ fn fuse_sigterm_with_open_fd_exits_and_releases_lease_both_publications() {
             .expect_err("a held descriptor must report an I/O error after daemon exit");
         assert_errno(error, &[ENOTCONN, EIO], "read after busy SIGTERM");
         drop(held);
+        mounted.cleanup_after_kill();
 
         let mountpoint = fixture
             .temp

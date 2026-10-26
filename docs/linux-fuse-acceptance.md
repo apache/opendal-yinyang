@@ -53,6 +53,11 @@ cargo x test-linux-fuse --read-only
   Path stat and fd fstat both report the staged size after dirty grow/truncate
   across the attribute TTL, and an external grow/shrink cannot overwrite the
   same inode's staged size while an old descriptor is retained.
+- External rename and add refresh: after warming a dentry and opening an old
+  descriptor, an independent in-process authority renames `a` to `b`, changes
+  `b`, and adds `new.txt`; SIGHUP must emit a native invalidation notification,
+  the same mount must expose the new namespace, and the old descriptor must
+  retain its bytes and fstat until it is closed.
 - Path truncate: real `truncate(2)` without an open descriptor commits its
   shrink/extend result to the independent authority at an explicit boundary.
 - Limited chmod: `0644 <-> 0755` is observable, while non-representable modes
