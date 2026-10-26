@@ -254,13 +254,13 @@ pub struct DirectorySync {
 
 impl DirectorySync {
     pub async fn open(authority: Arc<dyn Authority>, state: &Path) -> Result<Self> {
-        let replica = Replica::open(state, authority.volume())?;
+        let replica = Replica::open(state, authority.filesystem())?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
     }
 
     pub async fn init(authority: Arc<dyn Authority>, state: &Path, root: &Path) -> Result<Self> {
-        let replica = Replica::init(state, root, authority.volume())?;
+        let replica = Replica::init(state, root, authority.filesystem())?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
     }
@@ -304,7 +304,7 @@ impl DirectorySync {
                         state: BindingState::Error,
                         state_directory,
                         root: None,
-                        volume: Some(authority.volume()),
+                        volume: Some(authority.filesystem()),
                         same_volume: None,
                         error: Some(error.to_string()),
                     },
@@ -316,7 +316,7 @@ impl DirectorySync {
             state: BindingState::Bound,
             state_directory,
             root: Some(status.root.clone()),
-            volume: Some(status.volume),
+            volume: Some(status.filesystem),
             same_volume: Some(true),
             error: None,
         };
@@ -550,7 +550,7 @@ impl DirectorySync {
     }
 
     /// Export one side of a conflict. `side` is `"local"` or `"remote"`.
-    pub fn export_conflict_side(
+    pub async fn export_conflict_side(
         &self,
         conflict_id: &str,
         side: &str,
@@ -579,12 +579,33 @@ impl DirectorySync {
                 Ok(())
             }
             "remote" => {
-                if let Some(artifact) = record.remote_artifact {
-                    return Ok(self.replica.export_artifact(&artifact, output)?);
+                let node = record
+                    .remote_node
+                    .ok_or_else(|| "this conflict has no remote side to export".to_string())?;
+                let snapshot = match record.remote_revision {
+                    Some(revision) => {
+                        self.sync
+                            .authority()
+                            .observe_revision(Revision::from_bytes(revision))
+                            .await?
+                    }
+                    None => self.sync.authority().observe_latest().await?,
+                };
+                let version = snapshot.open_file(NodeId::from_bytes(node)).await?;
+                let length = version.descriptor().content_id().length();
+                let mut position = 0;
+                while position < length {
+                    let end = (position + 64 * 1024).min(length);
+                    let mut chunk = Vec::new();
+                    version.read_range(position..end, &mut chunk).await?;
+                    output
+                        .write_all(&chunk)
+                        .map_err(|error| error.to_string())?;
+                    position = end;
                 }
-                Err("this conflict has no retained remote side to export".to_string())
+                Ok(())
             }
-            other => Err(format!("unknown conflict side {other:?}")),
+            other => Err(format!("unknown conflict side {other:?}").into()),
         }
     }
 
@@ -872,7 +893,7 @@ impl DirectorySync {
                         Some(revision),
                         None,
                     )?;
-                    if let Some(node) = self.accepted_node_from_work(&record)? {
+                    if let Some(node) = self.accepted_node_from_work(&record).await? {
                         let accepted = accepted_local(&self.replica, &record)?;
                         self.replica.store_mut().save_baseline_path(
                             &record.path,
@@ -1379,29 +1400,21 @@ impl<'a> Context<'a> {
             (Action::None, Action::Delete) => self.materialize_delete(path).await,
             (Action::Delete, Action::None) => Ok(()),
             (Action::Create, Action::Create) => {
-                if canonical_matches(
-                    self.replica,
-                    self.current.get(path).unwrap(),
-                    self.remote.get(path).unwrap(),
-                )
-                .await?
+                let remote_node = self.remote.get(path).cloned().unwrap();
+                if canonical_matches(self.replica, self.current.get(path).unwrap(), &remote_node)
+                    .await?
                 {
-                    self.accept_remote(path, self.remote.get(path).unwrap())
-                        .await
+                    self.accept_remote(path, &remote_node).await
                 } else {
                     self.conflict(path, None, Some(path)).await
                 }
             }
             (Action::Modify, Action::Modify) => {
-                if canonical_matches(
-                    self.replica,
-                    self.current.get(path).unwrap(),
-                    self.remote.get(path).unwrap(),
-                )
-                .await?
+                let remote_node = self.remote.get(path).cloned().unwrap();
+                if canonical_matches(self.replica, self.current.get(path).unwrap(), &remote_node)
+                    .await?
                 {
-                    self.accept_remote(path, self.remote.get(path).unwrap())
-                        .await
+                    self.accept_remote(path, &remote_node).await
                 } else {
                     self.conflict(path, Some(path), Some(path)).await
                 }
@@ -1875,6 +1888,26 @@ impl<'a> Context<'a> {
         }
         Ok(())
     }
+
+    async fn stage_remote_file(&self, node: &Node) -> Result<std::fs::File> {
+        let snapshot = self
+            .sync
+            .authority()
+            .observe_revision(self.revision)
+            .await?;
+        let version = snapshot.open_file(node.id()).await?;
+        let length = version.descriptor().content_id().length();
+        let mut output = tokio::fs::File::from_std(tempfile::tempfile()?);
+        let mut position = 0;
+        while position < length {
+            let end = (position + 64 * 1024).min(length);
+            version.read_range(position..end, &mut output).await?;
+            position = end;
+        }
+        let mut spool = output.into_std().await;
+        spool.seek(SeekFrom::Start(0))?;
+        Ok(spool)
+    }
 }
 
 fn local_action(baseline: Option<&LocalNode>, current: Option<&LocalNode>) -> Action {
@@ -1889,6 +1922,14 @@ fn local_action(baseline: Option<&LocalNode>, current: Option<&LocalNode>) -> Ac
                 Action::Modify
             }
         }
+    }
+}
+
+fn local_kind_side(node: &LocalNode) -> &'static str {
+    if node.is_directory() {
+        "current_directory"
+    } else {
+        "current_file"
     }
 }
 
