@@ -153,9 +153,15 @@ pub(super) struct WorkRecord {
     pub local_digest: Option<[u8; 32]>,
     pub local_length: Option<u64>,
     pub local_executable: Option<bool>,
+    pub local_dev: Option<u64>,
+    pub local_ino: Option<u64>,
+    pub local_parent_dev: Option<u64>,
+    pub local_parent_ino: Option<u64>,
     pub baseline_node: Option<[u8; 16]>,
     pub baseline_revision: [u8; 24],
     pub remote_revision: Option<[u8; 24]>,
+    /// Original commit identity, retained before a replay can clear it.
+    pub commit_id: Option<[u8; 16]>,
     /// Conflict this edit resolves, if it was created by an explicit decision.
     pub conflict: Option<String>,
     /// Retained artifact holding the exact local input published by this edit.
@@ -260,9 +266,14 @@ impl Store {
                    local_digest BLOB,
                    local_length INTEGER,
                    local_executable INTEGER,
+                   local_dev BLOB,
+                   local_ino BLOB,
+                   local_parent_dev BLOB,
+                   local_parent_ino BLOB,
                    baseline_node BLOB,
                    baseline_revision BLOB NOT NULL,
                    remote_revision BLOB,
+                   commit_id BLOB,
                    conflict TEXT,
                    source_artifact TEXT,
                    state TEXT NOT NULL,
@@ -276,6 +287,16 @@ impl Store {
             .map_err(|e| Error::io("migrate replica work", path, e))?;
         ensure_column(&connection, "work", "source_artifact", "TEXT")
             .map_err(|e| Error::io("migrate replica work", path, e))?;
+        for column in [
+            "local_dev",
+            "local_ino",
+            "local_parent_dev",
+            "local_parent_ino",
+            "commit_id",
+        ] {
+            ensure_column(&connection, "work", column, "BLOB")
+                .map_err(|e| Error::io("migrate replica work", path, e))?;
+        }
         Ok(Self { connection })
     }
 
@@ -835,9 +856,11 @@ impl Store {
             .execute(
                 "INSERT OR REPLACE INTO work
                  (id,path,original_path,desired_path,operation,local_kind,local_digest,
-                  local_length,local_executable,baseline_node,baseline_revision,
-                  remote_revision,conflict,source_artifact,state,error)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                  local_length,local_executable,local_dev,local_ino,local_parent_dev,
+                  local_parent_ino,baseline_node,baseline_revision,remote_revision,
+                  commit_id,conflict,source_artifact,state,error)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                        ?16,?17,?18,?19,?20,?21)",
                 params![
                     work.id.as_slice(),
                     work.path,
@@ -851,9 +874,14 @@ impl Store {
                         .transpose()
                         .map_err(|_| Error::invalid("work length exceeds SQLite range"))?,
                     work.local_executable,
+                    work.local_dev.map(|v| v.to_be_bytes()),
+                    work.local_ino.map(|v| v.to_be_bytes()),
+                    work.local_parent_dev.map(|v| v.to_be_bytes()),
+                    work.local_parent_ino.map(|v| v.to_be_bytes()),
                     work.baseline_node.as_ref().map(|v| v.as_slice()),
                     work.baseline_revision.as_slice(),
                     work.remote_revision.as_ref().map(|v| v.as_slice()),
+                    work.commit_id.as_ref().map(|v| v.as_slice()),
                     work.conflict,
                     work.source_artifact,
                     work.state,
@@ -885,13 +913,26 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the original commit identity of an edit before a replay can
+    /// clear it from the staging handle.
+    pub fn set_work_commit_id(&mut self, id: &[u8; 32], commit_id: [u8; 16]) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE work SET commit_id=?2 WHERE id=?1",
+                params![id.as_slice(), commit_id.as_slice()],
+            )
+            .map_err(|e| Error::corrupt(format!("set work commit id: {e}")))?;
+        Ok(())
+    }
+
     pub fn work(&self) -> Result<Vec<WorkRecord>> {
         let mut query = self
             .connection
             .prepare(
                 "SELECT id,path,original_path,desired_path,operation,local_kind,local_digest,
-                        local_length,local_executable,baseline_node,baseline_revision,
-                        remote_revision,conflict,source_artifact,state,error
+                        local_length,local_executable,local_dev,local_ino,local_parent_dev,
+                        local_parent_ino,baseline_node,baseline_revision,remote_revision,
+                        commit_id,conflict,source_artifact,state,error
                  FROM work ORDER BY path,id",
             )
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
@@ -900,9 +941,14 @@ impl Store {
                 let id: Vec<u8> = row.get(0)?;
                 let local_digest: Option<Vec<u8>> = row.get(6)?;
                 let local_length: Option<i64> = row.get(7)?;
-                let baseline_node: Option<Vec<u8>> = row.get(9)?;
-                let baseline_revision: Vec<u8> = row.get(10)?;
-                let remote_revision: Option<Vec<u8>> = row.get(11)?;
+                let local_dev: Option<Vec<u8>> = row.get(9)?;
+                let local_ino: Option<Vec<u8>> = row.get(10)?;
+                let local_parent_dev: Option<Vec<u8>> = row.get(11)?;
+                let local_parent_ino: Option<Vec<u8>> = row.get(12)?;
+                let baseline_node: Option<Vec<u8>> = row.get(13)?;
+                let baseline_revision: Vec<u8> = row.get(14)?;
+                let remote_revision: Option<Vec<u8>> = row.get(15)?;
+                let commit_id: Option<Vec<u8>> = row.get(16)?;
                 Ok(WorkRecord {
                     id: fixed(&id, "work id")?,
                     path: row.get(1)?,
@@ -920,6 +966,22 @@ impl Store {
                         })
                         .transpose()?,
                     local_executable: row.get(8)?,
+                    local_dev: local_dev
+                        .as_deref()
+                        .map(|value| number(value, "work local device"))
+                        .transpose()?,
+                    local_ino: local_ino
+                        .as_deref()
+                        .map(|value| number(value, "work local inode"))
+                        .transpose()?,
+                    local_parent_dev: local_parent_dev
+                        .as_deref()
+                        .map(|value| number(value, "work parent device"))
+                        .transpose()?,
+                    local_parent_ino: local_parent_ino
+                        .as_deref()
+                        .map(|value| number(value, "work parent inode"))
+                        .transpose()?,
                     baseline_node: baseline_node
                         .as_deref()
                         .map(|value| fixed(value, "work baseline node"))
@@ -929,10 +991,14 @@ impl Store {
                         .as_deref()
                         .map(|value| fixed(value, "work remote revision"))
                         .transpose()?,
-                    conflict: row.get(12)?,
-                    source_artifact: row.get(13)?,
-                    state: row.get(14)?,
-                    error: row.get(15)?,
+                    commit_id: commit_id
+                        .as_deref()
+                        .map(|value| fixed(value, "work commit id"))
+                        .transpose()?,
+                    conflict: row.get(17)?,
+                    source_artifact: row.get(18)?,
+                    state: row.get(19)?,
+                    error: row.get(20)?,
                 })
             })
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?
