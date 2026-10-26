@@ -52,6 +52,7 @@ fuser = "0.17.0"
 nix = { version = "0.30.0", features = ["user"] }
 
 [dev-dependencies]
+opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
 tempfile = "3"
 
 [workspace]
