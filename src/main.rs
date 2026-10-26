@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
 mod file_cli;
+mod sync_cli;
 
 #[derive(Parser)]
 #[command(
@@ -37,12 +38,17 @@ struct Cli {
 enum Command {
     /// Inspect each capability layer and its effective intersection.
     Capabilities,
-    /// Mount a read-only Managed volume through the Linux FUSE frontend.
+    /// Mount a Managed volume through the Linux FUSE frontend.
     Mount { mountpoint: PathBuf },
     /// Operate recoverable file handles (requires --volume).
     File {
         #[command(subcommand)]
         command: file_cli::FileCommand,
+    },
+    /// Reconcile a bound ordinary directory with the Managed volume (requires --volume).
+    Sync {
+        #[command(subcommand)]
+        command: sync_cli::SyncCommand,
     },
     /// Run the authenticated loopback metadata authority with a local SQLite database.
     Serve {
@@ -73,25 +79,29 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("yy: {error}");
             ExitCode::FAILURE
         }
     }
 }
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     opendal::install_default();
     if let Some(path) = &cli.volume {
-        return file_cli::run(path, cli.command).await;
+        return match cli.command {
+            Command::Sync { command } => sync_cli::run(path, command).await,
+            command => {
+                file_cli::run(path, command).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+        };
     }
     match cli.command {
         Command::Mount { .. } => {
-            return Err(
-                "mount requires --volume CONFIG.json with frontend=fuse and read_only=true".into(),
-            );
+            return Err("mount requires --volume CONFIG.json with frontend=fuse".into());
         }
-        Command::File { .. } | Command::Capabilities => {
+        Command::File { .. } | Command::Capabilities | Command::Sync { .. } => {
             return Err("this command requires --volume CONFIG.json".into());
         }
         _ => {}
@@ -137,6 +147,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Command::Serve { .. }
         | Command::File { .. }
         | Command::Capabilities
+        | Command::Sync { .. }
         | Command::Mount { .. } => unreachable!(),
         Command::Publish {
             source,
@@ -195,7 +206,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 fn revision(value: Revision) -> String {
     value

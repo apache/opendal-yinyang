@@ -205,7 +205,7 @@ impl VolumeConfig {
         match self.access {
             Access::Mount if self.read_only => read_only(),
             Access::Mount => managed(),
-            Access::Sync => CapabilitySet::new(),
+            Access::Sync => managed(),
         }
     }
     fn frontend_capabilities(&self) -> CapabilitySet {
@@ -236,21 +236,29 @@ impl VolumeConfig {
         if self.model != Model::Managed {
             return Err(Error::Invalid("Direct volumes are not implemented"));
         }
-        if self.access != Access::Mount {
-            return Err(Error::Invalid("Sync reconciliation is not implemented"));
-        }
-        match self.frontend {
-            Frontend::Library => {}
-            Frontend::Fuse if !cfg!(target_os = "linux") => {
-                return Err(Error::Invalid(
-                    "the fuse frontend is implemented only on Linux",
-                ));
-            }
-            Frontend::Fuse => {}
-            Frontend::Macos | Frontend::Windows => {
-                return Err(Error::Invalid(
-                    "macOS and Windows frontends are not implemented; select library or fuse",
-                ));
+        match self.access {
+            Access::Mount => match self.frontend {
+                Frontend::Library => {}
+                Frontend::Fuse if !cfg!(target_os = "linux") => {
+                    return Err(Error::Invalid(
+                        "the fuse frontend is implemented only on Linux",
+                    ));
+                }
+                Frontend::Fuse => {}
+                Frontend::Macos | Frontend::Windows => {
+                    return Err(Error::Invalid(
+                        "macOS and Windows frontends are not implemented; select library or fuse",
+                    ));
+                }
+            },
+            Access::Sync => {
+                // Managed Sync installs an ordinary local directory itself; it
+                // never projects through an OS mount frontend.
+                if self.frontend != Frontend::Library {
+                    return Err(Error::Invalid(
+                        "managed sync uses the library frontend, not an OS mount frontend",
+                    ));
+                }
             }
         }
         match (self.publication, self.service_address) {
