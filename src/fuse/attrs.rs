@@ -53,9 +53,7 @@ pub fn attribute(
                         .expect("revision sequence prefix"),
                 ),
         );
-    let perm = if directory {
-        if read_only { 0o555 } else { 0o755 }
-    } else if executable {
+    let perm = if directory || executable {
         if read_only { 0o555 } else { 0o755 }
     } else {
         if read_only { 0o444 } else { 0o644 }

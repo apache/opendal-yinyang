@@ -82,7 +82,7 @@ struct OpenFile {
 }
 
 fn has_open_flag(flags: i32, flag: nix::fcntl::OFlag) -> bool {
-    flags & flag.bits() as i32 != 0
+    flags & flag.bits() != 0
 }
 
 fn writable_open(flags: OpenFlags) -> bool {
@@ -108,9 +108,7 @@ fn representable_mode(
         return false;
     }
     let effective = mode & !umask & 0o777;
-    let expected = if directory {
-        if read_only { 0o555 } else { 0o755 }
-    } else if executable {
+    let expected = if directory || executable {
         if read_only { 0o555 } else { 0o755 }
     } else {
         if read_only { 0o444 } else { 0o644 }
