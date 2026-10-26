@@ -274,6 +274,66 @@ async fn exercise_initial_push(authority: Arc<dyn Authority>) {
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
 }
 
+async fn exercise_rename_with_edit(authority: Arc<dyn Authority>) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("payload");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("old"), b"version one").unwrap();
+
+    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
+        .await
+        .unwrap();
+    let first = sync.run().await.unwrap();
+    assert_eq!(first.published_local, 1);
+    assert!(first.conflicts.is_empty());
+    assert_eq!(
+        local_tree(&root),
+        remote_tree(&authority).await,
+        "the file must converge at the old name before it is renamed"
+    );
+
+    // Rename and rewrite before a single run. The rename receipt must not
+    // acknowledge v2 bytes that the namespace intent never published.
+    std::fs::rename(root.join("old"), root.join("renamed")).unwrap();
+    std::fs::write(root.join("renamed"), b"version two").unwrap();
+    for _ in 0..8 {
+        let outcome = sync.run().await.unwrap();
+        assert!(
+            outcome.conflicts.is_empty(),
+            "rename/edit run conflicts: {:?}",
+            outcome.conflicts
+        );
+        if local_tree(&root) == remote_tree(&authority).await {
+            break;
+        }
+    }
+    let local = local_tree(&root);
+    let remote = remote_tree(&authority).await;
+    assert_eq!(
+        local, remote,
+        "the renamed and re-edited local file must converge to the new name and bytes"
+    );
+    assert_eq!(
+        local["renamed"],
+        TreeEntry::File {
+            executable: false,
+            bytes: b"version two".to_vec(),
+        }
+    );
+    assert_eq!(local.get("old"), None);
+    assert_eq!(remote.get("old"), None);
+
+    let stable = sync.run().await.unwrap();
+    assert_eq!(stable.published_local, 0, "converged run must not publish");
+    assert_eq!(
+        stable.materialized_remote, 0,
+        "converged run must not materialize"
+    );
+    assert!(stable.conflicts.is_empty());
+    assert_eq!(local_tree(&root), remote_tree(&authority).await);
+}
+
 async fn service_authority() -> (
     Arc<dyn Authority>,
     tempfile::TempDir,
@@ -318,6 +378,16 @@ async fn initial_nested_sync_converges_in_object_and_service_modes() {
     exercise_initial_push(client).await;
     server.abort();
     drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renamed_and_re_edited_local_file_converges() {
+    exercise_rename_with_edit(Arc::new(
+        Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    ))
+    .await;
 }
 
 /// Delegating authority that completes the real commit and then delays the
