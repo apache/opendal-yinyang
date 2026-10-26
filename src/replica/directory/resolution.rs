@@ -692,7 +692,7 @@ impl DirectorySync {
                 }
             }
         }
-        self.clear_resolved_conflict(&record.id)?;
+        self.clear_conflicts_under(path)?;
         Ok(true)
     }
 
@@ -939,7 +939,7 @@ impl DirectorySync {
         for entry in stale {
             self.replica.store_mut().remove_baseline_path(&entry)?;
         }
-        self.clear_resolved_conflict(&record.id)?;
+        self.clear_conflicts_under(path)?;
         Ok(true)
     }
 
@@ -1014,6 +1014,24 @@ impl DirectorySync {
         self.replica
             .store_mut()
             .save_baseline_path(path, &node, local, revision)?;
+        Ok(())
+    }
+
+    /// Drop every active conflict that belongs to a resolved directory
+    /// subtree: the same local or remote version decision covers each of them.
+    async fn clear_conflicts_under(&mut self, path: &str) -> Result<()> {
+        let prefix = format!("{path}/");
+        let ids: Vec<String> = self
+            .replica
+            .store()
+            .conflicts()?
+            .into_iter()
+            .filter(|conflict| conflict.path == path || conflict.path.starts_with(&prefix))
+            .map(|conflict| conflict.id)
+            .collect();
+        for id in ids {
+            self.clear_resolved_conflict(&id)?;
+        }
         Ok(())
     }
 
