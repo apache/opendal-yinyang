@@ -791,7 +791,7 @@ impl DirectorySync {
             .into_iter()
             .find(|artifact| artifact_conflict_identity(&artifact.id) == conflict_id)
             .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
-        if artifact.phase != "conflict" || artifact.origin.is_empty() {
+        if artifact.origin.is_empty() || !self.replica.retained_artifact_changed(&artifact.id)? {
             return Err(crate::replica::Error::invalid("unknown conflict")
                 .to_string()
                 .into());
@@ -1385,7 +1385,9 @@ pub fn export_conflict_local(
                 .into_iter()
                 .find(|artifact| {
                     artifact_conflict_identity(&artifact.id) == conflict_id
-                        && artifact.phase == "conflict"
+                        && replica
+                            .retained_artifact_changed(&artifact.id)
+                            .unwrap_or(false)
                 })
                 .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
             ConflictRecord {
