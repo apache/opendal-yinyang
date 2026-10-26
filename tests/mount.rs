@@ -476,8 +476,7 @@ async fn set_executable_conflicts_if_content_changes_after_publish() {
     let error = tokio::time::timeout(Duration::from_secs(5), &mut task)
         .await
         .expect("mode commit did not finish")
-        .err()
-        .expect("mode commit unexpectedly succeeded");
+        .expect_err("mode commit unexpectedly succeeded");
     assert_eq!(error.kind(), ErrorKind::Conflict);
     drop(task);
     assert!(file.status().await.unwrap().error.is_some());
