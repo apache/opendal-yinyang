@@ -444,13 +444,17 @@ async fn status(
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Classify the local binding without touching the authority, so an unbound
     // or invalid binding stays offline and never blocks on remote I/O.
-    let local = DirectorySync::inspect_local(&config.staging, None).await?;
+    let local = DirectorySync::inspect_local(&config.staging, None)
+        .await
+        .map_err(fatal)?;
     let inspection = match local.binding.state {
         domain::BindingState::Bound => match connect(config, operator).await {
-            Ok(authority) => DirectorySync::inspect(authority, &config.staging).await?,
-            Err(error) => {
-                DirectorySync::inspect_local(&config.staging, Some(error.to_string())).await?
-            }
+            Ok(authority) => DirectorySync::inspect(authority, &config.staging)
+                .await
+                .map_err(fatal)?,
+            Err(error) => DirectorySync::inspect_local(&config.staging, Some(error.to_string()))
+                .await
+                .map_err(fatal)?,
         },
         _ => local,
     };
@@ -469,7 +473,9 @@ async fn init(
     directory: &Path,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let authority = connect(config, operator).await?;
-    DirectorySync::init(authority, &config.staging, directory).await?;
+    DirectorySync::init(authority, &config.staging, directory)
+        .await
+        .map_err(fatal)?;
     println!(
         "sync bound {} to state {}",
         directory.display(),
@@ -483,8 +489,10 @@ async fn reconcile(
     operator: opendal::Operator,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let authority = connect(config, operator).await?;
-    let mut directory = DirectorySync::open(authority, &config.staging).await?;
-    let outcome = directory.run().await?;
+    let mut directory = DirectorySync::open(authority, &config.staging)
+        .await
+        .map_err(fatal)?;
+    let outcome = directory.run().await.map_err(fatal)?;
     report(&outcome)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -508,7 +516,9 @@ async fn export(
         }
     };
     let authority = connect(config, operator).await?;
-    let directory = DirectorySync::open(authority, &config.staging).await?;
+    let directory = DirectorySync::open(authority, &config.staging)
+        .await
+        .map_err(fatal)?;
     let mut file = std::fs::File::create(output)
         .map_err(|error| format!("create export {}: {error}", output.display()))?;
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = if let Some(id) = &artifact {
@@ -526,7 +536,7 @@ async fn export(
     if let Err(error) = result {
         // A failed export must not leave a pseudo artifact behind.
         let _ = std::fs::remove_file(output);
-        return Err(error);
+        return Err(fatal(error));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -554,8 +564,10 @@ async fn resolve(
         }
     };
     let authority = connect(config, operator).await?;
-    let mut directory = DirectorySync::open(authority, &config.staging).await?;
-    let outcome = directory.resolve(conflict, decision).await?;
+    let mut directory = DirectorySync::open(authority, &config.staging)
+        .await
+        .map_err(fatal)?;
+    let outcome = directory.resolve(conflict, decision).await.map_err(fatal)?;
     report(&outcome)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -585,6 +597,12 @@ fn report(outcome: &domain::RunOutcome) -> Result<(), Box<dyn std::error::Error>
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Adapts the replica layer's boxed error to this adapter's error type while
+/// keeping the diagnostic text, which names the offending path.
+fn fatal(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {
+    error.to_string().into()
 }
 
 fn project(inspection: &domain::Inspection) -> Result<SyncStatus, String> {
