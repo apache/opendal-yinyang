@@ -16,9 +16,12 @@
 // under the License.
 
 use super::{Error, Result};
+use super::{LocalKind, LocalNode, LocalSnapshot};
+use crate::replica::linux::{ContentHash, Identity};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeMap;
 use std::path::Path;
-use yinyang_core::NodeId;
+use yinyang_core::{Node, NodeId, NodeKind, Revision};
 
 pub(super) const PROFILE: &str = "yinyang-directory-replica-1";
 
@@ -104,6 +107,36 @@ pub(super) struct ArtifactRecord {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct BaselineNode {
+    pub node: NodeId,
+    pub directory: bool,
+    pub executable: bool,
+    pub length: u64,
+    pub digest: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BaselineRecord {
+    pub revision: Revision,
+    pub remote: BTreeMap<String, BaselineNode>,
+    pub local: LocalSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ConflictRecord {
+    pub id: String,
+    pub path: String,
+    pub original_path: Option<String>,
+    pub desired_path: Option<String>,
+    pub local: String,
+    pub remote: String,
+    pub local_artifact: Option<String>,
+    pub remote_node: Option<[u8; 16]>,
+    pub remote_revision: Option<[u8; 24]>,
+    pub error: String,
+}
+
 pub(super) struct Store {
     connection: Connection,
 }
@@ -128,15 +161,23 @@ impl Store {
                  );
                  CREATE TABLE IF NOT EXISTS baseline(
                    path TEXT PRIMARY KEY,
-                   node BLOB,
+                   node BLOB NOT NULL,
                    directory INTEGER NOT NULL,
                    executable INTEGER NOT NULL,
                    remote_digest BLOB,
                    remote_length INTEGER,
+                   local_present INTEGER NOT NULL,
                    local_digest BLOB,
                    local_length INTEGER,
-                   local_dev BLOB NOT NULL,
-                   local_ino BLOB NOT NULL
+                   local_executable INTEGER,
+                   local_dev BLOB,
+                   local_ino BLOB,
+                   local_parent_dev BLOB,
+                   local_parent_ino BLOB
+                 );
+                 CREATE TABLE IF NOT EXISTS baseline_meta(
+                   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                   revision BLOB NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS artifacts(
                    id TEXT PRIMARY KEY,
@@ -168,9 +209,34 @@ impl Store {
                    artifact TEXT NOT NULL REFERENCES artifacts(id),
                    phase TEXT NOT NULL,
                    error TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS conflicts(
+                   id TEXT PRIMARY KEY,
+                   path TEXT NOT NULL,
+                   original_path TEXT,
+                   desired_path TEXT,
+                   local TEXT NOT NULL,
+                   remote TEXT NOT NULL,
+                   local_artifact TEXT,
+                   remote_node BLOB,
+                   remote_revision BLOB,
+                   error TEXT NOT NULL
                  );",
             )
             .map_err(|e| Error::io("initialize replica state", path, e))?;
+        Ok(Self { connection })
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| Error::io("open", path, e))?;
+        connection
+            .execute_batch("PRAGMA query_only=ON")
+            .map_err(|e| Error::io("configure replica inspection", path, e))?;
         Ok(Self { connection })
     }
 
@@ -249,6 +315,321 @@ impl Store {
             && number(&stored.5, "state device")? == binding.state_dev
             && number(&stored.6, "state inode")? == binding.state_ino;
         Ok(matches)
+    }
+
+    pub fn save_baseline(
+        &mut self,
+        revision: Revision,
+        remote: &BTreeMap<String, Node>,
+        local: &LocalSnapshot,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|e| Error::corrupt(format!("begin baseline: {e}")))?;
+        transaction
+            .execute("DELETE FROM baseline", [])
+            .map_err(|e| Error::corrupt(format!("clear baseline: {e}")))?;
+        for (path, node) in remote {
+            let (directory, length, digest) = match node.kind() {
+                NodeKind::Directory { .. } => (true, 0, None),
+                NodeKind::File(file) => (
+                    false,
+                    file.content_id().length(),
+                    Some(*file.content_id().digest()),
+                ),
+            };
+            let (
+                present,
+                local_digest,
+                local_length,
+                local_mode,
+                local_dev,
+                local_ino,
+                parent_dev,
+                parent_ino,
+            ) = match local.get(path) {
+                Some(entry) => (
+                    1_i64,
+                    match entry.kind {
+                        LocalKind::File { digest, .. } => Some(digest),
+                        LocalKind::Directory => None,
+                    },
+                    match entry.kind {
+                        LocalKind::File { length, .. } => {
+                            Some(i64::try_from(length).map_err(|_| {
+                                Error::invalid("local baseline length exceeds SQLite range")
+                            })?)
+                        }
+                        LocalKind::Directory => None,
+                    },
+                    entry.executable,
+                    Some(entry.identity.dev.to_be_bytes()),
+                    Some(entry.identity.ino.to_be_bytes()),
+                    entry.parent.map(|value| value.dev.to_be_bytes()),
+                    entry.parent.map(|value| value.ino.to_be_bytes()),
+                ),
+                None => (0_i64, None, None, None, None, None, None, None),
+            };
+            transaction
+                .execute(
+                    "INSERT INTO baseline VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        path,
+                        node.id().as_bytes().as_slice(),
+                        directory,
+                        node.executable(),
+                        digest.as_ref().map(|value| value.as_slice()),
+                        i64::try_from(length).map_err(|_| Error::invalid(
+                            "remote baseline length exceeds SQLite range"
+                        ))?,
+                        present,
+                        local_digest
+                            .as_ref()
+                            .map(|value| value.as_bytes().as_slice()),
+                        local_length,
+                        local_mode,
+                        local_dev,
+                        local_ino,
+                        parent_dev,
+                        parent_ino,
+                    ],
+                )
+                .map_err(|e| Error::corrupt(format!("write baseline: {e}")))?;
+        }
+        transaction
+            .execute("DELETE FROM baseline_meta", [])
+            .map_err(|e| Error::corrupt(format!("clear baseline revision: {e}")))?;
+        transaction
+            .execute(
+                "INSERT INTO baseline_meta VALUES(1,?1)",
+                params![revision.to_bytes().as_slice()],
+            )
+            .map_err(|e| Error::corrupt(format!("write baseline revision: {e}")))?;
+        transaction
+            .commit()
+            .map_err(|e| Error::corrupt(format!("commit baseline: {e}")))?;
+        Ok(())
+    }
+
+    pub fn load_baseline(&self) -> Result<Option<BaselineRecord>> {
+        let revision: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT revision FROM baseline_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::corrupt(format!("read baseline revision: {e}")))?;
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        let revision: [u8; 24] = fixed(&revision, "baseline revision")?;
+        let mut remote = BTreeMap::new();
+        let mut local = BTreeMap::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path,node,directory,executable,remote_digest,remote_length,
+                        local_present,local_digest,local_length,local_executable,
+                        local_dev,local_ino,local_parent_dev,local_parent_ino
+                 FROM baseline ORDER BY path",
+            )
+            .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
+        let rows = statement
+            .query_map([], |row| -> rusqlite::Result<_> {
+                let node: Vec<u8> = row.get(1)?;
+                let remote_digest: Option<Vec<u8>> = row.get(4)?;
+                let remote_length: Option<i64> = row.get(5)?;
+                let local_digest: Option<Vec<u8>> = row.get(7)?;
+                let local_length: Option<i64> = row.get(8)?;
+                let local_dev: Option<Vec<u8>> = row.get(10)?;
+                let local_ino: Option<Vec<u8>> = row.get(11)?;
+                let local_parent_dev: Option<Vec<u8>> = row.get(12)?;
+                let local_parent_ino: Option<Vec<u8>> = row.get(13)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    NodeId::from_bytes(fixed(&node, "baseline node")?),
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                    remote_digest
+                        .as_deref()
+                        .map(|value| fixed(value, "baseline remote digest"))
+                        .transpose()?,
+                    remote_length
+                        .map(|value| {
+                            u64::try_from(value).map_err(|_| corrupt_sql("negative remote length"))
+                        })
+                        .transpose()?,
+                    row.get::<_, bool>(6)?,
+                    local_digest
+                        .as_deref()
+                        .map(|value| fixed(value, "baseline local digest"))
+                        .transpose()?,
+                    local_length
+                        .map(|value| {
+                            u64::try_from(value).map_err(|_| corrupt_sql("negative local length"))
+                        })
+                        .transpose()?,
+                    row.get::<_, Option<bool>>(9)?,
+                    local_dev
+                        .as_deref()
+                        .map(|value| number(value, "baseline local device"))
+                        .transpose()?,
+                    local_ino
+                        .as_deref()
+                        .map(|value| number(value, "baseline local inode"))
+                        .transpose()?,
+                    local_parent_dev
+                        .as_deref()
+                        .map(|value| number(value, "baseline parent device"))
+                        .transpose()?,
+                    local_parent_ino
+                        .as_deref()
+                        .map(|value| number(value, "baseline parent inode"))
+                        .transpose()?,
+                ))
+            })
+            .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
+        for row in rows {
+            let (
+                path,
+                node,
+                directory,
+                executable,
+                remote_digest,
+                remote_length,
+                local_present,
+                local_digest,
+                local_length,
+                local_executable,
+                local_dev,
+                local_ino,
+                local_parent_dev,
+                local_parent_ino,
+            ) = row.map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
+            remote.insert(
+                path.clone(),
+                BaselineNode {
+                    node,
+                    directory,
+                    executable,
+                    length: remote_length.unwrap_or(0),
+                    digest: remote_digest,
+                },
+            );
+            if local_present {
+                let kind = if directory {
+                    LocalKind::Directory
+                } else {
+                    LocalKind::File {
+                        length: local_length
+                            .ok_or_else(|| Error::corrupt("local baseline file lacks a length"))?,
+                        digest: ContentHash::from_bytes(
+                            local_digest.ok_or_else(|| {
+                                Error::corrupt("local baseline file lacks a digest")
+                            })?,
+                        ),
+                    }
+                };
+                let identity = Identity {
+                    dev: local_dev
+                        .ok_or_else(|| Error::corrupt("local baseline entry lacks a device"))?,
+                    ino: local_ino
+                        .ok_or_else(|| Error::corrupt("local baseline entry lacks an inode"))?,
+                };
+                local.insert(
+                    path.clone(),
+                    LocalNode {
+                        path: path.clone(),
+                        kind,
+                        executable: local_executable.unwrap_or(false),
+                        identity,
+                        parent: match (local_parent_dev, local_parent_ino) {
+                            (Some(dev), Some(ino)) => Some(Identity { dev, ino }),
+                            _ => None,
+                        },
+                    },
+                );
+            }
+        }
+        Ok(Some(BaselineRecord {
+            revision: Revision::from_bytes(revision),
+            remote,
+            local: LocalSnapshot::from_nodes(local),
+        }))
+    }
+
+    pub fn insert_conflict(&mut self, conflict: &ConflictRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO conflicts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    conflict.id,
+                    conflict.path,
+                    conflict.original_path,
+                    conflict.desired_path,
+                    conflict.local,
+                    conflict.remote,
+                    conflict.local_artifact,
+                    conflict.remote_node.as_ref().map(|value| value.as_slice()),
+                    conflict
+                        .remote_revision
+                        .as_ref()
+                        .map(|value| value.as_slice()),
+                    conflict.error,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("write conflict: {e}")))?;
+        Ok(())
+    }
+
+    pub fn conflicts(&self) -> Result<Vec<ConflictRecord>> {
+        let mut query = self
+            .connection
+            .prepare(
+                "SELECT id,path,original_path,desired_path,local,remote,local_artifact,
+                        remote_node,remote_revision,error
+                 FROM conflicts ORDER BY path,id",
+            )
+            .map_err(|e| Error::corrupt(format!("read conflicts: {e}")))?;
+        query
+            .query_map([], |row| {
+                let remote_node: Option<Vec<u8>> = row.get(7)?;
+                let remote_revision: Option<Vec<u8>> = row.get(8)?;
+                Ok(ConflictRecord {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    original_path: row.get(2)?,
+                    desired_path: row.get(3)?,
+                    local: row.get(4)?,
+                    remote: row.get(5)?,
+                    local_artifact: row.get(6)?,
+                    remote_node: remote_node
+                        .as_deref()
+                        .map(|value| fixed(value, "conflict remote node"))
+                        .transpose()?,
+                    remote_revision: remote_revision
+                        .as_deref()
+                        .map(|value| fixed(value, "conflict remote revision"))
+                        .transpose()?,
+                    error: row.get(9)?,
+                })
+            })
+            .map_err(|e| Error::corrupt(format!("read conflicts: {e}")))?
+            .map(|row| row.map_err(|e| Error::corrupt(format!("read conflict: {e}"))))
+            .collect()
+    }
+
+    pub fn update_conflict_error(&mut self, id: &str, error: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE conflicts SET error=?2 WHERE id=?1",
+                params![id, error],
+            )
+            .map_err(|e| Error::corrupt(format!("update conflict: {e}")))?;
+        Ok(())
     }
 
     pub fn insert_artifact(&mut self, artifact: &ArtifactRecord) -> Result<()> {
@@ -344,17 +725,25 @@ impl Store {
     }
 
     pub fn incomplete_installs(&self) -> Result<Vec<InstallRecord>> {
+        self.installs_where("WHERE phase NOT IN ('retained','conflict','failed')")
+    }
+
+    pub fn installs(&self) -> Result<Vec<InstallRecord>> {
+        self.installs_where("")
+    }
+
+    fn installs_where(&self, filter: &str) -> Result<Vec<InstallRecord>> {
         let mut query = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT id,path,parent,name,temporary,temporary_dev,temporary_ino,
                         expected_digest,expected_length,expected_dev,expected_ino,
                         parent_dev,parent_ino,replacement_digest,replacement_length,
                         remote_revision,artifact,phase,error
                  FROM installs
-                 WHERE phase NOT IN ('retained','conflict','failed')
-                 ORDER BY id",
-            )
+                 {filter}
+                 ORDER BY id"
+            ))
             .map_err(|e| Error::corrupt(format!("read install journal: {e}")))?;
         query
             .query_map([], install_from_row)

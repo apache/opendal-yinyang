@@ -196,6 +196,14 @@ pending/frozen/conflict state, and last error. Durability is the acknowledgment
 of the configured filesystem/backend, not a claim of stronger physical-media
 guarantees.
 
+`HandleStatus::frozen_commit_id` exposes the exact identity of a persisted
+frozen transaction. It is derived read-only from the local plan through
+`Transaction::inspect_identity`, so it survives restart and requires neither
+network access nor the runtime lease. A generic response or transport error
+after dispatch is reported as `Unknown`: the original diagnostic and commit ID
+remain available, and retry uses the same frozen request rather than treating
+the missing response as a definitive failure.
+
 ## Validation and limits
 
 The file-operation tests exercise public Runtime/FileHandle methods against

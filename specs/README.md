@@ -10,7 +10,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Metadata service](metadata-service.md) | Experimental durable SQLite authority and authenticated loopback protocol. |
 | [File-operation runtime](file-runtime.md) | Pinned Managed handles, durable staging, conditional fsync, and recovery. |
 | [Mount runtime](mount-runtime.md) | Instance-local shared nodes, explicit refresh, remote fsync, and retained failures. |
-| [Sync runtime](sync-runtime.md) | Durable content and namespace intents plus ordinary-directory reconciliation, conflict retention, and exact retry. |
+| [Sync runtime](sync-runtime.md) | Experimental content and namespace coordinator plus Linux ordinary-directory reconciliation against an explicit remote baseline. |
 | [Managed Sync acceptance](managed-sync-acceptance.md) | Real-process Linux acceptance for ordinary-directory reconciliation, conflicts, artifacts, and recovery. |
 | [Native bridge](native-bridge.md) | In-process ownership and private adapter request semantics. |
 | [Experimental macOS frontends](macos-frontends.md) | Isolated FSKit and File Provider prototypes; not ordinary CLI admission. |

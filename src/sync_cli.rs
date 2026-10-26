@@ -88,10 +88,9 @@ impl SyncSide {
     }
 }
 
-/// Exit codes are part of the Managed Sync CLI contract.
-const EXIT_OK: u8 = 0;
+/// Exit codes are part of the Managed Sync CLI contract: `0` valid, `3`
+/// unbound, `4` invalid binding, `1` argument or unexpected error.
 const EXIT_UNBOUND: u8 = 3;
-const EXIT_INVALID_BINDING: u8 = 4;
 
 /// The versioned status document consumed by operators and acceptance tests.
 ///
@@ -150,6 +149,7 @@ pub struct BindingStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingState {
     Unbound,
@@ -165,6 +165,7 @@ pub struct RemoteStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAvailability {
     NotChecked,
@@ -179,6 +180,7 @@ pub struct LocalStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalScanState {
     NotScanned,
@@ -212,6 +214,7 @@ pub struct SyncEntry {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryState {
     InSync,
@@ -243,6 +246,7 @@ pub struct RemoteEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
@@ -250,6 +254,7 @@ pub enum EntryKind {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum Presence {
     Present,
@@ -273,6 +278,7 @@ pub struct IntentStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentOperation {
     Content,
@@ -284,6 +290,7 @@ pub enum IntentOperation {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentState {
     Prepared,
@@ -301,6 +308,7 @@ pub struct OutcomeStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeState {
     Pending,
@@ -337,6 +345,7 @@ pub struct ConflictRecord {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictSide {
     CurrentFile,
@@ -358,6 +367,7 @@ pub struct ArtifactRecord {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     ReplacedFile,
@@ -368,6 +378,7 @@ pub enum ArtifactKind {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactPhase {
     Preparing,

@@ -82,6 +82,15 @@ impl Failure {
             },
         }
     }
+    pub(crate) fn unknown_with(commit: CommitId, cause: impl std::fmt::Display) -> Self {
+        Self {
+            kind: ErrorKind::Unknown,
+            message: format!(
+                "{cause}; publication outcome is unknown, the frozen request is retained"
+            ),
+            commit: Some(*commit.as_bytes()),
+        }
+    }
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
