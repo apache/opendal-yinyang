@@ -19,20 +19,19 @@
 //!
 //! Detection lives in the reconciliation context. This module applies a
 //! durable decision for the exact conflict record it was given. Every
-//! mutation is staged against the conflict's recorded remote side and
-//! predicate; a newer head is never adopted silently. Directory and deletion
-//! decisions publish or materialize the corresponding tree through the same
-//! persistent `Sync`/`Replica` capabilities, keep the recoverable work
-//! association, and confirm the common baseline only for the version that was
-//! actually selected and made durable on both sides.
+//! mutation is staged against the remote evidence the conflict recorded and
+//! the predicate that pinned it; a newer head is never adopted silently.
+//! Directory and deletion decisions publish or materialize the corresponding
+//! tree through the same persistent `Sync`/`Replica` capabilities, keep the
+//! recoverable work association, and confirm the common baseline only for the
+//! version that was actually selected and made durable on both sides.
 
 use super::{DirectorySync, Resolution, Result, revision_bytes, split, work_state_for};
 use crate::replica::state::{BaselineRecord, ConflictRecord, WorkRecord};
 use crate::replica::{ContentHash, Identity, LocalKind, LocalNode};
 use crate::sync::{EditId, FileMetadata};
 use std::collections::BTreeMap;
-use std::io::{Seek as _, SeekFrom};
-use yinyang_core::{Node, NodeId, NodeKind, Revision, Snapshot};
+use yinyang_core::{ContentId, Node, NodeId, NodeKind, Revision, Snapshot};
 
 impl DirectorySync {
     /// Publish the chosen local bytes through the same durable work/receipt
@@ -49,14 +48,6 @@ impl DirectorySync {
             .desired_path
             .clone()
             .unwrap_or_else(|| record.path.clone());
-        // The recorded remote side pins every predicate below. The fresh head
-        // is observed only to confirm equality with the chosen version, never
-        // to overwrite a changed remote side.
-        let recorded = match revision_bytes(record.remote_revision) {
-            Some(revision) => self.sync.authority().observe_revision(revision).await?,
-            None => self.sync.authority().observe_latest().await?,
-        };
-        let recorded_remote = crate::directory_nodes(&recorded).await?;
         let bytes = match &decision {
             Resolution::Content(bytes) => Some(bytes.clone()),
             _ => None,
@@ -64,27 +55,21 @@ impl DirectorySync {
         let current = self.replica.scan()?;
         match (bytes, current.get(&path)) {
             (Some(bytes), _) => {
-                self.publish_keep_local_file(record, &recorded, &recorded_remote, baseline, bytes)
+                self.publish_keep_local_file(record, baseline, &path, bytes)
                     .await
             }
             (None, None) => {
                 // The user keeps the local deletion: publish the removal of the
                 // recorded remote node against its recorded predicate.
-                self.publish_keep_local_delete(record, baseline, recorded.revision())
+                self.publish_keep_local_delete(record, baseline, &path)
                     .await
             }
             (None, Some(node)) if node.is_directory() => {
-                self.publish_keep_local_subtree(
-                    record,
-                    &recorded_remote,
-                    recorded.revision(),
-                    &path,
-                )
-                .await
+                self.publish_keep_local_subtree(record, &path).await
             }
             (None, Some(_)) => {
                 let bytes = self.local_side_bytes(record)?;
-                self.publish_keep_local_file(record, &recorded, &recorded_remote, baseline, bytes)
+                self.publish_keep_local_file(record, baseline, &path, bytes)
                     .await
             }
         }
@@ -102,21 +87,34 @@ impl DirectorySync {
             .desired_path
             .clone()
             .unwrap_or_else(|| record.path.clone());
-        let Some(node_id) = record.remote_node else {
-            // The selected remote side is a deletion. Apply the local removal
-            // durably; the quarantine keeps any new local bytes exportable.
+        if record.remote == "deleted" {
+            // The selected remote side is an explicit deletion. Apply the local
+            // removal durably; the quarantine keeps any new local bytes
+            // exportable.
             return self.apply_keep_remote_deletion(record, &path).await;
+        }
+        // A recorded node is materialized exactly as recorded. A synthetic
+        // retained-inode conflict reports the current file without a recorded
+        // node, so the current observation is its evidence.
+        let (snapshot, node_id) = match (record.remote_node, revision_bytes(record.remote_revision))
+        {
+            (Some(node), Some(revision)) => (
+                self.sync.authority().observe_revision(revision).await?,
+                NodeId::from_bytes(node),
+            ),
+            _ => {
+                let snapshot = observed.clone();
+                let Some(node) = snapshot.resolve(&path).await? else {
+                    // The reported remote file is no longer present.
+                    return self.apply_keep_remote_deletion(record, &path).await;
+                };
+                (snapshot, node.id())
+            }
         };
-        // Keep the version recorded by the conflict, exactly the version the
-        // adapter could have exported; never a newer head.
-        let snapshot = match revision_bytes(record.remote_revision) {
-            Some(revision) => self.sync.authority().observe_revision(revision).await?,
-            None => observed.clone(),
-        };
-        let revision = snapshot.revision();
-        let Some(node) = snapshot.node(NodeId::from_bytes(node_id)).await? else {
+        let Some(node) = snapshot.node(node_id).await? else {
             return Ok(false);
         };
+        let revision = snapshot.revision();
         if node.is_directory() {
             self.materialize_remote_subtree(record, &path, &snapshot, revision)
                 .await
@@ -152,7 +150,7 @@ impl DirectorySync {
         if record.path != path {
             self.replica
                 .store_mut()
-                .remove_baseline_path(&record.path)?;
+                .remove_baseline_subtree(&record.path)?;
         }
         if let Some(accepted) = accepted {
             self.replica
@@ -162,37 +160,67 @@ impl DirectorySync {
         Ok(true)
     }
 
-    /// Write the exactly chosen bytes into the local payload so it matches the
-    /// acknowledged remote version.
-    fn install_local_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
-        let expected = self.replica.scan()?.get(path).cloned();
-        match expected {
-            Some(expected) if matches!(expected.kind, LocalKind::File { .. }) => {
+    /// Install the chosen bytes only when the live local file is still the
+    /// version this decision was dispatched against. A newer local write stays
+    /// live and pending; it is never overwritten by the chosen version.
+    /// Returns the local fingerprint the baseline may accept for this path.
+    fn install_chosen_bytes(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        executable: bool,
+        pre_dispatch: Option<&LocalNode>,
+    ) -> Result<Option<LocalNode>> {
+        let live = self.replica.scan()?.get(path).cloned();
+        let chosen = chosen_file_local(path, bytes, executable, pre_dispatch);
+        match (live, pre_dispatch) {
+            (Some(live), Some(expected))
+                if matches!(live.kind, LocalKind::File { .. })
+                    && live.identity == expected.identity =>
+            {
+                if local_file_matches(&live, bytes)? {
+                    // The live file already holds the chosen version.
+                    return Ok(Some(live));
+                }
+                // Same inode as dispatch time: replace its bytes with the
+                // explicit chosen version, then verify the installed result.
                 self.replica
-                    .install_bytes(path, &expected, expected.executable, None, bytes)?;
+                    .install_bytes(path, &live, live.executable, None, bytes)?;
+                self.verified_local_file(path, bytes)
             }
-            Some(_) => {}
-            None => {
-                let mut source = bytes;
-                self.replica.create_file_local(path, false, &mut source)?;
+            (Some(_live), _) => {
+                // A newer local write or a different inode appeared while the
+                // receipt was pending: leave it live and pending.
+                Ok(Some(chosen))
+            }
+            (None, Some(_)) => {
+                // The local file was deleted while the receipt was pending:
+                // never resurrect it; the deletion stays pending.
+                Ok(Some(chosen))
+            }
+            (None, None) => {
+                // No local file existed before dispatch: install the chosen
+                // bytes and acknowledge only the verified result.
+                self.replica
+                    .create_file_local(path, executable, &mut &bytes[..])?;
+                self.verified_local_file(path, bytes)
             }
         }
-        Ok(())
     }
 
-    async fn download_remote(&self, snapshot: &Snapshot, node: &Node) -> Result<std::fs::File> {
+    async fn download_remote_bytes(&self, snapshot: &Snapshot, node: &Node) -> Result<Vec<u8>> {
         let version = snapshot.open_file(node.id()).await?;
         let length = version.descriptor().content_id().length();
-        let mut output = tokio::fs::File::from_std(tempfile::tempfile()?);
+        let mut bytes = Vec::new();
         let mut position = 0;
         while position < length {
             let end = (position + 64 * 1024).min(length);
-            version.read_range(position..end, &mut output).await?;
+            let mut chunk = Vec::new();
+            version.read_range(position..end, &mut chunk).await?;
+            bytes.extend_from_slice(&chunk);
             position = end;
         }
-        let mut spool = output.into_std().await;
-        spool.seek(SeekFrom::Start(0))?;
-        Ok(spool)
+        Ok(bytes)
     }
 
     fn local_side_bytes(&self, record: &ConflictRecord) -> Result<Vec<u8>> {
@@ -227,33 +255,33 @@ impl DirectorySync {
         &mut self,
         record: &ConflictRecord,
         baseline: Option<&BaselineRecord>,
-        fallback: Revision,
+        path: &str,
     ) -> Result<bool> {
-        let path = record
-            .desired_path
-            .clone()
-            .unwrap_or_else(|| record.path.clone());
         let Some(node_bytes) = record.remote_node else {
-            self.replica.store_mut().remove_baseline_path(&path)?;
-            self.replica
-                .store_mut()
-                .remove_baseline_path(&record.path)?;
+            self.replica.store_mut().remove_baseline_subtree(path)?;
+            if record.path != path {
+                self.replica
+                    .store_mut()
+                    .remove_baseline_subtree(&record.path)?;
+            }
             self.clear_resolved_conflict(&record.id)?;
             return Ok(true);
         };
-        let predicate = revision_bytes(record.remote_revision)
-            .or_else(|| {
-                baseline
-                    .and_then(|b| b.remote.get(&path))
-                    .map(|entry| entry.revision)
-            })
-            .unwrap_or(fallback);
+        let Some(predicate) = revision_bytes(record.remote_revision).or_else(|| {
+            baseline
+                .and_then(|b| b.remote.get(path))
+                .map(|entry| entry.revision)
+        }) else {
+            // Without the recorded predicate the removal cannot be expressed
+            // conditionally; leave the conflict for a refreshed run.
+            return Ok(false);
+        };
         let node = NodeId::from_bytes(node_bytes);
         let edit = self.sync.stage_remove(node, predicate).await?;
         self.associate_resolution(
             record,
             edit,
-            &path,
+            path,
             "remove",
             None,
             Some(node),
@@ -262,10 +290,12 @@ impl DirectorySync {
         )?;
         match self.sync.publish(edit).await {
             Ok(revision) => {
-                self.replica.store_mut().remove_baseline_path(&path)?;
-                self.replica
-                    .store_mut()
-                    .remove_baseline_path(&record.path)?;
+                self.replica.store_mut().remove_baseline_subtree(path)?;
+                if record.path != path {
+                    self.replica
+                        .store_mut()
+                        .remove_baseline_subtree(&record.path)?;
+                }
                 self.clear_resolved_conflict(&record.id)?;
                 self.replica.store_mut().update_work(
                     edit.as_bytes(),
@@ -287,141 +317,150 @@ impl DirectorySync {
         }
     }
 
-    /// Keep the local file version. An existing recorded remote node is edited
-    /// only at the recorded predicate; a recorded remote absence publishes a
-    /// conditional create. A remote path that now holds a different version is
-    /// never overwritten: the conflict stays active so the next run refreshes
-    /// its evidence.
+    /// Keep the local file version. A recorded remote file is edited only at
+    /// its recorded predicate; a recorded remote deletion confines the
+    /// decision to a conditional create (or equality confirmation). A remote
+    /// path that now holds a different version is never overwritten: the
+    /// conflict stays active so the next run refreshes its evidence.
     async fn publish_keep_local_file(
         &mut self,
         record: &ConflictRecord,
-        recorded: &Snapshot,
-        recorded_remote: &BTreeMap<String, Node>,
         baseline: Option<&BaselineRecord>,
+        path: &str,
         bytes: Vec<u8>,
     ) -> Result<bool> {
-        let path = record
-            .desired_path
-            .clone()
-            .unwrap_or_else(|| record.path.clone());
-        let expected = self.replica.scan()?.get(&path).cloned();
+        let expected = self.replica.scan()?.get(path).cloned();
         let executable = expected
             .as_ref()
             .filter(|node| matches!(node.kind, LocalKind::File { .. }))
             .map_or(false, |node| node.executable);
-        let predicate = revision_bytes(record.remote_revision)
-            .or_else(|| {
-                baseline
-                    .and_then(|b| b.remote.get(&path))
-                    .map(|entry| entry.revision)
-            })
-            .unwrap_or_else(|| recorded.revision());
-        let Some(node) = recorded_remote.get(&path).cloned() else {
-            // Recorded remote absence: the desired path only exists at a newer
-            // head. Confirm it when it is identical to the chosen bytes
-            // (nothing would be overwritten); otherwise publish the create at
-            // the recorded predicate, whose absence guard keeps a newer
-            // foreign version from being replaced.
-            if remote_file_matches_observed(self, &path, &bytes, executable).await? {
-                let accepted = chosen_file_local(&path, &bytes, executable, expected.as_ref());
-                let observed = self.sync.authority().observe_latest().await?;
-                if self
-                    .apply_resolved_baseline(
-                        record,
-                        &path,
-                        observed.revision(),
-                        observed.resolve(&path).await?.map(|node| node.id()),
-                        Some(&accepted),
-                    )
-                    .await?
-                {
-                    self.clear_resolved_conflict(&record.id)?;
-                }
-                return Ok(true);
-            }
+        if record.remote == "deleted" {
             return self
-                .publish_keep_local_create(
-                    record,
-                    recorded_remote,
-                    &path,
-                    executable,
-                    &bytes,
-                    expected.as_ref(),
-                    predicate,
+                .publish_keep_local_over_recorded_deletion(
+                    record, baseline, path, bytes, executable, expected,
                 )
                 .await;
+        }
+        // The exact file evidence this decision acts on: the recorded node at
+        // its recorded revision, or (for a synthetic retained-inode conflict)
+        // the current observation that reported it.
+        let (snapshot, node) = match (record.remote_node, revision_bytes(record.remote_revision)) {
+            (Some(node), Some(revision)) => {
+                let snapshot = self.sync.authority().observe_revision(revision).await?;
+                let Some(node) = snapshot.node(NodeId::from_bytes(node)).await? else {
+                    return Ok(false);
+                };
+                (snapshot, node)
+            }
+            _ => {
+                let snapshot = self.sync.authority().observe_latest().await?;
+                let Some(node) = snapshot.resolve(path).await? else {
+                    return Ok(false);
+                };
+                (snapshot, node)
+            }
         };
         if node.is_directory() {
             // A file decision cannot replace a remote directory; the next run
             // keeps reporting the kind conflict.
             return Ok(false);
         }
-        if *node.id().as_bytes() != record.remote_node.unwrap_or([0; 16]) {
-            // The remote side changed since the conflict was recorded. Confirm
-            // identical content
-            // or leave the conflict for a refreshed run; never edit a newer
-            // node against a stale predicate.
-            if remote_file_matches_observed(self, &path, &bytes, executable).await? {
-                let accepted = chosen_file_local(&path, &bytes, executable, expected.as_ref());
-                let observed = self.sync.authority().observe_latest().await?;
-                if self
-                    .apply_resolved_baseline(
-                        record,
-                        &path,
-                        observed.revision(),
-                        observed.resolve(&path).await?.map(|node| node.id()),
-                        Some(&accepted),
-                    )
-                    .await?
-                {
-                    self.clear_resolved_conflict(&record.id)?;
-                }
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-        // The recorded remote node: stage the chosen bytes against its recorded
-        // predicate, and keep the exact chosen input durable.
-        let artifact = self.replica.retain_bytes(&path, &bytes)?;
+        let artifact = self.replica.retain_bytes(path, &bytes)?;
+        let predicate = snapshot.revision();
         let mut source = &bytes[..];
         let edit = self.sync.stage(node.id(), predicate, &mut source).await?;
         self.finish_keep_local_edit(
             record,
-            &path,
+            path,
             node.id(),
             edit,
             Some(artifact),
             &bytes,
             predicate,
+            executable,
+            expected.as_ref(),
+        )
+        .await
+    }
+
+    /// Keep the local file version where the recorded remote side is a
+    /// deletion. Identical current content is confirmed without mutation;
+    /// otherwise the create is staged against the recorded predicate so a
+    /// newer foreign version can never be replaced.
+    async fn publish_keep_local_over_recorded_deletion(
+        &mut self,
+        record: &ConflictRecord,
+        baseline: Option<&BaselineRecord>,
+        path: &str,
+        bytes: Vec<u8>,
+        executable: bool,
+        expected: Option<LocalNode>,
+    ) -> Result<bool> {
+        if let Some((snapshot, node)) = matching_remote_file(self, path, &bytes, executable).await?
+        {
+            // The head already holds exactly the chosen version: confirming it
+            // overwrites nothing and is the selected version on both sides.
+            let accepted = expected
+                .as_ref()
+                .map(|node| chosen_file_local(path, &bytes, executable, Some(node)));
+            if self
+                .apply_resolved_baseline(
+                    record,
+                    path,
+                    snapshot.revision(),
+                    Some(node.id()),
+                    accepted.as_ref(),
+                )
+                .await?
+            {
+                self.clear_resolved_conflict(&record.id)?;
+            }
+            return Ok(true);
+        }
+        let Some(predicate) = revision_bytes(record.remote_revision).or_else(|| {
+            baseline
+                .and_then(|b| b.remote.get(path))
+                .map(|entry| entry.revision)
+        }) else {
+            return Ok(true);
+        };
+        self.publish_keep_local_create(
+            record,
+            predicate,
+            path,
+            executable,
+            &bytes,
             expected.as_ref(),
         )
         .await
     }
 
     /// Keep the local file version at a path the recorded remote side lacks:
-    /// create it under the recorded remote parent, creating any missing
-    /// ancestor directories first, all against the recorded predicate.
-    #[allow(clippy::too_many_arguments)]
+    /// create it under the remote parent, creating any missing ancestor
+    /// directories first, all against the recorded predicate.
     async fn publish_keep_local_create(
         &mut self,
         record: &ConflictRecord,
-        recorded_remote: &BTreeMap<String, Node>,
+        predicate: Revision,
         path: &str,
         executable: bool,
         bytes: &[u8],
         local: Option<&LocalNode>,
-        predicate: Revision,
     ) -> Result<bool> {
+        let recorded_remote = {
+            let recorded = self.sync.authority().observe_revision(predicate).await?;
+            crate::directory_nodes(&recorded).await?
+        };
         let (parent, name) = split(path);
         let (parent_node, predicate) = if parent.is_empty() || recorded_remote.contains_key(parent)
         {
             (
-                self.resolve_remote_node(recorded_remote, parent)?,
+                self.resolve_remote_node(&recorded_remote, parent)?,
                 predicate,
             )
         } else {
             let Some((node, predicate)) = self
-                .ensure_remote_ancestors(record, recorded_remote, predicate, parent)
+                .ensure_remote_ancestors(record, &recorded_remote, predicate, parent)
                 .await?
             else {
                 return Ok(false);
@@ -453,8 +492,7 @@ impl DirectorySync {
         )?;
         match self.sync.publish(edit).await {
             Ok(published) => {
-                self.install_local_bytes(path, bytes)?;
-                let accepted = self.accepted_local_file(path, bytes, executable, local)?;
+                let accepted = self.install_chosen_bytes(path, bytes, executable, local)?;
                 if self
                     .apply_resolved_baseline(
                         record,
@@ -488,6 +526,7 @@ impl DirectorySync {
     }
 
     /// Finish one conditional content edit chosen by keep-local.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_keep_local_edit(
         &mut self,
         record: &ConflictRecord,
@@ -497,6 +536,7 @@ impl DirectorySync {
         artifact: Option<String>,
         bytes: &[u8],
         predicate: Revision,
+        executable: bool,
         local: Option<&LocalNode>,
     ) -> Result<bool> {
         self.associate_resolution(
@@ -511,13 +551,7 @@ impl DirectorySync {
         )?;
         match self.sync.publish(edit).await {
             Ok(revision) => {
-                self.install_local_bytes(path, bytes)?;
-                let accepted = self.accepted_local_file(
-                    path,
-                    bytes,
-                    local.map_or(false, |n| n.executable),
-                    local,
-                )?;
+                let accepted = self.install_chosen_bytes(path, bytes, executable, local)?;
                 if self
                     .apply_resolved_baseline(
                         record,
@@ -562,13 +596,10 @@ impl DirectorySync {
     /// Keep the local directory subtree: create every local entry that the
     /// recorded remote side lacks (creating ancestors first) and confirm each
     /// published entry's baseline. Entries that already exist on the recorded
-    /// remote side with another version are left for normal reconciliation,
-    /// never overwritten here.
+    /// remote side are left for normal reconciliation, never overwritten here.
     async fn publish_keep_local_subtree(
         &mut self,
         record: &ConflictRecord,
-        recorded_remote: &BTreeMap<String, Node>,
-        revision: Revision,
         path: &str,
     ) -> Result<bool> {
         let current = self.replica.scan()?;
@@ -579,6 +610,13 @@ impl DirectorySync {
         if !root.is_directory() {
             return Ok(false);
         }
+        let Some(predicate) = revision_bytes(record.remote_revision) else {
+            return Ok(false);
+        };
+        let recorded_remote = {
+            let recorded = self.sync.authority().observe_revision(predicate).await?;
+            crate::directory_nodes(&recorded).await?
+        };
         let prefix = format!("{path}/");
         let mut entries: Vec<String> = current
             .nodes()
@@ -588,7 +626,7 @@ impl DirectorySync {
             .collect();
         entries.sort_by_key(|entry| (entry.matches('/').count(), entry.clone()));
         let mut created: BTreeMap<String, NodeId> = BTreeMap::new();
-        let mut running = revision;
+        let mut running = predicate;
         for entry in &entries {
             let local = current.get(entry).cloned().unwrap();
             if recorded_remote.contains_key(entry) {
@@ -600,9 +638,9 @@ impl DirectorySync {
             let parent_id = if let Some(id) = created.get(parent) {
                 *id
             } else if parent.is_empty() {
-                self.resolve_remote_node(recorded_remote, "")?
+                self.resolve_remote_node(&recorded_remote, "")?
             } else {
-                self.resolve_remote_node(recorded_remote, parent)?
+                self.resolve_remote_node(&recorded_remote, parent)?
             };
             if local.is_directory() {
                 let edit = self
@@ -770,8 +808,8 @@ impl DirectorySync {
     }
 
     /// Keep the recorded remote deletion: quarantine any current local path
-    /// (preserving its bytes as an artifact), drop the stale baselines and
-    /// clear the conflict once the local side is durably gone.
+    /// (preserving its bytes as an artifact), drop the accepted baseline
+    /// subtree and clear the conflict once the local side is durably gone.
     async fn apply_keep_remote_deletion(
         &mut self,
         record: &ConflictRecord,
@@ -786,22 +824,12 @@ impl DirectorySync {
                 record.remote_revision,
             )?;
         }
-        let baseline = self.replica.store().load_baseline()?;
-        if let Some(baseline) = baseline.as_ref() {
-            let prefix = format!("{path}/");
-            let stale: Vec<String> = baseline
-                .remote
-                .keys()
-                .filter(|entry| *entry == path || entry.starts_with(&prefix))
-                .cloned()
-                .collect();
-            for entry in stale {
-                self.replica.store_mut().remove_baseline_path(&entry)?;
-            }
+        self.replica.store_mut().remove_baseline_subtree(path)?;
+        if record.path != path {
+            self.replica
+                .store_mut()
+                .remove_baseline_subtree(&record.path)?;
         }
-        self.replica
-            .store_mut()
-            .remove_baseline_path(&record.path)?;
         self.clear_resolved_conflict(&record.id)?;
         Ok(true)
     }
@@ -817,21 +845,11 @@ impl DirectorySync {
         revision: Revision,
         node: Node,
     ) -> Result<bool> {
-        let mut staged = self.download_remote(snapshot, &node).await?;
+        let bytes = self.download_remote_bytes(snapshot, &node).await?;
         let expected = self.replica.scan()?.get(path).cloned();
         match expected {
             Some(expected) if !expected.is_directory() => {
-                let mut bytes = Vec::new();
-                std::io::copy(&mut staged, &mut bytes).map_err(|e| e.to_string())?;
-                let current_digest = match expected.kind {
-                    LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
-                    LocalKind::Directory => None,
-                };
-                let remote_digest = match node.kind() {
-                    NodeKind::File(file) => Some(*file.content_id().digest()),
-                    _ => None,
-                };
-                if current_digest != remote_digest {
+                if !local_file_matches(&expected, &bytes)? {
                     // Preserve the replaced local bytes as a retained artifact.
                     self.replica.capture_file(path, &expected)?;
                 }
@@ -845,13 +863,10 @@ impl DirectorySync {
             }
             _ => {
                 self.replica
-                    .create_file_local(path, node.executable(), &mut staged)?;
+                    .create_file_local(path, node.executable(), &mut &bytes[..])?;
             }
         }
-        let Some((length, digest)) = node_file_content(&node) else {
-            return Ok(false);
-        };
-        let Some(accepted) = self.verified_local_file(path, &digest, length)? else {
+        let Some(accepted) = self.verified_local_file(path, &bytes)? else {
             return Ok(false);
         };
         if self
@@ -886,6 +901,7 @@ impl DirectorySync {
             .map(|(entry, node)| (entry.clone(), node.clone()))
             .collect();
         pending.sort_by_key(|(entry, _)| (entry.matches('/').count(), entry.clone()));
+        let mut materialized: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (entry, node) in &pending {
             if self.replica.scan()?.get(entry).is_some() {
                 continue;
@@ -893,9 +909,10 @@ impl DirectorySync {
             if node.is_directory() {
                 self.replica.create_directory_local(entry)?;
             } else {
-                let mut staged = self.download_remote(snapshot, node).await?;
+                let bytes = self.download_remote_bytes(snapshot, node).await?;
                 self.replica
-                    .create_file_local(entry, node.executable(), &mut staged)?;
+                    .create_file_local(entry, node.executable(), &mut &bytes[..])?;
+                materialized.insert(entry.clone(), bytes);
             }
         }
         for (entry, node) in &pending {
@@ -905,12 +922,19 @@ impl DirectorySync {
                     None => return Ok(false),
                 }
             } else {
-                let Some((length, digest)) = node_file_content(node) else {
-                    return Ok(false);
-                };
-                match self.verified_local_file(entry, &digest, length)? {
-                    Some(accepted) => accepted,
+                let live = match self.replica.scan()?.get(entry).cloned() {
+                    Some(live) => live,
                     None => return Ok(false),
+                };
+                match materialized.get(entry) {
+                    // Freshly materialized bytes verify against themselves.
+                    Some(bytes) => match local_file_matches(&live, bytes)? {
+                        true => live,
+                        false => return Ok(false),
+                    },
+                    // An existing local entry was intentionally left alone; the
+                    // baseline can still accept the recorded remote version.
+                    None => live,
                 }
             };
             self.confirm_baseline_for(entry, Some(&accepted), node.id(), revision)
@@ -946,8 +970,8 @@ impl DirectorySync {
         Ok(true)
     }
 
-    /// Read every node under `path` from one pinned snapshot, in remote
-    /// order, including `path` itself.
+    /// Read every node under `path` from one pinned snapshot, including `path`
+    /// itself.
     async fn recorded_subtree(
         &self,
         snapshot: &Snapshot,
@@ -1044,40 +1068,14 @@ impl DirectorySync {
         Ok(status.intent.operation.node_id())
     }
 
-    /// Build the accepted local fingerprint for a keep-local file: the chosen
-    /// bytes plus the pre-dispatch inode identity. When no local file existed
-    /// before dispatch, the just-installed file is verified against the chosen
-    /// bytes instead.
-    fn accepted_local_file(
-        &mut self,
-        path: &str,
-        bytes: &[u8],
-        executable: bool,
-        pre_dispatch: Option<&LocalNode>,
-    ) -> Result<Option<LocalNode>> {
-        match pre_dispatch {
-            Some(node) => Ok(Some(chosen_file_local(path, bytes, executable, Some(node)))),
-            None => {
-                self.verified_local_file(path, blake3::hash(bytes).as_bytes(), bytes.len() as u64)
-            }
-        }
-    }
-
-    fn verified_local_file(
-        &self,
-        path: &str,
-        digest: &[u8; 32],
-        length: u64,
-    ) -> Result<Option<LocalNode>> {
-        match self.replica.scan()?.get(path).cloned() {
-            Some(node) => match node.kind {
-                LocalKind::File {
-                    digest: current,
-                    length: current_length,
-                } if current.as_bytes() == digest && current_length == length => Ok(Some(node)),
-                _ => Ok(None),
-            },
-            None => Ok(None),
+    fn verified_local_file(&self, path: &str, bytes: &[u8]) -> Result<Option<LocalNode>> {
+        let Some(node) = self.replica.scan()?.get(path).cloned() else {
+            return Ok(None);
+        };
+        if matches!(node.kind, LocalKind::File { .. }) && local_file_matches(&node, bytes)? {
+            Ok(Some(node))
+        } else {
+            Ok(None)
         }
     }
 
@@ -1172,38 +1170,43 @@ fn chosen_file_local(
     }
 }
 
-/// Confirm that the fresh head holds the chosen bytes at `path` without
-/// mutating it: resolving a keep-local file against identical remote content
-/// overwrites nothing and is the actual selected version on both sides.
-async fn remote_file_matches_observed(
+/// Compare one local file with raw chosen bytes. Local observations keep the
+/// raw content hash, while remote nodes keep the canonical content identity.
+fn local_file_matches(node: &LocalNode, bytes: &[u8]) -> Result<bool> {
+    match node.kind {
+        LocalKind::File { length, digest } => {
+            Ok(length == bytes.len() as u64 && digest.as_bytes() == blake3::hash(bytes).as_bytes())
+        }
+        LocalKind::Directory => Ok(false),
+    }
+}
+
+/// Find the current remote file that holds exactly the chosen bytes, returning
+/// the single observation used both to compare and to acknowledge the
+/// baseline. Nothing is mutated here.
+async fn matching_remote_file(
     directory: &DirectorySync,
     path: &str,
     bytes: &[u8],
     executable: bool,
-) -> Result<bool> {
-    let observed = directory.sync.authority().observe_latest().await?;
-    let Some(node) = observed.resolve(path).await? else {
-        return Ok(false);
+) -> Result<Option<(Snapshot, Node)>> {
+    let snapshot = directory.sync.authority().observe_latest().await?;
+    let Some(node) = snapshot.resolve(path).await? else {
+        return Ok(None);
     };
     if node.is_directory() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(remote_file_matches(&node, bytes, executable))
-}
-
-fn node_file_content(node: &Node) -> Option<(u64, [u8; 32])> {
-    match node.kind() {
-        NodeKind::File(file) => Some((file.content_id().length(), *file.content_id().digest())),
-        _ => None,
+    let NodeKind::File(file) = node.kind() else {
+        return Ok(None);
+    };
+    if node.executable() != executable {
+        return Ok(None);
     }
-}
-
-fn remote_file_matches(node: &Node, bytes: &[u8], executable: bool) -> bool {
-    match node.kind() {
-        NodeKind::File(file) => {
-            node.executable() == executable
-                && file.content_id().digest() == blake3::hash(bytes).as_bytes()
-        }
-        _ => false,
+    let content = ContentId::calculate(&mut &bytes[..]).await?;
+    if *file.content_id() == content {
+        Ok(Some((snapshot, node)))
+    } else {
+        Ok(None)
     }
 }
