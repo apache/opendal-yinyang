@@ -88,7 +88,10 @@ version remains coherent until a later release becomes the final reference;
 that open's metadata and content never disagree. The frontend does not call
 `Mount::refresh` while references exist, because refresh rebases live handles;
 a writable layer that in-place refreshes must first define its open-fd and
-kernel-cache invalidation policy.
+kernel-cache invalidation policy. Before a new open, the adapter retries
+reclaiming a clean unreferenced NodeId; a successful reclaim makes that open
+materialize the latest remote version, while Busy retains all still-pinned or
+dirty/frozen/error state.
 
 ## Writable callbacks
 
