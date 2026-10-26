@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, Fs, NodeId, Outcome, Revision, Transaction};
+use yinyang::core::{Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Transaction};
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::sync::{
     EditStatus, FileMetadata, NamespaceOperation, NamespaceState, RenameMode, Sync,
@@ -249,14 +249,14 @@ impl Authority for FaultAuthority {
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
-    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<Outcome>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
         Box::pin(async move {
             let outcomes = self.inner.commit_batch(requests).await?;
             if self.fail_next.swap(false, Ordering::SeqCst) {
-                return Err(yinyang::core::Error::invalid(
-                    "fault authority",
-                    "publication response was malformed",
-                ));
+                return Err(
+                    yinyang::core::ContentDescriptor::from_bytes(b"malformed response")
+                        .unwrap_err(),
+                );
             }
             Ok(outcomes)
         })
@@ -545,7 +545,7 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
     let (baseline, always_safe) =
         create_file(&authority, &runtime, root, "moved-then-edited").await;
     let content = sync
-        .stage(always_safe, baseline, &mut b"moved edit"[..])
+        .stage(always_safe, baseline, &mut &b"moved edit"[..])
         .await
         .unwrap();
     let rename = sync
