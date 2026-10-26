@@ -2621,6 +2621,7 @@ dependencies = [
  "borsh",
  "clap",
  "fuser",
+ "libc",
  "nix",
  "opendal",
  "rusqlite",

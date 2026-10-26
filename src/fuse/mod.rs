@@ -95,7 +95,9 @@ pub async fn run(
         tokio::runtime::Handle::current(),
         read_only,
     ));
-    let filesystem = frontend::FuseFrontend { inner };
+    let filesystem = frontend::FuseFrontend {
+        inner: inner.clone(),
+    };
     let mut options = Config::default();
     options.mount_options = vec![
         MountOption::FSName(format!("yinyang-{}", config.name)),
@@ -105,6 +107,16 @@ pub async fn run(
         options.mount_options.insert(0, MountOption::RO);
     }
     options.acl = SessionACL::Owner;
+    // Register SIGHUP before the mount becomes externally visible so a
+    // refresh signal cannot fall through to the default handler while the loop
+    // task waits for its first poll.
+    let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            eprintln!("yy: fuse refresh: cannot handle SIGHUP: {error}");
+            None
+        }
+    };
     let session = Session::new(filesystem, &mountpoint, &options)?;
     println!(
         "yy: mounted {} {} at {} (fuse.yinyang)",
@@ -117,8 +129,15 @@ pub async fn run(
     // empty slot. One blocking owner holds the background session, polls its
     // public thread guard for a natural end (for example `fusermount3 -u`),
     // and receives the local teardown request. Exactly one `join` or
-    // `umount_and_join` runs.
+    // `umount_and_join` runs under the shared grace period.
     let background = session.spawn()?;
+    inner.install_notifier(background.notifier());
+    let (stop_refresh, stop_refresh_rx) = tokio::sync::oneshot::channel::<()>();
+    let refresh_task = hangup.map(|signal| {
+        let refresh = inner.clone();
+        tokio::runtime::Handle::current()
+            .spawn(async move { refresh.serve_hup(signal, stop_refresh_rx).await })
+    });
     let (teardown, teardown_rx) = std::sync::mpsc::channel();
     let join = tokio::task::spawn_blocking(move || {
         loop {
@@ -135,36 +154,48 @@ pub async fn run(
         }
     });
     tokio::pin!(join);
-    let outcome = tokio::select! {
-        result = &mut join => {
-            // The session ended on its own, for example through an external
-            // `fusermount3 -u`. Returning now lets the process exit and release
-            // the staging lease instead of waiting for a signal forever.
-            result.map_err(blocking_error)??;
-            Outcome::Unmounted
-        }
+    // A JoinHandle must not be polled after completion: remember a natural
+    // session end here and only await it in finalize when the signal path ran.
+    let joined = tokio::select! {
+        result = &mut join => Some(result),
         _ = shutdown_signal() => {
             let _ = teardown.send(());
-            match tokio::time::timeout(TEARDOWN_GRACE, &mut join).await {
-                Ok(result) => {
-                    result.map_err(blocking_error)??;
-                    Outcome::Unmounted
-                }
-                // A lazy unmount keeps the session alive while clients hold
-                // the mount. Report it to the CLI instead of returning into a
-                // runtime shutdown that would wait for the blocked session
-                // task; the CLI exits the process so the kernel aborts the
-                // connection.
-                Err(_) => Outcome::TeardownExpired {
-                    grace: TEARDOWN_GRACE,
-                },
-            }
+            None
         }
     };
-    if matches!(outcome, Outcome::Unmounted) {
-        println!("yy: unmounted {}", mountpoint.display());
+    // One grace period covers the session teardown and the SIGHUP loop: stop
+    // the refresh task, then wait for both. A refresh in progress may finish
+    // inside this window; no cancellation is needed. Both waits happen before
+    // either result is propagated so an error cannot skip the other cleanup.
+    let _ = stop_refresh.send(());
+    match tokio::time::timeout(TEARDOWN_GRACE, async {
+        let session = match joined {
+            Some(result) => result,
+            None => join.await,
+        };
+        let refresh = match refresh_task {
+            Some(task) => task.await,
+            None => Ok(()),
+        };
+        session.map_err(blocking_error)??;
+        refresh.map_err(blocking_error)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            println!("yy: unmounted {}", mountpoint.display());
+            Ok(Outcome::Unmounted)
+        }
+        Ok(Err(error)) => Err(error),
+        // A lazy unmount keeps the session alive while clients hold the
+        // mount. Report it to the CLI instead of returning into a runtime
+        // shutdown that would wait for the blocked session task; the CLI exits
+        // the process so the kernel aborts the connection.
+        Err(_) => Ok(Outcome::TeardownExpired {
+            grace: TEARDOWN_GRACE,
+        }),
     }
-    Ok(outcome)
 }
 
 fn blocking_error(error: tokio::task::JoinError) -> std::io::Error {

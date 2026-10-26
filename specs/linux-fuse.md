@@ -98,12 +98,17 @@ all still-pinned or dirty/frozen/error state.
 
 ## Writable callbacks
 
-`write` stages bytes in the shared per-NodeId Mount handle. A handle opened with
-`O_APPEND` uses the node's append path, which chooses its offset under the same
-per-node lock as other writes; a regular write uses the kernel offset.
-`O_TRUNC` stages a zero length before the open reply. `O_SYNC`/`O_DSYNC` writes
-attempt publication before acknowledging the write. Unsupported write flags
-return an explicit error instead of silently changing semantics.
+`write` stages bytes in the shared per-NodeId Mount handle. Each request
+evaluates the file flags supplied by the kernel. `fcntl(F_SETFL)` can toggle
+`O_APPEND` for later writes. `O_SYNC`/`O_DSYNC` are set at open or carried as
+per-request IOCB sync markers; `F_SETFL` does not toggle them. An append
+request uses the node's append path, which chooses its offset under the same
+per-node lock as other writes; a regular write uses the kernel offset. The
+writable access mode is fixed by the open request. `O_TRUNC` stages a zero
+length before the open reply. A write whose current flags include
+`O_SYNC`/`O_DSYNC` attempts publication before acknowledging the write.
+Unsupported write flags return an explicit error instead of silently changing
+semantics.
 
 `flush` publishes a writable handle and reports the real remote outcome to the
 closing descriptor. `release` never publishes and never discards staging.
@@ -136,6 +141,41 @@ content revision, and advances only that clean handle to the receipt revision.
 An external content change therefore produces Conflict rather than rebasing
 old staged bytes onto new content. Ownership, timestamps and other mode bits
 are not persisted.
+
+## Explicit refresh
+
+`SIGHUP` triggers one explicit refresh; this is a manual invalidation entry
+point, not an automatic change watch. There is no background polling, no
+change-feed watcher, and no whole-tree enumeration. The refresh observes the
+latest snapshot once and then:
+
+- reclaims every clean, unreferenced node through the shared `Mount` contract,
+  so the next open materializes the current remote revision; nodes with live
+  references or retained state are left pinned (`Busy`);
+- invalidates known inode attributes with `inval_inode(ino, -1, 0)` and
+  replied dentries with `inval_entry(parent, name)` through the fuser
+  `Notifier`. Only dentries this adapter actually replied to the kernel are
+  recorded: successful `LOOKUP` results. Negative lookups carry no timeout in
+  FUSE replies and are not recorded, and plain `READDIR` does not install
+  dentries without `READDIRPLUS`, so directory names are not recorded.
+
+The adapter never calls `Mount::refresh`, because that replaces the shared
+staged handle and would rebase open file descriptors. The refresh must also
+hold no adapter lock while reclaiming nodes or sending notifications; targets
+are collected under short locks, then the sends run on a blocking thread. At
+most one refresh runs at a time and duplicate `SIGHUP`s while one is running
+are coalesced by the signal stream. The SIGHUP loop is a tracked Tokio task:
+the signal handler is registered synchronously before the mount becomes
+visible, teardown sends it a stop signal, and the session join and the refresh
+task share the same five-second grace period; a refresh already in progress
+may finish inside that window. A `NotFound` notification result is expected
+(the kernel already dropped the entry or inode) and is counted separately, so
+only explicit connection-ended errors (`ENODEV`, `ENOTCONN`, `EPIPE`,
+`ECONNRESET`, `ESHUTDOWN`) stop the batch before it would otherwise finish.
+
+Stable `yy: fuse refresh:` log lines report the observed revision, the
+reclaimed/active node counts, and the native notification counts at
+completion, so an acceptance harness can confirm a refresh finished.
 
 ## Pinned directory cursors
 
@@ -207,9 +247,9 @@ there is no mid-session cancellation signal.
   cross-mount or cross-client meaning; no distributed lock semantics are
   claimed. A writable mount must not claim that locking is rejected outright,
   because the kernel may return success for its own local lock manager.
-- The shared Mount node map is not held across first materialization or other
-  authority/staging I/O; the adapter adds no mount-wide lock across those
-  awaits.
-- Extension points for the next layer are the runtime namespace operations,
-  `Mount::refresh` guarded by reference counts, and the session `Notifier`
-  for kernel entry/inode invalidation once an in-place refresh policy exists.
+- Node cache lookup and open-gate registration share a short-lived node-map
+  critical section. First materialization is serialized per NodeId by that
+  gate; neither lock is held across remote observation or staging I/O, and
+  different nodes initialize independently.
+- The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
+  there is no automatic external-change watch.
