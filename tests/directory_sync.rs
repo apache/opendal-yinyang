@@ -876,7 +876,6 @@ async fn local_deletion_during_delayed_publication_receipt_stays_pending() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn namespace_only_rename_receipt_keeps_interleaved_content() {
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(
