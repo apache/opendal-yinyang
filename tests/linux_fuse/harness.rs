@@ -928,9 +928,19 @@ impl Mounted {
 
 fn read_all_logged(mut reader: impl Read, log: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
     let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
-    if let Ok(mut output) = log.lock() {
-        output.extend_from_slice(&bytes);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Ok(mut output) = log.lock() {
+                    output.extend_from_slice(&chunk[..count]);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
     }
     bytes
 }
