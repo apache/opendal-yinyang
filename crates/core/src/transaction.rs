@@ -95,6 +95,12 @@ impl Condition {
             );
             part(snapshot.node(id).await?.as_ref(), self.key[0])?
         };
+        if actual != self.expected {
+            eprintln!(
+                "yy-core: condition actual tag={} actual={actual:?} expected={:?}",
+                self.key[0], self.expected
+            );
+        }
         Ok(actual == self.expected)
     }
 }
