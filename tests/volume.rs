@@ -132,13 +132,12 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     } else {
         assert!(ro.validate(&backend.operator()).is_err());
     }
-    for invalid in [VolumeConfig {
+    let invalid = VolumeConfig {
         service_address: Some("0.0.0.0:7447".parse().unwrap()),
         publication: Publication::Service,
         ..ro.clone()
-    }] {
-        assert!(invalid.validate(&backend.operator()).is_err());
-    }
+    };
+    assert!(invalid.validate(&backend.operator()).is_err());
 }
 #[tokio::test]
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
