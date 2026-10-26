@@ -310,10 +310,18 @@ impl Store {
         let matches = stored.0 == PROFILE
             && stored.1 == binding.filesystem.as_bytes()
             && stored.2 == binding.root
-            && number(&stored.3, "root device")? == binding.root_dev
-            && number(&stored.4, "root inode")? == binding.root_ino
-            && number(&stored.5, "state device")? == binding.state_dev
-            && number(&stored.6, "state inode")? == binding.state_ino;
+            && number(&stored.3, "root device")
+                .map_err(|e| Error::corrupt(format!("decode root device: {e}")))?
+                == binding.root_dev
+            && number(&stored.4, "root inode")
+                .map_err(|e| Error::corrupt(format!("decode root inode: {e}")))?
+                == binding.root_ino
+            && number(&stored.5, "state device")
+                .map_err(|e| Error::corrupt(format!("decode state device: {e}")))?
+                == binding.state_dev
+            && number(&stored.6, "state inode")
+                .map_err(|e| Error::corrupt(format!("decode state inode: {e}")))?
+                == binding.state_ino;
         Ok(matches)
     }
 
@@ -352,7 +360,7 @@ impl Store {
                 Some(entry) => (
                     1_i64,
                     match entry.kind {
-                        LocalKind::File { digest, .. } => Some(digest),
+                        LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
                         LocalKind::Directory => None,
                     },
                     match entry.kind {

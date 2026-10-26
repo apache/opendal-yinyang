@@ -50,7 +50,7 @@ pub enum LocalKind {
     File { length: u64, digest: ContentHash },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Identity {
     pub dev: u64,
     pub ino: u64,
@@ -417,7 +417,7 @@ impl Replica {
         .map_err(|e| Error::errno("open retained artifact directory", &state, e))?;
         let mut artifacts: Vec<Artifact> =
             store.artifacts()?.into_iter().map(Artifact::from).collect();
-        for mut artifact in artifacts.iter_mut() {
+        for artifact in artifacts.iter_mut() {
             let record = store
                 .artifacts()?
                 .into_iter()
@@ -721,7 +721,7 @@ impl Replica {
         let name_check = yinyang_core::namespace::name_key(name)
             .map_err(|e| Error::invalid(format!("invalid local name {name:?}: {e}")))?;
         let parent_fd = self.open_relative_dir(&parent)?;
-        if let Some(stat) = optional_stat(&parent_fd, name, &self.root.join(path))? {
+        if optional_stat(&parent_fd, name, &self.root.join(path))?.is_some() {
             return Err(Error::conflict(format!(
                 "{} already exists before remote creation could install",
                 path
@@ -1012,7 +1012,7 @@ impl Replica {
         Ok(record.into())
     }
 
-    pub fn export_artifact(&self, id: &str, output: &mut impl Write) -> Result<()> {
+    pub fn export_artifact(&self, id: &str, output: &mut (impl Write + ?Sized)) -> Result<()> {
         let artifact = self
             .store
             .artifacts()?
@@ -1551,7 +1551,7 @@ impl PreparedInstall<'_> {
     where
         F: FnOnce(&Self),
     {
-        let mut file = self.file.take().expect("prepared install is live");
+        let file = self.file.take().expect("prepared install is live");
         file.sync_all().map_err(|e| {
             Error::io(
                 "persist replacement file",
@@ -2238,7 +2238,7 @@ mod tests {
         let mut replica = Replica::init(&state, &root, NodeId::from_bytes([9; 16])).unwrap();
         let snapshot = replica.scan().unwrap();
         let expected = snapshot.get("file").unwrap();
-        let mut local_writer = std::fs::OpenOptions::new()
+        let local_writer = std::fs::OpenOptions::new()
             .write(true)
             .open(root.join("file"))
             .unwrap();
@@ -2251,7 +2251,7 @@ mod tests {
         let target = root.join("file");
         let error = install
             .finish_with_hook(|_| {
-                let mut replacement_writer = std::fs::OpenOptions::new()
+                let replacement_writer = std::fs::OpenOptions::new()
                     .write(true)
                     .open(&target)
                     .unwrap();

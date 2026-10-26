@@ -21,7 +21,7 @@ use crate::replica::state::{BaselineRecord, ConflictRecord};
 use crate::replica::{Conflict, LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaStatus};
 use crate::sync::{EditId, FileMetadata, NamespaceState, RenameMode, Sync};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Seek as _, SeekFrom, Write, Write as _};
+use std::io::{Seek as _, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 use yinyang_core::{Authority, Node, NodeId, NodeKind, Revision, Snapshot};
@@ -75,7 +75,7 @@ impl DirectorySync {
         let mut outcome = self.retry_pending().await?;
         let mut current = self.replica.scan()?;
         let observed = self.sync.authority().observe_latest().await?;
-        let mut remote = crate::directory_nodes(&observed)?;
+        let mut remote = crate::directory_nodes(&observed).await?;
         let baseline = self.replica.store().load_baseline()?;
         match baseline {
             Some(baseline) => {
@@ -157,10 +157,11 @@ impl DirectorySync {
             Resolution::KeepLocal => {
                 if let Some(artifact) = record.local_artifact {
                     let observed = self.sync.authority().observe_latest().await?;
-                    let remote = crate::directory_nodes(&observed)?;
+                    let remote = crate::directory_nodes(&observed).await?;
                     if let Some(node) = remote.get(&record.path) {
                         let mut source = self.replica.open_artifact(&artifact)?;
-                        let mut source = tokio::io::BufReader::new(source);
+                        let mut source =
+                            tokio::io::BufReader::new(tokio::fs::File::from_std(source));
                         self.sync
                             .stage(node.id(), observed.revision(), &mut source)
                             .await?;
@@ -529,6 +530,7 @@ impl<'a> Context<'a> {
                     Ok(())
                 } else {
                     self.conflict(path, None, Some(path), "create", "create")
+                        .await
                 }
             }
             (Action::Modify, Action::Modify) => {
@@ -538,6 +540,7 @@ impl<'a> Context<'a> {
                     Ok(())
                 } else {
                     self.conflict(path, Some(path), None, "modify", "modify")
+                        .await
                 }
             }
             (Action::Delete, Action::Modify)
@@ -547,6 +550,7 @@ impl<'a> Context<'a> {
             | (Action::Create, Action::Modify)
             | (Action::Create, Action::Delete) => {
                 self.conflict(path, Some(path), None, "local", "remote")
+                    .await
             }
         }
     }
@@ -680,13 +684,16 @@ impl<'a> Context<'a> {
                     self.accept_remote(path, node).await?;
                     Ok(())
                 }
-                Err(error) => self
-                    .conflict(path, None, Some(path), "present", "remote-create")
-                    .map_err(|_| error.into()),
+                Err(_) => {
+                    self.conflict(path, None, Some(path), "present", "remote-create")
+                        .await
+                }
             },
             NodeKind::File(_) => {
                 if self.current.get(path).is_some() {
-                    return self.conflict(path, None, Some(path), "present", "remote-create");
+                    return self
+                        .conflict(path, None, Some(path), "present", "remote-create")
+                        .await;
                 }
                 let mut staged = self.stage_remote_file(node).await?;
                 match self
@@ -699,9 +706,10 @@ impl<'a> Context<'a> {
                         self.accept_remote(path, node).await?;
                         Ok(())
                     }
-                    Err(error) => self
-                        .conflict(path, None, Some(path), "present", "remote-create")
-                        .map_err(|_| error.into()),
+                    Err(_) => {
+                        self.conflict(path, None, Some(path), "present", "remote-create")
+                            .await
+                    }
                 }
             }
         }
@@ -712,7 +720,9 @@ impl<'a> Context<'a> {
             crate::replica::Error::invalid("remote modify path is local-absent").to_string()
         })?;
         if expected.is_directory() || node.is_directory() {
-            return self.conflict(path, Some(path), None, "local", "remote-kind");
+            return self
+                .conflict(path, Some(path), None, "local", "remote-kind")
+                .await;
         }
         let snapshot = self
             .sync
@@ -742,15 +752,16 @@ impl<'a> Context<'a> {
                 self.accept_remote(path, node).await?;
                 Ok(())
             }
-            Err(error) => self
-                .conflict(
+            Err(_) => {
+                self.conflict(
                     path,
                     Some(path),
                     None,
                     "changed-during-install",
                     "remote-modify",
                 )
-                .map_err(|_| error.into()),
+                .await
+            }
         }
     }
 
@@ -769,16 +780,23 @@ impl<'a> Context<'a> {
                 self.outcome.materialized_remote += 1;
                 Ok(())
             }
-            Err(_) => self.conflict(path, Some(path), None, "local-changed", "remote-delete"),
+            Err(_) => {
+                self.conflict(path, Some(path), None, "local-changed", "remote-delete")
+                    .await
+            }
         }
     }
 
     async fn remote_rename(&mut self, from: &str, to: &str) -> Result<()> {
         if local_action(self.baseline.local.get(from), self.current.get(from)) != Action::None {
-            return self.conflict(from, Some(from), Some(to), "local-changed", "remote-rename");
+            return self
+                .conflict(from, Some(from), Some(to), "local-changed", "remote-rename")
+                .await;
         }
         if self.current.get(to).is_some() {
-            return self.conflict(to, Some(from), Some(to), "present", "remote-rename");
+            return self
+                .conflict(to, Some(from), Some(to), "present", "remote-rename")
+                .await;
         }
         match self.replica.rename_local(from, to) {
             Ok(()) => {
@@ -793,9 +811,10 @@ impl<'a> Context<'a> {
                 self.outcome.materialized_remote += 1;
                 Ok(())
             }
-            Err(error) => self
-                .conflict(from, Some(from), Some(to), "local-changed", "remote-rename")
-                .map_err(|_| error.into()),
+            Err(_) => {
+                self.conflict(from, Some(from), Some(to), "local-changed", "remote-rename")
+                    .await
+            }
         }
     }
 
