@@ -91,6 +91,27 @@ fn sync_rejects_a_direct_volume() {
 }
 
 #[test]
+fn sync_rejects_a_read_only_volume() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("read-only.json");
+    let value = serde_json::json!({
+        "name": "read-only",
+        "model": "managed",
+        "access": "sync",
+        "frontend": "library",
+        "publication": "object",
+        "storage_profile": "minio",
+        "staging": temp.path().join("read-only-state"),
+        "read_only": true,
+        "require": [],
+    });
+    std::fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let output = yy(&["--volume", config.to_str().unwrap(), "sync", "status"]);
+    assert!(!output.status.success());
+    assert_stderr(&output, "read_only must be false");
+}
+
+#[test]
 fn unbound_status_is_schema_valid_and_exits_three() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path(), "unbound", "managed", "sync");
