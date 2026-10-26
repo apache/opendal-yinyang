@@ -529,7 +529,7 @@ impl Store {
         let Some(revision) = revision else {
             return Ok(None);
         };
-        let revision: [u8; 24] = fixed(&revision, "baseline revision")
+        let _revision: [u8; 24] = fixed(&revision, "baseline revision")
             .map_err(|e| Error::corrupt(format!("decode baseline revision: {e}")))?;
         let mut remote = BTreeMap::new();
         let mut local = BTreeMap::new();
