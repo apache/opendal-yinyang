@@ -256,7 +256,7 @@ async fn local_deletion_vs_remote_edit_resolves_both_ways() {
                 "keep-local must keep the local deletion"
             );
             assert!(
-                remote_tree(&authority).await.get("file.txt").is_none(),
+                !remote_tree(&authority).await.contains_key("file.txt"),
                 "keep-local must publish the deletion to the remote side"
             );
         } else {
