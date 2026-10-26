@@ -78,10 +78,9 @@ decide whether to retry.
 classifies the local binding first and reports remote availability truthfully,
 marking it unavailable with the real connection error when the authority cannot
 be reached; it never fabricates success. `export --artifact` reads retained
-bytes from the local replica and never contacts the authority. A conflict's
-remote side reads a retained revision, so `export --conflict --side remote`
-needs the authority; the local side is served from the retained artifact or the
-current local file.
+bytes from the local replica and never contacts the authority. `export
+--conflict` currently connects to the authority, because the remote side reads
+a retained revision.
 
 ## Status document
 
@@ -166,5 +165,5 @@ yy --volume sync.json sync status --json
 
 `sync` is implemented only on Linux and drives an ordinary directory; it does
 not provide macOS File Provider integration, an automatic watcher or a daemon.
-A conflict's local side is exported offline, but its remote side needs the
+Retained-artifact export is offline; conflict-side export currently needs the
 authority.
