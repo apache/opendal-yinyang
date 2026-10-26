@@ -563,8 +563,8 @@ async fn export_artifact_local(
         .binding
         .volume
         .ok_or("sync state is not bound; run sync init")?;
-    let replica = Replica::open(&config.staging, volume).map_err(fatal)?;
-    replica.export_artifact(id, output).map_err(fatal)?;
+    let replica = Replica::open(&config.staging, volume)?;
+    replica.export_artifact(id, output)?;
     Ok(())
 }
 
