@@ -303,6 +303,20 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
         assert_eq!(repeated_entry.desired_path, conflict.desired_path);
         assert_eq!(remote_file_bytes(&fixture, "shared.txt"), b"left");
 
+        let sentinel = fixture.path("conflict-sentinel");
+        write_local(&sentinel, b"sentinel-bytes");
+        let failed = fixture.sync_export_conflict_output(&right, &conflict.id, "local", &sentinel);
+        assert_failure(&failed, "conflict export over an existing output path");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel-bytes");
+
+        if publication == Publication::Service {
+            let offline_local = fixture.path("content-local-offline");
+            fixture.stop_service();
+            fixture.sync_export_conflict(&right, &conflict.id, "local", &offline_local);
+            assert_eq!(fs::read(&offline_local).unwrap(), b"right");
+            fixture.restart_service();
+        }
+
         let local_export = fixture.path("content-local");
         let remote_export = fixture.path("content-remote");
         fixture.sync_export_conflict(&right, &conflict.id, "local", &local_export);

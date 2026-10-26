@@ -709,6 +709,27 @@ impl Fixture {
         ]);
     }
 
+    pub fn sync_export_conflict_output(
+        &self,
+        paths: &SyncPaths,
+        conflict: &str,
+        side: &str,
+        output: &Path,
+    ) -> Captured {
+        self.yy(&[
+            "--volume",
+            text(&paths.config),
+            "sync",
+            "export",
+            "--conflict",
+            conflict,
+            "--side",
+            side,
+            "--output",
+            text(output),
+        ])
+    }
+
     pub fn sync_export_artifact(&self, paths: &SyncPaths, artifact: &str, output: &Path) {
         self.yy_ok(&[
             "--volume",
