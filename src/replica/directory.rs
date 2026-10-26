@@ -957,7 +957,7 @@ async fn canonical_matches(
             let mut source =
                 tokio::fs::File::from_std(replica.open_artifact(&captured.artifact.id)?);
             let content = ContentId::calculate(&mut source).await?;
-            Ok(local.executable == remote.executable() && content == *file.content_id())
+            Ok(local.executable == remote.executable() && content == file.content_id())
         }
         _ => Ok(false),
     }
