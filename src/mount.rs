@@ -19,19 +19,48 @@
 use crate::runtime::{Error, ErrorKind, FileHandle, HandleStatus, Result, Runtime, RuntimeStatus};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, Semaphore};
 use yinyang_core::{Authority, NodeId, Receipt};
 
 struct Node {
     handle: Mutex<FileHandle>,
     references: AtomicUsize,
 }
+struct OpenGate {
+    inner: Arc<Inner>,
+    id: NodeId,
+    ready: Arc<Semaphore>,
+}
+impl Drop for OpenGate {
+    fn drop(&mut self) {
+        if let Ok(mut opening) = self.inner.opening.lock() {
+            opening.remove(&self.id);
+        }
+        // Close wakes every waiter; a single permit would strand later waiters.
+        self.ready.close();
+    }
+}
+struct NodeGuard {
+    node: Arc<Node>,
+}
+impl NodeGuard {
+    fn new(node: Arc<Node>) -> Self {
+        node.references.fetch_add(1, Ordering::Relaxed);
+        Self { node }
+    }
+}
+impl Drop for NodeGuard {
+    fn drop(&mut self) {
+        self.node.references.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 struct Inner {
     runtime: Runtime,
     read_only: bool,
-    nodes: Mutex<BTreeMap<NodeId, Arc<Node>>>,
+    nodes: StdMutex<BTreeMap<NodeId, Arc<Node>>>,
+    opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
 }
 /// A mount instance owns one recoverable staged version per node, not per open.
 /// It does not install a mount or manage kernel caches.
@@ -75,7 +104,8 @@ impl Mount {
             inner: Arc::new(Inner {
                 runtime,
                 read_only,
-                nodes: Mutex::new(nodes),
+                nodes: StdMutex::new(nodes),
+                opening: StdMutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -84,6 +114,18 @@ impl Mount {
     }
     pub async fn status(&self) -> Result<RuntimeStatus> {
         self.inner.runtime.status().await
+    }
+    /// Observe staged metadata for one shared node without opening a reference.
+    /// `None` means this mount has no shared handle for the node.
+    pub async fn node_status(&self, id: NodeId) -> Result<Option<HandleStatus>> {
+        let guard = {
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            nodes.get(&id).cloned().map(NodeGuard::new)
+        };
+        let Some(guard) = guard else {
+            return Ok(None);
+        };
+        guard.node.handle.lock().await.status().await.map(Some)
     }
     /// Namespace operations use the same conditional runtime contract. Do not
     /// open private FileHandles through this runtime alongside Mount references.
@@ -94,37 +136,73 @@ impl Mount {
         if writable && self.inner.read_only {
             return Err(Error::State(ErrorKind::ReadOnly, "mount is read-only"));
         }
-        // Serialize first materialization with opens and reclaim. File I/O and
-        // publication use per-node locks, never this namespace lock.
-        let mut nodes = self.inner.nodes.lock().await;
-        let node = match nodes.get(&id) {
-            Some(node) => node.clone(),
-            None => {
-                let handle = self
-                    .inner
-                    .runtime
-                    .open_node(id, !self.inner.read_only)
-                    .await?;
-                let node = Arc::new(Node {
-                    handle: Mutex::new(handle),
-                    references: AtomicUsize::new(0),
-                });
-                nodes.insert(id, node.clone());
-                node
+        loop {
+            // Cache lookup and gate registration must be one critical section.
+            // Always take nodes then opening, and never hold either across await.
+            let (existing, gate) = {
+                let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+                if let Some(node) = nodes.get(&id) {
+                    node.references.fetch_add(1, Ordering::Relaxed);
+                    (Some(node.clone()), None)
+                } else {
+                    let mut opening = self.inner.opening.lock().map_err(Error::local)?;
+                    match opening.get(&id) {
+                        Some(ready) => (None, Some((ready.clone(), true))),
+                        None => {
+                            let ready = Arc::new(Semaphore::new(0));
+                            opening.insert(id, ready.clone());
+                            (None, Some((ready, false)))
+                        }
+                    }
+                }
+            };
+            if let Some(node) = existing {
+                return Ok(MountFile { node, writable });
             }
-        };
-        node.references.fetch_add(1, Ordering::Relaxed);
-        Ok(MountFile { node, writable })
+            let (ready, waiting) = gate.expect("a waiter or owner always carries the node gate");
+            if waiting {
+                // Closing the gate is a broadcast completion signal, not an error.
+                let _ = ready.acquire().await;
+                continue;
+            }
+
+            // Only one task materializes a NodeId. The namespace map is not
+            // held across the runtime's remote observation and staging read.
+            let gate = OpenGate {
+                inner: self.inner.clone(),
+                id,
+                ready,
+            };
+            let handle = self
+                .inner
+                .runtime
+                .open_node(id, !self.inner.read_only)
+                .await?;
+            let node = Arc::new(Node {
+                handle: Mutex::new(handle),
+                references: AtomicUsize::new(0),
+            });
+            {
+                let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
+                nodes.insert(id, node.clone());
+                node.references.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(gate);
+            return Ok(MountFile { node, writable });
+        }
     }
     /// Replace a clean local version with a fresh remote observation. Pending,
     /// frozen or failed versions are never rebased. Adapters must coordinate any
     /// OS cache invalidation outside this call; no OS callbacks run under locks.
     pub async fn refresh(&self, id: NodeId) -> Result<()> {
-        let nodes = self.inner.nodes.lock().await;
-        let Some(node) = nodes.get(&id) else {
+        let guard = {
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            nodes.get(&id).cloned().map(NodeGuard::new)
+        };
+        let Some(guard) = guard else {
             return Ok(());
         };
-        let mut handle = node.handle.lock().await;
+        let mut handle = guard.node.handle.lock().await;
         let state = handle.status().await?;
         if state.pending || state.frozen || state.error.is_some() {
             return Err(Error::State(
@@ -145,10 +223,13 @@ impl Mount {
     /// Persist every currently staged node remotely. Continue after one failure
     /// so independent nodes can finish; the original failures remain in status.
     pub async fn fsync(&self) -> Result<()> {
-        let nodes: Vec<_> = self.inner.nodes.lock().await.values().cloned().collect();
+        let nodes: Vec<_> = {
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            nodes.values().cloned().map(NodeGuard::new).collect()
+        };
         let mut failure = None;
-        for node in nodes {
-            if let Err(error) = node.handle.lock().await.fsync().await {
+        for node in &nodes {
+            if let Err(error) = node.node.handle.lock().await.fsync().await {
                 failure.get_or_insert(error);
             }
         }
@@ -157,28 +238,43 @@ impl Mount {
     /// Forget only an unreferenced, clean node. Failed and pending nodes remain
     /// recoverable even after the OS releases all references.
     pub async fn reclaim(&self, id: NodeId) -> Result<()> {
-        let mut nodes = self.inner.nodes.lock().await;
-        let Some(node) = nodes.get(&id) else {
-            return Ok(());
+        let node = {
+            let nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            let Some(node) = nodes.get(&id) else {
+                return Ok(());
+            };
+            if node.references.load(Ordering::Relaxed) != 0 {
+                return Err(Error::State(
+                    ErrorKind::Busy,
+                    "node still has open references",
+                ));
+            }
+            node.clone()
         };
-        if node.references.load(Ordering::Relaxed) != 0 {
-            return Err(Error::State(
-                ErrorKind::Busy,
-                "node still has open references",
-            ));
+        {
+            let handle = node.handle.lock().await;
+            let state = handle.status().await?;
+            if state.pending || state.frozen || state.error.is_some() {
+                return Err(Error::State(
+                    ErrorKind::Busy,
+                    "node has retained writes or failures",
+                ));
+            }
         }
-        let handle = node.handle.lock().await;
-        let state = handle.status().await?;
-        if state.pending || state.frozen || state.error.is_some() {
-            return Err(Error::State(
-                ErrorKind::Busy,
-                "node has retained writes or failures",
-            ));
+        {
+            let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            let current = nodes.get(&id).cloned();
+            let Some(current) = current else {
+                return Ok(());
+            };
+            if current.references.load(Ordering::Relaxed) != 0 || !Arc::ptr_eq(&current, &node) {
+                return Err(Error::State(
+                    ErrorKind::Busy,
+                    "node state changed during reclaim",
+                ));
+            }
+            let _ = nodes.remove(&id);
         }
-        drop(handle);
-        let node = nodes
-            .remove(&id)
-            .expect("node exists under the namespace lock");
         node.handle.lock().await.close().await
     }
 }
@@ -222,5 +318,21 @@ impl MountFile {
     }
     pub async fn fsync(&self) -> Result<Option<Receipt>> {
         self.node.handle.lock().await.fsync().await
+    }
+    /// Publish staged bytes for a FUSE flush or close that can report errors.
+    /// Dropping or releasing the reference never performs this operation.
+    pub async fn flush(&self) -> Result<Option<Receipt>> {
+        self.fsync().await
+    }
+    /// Publish this node's dirty content first, then update the executable
+    /// flag and advance the shared clean handle to the metadata revision.
+    pub async fn set_executable(&self, executable: bool) -> Result<Receipt> {
+        self.require_write()?;
+        self.node
+            .handle
+            .lock()
+            .await
+            .set_executable(executable)
+            .await
     }
 }

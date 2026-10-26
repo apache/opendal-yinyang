@@ -41,6 +41,7 @@ pub fn attribute(
     executable: bool,
     size: u64,
     revision: Revision,
+    read_only: bool,
 ) -> FileAttr {
     let (uid, gid) = mount_owner();
     let stamp = SystemTime::UNIX_EPOCH
@@ -52,10 +53,12 @@ pub fn attribute(
                         .expect("revision sequence prefix"),
                 ),
         );
-    let perm = if directory || executable {
-        0o555
+    let perm = if directory {
+        if read_only { 0o555 } else { 0o755 }
+    } else if executable {
+        if read_only { 0o555 } else { 0o755 }
     } else {
-        0o444
+        if read_only { 0o444 } else { 0o644 }
     };
     FileAttr {
         ino,

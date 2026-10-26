@@ -18,11 +18,127 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+use std::{future::Future, pin::Pin};
 use support::TestBackend;
+use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, Fs};
+use yinyang::core::{
+    Authority, BackendProfile, CommitOutcome, DataStore, Fs, NodeId, Revision, Snapshot,
+    Transaction,
+};
 use yinyang::mount::Mount;
 use yinyang::runtime::{ErrorKind, Runtime};
+
+struct PausingObserveAuthority {
+    inner: Arc<dyn Authority>,
+    entered: Semaphore,
+    release: Semaphore,
+    pause_next_observe: AtomicBool,
+    fail_next_observe: AtomicBool,
+    commit_entered: Semaphore,
+    commit_release: Semaphore,
+    pause_after_commits: AtomicUsize,
+}
+impl PausingObserveAuthority {
+    fn new(inner: Arc<dyn Authority>) -> Self {
+        Self {
+            inner,
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            pause_next_observe: AtomicBool::new(false),
+            fail_next_observe: AtomicBool::new(false),
+            commit_entered: Semaphore::new(0),
+            commit_release: Semaphore::new(0),
+            pause_after_commits: AtomicUsize::new(0),
+        }
+    }
+    fn pause_next_observe(&self) {
+        self.pause_next_observe.store(true, Ordering::SeqCst);
+    }
+    fn fail_next_observe(&self) {
+        self.fail_next_observe.store(true, Ordering::SeqCst);
+    }
+    fn pause_after_commits(&self, commits: usize) {
+        self.pause_after_commits.store(commits, Ordering::SeqCst);
+    }
+}
+impl std::fmt::Debug for PausingObserveAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PausingObserveAuthority")
+            .finish_non_exhaustive()
+    }
+}
+impl Authority for PausingObserveAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+    fn observe_latest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        Box::pin(async move {
+            if self.pause_next_observe.swap(false, Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            if self.fail_next_observe.swap(false, Ordering::SeqCst) {
+                return Err(yinyang::core::Error::new(
+                    yinyang::core::ErrorKind::Storage,
+                    "test observe",
+                    "injected first-open failure",
+                ));
+            }
+            self.inner.observe_latest().await
+        })
+    }
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_revision(revision)
+    }
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut remaining = self.pause_after_commits.load(Ordering::SeqCst);
+            let mut pause = None;
+            while remaining > 0 {
+                match self.pause_after_commits.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(previous) => {
+                        pause = Some(previous);
+                        break;
+                    }
+                    Err(actual) => remaining = actual,
+                }
+            }
+            if pause == Some(1) {
+                self.commit_entered.add_permits(1);
+                self.commit_release.acquire().await.unwrap().forget();
+            }
+            self.inner.commit_batch(requests).await
+        })
+    }
+}
+
+fn assert_pending<F: Future + Unpin>(future: &mut F) {
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    assert!(std::pin::Pin::new(future).poll(&mut context).is_pending());
+}
 
 async fn exercise(authority: Arc<dyn Authority>) {
     let temp = tempfile::tempdir().unwrap();
@@ -167,4 +283,350 @@ async fn frozen_mount_write_recovers_original_request() {
     drop(file);
     mount.reclaim(id).await.unwrap();
     assert!(mount.status().await.unwrap().handles.is_empty());
+}
+
+#[tokio::test]
+async fn flush_publishes_but_reference_release_does_not() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority.clone(), temp.path(), false)
+        .await
+        .unwrap();
+    let (pending, _) = mount
+        .namespace()
+        .create_file_with_node(authority.root(), "pending", false)
+        .await
+        .unwrap();
+    assert!(mount.node_status(pending).await.unwrap().is_none());
+
+    let file = mount.open_node(pending, true).await.unwrap();
+    file.write(0, b"pending").await.unwrap();
+    let state = mount.node_status(pending).await.unwrap().unwrap();
+    assert_eq!(state.length, 7);
+    assert!(state.pending);
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(pending)
+            .await
+            .unwrap()
+            .read(0, 7)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Releasing the shared reference performs no remote publication.
+    drop(file);
+    assert!(mount.node_status(pending).await.unwrap().unwrap().pending);
+    assert_eq!(
+        mount.reclaim(pending).await.unwrap_err().kind(),
+        ErrorKind::Busy
+    );
+
+    let file = mount.open_node(pending, true).await.unwrap();
+    assert_eq!(file.read(0, 7).await.unwrap(), b"pending");
+    file.flush().await.unwrap().unwrap();
+    assert!(!mount.node_status(pending).await.unwrap().unwrap().pending);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(pending)
+            .await
+            .unwrap()
+            .read(0, 7)
+            .await
+            .unwrap(),
+        b"pending"
+    );
+
+    drop(file);
+    assert!(mount.node_status(pending).await.unwrap().is_some());
+    mount.reclaim(pending).await.unwrap();
+    assert!(mount.node_status(pending).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn set_executable_serializes_with_dirty_mount_handle() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority.clone(), temp.path(), false)
+        .await
+        .unwrap();
+    let (node, _) = mount
+        .namespace()
+        .create_file_with_node(authority.root(), "file", false)
+        .await
+        .unwrap();
+    let file = mount.open_node(node, true).await.unwrap();
+    file.write(0, b"dirty").await.unwrap();
+    file.set_executable(true).await.unwrap();
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .node(node)
+            .await
+            .unwrap()
+            .unwrap()
+            .executable()
+    );
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 5)
+            .await
+            .unwrap(),
+        b"dirty"
+    );
+    file.write(5, b"more").await.unwrap();
+    file.fsync().await.unwrap();
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 9)
+            .await
+            .unwrap(),
+        b"dirtymore"
+    );
+    let read_only = mount.open_node(node, false).await.unwrap();
+    assert_eq!(
+        read_only.set_executable(false).await.unwrap_err().kind(),
+        ErrorKind::ReadOnly
+    );
+
+    let (retry, _) = mount
+        .namespace()
+        .create_file_with_node(authority.root(), "retry", false)
+        .await
+        .unwrap();
+    let retry_file = mount.open_node(retry, true).await.unwrap();
+    retry_file.write(0, b"staged").await.unwrap();
+    backend.state.lock().unwrap().fail_data_close = true;
+    assert_eq!(
+        retry_file.set_executable(true).await.unwrap_err().kind(),
+        ErrorKind::Storage
+    );
+    assert!(retry_file.status().await.unwrap().pending);
+    assert!(retry_file.status().await.unwrap().error.is_some());
+    backend.state.lock().unwrap().fail_data_close = false;
+    retry_file.set_executable(true).await.unwrap();
+    assert!(!retry_file.status().await.unwrap().pending);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(retry)
+            .await
+            .unwrap()
+            .read(0, 6)
+            .await
+            .unwrap(),
+        b"staged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_executable_conflicts_if_content_changes_after_publish() {
+    let (pausing, mount, node, _b, _setup_temp, _mount_temp) = pausing_mount().await;
+    let file = mount.open_node(node, true).await.unwrap();
+    file.write(0, b"staged").await.unwrap();
+    pausing.pause_after_commits(2);
+    let mut task = Box::pin(file.set_executable(true));
+    tokio::select! {
+        _ = pausing.commit_entered.acquire() => {}
+        _ = &mut task => panic!("mode commit completed before the gate paused"),
+    }
+
+    let other_temp = tempfile::tempdir().unwrap();
+    let other = Runtime::open(pausing.inner.clone(), other_temp.path())
+        .await
+        .unwrap();
+    let mut editor = other.open_node(node, true).await.unwrap();
+    editor.write(0, b"external").await.unwrap();
+    editor.close().await.unwrap();
+    pausing.commit_release.add_permits(1);
+
+    let error = tokio::time::timeout(Duration::from_secs(5), &mut task)
+        .await
+        .expect("mode commit did not finish")
+        .err()
+        .expect("mode commit unexpectedly succeeded");
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    drop(task);
+    assert!(file.status().await.unwrap().error.is_some());
+    assert_eq!(
+        pausing
+            .inner
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 8)
+            .await
+            .unwrap(),
+        b"external"
+    );
+}
+
+async fn pausing_mount() -> (
+    Arc<PausingObserveAuthority>,
+    Mount,
+    yinyang::core::NodeId,
+    yinyang::core::NodeId,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let backend = TestBackend::default();
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let setup_temp = tempfile::tempdir().unwrap();
+    let setup = Runtime::open(inner.clone(), setup_temp.path())
+        .await
+        .unwrap();
+    let (a, _) = setup
+        .create_file_with_node(inner.root(), "a", false)
+        .await
+        .unwrap();
+    let (b, _) = setup
+        .create_file_with_node(inner.root(), "b", false)
+        .await
+        .unwrap();
+    drop(setup);
+
+    let pausing = Arc::new(PausingObserveAuthority::new(inner));
+    let authority: Arc<dyn Authority> = pausing.clone();
+    let mount_temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority, mount_temp.path(), false)
+        .await
+        .unwrap();
+    (pausing, mount, a, b, setup_temp, mount_temp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_materialization_is_independent_and_broadcasts_completion() {
+    let (pausing, mount, a, b, _setup_temp, _mount_temp) = pausing_mount().await;
+    pausing.pause_next_observe();
+    let mut owner = Box::pin(mount.open_node(a, false));
+    assert_pending(&mut owner);
+    pausing.entered.acquire().await.unwrap().forget();
+    let mut independent = Box::pin(mount.open_node(b, false));
+    let b_file = tokio::time::timeout(Duration::from_secs(5), &mut independent)
+        .await
+        .expect("opening an independent node waited for another node's remote observation")
+        .expect("independent open failed");
+    drop(b_file);
+
+    let mut first = Box::pin(mount.open_node(a, false));
+    let mut second = Box::pin(mount.open_node(a, false));
+    assert_pending(&mut first);
+    assert_pending(&mut second);
+
+    pausing.release.add_permits(1);
+    let a_file = tokio::time::timeout(Duration::from_secs(5), &mut owner)
+        .await
+        .expect("first open did not complete after the observation was released")
+        .expect("first open failed");
+    let shared = a_file.status().await.unwrap().id;
+    let first_file = tokio::time::timeout(Duration::from_secs(5), &mut first)
+        .await
+        .expect("a same-node waiter was not broadcast awake")
+        .expect("same-node waiter open failed");
+    let second_file = tokio::time::timeout(Duration::from_secs(5), &mut second)
+        .await
+        .expect("a same-node waiter was not broadcast awake")
+        .expect("same-node waiter open failed");
+    assert_eq!(first_file.status().await.unwrap().id, shared);
+    assert_eq!(second_file.status().await.unwrap().id, shared);
+    drop(a_file);
+    assert_eq!(mount.status().await.unwrap().handles.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_first_open_broadcasts_retry_to_all_waiters() {
+    let (pausing, mount, a, _b, _setup_temp, _mount_temp) = pausing_mount().await;
+    pausing.pause_next_observe();
+    pausing.fail_next_observe();
+    let mut owner = Box::pin(mount.open_node(a, false));
+    assert_pending(&mut owner);
+    pausing.entered.acquire().await.unwrap().forget();
+    let mut first = Box::pin(mount.open_node(a, false));
+    let mut second = Box::pin(mount.open_node(a, false));
+    assert_pending(&mut first);
+    assert_pending(&mut second);
+    pausing.release.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(5), &mut owner)
+        .await
+        .expect("failed owner did not finish")
+        .err()
+        .expect("failed owner returned a file");
+    assert_eq!(error.kind(), ErrorKind::Storage);
+    let first_file = tokio::time::timeout(Duration::from_secs(5), &mut first)
+        .await
+        .expect("first waiter did not retry after owner failure")
+        .expect("first waiter open failed");
+    let shared = first_file.status().await.unwrap().id;
+    let second_file = tokio::time::timeout(Duration::from_secs(5), &mut second)
+        .await
+        .expect("second waiter did not retry after owner failure")
+        .expect("second waiter open failed");
+    assert_eq!(second_file.status().await.unwrap().id, shared);
+    assert_eq!(mount.status().await.unwrap().handles.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_first_open_broadcasts_retry_to_all_waiters() {
+    let (pausing, mount, a, _b, _setup_temp, _mount_temp) = pausing_mount().await;
+    pausing.pause_next_observe();
+    let mut owner = Box::pin(mount.open_node(a, false));
+    assert_pending(&mut owner);
+    pausing.entered.acquire().await.unwrap().forget();
+    let mut first = Box::pin(mount.open_node(a, false));
+    let mut second = Box::pin(mount.open_node(a, false));
+    assert_pending(&mut first);
+    assert_pending(&mut second);
+    drop(owner);
+
+    let first_file = tokio::time::timeout(Duration::from_secs(5), &mut first)
+        .await
+        .expect("first waiter did not retry after cancellation")
+        .expect("first waiter open failed");
+    let shared = first_file.status().await.unwrap().id;
+    let second_file = tokio::time::timeout(Duration::from_secs(5), &mut second)
+        .await
+        .expect("second waiter did not retry after cancellation")
+        .expect("second waiter open failed");
+    assert_eq!(second_file.status().await.unwrap().id, shared);
+    assert_eq!(mount.status().await.unwrap().handles.len(), 1);
 }

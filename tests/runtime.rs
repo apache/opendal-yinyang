@@ -18,10 +18,75 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{future::Future, pin::Pin};
 use support::TestBackend;
+use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
+use yinyang::core::{
+    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, Fs, NodeId, Planner, Revision,
+    Snapshot, Transaction,
+};
 use yinyang::runtime::{Error, ErrorKind, Runtime};
+
+struct PausingAuthority {
+    inner: Arc<dyn Authority>,
+    entered: Semaphore,
+    release: Semaphore,
+    pause_next_commit: AtomicBool,
+}
+impl PausingAuthority {
+    fn new(inner: Arc<dyn Authority>) -> Self {
+        Self {
+            inner,
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            pause_next_commit: AtomicBool::new(false),
+        }
+    }
+    fn pause_next_commit(&self) {
+        self.pause_next_commit.store(true, Ordering::SeqCst);
+    }
+}
+impl std::fmt::Debug for PausingAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PausingAuthority").finish_non_exhaustive()
+    }
+}
+impl Authority for PausingAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+    fn observe_latest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_latest()
+    }
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_revision(revision)
+    }
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.pause_next_commit.swap(false, Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.inner.commit_batch(requests).await
+        })
+    }
+}
 
 async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend: &TestBackend) {
     let runtime = Runtime::open(authority.clone(), path).await.unwrap();
@@ -643,4 +708,235 @@ async fn clean_handle_reports_unacknowledged_errors_on_close() {
     file.acknowledge_error().await.unwrap();
     file.close().await.unwrap();
     assert!(!runtime.status().await.unwrap().errors.is_empty());
+}
+
+#[tokio::test]
+async fn create_results_keep_the_committed_node_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    let root = authority.root();
+
+    let (first, receipt) = runtime
+        .create_file_with_node(root, "file", true)
+        .await
+        .unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    assert_eq!(snapshot.revision(), receipt.cursor.revision);
+    assert_eq!(snapshot.resolve("file").await.unwrap().unwrap().id(), first);
+    assert!(snapshot.node(first).await.unwrap().unwrap().executable());
+
+    // A path lookup after the commit could have selected this replacement.
+    runtime.rename(first, root, "moved").await.unwrap();
+    let (second, _) = runtime
+        .create_file_with_node(root, "file", false)
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        second
+    );
+    let mut original = runtime.open_node(first, false).await.unwrap();
+    assert_eq!(original.status().await.unwrap().node, first);
+    original.close().await.unwrap();
+
+    let (directory, _) = runtime
+        .create_directory_with_node(root, "directory")
+        .await
+        .unwrap();
+    let (child, _) = runtime
+        .create_file_with_node(directory, "child", false)
+        .await
+        .unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    assert_eq!(
+        snapshot
+            .lookup(root, "directory")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_id,
+        directory
+    );
+    assert_eq!(
+        snapshot
+            .lookup(directory, "child")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_id,
+        child
+    );
+}
+
+#[tokio::test]
+async fn path_namespace_operations_use_snapshot_identity_and_kind() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    let root = authority.root();
+    let (file, _) = runtime
+        .create_file_with_node(root, "file", false)
+        .await
+        .unwrap();
+    let (directory, _) = runtime
+        .create_directory_with_node(root, "directory")
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .unlink_path(root, "directory")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::IsDirectory
+    );
+    assert_eq!(
+        runtime.rmdir_path(root, "file").await.unwrap_err().kind(),
+        ErrorKind::NotDirectory
+    );
+
+    let (removed, _) = runtime.unlink_path(root, "file").await.unwrap();
+    assert_eq!(removed, file);
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("file")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (source, _) = runtime
+        .create_file_with_node(root, "source", false)
+        .await
+        .unwrap();
+    let (renamed, _) = runtime
+        .rename_path(root, "source", root, "renamed")
+        .await
+        .unwrap();
+    assert_eq!(renamed, source);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("renamed")
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        source
+    );
+    let (replacement, _) = runtime
+        .create_file_with_node(root, "replacement", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .rename_path(root, "replacement", root, "renamed")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::AlreadyExists
+    );
+    let (replaced, _) = runtime
+        .rename_path_replace(root, "replacement", root, "renamed")
+        .await
+        .unwrap();
+    assert_eq!(replaced, replacement);
+    let snapshot = authority.observe_latest().await.unwrap();
+    assert_eq!(
+        snapshot.resolve("renamed").await.unwrap().unwrap().id(),
+        replacement
+    );
+    assert!(snapshot.node(source).await.unwrap().is_none());
+
+    let (removed, _) = runtime.rmdir_path(root, "directory").await.unwrap();
+    assert_eq!(removed, directory);
+}
+
+#[tokio::test]
+async fn path_namespace_mutations_conflict_after_concurrent_move_and_replace() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let setup = Runtime::open(inner.clone(), temp.path().join("setup"))
+        .await
+        .unwrap();
+    let (source, _) = setup
+        .create_file_with_node(inner.root(), "a", false)
+        .await
+        .unwrap();
+    drop(setup);
+
+    let pausing = Arc::new(PausingAuthority::new(inner.clone()));
+    let authority: Arc<dyn Authority> = pausing.clone();
+    let runtime = Runtime::open(authority, temp.path().join("mount"))
+        .await
+        .unwrap();
+    let other = Runtime::open(inner.clone(), temp.path().join("other"))
+        .await
+        .unwrap();
+    let root = inner.root();
+
+    pausing.pause_next_commit();
+    let task = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.unlink_path(root, "a").await })
+    };
+    pausing.entered.acquire().await.unwrap().forget();
+    other.rename(source, root, "b").await.unwrap();
+    let (unlink_replacement, _) = other.create_file_with_node(root, "a", false).await.unwrap();
+    pausing.release.add_permits(1);
+    assert_eq!(task.await.unwrap().unwrap_err().kind(), ErrorKind::Conflict);
+    let snapshot = inner.observe_latest().await.unwrap();
+    assert_eq!(snapshot.resolve("b").await.unwrap().unwrap().id(), source);
+    assert_eq!(
+        snapshot.resolve("a").await.unwrap().unwrap().id(),
+        unlink_replacement
+    );
+
+    pausing.pause_next_commit();
+    let task = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.rename_path(root, "b", root, "target").await })
+    };
+    pausing.entered.acquire().await.unwrap().forget();
+    other.rename(source, root, "c").await.unwrap();
+    let (rename_replacement, _) = other.create_file_with_node(root, "b", false).await.unwrap();
+    pausing.release.add_permits(1);
+    assert_eq!(task.await.unwrap().unwrap_err().kind(), ErrorKind::Conflict);
+    let snapshot = inner.observe_latest().await.unwrap();
+    assert_eq!(snapshot.resolve("c").await.unwrap().unwrap().id(), source);
+    assert_eq!(
+        snapshot.resolve("b").await.unwrap().unwrap().id(),
+        rename_replacement
+    );
+    assert!(snapshot.resolve("target").await.unwrap().is_none());
 }

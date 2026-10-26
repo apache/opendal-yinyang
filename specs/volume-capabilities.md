@@ -1,10 +1,10 @@
 # Volume admission and capabilities
 
 **Status: experimental Managed volume, Mount durability policy, library and
-read-only Linux FUSE frontends.**
-Direct, Sync reconciliation, writable FUSE, macOS, and Windows frontends are
-recognized configuration choices but are rejected as unimplemented before
-startup. The read-only Linux FUSE frontend is specified separately in
+Linux FUSE frontends.**
+Direct, Sync reconciliation, macOS, and Windows frontends are recognized
+configuration choices but are rejected as unimplemented before startup. The
+Linux FUSE frontend is specified separately in
 [`linux-fuse.md`](linux-fuse.md).
 
 ## Configuration
@@ -40,9 +40,10 @@ The config contains no service secret or storage credentials.
 `access=mount` selects online remote-fsync semantics. `frontend=library`
 executes these semantics through Runtime/FileHandle and the CLI without
 installing a mount point. It does not claim an OS frontend or offline Sync.
-`frontend=fuse` requires Linux and `read_only=true`; the mount command hands
-the same validated configuration to the Linux FUSE frontend, which adds its
-own staged-state admission before serving reads.
+`frontend=fuse` requires Linux. A read-only configuration mounts with kernel
+`ro` and refuses unpublished staging before serving. A writable configuration
+opens the shared Mount read-write; recovered pending/frozen/error state is
+served through the same handles and reported by flush/fsync rather than hidden.
 
 ## Negotiation and enforcement
 
@@ -56,8 +57,10 @@ The effective capability set is the intersection of:
 Startup also requires the intersection of the volume, access, and frontend
 contracts (the combination baseline) to survive the storage intersection, so a
 frontend cannot silently weaken the model. The library frontend claims the full
-implemented runtime set. The Linux FUSE frontend claims read, list,
-stable-identity, pinned-reads, and retained-unlink-read; its read-only mount
+implemented runtime set. A read-only Linux FUSE mount claims read, list,
+stable-identity, pinned-reads, and retained-unlink-read; a writable FUSE mount
+claims the full Managed set, including write, append, truncate, atomic rename,
+remote fsync, and recoverable staging.
 does not claim recoverable staging or any write-side operation. Every other
 frontend claims an empty set and is rejected by its own admission rule.
 

@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Linux FUSE mount frontend for Managed read-only volumes.
+//! Linux FUSE mount frontend for Managed volumes.
 //!
 //! The CLI form is `yy --volume CONFIG mount MOUNTPOINT`; the process stays in
-//! the foreground until unmounted. The volume must declare `frontend = "fuse"`
-//! and `read_only = true`; the shared admission rules in
+//! the foreground until unmounted. The volume must declare `frontend = "fuse"`;
+//! read-only and writable Managed mounts are supported. The shared admission rules in
 //! [`crate::volume`] reject every other combination before an authority
 //! connection or staging lease is created.
 //!
-//! Startup takes the staging lease through [`crate::mount::Mount`] and then
-//! refuses to serve a staging database that still holds unpublished, frozen,
-//! conflicted or failed handles: a read-only snapshot view must never surface
-//! those locally staged bytes as if they were remote. Clean observations are
-//! disposable and are reclaimed by the existing Mount recovery.
+//! Startup takes the staging lease through [`crate::mount::Mount`]. A read-only
+//! mount refuses to serve a staging database that still holds unpublished,
+//! frozen, conflicted or failed handles: a read-only snapshot view must never
+//! surface those locally staged bytes as if they were remote. A writable mount
+//! serves recovered pending/error state through the shared Mount, where flush
+//! or fsync reports the real outcome. Clean observations are disposable and are
+//! reclaimed by the existing Mount recovery.
 //!
 //! The session mounts as `fuse.yinyang` and runs in the foreground. SIGINT and
 //! SIGTERM unmount the session and finish the process; dropping the session
@@ -45,7 +47,7 @@ use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Mount a validated read-only FUSE volume in the foreground.
+/// Mount a validated read-only or writable FUSE volume in the foreground.
 ///
 /// `staging` must already be resolved to an absolute path by the CLI.
 pub async fn run(
@@ -54,9 +56,12 @@ pub async fn run(
     token: Option<String>,
     mountpoint: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let read_only = config.read_only;
     let authority = Volume::connect(&config, operator, token).await?;
-    let mount = Mount::open(authority, &config.staging, true).await?;
-    reject_unpublished_staging(&mount).await?;
+    let mount = Mount::open(authority, &config.staging, read_only).await?;
+    if read_only {
+        reject_unpublished_staging(&mount).await?;
+    }
     let snapshot = mount.authority().observe_latest().await?;
     let root = mount.authority().root();
     let root_node = snapshot.node(root).await?;
@@ -66,22 +71,26 @@ pub async fn run(
         )
         .into());
     }
-    let inner = Arc::new(frontend::Inner::new(
+    let inner = Arc::new(frontend::Inner::with_read_only(
         mount,
         tokio::runtime::Handle::current(),
+        read_only,
     ));
     let filesystem = frontend::FuseFrontend { inner };
     let mut options = Config::default();
     options.mount_options = vec![
-        MountOption::RO,
         MountOption::FSName(format!("yinyang-{}", config.name)),
         MountOption::Subtype("yinyang".into()),
     ];
+    if read_only {
+        options.mount_options.insert(0, MountOption::RO);
+    }
     options.acl = SessionACL::Owner;
     let session = Session::new(filesystem, &mountpoint, &options)?;
     println!(
-        "yy: mounted {} read-only at {} (fuse.yinyang)",
+        "yy: mounted {} {} at {} (fuse.yinyang)",
         config.name,
+        if read_only { "read-only" } else { "read-write" },
         mountpoint.display()
     );
     // `Session::spawn` moves the mount object into `BackgroundSession`, so a
