@@ -180,7 +180,9 @@ fn managed_sync_local_and_remote_namespace_both_authorities() {
         let fixture = Fixture::new(publication);
         fixture.remote_create_directory("docs");
         fixture.remote_create_directory("empty");
+        fixture.remote_create_directory("local-tree");
         fixture.remote_create_directory("local-tree/sub");
+        fixture.remote_create_directory("remote-delete");
         fixture.remote_create_directory("remote-delete/sub");
         fixture.remote_create_file("docs/base", b"base", false);
         fixture.remote_create_file("local-tree/sub/local-data", b"local-data", false);
@@ -391,11 +393,12 @@ fn managed_sync_completion_race_and_unknown_retry_use_real_service_processes() {
     {
         let fixture = Fixture::new(Publication::Service);
         fixture.remote_create_file("race.txt", b"remote-base", false);
+        let initial = fixture.sync_paths("completion-race");
+        fs::create_dir(&initial.directory).unwrap();
+        fixture.sync_init(&initial);
+        fixture.sync_run_ok(&initial);
         let gate = fixture.service_gate(false);
         let client = fixture.sync_paths_at("completion-race", Some(gate.address()));
-        fs::create_dir(&client.directory).unwrap();
-        fixture.sync_init(&client);
-        fixture.sync_run_ok(&client);
         let base_version = fixture.remote_file_version("race.txt");
 
         write_local(&client.directory.join("race.txt"), b"local-v1");
@@ -447,11 +450,12 @@ fn managed_sync_completion_race_and_unknown_retry_use_real_service_processes() {
     {
         let fixture = Fixture::new(Publication::Service);
         fixture.remote_create_file("unknown.txt", b"remote-base", false);
+        let initial = fixture.sync_paths("unknown-retry");
+        fs::create_dir(&initial.directory).unwrap();
+        fixture.sync_init(&initial);
+        fixture.sync_run_ok(&initial);
         let gate = fixture.service_gate(true);
         let client = fixture.sync_paths_at("unknown-retry", Some(gate.address()));
-        fs::create_dir(&client.directory).unwrap();
-        fixture.sync_init(&client);
-        fixture.sync_run_ok(&client);
         let base_version = fixture.remote_file_version("unknown.txt");
 
         write_local(&client.directory.join("unknown.txt"), b"exactly-once");
@@ -639,6 +643,7 @@ fn managed_sync_retained_artifacts_export_post_install_writes_both_authorities()
     for_each_authority(|publication| {
         let fixture = Fixture::new(publication);
         fixture.remote_create_file("watched.txt", b"original", false);
+        fixture.remote_create_directory("gone");
         fixture.remote_create_directory("gone/sub");
         fixture.remote_create_file("gone/sub/data", b"quarantined", false);
         let client = fixture.sync_client("artifacts");
