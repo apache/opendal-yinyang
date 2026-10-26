@@ -44,6 +44,7 @@ use crate::volume::{Volume, VolumeConfig};
 use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Mount a validated read-only FUSE volume in the foreground.
 ///
@@ -84,11 +85,58 @@ pub async fn run(
         config.name,
         mountpoint.display()
     );
-    let background = session.spawn()?;
-    shutdown_signal().await;
-    background.umount_and_join()?;
+    // `Session::spawn` moves the mount object into `BackgroundSession`, so a
+    // `SessionUnmounter` obtained from the pre-spawn session would find an
+    // empty slot. Instead, one blocking owner polls the public session guard
+    // for a natural end (for example `fusermount3 -u`) and waits for a local
+    // teardown request. The async side only signals; the owner performs a
+    // single `join` or `umount_and_join`, so exactly one teardown runs.
+    let shared = Arc::new(Mutex::new(Some(session.spawn()?)));
+    let (teardown, teardown_rx) = std::sync::mpsc::channel();
+    let join = {
+        let shared = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                match teardown_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let Some(background) = shared.lock().unwrap().take() else {
+                            return Ok(());
+                        };
+                        return background.umount_and_join();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let mut slot = shared.lock().unwrap();
+                        if slot
+                            .as_ref()
+                            .is_some_and(|background| background.guard.is_finished())
+                        {
+                            let background = slot.take().expect("guard was checked");
+                            return background.join();
+                        }
+                    }
+                }
+            }
+        })
+    };
+    tokio::pin!(join);
+    tokio::select! {
+        result = &mut join => {
+            // The session ended on its own, for example through an external
+            // `fusermount3 -u`. Returning now lets the process exit and release
+            // the staging lease instead of waiting for a signal forever.
+            result.map_err(blocking_error)??;
+        }
+        _ = shutdown_signal() => {
+            let _ = teardown.send(());
+            join.await.map_err(blocking_error)??;
+        }
+    }
     println!("yy: unmounted {}", mountpoint.display());
     Ok(())
+}
+
+fn blocking_error(error: tokio::task::JoinError) -> std::io::Error {
+    std::io::Error::other(format!("filesystem session task failed: {error}"))
 }
 
 /// A read-only snapshot must never expose staged bytes that were not
