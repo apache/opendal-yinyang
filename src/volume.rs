@@ -73,6 +73,21 @@ fn read_only() -> CapabilitySet {
     .into_iter()
     .collect()
 }
+/// Read-only Linux FUSE frontend capabilities. The frontend serves immutable
+/// pinned file versions and pinned directory scans, so it does not provide
+/// recoverable staging or any write-side operation.
+fn fuse() -> CapabilitySet {
+    use Capability::*;
+    [
+        Read,
+        List,
+        StableIdentity,
+        PinnedReads,
+        RetainedUnlinkRead,
+    ]
+    .into_iter()
+    .collect()
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Model {
@@ -168,11 +183,7 @@ impl VolumeConfig {
     /// Negotiation is read-only. Storage capabilities are semantic prerequisites
     /// for Managed operations, not claims that raw S3 implements atomic rename.
     pub fn capabilities(&self, operator: &Operator) -> Capabilities {
-        let volume = if self.model == Model::Managed {
-            managed()
-        } else {
-            CapabilitySet::new()
-        };
+        let volume = self.volume_capabilities();
         let cap = operator.info().capability();
         let content = operator.info().scheme() == "s3"
             && cap.read
@@ -185,21 +196,43 @@ impl VolumeConfig {
         } else {
             CapabilitySet::new()
         };
-        let access = if self.access == Access::Mount {
-            if self.read_only {
-                read_only()
-            } else {
-                managed()
-            }
-        } else {
-            CapabilitySet::new()
-        };
-        let frontend = if self.frontend == Frontend::Library {
+        let access = self.access_capabilities();
+        let frontend = self.frontend_capabilities();
+        Capabilities::intersect(volume, storage, access, frontend)
+    }
+    fn volume_capabilities(&self) -> CapabilitySet {
+        if self.model == Model::Managed {
             managed()
         } else {
             CapabilitySet::new()
-        };
-        Capabilities::intersect(volume, storage, access, frontend)
+        }
+    }
+    fn access_capabilities(&self) -> CapabilitySet {
+        match self.access {
+            Access::Mount if self.read_only => read_only(),
+            Access::Mount => managed(),
+            Access::Sync => CapabilitySet::new(),
+        }
+    }
+    fn frontend_capabilities(&self) -> CapabilitySet {
+        match self.frontend {
+            Frontend::Library => managed(),
+            Frontend::Fuse => fuse(),
+            Frontend::Macos | Frontend::Windows => CapabilitySet::new(),
+        }
+    }
+    /// Capabilities the selected combination promises independent of storage
+    /// support. Startup requires this intersection to survive storage and
+    /// frontend negotiation, so a frontend cannot silently weaken the model.
+    fn baseline(&self) -> CapabilitySet {
+        let volume = self.volume_capabilities();
+        let access = self.access_capabilities();
+        let frontend = self.frontend_capabilities();
+        volume
+            .intersection(&access)
+            .filter(|capability| frontend.contains(capability))
+            .copied()
+            .collect()
     }
     pub fn validate(&self, operator: &Operator) -> Result<Capabilities> {
         if self.name.trim().is_empty() || self.staging.as_os_str().is_empty() {
@@ -211,10 +244,24 @@ impl VolumeConfig {
         if self.access != Access::Mount {
             return Err(Error::Invalid("Sync reconciliation is not implemented"));
         }
-        if self.frontend != Frontend::Library {
-            return Err(Error::Invalid(
-                "OS frontends are not implemented; select the library frontend",
-            ));
+        match self.frontend {
+            Frontend::Library => {}
+            Frontend::Fuse if !cfg!(target_os = "linux") => {
+                return Err(Error::Invalid(
+                    "the fuse frontend is implemented only on Linux",
+                ));
+            }
+            Frontend::Fuse if !self.read_only => {
+                return Err(Error::Invalid(
+                    "the Linux FUSE frontend is read-only in this release",
+                ));
+            }
+            Frontend::Fuse => {}
+            Frontend::Macos | Frontend::Windows => {
+                return Err(Error::Invalid(
+                    "macOS and Windows frontends are not implemented; select library or fuse",
+                ));
+            }
         }
         match (self.publication, self.service_address) {
             (Publication::Service, Some(addr)) if addr.ip().is_loopback() => {}
@@ -226,11 +273,7 @@ impl VolumeConfig {
             }
         }
         let caps = self.capabilities(operator);
-        let baseline = if self.read_only {
-            read_only()
-        } else {
-            managed()
-        };
+        let baseline = self.baseline();
         if !baseline.is_subset(&caps.effective) || !self.require.is_subset(&caps.effective) {
             return Err(Error::Invalid(
                 "effective capability intersection is missing baseline or required operations",
