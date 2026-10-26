@@ -408,7 +408,45 @@ impl DirectorySync {
         }
         paths.remove("");
 
-        let conflicts: Vec<Conflict> = status.conflicts.clone();
+        let mut conflicts: Vec<Conflict> = status.conflicts.clone();
+        // A retained install inode that gained late writer bytes is an
+        // unresolved conflict even though nothing durable was written before.
+        for artifact in &status.artifacts {
+            let install_kind =
+                artifact.kind == "replaced-file" || artifact.kind == "rollback-displaced";
+            if artifact.phase != "conflict"
+                || !install_kind
+                || artifact.origin.is_empty()
+                || conflicts.iter().any(|conflict| {
+                    conflict.local_artifact.as_deref() == Some(artifact.id.as_str())
+                })
+            {
+                continue;
+            }
+            let path = artifact.origin.clone();
+            let remote = match remote_map.and_then(|map| map.get(&path)) {
+                Some(node) if node.is_directory() => "current_directory",
+                Some(_) => "current_file",
+                None => "deleted",
+            };
+            conflicts.push(Conflict {
+                id: artifact_conflict_identity(&artifact.id),
+                path: path.clone(),
+                original_path: Some(path.clone()),
+                desired_path: Some(path),
+                local: "retained_artifact".to_owned(),
+                remote: remote.to_owned(),
+                local_artifact: Some(artifact.id.clone()),
+                remote_node: remote_map
+                    .and_then(|map| map.get(&artifact.origin))
+                    .map(Node::id),
+                remote_revision: remote_status.revision.map(Revision::to_bytes),
+                error: artifact
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
+            });
+        }
         let mut entries = Vec::with_capacity(paths.len());
         let mut pending = 0_u64;
         for path in &paths {
@@ -658,13 +696,16 @@ impl DirectorySync {
     /// Apply one durable decision to an active conflict, then reconcile again.
     /// The conflict stays active until its derived request actually commits.
     pub async fn resolve(&mut self, conflict_id: &str, decision: Resolution) -> Result<RunOutcome> {
-        let record = self
+        let record = match self
             .replica
             .store()
             .conflicts()?
             .into_iter()
             .find(|record| record.id == conflict_id)
-            .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+        {
+            Some(record) => record,
+            None => self.synthetic_conflict(conflict_id)?,
+        };
         let observed = self.sync.authority().observe_latest().await?;
         let remote = crate::directory_nodes(&observed).await?;
         let baseline = self.replica.store().load_baseline()?;
@@ -679,9 +720,57 @@ impl DirectorySync {
             }
         };
         if applied {
-            self.replica.store_mut().remove_conflict(conflict_id)?;
+            self.clear_resolved_conflict(conflict_id)?;
         }
         self.run().await
+    }
+
+    /// Stop reporting a resolved conflict: drop the durable record, or
+    /// acknowledge the retained inode if the conflict was synthesized from one.
+    fn clear_resolved_conflict(&mut self, conflict_id: &str) -> Result<()> {
+        let artifact = self
+            .replica
+            .store()
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact_conflict_identity(&artifact.id) == conflict_id);
+        match artifact {
+            Some(artifact) => self.replica.acknowledge_retained_artifact(&artifact.id)?,
+            None => self.replica.store_mut().remove_conflict(conflict_id)?,
+        }
+        Ok(())
+    }
+
+    /// Build the conflict record for a retained install inode that gained late
+    /// writer bytes. This conflict is reported by inspection but is not durable
+    /// until an explicit decision is applied.
+    fn synthetic_conflict(&self, conflict_id: &str) -> Result<ConflictRecord> {
+        let artifact = self
+            .replica
+            .store()
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact_conflict_identity(&artifact.id) == conflict_id)
+            .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+        if artifact.phase != "conflict" || artifact.origin.is_empty() {
+            return Err(crate::replica::Error::invalid("unknown conflict")
+                .to_string()
+                .into());
+        }
+        Ok(ConflictRecord {
+            id: conflict_id.to_owned(),
+            path: artifact.origin.clone(),
+            original_path: Some(artifact.origin.clone()),
+            desired_path: Some(artifact.origin.clone()),
+            local: "retained_artifact".to_owned(),
+            remote: "current_file".to_owned(),
+            local_artifact: Some(artifact.id),
+            remote_node: None,
+            remote_revision: None,
+            error: artifact
+                .error
+                .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
+        })
     }
 
     /// Publish the chosen local bytes through the same durable work/receipt
@@ -955,9 +1044,19 @@ impl DirectorySync {
         let local_empty = current.len() == 1;
         let remote_empty = remote.len() == 1;
         if !local_empty && !remote_empty {
-            record_conflict(
+            let id = conflict_identity(
+                "",
+                None,
+                Some(""),
+                "current_directory",
+                "current_directory",
+                None,
+                None,
+            );
+            record_conflict_side(
                 outcome,
                 &mut self.replica,
+                &id,
                 "",
                 None,
                 Some(""),
@@ -1066,7 +1165,7 @@ impl DirectorySync {
                         None,
                     )?;
                     if let Some(conflict) = &record.conflict {
-                        self.replica.store_mut().remove_conflict(conflict)?;
+                        self.clear_resolved_conflict(conflict)?;
                     }
                 }
                 Err(error) if error.kind() == crate::runtime::ErrorKind::Unknown => {
@@ -1509,9 +1608,24 @@ impl<'a> Context<'a> {
                         }
                     })
                     .unwrap_or("unknown");
+                let baseline_node = self
+                    .baseline
+                    .remote
+                    .get(&path)
+                    .map(|entry| *entry.node.as_bytes());
+                let id = conflict_identity(
+                    &path,
+                    Some(&path),
+                    Some(&path),
+                    kind,
+                    "deleted",
+                    baseline_node,
+                    None,
+                );
                 record_conflict_side(
                     self.outcome,
                     self.replica,
+                    &id,
                     &path,
                     Some(&path),
                     Some(&path),
@@ -1973,27 +2087,48 @@ impl<'a> Context<'a> {
         original_path: Option<&str>,
         desired_path: Option<&str>,
     ) -> Result<()> {
-        let captured = self
-            .current
-            .get(path)
-            .filter(|node| matches!(node.kind, LocalKind::File { .. }))
-            .and_then(|node| self.replica.capture_file(path, node).ok());
-        let remote_node = self.remote.get(path).map(Node::id);
-        let local = if captured.is_some() {
-            "retained_artifact"
-        } else {
-            self.local_side(path)
-        };
+        // The observable local side is classified by presence. A preserved
+        // backup is reported separately as `local_artifact` and does not turn
+        // an ordinary content divergence into a retained-artifact side.
+        let local = self.local_side(path);
         let remote = self.remote_side(path);
-        record_conflict(
-            self.outcome,
-            self.replica,
+        let baseline_node = self.baseline.remote.get(path).map(|entry| entry.node);
+        let remote_node = self.remote.get(path).map(Node::id);
+        let id = conflict_identity(
             path,
             original_path,
             desired_path,
             local,
             remote,
-            captured.as_ref().map(|value| value.artifact.id.as_str()),
+            baseline_node.map(|node| *node.as_bytes()),
+            remote_node,
+        );
+        let existing_artifact = self
+            .replica
+            .store()
+            .conflicts()?
+            .into_iter()
+            .find(|conflict| conflict.id == id)
+            .and_then(|conflict| conflict.local_artifact);
+        let local_artifact = match existing_artifact {
+            Some(artifact) => Some(artifact),
+            None => self
+                .current
+                .get(path)
+                .filter(|node| matches!(node.kind, LocalKind::File { .. }))
+                .and_then(|node| self.replica.capture_file(path, node).ok())
+                .map(|captured| captured.artifact.id),
+        };
+        record_conflict_side(
+            self.outcome,
+            self.replica,
+            &id,
+            path,
+            original_path,
+            desired_path,
+            local,
+            remote,
+            local_artifact.as_deref(),
             remote_node,
             Some(self.revision),
             "local and remote changed from the same baseline",
@@ -2243,38 +2378,52 @@ fn revision_bytes(revision: Option<[u8; 24]>) -> Option<Revision> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_conflict(
-    outcome: &mut RunOutcome,
-    replica: &mut Replica,
+fn conflict_identity(
     path: &str,
     original_path: Option<&str>,
     desired_path: Option<&str>,
     local: &str,
     remote: &str,
-    local_artifact: Option<&str>,
+    baseline_node: Option<[u8; 16]>,
     remote_node: Option<NodeId>,
-    remote_revision: Option<Revision>,
-    error: &str,
-) -> Result<()> {
-    record_conflict_side(
-        outcome,
-        replica,
-        path,
-        original_path,
-        desired_path,
-        local,
-        remote,
-        local_artifact,
-        remote_node,
-        remote_revision,
-        error,
-    )
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(path.as_bytes());
+    hasher.update(original_path.unwrap_or("").as_bytes());
+    hasher.update(desired_path.unwrap_or("").as_bytes());
+    hasher.update(local.as_bytes());
+    hasher.update(remote.as_bytes());
+    let baseline = baseline_node.unwrap_or([0; 16]);
+    hasher.update(&baseline);
+    let remote_id = remote_node.map(|node| *node.as_bytes()).unwrap_or([0; 16]);
+    hasher.update(&remote_id);
+    hex16(&hasher.finalize())
 }
 
+/// A stable 32-hex identity derived from an artifact, used for the read-only
+/// conflict reported when a retained inode gains late writer bytes.
+fn artifact_conflict_identity(artifact_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"yinyang-retained-conflict-1");
+    hasher.update(artifact_id.as_bytes());
+    hex16(&hasher.finalize())
+}
+
+fn hex16(digest: &blake3::Hash) -> String {
+    digest.as_bytes()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Record one active conflict. Detection is idempotent: the same evidence
+/// keeps one record and one stable identity until an explicit resolution, and a
+/// retained backup is reused instead of duplicated on every run.
 #[allow(clippy::too_many_arguments)]
 fn record_conflict_side(
     outcome: &mut RunOutcome,
     replica: &mut Replica,
+    id: &str,
     path: &str,
     original_path: Option<&str>,
     desired_path: Option<&str>,
@@ -2285,32 +2434,43 @@ fn record_conflict_side(
     remote_revision: Option<Revision>,
     error: &str,
 ) -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let conflict = Conflict {
-        id: id.clone(),
+    let existing = replica
+        .store()
+        .conflicts()?
+        .into_iter()
+        .find(|conflict| conflict.id == id);
+    let local_artifact = local_artifact
+        .map(str::to_owned)
+        .or_else(|| existing.as_ref().and_then(|c| c.local_artifact.clone()));
+    let record = ConflictRecord {
+        id: id.to_owned(),
         path: path.to_owned(),
         original_path: original_path.map(str::to_owned),
         desired_path: desired_path.map(str::to_owned),
         local: local.to_owned(),
         remote: remote.to_owned(),
-        local_artifact: local_artifact.map(str::to_owned),
-        remote_node,
-        remote_revision: remote_revision.map(Revision::to_bytes),
-        error: error.to_owned(),
-    };
-    outcome.conflicts.push(conflict);
-    replica.store_mut().insert_conflict(&ConflictRecord {
-        id,
-        path: path.to_owned(),
-        original_path: original_path.map(str::to_owned),
-        desired_path: desired_path.map(str::to_owned),
-        local: local.to_owned(),
-        remote: remote.to_owned(),
-        local_artifact: local_artifact.map(str::to_owned),
+        local_artifact,
         remote_node: remote_node.map(|value| *value.as_bytes()),
         remote_revision: remote_revision.map(Revision::to_bytes),
         error: error.to_owned(),
-    })?;
+    };
+    if existing.is_some() {
+        replica.store_mut().refresh_conflict(&record)?;
+    } else {
+        replica.store_mut().insert_conflict(&record)?;
+    }
+    outcome.conflicts.push(Conflict {
+        id: record.id,
+        path: record.path,
+        original_path: record.original_path,
+        desired_path: record.desired_path,
+        local: record.local,
+        remote: record.remote,
+        local_artifact: record.local_artifact,
+        remote_node,
+        remote_revision: record.remote_revision,
+        error: record.error,
+    });
     Ok(())
 }
 
