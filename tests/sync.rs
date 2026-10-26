@@ -672,14 +672,18 @@ async fn namespace_unknown_survives_unavailable_recovery_and_resolves_once() {
     let sync = Sync::open(authority.clone(), temp.path().join("sync"))
         .await
         .unwrap();
-    assert!(sync.resolve_namespace(intent).await.is_err());
-    assert_eq!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Unknown
-    );
+    let before = sync.namespace_status(intent).await.unwrap();
+    assert_eq!(before.state, NamespaceState::Unknown);
+    assert!(sync.publish(intent).await.is_err());
+    let after = sync.namespace_status(intent).await.unwrap();
+    assert_eq!(after.state, NamespaceState::Unknown);
+    assert_eq!(after.intent.commit_id, before.intent.commit_id);
+    assert_eq!(after.intent.request_digest, before.intent.request_digest);
 
     backend.state.lock().unwrap().offline = false;
+    let revision = sync.publish(intent).await.unwrap();
     let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
+    assert_eq!(revision, receipt.cursor.revision);
     assert!(matches!(
         sync.namespace_status(intent).await.unwrap().state,
         NamespaceState::Committed(_)
@@ -689,4 +693,35 @@ async fn namespace_unknown_survives_unavailable_recovery_and_resolves_once() {
         receipt.cursor.revision
     );
     assert_eq!(sync.publish(intent).await.unwrap(), receipt.cursor.revision);
+}
+
+#[tokio::test]
+async fn namespace_restore_failure_keeps_a_prepared_intent_retryable() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let intent = sync
+        .stage_create_directory(authority.root(), "retry-restore", baseline.revision())
+        .await
+        .unwrap();
+    backend.state.lock().unwrap().offline = true;
+    assert!(sync.publish(intent).await.is_err());
+    assert_eq!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Retryable
+    );
+    backend.state.lock().unwrap().offline = false;
+    sync.publish(intent).await.unwrap();
+    assert!(matches!(
+        sync.namespace_status(intent).await.unwrap().state,
+        NamespaceState::Committed(_)
+    ));
 }
