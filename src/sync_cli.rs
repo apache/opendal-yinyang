@@ -18,16 +18,20 @@
 //! CLI adapter for Linux ordinary-directory Managed Sync.
 //!
 //! This module owns argument parsing, volume admission, exit-code mapping and
-//! the `yinyang.sync.status.v1` projection. The reconciliation itself, the
-//! durable binding and the local installation live in the library (`replica`
-//! and `sync`); this adapter binds a volume configuration to that contract and
-//! formats its results.
+//! the fixed `yinyang.sync.status.v1` projection. Reconciliation, durable
+//! binding and local installation live in `yinyang::replica::DirectorySync`;
+//! this adapter only binds a volume configuration to that responsibility and
+//! projects its domain evidence into the CLI contract.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use yinyang::volume::{Access, Model, VolumeConfig};
+use yinyang::core::Authority;
+use yinyang::replica as domain;
+use yinyang::replica::DirectorySync;
+use yinyang::volume::{Access, Model, Volume, VolumeConfig};
 
 /// Managed Sync subcommands. Every subcommand requires `--volume CONFIG`.
 #[derive(Subcommand)]
@@ -56,7 +60,7 @@ pub enum SyncCommand {
         /// Conflict side to export; required with `--conflict`.
         #[arg(long)]
         side: Option<SyncSide>,
-        /// Destination path; must not already exist.
+        /// Destination path for the exported bytes.
         #[arg(long)]
         output: PathBuf,
     },
@@ -86,11 +90,19 @@ impl SyncSide {
             Self::Remote => "remote",
         }
     }
+
+    fn domain_keep(self) -> domain::Resolution {
+        match self {
+            Self::Local => domain::Resolution::KeepLocal,
+            Self::Remote => domain::Resolution::KeepRemote,
+        }
+    }
 }
 
 /// Exit codes are part of the Managed Sync CLI contract: `0` valid, `3`
 /// unbound, `4` invalid binding, `1` argument or unexpected error.
 const EXIT_UNBOUND: u8 = 3;
+const EXIT_INVALID_BINDING: u8 = 4;
 
 /// The versioned status document consumed by operators and acceptance tests.
 ///
@@ -109,34 +121,7 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
-    pub const SCHEMA: &'static str = "yinyang.sync.status.v1";
-
-    /// A schema-valid document for a state directory that is not yet bound.
-    fn unbound(state_directory: &Path) -> Self {
-        Self {
-            schema: Self::SCHEMA.to_owned(),
-            binding: BindingStatus {
-                state: BindingState::Unbound,
-                state_directory: state_directory.display().to_string(),
-                root: None,
-                filesystem: None,
-                same_filesystem: None,
-            },
-            remote: RemoteStatus {
-                availability: RemoteAvailability::NotChecked,
-                revision: None,
-                error: None,
-            },
-            local: LocalStatus {
-                scan: LocalScanState::NotScanned,
-                error: None,
-            },
-            summary: StatusSummary::default(),
-            entries: Vec::new(),
-            conflicts: Vec::new(),
-            artifacts: Vec::new(),
-        }
-    }
+    const SCHEMA: &'static str = "yinyang.sync.status.v1";
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -149,7 +134,6 @@ pub struct BindingStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingState {
     Unbound,
@@ -165,7 +149,6 @@ pub struct RemoteStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAvailability {
     NotChecked,
@@ -180,7 +163,6 @@ pub struct LocalStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalScanState {
     NotScanned,
@@ -189,7 +171,7 @@ pub enum LocalScanState {
     Failed,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct StatusSummary {
     pub in_sync: bool,
     pub pending: u64,
@@ -214,7 +196,6 @@ pub struct SyncEntry {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryState {
     InSync,
@@ -246,7 +227,6 @@ pub struct RemoteEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
@@ -254,7 +234,6 @@ pub enum EntryKind {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum Presence {
     Present,
@@ -278,7 +257,6 @@ pub struct IntentStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentOperation {
     Content,
@@ -290,7 +268,6 @@ pub enum IntentOperation {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentState {
     Prepared,
@@ -308,7 +285,6 @@ pub struct OutcomeStatus {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeState {
     Pending,
@@ -345,7 +321,6 @@ pub struct ConflictRecord {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictSide {
     CurrentFile,
@@ -367,7 +342,6 @@ pub struct ArtifactRecord {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     ReplacedFile,
@@ -378,7 +352,6 @@ pub enum ArtifactKind {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
-#[allow(dead_code)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactPhase {
     Preparing,
@@ -400,22 +373,22 @@ pub async fn run(
             .unwrap_or(Path::new("."))
             .join(&config.staging);
     }
-    admit(&config)?;
+    let operator = admit(&config)?;
     match command {
-        SyncCommand::Status { json } => status(&config, json).await,
-        SyncCommand::Init { directory } => init(&config, &directory).await,
-        SyncCommand::Run => reconcile(&config).await,
+        SyncCommand::Status { json } => status(&config, operator, json).await,
+        SyncCommand::Init { directory } => init(&config, operator, &directory).await,
+        SyncCommand::Run => reconcile(&config, operator).await,
         SyncCommand::Export {
             artifact,
             conflict,
             side,
             output,
-        } => export(&config, artifact, conflict, side, &output).await,
+        } => export(&config, operator, artifact, conflict, side, &output).await,
         SyncCommand::Resolve {
             conflict,
             keep,
             content,
-        } => resolve(&config, &conflict, keep, content.as_deref()).await,
+        } => resolve(&config, operator, &conflict, keep, content.as_deref()).await,
     }
 }
 
@@ -437,10 +410,9 @@ fn operator() -> Result<opendal::Operator, opendal::Error> {
     opendal::Operator::via_iter("s3", config)
 }
 
-/// Applies the same four-layer admission as every other volume command.
-fn admit(config: &VolumeConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // `VolumeConfig::validate` admits every supported mode; the sync frontend
-    // must additionally pin the exact Managed + Sync combination it implements.
+/// Applies the same four-layer admission as every other volume command, then
+/// pins the exact Managed + Sync combination this frontend implements.
+fn admit(config: &VolumeConfig) -> Result<opendal::Operator, Box<dyn std::error::Error>> {
     if config.model != Model::Managed || config.access != Access::Sync {
         return Err(format!(
             "managed sync requires a Managed volume with access=sync, found model={:?} access={:?}",
@@ -450,48 +422,84 @@ fn admit(config: &VolumeConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
     let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
     config.validate(&operator)?;
-    Ok(())
+    Ok(operator)
 }
 
-async fn status(config: &VolumeConfig, json: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // Unbound is observable from the local state directory alone, so status
-    // stays offline and never needs the authority.
-    if !config.staging.is_dir() {
-        let document = SyncStatus::unbound(&config.staging);
-        emit(&document, json)?;
-        return Ok(ExitCode::from(EXIT_UNBOUND));
-    }
-    let inspection = manager::inspect(config).await?;
-    emit(&inspection.status, json)?;
-    Ok(ExitCode::from(inspection.exit))
+fn token() -> Option<String> {
+    std::env::var("YINYANG_SERVICE_TOKEN").ok()
+}
+
+/// Connects the configured publication authority, if it is reachable.
+async fn connect(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+) -> Result<std::sync::Arc<dyn Authority>, Box<dyn std::error::Error>> {
+    Ok(Volume::connect(config, operator, token()).await?)
+}
+
+async fn status(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+    json: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // Classify the local binding without touching the authority, so an unbound
+    // or invalid binding stays offline and never blocks on remote I/O.
+    let local = DirectorySync::inspect_local(&config.staging, None).await?;
+    let inspection = match local.binding.state {
+        domain::BindingState::Bound => match connect(config, operator).await {
+            Ok(authority) => DirectorySync::inspect(authority, &config.staging).await?,
+            Err(error) => {
+                DirectorySync::inspect_local(&config.staging, Some(error.to_string())).await?
+            }
+        },
+        _ => local,
+    };
+    let code = match inspection.binding.state {
+        domain::BindingState::Unbound => EXIT_UNBOUND,
+        domain::BindingState::Bound => 0,
+        domain::BindingState::Error => EXIT_INVALID_BINDING,
+    };
+    emit(&project(&inspection)?, json)?;
+    Ok(ExitCode::from(code))
 }
 
 async fn init(
     config: &VolumeConfig,
+    operator: opendal::Operator,
     directory: &Path,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    manager::init(config, directory).await?;
+    let authority = connect(config, operator).await?;
+    DirectorySync::init(authority, &config.staging, directory).await?;
+    println!(
+        "sync bound {} to state {}",
+        directory.display(),
+        config.staging.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
-async fn reconcile(config: &VolumeConfig) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    manager::reconcile(config).await?;
+async fn reconcile(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let authority = connect(config, operator).await?;
+    let mut directory = DirectorySync::open(authority, &config.staging).await?;
+    let outcome = directory.run().await?;
+    report(&outcome)?;
     Ok(ExitCode::SUCCESS)
 }
 
 async fn export(
     config: &VolumeConfig,
+    operator: opendal::Operator,
     artifact: Option<String>,
     conflict: Option<String>,
     side: Option<SyncSide>,
     output: &Path,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let selector = match (artifact, conflict) {
-        (Some(artifact), None) => manager::Export::artifact(artifact),
-        (None, Some(conflict)) => {
-            let side = side.ok_or("--conflict requires --side local|remote")?;
-            manager::Export::conflict(conflict, side.as_str())
-        }
+    let side = match (&artifact, &conflict) {
+        (Some(_), None) => None,
+        (None, Some(_)) => Some(side.ok_or("--conflict requires --side local|remote")?),
         (Some(_), Some(_)) => {
             return Err("--artifact and --conflict are mutually exclusive".into());
         }
@@ -499,19 +507,45 @@ async fn export(
             return Err("export requires exactly one of --artifact or --conflict".into());
         }
     };
-    manager::export(config, selector, output).await?;
+    let authority = connect(config, operator).await?;
+    let directory = DirectorySync::open(authority, &config.staging).await?;
+    let mut file = std::fs::File::create(output)
+        .map_err(|error| format!("create export {}: {error}", output.display()))?;
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = if let Some(id) = &artifact {
+        directory.export_artifact(id, &mut file)
+    } else {
+        directory
+            .export_conflict_side(
+                conflict.as_deref().expect("conflict selector present"),
+                side.expect("conflict side present").as_str(),
+                &mut file,
+            )
+            .await
+    };
+    drop(file);
+    if let Err(error) = result {
+        // A failed export must not leave a pseudo artifact behind.
+        let _ = std::fs::remove_file(output);
+        return Err(error);
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 async fn resolve(
     config: &VolumeConfig,
+    operator: opendal::Operator,
     conflict: &str,
     keep: Option<SyncSide>,
     content: Option<&Path>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let decision = match (keep, content) {
-        (Some(side), None) => manager::Resolution::keep(side.as_str()),
-        (None, Some(path)) => manager::Resolution::content(path),
+        (Some(side), None) => side.domain_keep(),
+        (None, Some(path)) => {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|error| format!("read resolution content {}: {error}", path.display()))?;
+            domain::Resolution::Content(bytes)
+        }
         (Some(_), Some(_)) => {
             return Err("--keep and --content are mutually exclusive".into());
         }
@@ -519,8 +553,291 @@ async fn resolve(
             return Err("resolve requires exactly one of --keep or --content".into());
         }
     };
-    manager::resolve(config, conflict, decision).await?;
+    let authority = connect(config, operator).await?;
+    let mut directory = DirectorySync::open(authority, &config.staging).await?;
+    let outcome = directory.resolve(conflict, decision).await?;
+    report(&outcome)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// A finite reconciliation may legitimately end with work still pending (for
+/// example, an observed v1 completion with a newer local v2). Only an
+/// unresolved `Unknown` outcome — a possibly published request with no receipt
+/// — must fail so the operator retries instead of treating it as lost.
+fn report(outcome: &domain::RunOutcome) -> Result<(), Box<dyn std::error::Error>> {
+    if outcome.unknown > 0 {
+        return Err(format!(
+            "{} sync outcome(s) are unknown; a request may still publish — inspect `sync status` and retry",
+            outcome.unknown
+        )
+        .into());
+    }
+    println!(
+        "sync: published {} materialized {} pending {} conflicts {} in-sync {}",
+        outcome.published_local,
+        outcome.materialized_remote,
+        outcome.pending,
+        outcome.conflicts.len(),
+        outcome.in_sync,
+    );
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn project(inspection: &domain::Inspection) -> Result<SyncStatus, String> {
+    let entries = inspection
+        .entries
+        .iter()
+        .map(|entry| project_entry(entry, &inspection.conflicts))
+        .collect::<Result<Vec<_>, _>>()?;
+    let conflicts = inspection
+        .conflicts
+        .iter()
+        .map(project_conflict)
+        .collect::<Vec<_>>();
+    let artifacts = inspection
+        .artifacts
+        .iter()
+        .map(|artifact| project_artifact(artifact, &inspection.binding.state_directory))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SyncStatus {
+        schema: SyncStatus::SCHEMA.to_owned(),
+        binding: project_binding(&inspection.binding),
+        remote: project_remote(&inspection.remote),
+        local: project_local(&inspection.local),
+        summary: StatusSummary {
+            in_sync: inspection.summary.in_sync,
+            pending: inspection.summary.pending,
+            unknown: inspection.summary.unknown,
+            conflicts: inspection.summary.conflicts,
+            failed: inspection.summary.failed,
+            retained_artifacts: inspection.summary.retained_artifacts,
+        },
+        entries,
+        conflicts,
+        artifacts,
+    })
+}
+
+fn project_binding(binding: &domain::BindingEvidence) -> BindingStatus {
+    BindingStatus {
+        state: match binding.state {
+            domain::BindingState::Unbound => BindingState::Unbound,
+            domain::BindingState::Bound => BindingState::Bound,
+            domain::BindingState::Error => BindingState::Error,
+        },
+        state_directory: binding.state_directory.display().to_string(),
+        root: binding.root.as_ref().map(|root| root.display().to_string()),
+        filesystem: binding.volume.map(|volume| hex(volume.as_bytes())),
+        same_filesystem: binding.same_volume,
+    }
+}
+
+fn project_remote(remote: &domain::RemoteStatus) -> RemoteStatus {
+    RemoteStatus {
+        availability: match remote.availability {
+            domain::RemoteAvailability::NotChecked => RemoteAvailability::NotChecked,
+            domain::RemoteAvailability::Available => RemoteAvailability::Available,
+            domain::RemoteAvailability::Unavailable => RemoteAvailability::Unavailable,
+        },
+        revision: remote.revision.map(|revision| hex(&revision.to_bytes())),
+        error: remote.error.clone(),
+    }
+}
+
+fn project_local(local: &domain::LocalStatus) -> LocalStatus {
+    LocalStatus {
+        scan: match local.scan {
+            domain::LocalScanState::NotScanned => LocalScanState::NotScanned,
+            domain::LocalScanState::Clean => LocalScanState::Clean,
+            domain::LocalScanState::Changed => LocalScanState::Changed,
+            domain::LocalScanState::Failed => LocalScanState::Failed,
+        },
+        error: local.error.clone(),
+    }
+}
+
+fn project_entry(
+    entry: &domain::EntryEvidence,
+    conflicts: &[domain::Conflict],
+) -> Result<SyncEntry, String> {
+    let conflict = entry
+        .conflict
+        .as_deref()
+        .and_then(|id| conflicts.iter().find(|conflict| conflict.id == id))
+        .map(project_entry_conflict);
+    Ok(SyncEntry {
+        path: entry.path.clone(),
+        original_path: entry.original_path.clone(),
+        desired_path: entry.desired_path.clone(),
+        state: match entry.state {
+            domain::EntryState::InSync => EntryState::InSync,
+            domain::EntryState::LocalPending => EntryState::LocalPending,
+            domain::EntryState::RemotePending => EntryState::RemotePending,
+            domain::EntryState::Conflict => EntryState::Conflict,
+            domain::EntryState::Unknown => EntryState::Unknown,
+            domain::EntryState::Failed => EntryState::Failed,
+        },
+        local: project_local_evidence(&entry.local),
+        remote: project_remote_evidence(&entry.remote),
+        baseline: BaselineEvidence {
+            node: entry.baseline.node.map(|node| hex(node.as_bytes())),
+            revision: entry
+                .baseline
+                .revision
+                .map(|revision| hex(&revision.to_bytes())),
+        },
+        intent: IntentStatus {
+            id: entry.intent.id.map(|id| hex(&id)),
+            operation: entry.intent.operation.map(|operation| match operation {
+                domain::IntentOperation::Content => IntentOperation::Content,
+                domain::IntentOperation::CreateFile => IntentOperation::CreateFile,
+                domain::IntentOperation::CreateDirectory => IntentOperation::CreateDirectory,
+                domain::IntentOperation::Remove => IntentOperation::Remove,
+                domain::IntentOperation::Rename => IntentOperation::Rename,
+                domain::IntentOperation::SetExecutable => IntentOperation::SetExecutable,
+            }),
+            state: entry.intent.state.map(|state| match state {
+                domain::IntentState::Prepared => IntentState::Prepared,
+                domain::IntentState::Unknown => IntentState::Unknown,
+                domain::IntentState::Committed => IntentState::Committed,
+                domain::IntentState::Conflict => IntentState::Conflict,
+                domain::IntentState::Retryable => IntentState::Retryable,
+                domain::IntentState::Failed => IntentState::Failed,
+            }),
+            commit_id: entry.intent.commit_id.map(|commit| hex(commit.as_bytes())),
+            receipt_revision: entry
+                .intent
+                .receipt_revision
+                .map(|revision| hex(&revision.to_bytes())),
+        },
+        outcome: OutcomeStatus {
+            state: match entry.outcome.state {
+                domain::OutcomeState::Pending => OutcomeState::Pending,
+                domain::OutcomeState::RemoteCompleted => OutcomeState::RemoteCompleted,
+                domain::OutcomeState::Conflict => OutcomeState::Conflict,
+                domain::OutcomeState::Unknown => OutcomeState::Unknown,
+                domain::OutcomeState::Retryable => OutcomeState::Retryable,
+                domain::OutcomeState::Failed => OutcomeState::Failed,
+                domain::OutcomeState::None => OutcomeState::None,
+            },
+            error: entry.outcome.error.clone(),
+        },
+        conflict,
+    })
+}
+
+fn project_local_evidence(local: &domain::LocalEvidence) -> LocalEvidence {
+    LocalEvidence {
+        kind: local.kind.map(|kind| match kind {
+            domain::EntryKind::File => EntryKind::File,
+            domain::EntryKind::Directory => EntryKind::Directory,
+        }),
+        length: local.length,
+        digest: local.digest.map(|digest| hex(&digest)),
+        executable: local.executable,
+        presence: match local.presence {
+            domain::Presence::Present => Presence::Present,
+            domain::Presence::Absent => Presence::Absent,
+            domain::Presence::Unknown => Presence::Unknown,
+        },
+    }
+}
+
+fn project_remote_evidence(remote: &domain::RemoteEvidence) -> RemoteEvidence {
+    RemoteEvidence {
+        kind: remote.kind.map(|kind| match kind {
+            domain::EntryKind::File => EntryKind::File,
+            domain::EntryKind::Directory => EntryKind::Directory,
+        }),
+        length: remote.length,
+        digest: remote.digest.map(|digest| hex(&digest)),
+        executable: remote.executable,
+        presence: match remote.presence {
+            domain::Presence::Present => Presence::Present,
+            domain::Presence::Absent => Presence::Absent,
+            domain::Presence::Unknown => Presence::Unknown,
+        },
+        node: remote.node.map(|node| hex(node.as_bytes())),
+        revision: remote.revision.map(|revision| hex(&revision.to_bytes())),
+    }
+}
+
+fn project_entry_conflict(conflict: &domain::Conflict) -> EntryConflict {
+    EntryConflict {
+        id: conflict.id.clone(),
+        local: conflict_side(&conflict.local),
+        remote: conflict_side(&conflict.remote),
+        local_artifact: conflict.local_artifact.clone(),
+        // The domain record exposes the remote node identity, not a retained
+        // remote artifact; the schema keeps the field present and null.
+        remote_artifact: None,
+        remote_revision: conflict.remote_revision.map(|revision| hex(&revision)),
+    }
+}
+
+fn project_conflict(conflict: &domain::Conflict) -> ConflictRecord {
+    ConflictRecord {
+        id: conflict.id.clone(),
+        path: conflict.path.clone(),
+        original_path: conflict.original_path.clone(),
+        desired_path: conflict.desired_path.clone(),
+        local: conflict_side(&conflict.local),
+        remote: conflict_side(&conflict.remote),
+        local_artifact: conflict.local_artifact.clone(),
+        remote_artifact: None,
+        remote_revision: conflict.remote_revision.map(|revision| hex(&revision)),
+        error: conflict.error.clone(),
+    }
+}
+
+fn conflict_side(side: &str) -> ConflictSide {
+    match side {
+        "current_file" => ConflictSide::CurrentFile,
+        "current_directory" => ConflictSide::CurrentDirectory,
+        "retained_artifact" => ConflictSide::RetainedArtifact,
+        "deleted" => ConflictSide::Deleted,
+        _ => ConflictSide::Unknown,
+    }
+}
+
+fn project_artifact(artifact: &domain::Artifact, state: &Path) -> Result<ArtifactRecord, String> {
+    let kind = match artifact.kind.as_str() {
+        "replaced-file" => ArtifactKind::ReplacedFile,
+        "rollback-displaced" => ArtifactKind::RollbackDisplaced,
+        "quarantined-file" => ArtifactKind::QuarantinedFile,
+        "quarantined-directory" => ArtifactKind::QuarantinedDirectory,
+        "upload-retained" => ArtifactKind::UploadRetained,
+        other => return Err(format!("unknown retained artifact kind {other:?}")),
+    };
+    let phase = match artifact.phase.as_str() {
+        "preparing" => ArtifactPhase::Preparing,
+        "prepared" => ArtifactPhase::Prepared,
+        "moved" => ArtifactPhase::Moved,
+        "retained" => ArtifactPhase::Retained,
+        "conflict" => ArtifactPhase::Conflict,
+        "failed" => ArtifactPhase::Failed,
+        other => return Err(format!("unknown retained artifact phase {other:?}")),
+    };
+    Ok(ArtifactRecord {
+        id: artifact.id.clone(),
+        origin: artifact.origin.clone(),
+        kind,
+        phase,
+        // Retained bytes live under the state directory's quarantine. The
+        // domain record exposes the file name; the adapter composes the public
+        // path the operator and export use.
+        path: state
+            .join("quarantine")
+            .join(&artifact.name)
+            .display()
+            .to_string(),
+        exportable: kind != ArtifactKind::QuarantinedDirectory,
+        error: artifact.error.clone(),
+    })
 }
 
 /// Writes the status projection, propagating serialization or stdout failure
@@ -547,91 +864,4 @@ fn emit(document: &SyncStatus, json: bool) -> Result<(), Box<dyn std::error::Err
         )?;
     }
     Ok(())
-}
-
-/// Boundary between the CLI adapter and the library's reconciliation contract.
-///
-/// The replica and sync modules own the durable binding, local installation and
-/// baseline-bound reconciliation. This adapter contributes argument shapes,
-/// admission, exit codes and the status projection; the functions below are the
-/// single place that has to be wired to that public API.
-mod manager {
-    use super::SyncStatus;
-    use std::path::Path;
-    use yinyang::volume::VolumeConfig;
-
-    pub struct Inspection {
-        pub status: SyncStatus,
-        /// `0` for a valid bound state, `4` for an invalid binding.
-        pub exit: u8,
-    }
-
-    #[allow(dead_code)]
-    pub enum Export {
-        Artifact(String),
-        Conflict(String, String),
-    }
-
-    impl Export {
-        pub fn artifact(id: String) -> Self {
-            Self::Artifact(id)
-        }
-
-        pub fn conflict(id: String, side: &str) -> Self {
-            Self::Conflict(id, side.to_owned())
-        }
-    }
-
-    #[allow(dead_code)]
-    pub enum Resolution {
-        Keep(String),
-        Content(std::path::PathBuf),
-    }
-
-    impl Resolution {
-        pub fn keep(side: &str) -> Self {
-            Self::Keep(side.to_owned())
-        }
-
-        pub fn content(path: &Path) -> Self {
-            Self::Content(path.to_owned())
-        }
-    }
-
-    fn unwired<T>() -> Result<T, String> {
-        Err(
-            "managed sync reconciliation is not wired to the library yet; the replica/sync \
-             modules must expose a read-only binding probe plus baseline-bound init, run, export \
-             and resolve entry points returning yinyang.sync.status.v1"
-                .to_owned(),
-        )
-    }
-
-    pub async fn inspect(_config: &VolumeConfig) -> Result<Inspection, String> {
-        unwired()
-    }
-
-    pub async fn init(_config: &VolumeConfig, _directory: &Path) -> Result<(), String> {
-        unwired()
-    }
-
-    pub async fn reconcile(_config: &VolumeConfig) -> Result<(), String> {
-        unwired()
-    }
-
-    pub async fn export(
-        _config: &VolumeConfig,
-        _selector: Export,
-        _output: &Path,
-    ) -> Result<(), String> {
-        unwired()
-    }
-
-    pub async fn resolve(
-        _config: &VolumeConfig,
-        _conflict: &str,
-        _decision: Resolution,
-    ) -> Result<(), String> {
-        unwired()
-    }
 }
