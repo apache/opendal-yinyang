@@ -47,6 +47,9 @@ tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync
 uuid.workspace = true
 yinyang-core = { path = "crates/core" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [workspace]
 members = [".", "crates/core", "crates/native", "xtask"]
 resolver = "3"

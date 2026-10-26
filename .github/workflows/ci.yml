@@ -142,6 +142,49 @@ jobs:
             docker logs yinyang-silo
           fi
 
+  linux-fuse:
+    name: Linux FUSE acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      YINYANG_S3_BUCKET: yinyang-test
+      YINYANG_S3_ENDPOINT: http://127.0.0.1:9000
+      YINYANG_S3_REGION: us-east-1
+      YINYANG_S3_ACCESS_KEY_ID: yinyang-test
+      YINYANG_S3_SECRET_ACCESS_KEY: yinyang-test-only
+      YINYANG_STORAGE_PROFILE: minio
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show FUSE device
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          ls -l /dev/fuse
+
+      - name: Start isolated S3-compatible storage
+        run: |
+          docker run -d --name yinyang-linux-fuse-silo -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=yinyang-test -e MINIO_ROOT_PASSWORD=yinyang-test-only \
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then break; fi
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:9000/minio/health/ready
+          docker exec yinyang-linux-fuse-silo mcli alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
+          docker exec yinyang-linux-fuse-silo mcli mb local/yinyang-test
+
+      - name: Run real Linux FUSE acceptance
+        run: cargo x test-linux-fuse
+
+      - name: Show storage logs on failure
+        if: failure()
+        run: |
+          if docker container inspect yinyang-linux-fuse-silo > /dev/null 2>&1; then
+            docker logs yinyang-linux-fuse-silo
+          fi
+
   required:
     name: Required
     runs-on: ubuntu-24.04
@@ -152,6 +195,7 @@ jobs:
       - test
       - compliance
       - s3
+      - linux-fuse
     steps:
       - name: Guardian
         run: |
@@ -161,6 +205,7 @@ jobs:
               && "${{ needs.test.result }}" == "success" \
               && "${{ needs.compliance.result }}" == "success" \
               && "${{ needs.s3.result }}" == "success" \
+              && "${{ needs.linux-fuse.result }}" == "success" \
               ) ]]; then
             echo "Required jobs haven't been completed successfully."
             exit 1
