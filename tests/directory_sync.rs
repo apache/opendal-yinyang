@@ -828,3 +828,195 @@ async fn local_deletion_during_delayed_publication_receipt_stays_pending() {
     );
     assert_eq!(local_tree(&root), remote);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn namespace_only_rename_receipt_keeps_interleaved_content() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("payload");
+    let state = temp.path().join("state");
+    let dir = root.join("dir");
+    let file = dir.join("file");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&file, b"v1").unwrap();
+
+    // A common baseline for the directory subtree first.
+    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
+        .await
+        .unwrap();
+    let first = sync.run().await.unwrap();
+    assert_eq!(first.published_local, 2);
+    assert!(first.conflicts.is_empty());
+    assert_eq!(local_tree(&root), remote_tree(&authority).await);
+    drop(sync);
+
+    // The next run renames the directory locally while the remote is observed
+    // unchanged, then parks the rename commit before it executes.
+    std::fs::rename(&dir, root.join("moved")).unwrap();
+    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = Arc::new(HeldAuthority::new_before_commit(
+        authority.clone(),
+        committed_tx,
+        release.clone(),
+    ));
+    let mut sync = DirectorySync::open(held.clone(), &state).await.unwrap();
+    let run = sync.run();
+    let writer = async {
+        committed_rx
+            .recv()
+            .await
+            .expect("the rename commit must reach the pre-commit barrier");
+        // The interleaved content edit goes through the independent raw
+        // authority while the namespace-only rename is parked. The rename
+        // predicates guard links and entries, never the inner file content.
+        let external = tempfile::tempdir().unwrap();
+        let seed = Sync::open(authority.clone(), external.path().join("seed"))
+            .await
+            .unwrap();
+        let baseline = authority.observe_latest().await.unwrap();
+        let file = baseline.resolve("dir/file").await.unwrap().unwrap().id();
+        assert_eq!(
+            baseline
+                .open_file(file)
+                .await
+                .unwrap()
+                .read(0, 64)
+                .await
+                .unwrap(),
+            b"v1",
+            "the run must observe the remote unchanged before the interleave"
+        );
+        let edit = seed
+            .stage(
+                file,
+                baseline.revision(),
+                &mut &b"v2-was-never-seen-locally"[..],
+            )
+            .await
+            .unwrap();
+        seed.publish(edit).await.unwrap();
+        release.notify_one();
+    };
+    let run_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(run, writer)
+    })
+    .await
+    .expect("the interleaved rename run must finish within the timeout")
+    .0;
+
+    if let Ok(outcome) = &run_result {
+        // Core invariant: in_sync may only ever claim byte-identical real
+        // trees, so the namespace rename receipt cannot fold the unobserved
+        // v2 into a common baseline with the local v1.
+        assert_eq!(
+            outcome.in_sync,
+            local_tree(&root) == remote_tree(&authority).await,
+            "in_sync must imply identical real trees"
+        );
+        assert!(
+            remote_tree(&authority).await.get("dir").is_none(),
+            "the accepted rename must move the directory out of the old name"
+        );
+        assert_eq!(
+            remote_tree(&authority).await["moved/file"],
+            TreeEntry::File {
+                executable: false,
+                bytes: b"v2-was-never-seen-locally".to_vec(),
+            },
+            "the namespace rename receipt must not swallow the interleaved external content"
+        );
+    } else {
+        // A legal core conflict retains both sides: the external bytes stay
+        // remote under one of the two names and the local v1 stays put.
+        let external = TreeEntry::File {
+            executable: false,
+            bytes: b"v2-was-never-seen-locally".to_vec(),
+        };
+        let remote = remote_tree(&authority).await;
+        assert!(
+            remote.get("dir/file") == Some(&external)
+                || remote.get("moved/file") == Some(&external),
+            "the interleaved external bytes must be retained"
+        );
+        assert_eq!(
+            local_tree(&root)["moved/file"],
+            TreeEntry::File {
+                executable: false,
+                bytes: b"v1".to_vec(),
+            },
+            "the local v1 must be retained on a legal conflict"
+        );
+    }
+
+    // After the namespace receipt, the machine either converges the subtree
+    // to the interleaved v2 or keeps a legal conflict; it may never report in
+    // sync while the real trees still differ.
+    let mut legal_conflict = run_result.is_err();
+    for _ in 0..8 {
+        let local = local_tree(&root);
+        let remote = remote_tree(&authority).await;
+        if local == remote {
+            break;
+        }
+        match sync.run().await {
+            Ok(outcome) => {
+                legal_conflict |= !outcome.conflicts.is_empty();
+                assert_eq!(
+                    outcome.in_sync,
+                    local_tree(&root) == remote_tree(&authority).await,
+                    "in_sync must imply identical real trees"
+                );
+            }
+            Err(_) => legal_conflict = true,
+        }
+    }
+    let local = local_tree(&root);
+    let remote = remote_tree(&authority).await;
+    if !legal_conflict {
+        assert_eq!(
+            local, remote,
+            "the moved subtree must converge to the interleaved external content"
+        );
+        assert_eq!(
+            local["moved/file"],
+            TreeEntry::File {
+                executable: false,
+                bytes: b"v2-was-never-seen-locally".to_vec(),
+            }
+        );
+        assert!(local.get("dir").is_none());
+        let stable = sync.run().await.unwrap();
+        assert_eq!(stable.published_local, 0);
+        assert_eq!(stable.materialized_remote, 0);
+        assert!(stable.conflicts.is_empty());
+        assert!(
+            stable.in_sync,
+            "the converged renamed subtree must report in sync"
+        );
+        assert_eq!(local_tree(&root), remote_tree(&authority).await);
+    } else {
+        let external = TreeEntry::File {
+            executable: false,
+            bytes: b"v2-was-never-seen-locally".to_vec(),
+        };
+        assert_eq!(
+            local["moved/file"],
+            TreeEntry::File {
+                executable: false,
+                bytes: b"v1".to_vec(),
+            },
+            "local v1 must survive a legal conflict"
+        );
+        assert!(
+            remote.get("dir/file") == Some(&external)
+                || remote.get("moved/file") == Some(&external),
+            "the interleaved external bytes must be retained on a legal conflict"
+        );
+    }
+}
