@@ -26,8 +26,6 @@ test "$#" -gt 0
 . "$HOME/.cargo/env"
 state="$HOME/.local/state/yinyang-devbox"
 mkdir -p "$state/runs"
-exec 9> "$state/validation.lock"
-flock -n 9
 log="$state/runs/$label"
 test ! -e "$log.log"
 exec > >(tee "$log.log") 2>&1
@@ -38,6 +36,10 @@ finish() {
 }
 trap finish EXIT
 date -Is
+printf 'Waiting for the shared validation slot (up to 30 minutes).\n'
+exec 9> "$state/validation.lock"
+flock -w 1800 9
+printf 'Validation slot acquired.\n'
 git rev-parse HEAD
 git status --short
 printf 'Command:'
