@@ -11,8 +11,13 @@ Do not mix private library handles into this staging directory.
 writes from other references immediately after local acceptance. Writes,
 truncate, append and fsync are serialized per node; append chooses its offset
 under the same lock. Different nodes do not share an I/O lock. Initial
-materialization, refresh and reclaim serialize through the instance node map.
-Both read-only and writable references currently use full-file staging.
+materialization is serialized per NodeId by a short-lived open gate, and the
+instance node map is not held during a remote observation or staging read.
+Different nodes can therefore complete their first opens independently. Refresh
+and reclaim use the map for lookup and reference accounting; data-plane calls
+keep per-node locks. Cancelling a first open releases its gate; an incomplete
+local open is never exposed and is discarded when staging is reopened. Both
+read-only and writable references currently use full-file staging.
 
 Dropping a reference performs no I/O and never publishes or deletes data.
 `reclaim` rejects referenced, pending, frozen or failed nodes. Clean unreferenced

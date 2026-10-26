@@ -18,11 +18,78 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::{future::Future, pin::Pin};
 use support::TestBackend;
+use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, Fs};
+use yinyang::core::{
+    Authority, BackendProfile, CommitOutcome, DataStore, Fs, NodeId, Revision, Snapshot,
+    Transaction,
+};
 use yinyang::mount::Mount;
 use yinyang::runtime::{ErrorKind, Runtime};
+
+struct PausingObserveAuthority {
+    inner: Arc<dyn Authority>,
+    entered: Semaphore,
+    release: Semaphore,
+    pause_next_observe: AtomicBool,
+}
+impl PausingObserveAuthority {
+    fn new(inner: Arc<dyn Authority>) -> Self {
+        Self {
+            inner,
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            pause_next_observe: AtomicBool::new(false),
+        }
+    }
+    fn pause_next_observe(&self) {
+        self.pause_next_observe.store(true, Ordering::SeqCst);
+    }
+}
+impl std::fmt::Debug for PausingObserveAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PausingObserveAuthority")
+            .finish_non_exhaustive()
+    }
+}
+impl Authority for PausingObserveAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+    fn observe_latest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        Box::pin(async move {
+            if self.pause_next_observe.swap(false, Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.inner.observe_latest().await
+        })
+    }
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_revision(revision)
+    }
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
+        self.inner.commit_batch(requests)
+    }
+}
 
 async fn exercise(authority: Arc<dyn Authority>) {
     let temp = tempfile::tempdir().unwrap();
@@ -237,4 +304,107 @@ async fn flush_publishes_but_reference_release_does_not() {
     assert!(mount.node_status(pending).await.unwrap().is_some());
     mount.reclaim(pending).await.unwrap();
     assert!(mount.node_status(pending).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn independent_node_opens_do_not_share_the_namespace_lock() {
+    let backend = TestBackend::default();
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let setup_temp = tempfile::tempdir().unwrap();
+    let setup = Runtime::open(inner.clone(), setup_temp.path())
+        .await
+        .unwrap();
+    let (a, _) = setup
+        .create_file_with_node(inner.root(), "a", false)
+        .await
+        .unwrap();
+    let (b, _) = setup
+        .create_file_with_node(inner.root(), "b", false)
+        .await
+        .unwrap();
+    drop(setup);
+
+    let pausing = Arc::new(PausingObserveAuthority::new(inner));
+    let authority: Arc<dyn Authority> = pausing.clone();
+    let mount_temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority, mount_temp.path(), false)
+        .await
+        .unwrap();
+    pausing.pause_next_observe();
+    let a_task = {
+        let mount = mount.clone();
+        tokio::spawn(async move { mount.open_node(a, false).await })
+    };
+    pausing.entered.acquire().await.unwrap().forget();
+    let mut b_task = {
+        let mount = mount.clone();
+        tokio::spawn(async move { mount.open_node(b, false).await })
+    };
+    let b_file = tokio::time::timeout(Duration::from_secs(5), &mut b_task)
+        .await
+        .expect("opening an independent node waited for another node's remote observation")
+        .unwrap()
+        .unwrap();
+    drop(b_file);
+    let a_second = {
+        let mount = mount.clone();
+        tokio::spawn(async move { mount.open_node(a, false).await })
+    };
+
+    pausing.release.add_permits(1);
+    let a_file = a_task.await.unwrap().unwrap();
+    let a_second = a_second.await.unwrap().unwrap();
+    assert_eq!(
+        a_file.status().await.unwrap().id,
+        a_second.status().await.unwrap().id
+    );
+    drop(a_second);
+    drop(a_file);
+    assert!(mount.node_status(a).await.unwrap().is_some());
+    assert!(mount.node_status(b).await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_first_open_releases_the_node_gate() {
+    let backend = TestBackend::default();
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let setup_temp = tempfile::tempdir().unwrap();
+    let setup = Runtime::open(inner.clone(), setup_temp.path())
+        .await
+        .unwrap();
+    let (a, _) = setup
+        .create_file_with_node(inner.root(), "a", false)
+        .await
+        .unwrap();
+    drop(setup);
+
+    let pausing = Arc::new(PausingObserveAuthority::new(inner));
+    let authority: Arc<dyn Authority> = pausing.clone();
+    let mount_temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority, mount_temp.path(), false)
+        .await
+        .unwrap();
+    pausing.pause_next_observe();
+    let cancelled = {
+        let mount = mount.clone();
+        tokio::spawn(async move { mount.open_node(a, false).await })
+    };
+    pausing.entered.acquire().await.unwrap().forget();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+
+    let file = tokio::time::timeout(Duration::from_secs(5), mount.open_node(a, false))
+        .await
+        .expect("cancelled open left the per-node gate claimed")
+        .unwrap();
+    assert!(mount.node_status(a).await.unwrap().is_some());
+    drop(file);
 }

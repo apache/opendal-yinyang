@@ -19,19 +19,47 @@
 use crate::runtime::{Error, ErrorKind, FileHandle, HandleStatus, Result, Runtime, RuntimeStatus};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, Semaphore};
 use yinyang_core::{Authority, NodeId, Receipt};
 
 struct Node {
     handle: Mutex<FileHandle>,
     references: AtomicUsize,
 }
+struct OpenGate {
+    inner: Arc<Inner>,
+    id: NodeId,
+    ready: Arc<Semaphore>,
+}
+impl Drop for OpenGate {
+    fn drop(&mut self) {
+        if let Ok(mut opening) = self.inner.opening.lock() {
+            opening.remove(&self.id);
+        }
+        self.ready.add_permits(1);
+    }
+}
+struct NodeGuard {
+    node: Arc<Node>,
+}
+impl NodeGuard {
+    fn new(node: Arc<Node>) -> Self {
+        node.references.fetch_add(1, Ordering::Relaxed);
+        Self { node }
+    }
+}
+impl Drop for NodeGuard {
+    fn drop(&mut self) {
+        self.node.references.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 struct Inner {
     runtime: Runtime,
     read_only: bool,
     nodes: Mutex<BTreeMap<NodeId, Arc<Node>>>,
+    opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
 }
 /// A mount instance owns one recoverable staged version per node, not per open.
 /// It does not install a mount or manage kernel caches.
@@ -76,6 +104,7 @@ impl Mount {
                 runtime,
                 read_only,
                 nodes: Mutex::new(nodes),
+                opening: StdMutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -88,14 +117,14 @@ impl Mount {
     /// Observe staged metadata for one shared node without opening a reference.
     /// `None` means this mount has no shared handle for the node.
     pub async fn node_status(&self, id: NodeId) -> Result<Option<HandleStatus>> {
-        let node = {
+        let guard = {
             let nodes = self.inner.nodes.lock().await;
-            nodes.get(&id).cloned()
+            nodes.get(&id).cloned().map(NodeGuard::new)
         };
-        let Some(node) = node else {
+        let Some(guard) = guard else {
             return Ok(None);
         };
-        node.handle.lock().await.status().await.map(Some)
+        guard.node.handle.lock().await.status().await.map(Some)
     }
     /// Namespace operations use the same conditional runtime contract. Do not
     /// open private FileHandles through this runtime alongside Mount references.
@@ -106,37 +135,75 @@ impl Mount {
         if writable && self.inner.read_only {
             return Err(Error::State(ErrorKind::ReadOnly, "mount is read-only"));
         }
-        // Serialize first materialization with opens and reclaim. File I/O and
-        // publication use per-node locks, never this namespace lock.
-        let mut nodes = self.inner.nodes.lock().await;
-        let node = match nodes.get(&id) {
-            Some(node) => node.clone(),
-            None => {
-                let handle = self
-                    .inner
-                    .runtime
-                    .open_node(id, !self.inner.read_only)
-                    .await?;
-                let node = Arc::new(Node {
-                    handle: Mutex::new(handle),
-                    references: AtomicUsize::new(0),
-                });
-                nodes.insert(id, node.clone());
-                node
+        loop {
+            let existing = {
+                let nodes = self.inner.nodes.lock().await;
+                nodes.get(&id).map(|node| {
+                    node.references.fetch_add(1, Ordering::Relaxed);
+                    node.clone()
+                })
+            };
+            if let Some(node) = existing {
+                return Ok(MountFile { node, writable });
             }
-        };
-        node.references.fetch_add(1, Ordering::Relaxed);
-        Ok(MountFile { node, writable })
+
+            let (waiting, ready) = {
+                let mut opening = self.inner.opening.lock().map_err(Error::local)?;
+                match opening.get(&id) {
+                    Some(ready) => (true, ready.clone()),
+                    None => {
+                        let ready = Arc::new(Semaphore::new(0));
+                        opening.insert(id, ready.clone());
+                        (false, ready)
+                    }
+                }
+            };
+            if waiting {
+                ready
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::local("mount open coordination closed"))?
+                    .forget();
+                continue;
+            }
+
+            // Only one task materializes a NodeId. The namespace map is not
+            // held across the runtime's remote observation and staging read.
+            let gate = OpenGate {
+                inner: self.inner.clone(),
+                id,
+                ready,
+            };
+            let handle = self
+                .inner
+                .runtime
+                .open_node(id, !self.inner.read_only)
+                .await?;
+            let node = Arc::new(Node {
+                handle: Mutex::new(handle),
+                references: AtomicUsize::new(0),
+            });
+            {
+                let mut nodes = self.inner.nodes.lock().await;
+                nodes.insert(id, node.clone());
+                node.references.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(gate);
+            return Ok(MountFile { node, writable });
+        }
     }
     /// Replace a clean local version with a fresh remote observation. Pending,
     /// frozen or failed versions are never rebased. Adapters must coordinate any
     /// OS cache invalidation outside this call; no OS callbacks run under locks.
     pub async fn refresh(&self, id: NodeId) -> Result<()> {
-        let nodes = self.inner.nodes.lock().await;
-        let Some(node) = nodes.get(&id) else {
+        let guard = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes.get(&id).cloned().map(NodeGuard::new)
+        };
+        let Some(guard) = guard else {
             return Ok(());
         };
-        let mut handle = node.handle.lock().await;
+        let mut handle = guard.node.handle.lock().await;
         let state = handle.status().await?;
         if state.pending || state.frozen || state.error.is_some() {
             return Err(Error::State(
@@ -157,10 +224,13 @@ impl Mount {
     /// Persist every currently staged node remotely. Continue after one failure
     /// so independent nodes can finish; the original failures remain in status.
     pub async fn fsync(&self) -> Result<()> {
-        let nodes: Vec<_> = self.inner.nodes.lock().await.values().cloned().collect();
+        let nodes: Vec<_> = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes.values().cloned().map(NodeGuard::new).collect()
+        };
         let mut failure = None;
-        for node in nodes {
-            if let Err(error) = node.handle.lock().await.fsync().await {
+        for node in &nodes {
+            if let Err(error) = node.node.handle.lock().await.fsync().await {
                 failure.get_or_insert(error);
             }
         }
