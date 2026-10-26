@@ -16,18 +16,24 @@
 // under the License.
 
 //! Finite directory reconciliation on top of the existing Sync intent journal.
+//!
+//! `Sync` owns durable, conditional publication of local intents; this module
+//! owns the common baseline that records the last agreed state of both sides,
+//! drives local installation through `Replica`, and reports truthful,
+//! read-only domain evidence for the adapter to project.
 
-use crate::replica::state::{BaselineRecord, ConflictRecord};
-use crate::replica::{Conflict, LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaStatus};
+use crate::replica::state::{BaselineNode, BaselineRecord, ConflictRecord, WorkRecord};
+use crate::replica::{Artifact, Conflict, LocalKind, LocalNode, LocalSnapshot, Replica};
 use crate::sync::{EditId, FileMetadata, NamespaceState, RenameMode, Sync};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek as _, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use yinyang_core::{Authority, ContentId, Node, NodeId, NodeKind, Revision, Snapshot};
+use yinyang_core::{Authority, CommitId, Node, NodeId, NodeKind, Revision, Snapshot};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + std::marker::Sync>>;
 
+/// The observable result of one finite reconciliation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunOutcome {
     pub revision: Option<Revision>,
@@ -39,10 +45,206 @@ pub struct RunOutcome {
     pub in_sync: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A durable decision for one active conflict.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Resolution {
     KeepLocal,
     KeepRemote,
+    Content(Vec<u8>),
+}
+
+// ---- Read-only domain evidence -------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Presence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryState {
+    InSync,
+    LocalPending,
+    RemotePending,
+    Conflict,
+    Unknown,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentOperation {
+    Content,
+    CreateFile,
+    CreateDirectory,
+    Remove,
+    Rename,
+    SetExecutable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentState {
+    Prepared,
+    Unknown,
+    Committed,
+    Conflict,
+    Retryable,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutcomeState {
+    Pending,
+    RemoteCompleted,
+    Conflict,
+    Unknown,
+    Retryable,
+    Failed,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingState {
+    Unbound,
+    Bound,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteAvailability {
+    NotChecked,
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalScanState {
+    NotScanned,
+    Clean,
+    Changed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingEvidence {
+    pub state: BindingState,
+    pub state_directory: PathBuf,
+    pub root: Option<PathBuf>,
+    pub volume: Option<NodeId>,
+    pub same_volume: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteStatus {
+    pub availability: RemoteAvailability,
+    pub revision: Option<Revision>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStatus {
+    pub scan: LocalScanState,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StatusSummary {
+    pub in_sync: bool,
+    pub pending: u64,
+    pub unknown: u64,
+    pub conflicts: usize,
+    pub failed: u64,
+    pub retained_artifacts: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEvidence {
+    pub kind: Option<EntryKind>,
+    pub length: Option<u64>,
+    pub digest: Option<[u8; 32]>,
+    pub executable: Option<bool>,
+    pub presence: Presence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteEvidence {
+    pub kind: Option<EntryKind>,
+    pub length: Option<u64>,
+    pub digest: Option<[u8; 32]>,
+    pub executable: Option<bool>,
+    pub presence: Presence,
+    pub node: Option<NodeId>,
+    pub revision: Option<Revision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaselineEvidence {
+    pub node: Option<NodeId>,
+    pub revision: Option<Revision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntentEvidence {
+    pub id: Option<[u8; 32]>,
+    pub operation: Option<IntentOperation>,
+    pub state: Option<IntentState>,
+    pub commit_id: Option<CommitId>,
+    pub receipt_revision: Option<Revision>,
+    pub error: Option<String>,
+}
+
+impl Default for IntentEvidence {
+    fn default() -> Self {
+        Self {
+            id: None,
+            operation: None,
+            state: None,
+            commit_id: None,
+            receipt_revision: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutcomeEvidence {
+    pub state: OutcomeState,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntryEvidence {
+    pub path: String,
+    pub original_path: Option<String>,
+    pub desired_path: Option<String>,
+    pub state: EntryState,
+    pub local: LocalEvidence,
+    pub remote: RemoteEvidence,
+    pub baseline: BaselineEvidence,
+    pub intent: IntentEvidence,
+    pub outcome: OutcomeEvidence,
+    pub conflict: Option<String>,
+}
+
+/// Truthful, read-only inspection of one Managed Sync binding. It never
+/// acquires the writer lease, recovers, or writes; it remains usable while a
+/// writer runs and while the remote is unreachable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Inspection {
+    pub binding: BindingEvidence,
+    pub remote: RemoteStatus,
+    pub local: LocalStatus,
+    pub summary: StatusSummary,
+    pub entries: Vec<EntryEvidence>,
+    pub conflicts: Vec<Conflict>,
+    pub artifacts: Vec<Artifact>,
 }
 
 pub struct DirectorySync {
@@ -52,102 +254,308 @@ pub struct DirectorySync {
 
 impl DirectorySync {
     pub async fn open(authority: Arc<dyn Authority>, state: &Path) -> Result<Self> {
-        let replica = Replica::open(state, authority.filesystem())?;
+        let replica = Replica::open(state, authority.volume())?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
     }
 
     pub async fn init(authority: Arc<dyn Authority>, state: &Path, root: &Path) -> Result<Self> {
-        let replica = Replica::init(state, root, authority.filesystem())?;
+        let replica = Replica::init(state, root, authority.volume())?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
     }
 
-    pub fn inspect(state: &Path) -> Result<ReplicaStatus> {
-        Ok(Replica::inspect(state)?)
+    /// Truthful, read-only inspection for the adapter to project. It never
+    /// acquires the writer lease, recovers, or writes, and it works while the
+    /// remote is unreachable.
+    pub async fn inspect(authority: Arc<dyn Authority>, state: &Path) -> Result<Inspection> {
+        let state_directory = std::fs::canonicalize(state).unwrap_or_else(|_| state.to_owned());
+        let unbound = Inspection {
+            binding: BindingEvidence {
+                state: BindingState::Unbound,
+                state_directory: state_directory.clone(),
+                root: None,
+                volume: None,
+                same_volume: None,
+                error: None,
+            },
+            remote: RemoteStatus {
+                availability: RemoteAvailability::NotChecked,
+                revision: None,
+                error: None,
+            },
+            local: LocalStatus {
+                scan: LocalScanState::NotScanned,
+                error: None,
+            },
+            summary: StatusSummary::default(),
+            entries: Vec::new(),
+            conflicts: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        if !state.join("replica.db").exists() {
+            return Ok(unbound);
+        }
+        let status = match Replica::inspect(state) {
+            Ok(status) => status,
+            Err(error) => {
+                return Ok(Inspection {
+                    binding: BindingEvidence {
+                        state: BindingState::Error,
+                        state_directory,
+                        root: None,
+                        volume: Some(authority.volume()),
+                        same_volume: None,
+                        error: Some(error.to_string()),
+                    },
+                    ..unbound
+                });
+            }
+        };
+        let binding = BindingEvidence {
+            state: BindingState::Bound,
+            state_directory,
+            root: Some(status.root.clone()),
+            volume: Some(status.volume),
+            same_volume: Some(true),
+            error: None,
+        };
+
+        let (snapshot, local_status) = match Replica::scan_read_only(state) {
+            Ok(snapshot) => (
+                Some(snapshot),
+                LocalStatus {
+                    scan: LocalScanState::Clean,
+                    error: None,
+                },
+            ),
+            Err(error) => (
+                None,
+                LocalStatus {
+                    scan: LocalScanState::Failed,
+                    error: Some(error.to_string()),
+                },
+            ),
+        };
+
+        let (remote_status, remote_map) = match authority.observe_latest().await {
+            Ok(observed) => match crate::directory_nodes(&observed).await {
+                Ok(map) => (
+                    RemoteStatus {
+                        availability: RemoteAvailability::Available,
+                        revision: Some(observed.revision()),
+                        error: None,
+                    },
+                    Some(map),
+                ),
+                Err(error) => (
+                    RemoteStatus {
+                        availability: RemoteAvailability::Unavailable,
+                        revision: None,
+                        error: Some(error.to_string()),
+                    },
+                    None,
+                ),
+            },
+            Err(error) => (
+                RemoteStatus {
+                    availability: RemoteAvailability::Unavailable,
+                    revision: None,
+                    error: Some(error.to_string()),
+                },
+                None,
+            ),
+        };
+
+        let store = crate::replica::state::Store::open_read_only(&state.join("replica.db"))?;
+        let baseline = store.load_baseline()?;
+        let work = store.work()?;
+        let sync_inspect = Sync::inspect(state).await.ok();
+
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        if let Some(baseline) = &baseline {
+            paths.extend(baseline.remote.keys().cloned());
+            paths.extend(baseline.local.nodes().keys().cloned());
+        }
+        if let Some(snapshot) = &snapshot {
+            paths.extend(snapshot.nodes().keys().cloned());
+        }
+        if let Some(remote) = &remote_map {
+            paths.extend(remote.keys().cloned());
+        }
+        paths.remove("");
+
+        let conflicts: Vec<Conflict> = status.conflicts.clone();
+        let mut entries = Vec::with_capacity(paths.len());
+        let mut pending = 0_u64;
+        let mut unknown = 0_u64;
+        let mut failed = 0_u64;
+        for path in &paths {
+            let local_node = snapshot.as_ref().and_then(|snapshot| snapshot.get(path));
+            let remote_node = remote_map.as_ref().and_then(|remote| remote.get(path));
+            let baseline_node = baseline
+                .as_ref()
+                .and_then(|baseline| baseline.remote.get(path));
+            let baseline_local = baseline
+                .as_ref()
+                .and_then(|baseline| baseline.local.get(path));
+            let conflict = conflicts.iter().find(|conflict| {
+                conflict
+                    .desired_path
+                    .as_deref()
+                    .unwrap_or(conflict.path.as_str())
+                    == path
+            });
+            let work_record = work.iter().find(|record| record.path == *path);
+            let intent = intent_evidence(work_record, sync_inspect.as_ref());
+            let local = local_evidence(local_node);
+            let remote = remote_evidence(remote_node, remote_status.revision);
+            let baseline_ev = BaselineEvidence {
+                node: baseline_node.map(|node| node.node),
+                revision: baseline_node.map(|node| node.revision),
+            };
+            let local_action = local_action(baseline_local, local_node);
+            let remote_action = remote_action(baseline_node, remote_node);
+            let (state, outcome) = if conflict.is_some() {
+                (
+                    EntryState::Conflict,
+                    OutcomeEvidence {
+                        state: OutcomeState::Conflict,
+                        error: None,
+                    },
+                )
+            } else if intent.state == Some(IntentState::Unknown) {
+                unknown += 1;
+                (
+                    EntryState::Unknown,
+                    OutcomeEvidence {
+                        state: OutcomeState::Unknown,
+                        error: intent.error.clone(),
+                    },
+                )
+            } else if intent.state == Some(IntentState::Failed) {
+                failed += 1;
+                (
+                    EntryState::Failed,
+                    OutcomeEvidence {
+                        state: OutcomeState::Failed,
+                        error: intent.error.clone(),
+                    },
+                )
+            } else if local_action != Action::None {
+                pending += 1;
+                (
+                    EntryState::LocalPending,
+                    OutcomeEvidence {
+                        state: OutcomeState::Pending,
+                        error: None,
+                    },
+                )
+            } else if remote_action != Action::None {
+                pending += 1;
+                (
+                    EntryState::RemotePending,
+                    OutcomeEvidence {
+                        state: OutcomeState::Pending,
+                        error: None,
+                    },
+                )
+            } else if baseline_node.is_some() {
+                (
+                    EntryState::InSync,
+                    OutcomeEvidence {
+                        state: OutcomeState::RemoteCompleted,
+                        error: None,
+                    },
+                )
+            } else {
+                (
+                    EntryState::InSync,
+                    OutcomeEvidence {
+                        state: OutcomeState::None,
+                        error: None,
+                    },
+                )
+            };
+            entries.push(EntryEvidence {
+                path: path.clone(),
+                original_path: conflict.and_then(|c| c.original_path.clone()),
+                desired_path: conflict.and_then(|c| c.desired_path.clone()),
+                state,
+                local,
+                remote,
+                baseline: baseline_ev,
+                intent,
+                outcome,
+                conflict: conflict.map(|c| c.id.clone()),
+            });
+        }
+        pending += status.pending_installs as u64;
+        let mut unknown = unknown;
+        for work in &work {
+            if work.state == "unknown" {
+                unknown += 1;
+            }
+        }
+        if let Some(sync_inspect) = &sync_inspect {
+            for status in &sync_inspect.namespace {
+                match status.state {
+                    NamespaceState::Unknown => unknown += 1,
+                    NamespaceState::Failed => failed += 1,
+                    _ => {}
+                }
+            }
+        }
+        let in_sync = pending == 0
+            && unknown == 0
+            && failed == 0
+            && conflicts.is_empty()
+            && remote_status.availability == RemoteAvailability::Available
+            && local_status.scan != LocalScanState::Failed;
+        let summary = StatusSummary {
+            in_sync,
+            pending,
+            unknown,
+            conflicts: conflicts.len(),
+            failed,
+            retained_artifacts: status.artifacts.len() as u64,
+        };
+        Ok(Inspection {
+            binding,
+            remote: remote_status,
+            local: local_status,
+            summary,
+            entries,
+            conflicts,
+            artifacts: status.artifacts,
+        })
     }
 
+    pub fn root(&self) -> &Path {
+        self.replica.root()
+    }
+
+    pub fn state(&self) -> &Path {
+        self.replica.state()
+    }
+
+    /// Retained-artifact export and conflict-side export share one path-based
+    /// reader so late writers into a retained inode stay observable.
     pub fn export_artifact(&self, id: &str, output: &mut dyn Write) -> Result<()> {
         Ok(self.replica.export_artifact(id, output)?)
     }
 
-    pub async fn run(&mut self) -> Result<RunOutcome> {
-        let mut outcome = self.retry_pending().await?;
-        let mut current = self.replica.scan()?;
-        let observed = self.sync.authority().observe_latest().await?;
-        let mut remote = crate::directory_nodes(&observed).await?;
-        let baseline = self.replica.store().load_baseline()?;
-        match baseline {
-            Some(baseline) => {
-                let mut ctx = Context::new(
-                    &mut self.sync,
-                    &mut self.replica,
-                    &mut outcome,
-                    baseline,
-                    &current,
-                    &mut remote,
-                    observed.revision(),
-                );
-                ctx.reconcile().await?;
-            }
-            None => {
-                let local_empty = current.len() == 1;
-                let remote_empty = remote.len() == 1;
-                if !local_empty && !remote_empty {
-                    record_conflict(
-                        &mut outcome,
-                        &mut self.replica,
-                        "",
-                        None,
-                        Some(""),
-                        "local-present",
-                        "remote-present",
-                        None,
-                        None,
-                        None,
-                        "initial sync requires one empty side; other non-empty states are explicit merges",
-                    )?;
-                    return Ok(outcome);
-                }
-                if let Some(root) = current.get("")
-                    && let Some(root_node) = observed.resolve("").await?
-                {
-                    self.replica
-                        .store_mut()
-                        .save_baseline_path("", &root_node, Some(root))?;
-                    self.replica
-                        .store_mut()
-                        .set_baseline_revision(observed.revision())?;
-                }
-                if local_empty && remote_empty {
-                    outcome.revision = Some(observed.revision());
-                } else if local_empty {
-                    self.materialize_all(&mut outcome, &observed, &remote)
-                        .await?;
-                } else if remote_empty {
-                    self.publish_all(&mut outcome, &observed, &mut current)
-                        .await?;
-                }
-            }
-        }
-        let status = self.replica.status()?;
-        outcome.pending = status.pending_installs as u64 + outcome.pending;
-        outcome.conflicts.extend(status.conflicts);
-        outcome.conflicts.sort_by(|a, b| a.path.cmp(&b.path));
-        outcome.in_sync = outcome.revision.is_some()
-            && outcome.pending == 0
-            && outcome.unknown == 0
-            && outcome.conflicts.is_empty();
-        if outcome.revision.is_some() {
-            let latest = self.sync.authority().observe_latest().await?;
-            self.replica
-                .store_mut()
-                .set_baseline_revision(latest.revision())?;
-        }
-        Ok(outcome)
+    pub fn artifact_path(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.replica.artifact_path(id)?)
     }
 
-    pub async fn resolve(&mut self, conflict_id: &str, pick: Resolution) -> Result<RunOutcome> {
+    /// Export one side of a conflict. `side` is `"local"` or `"remote"`.
+    pub fn export_conflict_side(
+        &self,
+        conflict_id: &str,
+        side: &str,
+        output: &mut dyn Write,
+    ) -> Result<()> {
         let record = self
             .replica
             .store()
@@ -155,204 +563,365 @@ impl DirectorySync {
             .into_iter()
             .find(|record| record.id == conflict_id)
             .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
-        let message = match pick {
-            Resolution::KeepLocal => {
+        match side {
+            "local" => {
                 if let Some(artifact) = record.local_artifact {
-                    let observed = self.sync.authority().observe_latest().await?;
-                    let remote = crate::directory_nodes(&observed).await?;
-                    if let Some(node) = remote.get(&record.path) {
-                        let source = self.replica.open_artifact(&artifact)?;
-                        let mut source =
-                            tokio::io::BufReader::new(tokio::fs::File::from_std(source));
-                        self.sync
-                            .stage(node.id(), observed.revision(), &mut source)
-                            .await?;
-                    }
+                    return Ok(self.replica.export_artifact(&artifact, output)?);
                 }
-                "resolved to local; run publishes the retained intent"
+                // The live local file for the conflict's current path.
+                let path = record
+                    .desired_path
+                    .as_deref()
+                    .unwrap_or(record.path.as_str());
+                let file = self.replica.open_local_file(path)?;
+                let mut file = file;
+                std::io::copy(&mut file, output).map_err(|error| error.to_string())?;
+                Ok(())
             }
-            Resolution::KeepRemote => "resolved to remote; run materializes the retained revision",
+            "remote" => {
+                if let Some(artifact) = record.remote_artifact {
+                    return Ok(self.replica.export_artifact(&artifact, output)?);
+                }
+                Err("this conflict has no retained remote side to export".to_string())
+            }
+            other => Err(format!("unknown conflict side {other:?}")),
         }
-        .to_owned();
-        self.replica
-            .store_mut()
-            .update_conflict_error(&conflict_id, &message)?;
-        self.run().await
     }
 
-    async fn retry_pending(&mut self) -> Result<RunOutcome> {
+    pub async fn run(&mut self) -> Result<RunOutcome> {
         let mut outcome = RunOutcome::default();
-        for status in self.sync.namespace_intents().await? {
-            match status.state {
-                NamespaceState::Prepared | NamespaceState::Unknown | NamespaceState::Retryable => {
-                    match self.sync.publish(status.intent.id).await {
-                        Ok(revision) => {
-                            outcome.revision = Some(revision);
-                            outcome.published_local += 1;
-                        }
-                        Err(error) if error.kind() == crate::runtime::ErrorKind::Unknown => {
-                            outcome.unknown += 1;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                NamespaceState::Committed(_) => {}
-                NamespaceState::Conflict | NamespaceState::Failed => {
-                    outcome.conflicts.push(Conflict {
-                        id: format!("intent-{:?}", status.intent.id),
-                        path: String::new(),
-                        original_path: None,
-                        desired_path: None,
-                        local: "local-intent".to_owned(),
-                        remote: "conflict".to_owned(),
-                        local_artifact: None,
-                        remote_node: None,
-                        remote_revision: None,
-                        error: status
-                            .failure
-                            .map(|failure| failure.to_string())
-                            .unwrap_or_else(|| "namespace intent is terminal".to_owned()),
-                    });
-                }
-            }
+        self.retry_associated(&mut outcome).await?;
+
+        let observed = self.sync.authority().observe_latest().await?;
+        let mut remote = crate::directory_nodes(&observed).await?;
+        let current = self.replica.scan()?;
+
+        if self.replica.store().load_baseline()?.is_none() {
+            self.admit(&mut outcome, &current, &mut remote, &observed)
+                .await?;
         }
-        for id in self.sync.edits().await? {
-            if let crate::sync::EditStatus::Content(status) = self.sync.edit_status(id).await?
-                && (status.pending || status.frozen)
-            {
-                match self.sync.publish(id).await {
-                    Ok(revision) => {
-                        outcome.revision = Some(revision);
-                        outcome.published_local += 1;
-                    }
-                    Err(error) if error.kind() == crate::runtime::ErrorKind::Unknown => {
-                        outcome.unknown += 1;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
+
+        if let Some(baseline) = self.replica.store().load_baseline()? {
+            let mut ctx = Context {
+                sync: &mut self.sync,
+                replica: &mut self.replica,
+                outcome: &mut outcome,
+                baseline,
+                current: &current,
+                remote: &mut remote,
+                revision: observed.revision(),
+                nodes: BTreeMap::new(),
+                revisions: BTreeMap::new(),
+            };
+            ctx.reconcile().await?;
         }
+
+        self.finalize(&mut outcome, observed.revision()).await?;
         Ok(outcome)
     }
 
-    async fn materialize_all(
-        &mut self,
-        outcome: &mut RunOutcome,
-        observed: &Snapshot,
-        remote: &BTreeMap<String, Node>,
-    ) -> Result<()> {
-        for (path, node) in remote {
-            if path.is_empty() {
-                continue;
+    /// Apply one durable decision to an active conflict, then reconcile again.
+    /// The conflict stays active until its derived request actually commits.
+    pub async fn resolve(&mut self, conflict_id: &str, decision: Resolution) -> Result<RunOutcome> {
+        let record = self
+            .replica
+            .store()
+            .conflicts()?
+            .into_iter()
+            .find(|record| record.id == conflict_id)
+            .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+        let observed = self.sync.authority().observe_latest().await?;
+        let remote = crate::directory_nodes(&observed).await?;
+        let baseline = self.replica.store().load_baseline()?;
+        match decision {
+            Resolution::KeepLocal | Resolution::Content(_) => {
+                let bytes = match decision {
+                    Resolution::Content(bytes) => bytes,
+                    _ => self.local_side_bytes(&record)?,
+                };
+                self.apply_local_resolution(&record, &remote, baseline.as_ref(), &bytes)
+                    .await?;
             }
-            match node.kind() {
-                NodeKind::Directory { .. } => {
-                    self.replica.create_directory_local(path).map_err(|error| {
-                        crate::replica::Error::conflict(format!(
-                            "{path} exists during initial materialization: {error}"
-                        ))
-                        .to_string()
-                    })?;
-                    outcome.materialized_remote += 1;
-                    let fresh = self.replica.scan()?;
-                    if let Some(local) = fresh.get(path) {
-                        self.replica
-                            .store_mut()
-                            .save_baseline_path(path, node, Some(local))?;
-                    }
-                }
-                NodeKind::File(_) => {
-                    let mut staged = self.stage_remote_file(observed, node).await?;
-                    self.replica
-                        .create_file_local(path, node.executable(), &mut staged)?;
-                    outcome.materialized_remote += 1;
-                    let fresh = self.replica.scan()?;
-                    if let Some(local) = fresh.get(path) {
-                        if canonical_matches(&mut self.replica, local, node).await? {
-                            self.replica
-                                .store_mut()
-                                .save_baseline_path(path, node, Some(local))?;
-                        }
-                    }
-                }
+            Resolution::KeepRemote => {
+                self.apply_remote_resolution(&record, &observed).await?;
             }
         }
-        outcome.revision = Some(observed.revision());
+        self.replica.store_mut().remove_conflict(&conflict_id)?;
+        self.run().await
+    }
+
+    async fn apply_local_resolution(
+        &mut self,
+        record: &ConflictRecord,
+        remote: &BTreeMap<String, Node>,
+        baseline: Option<&BaselineRecord>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let path = record
+            .desired_path
+            .as_deref()
+            .unwrap_or(record.path.as_str());
+        let (parent, name) = split(path);
+        let predicate = revision_bytes(record.remote_revision).or_else(|| {
+            baseline
+                .and_then(|b| b.remote.get(path))
+                .map(|n| n.revision)
+        });
+        let predicate =
+            predicate.ok_or_else(|| "conflict has no baseline revision to rebase".to_string())?;
+        match remote.get(path) {
+            Some(node) if !node.is_directory() => {
+                let mut source = bytes;
+                let edit = self.sync.stage(node.id(), predicate, &mut source).await?;
+                let _ = self.sync.publish(edit).await?;
+            }
+            _ => {
+                let parent_node = self.resolve_remote_node(remote, parent)?;
+                let mut source = bytes;
+                let edit = self
+                    .sync
+                    .stage_create_file(
+                        parent_node,
+                        name,
+                        predicate,
+                        FileMetadata::new(false),
+                        &mut source,
+                    )
+                    .await?;
+                let _ = self.sync.publish(edit).await?;
+            }
+        }
         Ok(())
     }
 
-    async fn publish_all(
+    async fn apply_remote_resolution(
+        &mut self,
+        record: &ConflictRecord,
+        observed: &Snapshot,
+    ) -> Result<()> {
+        let path = record
+            .desired_path
+            .as_deref()
+            .unwrap_or(record.path.as_str());
+        if let Some(node) = observed.resolve(path).await?
+            && !node.is_directory()
+        {
+            let expected = self.replica.scan()?.get(path).cloned();
+            let mut staged = self.stage_remote_file(&node).await?;
+            if let Some(expected) = expected {
+                let mut bytes = Vec::new();
+                std::io::copy(&mut staged, &mut bytes).map_err(|e| e.to_string())?;
+                self.replica.install_bytes(
+                    path,
+                    &expected,
+                    node.executable(),
+                    Some(observed.revision().to_bytes()),
+                    &bytes,
+                )?;
+            } else {
+                self.replica
+                    .create_file_local(path, node.executable(), &mut staged)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn local_side_bytes(&self, record: &ConflictRecord) -> Result<Vec<u8>> {
+        if let Some(artifact) = &record.local_artifact {
+            let mut file = self.replica.open_artifact(artifact)?;
+            let mut bytes = Vec::new();
+            std::io::copy(&mut file, &mut bytes).map_err(|e| e.to_string())?;
+            return Ok(bytes);
+        }
+        let path = record
+            .desired_path
+            .as_deref()
+            .unwrap_or(record.path.as_str());
+        let mut file = self.replica.open_local_file(path)?;
+        let mut bytes = Vec::new();
+        std::io::copy(&mut file, &mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+
+    fn resolve_remote_node(&self, remote: &BTreeMap<String, Node>, path: &str) -> Result<NodeId> {
+        remote
+            .get(path)
+            .map(Node::id)
+            .ok_or_else(|| format!("remote parent {path:?} is missing").into())
+    }
+
+    async fn admit(
         &mut self,
         outcome: &mut RunOutcome,
-        observed: &Snapshot,
         current: &LocalSnapshot,
+        remote: &mut BTreeMap<String, Node>,
+        observed: &Snapshot,
     ) -> Result<()> {
-        let mut nodes: BTreeMap<String, NodeId> =
-            BTreeMap::from([(String::new(), observed.root())]);
-        let mut stage_revision = observed.revision();
-        for (path, entry) in current.nodes() {
-            if path.is_empty() {
+        let local_empty = current.len() == 1;
+        let remote_empty = remote.len() == 1;
+        if !local_empty && !remote_empty {
+            record_conflict(
+                outcome,
+                &mut self.replica,
+                "",
+                None,
+                Some(""),
+                "current_directory",
+                "current_directory",
+                None,
+                None,
+                None,
+                "initial sync requires one empty side; two non-empty sides are an explicit merge",
+            )?;
+            return Ok(());
+        }
+        let root_node = observed
+            .resolve("")
+            .await?
+            .ok_or_else(|| "remote root is unresolved".to_string())?;
+        let root_local = current
+            .get("")
+            .cloned()
+            .ok_or_else(|| "local root is unresolved".to_string())?;
+        self.replica.store_mut().save_baseline_path(
+            "",
+            &root_node,
+            Some(&root_local),
+            observed.revision(),
+        )?;
+        self.replica
+            .store_mut()
+            .set_baseline_revision(observed.revision())?;
+        let _ = remote;
+        Ok(())
+    }
+
+    async fn finalize(&mut self, outcome: &mut RunOutcome, revision: Revision) -> Result<()> {
+        outcome.revision = Some(revision);
+        let status = self.replica.status()?;
+        outcome.conflicts.extend(status.conflicts.clone());
+        outcome
+            .conflicts
+            .sort_by(|a, b| (a.path.clone(), a.id.clone()).cmp(&(b.path.clone(), b.id.clone())));
+        outcome.conflicts.dedup_by(|a, b| a.id == b.id);
+
+        // Recompute honest pending/unknown from the persisted baseline.
+        let baseline = self.replica.store().load_baseline()?;
+        let current = self.replica.scan()?;
+        let observed = self.sync.authority().observe_latest().await?;
+        let remote = crate::directory_nodes(&observed).await?;
+        let mut pending = 0_u64;
+        if let Some(baseline) = &baseline {
+            let mut paths: BTreeSet<String> = BTreeSet::new();
+            paths.extend(baseline.remote.keys().cloned());
+            paths.extend(baseline.local.nodes().keys().cloned());
+            paths.extend(current.nodes().keys().cloned());
+            paths.extend(remote.keys().cloned());
+            for path in &paths {
+                if path.is_empty() {
+                    continue;
+                }
+                if local_action(baseline.local.get(path), current.get(path)) != Action::None {
+                    pending += 1;
+                }
+                if remote_action(baseline.remote.get(path), remote.get(path)) != Action::None {
+                    pending += 1;
+                }
+            }
+        }
+        let mut unknown = 0_u64;
+        let mut failed = 0_u64;
+        for work in self.replica.store().work()? {
+            match work.state.as_str() {
+                "unknown" => unknown += 1,
+                "failed" => failed += 1,
+                _ => {}
+            }
+        }
+        for status in self.sync.namespace_intents().await? {
+            match status.state {
+                NamespaceState::Unknown => unknown += 1,
+                NamespaceState::Failed => failed += 1,
+                _ => {}
+            }
+        }
+        outcome.pending = outcome.pending.max(pending);
+        outcome.unknown = outcome.unknown.max(unknown);
+        outcome.in_sync = outcome.pending == 0
+            && outcome.unknown == 0
+            && failed == 0
+            && outcome.conflicts.is_empty();
+        let _ = failed;
+        Ok(())
+    }
+
+    async fn retry_associated(&mut self, outcome: &mut RunOutcome) -> Result<()> {
+        let work = self.replica.store().work()?;
+        for record in work {
+            if matches!(record.state.as_str(), "committed" | "conflict" | "failed") {
                 continue;
             }
-            let (parent, name) = split(path);
-            let parent_node = nodes.get(parent).copied().ok_or_else(|| {
-                crate::replica::Error::invalid("local parent missing").to_string()
-            })?;
-            let edit = match entry.kind {
-                LocalKind::Directory => {
-                    self.sync
-                        .stage_create_directory(parent_node, name, stage_revision)
-                        .await?
-                }
-                LocalKind::File { .. } => {
-                    let captured = self.replica.capture_file(path, entry)?;
-                    let mut source = tokio::fs::File::from_std(
-                        self.replica.open_artifact(&captured.artifact.id)?,
-                    );
-                    self.sync
-                        .stage_create_file(
-                            parent_node,
-                            name,
-                            stage_revision,
-                            FileMetadata::new(entry.executable),
-                            &mut source,
-                        )
-                        .await?
-                }
-            };
-            let revision = self.sync.publish(edit).await?;
-            stage_revision = revision;
-            let node = self.namespace_node(edit).await?;
-            nodes.insert(path.clone(), node);
-            let snapshot = self.sync.authority().observe_revision(revision).await?;
-            if let Some(remote_node) = snapshot.resolve(path).await? {
-                let fresh = self.replica.scan()?;
-                if let Some(local) = fresh.get(path) {
-                    if local_equal(entry, local) {
+            let edit = EditId::from_bytes(record.id);
+            match self.sync.publish(edit).await {
+                Ok(revision) => {
+                    outcome.published_local += 1;
+                    outcome.revision = Some(revision);
+                    self.replica.store_mut().update_work(
+                        &record.id,
+                        "committed",
+                        Some(revision),
+                        None,
+                    )?;
+                    if let Some(node) = self.accepted_node_from_work(&record)? {
+                        let accepted = accepted_local(&self.replica, &record)?;
                         self.replica.store_mut().save_baseline_path(
-                            path,
-                            &remote_node,
-                            Some(local),
+                            &record.path,
+                            &node,
+                            accepted.as_ref(),
+                            revision,
                         )?;
                     }
                 }
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Unknown => {
+                    outcome.unknown += 1;
+                    self.replica.store_mut().update_work(
+                        &record.id,
+                        "unknown",
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.replica.store_mut().update_work(
+                        &record.id,
+                        "conflict",
+                        None,
+                        Some(&message),
+                    )?;
+                }
             }
-            outcome.revision = Some(revision);
-            outcome.published_local += 1;
         }
         Ok(())
     }
 
-    async fn namespace_node(&mut self, edit: EditId) -> Result<NodeId> {
-        let status = self.sync.namespace_status(edit).await?;
-        Ok(status.intent.operation.node_id())
+    async fn accepted_node_from_work(&mut self, record: &WorkRecord) -> Result<Option<Node>> {
+        let Some(revision) = record.remote_revision else {
+            return Ok(None);
+        };
+        let observed = self
+            .sync
+            .authority()
+            .observe_revision(Revision::from_bytes(revision))
+            .await?;
+        Ok(observed.resolve(&record.path).await?)
     }
 
-    async fn stage_remote_file(&self, observed: &Snapshot, node: &Node) -> Result<std::fs::File> {
+    async fn stage_remote_file(&self, node: &Node) -> Result<std::fs::File> {
+        let observed = self.sync.authority().observe_latest().await?;
         let version = observed.open_file(node.id()).await?;
         let length = version.descriptor().content_id().length();
-        let spool = tempfile::tempfile()?;
-        let mut output = tokio::fs::File::from_std(spool);
+        let mut output = tokio::fs::File::from_std(tempfile::tempfile()?);
         let mut position = 0;
         while position < length {
             let end = (position + 64 * 1024).min(length);
@@ -365,15 +934,35 @@ impl DirectorySync {
     }
 }
 
-struct Context<'a> {
-    sync: &'a mut Sync,
-    replica: &'a mut Replica,
-    outcome: &'a mut RunOutcome,
-    baseline: BaselineRecord,
-    current: &'a LocalSnapshot,
-    remote: &'a mut BTreeMap<String, Node>,
-    revision: Revision,
-    nodes: BTreeMap<String, NodeId>,
+fn accepted_local(replica: &Replica, record: &WorkRecord) -> Result<Option<LocalNode>> {
+    let fresh = replica.scan()?;
+    let identity = fresh.get(&record.path).map(|node| node.identity);
+    let parent = fresh.get(&record.path).and_then(|node| node.parent);
+    let Some(kind) = record.local_kind.as_deref() else {
+        return Ok(None);
+    };
+    let kind = match kind {
+        "directory" => LocalKind::Directory,
+        "file" => LocalKind::File {
+            length: record.local_length.unwrap_or(0),
+            digest: crate::replica::ContentHash::from_bytes(
+                record
+                    .local_digest
+                    .ok_or_else(|| "work association lacks a local digest".to_string())?,
+            ),
+        },
+        other => return Err(format!("unknown work local kind {other:?}").into()),
+    };
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    Ok(Some(LocalNode {
+        path: record.path.clone(),
+        kind,
+        executable: record.local_executable.unwrap_or(false),
+        identity,
+        parent,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,71 +973,71 @@ enum Action {
     Delete,
 }
 
+struct Context<'a> {
+    sync: &'a mut Sync,
+    replica: &'a mut Replica,
+    outcome: &'a mut RunOutcome,
+    baseline: BaselineRecord,
+    current: &'a LocalSnapshot,
+    remote: &'a mut BTreeMap<String, Node>,
+    revision: Revision,
+    nodes: BTreeMap<String, NodeId>,
+    revisions: BTreeMap<String, Revision>,
+}
+
 impl<'a> Context<'a> {
-    fn new(
-        sync: &'a mut Sync,
-        replica: &'a mut Replica,
-        outcome: &'a mut RunOutcome,
-        baseline: BaselineRecord,
-        current: &'a LocalSnapshot,
-        remote: &'a mut BTreeMap<String, Node>,
-        revision: Revision,
-    ) -> Self {
-        let nodes = remote
-            .iter()
-            .map(|(path, node)| (path.clone(), node.id()))
-            .collect();
-        Self {
-            sync,
-            replica,
-            outcome,
-            baseline,
-            current,
-            remote,
-            revision,
-            nodes,
+    fn seed(&mut self) {
+        for (path, node) in self.remote.iter() {
+            self.nodes.insert(path.clone(), node.id());
+        }
+        for path in self.remote.keys() {
+            let revision = self
+                .baseline
+                .remote
+                .get(path)
+                .map(|entry| entry.revision)
+                .unwrap_or(self.revision);
+            self.revisions.insert(path.clone(), revision);
         }
     }
 
     async fn reconcile(&mut self) -> Result<()> {
+        self.seed();
         let (remote_moves, local_moves) = self.detect_moves();
+        let mut handled: BTreeSet<String> = BTreeSet::new();
+        self.apply_moves(&remote_moves, &local_moves, &mut handled)
+            .await?;
+        let retained = self.retained_remote_deleted_dirs();
+        self.handle_retained(&retained, &mut handled).await?;
+
         let mut paths: BTreeSet<String> = BTreeSet::new();
         paths.extend(self.baseline.remote.keys().cloned());
         paths.extend(self.current.nodes().keys().cloned());
         paths.extend(self.remote.keys().cloned());
-        let order: Vec<String> = paths.iter().cloned().collect();
-        let mut ascending = order.clone();
+
+        let mut ascending: Vec<String> = paths.iter().cloned().collect();
         ascending.sort_by_key(|path| (depth(path), path.clone()));
-        let mut descending = order;
+        for path in &ascending {
+            if path.is_empty() || handled.contains(path) {
+                continue;
+            }
+            if under_any(&retained, path) {
+                continue;
+            }
+            self.entry(path).await?;
+        }
+
+        let mut descending = ascending.clone();
         descending.sort_by_key(|path| (depth(path), path.clone()));
         descending.reverse();
-        for path in &ascending {
-            if let Some(destination) = remote_moves.get(path) {
-                self.remote_rename(path, destination).await?;
-                continue;
-            }
-            if remote_moves.values().any(|from| from == path) {
-                continue;
-            }
-            if let Some(destination) = local_moves.get(path) {
-                self.local_rename(path, destination).await?;
-                continue;
-            }
-            if local_moves.values().any(|from| from == path) {
-                continue;
-            }
-            if is_moved_child(&remote_moves, path) || is_moved_child(&local_moves, path) {
-                continue;
-            }
-            self.entry(path, &remote_moves, &local_moves).await?;
-        }
         for path in &descending {
+            if handled.contains(path) || under_any(&retained, path) {
+                continue;
+            }
             let local = local_action(self.baseline.local.get(path), self.current.get(path));
             let remote = remote_action(self.baseline.remote.get(path), self.remote.get(path));
             if local == Action::Delete && remote == Action::None {
-                if !is_moved_child(&remote_moves, path) && !is_moved_child(&local_moves, path) {
-                    self.publish_remove(path).await?;
-                }
+                self.publish_remove(path).await?;
             }
         }
         Ok(())
@@ -484,95 +1073,382 @@ impl<'a> Context<'a> {
         (remote_moves, local_moves)
     }
 
-    async fn entry(
+    async fn apply_moves(
         &mut self,
-        path: &str,
-        _remote_moves: &BTreeMap<String, String>,
-        _local_moves: &BTreeMap<String, String>,
+        remote_moves: &BTreeMap<String, String>,
+        local_moves: &BTreeMap<String, String>,
+        handled: &mut BTreeSet<String>,
     ) -> Result<()> {
+        let mut sources: BTreeSet<String> = BTreeSet::new();
+        sources.extend(remote_moves.keys().cloned());
+        sources.extend(local_moves.keys().cloned());
+        // Only the top-most moved path is renamed; descendants move with it.
+        let roots: Vec<String> = sources
+            .iter()
+            .filter(|source| {
+                !sources.iter().any(|other| {
+                    *other != **source
+                        && source
+                            .strip_prefix(other)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+            })
+            .cloned()
+            .collect();
+        for source in roots {
+            let rm = remote_moves.get(&source);
+            let lm = local_moves.get(&source);
+            match (rm, lm) {
+                (Some(destination), Some(local_destination))
+                    if destination == local_destination =>
+                {
+                    self.nodes.remove(&source);
+                    if let Some(node) = self.remote.get(destination) {
+                        self.nodes.insert(destination.clone(), node.id());
+                    }
+                    self.migrate_subtree(handled, &source, destination, self.revision)
+                        .await?;
+                }
+                (Some(_), Some(local_destination)) => {
+                    let desired = local_destination.clone();
+                    self.mark_subtree(handled, &source);
+                    self.conflict(&source, Some(&source), Some(&desired))
+                        .await?;
+                }
+                (Some(destination), None) => {
+                    let local_unchanged =
+                        local_action(self.baseline.local.get(&source), self.current.get(&source))
+                            == Action::None;
+                    if local_unchanged && self.current.get(destination).is_none() {
+                        if self.remote_rename(&source, destination).await? {
+                            self.migrate_subtree(handled, &source, destination, self.revision)
+                                .await?;
+                        } else {
+                            self.mark_subtree(handled, &source);
+                        }
+                    } else {
+                        self.mark_subtree(handled, &source);
+                        self.conflict(&source, Some(&source), Some(&source)).await?;
+                    }
+                }
+                (None, Some(destination)) => {
+                    let remote_unchanged =
+                        remote_action(self.baseline.remote.get(&source), self.remote.get(&source))
+                            == Action::None;
+                    if remote_unchanged && self.current.get(destination).is_none() {
+                        let revision = self.local_rename(&source, destination).await?;
+                        self.migrate_subtree(handled, &source, destination, revision)
+                            .await?;
+                    } else {
+                        self.mark_subtree(handled, &source);
+                        self.conflict(&source, Some(&source), Some(&source)).await?;
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark every local/baseline path under one renamed directory as handled so
+    /// the single per-root rename is the only namespace request issued.
+    fn mark_subtree(&self, handled: &mut BTreeSet<String>, from: &str) {
+        let prefix = format!("{from}/");
+        let targets: Vec<String> = self
+            .current
+            .nodes()
+            .keys()
+            .chain(self.baseline.local.nodes().keys())
+            .chain(self.baseline.remote.keys())
+            .filter(|path| path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        handled.extend(targets);
+    }
+
+    /// Relocate every baseline entry under a renamed directory to its new path,
+    /// preserving each entry's previously accepted content fingerprint so a
+    /// concurrent content edit stays pending instead of being acknowledged by
+    /// the rename receipt.
+    async fn migrate_subtree(
+        &mut self,
+        handled: &mut BTreeSet<String>,
+        from: &str,
+        to: &str,
+        revision: Revision,
+    ) -> Result<()> {
+        self.mark_subtree(handled, from);
+        handled.insert(from.to_owned());
+        handled.insert(to.to_owned());
+        let prefix = format!("{from}/");
+        let descendants: Vec<String> = self
+            .baseline
+            .remote
+            .keys()
+            .filter(|path| path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for descendant in descendants {
+            if handled.contains(&descendant) {
+                continue;
+            }
+            let destination = format!("{to}{}", &descendant[from.len()..]);
+            self.migrate_baseline_path(&descendant, &destination, revision)
+                .await?;
+            handled.insert(destination);
+        }
+        Ok(())
+    }
+
+    async fn migrate_baseline_path(
+        &mut self,
+        from: &str,
+        to: &str,
+        revision: Revision,
+    ) -> Result<()> {
+        let Some(entry) = self.baseline.remote.get(from).cloned() else {
+            return Ok(());
+        };
+        let snapshot = self.sync.authority().observe_revision(revision).await?;
+        let Some(node) = snapshot.node(entry.node).await? else {
+            return Ok(());
+        };
+        let previous = self.baseline.local.get(from).cloned();
+        let accepted = self.accepted_local_at(to, previous.as_ref())?;
+        self.replica
+            .store_mut()
+            .save_baseline_path(to, &node, accepted.as_ref(), revision)?;
+        self.replica.store_mut().remove_baseline_path(from)?;
+        self.nodes.remove(from);
+        self.nodes.insert(to.to_owned(), entry.node);
+        self.revisions.remove(from);
+        self.revisions.insert(to.to_owned(), revision);
+        Ok(())
+    }
+
+    /// Build the accepted local fingerprint for a path, preserving the previous
+    /// content kind/executable but taking the current inode identity so later
+    /// move detection stays accurate.
+    fn accepted_local_at(
+        &self,
+        to: &str,
+        previous: Option<&LocalNode>,
+    ) -> Result<Option<LocalNode>> {
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        let fresh = self.replica.scan()?;
+        let Some(current) = fresh.get(to) else {
+            return Ok(None);
+        };
+        Ok(Some(LocalNode {
+            path: to.to_owned(),
+            kind: previous.kind,
+            executable: previous.executable,
+            identity: current.identity,
+            parent: current.parent,
+        }))
+    }
+
+    fn retained_remote_deleted_dirs(&self) -> BTreeSet<String> {
+        let mut retained = BTreeSet::new();
+        for (path, entry) in &self.baseline.remote {
+            if path.is_empty() || !entry.directory || self.remote.contains_key(path) {
+                continue;
+            }
+            if self.subtree_local_diverges(path) {
+                retained.insert(path.clone());
+            }
+        }
+        retained
+    }
+
+    fn subtree_local_diverges(&self, directory: &str) -> bool {
+        let prefix = format!("{directory}/");
+        let mut paths: BTreeSet<&str> = BTreeSet::new();
+        paths.extend(self.baseline.local.nodes().keys().map(String::as_str));
+        paths.extend(self.current.nodes().keys().map(String::as_str));
+        for path in paths {
+            if !path.starts_with(&prefix) {
+                continue;
+            }
+            if local_action(self.baseline.local.get(path), self.current.get(path)) != Action::None {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn handle_retained(
+        &mut self,
+        retained: &BTreeSet<String>,
+        handled: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if retained.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<String> = self
+            .baseline
+            .remote
+            .keys()
+            .cloned()
+            .chain(self.current.nodes().keys().cloned())
+            .collect();
+        for path in paths {
+            if path.is_empty() || !under_any_inclusive(retained, &path) {
+                continue;
+            }
+            handled.insert(path.clone());
+            let local = local_action(self.baseline.local.get(&path), self.current.get(&path));
+            let remote = remote_action(self.baseline.remote.get(&path), self.remote.get(&path));
+            if remote == Action::Delete && local == Action::None {
+                let kind = self
+                    .current
+                    .get(&path)
+                    .map(|node| {
+                        if node.is_directory() {
+                            "current_directory"
+                        } else {
+                            "current_file"
+                        }
+                    })
+                    .unwrap_or("unknown");
+                record_conflict_side(
+                    self.outcome,
+                    self.replica,
+                    &path,
+                    Some(&path),
+                    Some(&path),
+                    kind,
+                    "deleted",
+                    None,
+                    None,
+                    Some(self.revision),
+                    "a remote-deleted directory still holds local entries; nothing was removed",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn entry(&mut self, path: &str) -> Result<()> {
         let local = local_action(self.baseline.local.get(path), self.current.get(path));
         let remote = remote_action(self.baseline.remote.get(path), self.remote.get(path));
         match (local, remote) {
             (Action::None, Action::None) => Ok(()),
             (Action::Create, Action::None) => {
-                let node = self.current.get(path).ok_or_else(|| {
-                    crate::replica::Error::invalid("local create disappeared").to_string()
-                })?;
+                let node = self
+                    .current
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| "local create disappeared".to_string())?;
                 if node.is_directory() {
                     self.publish_directory(path).await
                 } else {
-                    self.publish_file(path, node).await
+                    self.publish_file(path, &node).await
                 }
             }
             (Action::Modify, Action::None) => {
-                let node = self.current.get(path).ok_or_else(|| {
-                    crate::replica::Error::invalid("local modify disappeared").to_string()
-                })?;
-                self.publish_modify(path, node).await
+                let node = self
+                    .current
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| "local modify disappeared".to_string())?;
+                self.publish_modify(path, &node).await
             }
             (Action::None, Action::Create) => {
-                let node = self.remote.get(path).cloned().ok_or_else(|| {
-                    crate::replica::Error::invalid("remote create disappeared").to_string()
-                })?;
+                let node = self
+                    .remote
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| "remote create disappeared".to_string())?;
                 self.materialize_create(path, &node).await
             }
             (Action::None, Action::Modify) => {
-                let node = self.remote.get(path).cloned().ok_or_else(|| {
-                    crate::replica::Error::invalid("remote modify disappeared").to_string()
-                })?;
+                let node = self
+                    .remote
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| "remote modify disappeared".to_string())?;
                 self.materialize_modify(path, &node).await
             }
-            (Action::Delete, Action::Delete) => Ok(()),
+            (Action::Delete, Action::Delete) => {
+                self.replica.store_mut().remove_baseline_path(path)?;
+                Ok(())
+            }
             (Action::None, Action::Delete) => self.materialize_delete(path).await,
-            (Action::Delete, Action::None) => Ok(()), // applied in descending pass
+            (Action::Delete, Action::None) => Ok(()),
             (Action::Create, Action::Create) => {
-                let local = self.current.get(path);
-                let remote = self.remote.get(path);
-                if canonical_matches(self.replica, local.unwrap(), remote.unwrap()).await? {
-                    Ok(())
-                } else {
-                    self.conflict(path, None, Some(path), "create", "create")
+                if canonical_matches(
+                    self.replica,
+                    self.current.get(path).unwrap(),
+                    self.remote.get(path).unwrap(),
+                )
+                .await?
+                {
+                    self.accept_remote(path, self.remote.get(path).unwrap())
                         .await
+                } else {
+                    self.conflict(path, None, Some(path)).await
                 }
             }
             (Action::Modify, Action::Modify) => {
-                let local = self.current.get(path);
-                let remote = self.remote.get(path);
-                if canonical_matches(self.replica, local.unwrap(), remote.unwrap()).await? {
-                    Ok(())
-                } else {
-                    self.conflict(path, Some(path), None, "modify", "modify")
+                if canonical_matches(
+                    self.replica,
+                    self.current.get(path).unwrap(),
+                    self.remote.get(path).unwrap(),
+                )
+                .await?
+                {
+                    self.accept_remote(path, self.remote.get(path).unwrap())
                         .await
+                } else {
+                    self.conflict(path, Some(path), Some(path)).await
                 }
             }
-            (Action::Delete, Action::Modify)
-            | (Action::Delete, Action::Create)
-            | (Action::Modify, Action::Delete)
-            | (Action::Modify, Action::Create)
-            | (Action::Create, Action::Modify)
-            | (Action::Create, Action::Delete) => {
-                self.conflict(path, Some(path), None, "local", "remote")
-                    .await
+            _ => {
+                let original = self.baseline.local.get(path).is_some()
+                    || self.baseline.remote.get(path).is_some();
+                let original_path = original.then_some(path);
+                self.conflict(path, original_path, Some(path)).await
             }
         }
     }
 
     async fn publish_directory(&mut self, path: &str) -> Result<()> {
         let (parent, name) = split(path);
-        let parent_node = self.nodes.get(parent).copied().ok_or_else(|| {
-            crate::replica::Error::invalid("directory parent missing").to_string()
-        })?;
+        let parent_node = self
+            .nodes
+            .get(parent)
+            .copied()
+            .ok_or_else(|| format!("directory parent {parent:?} is missing"))?;
+        let parent_revision = self.revisions.get(parent).copied().unwrap_or(self.revision);
         let edit = self
             .sync
-            .stage_create_directory(parent_node, name, self.revision)
+            .stage_create_directory(parent_node, name, parent_revision)
             .await?;
+        self.associate(
+            edit,
+            path,
+            None,
+            Some(path),
+            "create-directory",
+            self.current.get(path),
+            Some(parent_node),
+            parent_revision,
+        )?;
         let revision = self.sync.publish(edit).await?;
-        let node_id = self.namespace_node(&mut edit.clone()).await?;
+        self.replica
+            .store_mut()
+            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
+        self.revisions.insert(path.to_owned(), revision);
         if let Some(local) = self.current.get(path) {
-            self.accept_local(path, local, revision).await?;
+            self.accept_local(path, local, node_id, revision).await?;
         }
         self.outcome.published_local += 1;
+        self.outcome.revision = Some(revision);
         Ok(())
     }
 
@@ -582,7 +1458,8 @@ impl<'a> Context<'a> {
             .nodes
             .get(parent)
             .copied()
-            .ok_or_else(|| crate::replica::Error::invalid("file parent missing").to_string())?;
+            .ok_or_else(|| format!("file parent {parent:?} is missing"))?;
+        let parent_revision = self.revisions.get(parent).copied().unwrap_or(self.revision);
         let captured = self.replica.capture_file(path, node)?;
         let mut source =
             tokio::fs::File::from_std(self.replica.open_artifact(&captured.artifact.id)?);
@@ -591,80 +1468,133 @@ impl<'a> Context<'a> {
             .stage_create_file(
                 parent_node,
                 name,
-                self.revision,
+                parent_revision,
                 FileMetadata::new(node.executable),
                 &mut source,
             )
             .await?;
+        self.associate(
+            edit,
+            path,
+            None,
+            Some(path),
+            "create-file",
+            Some(node),
+            Some(parent_node),
+            parent_revision,
+        )?;
         let revision = self.sync.publish(edit).await?;
-        let node_id = self.namespace_node(&mut edit.clone()).await?;
+        self.replica
+            .store_mut()
+            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
-        self.accept_local(path, node, revision).await?;
+        self.revisions.insert(path.to_owned(), revision);
+        self.accept_local(path, node, node_id, revision).await?;
         self.outcome.published_local += 1;
+        self.outcome.revision = Some(revision);
         Ok(())
     }
 
     async fn publish_modify(&mut self, path: &str, node: &LocalNode) -> Result<()> {
-        let remote_node =
-            self.nodes.get(path).copied().ok_or_else(|| {
-                crate::replica::Error::invalid("modify source missing").to_string()
-            })?;
+        let remote_node = self
+            .nodes
+            .get(path)
+            .copied()
+            .ok_or_else(|| format!("modify source {path:?} is missing"))?;
+        let predicate = self.entry_revision(path);
         let captured = self.replica.capture_file(path, node)?;
         let mut source =
             tokio::fs::File::from_std(self.replica.open_artifact(&captured.artifact.id)?);
-        let edit = self
-            .sync
-            .stage(remote_node, self.revision, &mut source)
-            .await?;
+        let edit = self.sync.stage(remote_node, predicate, &mut source).await?;
+        self.associate(
+            edit,
+            path,
+            Some(path),
+            Some(path),
+            "content",
+            Some(node),
+            Some(remote_node),
+            predicate,
+        )?;
         let revision = self.sync.publish(edit).await?;
-        self.accept_local(path, node, revision).await?;
+        self.replica
+            .store_mut()
+            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        self.revisions.insert(path.to_owned(), revision);
+        self.accept_local(path, node, remote_node, revision).await?;
         self.outcome.published_local += 1;
+        self.outcome.revision = Some(revision);
         Ok(())
     }
 
     async fn publish_remove(&mut self, path: &str) -> Result<()> {
-        let node =
-            self.nodes.get(path).copied().ok_or_else(|| {
-                crate::replica::Error::invalid("remove source missing").to_string()
-            })?;
-        let edit = self.sync.stage_remove(node, self.revision).await?;
-        self.sync.publish(edit).await?;
+        let node = self
+            .nodes
+            .get(path)
+            .copied()
+            .ok_or_else(|| format!("remove source {path:?} is missing"))?;
+        let predicate = self.entry_revision(path);
+        let edit = self.sync.stage_remove(node, predicate).await?;
+        self.associate(
+            edit,
+            path,
+            Some(path),
+            Some(path),
+            "remove",
+            None,
+            Some(node),
+            predicate,
+        )?;
+        let revision = self.sync.publish(edit).await?;
+        self.replica
+            .store_mut()
+            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
         self.nodes.remove(path);
+        self.revisions.remove(path);
         self.replica.store_mut().remove_baseline_path(path)?;
         self.outcome.published_local += 1;
+        self.outcome.revision = Some(revision);
         Ok(())
     }
 
-    async fn local_rename(&mut self, from: &str, to: &str) -> Result<()> {
-        let node =
-            self.nodes.get(from).copied().ok_or_else(|| {
-                crate::replica::Error::invalid("rename source missing").to_string()
-            })?;
+    async fn local_rename(&mut self, from: &str, to: &str) -> Result<Revision> {
+        let node = self
+            .nodes
+            .get(from)
+            .copied()
+            .ok_or_else(|| format!("rename source {from:?} is missing"))?;
+        let predicate = self.entry_revision(from);
         let (parent, name) = split(to);
-        let parent_node =
-            self.nodes.get(parent).copied().ok_or_else(|| {
-                crate::replica::Error::invalid("rename parent missing").to_string()
-            })?;
+        let parent_node = self
+            .nodes
+            .get(parent)
+            .copied()
+            .ok_or_else(|| format!("rename parent {parent:?} is missing"))?;
         let edit = self
             .sync
-            .stage_rename(
-                node,
-                self.revision,
-                parent_node,
-                name,
-                RenameMode::NoReplace,
-            )
+            .stage_rename(node, predicate, parent_node, name, RenameMode::NoReplace)
             .await?;
+        self.associate(
+            edit,
+            to,
+            Some(from),
+            Some(to),
+            "rename",
+            None,
+            Some(node),
+            predicate,
+        )?;
         let revision = self.sync.publish(edit).await?;
-        self.nodes.remove(from);
-        self.nodes.insert(to.to_owned(), node);
-        self.replica.store_mut().remove_baseline_path(from)?;
-        let fresh = self.replica.scan()?;
-        if let Some(local) = fresh.get(to) {
-            self.accept_local(to, local, revision).await?;
-        }
+        self.replica
+            .store_mut()
+            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        // The rename receipt proves the namespace move, never a concurrent
+        // content edit. Preserve the previously accepted fingerprint for `to`.
+        self.migrate_baseline_path(from, to, revision).await?;
         self.outcome.published_local += 1;
-        Ok(())
+        self.outcome.revision = Some(revision);
+        Ok(revision)
     }
 
     async fn materialize_create(&mut self, path: &str, node: &Node) -> Result<()> {
@@ -672,30 +1602,22 @@ impl<'a> Context<'a> {
             NodeKind::Directory { .. } => match self.replica.create_directory_local(path) {
                 Ok(()) => {
                     self.nodes.insert(path.to_owned(), node.id());
+                    self.revisions.insert(path.to_owned(), self.revision);
                     self.outcome.materialized_remote += 1;
                     self.accept_remote(path, node).await?;
                     Ok(())
                 }
-                Err(_)
-                    if self
-                        .current
-                        .get(path)
-                        .is_some_and(|entry| entry.is_directory()) =>
-                {
+                Err(_) if self.current.get(path).is_some_and(LocalNode::is_directory) => {
                     self.nodes.insert(path.to_owned(), node.id());
+                    self.revisions.insert(path.to_owned(), self.revision);
                     self.accept_remote(path, node).await?;
                     Ok(())
                 }
-                Err(_) => {
-                    self.conflict(path, None, Some(path), "present", "remote-create")
-                        .await
-                }
+                Err(_) => self.conflict(path, None, Some(path)).await,
             },
             NodeKind::File(_) => {
                 if self.current.get(path).is_some() {
-                    return self
-                        .conflict(path, None, Some(path), "present", "remote-create")
-                        .await;
+                    return self.conflict(path, None, Some(path)).await;
                 }
                 let mut staged = self.stage_remote_file(node).await?;
                 match self
@@ -704,27 +1626,25 @@ impl<'a> Context<'a> {
                 {
                     Ok(()) => {
                         self.nodes.insert(path.to_owned(), node.id());
+                        self.revisions.insert(path.to_owned(), self.revision);
                         self.outcome.materialized_remote += 1;
                         self.accept_remote(path, node).await?;
                         Ok(())
                     }
-                    Err(_) => {
-                        self.conflict(path, None, Some(path), "present", "remote-create")
-                            .await
-                    }
+                    Err(_) => self.conflict(path, None, Some(path)).await,
                 }
             }
         }
     }
 
     async fn materialize_modify(&mut self, path: &str, node: &Node) -> Result<()> {
-        let expected = self.current.get(path).cloned().ok_or_else(|| {
-            crate::replica::Error::invalid("remote modify path is local-absent").to_string()
-        })?;
+        let expected = self
+            .current
+            .get(path)
+            .cloned()
+            .ok_or_else(|| format!("remote modify path {path:?} is local-absent"))?;
         if expected.is_directory() || node.is_directory() {
-            return self
-                .conflict(path, Some(path), None, "local", "remote-kind")
-                .await;
+            return self.conflict(path, Some(path), Some(path)).await;
         }
         let snapshot = self
             .sync
@@ -750,25 +1670,19 @@ impl<'a> Context<'a> {
         match install.finish() {
             Ok(_) => {
                 self.nodes.insert(path.to_owned(), node.id());
+                self.revisions.insert(path.to_owned(), self.revision);
                 self.outcome.materialized_remote += 1;
                 self.accept_remote(path, node).await?;
                 Ok(())
             }
-            Err(_) => {
-                self.conflict(
-                    path,
-                    Some(path),
-                    None,
-                    "changed-during-install",
-                    "remote-modify",
-                )
-                .await
-            }
+            Err(_) => self.conflict(path, Some(path), Some(path)).await,
         }
     }
 
     async fn materialize_delete(&mut self, path: &str) -> Result<()> {
-        // The common baseline, not the fresh scan, is the deletion predicate.
+        if path.is_empty() {
+            return Ok(());
+        }
         let expected = self.baseline.local.clone();
         match self.replica.quarantine(
             path,
@@ -778,46 +1692,89 @@ impl<'a> Context<'a> {
         ) {
             Ok(_) => {
                 self.nodes.remove(path);
+                self.revisions.remove(path);
                 self.replica.store_mut().remove_baseline_path(path)?;
                 self.outcome.materialized_remote += 1;
                 Ok(())
             }
+            Err(_) => self.conflict(path, Some(path), Some(path)).await,
+        }
+    }
+
+    async fn remote_rename(&mut self, from: &str, to: &str) -> Result<bool> {
+        match self.replica.rename_local(from, to) {
+            Ok(()) => {
+                self.migrate_baseline_path(from, to, self.revision).await?;
+                self.outcome.materialized_remote += 1;
+                Ok(true)
+            }
             Err(_) => {
-                self.conflict(path, Some(path), None, "local-changed", "remote-delete")
-                    .await
+                self.conflict(from, Some(from), Some(to)).await?;
+                Ok(false)
             }
         }
     }
 
-    async fn remote_rename(&mut self, from: &str, to: &str) -> Result<()> {
-        if local_action(self.baseline.local.get(from), self.current.get(from)) != Action::None {
-            return self
-                .conflict(from, Some(from), Some(to), "local-changed", "remote-rename")
-                .await;
-        }
-        if self.current.get(to).is_some() {
-            return self
-                .conflict(to, Some(from), Some(to), "present", "remote-rename")
-                .await;
-        }
-        match self.replica.rename_local(from, to) {
-            Ok(()) => {
-                let node = self.nodes.remove(from);
-                if let Some(node) = node {
-                    self.nodes.insert(to.to_owned(), node);
-                }
-                self.replica.store_mut().remove_baseline_path(from)?;
-                if let Some(remote_node) = self.remote.get(to).cloned() {
-                    self.accept_remote(to, &remote_node).await?;
-                }
-                self.outcome.materialized_remote += 1;
-                Ok(())
-            }
-            Err(_) => {
-                self.conflict(from, Some(from), Some(to), "local-changed", "remote-rename")
-                    .await
-            }
-        }
+    fn entry_revision(&self, path: &str) -> Revision {
+        self.baseline
+            .remote
+            .get(path)
+            .map(|entry| entry.revision)
+            .or_else(|| self.revisions.get(path).copied())
+            .unwrap_or(self.revision)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn associate(
+        &mut self,
+        edit: EditId,
+        path: &str,
+        original_path: Option<&str>,
+        desired_path: Option<&str>,
+        operation: &str,
+        local: Option<&LocalNode>,
+        baseline_node: Option<NodeId>,
+        baseline_revision: Revision,
+    ) -> Result<()> {
+        let (local_kind, local_digest, local_length, local_executable) = match local {
+            Some(node) => (
+                Some(
+                    if node.is_directory() {
+                        "directory"
+                    } else {
+                        "file"
+                    }
+                    .to_owned(),
+                ),
+                match node.kind {
+                    LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
+                    LocalKind::Directory => None,
+                },
+                match node.kind {
+                    LocalKind::File { length, .. } => Some(length),
+                    LocalKind::Directory => None,
+                },
+                Some(node.executable),
+            ),
+            None => (None, None, None, None),
+        };
+        self.replica.store_mut().insert_work(&WorkRecord {
+            id: *edit.as_bytes(),
+            path: path.to_owned(),
+            original_path: original_path.map(str::to_owned),
+            desired_path: desired_path.map(str::to_owned),
+            operation: operation.to_owned(),
+            local_kind,
+            local_digest,
+            local_length,
+            local_executable,
+            baseline_node: baseline_node.map(|node| *node.as_bytes()),
+            baseline_revision: baseline_revision.to_bytes(),
+            remote_revision: None,
+            state: "prepared".to_owned(),
+            error: None,
+        })?;
+        Ok(())
     }
 
     async fn conflict(
@@ -825,8 +1782,6 @@ impl<'a> Context<'a> {
         path: &str,
         original_path: Option<&str>,
         desired_path: Option<&str>,
-        local: &str,
-        remote: &str,
     ) -> Result<()> {
         let captured = self
             .current
@@ -834,6 +1789,12 @@ impl<'a> Context<'a> {
             .filter(|node| matches!(node.kind, LocalKind::File { .. }))
             .and_then(|node| self.replica.capture_file(path, node).ok());
         let remote_node = self.remote.get(path).map(Node::id);
+        let local = if captured.is_some() {
+            "retained_artifact"
+        } else {
+            self.local_side(path)
+        };
+        let remote = self.remote_side(path);
         record_conflict(
             self.outcome,
             self.replica,
@@ -849,62 +1810,68 @@ impl<'a> Context<'a> {
         )
     }
 
-    async fn stage_remote_file(&self, node: &Node) -> Result<std::fs::File> {
-        let snapshot = self
-            .sync
-            .authority()
-            .observe_revision(self.revision)
-            .await?;
-        let version = snapshot.open_file(node.id()).await?;
-        let length = version.descriptor().content_id().length();
-        let mut output = tokio::fs::File::from_std(tempfile::tempfile()?);
-        let mut position = 0;
-        while position < length {
-            let end = (position + 64 * 1024).min(length);
-            version.read_range(position..end, &mut output).await?;
-            position = end;
+    /// The local side of a conflict by observable content, following a local
+    /// move of the same inode so a rename is reported as retained content.
+    fn local_side(&self, path: &str) -> &'static str {
+        if let Some(node) = self.current.get(path) {
+            return local_kind_side(node);
         }
-        let mut spool = output.into_std().await;
-        spool.seek(SeekFrom::Start(0))?;
-        Ok(spool)
+        if let Some(baseline) = self.baseline.local.get(path)
+            && self
+                .current
+                .nodes()
+                .values()
+                .any(|node| node.identity == baseline.identity)
+        {
+            return local_kind_side(baseline);
+        }
+        "deleted"
     }
 
-    async fn namespace_node(&mut self, edit: &mut EditId) -> Result<NodeId> {
-        let status = self.sync.namespace_status(*edit).await?;
+    fn remote_side(&self, path: &str) -> &'static str {
+        match self.remote.get(path) {
+            Some(node) if node.is_directory() => "current_directory",
+            Some(_) => "current_file",
+            None => "deleted",
+        }
+    }
+
+    async fn namespace_node(&mut self, edit: EditId) -> Result<NodeId> {
+        let status = self.sync.namespace_status(edit).await?;
         Ok(status.intent.operation.node_id())
     }
 
     async fn accept_local(
         &mut self,
         path: &str,
-        expected: &LocalNode,
+        accepted: &LocalNode,
+        node_id: NodeId,
         revision: Revision,
     ) -> Result<()> {
         let snapshot = self.sync.authority().observe_revision(revision).await?;
-        let Some(node) = snapshot.resolve(path).await? else {
+        let Some(node) = snapshot.node(node_id).await? else {
             return Ok(());
         };
-        let fresh = self.replica.scan()?;
-        let Some(current) = fresh.get(path) else {
-            return Ok(());
-        };
-        if local_equal(expected, current) {
-            self.replica
-                .store_mut()
-                .save_baseline_path(path, &node, Some(current))?;
-        }
+        self.replica
+            .store_mut()
+            .save_baseline_path(path, &node, Some(accepted), revision)?;
+        self.nodes.insert(path.to_owned(), node_id);
+        self.revisions.insert(path.to_owned(), revision);
         Ok(())
     }
 
     async fn accept_remote(&mut self, path: &str, node: &Node) -> Result<()> {
         let fresh = self.replica.scan()?;
-        let Some(current) = fresh.get(path) else {
+        let Some(current) = fresh.get(path).cloned() else {
             return Ok(());
         };
-        if canonical_matches(self.replica, current, node).await? {
-            self.replica
-                .store_mut()
-                .save_baseline_path(path, node, Some(current))?;
+        if canonical_matches(self.replica, &current, node).await? {
+            self.replica.store_mut().save_baseline_path(
+                path,
+                node,
+                Some(&current),
+                self.revision,
+            )?;
         }
         Ok(())
     }
@@ -925,10 +1892,7 @@ fn local_action(baseline: Option<&LocalNode>, current: Option<&LocalNode>) -> Ac
     }
 }
 
-fn remote_action(
-    baseline: Option<&crate::replica::state::BaselineNode>,
-    current: Option<&Node>,
-) -> Action {
+fn remote_action(baseline: Option<&BaselineNode>, current: Option<&Node>) -> Action {
     match (baseline, current) {
         (None, None) => Action::None,
         (None, Some(_)) => Action::Create,
@@ -958,14 +1922,14 @@ async fn canonical_matches(
             let captured = replica.capture_file(&local.path, local)?;
             let mut source =
                 tokio::fs::File::from_std(replica.open_artifact(&captured.artifact.id)?);
-            let content = ContentId::calculate(&mut source).await?;
+            let content = yinyang_core::ContentId::calculate(&mut source).await?;
             Ok(local.executable == remote.executable() && content == file.content_id())
         }
         _ => Ok(false),
     }
 }
 
-fn remote_equal(baseline: &crate::replica::state::BaselineNode, current: &Node) -> bool {
+fn remote_equal(baseline: &BaselineNode, current: &Node) -> bool {
     let digest = match current.kind() {
         NodeKind::File(file) => Some(*file.content_id().digest()),
         NodeKind::Directory { .. } => None,
@@ -976,6 +1940,11 @@ fn remote_equal(baseline: &crate::replica::state::BaselineNode, current: &Node) 
         && baseline.digest == digest
 }
 
+fn revision_bytes(revision: Option<[u8; 24]>) -> Option<Revision> {
+    revision.map(Revision::from_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_conflict(
     outcome: &mut RunOutcome,
     replica: &mut Replica,
@@ -989,8 +1958,37 @@ fn record_conflict(
     remote_revision: Option<Revision>,
     error: &str,
 ) -> Result<()> {
+    record_conflict_side(
+        outcome,
+        replica,
+        path,
+        original_path,
+        desired_path,
+        local,
+        remote,
+        local_artifact,
+        remote_node,
+        remote_revision,
+        error,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_conflict_side(
+    outcome: &mut RunOutcome,
+    replica: &mut Replica,
+    path: &str,
+    original_path: Option<&str>,
+    desired_path: Option<&str>,
+    local: &str,
+    remote: &str,
+    local_artifact: Option<&str>,
+    remote_node: Option<NodeId>,
+    remote_revision: Option<Revision>,
+    error: &str,
+) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
-    outcome.conflicts.push(Conflict {
+    let conflict = Conflict {
         id: id.clone(),
         path: path.to_owned(),
         original_path: original_path.map(str::to_owned),
@@ -1001,7 +1999,8 @@ fn record_conflict(
         remote_node,
         remote_revision: remote_revision.map(Revision::to_bytes),
         error: error.to_owned(),
-    });
+    };
+    outcome.conflicts.push(conflict);
     replica.store_mut().insert_conflict(&ConflictRecord {
         id,
         path: path.to_owned(),
@@ -1025,15 +2024,165 @@ fn depth(path: &str) -> usize {
     path.matches('/').count()
 }
 
-fn is_moved_child(moves: &BTreeMap<String, String>, path: &str) -> bool {
-    moves.iter().any(|(from, to)| {
-        (path != *from
+fn under_any(dirs: &BTreeSet<String>, path: &str) -> bool {
+    dirs.iter().any(|dir| {
+        path != dir
             && path
-                .strip_prefix(from)
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.starts_with('/')))
-            || (path != *to
-                && path
-                    .strip_prefix(to)
-                    .is_some_and(|suffix| !suffix.is_empty() && suffix.starts_with('/')))
+                .strip_prefix(dir)
+                .is_some_and(|suffix| suffix.starts_with('/'))
     })
+}
+
+fn under_any_inclusive(dirs: &BTreeSet<String>, path: &str) -> bool {
+    dirs.iter().any(|dir| {
+        path == dir
+            || path
+                .strip_prefix(dir)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn local_evidence(node: Option<&LocalNode>) -> LocalEvidence {
+    match node {
+        None => LocalEvidence {
+            kind: None,
+            length: None,
+            digest: None,
+            executable: None,
+            presence: Presence::Absent,
+        },
+        Some(node) => match node.kind {
+            LocalKind::Directory => LocalEvidence {
+                kind: Some(EntryKind::Directory),
+                length: None,
+                digest: None,
+                executable: Some(node.executable),
+                presence: Presence::Present,
+            },
+            LocalKind::File { length, digest } => LocalEvidence {
+                kind: Some(EntryKind::File),
+                length: Some(length),
+                digest: Some(*digest.as_bytes()),
+                executable: Some(node.executable),
+                presence: Presence::Present,
+            },
+        },
+    }
+}
+
+fn remote_evidence(node: Option<&Node>, revision: Option<Revision>) -> RemoteEvidence {
+    match node {
+        None => RemoteEvidence {
+            kind: None,
+            length: None,
+            digest: None,
+            executable: None,
+            presence: Presence::Absent,
+            node: None,
+            revision: None,
+        },
+        Some(node) => {
+            let (kind, length, digest) = match node.kind() {
+                NodeKind::Directory { .. } => (EntryKind::Directory, None, None),
+                NodeKind::File(file) => (
+                    EntryKind::File,
+                    Some(file.content_id().length()),
+                    Some(*file.content_id().digest()),
+                ),
+            };
+            RemoteEvidence {
+                kind: Some(kind),
+                length,
+                digest,
+                executable: Some(node.executable()),
+                presence: Presence::Present,
+                node: Some(node.id()),
+                revision,
+            }
+        }
+    }
+}
+
+fn intent_evidence(
+    work: Option<&WorkRecord>,
+    inspect: Option<&crate::sync::SyncInspect>,
+) -> IntentEvidence {
+    let Some(work) = work else {
+        return IntentEvidence::default();
+    };
+    let operation = match work.operation.as_str() {
+        "content" => IntentOperation::Content,
+        "create-file" => IntentOperation::CreateFile,
+        "create-directory" => IntentOperation::CreateDirectory,
+        "remove" => IntentOperation::Remove,
+        "rename" => IntentOperation::Rename,
+        "set-executable" => IntentOperation::SetExecutable,
+        _ => return IntentEvidence::default(),
+    };
+    let mut evidence = IntentEvidence {
+        id: Some(work.id),
+        operation: Some(operation),
+        state: Some(intent_state_from_work(&work.state)),
+        commit_id: None,
+        receipt_revision: work.remote_revision.map(Revision::from_bytes),
+        error: work.error.clone(),
+    };
+    if let Some(inspect) = inspect {
+        let edit = EditId::from_bytes(work.id);
+        if let Some(status) = inspect
+            .namespace
+            .iter()
+            .find(|status| status.intent.id == edit)
+        {
+            evidence.commit_id = Some(status.intent.commit_id);
+            evidence.state = Some(namespace_intent_state(&status.state));
+            if let NamespaceState::Committed(receipt) = &status.state {
+                evidence.receipt_revision = Some(receipt.cursor.revision);
+            }
+            evidence.error = status.failure.as_ref().map(|failure| failure.to_string());
+        } else if let Some(content) = inspect.content.iter().find(|content| content.id == edit) {
+            evidence.state = Some(intent_state_from_handle(&content.handle));
+            evidence.error = content
+                .handle
+                .error
+                .as_ref()
+                .map(|failure| failure.to_string());
+        }
+    }
+    evidence
+}
+
+fn intent_state_from_work(state: &str) -> IntentState {
+    match state {
+        "prepared" => IntentState::Prepared,
+        "unknown" => IntentState::Unknown,
+        "committed" => IntentState::Committed,
+        "conflict" => IntentState::Conflict,
+        "retryable" => IntentState::Retryable,
+        _ => IntentState::Failed,
+    }
+}
+
+fn namespace_intent_state(state: &NamespaceState) -> IntentState {
+    match state {
+        NamespaceState::Prepared => IntentState::Prepared,
+        NamespaceState::Unknown => IntentState::Unknown,
+        NamespaceState::Committed(_) => IntentState::Committed,
+        NamespaceState::Conflict => IntentState::Conflict,
+        NamespaceState::Retryable => IntentState::Retryable,
+        NamespaceState::Failed => IntentState::Failed,
+    }
+}
+
+fn intent_state_from_handle(handle: &crate::runtime::HandleStatus) -> IntentState {
+    if handle.conflict {
+        return IntentState::Conflict;
+    }
+    match handle.error.as_ref().map(|failure| failure.kind()) {
+        Some(crate::runtime::ErrorKind::Unknown) => IntentState::Unknown,
+        Some(crate::runtime::ErrorKind::Conflict) => IntentState::Conflict,
+        Some(_) => IntentState::Failed,
+        None if handle.pending || handle.frozen => IntentState::Prepared,
+        None => IntentState::Committed,
+    }
 }

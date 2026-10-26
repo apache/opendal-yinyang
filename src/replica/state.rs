@@ -113,6 +113,10 @@ pub(super) struct BaselineNode {
     pub directory: bool,
     pub executable: bool,
     pub digest: Option<[u8; 32]>,
+    /// Remote revision at which this entry's accepted state was observed. It is
+    /// the predicate revision for later staging and status; never a global
+    /// latest revision substituted for the original observation.
+    pub revision: Revision,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +137,27 @@ pub(super) struct ConflictRecord {
     pub remote_node: Option<[u8; 16]>,
     pub remote_revision: Option<[u8; 24]>,
     pub error: String,
+}
+
+/// Directory ownership bookkeeping for one staged Sync edit. It records which
+/// local path the edit belongs to (before dispatch) so a restart can retry only
+/// associated work and keep orphaned staging unpublished.
+#[derive(Clone, Debug)]
+pub(super) struct WorkRecord {
+    pub id: [u8; 32],
+    pub path: String,
+    pub original_path: Option<String>,
+    pub desired_path: Option<String>,
+    pub operation: String,
+    pub local_kind: Option<String>,
+    pub local_digest: Option<[u8; 32]>,
+    pub local_length: Option<u64>,
+    pub local_executable: Option<bool>,
+    pub baseline_node: Option<[u8; 16]>,
+    pub baseline_revision: [u8; 24],
+    pub remote_revision: Option<[u8; 24]>,
+    pub state: String,
+    pub error: Option<String>,
 }
 
 pub(super) struct Store {
@@ -171,7 +196,8 @@ impl Store {
                    local_dev BLOB,
                    local_ino BLOB,
                    local_parent_dev BLOB,
-                   local_parent_ino BLOB
+                   local_parent_ino BLOB,
+                   remote_revision BLOB
                  );
                  CREATE TABLE IF NOT EXISTS baseline_meta(
                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -219,9 +245,27 @@ impl Store {
                    remote_node BLOB,
                    remote_revision BLOB,
                    error TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS work(
+                   id BLOB PRIMARY KEY,
+                   path TEXT NOT NULL,
+                   original_path TEXT,
+                   desired_path TEXT,
+                   operation TEXT NOT NULL,
+                   local_kind TEXT,
+                   local_digest BLOB,
+                   local_length INTEGER,
+                   local_executable INTEGER,
+                   baseline_node BLOB,
+                   baseline_revision BLOB NOT NULL,
+                   remote_revision BLOB,
+                   state TEXT NOT NULL,
+                   error TEXT
                  );",
             )
             .map_err(|e| Error::io("initialize replica state", path, e))?;
+        ensure_column(&connection, "baseline", "remote_revision", "BLOB")
+            .map_err(|e| Error::io("migrate replica baseline", path, e))?;
         Ok(Self { connection })
     }
 
@@ -389,7 +433,11 @@ impl Store {
             };
             transaction
                 .execute(
-                    "INSERT INTO baseline VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    "INSERT INTO baseline
+                     (path,node,directory,executable,remote_digest,remote_length,
+                      local_present,local_digest,local_length,local_executable,
+                      local_dev,local_ino,local_parent_dev,local_parent_ino,remote_revision)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     params![
                         path,
                         node.id().as_bytes().as_slice(),
@@ -407,6 +455,7 @@ impl Store {
                         local_ino,
                         parent_dev,
                         parent_ino,
+                        revision.to_bytes().as_slice(),
                     ],
                 )
                 .map_err(|e| Error::corrupt(format!("write baseline: {e}")))?;
@@ -431,6 +480,7 @@ impl Store {
         path: &str,
         node: &Node,
         local: Option<&LocalNode>,
+        revision: Revision,
     ) -> Result<()> {
         let (directory, length, digest) = match node.kind() {
             NodeKind::Directory { .. } => (true, 0, None),
@@ -475,7 +525,10 @@ impl Store {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO baseline
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                 (path,node,directory,executable,remote_digest,remote_length,
+                  local_present,local_digest,local_length,local_executable,
+                  local_dev,local_ino,local_parent_dev,local_parent_ino,remote_revision)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     path,
                     node.id().as_bytes().as_slice(),
@@ -493,6 +546,7 @@ impl Store {
                     local_ino,
                     parent_dev,
                     parent_ino,
+                    revision.to_bytes().as_slice(),
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write baseline entry: {e}")))?;
@@ -538,7 +592,8 @@ impl Store {
             .prepare(
                 "SELECT path,node,directory,executable,remote_digest,remote_length,
                         local_present,local_digest,local_length,local_executable,
-                        local_dev,local_ino,local_parent_dev,local_parent_ino
+                        local_dev,local_ino,local_parent_dev,local_parent_ino,
+                        remote_revision
                  FROM baseline ORDER BY path",
             )
             .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
@@ -553,6 +608,7 @@ impl Store {
                 let local_ino: Option<Vec<u8>> = row.get(11)?;
                 let local_parent_dev: Option<Vec<u8>> = row.get(12)?;
                 let local_parent_ino: Option<Vec<u8>> = row.get(13)?;
+                let revision: Vec<u8> = row.get(14)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     NodeId::from_bytes(fixed(&node, "baseline node")?),
@@ -594,6 +650,7 @@ impl Store {
                         .as_deref()
                         .map(|value| number(value, "baseline parent inode"))
                         .transpose()?,
+                    Revision::from_bytes(fixed(&revision, "baseline revision")?),
                 ))
             })
             .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
@@ -613,6 +670,7 @@ impl Store {
                 local_ino,
                 local_parent_dev,
                 local_parent_ino,
+                revision,
             ) = row.map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
             remote.insert(
                 path.clone(),
@@ -621,6 +679,7 @@ impl Store {
                     directory,
                     executable,
                     digest: remote_digest,
+                    revision,
                 },
             );
             if local_present {
@@ -733,6 +792,127 @@ impl Store {
             )
             .map_err(|e| Error::corrupt(format!("update conflict: {e}")))?;
         Ok(())
+    }
+
+    pub fn remove_conflict(&mut self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM conflicts WHERE id=?1", params![id])
+            .map_err(|e| Error::corrupt(format!("remove conflict: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist the directory association for a staged edit before dispatch.
+    pub fn insert_work(&mut self, work: &WorkRecord) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO work
+                 (id,path,original_path,desired_path,operation,local_kind,local_digest,
+                  local_length,local_executable,baseline_node,baseline_revision,
+                  remote_revision,state,error)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    work.id.as_slice(),
+                    work.path,
+                    work.original_path,
+                    work.desired_path,
+                    work.operation,
+                    work.local_kind,
+                    work.local_digest.as_ref().map(|v| v.as_slice()),
+                    work.local_length
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| Error::invalid("work length exceeds SQLite range"))?,
+                    work.local_executable,
+                    work.baseline_node.as_ref().map(|v| v.as_slice()),
+                    work.baseline_revision.as_slice(),
+                    work.remote_revision.as_ref().map(|v| v.as_slice()),
+                    work.state,
+                    work.error,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("write work association: {e}")))?;
+        Ok(())
+    }
+
+    pub fn update_work(
+        &mut self,
+        id: &[u8; 32],
+        state: &str,
+        remote_revision: Option<Revision>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE work SET state=?2,remote_revision=?3,error=?4 WHERE id=?1",
+                params![
+                    id.as_slice(),
+                    state,
+                    remote_revision.map(|value| value.to_bytes().to_vec()),
+                    error,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("update work association: {e}")))?;
+        Ok(())
+    }
+
+    pub fn remove_work(&mut self, id: &[u8; 32]) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM work WHERE id=?1", params![id.as_slice()])
+            .map_err(|e| Error::corrupt(format!("remove work association: {e}")))?;
+        Ok(())
+    }
+
+    pub fn work(&self) -> Result<Vec<WorkRecord>> {
+        let mut query = self
+            .connection
+            .prepare(
+                "SELECT id,path,original_path,desired_path,operation,local_kind,local_digest,
+                        local_length,local_executable,baseline_node,baseline_revision,
+                        remote_revision,state,error
+                 FROM work ORDER BY path,id",
+            )
+            .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
+        query
+            .query_map([], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let local_digest: Option<Vec<u8>> = row.get(6)?;
+                let local_length: Option<i64> = row.get(7)?;
+                let baseline_node: Option<Vec<u8>> = row.get(9)?;
+                let baseline_revision: Vec<u8> = row.get(10)?;
+                let remote_revision: Option<Vec<u8>> = row.get(11)?;
+                Ok(WorkRecord {
+                    id: fixed(&id, "work id")?,
+                    path: row.get(1)?,
+                    original_path: row.get(2)?,
+                    desired_path: row.get(3)?,
+                    operation: row.get(4)?,
+                    local_kind: row.get(5)?,
+                    local_digest: local_digest
+                        .as_deref()
+                        .map(|value| fixed(value, "work local digest"))
+                        .transpose()?,
+                    local_length: local_length
+                        .map(|value| {
+                            u64::try_from(value).map_err(|_| corrupt_sql("negative work length"))
+                        })
+                        .transpose()?,
+                    local_executable: row.get(8)?,
+                    baseline_node: baseline_node
+                        .as_deref()
+                        .map(|value| fixed(value, "work baseline node"))
+                        .transpose()?,
+                    baseline_revision: fixed(&baseline_revision, "work baseline revision")?,
+                    remote_revision: remote_revision
+                        .as_deref()
+                        .map(|value| fixed(value, "work remote revision"))
+                        .transpose()?,
+                    state: row.get(12)?,
+                    error: row.get(13)?,
+                })
+            })
+            .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?
+            .map(|row| row.map_err(|e| Error::corrupt(format!("read work association: {e}"))))
+            .collect()
     }
 
     pub fn insert_artifact(&mut self, artifact: &ArtifactRecord) -> Result<()> {
@@ -945,6 +1125,27 @@ fn fixed<const N: usize>(bytes: &[u8], name: &str) -> rusqlite::Result<[u8; N]> 
     bytes
         .try_into()
         .map_err(|_| corrupt_sql(format!("invalid {name} length")))
+}
+
+/// Add a column to an existing table when an older database predates it.
+/// `CREATE TABLE IF NOT EXISTS` only covers fresh databases.
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    if existing.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    connection.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+    ))
 }
 
 fn number(bytes: &[u8], name: &str) -> rusqlite::Result<u64> {

@@ -191,7 +191,7 @@ pub struct Replica {
     state_identity: Identity,
     root_fd: OwnedFd,
     quarantine_fd: OwnedFd,
-    _lease: std::fs::File,
+    _lease: Option<std::fs::File>,
     store: Store,
 }
 
@@ -271,7 +271,7 @@ impl Replica {
             state_identity,
             root_fd,
             quarantine_fd,
-            _lease: lease,
+            _lease: Some(lease),
             store,
         };
         replica.recover_incomplete()?;
@@ -330,7 +330,7 @@ impl Replica {
             state_identity,
             root_fd,
             quarantine_fd,
-            _lease: lease,
+            _lease: Some(lease),
             store,
         };
         replica.recover_incomplete()?;
@@ -383,6 +383,16 @@ impl Replica {
     /// Read-only bound status. No exclusive lease, no recovery and no writes,
     /// so progress remains inspectable while another process runs.
     pub fn inspect(state: &Path) -> Result<ReplicaStatus> {
+        Self::open_read_only(state)?.inspect_status_readonly()
+    }
+
+    /// Read-only local scan without acquiring the writer lease or performing
+    /// recovery, so a bound root stays inspectable while a writer runs.
+    pub fn scan_read_only(state: &Path) -> Result<LocalSnapshot> {
+        Self::open_read_only(state)?.scan()
+    }
+
+    fn open_read_only(state: &Path) -> Result<Self> {
         let state =
             std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;
         let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
@@ -394,7 +404,7 @@ impl Replica {
             return Err(Error::invalid("sync state identity changed"));
         }
         let root = PathBuf::from(&binding.root);
-        let (_root_fd, root_identity) = open_bound_directory(&root, "open bound local root")
+        let (root_fd, root_identity) = open_bound_directory(&root, "open bound local root")
             .map_err(|error| Error::invalid(format!("bound local root is unavailable: {error}")))?;
         if root_identity.dev != binding.root_dev || root_identity.ino != binding.root_ino {
             return Err(Error::invalid("bound local root identity changed"));
@@ -411,8 +421,22 @@ impl Replica {
             Mode::empty(),
         )
         .map_err(|e| Error::errno("open retained artifact directory", &state, e))?;
-        let records = store.artifacts()?;
-        let installs = store.installs()?;
+        Ok(Self {
+            root,
+            state,
+            filesystem: binding.filesystem,
+            root_identity,
+            state_identity,
+            root_fd,
+            quarantine_fd,
+            _lease: None,
+            store,
+        })
+    }
+
+    fn inspect_status_readonly(&self) -> Result<ReplicaStatus> {
+        let records = self.store.artifacts()?;
+        let installs = self.store.installs()?;
         let mut artifacts: Vec<Artifact> = records.iter().cloned().map(Artifact::from).collect();
         for (artifact, record) in artifacts.iter_mut().zip(records) {
             let install = installs
@@ -423,7 +447,7 @@ impl Replica {
                     || install.phase == InstallPhase::Conflict)
             {
                 let matches = match hash_artifact_matches(
-                    &quarantine_fd,
+                    &self.quarantine_fd,
                     &record.name,
                     &install.expected_digest,
                     install.expected_length,
@@ -440,11 +464,16 @@ impl Replica {
                 }
             }
         }
-        let conflicts = store.conflicts()?.into_iter().map(Conflict::from).collect();
+        let conflicts = self
+            .store
+            .conflicts()?
+            .into_iter()
+            .map(Conflict::from)
+            .collect();
         Ok(ReplicaStatus {
-            root,
-            filesystem: binding.filesystem,
-            pending_installs: store.incomplete_installs()?.len(),
+            root: self.root.clone(),
+            filesystem: self.filesystem,
+            pending_installs: self.store.incomplete_installs()?.len(),
             artifacts,
             conflicts,
         })
@@ -666,6 +695,22 @@ impl Replica {
             Mode::empty(),
         )
         .map_err(|e| Error::errno("open retained artifact", &self.state, e))?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    /// Open one live local file without following symlinks and without blocking
+    /// on a FIFO: used to export the current local side of a conflict.
+    pub fn open_local_file(&self, path: &str) -> Result<std::fs::File> {
+        validate_path(path)?;
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(&parent)?;
+        let fd = openat(
+            &parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::errno("open local file", &self.root.join(path), e))?;
         Ok(std::fs::File::from(fd))
     }
 
