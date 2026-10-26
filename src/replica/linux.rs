@@ -17,7 +17,7 @@
 
 use super::state::{ArtifactRecord, ConflictRecord, InstallPhase, InstallRecord, Store};
 use super::{Error, Result};
-use rustix::fd::{AsFd, OwnedFd};
+use rustix::fd::OwnedFd;
 use rustix::fs::{
     AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, fchmod, flock, fstat,
     fsync, mkdirat, open, openat, renameat_with, statat, unlinkat,

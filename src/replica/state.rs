@@ -16,7 +16,8 @@
 // under the License.
 
 use super::{Error, Result};
-use super::{Identity, LocalKind, LocalNode, LocalSnapshot};
+use super::{LocalKind, LocalNode, LocalSnapshot};
+use crate::replica::linux::{ContentHash, Identity};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::path::Path;

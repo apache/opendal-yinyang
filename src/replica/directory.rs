@@ -21,12 +21,12 @@ use crate::replica::state::{BaselineRecord, ConflictRecord};
 use crate::replica::{Conflict, LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaStatus};
 use crate::sync::{EditId, FileMetadata, NamespaceState, RenameMode, Sync};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Seek as _, SeekFrom, Write as _};
+use std::io::{Seek as _, SeekFrom, Write, Write as _};
 use std::path::Path;
 use std::sync::Arc;
-use yinyang::core::{Authority, Node, NodeId, NodeKind, Revision, Snapshot};
+use yinyang_core::{Authority, Node, NodeId, NodeKind, Revision, Snapshot};
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + std::marker::Sync>>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunOutcome {
@@ -75,7 +75,7 @@ impl DirectorySync {
         let mut outcome = self.retry_pending().await?;
         let mut current = self.replica.scan()?;
         let observed = self.sync.authority().observe_latest().await?;
-        let mut remote = yinyang::directory_nodes(&observed)?;
+        let mut remote = crate::directory_nodes(&observed)?;
         let baseline = self.replica.store().load_baseline()?;
         match baseline {
             Some(baseline) => {
@@ -129,7 +129,7 @@ impl DirectorySync {
         if outcome.in_sync {
             let latest = self.sync.authority().observe_latest().await?;
             let after = self.replica.scan()?;
-            let after_remote = yinyang::directory_nodes(&latest)?;
+            let after_remote = crate::directory_nodes(&latest)?;
             self.replica
                 .store_mut()
                 .save_baseline(latest.revision(), &after_remote, &after)?;
@@ -149,7 +149,7 @@ impl DirectorySync {
             Resolution::KeepLocal => {
                 if let Some(artifact) = record.local_artifact {
                     let observed = self.sync.authority().observe_latest().await?;
-                    let remote = yinyang::directory_nodes(&observed)?;
+                    let remote = crate::directory_nodes(&observed)?;
                     if let Some(node) = remote.get(&record.path) {
                         let mut source = self.replica.open_artifact(&artifact)?;
                         let mut source = tokio::io::BufReader::new(source);
