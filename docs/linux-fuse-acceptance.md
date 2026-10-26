@@ -47,6 +47,14 @@ cargo x test-linux-fuse --read-only
   520-entry bulk directory that crosses the adapter's 512-entry readdir page.
 - Basic writable I/O: create, write, remote `fsync` verified through an
   independent authority, append, truncate, and multiple descriptors on one file.
+- Dirty descriptor isolation: a read-only descriptor closed while another
+  descriptor is dirty must not publish the dirty or frozen state; explicit
+  `fsync` on the dirty descriptor establishes the remote result.
+- Path truncate: real `truncate(2)` without an open descriptor commits its
+  shrink/extend result to the independent authority at an explicit boundary.
+- Limited chmod: `0644 <-> 0755` is observable, while non-representable modes
+  such as `0600` and `0000` fail with an explicit error and leave attributes
+  unchanged.
 - Safe-save rename replacement: `rename` replaces an observed destination
   atomically and the independent authority observes the result; plain rename
   preserves the moved node's inode identity.

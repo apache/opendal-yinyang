@@ -20,9 +20,10 @@
 use crate::harness::{
     Fixture, Frontend, Publication, assert_errno, run_external, sync_all_with_deadline,
 };
+use nix::unistd::truncate;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
@@ -33,6 +34,7 @@ const ENOSYS: i32 = 38;
 const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
 const EROFS: i32 = 30;
+const EINVAL: i32 = 22;
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
@@ -59,6 +61,14 @@ fn inode(path: &Path) -> u64 {
     fs::metadata(path)
         .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
         .ino()
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path)
+        .unwrap_or_else(|error| panic!("stat mode {}: {error}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
 }
 
 #[test]
@@ -284,6 +294,120 @@ fn basic_io(fixture: &Fixture) {
         "an open reader must observe accepted writes"
     );
     mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_dirty_fd_readonly_close_keeps_remote_unchanged_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-flush-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "flush.txt", b"original");
+        let config = fixture.volume_config(&format!("stage-flush-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-flush-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+
+        let mut dirty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mounted.mountpoint().join("flush.txt"))
+            .expect("open write descriptor");
+        dirty.write_all(b"dirty").expect("stage dirty bytes");
+        let mut reader =
+            File::open(mounted.mountpoint().join("flush.txt")).expect("open read-only descriptor");
+        let mut staged = Vec::new();
+        reader
+            .read_to_end(&mut staged)
+            .expect("read through the read-only descriptor");
+        assert_eq!(staged, b"dirty");
+        drop(reader);
+        assert_eq!(
+            fixture.remote_read(&library, "flush.txt", 16),
+            b"original",
+            "closing a read-only descriptor must not publish another descriptor's dirty bytes"
+        );
+        dirty.sync_all().expect("explicit dirty fsync publishes");
+        drop(dirty);
+        assert_eq!(fixture.remote_read(&library, "flush.txt", 16), b"dirty");
+        mounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_path_truncate_commits_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-truncate-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "truncate.txt", b"0123456789");
+        let config =
+            fixture.volume_config(&format!("stage-truncate-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-truncate-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let path = mounted.mountpoint().join("truncate.txt");
+
+        truncate(&path, 3).expect("truncate(2) shrink without an open descriptor");
+        assert_eq!(fs::metadata(&path).expect("stat truncated path").len(), 3);
+        assert_eq!(
+            fixture.remote_read(&library, "truncate.txt", 16),
+            b"012",
+            "a successful path truncate must have an explicit remote commit boundary"
+        );
+        truncate(&path, 6).expect("truncate(2) extend without an open descriptor");
+        assert_eq!(
+            fixture.remote_read(&library, "truncate.txt", 16),
+            vec![b'0', b'1', b'2', 0u8, 0u8, 0u8],
+            "path extension must also reach the independent authority"
+        );
+        mounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_chmod_limits_to_executable_bit_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-chmod-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "chmod.txt", b"mode");
+        let config = fixture.volume_config(&format!("stage-chmod-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-chmod-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let path = mounted.mountpoint().join("chmod.txt");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("baseline chmod 0644");
+        assert_eq!(mode(&path), 0o644);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 must be representable");
+        assert_eq!(mode(&path), 0o755);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod back to 0644");
+        assert_eq!(mode(&path), 0o644);
+
+        for unsupported_mode in [0o600, 0o000] {
+            let error = fs::set_permissions(&path, fs::Permissions::from_mode(unsupported_mode))
+                .expect_err("non-representable mode must fail explicitly");
+            assert_errno(
+                error,
+                &[ENOSYS, EOPNOTSUPP, EINVAL],
+                "chmod non-representable mode",
+            );
+            assert_eq!(
+                mode(&path),
+                0o644,
+                "failed chmod {unsupported_mode:o} must not change the previous attributes"
+            );
+        }
+        mounted.unmount();
+    }
 }
 
 #[test]
@@ -715,6 +839,14 @@ fn fuse_daemon_crash_interrupts_pending_fsync_service() {
     });
     let frozen = fixture.wait_for_frozen(&config);
     println!("fsync reached the frozen publication boundary:\n{frozen}");
+    let mut frozen_reader = File::open(mounted.mountpoint().join("interrupted.txt"))
+        .expect("open read-only descriptor while the write is frozen");
+    let mut frozen_bytes = Vec::new();
+    frozen_reader
+        .read_to_end(&mut frozen_bytes)
+        .expect("read staged bytes while frozen");
+    assert_eq!(frozen_bytes, b"interrupted-local");
+    drop(frozen_reader);
     mounted.kill();
     let outcome = receiver
         .recv_timeout(Duration::from_secs(20))
