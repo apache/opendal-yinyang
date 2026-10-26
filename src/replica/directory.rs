@@ -531,10 +531,18 @@ impl DirectorySync {
                 )
             } else if local_action != Action::None {
                 pending += 1;
+                // A local change is pending, but a previous request may already
+                // have completed: report that receipt separately from the new
+                // local edit so a completed v1 is not shown as merely Pending.
+                let previous_completed = baseline_node.is_some() && remote_action == Action::None;
                 (
                     EntryState::LocalPending,
                     OutcomeEvidence {
-                        state: OutcomeState::Pending,
+                        state: if previous_completed {
+                            OutcomeState::RemoteCompleted
+                        } else {
+                            OutcomeState::Pending
+                        },
                         error: None,
                     },
                 )
@@ -630,28 +638,9 @@ impl DirectorySync {
         side: &str,
         output: &mut dyn Write,
     ) -> Result<()> {
-        let record = self
-            .replica
-            .store()
-            .conflicts()?
-            .into_iter()
-            .find(|record| record.id == conflict_id)
-            .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+        let record = self.load_conflict_record(conflict_id)?;
         match side {
-            "local" => {
-                if let Some(artifact) = record.local_artifact {
-                    return Ok(self.replica.export_artifact(&artifact, output)?);
-                }
-                // The live local file for the conflict's current path.
-                let path = record
-                    .desired_path
-                    .as_deref()
-                    .unwrap_or(record.path.as_str());
-                let file = self.replica.open_local_file(path)?;
-                let mut file = file;
-                std::io::copy(&mut file, output).map_err(|error| error.to_string())?;
-                Ok(())
-            }
+            "local" => self.export_conflict_local(conflict_id, output),
             "remote" => {
                 let node = record
                     .remote_node
@@ -683,6 +672,27 @@ impl DirectorySync {
         }
     }
 
+    /// Export only the local side of a conflict. The bytes are local (a
+    /// retained artifact or the live local file), so no Authority is needed;
+    /// it keeps working offline.
+    pub fn export_conflict_local(&self, conflict_id: &str, output: &mut dyn Write) -> Result<()> {
+        let record = self.load_conflict_record(conflict_id)?;
+        export_local_side(&self.replica, &record, output)
+    }
+
+    fn load_conflict_record(&self, conflict_id: &str) -> Result<ConflictRecord> {
+        match self
+            .replica
+            .store()
+            .conflicts()?
+            .into_iter()
+            .find(|record| record.id == conflict_id)
+        {
+            Some(record) => Ok(record),
+            None => self.synthetic_conflict(conflict_id),
+        }
+    }
+
     pub async fn run(&mut self) -> Result<RunOutcome> {
         let mut outcome = RunOutcome::default();
         self.retry_associated(&mut outcome).await?;
@@ -696,6 +706,20 @@ impl DirectorySync {
                 .await?;
         }
 
+        // Paths owned by unresolved or terminal work are excluded from this
+        // pass so the exact original request is never silently superseded by a
+        // freshly staged edit.
+        let blocked: BTreeSet<String> = self
+            .replica
+            .store()
+            .work()?
+            .into_iter()
+            .filter_map(|record| match record.state.as_str() {
+                "prepared" | "unknown" | "retryable" | "conflict" | "failed" => Some(record.path),
+                _ => None,
+            })
+            .collect();
+
         if let Some(baseline) = self.replica.store().load_baseline()? {
             let mut ctx = Context {
                 sync: &mut self.sync,
@@ -708,6 +732,7 @@ impl DirectorySync {
                 nodes: BTreeMap::new(),
                 revisions: BTreeMap::new(),
                 dirty: BTreeSet::new(),
+                blocked,
             };
             ctx.reconcile().await?;
         }
@@ -719,16 +744,7 @@ impl DirectorySync {
     /// Apply one durable decision to an active conflict, then reconcile again.
     /// The conflict stays active until its derived request actually commits.
     pub async fn resolve(&mut self, conflict_id: &str, decision: Resolution) -> Result<RunOutcome> {
-        let record = match self
-            .replica
-            .store()
-            .conflicts()?
-            .into_iter()
-            .find(|record| record.id == conflict_id)
-        {
-            Some(record) => record,
-            None => self.synthetic_conflict(conflict_id)?,
-        };
+        let record = self.load_conflict_record(conflict_id)?;
         let observed = self.sync.authority().observe_latest().await?;
         let remote = crate::directory_nodes(&observed).await?;
         let baseline = self.replica.store().load_baseline()?;
@@ -756,7 +772,12 @@ impl DirectorySync {
             .find(|artifact| artifact_conflict_identity(&artifact.id) == conflict_id);
         match artifact {
             Some(artifact) => self.replica.acknowledge_retained_artifact(&artifact.id)?,
-            None => self.replica.store_mut().remove_conflict(conflict_id)?,
+            None => {
+                self.replica
+                    .store_mut()
+                    .supersede_conflict_work(conflict_id)?;
+                self.replica.store_mut().remove_conflict(conflict_id)?;
+            }
         }
         Ok(())
     }
@@ -792,6 +813,7 @@ impl DirectorySync {
                 .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
         })
     }
+
     async fn admit(
         &mut self,
         outcome: &mut RunOutcome,
@@ -896,7 +918,10 @@ impl DirectorySync {
     async fn retry_associated(&mut self, outcome: &mut RunOutcome) -> Result<()> {
         let work = self.replica.store().work()?;
         for record in work {
-            if matches!(record.state.as_str(), "committed" | "conflict" | "failed") {
+            if matches!(
+                record.state.as_str(),
+                "committed" | "superseded" | "conflict" | "failed"
+            ) {
                 continue;
             }
             let edit = EditId::from_bytes(record.id);
@@ -915,15 +940,7 @@ impl DirectorySync {
                     // Apply baseline and clear the linked conflict before
                     // marking the work complete. Publication is idempotent, so
                     // a crash here is recovered by re-running this retry.
-                    if let Some(node) = self.accepted_node_at(&record, revision).await? {
-                        let accepted = accepted_local(&record)?;
-                        self.replica.store_mut().save_baseline_path(
-                            &record.path,
-                            &node,
-                            accepted.as_ref(),
-                            revision,
-                        )?;
-                    }
+                    self.apply_retry_receipt(&record, revision).await?;
                     if let Some(conflict) = &record.conflict {
                         self.clear_resolved_conflict(conflict)?;
                     }
@@ -973,6 +990,179 @@ impl DirectorySync {
         let observed = self.sync.authority().observe_revision(revision).await?;
         Ok(observed.resolve(&record.path).await?)
     }
+
+    /// Apply an already-committed retry receipt to the common baseline by
+    /// operation kind: a removal drops the subtree, a rename relocates the
+    /// subtree preserving accepted fingerprints, and other edits save the
+    /// accepted version at the path.
+    async fn apply_retry_receipt(&mut self, record: &WorkRecord, revision: Revision) -> Result<()> {
+        match record.operation.as_str() {
+            "remove" => {
+                self.replica
+                    .store_mut()
+                    .remove_baseline_subtree(&record.path)?;
+            }
+            "rename" => {
+                if let Some(from) = record.original_path.clone() {
+                    self.migrate_baseline_from_work(&from, &record.path, revision)?;
+                }
+            }
+            _ => {
+                if let Some(node) = self.accepted_node_at(record, revision).await? {
+                    let accepted = accepted_local(record)?;
+                    self.replica.store_mut().save_baseline_path(
+                        &record.path,
+                        &node,
+                        accepted.as_ref(),
+                        revision,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Relocate a whole subtree recorded by a committed rename receipt without
+    /// re-reading content: the receipt proves the namespace move only.
+    fn migrate_baseline_from_work(
+        &mut self,
+        from: &str,
+        to: &str,
+        revision: Revision,
+    ) -> Result<()> {
+        let Some(baseline) = self.replica.store().load_baseline()? else {
+            return Ok(());
+        };
+        let prefix = format!("{from}/");
+        let moves: Vec<(
+            String,
+            String,
+            crate::replica::state::BaselineNode,
+            Option<LocalNode>,
+        )> = baseline
+            .remote
+            .iter()
+            .filter(|(path, _)| *path == from || path.starts_with(&prefix))
+            .map(|(path, entry)| {
+                let destination = if path == from {
+                    to.to_owned()
+                } else {
+                    format!("{to}{}", &path[from.len()..])
+                };
+                (
+                    path.clone(),
+                    destination,
+                    entry.clone(),
+                    baseline.local.get(path).cloned(),
+                )
+            })
+            .collect();
+        for (source, destination, entry, previous) in moves {
+            let accepted = accepted_local_before(&self.replica, &destination, previous.as_ref())?;
+            let length = accepted
+                .as_ref()
+                .and_then(|node| match node.kind {
+                    LocalKind::File { length, .. } => Some(length),
+                    LocalKind::Directory => None,
+                })
+                .unwrap_or(0);
+            self.replica.store_mut().save_baseline_entry(
+                &destination,
+                entry.node,
+                entry.directory,
+                entry.executable,
+                entry.digest,
+                length,
+                accepted.as_ref(),
+                revision,
+            )?;
+            self.replica.store_mut().remove_baseline_path(&source)?;
+        }
+        Ok(())
+    }
+}
+
+/// Export only the local side of a conflict without constructing an Authority.
+/// `conflict_id` is the identity reported by inspection, including a conflict
+/// synthesized from a retained install inode that gained late writer bytes.
+pub fn export_conflict_local(
+    state: &Path,
+    conflict_id: &str,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let replica = Replica::open_read_only(state)?;
+    let record = match replica
+        .store()
+        .conflicts()?
+        .into_iter()
+        .find(|record| record.id == conflict_id)
+    {
+        Some(record) => record,
+        None => {
+            let artifact = replica
+                .store()
+                .artifacts()?
+                .into_iter()
+                .find(|artifact| {
+                    artifact_conflict_identity(&artifact.id) == conflict_id
+                        && artifact.phase == "conflict"
+                })
+                .ok_or_else(|| crate::replica::Error::invalid("unknown conflict").to_string())?;
+            ConflictRecord {
+                id: conflict_id.to_owned(),
+                path: artifact.origin.clone(),
+                original_path: Some(artifact.origin.clone()),
+                desired_path: Some(artifact.origin.clone()),
+                local: "retained_artifact".to_owned(),
+                remote: "current_file".to_owned(),
+                local_artifact: Some(artifact.id),
+                remote_node: None,
+                remote_revision: None,
+                error: artifact
+                    .error
+                    .unwrap_or_else(|| "retained inode changed after installation".to_owned()),
+            }
+        }
+    };
+    export_local_side(&replica, &record, output)
+}
+
+fn export_local_side(
+    replica: &Replica,
+    record: &ConflictRecord,
+    output: &mut dyn Write,
+) -> Result<()> {
+    if let Some(artifact) = &record.local_artifact {
+        return Ok(replica.export_artifact(artifact, output)?);
+    }
+    let path = record
+        .desired_path
+        .as_deref()
+        .unwrap_or(record.path.as_str());
+    let mut file = replica.open_local_file(path)?;
+    std::io::copy(&mut file, output).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn accepted_local_before(
+    replica: &Replica,
+    to: &str,
+    previous: Option<&LocalNode>,
+) -> Result<Option<LocalNode>> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let fresh = replica.scan()?;
+    let Some(current) = fresh.get(to) else {
+        return Ok(None);
+    };
+    Ok(Some(LocalNode {
+        path: to.to_owned(),
+        kind: previous.kind,
+        executable: previous.executable,
+        identity: current.identity,
+        parent: current.parent,
+    }))
 }
 
 fn accepted_local(record: &WorkRecord) -> Result<Option<LocalNode>> {
@@ -1029,6 +1219,8 @@ struct Context<'a> {
     /// Paths whose remote namespace we changed earlier in this run; their
     /// staging predicate must reflect those receipts.
     dirty: BTreeSet<String>,
+    /// Paths owned by unresolved or terminal work; never re-planned here.
+    blocked: BTreeSet<String>,
 }
 
 impl<'a> Context<'a> {
@@ -1066,7 +1258,11 @@ impl<'a> Context<'a> {
         let mut dirs: Vec<String> = paths.iter().cloned().collect();
         dirs.sort_by_key(|path| (depth(path), path.clone()));
         for path in &dirs {
-            if path.is_empty() || handled.contains(path) || under_any_inclusive(&retained, path) {
+            if path.is_empty()
+                || handled.contains(path)
+                || self.blocked.contains(path)
+                || under_any_inclusive(&retained, path)
+            {
                 continue;
             }
             let is_remote_deleted_dir = self
@@ -1082,6 +1278,7 @@ impl<'a> Context<'a> {
                 continue;
             }
             self.materialize_delete(path).await?;
+            self.replica.store_mut().remove_baseline_subtree(path)?;
             self.mark_subtree(&mut handled, path);
             handled.insert(path.clone());
         }
@@ -1089,7 +1286,7 @@ impl<'a> Context<'a> {
         let mut ascending: Vec<String> = paths.iter().cloned().collect();
         ascending.sort_by_key(|path| (depth(path), path.clone()));
         for path in &ascending {
-            if path.is_empty() || handled.contains(path) {
+            if path.is_empty() || handled.contains(path) || self.blocked.contains(path) {
                 continue;
             }
             if under_any(&retained, path) {
@@ -1102,7 +1299,7 @@ impl<'a> Context<'a> {
         descending.sort_by_key(|path| (depth(path), path.clone()));
         descending.reverse();
         for path in &descending {
-            if handled.contains(path) || under_any(&retained, path) {
+            if handled.contains(path) || self.blocked.contains(path) || under_any(&retained, path) {
                 continue;
             }
             let local = local_action(self.baseline.local.get(path), self.current.get(path));
@@ -1167,6 +1364,9 @@ impl<'a> Context<'a> {
             .cloned()
             .collect();
         for source in roots {
+            if self.blocked.contains(&source) {
+                continue;
+            }
             let rm = remote_moves.get(&source);
             let lm = local_moves.get(&source);
             match (rm, lm) {
@@ -1207,9 +1407,12 @@ impl<'a> Context<'a> {
                         remote_action(self.baseline.remote.get(&source), self.remote.get(&source))
                             == Action::None;
                     if remote_unchanged && !self.remote.contains_key(destination) {
-                        let revision = self.local_rename(&source, destination).await?;
-                        self.migrate_subtree(handled, &source, destination, revision)
-                            .await?;
+                        if let Some(revision) = self.local_rename(&source, destination).await? {
+                            self.migrate_subtree(handled, &source, destination, revision)
+                                .await?;
+                        } else {
+                            self.mark_subtree(handled, &source);
+                        }
                     } else {
                         self.mark_subtree(handled, &source);
                         self.conflict(&source, Some(&source), Some(&source)).await?;
@@ -1280,15 +1483,27 @@ impl<'a> Context<'a> {
         let Some(entry) = self.baseline.remote.get(from).cloned() else {
             return Ok(());
         };
-        let snapshot = self.sync.authority().observe_revision(revision).await?;
-        let Some(node) = snapshot.node(entry.node).await? else {
-            return Ok(());
-        };
         let previous = self.baseline.local.get(from).cloned();
         let accepted = self.accepted_local_at(to, previous.as_ref())?;
-        self.replica
-            .store_mut()
-            .save_baseline_path(to, &node, accepted.as_ref(), revision)?;
+        let length = accepted
+            .as_ref()
+            .and_then(|node| match node.kind {
+                LocalKind::File { length, .. } => Some(length),
+                LocalKind::Directory => None,
+            })
+            .unwrap_or(0);
+        // The rename receipt proves the namespace move, not descendant content.
+        // Keep the previously accepted remote digest and executable bit.
+        self.replica.store_mut().save_baseline_entry(
+            to,
+            entry.node,
+            entry.directory,
+            entry.executable,
+            entry.digest,
+            length,
+            accepted.as_ref(),
+            revision,
+        )?;
         self.replica.store_mut().remove_baseline_path(from)?;
         self.nodes.remove(from);
         self.nodes.insert(to.to_owned(), entry.node);
@@ -1500,7 +1715,7 @@ impl<'a> Context<'a> {
             .get(parent)
             .copied()
             .ok_or_else(|| format!("directory parent {parent:?} is missing"))?;
-        let parent_revision = self.revisions.get(parent).copied().unwrap_or(self.revision);
+        let parent_revision = self.entry_revision(parent);
         let edit = self
             .sync
             .stage_create_directory(parent_node, name, parent_revision)
@@ -1515,7 +1730,9 @@ impl<'a> Context<'a> {
             Some(parent_node),
             parent_revision,
         )?;
-        let revision = self.sync.publish(edit).await?;
+        let Some(revision) = self.publish_edit(edit, path).await? else {
+            return Ok(());
+        };
         self.revision = revision;
         let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
@@ -1539,7 +1756,7 @@ impl<'a> Context<'a> {
             .get(parent)
             .copied()
             .ok_or_else(|| format!("file parent {parent:?} is missing"))?;
-        let parent_revision = self.revisions.get(parent).copied().unwrap_or(self.revision);
+        let parent_revision = self.entry_revision(parent);
         let captured = self.replica.capture_file(path, node)?;
         let mut source =
             tokio::fs::File::from_std(self.replica.open_artifact(&captured.artifact.id)?);
@@ -1563,7 +1780,9 @@ impl<'a> Context<'a> {
             Some(parent_node),
             parent_revision,
         )?;
-        let revision = self.sync.publish(edit).await?;
+        let Some(revision) = self.publish_edit(edit, path).await? else {
+            return Ok(());
+        };
         self.revision = revision;
         let node_id = self.namespace_node(edit).await?;
         self.nodes.insert(path.to_owned(), node_id);
@@ -1599,7 +1818,9 @@ impl<'a> Context<'a> {
             Some(remote_node),
             predicate,
         )?;
-        let revision = self.sync.publish(edit).await?;
+        let Some(revision) = self.publish_edit(edit, path).await? else {
+            return Ok(());
+        };
         self.revision = revision;
         self.revisions.insert(path.to_owned(), revision);
         self.accept_local(path, node, remote_node, revision).await?;
@@ -1629,7 +1850,9 @@ impl<'a> Context<'a> {
             Some(node),
             predicate,
         )?;
-        let revision = self.sync.publish(edit).await?;
+        let Some(revision) = self.publish_edit(edit, path).await? else {
+            return Ok(());
+        };
         self.revision = revision;
         self.nodes.remove(path);
         self.revisions.remove(path);
@@ -1643,7 +1866,7 @@ impl<'a> Context<'a> {
         Ok(())
     }
 
-    async fn local_rename(&mut self, from: &str, to: &str) -> Result<Revision> {
+    async fn local_rename(&mut self, from: &str, to: &str) -> Result<Option<Revision>> {
         let node = self
             .nodes
             .get(from)
@@ -1670,7 +1893,9 @@ impl<'a> Context<'a> {
             Some(node),
             predicate,
         )?;
-        let revision = self.sync.publish(edit).await?;
+        let Some(revision) = self.publish_edit(edit, from).await? else {
+            return Ok(None);
+        };
         self.revision = revision;
         // The rename receipt proves the namespace move, never a concurrent
         // content edit. Preserve the previously accepted fingerprint for `to`.
@@ -1682,7 +1907,7 @@ impl<'a> Context<'a> {
             .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
-        Ok(revision)
+        Ok(Some(revision))
     }
 
     async fn materialize_create(&mut self, path: &str, node: &Node) -> Result<()> {
@@ -1803,6 +2028,101 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Publish an associated edit and translate a predicate Conflict into a
+    /// durable directory conflict instead of aborting the run.
+    async fn publish_edit(&mut self, edit: EditId, path: &str) -> Result<Option<Revision>> {
+        match self.sync.publish(edit).await {
+            Ok(revision) => Ok(Some(revision)),
+            Err(error) if error.kind() == crate::runtime::ErrorKind::Conflict => {
+                self.replica.store_mut().update_work(
+                    edit.as_bytes(),
+                    "conflict",
+                    None,
+                    Some(&error.to_string()),
+                )?;
+                self.record_publish_conflict(path).await?;
+                Ok(None)
+            }
+            Err(error) if error.kind() == crate::runtime::ErrorKind::Retryable => {
+                self.replica.store_mut().update_work(
+                    edit.as_bytes(),
+                    "retryable",
+                    None,
+                    Some(&error.to_string()),
+                )?;
+                Ok(None)
+            }
+            Err(error) => {
+                if let Some(commit) = error.commit_id() {
+                    self.replica
+                        .store_mut()
+                        .set_work_commit_id(edit.as_bytes(), *commit.as_bytes())?;
+                }
+                self.replica.store_mut().update_work(
+                    edit.as_bytes(),
+                    work_state_for(&error),
+                    None,
+                    Some(&error.to_string()),
+                )?;
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Record the current remote evidence for a path whose publication
+    /// predicate no longer held.
+    async fn record_publish_conflict(&mut self, path: &str) -> Result<()> {
+        let observed = self.sync.authority().observe_latest().await?;
+        let remote_node = observed.resolve(path).await?;
+        let local = self.local_side(path);
+        let remote = match &remote_node {
+            Some(node) if node.is_directory() => "current_directory",
+            Some(_) => "current_file",
+            None => "deleted",
+        };
+        let baseline_node = self.baseline.remote.get(path).map(|entry| entry.node);
+        let remote_id = remote_node.as_ref().map(Node::id);
+        let id = conflict_identity(
+            path,
+            Some(path),
+            Some(path),
+            local,
+            remote,
+            baseline_node.map(|node| *node.as_bytes()),
+            remote_id,
+        );
+        let existing_artifact = self
+            .replica
+            .store()
+            .conflicts()?
+            .into_iter()
+            .find(|conflict| conflict.id == id)
+            .and_then(|conflict| conflict.local_artifact);
+        let local_artifact = match existing_artifact {
+            Some(artifact) => Some(artifact),
+            None => self
+                .current
+                .get(path)
+                .filter(|node| matches!(node.kind, LocalKind::File { .. }))
+                .and_then(|node| self.replica.capture_file(path, node).ok())
+                .map(|captured| captured.artifact.id),
+        };
+        record_conflict_side(
+            self.outcome,
+            self.replica,
+            &id,
+            path,
+            Some(path),
+            Some(path),
+            local,
+            remote,
+            local_artifact.as_deref(),
+            remote_id,
+            Some(observed.revision()),
+            "a concurrent remote edit changed the publication predicate",
+        )
+    }
+
     fn entry_revision(&self, path: &str) -> Revision {
         // Preserve each path's own accepted revision, except where our earlier
         // namespace receipts in this run changed that path; then stage against
@@ -1859,6 +2179,7 @@ impl<'a> Context<'a> {
             None => (None, None, None, None),
         };
         self.replica.store_mut().insert_work(&WorkRecord {
+            seq: 0,
             id: *edit.as_bytes(),
             path: path.to_owned(),
             original_path: original_path.map(str::to_owned),
@@ -2057,18 +2378,6 @@ fn work_state_for(error: &crate::runtime::Error) -> &'static str {
     }
 }
 
-fn intent_priority(state: Option<IntentState>) -> u8 {
-    match state {
-        Some(IntentState::Unknown) => 6,
-        Some(IntentState::Prepared) => 5,
-        Some(IntentState::Retryable) => 4,
-        Some(IntentState::Conflict) => 3,
-        Some(IntentState::Failed) => 2,
-        Some(IntentState::Committed) => 1,
-        None => 0,
-    }
-}
-
 /// The durable state of one associated work record, preferring the Sync
 /// journal's own outcome when it is present.
 fn effective_intent_state(
@@ -2097,18 +2406,18 @@ fn effective_intent_state(
 fn select_work<'a>(
     work: &'a [WorkRecord],
     path: &str,
-    inspect: Option<&crate::sync::SyncInspect>,
+    _inspect: Option<&crate::sync::SyncInspect>,
 ) -> Option<&'a WorkRecord> {
-    let mut best: Option<&WorkRecord> = None;
-    let mut best_rank = 0_u8;
-    for record in work.iter().filter(|record| record.path == path) {
-        let rank = intent_priority(effective_intent_state(record, inspect));
-        if best.is_none() || rank > best_rank {
-            best = Some(record);
-            best_rank = rank;
-        }
-    }
-    best
+    // The newest non-retired request is the current one. History remains
+    // stored but never hides a later request for the same path.
+    work.iter()
+        .filter(|record| record.path == path && record.state != "superseded")
+        .max_by_key(|record| record.seq)
+        .or_else(|| {
+            work.iter()
+                .filter(|record| record.path == path)
+                .max_by_key(|record| record.seq)
+        })
 }
 
 /// Count each associated logical request once by its effective durable state.
@@ -2422,6 +2731,7 @@ fn intent_state_from_work(state: &str) -> IntentState {
         "prepared" => IntentState::Prepared,
         "unknown" => IntentState::Unknown,
         "committed" => IntentState::Committed,
+        "superseded" => IntentState::Committed,
         "conflict" => IntentState::Conflict,
         "retryable" => IntentState::Retryable,
         _ => IntentState::Failed,

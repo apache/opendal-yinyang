@@ -30,7 +30,7 @@ pub use directory::{
     BaselineEvidence, BindingEvidence, BindingState, DirectorySync, EntryEvidence, EntryKind,
     EntryState, Inspection, IntentEvidence, IntentOperation, IntentState, LocalEvidence,
     LocalScanState, LocalStatus, OutcomeEvidence, OutcomeState, Presence, RemoteAvailability,
-    RemoteEvidence, RemoteStatus, Resolution, RunOutcome, StatusSummary,
+    RemoteEvidence, RemoteStatus, Resolution, RunOutcome, StatusSummary, export_conflict_local,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use linux::{
