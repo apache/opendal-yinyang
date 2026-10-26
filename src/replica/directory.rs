@@ -190,7 +190,7 @@ pub struct BaselineEvidence {
     pub revision: Option<Revision>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IntentEvidence {
     pub id: Option<[u8; 32]>,
     pub operation: Option<IntentOperation>,
@@ -198,19 +198,6 @@ pub struct IntentEvidence {
     pub commit_id: Option<CommitId>,
     pub receipt_revision: Option<Revision>,
     pub error: Option<String>,
-}
-
-impl Default for IntentEvidence {
-    fn default() -> Self {
-        Self {
-            id: None,
-            operation: None,
-            state: None,
-            commit_id: None,
-            receipt_revision: None,
-            error: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1010,7 +997,7 @@ impl DirectorySync {
         outcome.conflicts.extend(status.conflicts.clone());
         outcome
             .conflicts
-            .sort_by(|a, b| (a.path.clone(), a.id.clone()).cmp(&(b.path.clone(), b.id.clone())));
+            .sort_by_key(|a| (a.path.clone(), a.id.clone()));
         outcome.conflicts.dedup_by(|a, b| a.id == b.id);
 
         // Recompute honest pending/unknown from the persisted baseline.
@@ -1584,7 +1571,7 @@ impl<'a> Context<'a> {
             }
             _ => {
                 let original = self.baseline.local.get(path).is_some()
-                    || self.baseline.remote.get(path).is_some();
+                    || self.baseline.remote.contains_key(path);
                 let original_path = original.then_some(path);
                 self.conflict(path, original_path, Some(path)).await
             }

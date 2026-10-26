@@ -446,15 +446,13 @@ impl Replica {
                 && (install.phase == InstallPhase::Retained
                     || install.phase == InstallPhase::Conflict)
             {
-                let matches = match hash_artifact_matches(
+                let matches = hash_artifact_matches(
                     &self.quarantine_fd,
                     &record.name,
                     &install.expected_digest,
                     install.expected_length,
-                ) {
-                    Ok(matches) => matches,
-                    Err(_) => false,
-                };
+                )
+                .unwrap_or_default();
                 if !matches {
                     artifact.phase = "conflict".to_owned();
                     artifact.error = Some(
@@ -564,7 +562,7 @@ impl Replica {
             ));
         }
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(&parent_fd, &self.root, "inspect upload parent")?;
         if let Some(expected_parent) = expected.parent
             && parent_identity != expected_parent
@@ -703,7 +701,7 @@ impl Replica {
     pub fn open_local_file(&self, path: &str) -> Result<std::fs::File> {
         validate_path(path)?;
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let fd = openat(
             &parent_fd,
             name,
@@ -785,7 +783,7 @@ impl Replica {
             return Err(Error::invalid("the synchronized root already exists"));
         }
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         match mkdirat(&parent_fd, name, Mode::RWXU) {
             Ok(()) => {}
             Err(rustix::io::Errno::EXIST) => {
@@ -802,7 +800,7 @@ impl Replica {
             }
         }
         fsync(&parent_fd)
-            .map_err(|e| Error::errno("persist local directory", &self.root.join(&parent), e))
+            .map_err(|e| Error::errno("persist local directory", &self.root.join(parent), e))
     }
 
     /// Atomically install a complete file at an absent name. The file becomes
@@ -818,7 +816,7 @@ impl Replica {
         let (parent, name) = split_path(path)?;
         let name_check = yinyang_core::namespace::name_key(name)
             .map_err(|e| Error::invalid(format!("invalid local name {name:?}: {e}")))?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         if optional_stat(&parent_fd, name, &self.root.join(path))?.is_some() {
             return Err(Error::conflict(format!(
                 "{} already exists before remote creation could install",
@@ -873,7 +871,7 @@ impl Replica {
             ));
         }
         fsync(&parent_fd).map_err(|e| {
-            Error::errno("persist remote file creation", &self.root.join(&parent), e)
+            Error::errno("persist remote file creation", &self.root.join(parent), e)
         })?;
         fsync(&self.quarantine_fd)
             .map_err(|e| Error::errno("persist staged file removal", &self.state, e))?;
@@ -888,8 +886,8 @@ impl Replica {
         validate_path(destination)?;
         let (source_parent, source_name) = split_path(source)?;
         let (destination_parent, destination_name) = split_path(destination)?;
-        let source_fd = self.open_relative_dir(&source_parent)?;
-        let destination_fd = self.open_relative_dir(&destination_parent)?;
+        let source_fd = self.open_relative_dir(source_parent)?;
+        let destination_fd = self.open_relative_dir(destination_parent)?;
         renameat_with(
             &source_fd,
             source_name,
@@ -904,13 +902,12 @@ impl Replica {
                 e,
             )
         })?;
-        fsync(&source_fd).map_err(|e| {
-            Error::errno("persist local rename", &self.root.join(&source_parent), e)
-        })?;
+        fsync(&source_fd)
+            .map_err(|e| Error::errno("persist local rename", &self.root.join(source_parent), e))?;
         fsync(&destination_fd).map_err(|e| {
             Error::errno(
                 "persist local rename destination",
-                &self.root.join(&destination_parent),
+                &self.root.join(destination_parent),
                 e,
             )
         })
@@ -932,7 +929,7 @@ impl Replica {
             ));
         }
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(&parent_fd, &self.root, "inspect install parent")?;
         if let Some(expected_parent) = expected.parent
             && parent_identity != expected_parent
@@ -1027,7 +1024,7 @@ impl Replica {
             .get(path)
             .ok_or_else(|| Error::invalid("quarantine target is absent from the observation"))?;
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(&parent)?;
+        let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(&parent_fd, &self.root, "inspect quarantine parent")?;
         if let Some(expected_parent) = expected_node.parent
             && parent_identity != expected_parent
@@ -1758,10 +1755,7 @@ impl PreparedInstall<'_> {
             )?;
             return Err(error);
         }
-        let displaced_matches = match self.displaced_matches_expected() {
-            Ok(matches) => matches,
-            Err(_) => false,
-        };
+        let displaced_matches = self.displaced_matches_expected().unwrap_or_default();
         if !displaced_matches {
             return self.recover_concurrent_change();
         }
