@@ -17,7 +17,9 @@
 
 //! Real /dev/fuse acceptance scenarios for the YinYang mount adapter.
 
-use crate::harness::{Fixture, Frontend, Publication, assert_errno, sync_all_with_deadline};
+use crate::harness::{
+    Fixture, Frontend, Publication, assert_errno, run_external, sync_all_with_deadline,
+};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -134,7 +136,7 @@ fn basic_io(fixture: &Fixture) {
     drop(append);
     assert_eq!(fixture.remote_read(&library, "basic.txt", 8), b"hello!");
 
-    let mut truncate = OpenOptions::new()
+    let truncate = OpenOptions::new()
         .write(true)
         .open(root.join("basic.txt"))
         .expect("open mounted file for truncate");
@@ -498,7 +500,7 @@ fn fuse_process_kill_recovery_object() {
         b"dirty-local",
         "a killed mount process must recover staged bytes from persistent staging"
     );
-    let mut publish = OpenOptions::new()
+    let publish = OpenOptions::new()
         .write(true)
         .open(reopened.mountpoint().join("recover.txt"))
         .expect("reopen recovered file");
@@ -555,7 +557,7 @@ fn fuse_fsync_failure_retention_service() {
         fs::read(reopened.mountpoint().join("network.txt")).expect("read staged recovery"),
         b"survives"
     );
-    let mut publish = OpenOptions::new()
+    let publish = OpenOptions::new()
         .write(true)
         .open(reopened.mountpoint().join("network.txt"))
         .expect("reopen recovered file");
@@ -570,7 +572,7 @@ fn fuse_fsync_failure_retention_service() {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_interrupted_call_retention_service() {
+fn fuse_daemon_crash_interrupts_pending_fsync_service() {
     let fixture = Fixture::new(Publication::Service);
     let library = fixture.volume_config("lib-interrupted", Frontend::Library, false);
     fixture.library_seed(&library, "interrupted.txt", b"seed");
@@ -593,7 +595,8 @@ fn fuse_interrupted_call_retention_service() {
     let caller = thread::spawn(move || {
         let _ = sender.send(in_flight.sync_all());
     });
-    thread::sleep(Duration::from_millis(200));
+    let frozen = fixture.wait_for_frozen(&config);
+    println!("fsync reached the frozen publication boundary:\n{frozen}");
     mounted.kill();
     let outcome = receiver
         .recv_timeout(Duration::from_secs(20))
@@ -620,7 +623,7 @@ fn fuse_interrupted_call_retention_service() {
         fs::read(reopened.mountpoint().join("interrupted.txt")).expect("read staged recovery"),
         b"interrupted-local"
     );
-    let mut publish = OpenOptions::new()
+    let publish = OpenOptions::new()
         .write(true)
         .open(reopened.mountpoint().join("interrupted.txt"))
         .expect("reopen recovered file");
@@ -643,13 +646,8 @@ fn fuse_busy_unmount_object() {
     let mut mounted = fixture.mount(&config, &mountpoint);
 
     let file = File::create(mounted.mountpoint().join("held.txt")).expect("create held file");
-    let output = crate::harness::run_timeout(
-        std::process::Command::new("fusermount3").args([
-            "-u",
-            mounted.mountpoint().to_str().expect("UTF-8 mountpoint"),
-        ]),
-        Duration::from_secs(30),
-    );
+    let mountpoint = mounted.mountpoint().to_str().expect("UTF-8 mountpoint");
+    let output = run_external("fusermount3", &["-u", mountpoint], Duration::from_secs(30));
     assert!(
         !output.status.success(),
         "busy unmount unexpectedly succeeded while a descriptor was open: {}",

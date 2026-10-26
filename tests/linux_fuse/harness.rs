@@ -110,6 +110,12 @@ pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
     }
 }
 
+pub fn run_external(program: &str, args: &[&str], timeout: Duration) -> Captured {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    run_timeout(cmd, timeout)
+}
+
 fn read_all(mut reader: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     let _ = reader.read_to_end(&mut bytes);
@@ -313,8 +319,9 @@ impl Fixture {
             .expect("service publication requires a running metadata service")
             .child
             .id();
-        let output = run_timeout(
-            Command::new("kill").args(["-STOP", &pid.to_string()]),
+        let output = run_external(
+            "kill",
+            &["-STOP", &pid.to_string()],
             Duration::from_secs(30),
         );
         output.success_or("pause metadata service");
@@ -327,11 +334,36 @@ impl Fixture {
             .expect("service publication requires a running metadata service")
             .child
             .id();
-        let output = run_timeout(
-            Command::new("kill").args(["-CONT", &pid.to_string()]),
+        let output = run_external(
+            "kill",
+            &["-CONT", &pid.to_string()],
             Duration::from_secs(30),
         );
         output.success_or("resume metadata service");
+    }
+
+    /// Polls the existing no-lease status entry until a handle reports the
+    /// frozen publication boundary. A hang is a hard failure, not a skip.
+    pub fn wait_for_frozen(&self, config: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let config = config.to_str().expect("UTF-8 volume config");
+        loop {
+            let output = self.yy(&["--volume", config, "status"]);
+            output.success_or("yy status");
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if text
+                .lines()
+                .any(|line| line.starts_with("handle: ") && line.contains("frozen: true"))
+            {
+                return text;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "fsync never reached the frozen publication boundary within 30s; last yy status:\n{text}"
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Writes a strict volume config and returns its path. Rewriting the same
@@ -360,58 +392,114 @@ impl Fixture {
     }
 
     pub fn library_seed(&self, config: &Path, path: &str, bytes: &[u8]) {
-        self.yy_ok(&["--volume", config.as_str(), "file", "create", path]);
+        self.yy_ok(&[
+            "--volume",
+            config.to_str().expect("UTF-8 volume config"),
+            "file",
+            "create",
+            path,
+        ]);
         self.remote_write(config, path, bytes);
     }
 
     pub fn remote_write(&self, config: &Path, path: &str, bytes: &[u8]) {
         let handle = self
-            .yy_ok(&["--volume", config.as_str(), "file", "open", path, "--write"])
+            .yy_ok(&[
+                "--volume",
+                config.to_str().expect("UTF-8 volume config"),
+                "file",
+                "open",
+                path,
+                "--write",
+            ])
             .text();
         let source = self.temp.path().join("remote-write-source");
         fs::write(&source, bytes).expect("write remote source");
         self.yy_ok(&[
             "--volume",
-            config.as_str(),
+            config.to_str().expect("UTF-8 volume config"),
             "file",
             "write",
             &handle,
             source.to_str().expect("UTF-8 source path"),
         ]);
-        self.yy_ok(&["--volume", config.as_str(), "file", "fsync", &handle]);
-        self.yy_ok(&["--volume", config.as_str(), "file", "close", &handle]);
+        self.yy_ok(&[
+            "--volume",
+            config.to_str().expect("UTF-8 volume config"),
+            "file",
+            "fsync",
+            &handle,
+        ]);
+        self.yy_ok(&[
+            "--volume",
+            config.to_str().expect("UTF-8 volume config"),
+            "file",
+            "close",
+            &handle,
+        ]);
     }
 
     pub fn remote_truncate(&self, config: &Path, path: &str, length: u64) {
         let handle = self
-            .yy_ok(&["--volume", config.as_str(), "file", "open", path, "--write"])
+            .yy_ok(&[
+                "--volume",
+                config.to_str().expect("UTF-8 volume config"),
+                "file",
+                "open",
+                path,
+                "--write",
+            ])
             .text();
         self.yy_ok(&[
             "--volume",
-            config.as_str(),
+            config.to_str().expect("UTF-8 volume config"),
             "file",
             "truncate",
             &handle,
             &length.to_string(),
         ]);
-        self.yy_ok(&["--volume", config.as_str(), "file", "fsync", &handle]);
-        self.yy_ok(&["--volume", config.as_str(), "file", "close", &handle]);
+        self.yy_ok(&[
+            "--volume",
+            config.to_str().expect("UTF-8 volume config"),
+            "file",
+            "fsync",
+            &handle,
+        ]);
+        self.yy_ok(&[
+            "--volume",
+            config.to_str().expect("UTF-8 volume config"),
+            "file",
+            "close",
+            &handle,
+        ]);
     }
 
     pub fn remote_read(&self, config: &Path, path: &str, length: usize) -> Vec<u8> {
         let handle = self
-            .yy_ok(&["--volume", config.as_str(), "file", "open", path])
+            .yy_ok(&[
+                "--volume",
+                config.to_str().expect("UTF-8 volume config"),
+                "file",
+                "open",
+                path,
+            ])
             .text();
         let output = self.yy_ok(&[
             "--volume",
-            config.as_str(),
+            config.to_str().expect("UTF-8 volume config"),
             "file",
             "read",
             &handle,
             "--length",
             &length.to_string(),
         ]);
-        self.yy_ok(&["--volume", config.as_str(), "file", "close", &handle]);
+        self.yy_ok(&[
+            "--volume",
+            config.to_str().expect("UTF-8 volume config"),
+            "file",
+            "close",
+            &handle,
+        ]);
         output.stdout
     }
 
@@ -525,10 +613,7 @@ impl Mounted {
 
     pub fn terminate(&mut self) {
         let pid = self.child.id().to_string();
-        let output = run_timeout(
-            Command::new("kill").args(["-TERM", &pid]),
-            Duration::from_secs(30),
-        );
+        let output = run_external("kill", &["-TERM", &pid], Duration::from_secs(30));
         output.success_or("send SIGTERM to yy mount");
         let status = self.wait_exit(Duration::from_secs(30));
         assert!(
@@ -545,10 +630,7 @@ impl Mounted {
 
     pub fn unmount(&mut self) {
         let mountpoint = self.mountpoint.to_str().expect("UTF-8 mountpoint");
-        let output = run_timeout(
-            Command::new("fusermount3").args(["-u", mountpoint]),
-            Duration::from_secs(30),
-        );
+        let output = run_external("fusermount3", &["-u", mountpoint], Duration::from_secs(30));
         output.success_or(&format!("fusermount3 -u {mountpoint}"));
         let status = self.wait_exit(Duration::from_secs(30));
         assert!(
@@ -568,8 +650,9 @@ impl Mounted {
             return;
         }
         let mountpoint = self.mountpoint.to_str().expect("UTF-8 mountpoint");
-        let _ = run_timeout(
-            Command::new("fusermount3").args(["-u", "-z", mountpoint]),
+        let _ = run_external(
+            "fusermount3",
+            &["-u", "-z", mountpoint],
             Duration::from_secs(30),
         );
     }

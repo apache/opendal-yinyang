@@ -63,9 +63,10 @@ cargo x test-linux-fuse --read-only
 - Fsync/network failure retention: stopping the metadata service makes
   `fsync` fail within a bound; staged bytes survive, the service restarts, and
   a reopened mount publishes them through the unchanged service address.
-- Interrupted call retention: a `fsync` left in flight against a paused
-  metadata service is interrupted by killing the mount daemon, the authority is
-  untouched, and a reopened mount publishes the staged bytes.
+- Pending fsync interruption: `yy status` (no lease, no remote access) is polled
+  until the handle reports `frozen: true`, then killing the mount daemon
+  interrupts that pending publication. The authority is untouched and a
+  reopened mount replays the frozen request and publishes the staged bytes.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits
