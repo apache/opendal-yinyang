@@ -868,7 +868,7 @@ fn fuse_concurrent_mounts_object() {
             Ok(file)
         })();
         match prepared {
-            Ok(mut file) => {
+            Ok(file) => {
                 ready_a
                     .send(Ok(()))
                     .expect("send mount A preparation barrier");
@@ -889,7 +889,7 @@ fn fuse_concurrent_mounts_object() {
             Ok(file)
         })();
         match prepared {
-            Ok(mut file) => {
+            Ok(file) => {
                 ready_b
                     .send(Ok(()))
                     .expect("send mount B preparation barrier");
