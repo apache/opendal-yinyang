@@ -23,11 +23,11 @@
 //! and `sync`); this adapter binds a volume configuration to that contract and
 //! formats its results.
 
-use crate::volume::VolumeConfig;
 use clap::{Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use yinyang::volume::{Access, Model, VolumeConfig};
 
 /// Managed Sync subcommands. Every subcommand requires `--volume CONFIG`.
 #[derive(Subcommand)]
@@ -97,7 +97,7 @@ const EXIT_INVALID_BINDING: u8 = 4;
 ///
 /// Every field is always present; unknown values are reported as `null` rather
 /// than omitted, so a consumer can distinguish "unknown" from "not applicable".
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct SyncStatus {
     pub schema: String,
     pub binding: BindingStatus,
@@ -140,7 +140,7 @@ impl SyncStatus {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct BindingStatus {
     pub state: BindingState,
     pub state_directory: String,
@@ -149,7 +149,7 @@ pub struct BindingStatus {
     pub same_filesystem: Option<bool>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingState {
     Unbound,
@@ -157,14 +157,14 @@ pub enum BindingState {
     Error,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct RemoteStatus {
     pub availability: RemoteAvailability,
     pub revision: Option<String>,
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAvailability {
     NotChecked,
@@ -172,13 +172,13 @@ pub enum RemoteAvailability {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct LocalStatus {
     pub scan: LocalScanState,
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalScanState {
     NotScanned,
@@ -187,7 +187,7 @@ pub enum LocalScanState {
     Failed,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct StatusSummary {
     pub in_sync: bool,
     pub pending: u64,
@@ -197,7 +197,7 @@ pub struct StatusSummary {
     pub retained_artifacts: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct SyncEntry {
     pub path: String,
     pub original_path: Option<String>,
@@ -211,7 +211,7 @@ pub struct SyncEntry {
     pub conflict: Option<EntryConflict>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryState {
     InSync,
@@ -222,7 +222,7 @@ pub enum EntryState {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct LocalEvidence {
     pub kind: Option<EntryKind>,
     pub length: Option<u64>,
@@ -231,7 +231,7 @@ pub struct LocalEvidence {
     pub presence: Presence,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct RemoteEvidence {
     pub kind: Option<EntryKind>,
     pub length: Option<u64>,
@@ -242,14 +242,14 @@ pub struct RemoteEvidence {
     pub revision: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
     Directory,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Presence {
     Present,
@@ -257,13 +257,13 @@ pub enum Presence {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct BaselineEvidence {
     pub node: Option<String>,
     pub revision: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct IntentStatus {
     pub id: Option<String>,
     pub operation: Option<IntentOperation>,
@@ -272,7 +272,7 @@ pub struct IntentStatus {
     pub receipt_revision: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentOperation {
     Content,
@@ -283,7 +283,7 @@ pub enum IntentOperation {
     SetExecutable,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentState {
     Prepared,
@@ -294,13 +294,13 @@ pub enum IntentState {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct OutcomeStatus {
     pub state: OutcomeState,
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeState {
     Pending,
@@ -312,7 +312,7 @@ pub enum OutcomeState {
     None,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct EntryConflict {
     pub id: String,
     pub local: ConflictSide,
@@ -322,7 +322,7 @@ pub struct EntryConflict {
     pub remote_revision: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct ConflictRecord {
     pub id: String,
     pub path: String,
@@ -336,7 +336,7 @@ pub struct ConflictRecord {
     pub error: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictSide {
     CurrentFile,
@@ -346,7 +346,7 @@ pub enum ConflictSide {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct ArtifactRecord {
     pub id: String,
     pub origin: String,
@@ -357,7 +357,7 @@ pub struct ArtifactRecord {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     ReplacedFile,
@@ -367,7 +367,7 @@ pub enum ArtifactKind {
     UploadRetained,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactPhase {
     Preparing,
@@ -428,6 +428,15 @@ fn operator() -> Result<opendal::Operator, opendal::Error> {
 
 /// Applies the same four-layer admission as every other volume command.
 fn admit(config: &VolumeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // `VolumeConfig::validate` admits every supported mode; the sync frontend
+    // must additionally pin the exact Managed + Sync combination it implements.
+    if config.model != Model::Managed || config.access != Access::Sync {
+        return Err(format!(
+            "managed sync requires a Managed volume with access=sync, found model={:?} access={:?}",
+            config.model, config.access
+        )
+        .into());
+    }
     let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
     config.validate(&operator)?;
     Ok(())
@@ -438,11 +447,11 @@ async fn status(config: &VolumeConfig, json: bool) -> Result<ExitCode, Box<dyn s
     // stays offline and never needs the authority.
     if !config.staging.is_dir() {
         let document = SyncStatus::unbound(&config.staging);
-        emit(&document, json);
+        emit(&document, json)?;
         return Ok(ExitCode::from(EXIT_UNBOUND));
     }
     let inspection = manager::inspect(config).await?;
-    emit(&inspection.status, json);
+    emit(&inspection.status, json)?;
     Ok(ExitCode::from(inspection.exit))
 }
 
@@ -503,26 +512,30 @@ async fn resolve(
     Ok(ExitCode::SUCCESS)
 }
 
-fn emit(document: &SyncStatus, json: bool) {
+/// Writes the status projection, propagating serialization or stdout failure
+/// instead of reporting success without a document.
+fn emit(document: &SyncStatus, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
     if json {
-        match serde_json::to_string_pretty(document) {
-            Ok(text) => println!("{text}"),
-            Err(error) => eprintln!("yy: serialize sync status: {error}"),
-        }
-        return;
+        let text = serde_json::to_string_pretty(document)?;
+        writeln!(stdout, "{text}")?;
+    } else {
+        writeln!(
+            stdout,
+            "sync: {:?} remote: {:?} local: {:?} in-sync: {} pending: {} unknown: {} conflicts: {} failed: {} artifacts: {}",
+            document.binding.state,
+            document.remote.availability,
+            document.local.scan,
+            document.summary.in_sync,
+            document.summary.pending,
+            document.summary.unknown,
+            document.summary.conflicts,
+            document.summary.failed,
+            document.summary.retained_artifacts,
+        )?;
     }
-    println!(
-        "sync: {:?} remote: {:?} local: {:?} in-sync: {} pending: {} unknown: {} conflicts: {} failed: {} artifacts: {}",
-        document.binding.state,
-        document.remote.availability,
-        document.local.scan,
-        document.summary.in_sync,
-        document.summary.pending,
-        document.summary.unknown,
-        document.summary.conflicts,
-        document.summary.failed,
-        document.summary.retained_artifacts,
-    );
+    Ok(())
 }
 
 /// Boundary between the CLI adapter and the library's reconciliation contract.
@@ -533,8 +546,8 @@ fn emit(document: &SyncStatus, json: bool) {
 /// single place that has to be wired to that public API.
 mod manager {
     use super::SyncStatus;
-    use crate::volume::VolumeConfig;
     use std::path::Path;
+    use yinyang::volume::VolumeConfig;
 
     pub struct Inspection {
         pub status: SyncStatus,

@@ -130,7 +130,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(listen).await?;
         println!("metadata service listening on {}", listener.local_addr()?);
         yinyang::core::service::serve(listener, service, token).await?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if matches!(cli.command, Command::Create) {
         let fs = Fs::create(operator, profile).await?;
@@ -138,7 +138,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             "filesystem ready at revision {}",
             revision(fs.observe_latest().await?.revision())
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     let fs = Fs::open(operator, profile).await?;
     let observed = fs.observe_latest().await?;
