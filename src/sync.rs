@@ -228,7 +228,7 @@ impl Sync {
     /// Inspect either a content edit or a namespace intent.
     pub async fn edit_status(&self, edit: EditId) -> Result<EditStatus> {
         if let Some(status) = namespace::status(self, edit).await? {
-            return Ok(EditStatus::Namespace(status));
+            return Ok(EditStatus::Namespace(Box::new(status)));
         }
         Ok(EditStatus::Content(self.status(edit).await?))
     }

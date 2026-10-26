@@ -888,7 +888,7 @@ pub(super) async fn statuses(sync: &Sync) -> Result<Vec<NamespaceStatus>> {
 }
 
 pub(super) fn inspect(connection: &Connection) -> Result<Vec<NamespaceStatus>> {
-    let has_namespaces = connection
+    let has_namespaces: bool = connection
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sqlite_master WHERE type='table' AND name='namespaces'
