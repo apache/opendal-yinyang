@@ -321,6 +321,13 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
             .iter()
             .any(|intent| intent.intent.id == created)
     );
+    let inspect = Sync::inspect(temp.path().join("sync")).await.unwrap();
+    assert!(
+        inspect
+            .namespace
+            .iter()
+            .any(|intent| intent.intent.id == created)
+    );
     let revision = sync.publish(created).await.unwrap();
     let committed = authority.observe_revision(revision).await.unwrap();
     let file = committed.open_file(created_node).await.unwrap();
@@ -860,4 +867,58 @@ async fn namespace_post_dispatch_error_stays_unknown_and_resolves() {
         authority.observe_latest().await.unwrap().revision(),
         receipt.cursor.revision
     );
+}
+
+#[tokio::test]
+async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let editor = Runtime::open(authority.clone(), temp.path().join("editor"))
+        .await
+        .unwrap();
+    editor.create_file(authority.root(), "file").await.unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let node = baseline.resolve("file").await.unwrap().unwrap().id();
+
+    let fault = Arc::new(FaultAuthority::new(authority.clone()));
+    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let edit = sync
+        .stage(node, baseline.revision(), &mut &b"content"[..])
+        .await
+        .unwrap();
+    fault.fail_next_response();
+    let error = sync.publish(edit).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    let commit = error.commit_id().unwrap();
+    let status = sync.status(edit).await.unwrap();
+    assert!(status.frozen);
+    assert_eq!(status.frozen_commit_id, Some(commit));
+    assert_eq!(status.error.unwrap().commit_id(), Some(commit));
+
+    // Read-only inspection succeeds while the writer still owns the lease.
+    let inspect = Sync::inspect(temp.path().join("sync")).await.unwrap();
+    let inspected = inspect
+        .content
+        .iter()
+        .find(|inspected| inspected.id == edit)
+        .unwrap_or_else(|| panic!("missing inspected edit"));
+    assert_eq!(inspected.handle.frozen_commit_id, Some(commit));
+    drop(sync);
+
+    backend.state.lock().unwrap().offline = true;
+    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
+        .await
+        .unwrap();
+    let status = sync.status(edit).await.unwrap();
+    assert_eq!(status.frozen_commit_id, Some(commit));
+    assert_eq!(status.error.unwrap().commit_id(), Some(commit));
+    backend.state.lock().unwrap().offline = false;
+    sync.publish(edit).await.unwrap();
 }

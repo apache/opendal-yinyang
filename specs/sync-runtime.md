@@ -125,6 +125,13 @@ failure. One `EditId` identifies either a content edit or namespace intent.
 | Retryable | The attempt is known not to have published. |
 | Failed | Validation, readiness, corruption, or another definitive failure. |
 
+`Sync::inspect(directory)` provides the same durable view without opening a
+writer or acquiring the runtime lease. It opens `sync.db` and the content
+staging database read-only, returns each content EditId with its
+`HandleStatus`, and returns every namespace intent. This supports progress and
+failure inspection while another process or task holds the publication lease.
+It performs no recovery, mutation, or remote request.
+
 Before dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a durable
 SQLite transaction. A crash or lost response therefore cannot turn a possibly
 published request into a safe abort. `publish` retries `Unknown` and `Retryable`

@@ -57,6 +57,11 @@ impl Record {
                 .failure
                 .clone()
                 .or_else(|| self.error.clone().map(Failure::legacy)),
+            frozen_commit_id: self
+                .plan
+                .as_deref()
+                .and_then(|plan| yinyang_core::Transaction::inspect_identity(plan).ok())
+                .map(|(_, commit, _)| commit),
         }
     }
 }
