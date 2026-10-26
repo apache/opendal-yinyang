@@ -712,7 +712,9 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     );
 
     // Read-only inspection must expose a resolvable conflict, never in-sync.
-    let inspected = DirectorySync::inspect(&state).unwrap();
+    let inspected = DirectorySync::inspect(authority.clone(), &state)
+        .await
+        .unwrap();
     assert!(
         !inspected.conflicts.is_empty(),
         "the competing external edit must surface as a resolvable conflict"
