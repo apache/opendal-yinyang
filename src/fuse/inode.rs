@@ -47,7 +47,6 @@ pub struct CachedInfo {
 
 /// Stable NodeId <-> inode mapping with kernel lookup counters.
 pub struct InodeTable {
-    root: NodeId,
     by_inode: BTreeMap<u64, NodeId>,
     by_node: BTreeMap<NodeId, u64>,
     lookups: BTreeMap<u64, u64>,
@@ -57,7 +56,6 @@ pub struct InodeTable {
 impl InodeTable {
     pub fn new(root: NodeId) -> Self {
         Self {
-            root,
             by_inode: [(ROOT_INODE, root)].into_iter().collect(),
             by_node: [(root, ROOT_INODE)].into_iter().collect(),
             lookups: BTreeMap::new(),
@@ -105,6 +103,7 @@ impl InodeTable {
         }
     }
 
+    #[cfg(test)]
     pub fn lookup_count(&self, inode: u64) -> u64 {
         self.lookups.get(&inode).copied().unwrap_or(0)
     }
@@ -116,10 +115,6 @@ impl InodeTable {
 
     pub fn cached(&self, id: NodeId) -> Option<CachedInfo> {
         self.info.get(&id).copied()
-    }
-
-    pub fn root(&self) -> NodeId {
-        self.root
     }
 }
 
