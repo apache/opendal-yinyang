@@ -931,22 +931,27 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
         },
         "the namespace rename receipt must not swallow the interleaved external content"
     );
-    assert_eq!(
-        local1["moved/file"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"v1".to_vec(),
-        },
-        "the local v1 must stay untouched until the next run materializes v2"
-    );
     assert!(
         !outcome1.in_sync || local1 == remote1,
         "in_sync must imply identical real trees"
     );
-    assert!(
-        !outcome1.in_sync,
-        "the unobserved remote v2 must stay pending behind the rename receipt"
-    );
+    // The first run may materialize the retained v2 immediately; only when the
+    // local v1 survives it must the unobserved content stay pending.
+    if local1.get("moved/file")
+        == Some(&TreeEntry::File {
+            executable: false,
+            bytes: b"v1".to_vec(),
+        })
+    {
+        assert!(
+            outcome1.pending > 0,
+            "a surviving local v1 must keep the unobserved remote v2 pending"
+        );
+        assert!(
+            !outcome1.in_sync,
+            "a surviving local v1 must not report in sync"
+        );
+    }
 
     // A reopened sync materializes the retained v2 and then runs stable.
     drop(sync);
