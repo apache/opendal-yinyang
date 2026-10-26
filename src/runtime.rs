@@ -240,18 +240,54 @@ impl Runtime {
     /// Namespace operations publish explicit transactions. Unknown outcomes carry
     /// an identity and must be resolved through the authority's receipt API.
     pub async fn create_file(&self, parent: NodeId, name: &str) -> Result<Receipt> {
+        self.create_file_with_node(parent, name, false)
+            .await
+            .map(|(_, receipt)| receipt)
+    }
+    /// Create a file and return the NodeId produced by the same committed plan.
+    ///
+    /// Adapters must use this identity rather than resolving the path again:
+    /// a concurrent rename or replacement could bind that lookup to another node.
+    /// The executable flag is the only persisted mode bit supported by the core.
+    pub async fn create_file_with_node(
+        &self,
+        parent: NodeId,
+        name: &str,
+        executable: bool,
+    ) -> Result<(NodeId, Receipt)> {
         self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let empty = self.authority().prepare(&mut tokio::io::empty()).await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
-        plan.create_file(parent, name, empty, false).await?;
-        outcome(self.authority().commit(&plan.finish()?).await?)
+        let node = plan.create_file(parent, name, empty, executable).await?;
+        let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
+        Ok((node, receipt))
     }
     pub async fn create_directory(&self, parent: NodeId, name: &str) -> Result<Receipt> {
+        self.create_directory_with_node(parent, name)
+            .await
+            .map(|(_, receipt)| receipt)
+    }
+    /// Create a directory and return the NodeId produced by the committed plan.
+    pub async fn create_directory_with_node(
+        &self,
+        parent: NodeId,
+        name: &str,
+    ) -> Result<(NodeId, Receipt)> {
         self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
-        plan.create_directory(parent, name).await?;
+        let node = plan.create_directory(parent, name).await?;
+        let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
+        Ok((node, receipt))
+    }
+    /// Persist the core executable flag. Permission bits other than executable
+    /// state, ownership and timestamps have no durable core representation.
+    pub async fn set_executable(&self, node: NodeId, executable: bool) -> Result<Receipt> {
+        self.require_write()?;
+        let snapshot = self.authority().observe_latest().await?;
+        let mut plan = Planner::new(&snapshot, CommitId::generate());
+        plan.set_executable(node, executable).await?;
         outcome(self.authority().commit(&plan.finish()?).await?)
     }
     pub async fn rename(&self, node: NodeId, parent: NodeId, name: &str) -> Result<Receipt> {
@@ -261,12 +297,105 @@ impl Runtime {
         plan.rename(node, parent, name).await?;
         outcome(self.authority().commit(&plan.finish()?).await?)
     }
+    /// Rename the entry at `(parent, name)`, resolving and guarding that entry
+    /// in the same snapshot used for publication. Destination replacement is
+    /// not allowed.
+    pub async fn rename_path(
+        &self,
+        parent: NodeId,
+        name: &str,
+        new_parent: NodeId,
+        new_name: &str,
+    ) -> Result<(NodeId, Receipt)> {
+        self.rename_path_with(parent, name, new_parent, new_name, false)
+            .await
+    }
+    /// Atomically replace the destination of the entry resolved by `(parent, name)`.
+    pub async fn rename_path_replace(
+        &self,
+        parent: NodeId,
+        name: &str,
+        new_parent: NodeId,
+        new_name: &str,
+    ) -> Result<(NodeId, Receipt)> {
+        self.rename_path_with(parent, name, new_parent, new_name, true)
+            .await
+    }
+    async fn rename_path_with(
+        &self,
+        parent: NodeId,
+        name: &str,
+        new_parent: NodeId,
+        new_name: &str,
+        replace: bool,
+    ) -> Result<(NodeId, Receipt)> {
+        self.require_write()?;
+        let snapshot = self.authority().observe_latest().await?;
+        let mut plan = Planner::new(&snapshot, CommitId::generate());
+        let source = plan
+            .lookup(parent, name)
+            .await?
+            .ok_or(Error::State(ErrorKind::NotFound, "source does not exist"))?
+            .node_id;
+        if replace {
+            plan.rename_replace(source, new_parent, new_name).await?;
+        } else {
+            plan.rename(source, new_parent, new_name).await?;
+        }
+        let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
+        Ok((source, receipt))
+    }
     pub async fn unlink(&self, node: NodeId) -> Result<Receipt> {
         self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
         plan.remove(node).await?;
         outcome(self.authority().commit(&plan.finish()?).await?)
+    }
+    /// Remove the file entry at `(parent, name)` using one guarded snapshot.
+    pub async fn unlink_path(&self, parent: NodeId, name: &str) -> Result<(NodeId, Receipt)> {
+        self.remove_path(parent, name, false).await
+    }
+    /// Remove the empty directory entry at `(parent, name)` using one guarded snapshot.
+    pub async fn rmdir_path(&self, parent: NodeId, name: &str) -> Result<(NodeId, Receipt)> {
+        self.remove_path(parent, name, true).await
+    }
+    async fn remove_path(
+        &self,
+        parent: NodeId,
+        name: &str,
+        directory: bool,
+    ) -> Result<(NodeId, Receipt)> {
+        self.require_write()?;
+        let snapshot = self.authority().observe_latest().await?;
+        let mut plan = Planner::new(&snapshot, CommitId::generate());
+        let node = plan
+            .lookup(parent, name)
+            .await?
+            .ok_or(Error::State(ErrorKind::NotFound, "entry does not exist"))?
+            .node_id;
+        let entry = plan
+            .node(node)
+            .await?
+            .ok_or(Error::State(ErrorKind::NotFound, "entry does not exist"))?;
+        match (directory, entry.is_directory()) {
+            (false, true) => {
+                return Err(Error::State(
+                    ErrorKind::IsDirectory,
+                    "unlink requires a file",
+                ));
+            }
+            (true, false) => {
+                return Err(Error::State(
+                    ErrorKind::NotDirectory,
+                    "rmdir requires a directory",
+                ));
+            }
+            _ => {}
+        }
+        plan.remove(node).await?;
+        let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
+        Ok((node, receipt))
     }
     /// Replace the observed destination in one conditional transaction. The
     /// replaced identity remains readable through existing pinned versions.

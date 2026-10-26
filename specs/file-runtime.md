@@ -64,6 +64,23 @@ Unknown includes the commit ID for receipt lookup. These convenience namespace
 methods do not persist a replay journal; durable replay applies to file-handle
 publication. Callers needing frozen namespace replay use Authority/Planner.
 
+`create_file_with_node` and `create_directory_with_node` return the NodeId
+produced by the same Planner whose transaction returned the receipt. Adapters
+must use that identity instead of resolving the path again after publication,
+because a concurrent rename or replacement could otherwise bind the lookup to
+another node. File creation accepts the core executable flag; no other POSIX
+mode, ownership or timestamp state is persisted.
+
+Path-addressed namespace helpers (`rename_path`, `rename_path_replace`,
+`unlink_path`, and `rmdir_path`) resolve the requested entry and construct its
+mutation from the same Snapshot. A path-based frontend must use these helpers
+instead of resolving a NodeId in one observation and calling an
+identity-addressed convenience, which observes latest again. If another client
+moves the source node and replaces its old entry between observation and
+publication, the transaction returns Conflict instead of deleting or moving the
+replacement. The identity-addressed methods remain appropriate for an open
+handle whose NodeId intentionally survives path changes.
+
 `rename` never replaces a different destination node. `rename_replace` allows
 replacement of an observed destination of the same kind, with an empty
 directory required for directory replacement. Destination content, attributes,
