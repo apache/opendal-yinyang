@@ -682,6 +682,19 @@ fn revision_hex(revision: yinyang_core::Revision) -> String {
         .collect()
 }
 
+/// Explicit connection-ended errnos. ENOENT is not one of them: fuser already
+/// treats a missing inode or entry as an accepted invalidation.
+fn is_connection_ended(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if matches!(
+                code,
+                libc::ENODEV | libc::ENOTCONN | libc::EPIPE | libc::ECONNRESET | libc::ESHUTDOWN
+            )
+    )
+}
+
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
