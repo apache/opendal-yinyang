@@ -41,6 +41,7 @@ pub fn attribute(
     executable: bool,
     size: u64,
     revision: Revision,
+    read_only: bool,
 ) -> FileAttr {
     let (uid, gid) = mount_owner();
     let stamp = SystemTime::UNIX_EPOCH
@@ -53,11 +54,11 @@ pub fn attribute(
                 ),
         );
     let perm = if directory {
-        0o555
+        if read_only { 0o555 } else { 0o755 }
     } else if executable {
-        0o555
+        if read_only { 0o555 } else { 0o755 }
     } else {
-        0o444
+        if read_only { 0o444 } else { 0o644 }
     };
     FileAttr {
         ino,

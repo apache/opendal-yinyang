@@ -138,14 +138,17 @@ window; there is no mid-session cancellation signal.
 - Every open materializes the complete file through the existing shared Mount
   staging contract; there is no partial-download or mmap coherence claim, and
   `FOPEN_DIRECT_IO` does not provide page-cache-backed mmap behavior.
-- Writes, create, mkdir, unlink, rename, links, xattrs, ioctl, poll, locking
-  and capacity accounting are not implemented; the kernel read-only mount and
-  the callback errno policy reject them.
-- The module keeps existing core Mount behavior, including the node-map lock
-  that already spans first materialization; the adapter adds no mount-wide
-  lock across authority or staging I/O.
+- Hard links, symlinks, mknod, xattrs, ioctl, poll, fallocate and capacity
+  accounting are not implemented and return explicit `EOPNOTSUPP`/`ENOSYS`.
+- The frontend does not negotiate `FUSE_POSIX_LOCKS` or `FLOCK_LOCKS`, and its
+  getlk/setlk/flock callbacks are not implemented. If the kernel still provides
+  POSIX or flock locks, they are local to this mount instance and carry no
+  cross-mount or cross-client meaning; no distributed lock semantics are
+  claimed. A writable mount must not claim that locking is rejected outright,
+  because the kernel may return success for its own local lock manager.
+- The shared Mount node map is not held across first materialization or other
+  authority/staging I/O; the adapter adds no mount-wide lock across those
+  awaits.
 - Extension points for the next layer are the runtime namespace operations,
   `Mount::refresh` guarded by reference counts, and the session `Notifier`
   for kernel entry/inode invalidation once an in-place refresh policy exists.
-None of those operations are exposed by this layer, and its capability set does
-not claim recoverable staging or any write-side operation.

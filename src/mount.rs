@@ -261,19 +261,20 @@ impl Mount {
                 ));
             }
         }
-        let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
-        let current = nodes.get(&id).cloned();
-        let Some(current) = current else {
-            return Ok(());
-        };
-        if current.references.load(Ordering::Relaxed) != 0 || !Arc::ptr_eq(&current, &node) {
-            return Err(Error::State(
-                ErrorKind::Busy,
-                "node state changed during reclaim",
-            ));
+        {
+            let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
+            let current = nodes.get(&id).cloned();
+            let Some(current) = current else {
+                return Ok(());
+            };
+            if current.references.load(Ordering::Relaxed) != 0 || !Arc::ptr_eq(&current, &node) {
+                return Err(Error::State(
+                    ErrorKind::Busy,
+                    "node state changed during reclaim",
+                ));
+            }
+            let _ = nodes.remove(&id);
         }
-        let _ = nodes.remove(&id);
-        drop(nodes);
         node.handle.lock().await.close().await
     }
 }
@@ -322,5 +323,15 @@ impl MountFile {
     /// Dropping or releasing the reference never performs this operation.
     pub async fn flush(&self) -> Result<Option<Receipt>> {
         self.fsync().await
+    }
+    /// Publish this node's dirty content first, then update the executable
+    /// flag and advance the shared clean handle to the metadata revision.
+    pub async fn set_executable(&self, executable: bool) -> Result<Receipt> {
+        self.node
+            .handle
+            .lock()
+            .await
+            .set_executable(executable)
+            .await
     }
 }

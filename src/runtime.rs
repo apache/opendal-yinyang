@@ -507,6 +507,46 @@ impl FileHandle {
         let result = self.runtime.inner.stage.reset_content(self.id).await;
         self.report(result).await
     }
+    /// Publish dirty content, commit the executable flag, and advance this clean
+    /// handle to the new metadata revision without restaging the unchanged bytes.
+    pub(crate) async fn set_executable(&mut self, executable: bool) -> Result<Receipt> {
+        self.live()?;
+        let result = async {
+            self.runtime.require_write()?;
+            self.publish().await?;
+            let record = self.runtime.inner.stage.load(self.id).await?;
+            let node = NodeId::from_bytes(record.node);
+            let snapshot = self
+                .runtime
+                .authority()
+                .observe_revision(Revision::from_bytes(record.base))
+                .await?;
+            let mut plan = Planner::new(&snapshot, CommitId::generate());
+            plan.set_executable(node, executable).await?;
+            let receipt = outcome(self.runtime.authority().commit(&plan.finish()?).await?)?;
+            self.advance_clean_base(receipt.cursor.revision).await?;
+            Ok(receipt)
+        }
+        .await;
+        self.report(result).await
+    }
+    async fn advance_clean_base(&mut self, revision: Revision) -> Result<()> {
+        self.live()?;
+        let stage = &self.runtime.inner.stage;
+        let mut record = stage.load(self.id).await?;
+        if record.local != record.remote
+            || record.plan.is_some()
+            || record.conflict
+            || record.error.is_some()
+        {
+            return Err(Error::State(
+                ErrorKind::Busy,
+                "cannot advance a dirty or failed handle base",
+            ));
+        }
+        record.base = revision.to_bytes();
+        stage.save(record).await
+    }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             // Keep the original failure even if the local disk cannot record it.
