@@ -104,17 +104,23 @@ latest snapshot once and then:
 - invalidates known inode attributes with `inval_inode(ino, -1, 0)` and
   replied dentries with `inval_entry(parent, name)` through the fuser
   `Notifier`. Only dentries this adapter actually replied to the kernel are
-  recorded: successful `LOOKUP` results and `READDIR` entries. Negative
-  lookups carry no timeout in FUSE replies and are not recorded.
+  recorded: successful `LOOKUP` results. Negative lookups carry no timeout in
+  FUSE replies and are not recorded, and plain `READDIR` does not install
+  dentries without `READDIRPLUS`, so directory names are not recorded.
 
 The adapter never calls `Mount::refresh`, because that replaces the shared
 staged handle and would rebase open file descriptors. The refresh must also
 hold no adapter lock while reclaiming nodes or sending notifications; targets
 are collected under short locks, then the sends run on a blocking thread. At
-most one refresh run is in flight; duplicate `SIGHUP`s while one is running
-are merged into a single trailing run. The refresh task is concurrent with
-teardown and its lifetime sits inside the same bounded grace period: after
-unmount, notification sends fail and the refresh stops without retrying.
+most one refresh runs at a time and duplicate `SIGHUP`s while one is running
+are coalesced by the signal stream. The SIGHUP loop is a tracked Tokio task:
+the signal handler is registered synchronously before the mount becomes
+visible, teardown sends it a stop signal, and the session join and the refresh
+task share the same five-second grace period; a refresh already in progress
+may finish inside that window. A `NotFound` notification result is expected
+(the kernel already dropped the entry or inode) and is counted separately, so
+only explicit connection-ended errors (`ENODEV`, `ENOTCONN`, `EPIPE`,
+`ECONNRESET`, `ESHUTDOWN`) stop the batch before it would otherwise finish.
 
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at
