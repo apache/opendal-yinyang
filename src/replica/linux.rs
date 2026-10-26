@@ -145,6 +145,8 @@ pub struct Artifact {
     pub reason: String,
     pub phase: String,
     pub error: Option<String>,
+    pub path: PathBuf,
+    pub exportable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,7 +365,7 @@ impl Replica {
             .store
             .artifacts()?
             .into_iter()
-            .map(Artifact::from)
+            .map(|record| self.artifact_from(record))
             .collect();
         let conflicts = self
             .store
@@ -437,7 +439,11 @@ impl Replica {
     fn inspect_status_readonly(&self) -> Result<ReplicaStatus> {
         let records = self.store.artifacts()?;
         let installs = self.store.installs()?;
-        let mut artifacts: Vec<Artifact> = records.iter().cloned().map(Artifact::from).collect();
+        let mut artifacts: Vec<Artifact> = records
+            .iter()
+            .cloned()
+            .map(|record| self.artifact_from(record))
+            .collect();
         for (artifact, record) in artifacts.iter_mut().zip(records) {
             let install = installs
                 .iter()
@@ -654,7 +660,7 @@ impl Replica {
             self.store
                 .update_artifact(&artifact.id, &artifact.phase, artifact.error.as_deref())?;
             Ok(CapturedContent {
-                artifact: artifact.clone().into(),
+                artifact: self.artifact_from(artifact.clone()),
                 length,
                 digest,
                 executable: expected.executable,
@@ -1130,7 +1136,7 @@ impl Replica {
         }
         self.store
             .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
-        Ok(record.into())
+        Ok(self.artifact_from(record))
     }
 
     pub fn export_artifact(&self, id: &str, output: &mut (impl Write + ?Sized)) -> Result<()> {
@@ -1172,6 +1178,24 @@ impl Replica {
             .find(|artifact| artifact.id == id)
             .ok_or_else(|| Error::invalid("unknown retained artifact"))?;
         Ok(self.state.join("quarantine").join(artifact.name))
+    }
+
+    /// Canonical domain evidence for a retained artifact: physical path and
+    /// whether one byte stream can represent it.
+    fn artifact_from(&self, record: ArtifactRecord) -> Artifact {
+        let path = self.state.join("quarantine").join(&record.name);
+        let exportable = !matches!(record.kind.as_str(), "quarantined-directory");
+        Artifact {
+            id: record.id,
+            origin: record.origin,
+            name: record.name,
+            kind: record.kind,
+            reason: record.reason,
+            phase: record.phase,
+            error: record.error,
+            path,
+            exportable,
+        }
     }
 
     fn scan_directory(
@@ -1935,7 +1959,7 @@ impl PreparedInstall<'_> {
         self.replica
             .store
             .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
-        Ok(record.into())
+        Ok(self.replica.artifact_from(record))
     }
 
     fn retain_displaced(&mut self, reason: &str, phase: InstallPhase) -> Result<()> {
@@ -2022,22 +2046,8 @@ impl PreparedInstall<'_> {
             .artifacts()?
             .into_iter()
             .find(|artifact| artifact.id == self.record.id)
-            .map(Artifact::from)
+            .map(|artifact| self.replica.artifact_from(artifact))
             .ok_or_else(|| Error::corrupt("retained artifact record disappeared"))
-    }
-}
-
-impl From<ArtifactRecord> for Artifact {
-    fn from(value: ArtifactRecord) -> Self {
-        Self {
-            id: value.id,
-            origin: value.origin,
-            name: value.name,
-            kind: value.kind,
-            reason: value.reason,
-            phase: value.phase,
-            error: value.error,
-        }
     }
 }
 
