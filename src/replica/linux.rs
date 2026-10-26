@@ -562,7 +562,7 @@ impl Replica {
             let source = openat(
                 &parent_fd,
                 name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|e| Error::errno("open upload source", &self.root.join(path), e))?;
@@ -2087,7 +2087,7 @@ fn hash_file_at(
     let fd = openat(
         parent,
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| Error::errno("open local file", path, e))?;
