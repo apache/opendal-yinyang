@@ -358,6 +358,7 @@ fn basic_io(fixture: &Fixture) {
         updated, "Xirst",
         "an open reader must observe accepted writes"
     );
+    drop(reader);
     mounted.unmount();
 }
 

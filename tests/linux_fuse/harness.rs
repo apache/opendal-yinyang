@@ -160,6 +160,7 @@ pub struct Fixture {
     root: String,
     token: String,
     service: Option<ServiceGuard>,
+    last_service_address: Option<SocketAddr>,
 }
 
 impl Fixture {
@@ -180,6 +181,7 @@ impl Fixture {
             root,
             token,
             service: None,
+            last_service_address: None,
         };
         match publication {
             Publication::Object => {
@@ -289,6 +291,7 @@ impl Fixture {
                 panic!("invalid yy serve listening address {line:?}: {error}");
             });
         let _ = reader.join();
+        self.last_service_address = Some(address);
         self.service = Some(ServiceGuard {
             child,
             address,
@@ -298,6 +301,7 @@ impl Fixture {
 
     pub fn stop_service(&mut self) {
         if let Some(mut service) = self.service.take() {
+            self.last_service_address = Some(service.address);
             service.stop();
         }
     }
@@ -311,8 +315,9 @@ impl Fixture {
     pub fn service_address(&self) -> SocketAddr {
         self.service
             .as_ref()
+            .map(|service| service.address)
+            .or(self.last_service_address)
             .expect("service publication requires a running metadata service")
-            .address
     }
 
     pub fn pause_service(&self) {
