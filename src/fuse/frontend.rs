@@ -35,8 +35,11 @@
 //!
 //! The binding replies ENOSYS to FUSE_INTERRUPT, which the kernel ignores;
 //! an interrupted syscall therefore does not cancel in-flight remote work.
-//! Each operation still replies exactly once, and unmounting the session
-//! aborts remaining tasks whose dropped replies surface as EIO.
+//! Each operation still replies exactly once. Request tasks are detached and
+//! owned by the process Tokio runtime: ending the FUSE session does not abort
+//! them, and a reply written after unmount fails on the closing channel. The
+//! CLI returns after session teardown, so the runtime shutdown at process
+//! exit is the actual point where remaining tasks are dropped.
 
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE, attribute};
 use super::inode::{CachedInfo, InodeTable, ROOT_INODE};

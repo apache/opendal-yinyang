@@ -44,7 +44,6 @@ use crate::volume::{Volume, VolumeConfig};
 use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 /// Mount a validated read-only FUSE volume in the foreground.
 ///
@@ -87,37 +86,26 @@ pub async fn run(
     );
     // `Session::spawn` moves the mount object into `BackgroundSession`, so a
     // `SessionUnmounter` obtained from the pre-spawn session would find an
-    // empty slot. Instead, one blocking owner polls the public session guard
-    // for a natural end (for example `fusermount3 -u`) and waits for a local
-    // teardown request. The async side only signals; the owner performs a
-    // single `join` or `umount_and_join`, so exactly one teardown runs.
-    let shared = Arc::new(Mutex::new(Some(session.spawn()?)));
+    // empty slot. One blocking owner holds the background session, polls its
+    // public thread guard for a natural end (for example `fusermount3 -u`),
+    // and receives the local teardown request. Exactly one `join` or
+    // `umount_and_join` runs.
+    let background = session.spawn()?;
     let (teardown, teardown_rx) = std::sync::mpsc::channel();
-    let join = {
-        let shared = shared.clone();
-        tokio::task::spawn_blocking(move || {
-            loop {
-                match teardown_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        let Some(background) = shared.lock().unwrap().take() else {
-                            return Ok(());
-                        };
-                        return background.umount_and_join();
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let mut slot = shared.lock().unwrap();
-                        if slot
-                            .as_ref()
-                            .is_some_and(|background| background.guard.is_finished())
-                        {
-                            let background = slot.take().expect("guard was checked");
-                            return background.join();
-                        }
+    let join = tokio::task::spawn_blocking(move || {
+        loop {
+            match teardown_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return background.umount_and_join();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if background.guard.is_finished() {
+                        return background.join();
                     }
                 }
             }
-        })
-    };
+        }
+    });
     tokio::pin!(join);
     tokio::select! {
         result = &mut join => {
