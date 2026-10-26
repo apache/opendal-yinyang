@@ -93,25 +93,7 @@ impl DirectorySync {
             None => {
                 let local_empty = current.len() == 1;
                 let remote_empty = remote.len() == 1;
-                if let Some(root) = current.get("") {
-                    if let Some(root_node) = observed.resolve("").await? {
-                        self.replica
-                            .store_mut()
-                            .save_baseline_path("", &root_node, Some(root))?;
-                        self.replica
-                            .store_mut()
-                            .set_baseline_revision(observed.revision())?;
-                    }
-                }
-                if local_empty && remote_empty {
-                    outcome.revision = Some(observed.revision());
-                } else if local_empty {
-                    self.materialize_all(&mut outcome, &observed, &remote)
-                        .await?;
-                } else if remote_empty {
-                    self.publish_all(&mut outcome, &observed, &mut current)
-                        .await?;
-                } else {
+                if !local_empty && !remote_empty {
                     record_conflict(
                         &mut outcome,
                         &mut self.replica,
@@ -125,6 +107,26 @@ impl DirectorySync {
                         None,
                         "initial sync requires one empty side; other non-empty states are explicit merges",
                     )?;
+                    return Ok(outcome);
+                }
+                if let Some(root) = current.get("")
+                    && let Some(root_node) = observed.resolve("").await?
+                {
+                    self.replica
+                        .store_mut()
+                        .save_baseline_path("", &root_node, Some(root))?;
+                    self.replica
+                        .store_mut()
+                        .set_baseline_revision(observed.revision())?;
+                }
+                if local_empty && remote_empty {
+                    outcome.revision = Some(observed.revision());
+                } else if local_empty {
+                    self.materialize_all(&mut outcome, &observed, &remote)
+                        .await?;
+                } else if remote_empty {
+                    self.publish_all(&mut outcome, &observed, &mut current)
+                        .await?;
                 }
             }
         }
