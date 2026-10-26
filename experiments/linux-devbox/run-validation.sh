@@ -46,7 +46,9 @@ printf 'Command:'
 printf ' %q' "$@"
 printf '\n'
 export CARGO_BUILD_JOBS=4
-export CARGO_TARGET_DIR="$HOME/Code/opendal-yinyang/target"
+checkout_root=$(git rev-parse --show-toplevel)
+export CARGO_TARGET_DIR="$checkout_root/target"
+printf 'Cargo target: %s\n' "$CARGO_TARGET_DIR"
 export YINYANG_S3_BUCKET=yinyang-test
 export YINYANG_S3_ENDPOINT=http://127.0.0.1:9000
 export YINYANG_S3_REGION=us-east-1
