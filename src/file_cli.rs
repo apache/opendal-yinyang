@@ -19,6 +19,7 @@
 use crate::{Command, revision};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use tokio::io::AsyncReadExt;
 use yinyang::runtime::{Runtime, RuntimeStatus};
 use yinyang::volume::{Volume, VolumeConfig};
@@ -123,7 +124,7 @@ async fn destination(
         .ok_or("destination parent missing")?;
     Ok((parent.id(), name.to_owned()))
 }
-pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut config = VolumeConfig::from_json(&tokio::fs::read(path).await?)?;
     if config.staging.is_relative() {
         config.staging = path
@@ -132,7 +133,13 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
             .join(&config.staging);
     }
     let token = std::env::var("YINYANG_SERVICE_TOKEN").ok();
-    if matches!(command, Command::Status) {
+    if let Command::Status { revision: Some(_) } = &command {
+        return Err(
+            "--revision is only supported by object-storage `yy status`, not `yy --volume CONFIG status`"
+                .into(),
+        );
+    }
+    if matches!(command, Command::Status { .. }) {
         println!(
             "volume: {} access: {:?} frontend: {:?} read-only: {}",
             config.name, config.access, config.frontend, config.read_only
@@ -153,7 +160,7 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
             },
             Err(error) => println!("remote: unavailable ({error})"),
         }
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     let operator = operator()?;
     if matches!(command, Command::Capabilities) {
@@ -162,27 +169,32 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
             serde_json::to_string_pretty(&config.capabilities(&operator))?
         );
         config.validate(&operator)?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if let Command::Receipt { commit_id } = command {
         let authority = Volume::connect(&config, operator, token).await?;
-        let receipt = authority
+        let Some(receipt) = authority
             .observe_latest()
             .await?
             .receipt(yinyang::core::CommitId::from_bytes(*commit_id.as_bytes()))
             .await?
-            .ok_or("receipt absent; a delayed request may still publish")?;
+        else {
+            eprintln!(
+                "yy: receipt absent; a delayed request may still publish, so absence is not proof of failure"
+            );
+            return Ok(ExitCode::from(3));
+        };
         println!(
             "commit: {commit_id}\nrevision: {}",
             revision(receipt.cursor.revision)
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if let Command::Mount { mountpoint } = command {
         #[cfg(target_os = "linux")]
         {
             return match yinyang::fuse::run(config, operator, token, mountpoint).await? {
-                yinyang::fuse::Outcome::Unmounted => Ok(()),
+                yinyang::fuse::Outcome::Unmounted => Ok(ExitCode::SUCCESS),
                 yinyang::fuse::Outcome::TeardownExpired { grace } => {
                     eprintln!(
                         "yy: FUSE mount did not finish teardown within {}s (the session or the \
@@ -315,5 +327,5 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
             runtime.unlink(node.id()).await?;
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

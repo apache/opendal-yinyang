@@ -85,14 +85,34 @@ complete snapshot requires `publish ./source --replace`: remote-only paths are
 removed. Publication prints a commit UUID; retain it and query `yy receipt UUID`
 if the result is uncertain. A missing receipt does not prove failure while an
 attempt may still complete. `--commit-id` selects an identity for a new request,
-not permission to replan an old one. The library exposes a frozen transaction
-for exact retries without rescanning or reuploading. Concurrent changes within
-the replaced scope return a conflict without silently erasing them.
+not permission to replan an old one. Add `--state DIR` to retain the frozen
+request for restart-safe recovery:
+
+```shell
+target/debug/yy publish ./source --state ./publication-state --commit-id UUID
+target/debug/yy publication inspect UUID --state ./publication-state --json
+target/debug/yy publication retry UUID --state ./publication-state
+target/debug/yy publication export UUID --state ./publication-state --destination ./original
+```
+
+`--state DIR` must be outside `SOURCE`; the journal directory cannot be the
+source or one of its descendants. Keep the journal database and WAL files
+together and outside mounted or synchronized source trees.
+
+`publication inspect` reads only local state and needs no storage credentials.
+`retry` and `export` never scan `SOURCE`; they use the original frozen request
+and prepared manifest. Retrying a known identity with `publish` is rejected
+instead of silently applying changed source bytes under the old commit identity.
+Unknown outcomes exit with code 3 and do not establish failure. Conflict and
+Retryable outcomes exit with code 4. Concurrent changes within the replaced
+scope return a conflict without silently erasing them.
 
 Restore requires a destination that does not exist. It verifies and installs
 files individually without overwriting anything. An interrupted restore can
 leave a partial directory; inspect it and restore into a new destination to
-retry. This is one-shot transfer, not a background or bidirectional Sync engine.
+retry. `restore DESTINATION --revision REVISION` selects a retained historical
+revision; without the option it restores latest. This is one-shot transfer, not
+a background or bidirectional Sync engine.
 See the [directory transfer contract](specs/directory-transfer.md) for supported
 metadata, failure semantics, and limitations.
 

@@ -18,7 +18,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
+use std::str::FromStr;
+use yinyang::core::{BackendProfile, CommitId, Fs, Revision};
+mod directory_cli;
 mod file_cli;
 #[cfg(target_os = "linux")]
 mod sync_cli;
@@ -70,13 +72,41 @@ enum Command {
         /// Unique UUID for a new request, not a request to replan an old attempt.
         #[arg(long)]
         commit_id: Option<uuid::Uuid>,
+        /// Explicit state directory for durable, source-free recovery.
+        #[arg(long, requires = "commit_id")]
+        state: Option<PathBuf>,
     },
     /// Query an existing request without rescanning or republishing local files.
     Receipt { commit_id: uuid::Uuid },
-    /// Restore the current pinned snapshot into a directory that does not exist.
-    Restore { destination: PathBuf },
-    /// Enumerate the pinned namespace and report its size.
-    Status,
+    /// Inspect, retry, or export durable one-shot directory publications.
+    Publication {
+        #[command(subcommand)]
+        command: directory_cli::PublicationCommand,
+    },
+    /// Restore a pinned snapshot into a directory that does not exist.
+    Restore {
+        destination: PathBuf,
+        /// Retained revision to restore; defaults to the latest revision.
+        #[arg(long)]
+        revision: Option<RevisionArg>,
+    },
+    /// Enumerate a pinned namespace and report its size.
+    Status {
+        /// Retained revision to inspect; defaults to the latest revision.
+        #[arg(long)]
+        revision: Option<RevisionArg>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevisionArg(Revision);
+
+impl FromStr for RevisionArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_revision(value).map(Self)
+    }
 }
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -90,14 +120,28 @@ async fn main() -> ExitCode {
 }
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     opendal::install_default();
+    if let Command::Publication {
+        command:
+            directory_cli::PublicationCommand::Inspect {
+                commit_id,
+                state,
+                json,
+            },
+    } = &cli.command
+    {
+        if cli.volume.is_some() {
+            return Err("publication commands do not use --volume; configure object storage with YINYANG_S3_* instead".into());
+        }
+        return directory_cli::inspect(*commit_id, state, *json).await;
+    }
+    if cli.volume.is_some() && matches!(cli.command, Command::Publication { .. }) {
+        return Err("publication commands do not use --volume; configure object storage with YINYANG_S3_* instead".into());
+    }
     if let Some(path) = &cli.volume {
         return match cli.command {
             #[cfg(target_os = "linux")]
             Command::Sync { command } => sync_cli::run(path, command).await,
-            command => {
-                file_cli::run(path, command).await?;
-                Ok(ExitCode::SUCCESS)
-            }
+            command => file_cli::run(path, command).await,
         };
     }
     match cli.command {
@@ -148,7 +192,6 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
     let fs = Fs::open(operator, profile).await?;
-    let observed = fs.observe_latest().await?;
     match cli.command {
         Command::Create
         | Command::Serve { .. }
@@ -161,9 +204,25 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             source,
             replace,
             commit_id,
+            state,
         } => {
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
             let id = CommitId::from_bytes(*uuid.as_bytes());
+            let journal = if let Some(state) = &state {
+                let journal = yinyang::DirectoryJournal::open(&fs, state).await?;
+                if journal.status(id).await?.is_some() {
+                    return Err(format!(
+                        "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",
+                        state.display(),
+                        state.display()
+                    )
+                    .into());
+                }
+                Some(journal)
+            } else {
+                None
+            };
+            let observed = fs.observe_latest().await?;
             if observed.receipt(id).await?.is_some() {
                 return Err(format!("commit identity is already used; query its original result with yy receipt {uuid}; use a new identity for a new snapshot").into());
             }
@@ -174,21 +233,31 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 );
             }
             eprintln!("publication ID: {uuid}");
+            if let (Some(journal), Some(state)) = (journal, state) {
+                let status = journal.prepare(&observed, &source, id).await?;
+                eprintln!(
+                    "request digest: {}\njournal state: {}",
+                    blake3::Hash::from(status.intent.request_digest).to_hex(),
+                    state.display()
+                );
+                return directory_cli::publish(&journal, id).await;
+            }
             let request = yinyang::prepare_directory(&fs, &observed, &source, id).await?;
             eprintln!(
                 "request digest: {}",
                 blake3::Hash::from(request.digest()).to_hex()
             );
-            match fs.commit(&request).await? {
-                CommitOutcome::Committed(receipt) => println!("published revision {} (commit {uuid})",revision(receipt.cursor.revision)),
-                CommitOutcome::Conflict => return Err("original namespace predicates changed; inspect the remote state before planning a new request".into()),
-                CommitOutcome::Retryable => return Err("publication opportunity was exhausted without an unresolved write; submit a new directory request or retry the frozen Transaction through the library".into()),
-                CommitOutcome::Unknown(_) => return Err(format!("publication may still complete; query yy receipt {uuid}; an absent receipt does not prove failure").into()),
-            }
+            return directory_cli::classify_outcome(fs.commit(&request).await?, uuid);
         }
         Command::Receipt { commit_id } => {
             let id = CommitId::from_bytes(*commit_id.as_bytes());
-            let receipt = observed.receipt(id).await?.ok_or("receipt not found; a delayed attempt may still publish, so absence is not proof of failure")?;
+            let observed = fs.observe_latest().await?;
+            let Some(receipt) = observed.receipt(id).await? else {
+                eprintln!(
+                    "yy: receipt not found; a delayed attempt may still publish, so absence is not proof of failure"
+                );
+                return Ok(ExitCode::from(3));
+            };
             println!(
                 "commit: {commit_id}\nrevision: {}\nordinal: {}\nrequest digest: {}",
                 revision(receipt.cursor.revision),
@@ -196,20 +265,34 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 blake3::Hash::from(receipt.request_digest).to_hex()
             );
         }
-        Command::Restore { destination } => {
-            yinyang::restore_directory(&fs, &observed, &destination).await?;
+        Command::Publication { command } => {
+            return directory_cli::run(&fs, command).await;
+        }
+        Command::Restore {
+            destination,
+            revision: selected,
+        } => {
+            let snapshot = match selected {
+                Some(selected) => fs.observe_revision(selected.0).await?,
+                None => fs.observe_latest().await?,
+            };
+            yinyang::restore_directory(&fs, &snapshot, &destination).await?;
             println!(
                 "restored revision {} to {}",
-                revision(observed.revision()),
+                revision(snapshot.revision()),
                 destination.display()
             );
         }
-        Command::Status => {
-            let nodes = yinyang::directory_nodes(&observed).await?;
+        Command::Status { revision: selected } => {
+            let snapshot = match selected {
+                Some(selected) => fs.observe_revision(selected.0).await?,
+                None => fs.observe_latest().await?,
+            };
+            let nodes = yinyang::directory_nodes(&snapshot).await?;
             let directories = nodes.values().filter(|n| n.is_directory()).count();
             println!(
                 "revision: {}\nfiles: {}\ndirectories: {directories}",
-                revision(observed.revision()),
+                revision(snapshot.revision()),
                 nodes.len() - directories
             );
         }
@@ -222,4 +305,45 @@ fn revision(value: Revision) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn parse_revision(value: &str) -> Result<Revision, String> {
+    let value = value.as_bytes();
+    if value.len() != 48 {
+        return Err("revision must be exactly 48 hexadecimal characters".to_owned());
+    }
+    let mut bytes = [0_u8; 24];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = (hex_nibble(value[offset])? << 4) | hex_nibble(value[offset + 1])?;
+    }
+    Ok(Revision::from_bytes(bytes))
+}
+
+fn hex_nibble(value: u8) -> Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err("revision contains a non-hexadecimal character".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_revision;
+
+    #[test]
+    fn revision_requires_exactly_24_hex_bytes() {
+        assert!(parse_revision("00").is_err());
+        assert!(parse_revision(&"é".repeat(24)).is_err());
+        assert!(parse_revision(&"g".repeat(48)).is_err());
+        assert_eq!(
+            parse_revision(&"01".repeat(24))
+                .unwrap()
+                .to_bytes()
+                .as_slice(),
+            &[1; 24]
+        );
+    }
 }

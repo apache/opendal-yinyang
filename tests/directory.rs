@@ -787,9 +787,79 @@ fn cli_help_lists_commands() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for name in ["create", "publish", "restore", "status", "receipt"] {
+    for name in [
+        "create",
+        "publish",
+        "restore",
+        "status",
+        "receipt",
+        "publication",
+    ] {
         assert!(text.contains(name));
     }
+    let restore = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args(["restore", "--help"])
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    assert!(
+        String::from_utf8(restore.stdout)
+            .unwrap()
+            .contains("--revision <REVISION>")
+    );
+}
+
+#[test]
+fn revision_syntax_is_rejected_before_backend_admission() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args(["status", "--revision", "00"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("revision must be exactly 48 hexadecimal characters"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn volume_status_rejects_historical_revision_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("volume.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "name": "revision-admission",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": temp.path().join("state"),
+            "read_only": false,
+            "require": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let revision = "01".repeat(24);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args([
+            "--volume",
+            config.to_str().unwrap(),
+            "status",
+            "--revision",
+            &revision,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--revision is only supported by object-storage `yy status`"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -830,7 +900,13 @@ fn s3_cli_directory_round_trip() {
             .status
             .success()
     );
-    assert!(success(&["status"]).contains("files: 3"));
+    let first_status = success(&["status"]);
+    assert!(first_status.contains("files: 3"));
+    let first_revision = first_status
+        .lines()
+        .find_map(|line| line.strip_prefix("revision: "))
+        .unwrap();
+    assert_eq!(first_revision.len(), 48);
     assert!(!run(&["publish", input.to_str().unwrap()]).status.success());
     let output = temp.path().join("restored");
     success(&["restore", output.to_str().unwrap()]);
@@ -853,4 +929,25 @@ fn s3_cli_directory_round_trip() {
     );
     assert!(!second.join("empty").exists());
     assert!(success(&["status"]).contains("files: 2"));
+    let historical = temp.path().join("historical");
+    success(&[
+        "restore",
+        historical.to_str().unwrap(),
+        "--revision",
+        first_revision,
+    ]);
+    assert_eq!(
+        std::fs::read(historical.join("nested/hello")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(std::fs::read(historical.join("large")).unwrap(), bytes);
+    assert!(historical.join("nested/empty-dir").is_dir());
+    assert_eq!(std::fs::read(historical.join("empty")).unwrap(), b"");
+    let invalid = temp.path().join("invalid-revision");
+    assert!(
+        !run(&["restore", invalid.to_str().unwrap(), "--revision", "00",])
+            .status
+            .success()
+    );
+    assert!(!invalid.exists());
 }
