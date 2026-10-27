@@ -22,9 +22,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uuid::Uuid;
-use yinyang::core::{CommitId, Fs};
+use yinyang::core::{CommitId, Fs, Receipt};
 use yinyang::runtime::{Error, ErrorKind};
-use yinyang::{DirectoryInspection, DirectoryJournal, DirectoryState, DirectoryStatus, Receipt};
+use yinyang::{DirectoryInspection, DirectoryJournal, DirectoryState, DirectoryStatus};
 
 const EXIT_UNCERTAIN: u8 = 3;
 const EXIT_NOT_PUBLISHED: u8 = 4;

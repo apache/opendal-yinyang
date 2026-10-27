@@ -29,14 +29,14 @@ mod support;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use support::{Fixture, Publication, RemoteEntry, Tree, local_tree};
+use support::{Fixture, Publication, Tree, local_tree};
 
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(90);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
@@ -142,7 +142,7 @@ impl Drop for S3Gate {
 }
 
 fn handle_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     upstream: SocketAddr,
     action: CommitAction,
     release: Arc<(Mutex<bool>, Condvar)>,
@@ -150,6 +150,7 @@ fn handle_connection(
     poisoned: Arc<AtomicBool>,
     sender: mpsc::Sender<()>,
 ) {
+    let mut client = client;
     if poisoned.load(Ordering::SeqCst) {
         return;
     }

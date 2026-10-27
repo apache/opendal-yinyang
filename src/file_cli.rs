@@ -194,7 +194,7 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
         #[cfg(target_os = "linux")]
         {
             return match yinyang::fuse::run(config, operator, token, mountpoint).await? {
-                yinyang::fuse::Outcome::Unmounted => Ok(()),
+                yinyang::fuse::Outcome::Unmounted => Ok(ExitCode::SUCCESS),
                 yinyang::fuse::Outcome::TeardownExpired { grace } => {
                     eprintln!(
                         "yy: FUSE mount did not finish teardown within {}s (the session or the \
