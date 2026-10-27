@@ -48,16 +48,25 @@ enum CommitAction {
     /// Read the complete request, signal interception, and wait before sending
     /// it upstream. This leaves the journal frozen before any commit response.
     HoldBeforeCommit,
+    /// Read and hold the request, then close it without sending it upstream.
+    DropBeforeCommit,
     /// Send the request and consume the successful response, then close the
     /// client without forwarding that response. Subsequent connections fail so
     /// the client cannot turn the lost response back into a definitive commit.
     DropResponse,
 }
 
+enum GateEvent {
+    Intercepted,
+    CommitSucceeded,
+    OriginalDropped,
+    CommitFailed(String),
+}
+
 /// A loopback HTTP proxy that intercepts the first `.yinyang/head` mutation.
 struct S3Gate {
     address: SocketAddr,
-    intercepted: mpsc::Receiver<()>,
+    events: mpsc::Receiver<GateEvent>,
     release: Arc<(Mutex<bool>, Condvar)>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -104,7 +113,7 @@ impl S3Gate {
         });
         Self {
             address,
-            intercepted: receiver,
+            events: receiver,
             release,
             stop,
             thread: Some(thread),
@@ -116,9 +125,52 @@ impl S3Gate {
     }
 
     fn wait_intercepted(&self) {
-        self.intercepted
+        match self
+            .events
             .recv_timeout(COMMIT_TIMEOUT)
-            .expect("S3 gate did not intercept the conditional head publication");
+            .expect("S3 gate did not intercept the conditional head publication")
+        {
+            GateEvent::Intercepted => {}
+            GateEvent::CommitSucceeded => {
+                panic!("S3 gate observed a commit without reporting request interception")
+            }
+            GateEvent::OriginalDropped => {
+                panic!("S3 gate dropped a request without reporting request interception")
+            }
+            GateEvent::CommitFailed(error) => panic!("S3 gate commit failed: {error}"),
+        }
+    }
+
+    fn wait_commit_succeeded(&self) {
+        match self
+            .events
+            .recv_timeout(COMMIT_TIMEOUT)
+            .expect("S3 gate did not report the forwarded commit result")
+        {
+            GateEvent::CommitSucceeded => {}
+            GateEvent::Intercepted => {
+                panic!("S3 gate reported request interception twice")
+            }
+            GateEvent::OriginalDropped => {
+                panic!("S3 gate dropped the request instead of forwarding it")
+            }
+            GateEvent::CommitFailed(error) => panic!("S3 gate commit failed: {error}"),
+        }
+    }
+
+    fn wait_original_dropped(&self) {
+        match self
+            .events
+            .recv_timeout(COMMIT_TIMEOUT)
+            .expect("S3 gate did not report the dropped original request")
+        {
+            GateEvent::OriginalDropped => {}
+            GateEvent::Intercepted => panic!("S3 gate reported request interception twice"),
+            GateEvent::CommitSucceeded => {
+                panic!("S3 gate forwarded the request that was meant to be dropped")
+            }
+            GateEvent::CommitFailed(error) => panic!("S3 gate commit failed: {error}"),
+        }
     }
 
     fn release(&self) {
@@ -148,7 +200,7 @@ fn handle_connection(
     release: Arc<(Mutex<bool>, Condvar)>,
     intercepted: Arc<AtomicBool>,
     poisoned: Arc<AtomicBool>,
-    sender: mpsc::Sender<()>,
+    sender: mpsc::Sender<GateEvent>,
 ) {
     let mut client = client;
     if poisoned.load(Ordering::SeqCst) {
@@ -157,10 +209,7 @@ fn handle_connection(
     let Ok((head, request_line, headers)) = read_http_head(&mut client) else {
         return;
     };
-    if !is_head_commit(&request_line) || intercepted.swap(true, Ordering::SeqCst) {
-        forward_stream(client, upstream, head).ok();
-        return;
-    }
+    let is_commit = is_head_commit(&request_line) && !intercepted.swap(true, Ordering::SeqCst);
     if has_expect_continue(&headers) {
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
@@ -169,9 +218,18 @@ fn handle_connection(
     };
     let mut request = head;
     request.extend_from_slice(&body);
-    if matches!(action, CommitAction::HoldBeforeCommit) {
-        let _ = sender.send(());
+    if is_commit
+        && matches!(
+            action,
+            CommitAction::HoldBeforeCommit | CommitAction::DropBeforeCommit
+        )
+    {
+        let _ = sender.send(GateEvent::Intercepted);
         wait_release(&release);
+    }
+    if is_commit && matches!(action, CommitAction::DropBeforeCommit) {
+        let _ = sender.send(GateEvent::OriginalDropped);
+        return;
     }
     let Ok(mut server) = TcpStream::connect(upstream) else {
         return;
@@ -179,17 +237,36 @@ fn handle_connection(
     if server.write_all(&request).is_err() {
         return;
     }
-    let Ok(_response) = read_http_response(&mut server) else {
+    let head_only = request_line
+        .split_whitespace()
+        .next()
+        .is_some_and(|method| method == "HEAD");
+    let Ok(response) = read_http_response(&mut server, head_only) else {
         return;
     };
-    if !matches!(action, CommitAction::HoldBeforeCommit) {
-        let _ = sender.send(());
-    }
-    match action {
-        CommitAction::HoldBeforeCommit => {}
-        CommitAction::DropResponse => {
-            poisoned.store(true, Ordering::SeqCst);
+    if is_commit {
+        if response.status != 200 {
+            let message = format!(
+                "conditional head PUT returned HTTP {}, expected 200",
+                response.status
+            );
+            let _ = sender.send(GateEvent::CommitFailed(message));
+            return;
         }
+        match action {
+            CommitAction::HoldBeforeCommit => {
+                let _ = sender.send(GateEvent::CommitSucceeded);
+            }
+            CommitAction::DropBeforeCommit => unreachable!("handled before forwarding"),
+            CommitAction::DropResponse => {
+                let _ = sender.send(GateEvent::Intercepted);
+                poisoned.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    if !is_commit {
+        let response = with_connection_close(&response.bytes);
+        let _ = client.write_all(&response);
     }
     let _ = client.shutdown(Shutdown::Both);
 }
@@ -205,31 +282,6 @@ fn wait_release(release: &(Mutex<bool>, Condvar)) {
             .wait(released)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
-}
-
-fn forward_stream(
-    mut client: TcpStream,
-    upstream: SocketAddr,
-    head: Vec<u8>,
-) -> std::io::Result<()> {
-    let mut server = TcpStream::connect(upstream)?;
-    server.write_all(&head)?;
-    let mut client_read = client.try_clone()?;
-    let mut client_write = client.try_clone()?;
-    let mut server_read = server.try_clone()?;
-    let mut server_write = server.try_clone()?;
-    let request = thread::spawn(move || {
-        let _ = std::io::copy(&mut client_read, &mut server_write);
-        let _ = server_write.shutdown(Shutdown::Write);
-    });
-    let response = thread::spawn(move || {
-        let _ = std::io::copy(&mut server_read, &mut client_write);
-        let _ = client_write.shutdown(Shutdown::Write);
-    });
-    let _ = request.join();
-    let _ = response.join();
-    let _ = client.shutdown(Shutdown::Both);
-    Ok(())
 }
 
 fn read_http_head(
@@ -259,7 +311,12 @@ fn read_http_head(
     Ok((bytes, request_line, headers))
 }
 
-fn read_http_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+struct HttpResponse {
+    status: u16,
+    bytes: Vec<u8>,
+}
+
+fn read_http_response(stream: &mut TcpStream, head_only: bool) -> std::io::Result<HttpResponse> {
     loop {
         let (head, status_line, headers) = read_http_head(stream)?;
         let status = status_line
@@ -269,13 +326,42 @@ fn read_http_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "missing status")
             })?;
-        let body = read_http_body(stream, &headers)?;
+        let body = if head_only || matches!(status, 204 | 304) {
+            Vec::new()
+        } else {
+            read_http_body(stream, &headers)?
+        };
         if !(100..200).contains(&status) {
             let mut response = head;
             response.extend(body);
-            return Ok(response);
+            return Ok(HttpResponse {
+                status,
+                bytes: response,
+            });
         }
     }
+}
+
+fn with_connection_close(response: &[u8]) -> Vec<u8> {
+    let Some(boundary) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return response.to_vec();
+    };
+    let Ok(head) = std::str::from_utf8(&response[..boundary]) else {
+        return response.to_vec();
+    };
+    let mut output = Vec::with_capacity(response.len() + 19);
+    for line in head.split("\r\n") {
+        if !line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            output.extend_from_slice(line.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    output.extend_from_slice(b"Connection: close\r\n\r\n");
+    output.extend_from_slice(&response[boundary + 4..]);
+    output
 }
 
 fn read_http_body(
@@ -307,16 +393,25 @@ fn read_http_body(
 fn read_chunked(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
-        let size = read_line(stream)?;
-        let size = size
+        let line = read_line(stream)?;
+        let size = line
             .split(';')
             .next()
             .and_then(|value| usize::from_str_radix(value, 16).ok())
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size")
             })?;
+        body.extend_from_slice(line.as_bytes());
+        body.extend_from_slice(b"\r\n");
         if size == 0 {
-            while !read_line(stream)?.is_empty() {}
+            loop {
+                let trailer = read_line(stream)?;
+                body.extend_from_slice(trailer.as_bytes());
+                body.extend_from_slice(b"\r\n");
+                if trailer.is_empty() {
+                    break;
+                }
+            }
             return Ok(body);
         }
         if body.len().saturating_add(size) > MAX_HTTP_BODY {
@@ -327,7 +422,7 @@ fn read_chunked(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
         }
         let mut chunk = vec![0; size + 2];
         stream.read_exact(&mut chunk)?;
-        body.extend_from_slice(&chunk[..size]);
+        body.extend_from_slice(&chunk);
     }
 }
 
@@ -544,9 +639,87 @@ fn assert_tree(actual: &Tree, expected: &Tree, context: &str) {
     assert_eq!(actual, expected, "{context}");
 }
 
+fn process_death_case(action: CommitAction, delayed_original_succeeds: bool) {
+    let fixture = Fixture::new(Publication::Object);
+    let source = fixture.path("source");
+    write_source(&source);
+    let original = local_tree(&source).unwrap();
+    let state = fixture.path("journal");
+    let commit_id = uuid::Uuid::new_v4().to_string();
+    let gate = S3Gate::start(action);
+    let mut command = fixture.yy_command(&[
+        "publish",
+        source.to_str().unwrap(),
+        "--state",
+        state.to_str().unwrap(),
+        "--commit-id",
+        &commit_id,
+    ]);
+    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let running = spawn(&mut command);
+    gate.wait_intercepted();
+
+    let receipt = fixture.yy(&["receipt", &commit_id]);
+    assert_eq!(receipt.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&receipt.stderr).contains("absence is not proof of failure"),
+        "{}",
+        String::from_utf8_lossy(&receipt.stderr)
+    );
+    let intent = publication_inspect(&state, &commit_id);
+    assert_state(&intent, &["unknown"]);
+    let digest = intent["request_digest"].as_str().unwrap().to_owned();
+
+    mutate_source(&source);
+    running.kill();
+    gate.release();
+    if delayed_original_succeeds {
+        gate.wait_commit_succeeded();
+        fixture.wait_remote_tree(&original, Duration::from_secs(60));
+    } else {
+        gate.wait_original_dropped();
+        assert!(fixture.remote_tree().unwrap().is_empty());
+    }
+
+    let intent = publication_inspect(&state, &commit_id);
+    assert_state(&intent, &["unknown"]);
+    assert_eq!(intent["request_digest"], digest);
+    fixture.yy_ok(&[
+        "publication",
+        "retry",
+        &commit_id,
+        "--state",
+        state.to_str().unwrap(),
+    ]);
+    let intent = publication_inspect(&state, &commit_id);
+    assert_state(&intent, &["committed"]);
+    assert_eq!(intent["request_digest"], digest);
+    assert_tree(
+        &fixture.remote_tree().unwrap(),
+        &original,
+        "recovered publication",
+    );
+
+    let revision = fixture.yy_ok(&["receipt", &commit_id]).stdout;
+    let revision = std::str::from_utf8(&revision)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("revision: "))
+        .unwrap()
+        .to_owned();
+    let restored = fixture.path("restored");
+    fixture.yy_ok(&[
+        "restore",
+        restored.to_str().unwrap(),
+        "--revision",
+        &revision,
+    ]);
+    assert_eq!(local_tree(&restored).unwrap(), original);
+}
+
 #[test]
 #[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
-fn response_loss_replays_the_frozen_directory_without_rescanning_source() {
+fn s3_response_loss_replays_the_frozen_directory_without_rescanning_source() {
     let fixture = Fixture::new(Publication::Object);
     let source = fixture.path("source");
     write_source(&source);
@@ -649,81 +822,19 @@ fn response_loss_replays_the_frozen_directory_without_rescanning_source() {
 
 #[test]
 #[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
-fn process_death_keeps_the_original_identity_and_missing_receipt_is_uncertain() {
-    let fixture = Fixture::new(Publication::Object);
-    let source = fixture.path("source");
-    write_source(&source);
-    let original = local_tree(&source).unwrap();
-    let state = fixture.path("journal");
-    let commit_id = uuid::Uuid::new_v4().to_string();
-    let gate = S3Gate::start(CommitAction::HoldBeforeCommit);
-    let mut command = fixture.yy_command(&[
-        "publish",
-        source.to_str().unwrap(),
-        "--state",
-        state.to_str().unwrap(),
-        "--commit-id",
-        &commit_id,
-    ]);
-    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
-    let running = spawn(&mut command);
-    gate.wait_intercepted();
-
-    let receipt = fixture.yy(&["receipt", &commit_id]);
-    assert_eq!(receipt.status.code(), Some(3));
-    assert!(
-        String::from_utf8_lossy(&receipt.stderr).contains("absence is not proof of failure"),
-        "{}",
-        String::from_utf8_lossy(&receipt.stderr)
-    );
-    let intent = publication_inspect(&state, &commit_id);
-    assert_state(&intent, &["prepared", "unknown"]);
-    let digest = intent["request_digest"].as_str().unwrap().to_owned();
-
-    mutate_source(&source);
-    running.kill();
-    gate.release();
-    fixture.wait_remote_tree(&original, Duration::from_secs(60));
-
-    let intent = publication_inspect(&state, &commit_id);
-    assert_state(&intent, &["prepared", "unknown"]);
-    assert_eq!(intent["request_digest"], digest);
-    fixture.yy_ok(&[
-        "publication",
-        "retry",
-        &commit_id,
-        "--state",
-        state.to_str().unwrap(),
-    ]);
-    let intent = publication_inspect(&state, &commit_id);
-    assert_state(&intent, &["committed"]);
-    assert_eq!(intent["request_digest"], digest);
-    assert_tree(
-        &fixture.remote_tree().unwrap(),
-        &original,
-        "recovered publication",
-    );
-
-    let revision = fixture.yy_ok(&["receipt", &commit_id]).stdout;
-    let revision = std::str::from_utf8(&revision)
-        .unwrap()
-        .lines()
-        .find_map(|line| line.strip_prefix("revision: "))
-        .unwrap()
-        .to_owned();
-    let restored = fixture.path("restored");
-    fixture.yy_ok(&[
-        "restore",
-        restored.to_str().unwrap(),
-        "--revision",
-        &revision,
-    ]);
-    assert_eq!(local_tree(&restored).unwrap(), original);
+fn s3_process_death_recovers_a_delayed_original_commit() {
+    process_death_case(CommitAction::HoldBeforeCommit, true);
 }
 
 #[test]
 #[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
-fn historical_restore_and_publication_export_are_explicit_and_no_clobber() {
+fn s3_process_death_replays_after_the_original_request_is_dropped() {
+    process_death_case(CommitAction::DropBeforeCommit, false);
+}
+
+#[test]
+#[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
+fn s3_historical_restore_and_publication_export_are_explicit_and_no_clobber() {
     let fixture = Fixture::new(Publication::Object);
     let source = fixture.path("source");
     write_source(&source);

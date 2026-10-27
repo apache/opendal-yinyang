@@ -206,9 +206,23 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             commit_id,
             state,
         } => {
-            let observed = fs.observe_latest().await?;
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
             let id = CommitId::from_bytes(*uuid.as_bytes());
+            let journal = if let Some(state) = &state {
+                let journal = yinyang::DirectoryJournal::open(&fs, state).await?;
+                if journal.status(id).await?.is_some() {
+                    return Err(format!(
+                        "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",
+                        state.display(),
+                        state.display()
+                    )
+                    .into());
+                }
+                Some(journal)
+            } else {
+                None
+            };
+            let observed = fs.observe_latest().await?;
             if observed.receipt(id).await?.is_some() {
                 return Err(format!("commit identity is already used; query its original result with yy receipt {uuid}; use a new identity for a new snapshot").into());
             }
@@ -219,16 +233,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 );
             }
             eprintln!("publication ID: {uuid}");
-            if let Some(state) = state {
-                let journal = yinyang::DirectoryJournal::open(&fs, &state).await?;
-                if journal.status(id).await?.is_some() {
-                    return Err(format!(
-                        "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",
-                        state.display(),
-                        state.display()
-                    )
-                    .into());
-                }
+            if let (Some(journal), Some(state)) = (journal, state) {
                 let status = journal.prepare(&observed, &source, id).await?;
                 eprintln!(
                     "request digest: {}\njournal state: {}",
