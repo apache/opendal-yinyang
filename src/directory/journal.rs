@@ -129,6 +129,7 @@ impl DirectoryInspection {
 
 struct Inner {
     fs: Fs,
+    journal_directory: PathBuf,
     database: Arc<Mutex<Connection>>,
     gate: Mutex<()>,
 }
@@ -151,9 +152,13 @@ impl std::fmt::Debug for DirectoryJournal {
 
 impl DirectoryJournal {
     /// Open or create a journal bound to one object publication authority.
+    ///
+    /// Keep this directory outside every source tree published through it.
+    /// [`Self::prepare`] rejects a source that contains the journal directory.
     pub async fn open(fs: &Fs, directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref().to_owned();
         tokio::fs::create_dir_all(&directory).await.map_err(local)?;
+        let directory = tokio::fs::canonicalize(&directory).await.map_err(local)?;
         let path = directory.join("directory.db");
         let filesystem = *fs.filesystem().as_bytes();
         let root = *fs.root().as_bytes();
@@ -247,6 +252,7 @@ impl DirectoryJournal {
         Ok(Self {
             inner: Arc::new(Inner {
                 fs: fs.clone(),
+                journal_directory: directory,
                 database: Arc::new(Mutex::new(database)),
                 gate: Mutex::new(()),
             }),
@@ -264,7 +270,8 @@ impl DirectoryJournal {
     /// Build and durably accept one new publication request.
     ///
     /// An identity already present in the journal is rejected before local IO.
-    /// Use [`Self::publish`] for source-free exact replay instead.
+    /// Use [`Self::publish`] for source-free exact replay instead. The canonical
+    /// journal directory must be outside the canonical input tree.
     pub async fn prepare(
         &self,
         observed: &Snapshot,
@@ -275,8 +282,21 @@ impl DirectoryJournal {
         if load_async(self, commit_id).await?.is_some() {
             return Err(existing_identity(commit_id));
         }
+        let source = tokio::fs::canonicalize(source).await.map_err(local)?;
+        if self.inner.journal_directory == source
+            || self.inner.journal_directory.starts_with(&source)
+        {
+            return Err(Error::local_kind(
+                ErrorKind::Invalid,
+                format!(
+                    "directory journal {} is inside source {}; keep journal state outside the published input tree",
+                    self.inner.journal_directory.display(),
+                    source.display()
+                ),
+            ));
+        }
         let prepared =
-            prepare_directory_request(&self.inner.fs, observed, source, commit_id).await?;
+            prepare_directory_request(&self.inner.fs, observed, &source, commit_id).await?;
         let request = prepared.transaction.to_bytes()?;
         let (baseline, stored_id, digest) = Transaction::inspect_identity(&request)?;
         if stored_id != commit_id || digest != prepared.transaction.digest() {

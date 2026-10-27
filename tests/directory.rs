@@ -702,6 +702,56 @@ async fn journal_inspection_rejects_a_malformed_frozen_identity() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn journal_rejects_state_inside_a_symlinked_source_before_publication() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let alias = temp.path().join("source-alias");
+    symlink(&input, &alias).unwrap();
+    let state = input.join(".state");
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let observed = fs.observe_latest().await.unwrap();
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let before = backend.state.lock().unwrap().objects.len();
+    let id = CommitId::generate();
+    assert_eq!(
+        journal
+            .prepare(&observed, &alias, id)
+            .await
+            .unwrap_err()
+            .kind(),
+        RuntimeErrorKind::Invalid
+    );
+    assert!(journal.status(id).await.unwrap().is_none());
+    assert_eq!(
+        backend.state.lock().unwrap().objects.len(),
+        before,
+        "the rejected layout must not upload or publish directory content"
+    );
+}
+
+#[tokio::test]
+async fn journal_allows_a_source_below_a_larger_state_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let input = state.join("input");
+    tokio::fs::create_dir_all(&input).await.unwrap();
+    tokio::fs::write(input.join("file"), b"content")
+        .await
+        .unwrap();
+    let fs = filesystem(&TestBackend::default()).await;
+    let observed = fs.observe_latest().await.unwrap();
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let status = journal.prepare(&observed, &input, id).await.unwrap();
+    assert_eq!(status.state, DirectoryState::Prepared);
+}
+
 #[test]
 fn cli_help_lists_commands() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
