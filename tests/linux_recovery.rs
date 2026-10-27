@@ -862,6 +862,7 @@ fn object_publication_journal_restore_preserves_history_and_unknown() {
     let mut command = fixture.yy_command(&[
         "publish",
         text(&source),
+        "--replace",
         "--state",
         text(&journal),
         "--commit-id",
