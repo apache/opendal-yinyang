@@ -8,6 +8,8 @@ JSONL evidence.
 ## Tested identity
 
 - Source: `c5c74589f61726100e6a0c5090e2c0c5b8ea6db2`
+- Corrected service collector:
+  `1302ceab5d29781d944e70e3e034248b94dac65f` on unchanged production code
 - Release binary BLAKE3:
   `2e7cd592270e280cc5c2cd81fc3a28f8da38c0646107800c02cd4e9f12181da7`
 - Host: 4 vCPUs, 15 GiB RAM, Ubuntu 24.04 kernel `7.0.0-1014-aws`
@@ -20,6 +22,12 @@ JSONL evidence.
   (`129,999` bytes)
 - Evidence JSONL SHA-256:
   `91eb5a0cd531f6f25060bf0e42887e348c6e35e0221727c4147a7936f538bff2`
+- Corrected service evidence:
+  [linux-cost-service-2026-10-27-1302cea.jsonl](benchmarks/linux-cost-service-2026-10-27-1302cea.jsonl)
+  (`63,437` bytes), SHA-256
+  `266c28e6eb90ca4c8a42ae0a585cd7cf8c375c07ce0013c40ac45fa4aefcc508`
+- Corrected service runner label: `cost-1302cea-service-r1`, 22 measured and
+  2 unsupported records, `1 passed`, exit `0`
 
 The benchmark ran `cargo x bench-linux-cost --profile full` and produced 50
 records: 48 measured records plus two unsupported service-authority one-shot
@@ -34,33 +42,31 @@ files.
 > collector delay inflated service latency. Do not use service-authority p50
 > values from this file. Service connection/request/byte counts and space
 > observations remain inspectable, and the raw file is retained unchanged.
-> A corrected collector run supersedes service latency.
+> The `1302cea` corrected service run supersedes service latency. Object rows
+> remain the accepted `c5c7458` evidence.
 
 ## Representative results
 
 Latency is the batch p50. Network values are per latency sample. Object and
 service rows use separate collection paths and are not interchangeable.
 
-| Workload | Authority | Scale | p50 | S3 requests/sample | Service RPCs/sample |
-| --- | --- | --- | ---: | ---: | ---: |
-| Sync initial | Object | 32 files | 14.750 s | 2718 | 0 |
-| Sync no-op | Object | 32 files | 3.216 s | 486 | 0 |
-| Sync single edit | Object | 32 files | 3.449 s | 528 | 0 |
-| Sync rename | Object | 32 files | 4.041 s | 631 | 0 |
-| Sync initial | Service | 128 files | invalid* | 897 | 3122 |
-| Sync no-op | Service | 128 files | invalid* | 1 | 857 |
-| Sync single edit | Service | 128 files | invalid* | 5.7 | 862.3 |
-| Sync rename | Service | 128 files | invalid* | 1 | 886 |
-| FUSE cold open + 4 KiB read | Object | 8 MiB | 5.383 s | 1161 | 0 |
-| FUSE cold open + 4 KiB read | Service | 32 MiB | invalid* | 5632 | 7 |
-| FUSE warm 4 KiB read | Object | 32 MiB | 0.096 ms | 0 | 0 |
-| FUSE sparse update | Object | 32 MiB | 36.551 s | 6194 | 0 |
-| FUSE sparse update | Service | 32 MiB | invalid* | 7692 | 11 |
-| Concurrent writers | Object | 4 writers | 0.462 s | 127.8 | 0 |
-| Concurrent writers | Service | 4 writers | invalid* | 18 | 18.2 |
-
-`invalid*` marks service latency from the superseded nonblocking-accept
-collector. No service timing claim is made from those cells.
+| Workload | Authority | Collector | Scale | p50 | S3 requests/sample | Service RPCs/sample |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| Sync initial | Object | c5c | 32 files | 14.750 s | 2718 | 0 |
+| Sync no-op | Object | c5c | 32 files | 3.216 s | 486 | 0 |
+| Sync single edit | Object | c5c | 32 files | 3.449 s | 528 | 0 |
+| Sync rename | Object | c5c | 32 files | 4.041 s | 631 | 0 |
+| Sync initial | Service | 1302 | 128 files | 10.312 s | 897 | 3122 |
+| Sync no-op | Service | 1302 | 128 files | 0.565 s | 1 | 857 |
+| Sync single edit | Service | 1302 | 128 files | 0.666 s | 5.7 | 862.3 |
+| Sync rename | Service | 1302 | 128 files | 0.636 s | 1 | 886 |
+| FUSE cold open + 4 KiB read | Object | c5c | 8 MiB | 5.383 s | 1161 | 0 |
+| FUSE cold open + 4 KiB read | Service | 1302 | 32 MiB | 22.533 s | 5632 | 7 |
+| FUSE warm 4 KiB read | Object | c5c | 32 MiB | 0.096 ms | 0 | 0 |
+| FUSE sparse update | Object | c5c | 32 MiB | 36.551 s | 6194 | 0 |
+| FUSE sparse update | Service | 1302 | 32 MiB | 53.305 s | 7692 | 11 |
+| Concurrent writers | Object | c5c | 4 writers | 0.462 s | 127.8 | 0 |
+| Concurrent writers | Service | 1302 | 4 writers | 0.394 s | 18 | 18.2 |
 
 Every cold FUSE read transferred approximately the complete file: 8.875 MiB of
 S3 response for the 8 MiB file and 36.298 MiB for the 32 MiB file. Warm reads on
