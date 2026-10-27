@@ -280,5 +280,6 @@ there is no mid-session cancellation signal.
   critical section. First materialization or range pinning is serialized per
   NodeId by that gate; neither lock is held across remote observation or
   staging I/O, and different nodes initialize independently.
-- The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
-  there is no automatic external-change watch.
+- The session `Notifier` serves explicit `SIGHUP` refresh invalidation and the
+  pre-open inode attribute invalidation required by read-only range opens.
+  There is no automatic external-change watch.
