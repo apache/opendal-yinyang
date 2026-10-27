@@ -22,7 +22,7 @@
 #[path = "linux_sync/harness.rs"]
 mod fixture;
 
-use fixture::{Captured, EntryState, Fixture, Publication, SyncStatus, runtime};
+use fixture::{Captured, EntryState, Fixture, Publication, RemoteEntry, SyncStatus, runtime};
 use nix::unistd::{Gid, Uid};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -410,6 +410,16 @@ fn mount_staging_enospc_preserves_acknowledged_prefix_across_process_restart() {
         "full.txt",
         "--write",
     ]));
+    let acknowledged = fixture.path("acknowledged-input");
+    fs::write(&acknowledged, b"acknowledged").unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "write",
+        &handle.to_string(),
+        text(&acknowledged),
+    ]);
     let input = fixture.path("large-input");
     fs::write(&input, vec![b'x'; 12 * 1024 * 1024]).unwrap();
     let failed = fixture.yy(&[
@@ -419,6 +429,7 @@ fn mount_staging_enospc_preserves_acknowledged_prefix_across_process_restart() {
         "write",
         &handle.to_string(),
         text(&input),
+        "--append",
     ]);
     let diagnostic = String::from_utf8_lossy(&failed.stderr).to_ascii_lowercase();
     assert!(
@@ -437,10 +448,18 @@ fn mount_staging_enospc_preserves_acknowledged_prefix_across_process_restart() {
         .find(|candidate| candidate.id == handle)
         .map(|candidate| candidate.length)
         .expect("failed write discarded its staged handle");
-    assert!(length > 0, "no acknowledged prefix remained: {status:#?}");
     assert!(
-        length < 12 * 1024 * 1024,
+        length > b"acknowledged".len() as u64,
+        "no append prefix remained beyond the acknowledged write: {status:#?}"
+    );
+    assert!(
+        length < 12 * 1024 * 1024 + b"acknowledged".len() as u64,
         "the simulated ENOSPC accepted the complete input"
+    );
+    assert_eq!(
+        remote_entry_bytes(&fixture, "full.txt").as_deref(),
+        Some(b"base".as_slice()),
+        "failed append must not publish a partial remote version"
     );
     let read = fixture.yy_ok(&[
         "--volume",
@@ -449,11 +468,28 @@ fn mount_staging_enospc_preserves_acknowledged_prefix_across_process_restart() {
         "read",
         &handle.to_string(),
         "--length",
-        "65536",
+        &length.to_string(),
     ]);
-    let expected = usize::try_from(length.min(65536)).unwrap();
-    assert_eq!(read.stdout.len(), expected);
-    assert!(read.stdout.iter().all(|byte| *byte == b'x'));
+    assert_eq!(read.stdout.len(), usize::try_from(length).unwrap());
+    assert!(read.stdout.starts_with(b"acknowledged"));
+    assert!(
+        read.stdout[b"acknowledged".len()..]
+            .iter()
+            .all(|byte| *byte == b'x')
+    );
+    tmpfs.resize("32m");
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "fsync",
+        &handle.to_string(),
+    ]);
+    assert_eq!(
+        remote_entry_bytes(&fixture, "full.txt").as_deref(),
+        Some(read.stdout.as_slice()),
+        "explicit recovery fsync must publish the retained local prefix"
+    );
     drop(tmpfs);
 }
 
@@ -846,6 +882,13 @@ fn remote_bytes(authority: &std::sync::Arc<dyn Authority>, path: &str) -> Option
         .expect("read restored remote file")
 }
 
+fn remote_entry_bytes(fixture: &Fixture, path: &str) -> Option<Vec<u8>> {
+    match fixture.remote_tree().ok()?.remove(path)? {
+        RemoteEntry::File { bytes, .. } => Some(bytes),
+        RemoteEntry::Directory { .. } => None,
+    }
+}
+
 struct Tmpfs {
     path: PathBuf,
 }
@@ -879,15 +922,32 @@ impl Tmpfs {
             path: path.to_owned(),
         }
     }
+
+    fn resize(&self, size: &str) {
+        let option = format!("remount,size={size}");
+        run_external(
+            "sudo",
+            &["-n", "mount", "-o", &option, text(&self.path)],
+            Duration::from_secs(30),
+        )
+        .success_or("resize bounded tmpfs");
+    }
 }
 
 impl Drop for Tmpfs {
     fn drop(&mut self) {
-        let _ = run_external(
+        let unmounted = run_external(
             "sudo",
-            &["-n", "umount", "-l", text(&self.path)],
+            &["-n", "umount", text(&self.path)],
             Duration::from_secs(30),
         );
+        if !unmounted.status.success() {
+            let _ = run_external(
+                "sudo",
+                &["-n", "umount", "-l", text(&self.path)],
+                Duration::from_secs(30),
+            );
+        }
     }
 }
 
