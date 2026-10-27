@@ -487,6 +487,7 @@ fn service_authority(
 ) -> std::sync::Arc<dyn Authority> {
     runtime()
         .block_on(ServiceClient::connect(address, token.to_owned(), operator))
+        .map(|client| std::sync::Arc::new(client) as std::sync::Arc<dyn Authority>)
         .expect("connect restored service authority")
 }
 
