@@ -22,10 +22,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
-use yinyang_core::{Authority, NodeId, Receipt};
+use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
 
 struct Node {
     handle: Mutex<FileHandle>,
+    references: AtomicUsize,
+}
+struct ReadOnlyNode {
+    version: FileVersion,
     references: AtomicUsize,
 }
 struct OpenGate {
@@ -39,6 +43,19 @@ impl Drop for OpenGate {
             opening.remove(&self.id);
         }
         // Close wakes every waiter; a single permit would strand later waiters.
+        self.ready.close();
+    }
+}
+struct ReadOnlyOpenGate {
+    inner: Arc<Inner>,
+    id: NodeId,
+    ready: Arc<Semaphore>,
+}
+impl Drop for ReadOnlyOpenGate {
+    fn drop(&mut self) {
+        if let Ok(mut opening) = self.inner.read_only_opening.lock() {
+            opening.remove(&self.id);
+        }
         self.ready.close();
     }
 }
@@ -61,9 +78,12 @@ struct Inner {
     read_only: bool,
     nodes: StdMutex<BTreeMap<NodeId, Arc<Node>>>,
     opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
+    read_only_nodes: StdMutex<BTreeMap<NodeId, Arc<ReadOnlyNode>>>,
+    read_only_opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
 }
-/// A mount instance owns one recoverable staged version per node, not per open.
-/// It does not install a mount or manage kernel caches.
+/// A mount instance owns one shared staged version per writable node and one
+/// pinned authenticated file observation per active read-only node. It does not
+/// install a mount or manage kernel caches.
 #[derive(Clone)]
 pub struct Mount {
     inner: Arc<Inner>,
@@ -106,6 +126,8 @@ impl Mount {
                 read_only,
                 nodes: StdMutex::new(nodes),
                 opening: StdMutex::new(BTreeMap::new()),
+                read_only_nodes: StdMutex::new(BTreeMap::new()),
+                read_only_opening: StdMutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -190,6 +212,105 @@ impl Mount {
             drop(gate);
             return Ok(MountFile { node, writable });
         }
+    }
+    /// Pin one authenticated immutable observation for a read-only whole-volume
+    /// mount. Concurrent opens of the same NodeId share one FileVersion; when
+    /// the last reference is reclaimed, the next open observes latest again.
+    pub async fn open_read_only_node(&self, id: NodeId) -> Result<MountReadOnlyFile> {
+        if !self.inner.read_only {
+            return Err(Error::State(
+                ErrorKind::Unsupported,
+                "range observations require a read-only mount",
+            ));
+        }
+        match self.reclaim_read_only(id) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::Busy => {}
+            Err(error) => return Err(error),
+        }
+        loop {
+            let (existing, gate) = {
+                let nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+                if let Some(node) = nodes.get(&id) {
+                    node.references.fetch_add(1, Ordering::Relaxed);
+                    (Some(node.clone()), None)
+                } else {
+                    let mut opening = self.inner.read_only_opening.lock().map_err(Error::local)?;
+                    match opening.get(&id) {
+                        Some(ready) => (None, Some((ready.clone(), true))),
+                        None => {
+                            let ready = Arc::new(Semaphore::new(0));
+                            opening.insert(id, ready.clone());
+                            (None, Some((ready, false)))
+                        }
+                    }
+                }
+            };
+            if let Some(node) = existing {
+                return Ok(MountReadOnlyFile { node });
+            }
+            let (ready, waiting) = gate.expect("a waiter or owner always carries the node gate");
+            if waiting {
+                let _ = ready.acquire().await;
+                continue;
+            }
+
+            let gate = ReadOnlyOpenGate {
+                inner: self.inner.clone(),
+                id,
+                ready,
+            };
+            let version = self
+                .inner
+                .runtime
+                .authority()
+                .observe_latest()
+                .await?
+                .open_file(id)
+                .await?;
+            let node = Arc::new(ReadOnlyNode {
+                version,
+                references: AtomicUsize::new(0),
+            });
+            {
+                let mut nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+                nodes.insert(id, node.clone());
+                node.references.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(gate);
+            return Ok(MountReadOnlyFile { node });
+        }
+    }
+    /// Return the currently pinned read-only observation for path metadata.
+    /// A zero-reference entry is retired here because the operation that held
+    /// the final reference may finish after FUSE release already returned Busy.
+    pub fn read_only_version(&self, id: NodeId) -> Result<Option<FileVersion>> {
+        let mut nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+        let Some(node) = nodes.get(&id) else {
+            return Ok(None);
+        };
+        if node.references.load(Ordering::Relaxed) == 0 {
+            nodes.remove(&id);
+            return Ok(None);
+        }
+        Ok(Some(node.version.clone()))
+    }
+    /// Forget an unreferenced read-only observation. An interrupted operation
+    /// may still hold the observation after FUSE release; a later open retries
+    /// this reclaim so it still observes the current remote revision.
+    pub fn reclaim_read_only(&self, id: NodeId) -> Result<()> {
+        let mut nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+        let Some(node) = nodes.get(&id) else {
+            return Ok(());
+        };
+        if node.references.load(Ordering::Relaxed) != 0 {
+            return Err(Error::State(
+                ErrorKind::Busy,
+                "node still has open read-only references",
+            ));
+        }
+        nodes.remove(&id);
+        Ok(())
     }
     /// Replace a clean local version with a fresh remote observation. Pending,
     /// frozen or failed versions are never rebased. Adapters must coordinate any
@@ -284,6 +405,25 @@ impl Mount {
 pub struct MountFile {
     node: Arc<Node>,
     writable: bool,
+}
+/// A read-only reference to one authenticated pinned file version. Dropping it
+/// performs no I/O; the caller reclaims the observation when the last kernel
+/// handle is released.
+pub struct MountReadOnlyFile {
+    node: Arc<ReadOnlyNode>,
+}
+impl Drop for MountReadOnlyFile {
+    fn drop(&mut self) {
+        self.node.references.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+impl MountReadOnlyFile {
+    pub fn version(&self) -> &FileVersion {
+        &self.node.version
+    }
+    pub async fn read(&self, offset: u64, length: usize) -> yinyang_core::Result<Vec<u8>> {
+        self.node.version.read(offset, length).await
+    }
 }
 impl Drop for MountFile {
     fn drop(&mut self) {

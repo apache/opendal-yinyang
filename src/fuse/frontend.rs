@@ -25,13 +25,14 @@
 //! from the request are converted to owned values before the dispatch, and
 //! the low-level binding replies EIO if a task drops an unanswered reply.
 //!
-//! Files pin the node's shared staged version. `fstat` on an open handle uses
-//! that staged record's length, and reads return staged bytes, so an old
-//! descriptor never mixes a newer remote length with older content. `release`
-//! reclaims a clean shared node, which makes the next open observe the
-//! current remote revision without rebasing live handles. Directory handles
-//! pin one `Snapshot` revision; readdir offsets are stable ordinal positions
-//! over pages of that pinned listing.
+//! Files pin one node observation. A read-only whole-volume mount pins an
+//! authenticated `FileVersion` and reads intersecting content units directly;
+//! writable mounts and their read-only descriptors share the staged node so
+//! readers observe accepted local writes. `fstat` uses the pinned observation's
+//! length and metadata, and `release` drops the last clean reference so the next
+//! open observes the current remote revision without rebasing live handles.
+//! Directory handles pin one `Snapshot` revision; readdir offsets are stable
+//! ordinal positions over pages of that pinned listing.
 //!
 //! The binding replies ENOSYS to FUSE_INTERRUPT, which the kernel ignores;
 //! an interrupted syscall therefore does not cancel in-flight remote work.
@@ -43,7 +44,7 @@
 
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE, attribute};
 use super::inode::{CachedInfo, InodeTable};
-use crate::mount::{Mount, MountFile};
+use crate::mount::{Mount, MountFile, MountReadOnlyFile};
 use fuser::{
     AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, RenameFlags,
@@ -58,7 +59,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
-use yinyang_core::{NodeId, ScanToken, Snapshot};
+use yinyang_core::{FileVersion, Node, NodeId, ScanToken, Snapshot};
 
 /// Entries fetched per pinned directory scan.
 const READDIR_PAGE: usize = 512;
@@ -77,11 +78,16 @@ pub(super) struct Inner {
     read_only: bool,
 }
 
-/// One kernel open maps to one reference on the node's shared staged version.
+/// One kernel open maps to one reference on a pinned node observation.
 struct OpenFile {
     node: NodeId,
-    file: MountFile,
+    source: OpenSource,
     writable: bool,
+}
+
+enum OpenSource {
+    Staged(MountFile),
+    ReadOnly(MountReadOnlyFile),
 }
 
 fn has_open_flag(flags: i32, flag: nix::fcntl::OFlag) -> bool {
@@ -221,7 +227,12 @@ impl Inner {
             // Busy means live references or retained state: keep the pinned
             // version. Mount::refresh is never used here because it rebases
             // live open handles.
-            match self.mount.reclaim(id).await {
+            let reclaimed_node = if self.read_only {
+                self.mount.reclaim_read_only(id)
+            } else {
+                self.mount.reclaim(id).await
+            };
+            match reclaimed_node {
                 Ok(()) => reclaimed += 1,
                 Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => active += 1,
                 Err(error) => {
@@ -344,12 +355,20 @@ impl Inner {
             .await
             .map_err(|e| core_errno(&e))?
             .ok_or(fuser::Errno::ENOENT)?;
+        self.observed_attr(&node, snapshot.revision())
+    }
+
+    fn observed_attr(
+        &self,
+        node: &Node,
+        revision: yinyang_core::Revision,
+    ) -> Result<FileAttr, fuser::Errno> {
         let info = CachedInfo {
             directory: node.is_directory(),
             executable: node.executable(),
             generation: node.generation(),
         };
-        let ino = self.inode_for(id, Some(info))?;
+        let ino = self.inode_for(node.id(), Some(info))?;
         let size = match node.kind() {
             yinyang_core::NodeKind::File(content) => content.content_id().length(),
             yinyang_core::NodeKind::Directory { .. } => DIRECTORY_SIZE,
@@ -359,7 +378,7 @@ impl Inner {
             info.directory,
             info.executable,
             size,
-            snapshot.revision(),
+            revision,
             self.read_only,
         ))
     }
@@ -367,7 +386,28 @@ impl Inner {
     /// Attributes for an open handle: the staged length is authoritative so
     /// `fstat` and read bytes describe the same pinned version.
     async fn handle_attr(&self, open: &OpenFile) -> Result<FileAttr, fuser::Errno> {
-        self.shared_attr(open.node).await?.ok_or(fuser::Errno::EIO)
+        match &open.source {
+            OpenSource::Staged(_) => self.shared_attr(open.node).await?.ok_or(fuser::Errno::EIO),
+            OpenSource::ReadOnly(file) => self.version_attr(file.version()),
+        }
+    }
+
+    fn version_attr(&self, version: &FileVersion) -> Result<FileAttr, fuser::Errno> {
+        self.observed_attr(version.node(), version.revision())
+    }
+
+    async fn pinned_attr(&self, id: NodeId) -> Result<Option<FileAttr>, fuser::Errno> {
+        if self.read_only {
+            return match self
+                .mount
+                .read_only_version(id)
+                .map_err(|error| runtime_errno(&error))?
+            {
+                Some(version) => self.version_attr(&version).map(Some),
+                None => Ok(None),
+            };
+        }
+        self.shared_attr(id).await
     }
 
     /// Attributes for a node with a shared Mount handle. The staged length and
@@ -426,7 +466,7 @@ impl Inner {
         // skipped, and a plain READDIR does not install positive dentries
         // (that is READDIRPLUS), so scanned names are not recorded.
         self.record_dentry(parent, &name);
-        match self.shared_attr(entry.node_id).await {
+        match self.pinned_attr(entry.node_id).await {
             Ok(Some(attr)) => {
                 self.remember_lookup(attr.ino);
                 reply.entry(&ATTR_TTL, &attr, Generation(0));
@@ -458,7 +498,7 @@ impl Inner {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),
         };
-        match self.shared_attr(id).await {
+        match self.pinned_attr(id).await {
             Ok(Some(attr)) => reply.attr(&ATTR_TTL, &attr),
             Ok(None) => match self.snapshot_attr(&snapshot, id).await {
                 Ok(attr) => reply.attr(&ATTR_TTL, &attr),
@@ -483,6 +523,26 @@ impl Inner {
         if truncate && !writable {
             return reply.error(fuser::Errno::EINVAL);
         }
+        if self.read_only {
+            if writable {
+                return reply.error(fuser::Errno::EROFS);
+            }
+            return match self.mount.open_read_only_node(id).await {
+                Ok(file) => {
+                    let fh = self.next_handle();
+                    guard(&self.files).insert(
+                        fh,
+                        Arc::new(OpenFile {
+                            node: id,
+                            source: OpenSource::ReadOnly(file),
+                            writable: false,
+                        }),
+                    );
+                    reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+                }
+                Err(error) => reply.error(core_errno(&error)),
+            };
+        }
         if let Err(errno) = self.reclaim_clean_state(id).await {
             return reply.error(errno);
         }
@@ -496,7 +556,7 @@ impl Inner {
                     fh,
                     Arc::new(OpenFile {
                         node: id,
-                        file,
+                        source: OpenSource::Staged(file),
                         writable,
                     }),
                 );
@@ -510,9 +570,19 @@ impl Inner {
         let Some(open) = self.open_file(fh) else {
             return reply.error(fuser::Errno::EBADF);
         };
-        match open.file.read(offset, size as usize).await {
+        let result = match &open.source {
+            OpenSource::Staged(file) => file
+                .read(offset, size as usize)
+                .await
+                .map_err(|error| runtime_errno(&error)),
+            OpenSource::ReadOnly(file) => file
+                .read(offset, size as usize)
+                .await
+                .map_err(|error| core_errno(&error)),
+        };
+        match result {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(runtime_errno(&error)),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -530,19 +600,22 @@ impl Inner {
         if !open.writable {
             return reply.error(fuser::Errno::EBADF);
         }
+        let OpenSource::Staged(file) = &open.source else {
+            return reply.error(fuser::Errno::EROFS);
+        };
         // The kernel supplies current file flags on each WRITE. F_SETFL can
         // toggle append, while sync flags may also be attached per request.
         let append = has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND);
         let sync = has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
             || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC);
         let staged = if append {
-            open.file.append(&data).await.map(|_| ())
+            file.append(&data).await.map(|_| ())
         } else {
-            open.file.write(offset, &data).await
+            file.write(offset, &data).await
         };
         match staged {
             Ok(()) => {
-                if sync && let Err(error) = open.file.flush().await {
+                if sync && let Err(error) = file.flush().await {
                     return reply.error(runtime_errno(&error));
                 }
                 reply.written(data.len() as u32);
@@ -555,12 +628,15 @@ impl Inner {
         let Some(open) = self.open_file(fh) else {
             return reply.error(fuser::Errno::EBADF);
         };
-        if !open.writable {
+        let OpenSource::Staged(file) = &open.source else {
             // A read-only reference must not publish another writer's staged
             // bytes through its close path.
             return reply.ok();
+        };
+        if !open.writable {
+            return reply.ok();
         }
-        match open.file.flush().await {
+        match file.flush().await {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(runtime_errno(&error)),
         }
@@ -570,10 +646,13 @@ impl Inner {
         let Some(open) = self.open_file(fh) else {
             return reply.error(fuser::Errno::EBADF);
         };
+        let OpenSource::Staged(file) = &open.source else {
+            return reply.ok();
+        };
         if !open.writable {
             return reply.ok();
         }
-        match open.file.fsync().await {
+        match file.fsync().await {
             Ok(_) => reply.ok(),
             Err(error) => reply.error(runtime_errno(&error)),
         }
@@ -624,7 +703,10 @@ impl Inner {
                 let Some(open) = self.open_file(fh) else {
                     return reply.error(fuser::Errno::EBADF);
                 };
-                if let Err(error) = open.file.truncate(length).await {
+                let OpenSource::Staged(file) = &open.source else {
+                    return reply.error(fuser::Errno::EROFS);
+                };
+                if let Err(error) = file.truncate(length).await {
                     return reply.error(runtime_errno(&error));
                 }
                 match self.handle_attr(&open).await {
@@ -678,7 +760,10 @@ impl Inner {
                     let Some(open) = self.open_file(fh) else {
                         return reply.error(fuser::Errno::EBADF);
                     };
-                    open.file.set_executable(executable).await
+                    let OpenSource::Staged(file) = &open.source else {
+                        return reply.error(fuser::Errno::EROFS);
+                    };
+                    file.set_executable(executable).await
                 } else {
                     if let Err(errno) = self.reclaim_clean_state(id).await {
                         return reply.error(errno);
@@ -792,7 +877,7 @@ impl Inner {
             fh,
             Arc::new(OpenFile {
                 node,
-                file: open,
+                source: OpenSource::Staged(open),
                 writable: writable_open(OpenFlags(flags)),
             }),
         );
@@ -902,12 +987,18 @@ impl Inner {
             return reply.ok();
         };
         let node = removed.node;
+        let read_only = matches!(&removed.source, OpenSource::ReadOnly(_));
         drop(removed);
-        // Reclaim only the last clean reference so the next open materializes
-        // the current remote revision. A busy result means an interrupted read
+        // Reclaim only the last clean reference so the next open observes the
+        // current remote revision. A busy result means an interrupted read
         // still shares the node; that pinned version stays coherent and is
         // reclaimed once a later release is the final reference.
-        if let Err(error) = self.mount.reclaim(node).await
+        let reclaimed = if read_only {
+            self.mount.reclaim_read_only(node)
+        } else {
+            self.mount.reclaim(node).await
+        };
+        if let Err(error) = reclaimed
             && error.kind() != crate::runtime::ErrorKind::Busy
         {
             eprintln!("yy: fuse release cleanup inode {ino}: {error}");
@@ -1677,5 +1768,52 @@ mod tests {
         file.close().await.unwrap();
         let fresh = inner.mount.open_node(id, false).await.unwrap();
         assert_eq!(fresh.read(0, 6).await.unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn read_only_range_attributes_pin_executable_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
+            .await
+            .unwrap();
+        let (id, _) = writer
+            .create_file_with_node(authority.root(), "program", true)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mount = Mount::open(authority.clone(), temp.path().join("mount"), true)
+            .await
+            .unwrap();
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), true);
+        let pinned = inner.mount.open_read_only_node(id).await.unwrap();
+        assert_eq!(inner.pinned_attr(id).await.unwrap().unwrap().perm, 0o555);
+
+        let updater = Runtime::open(authority, temp.path().join("updater"))
+            .await
+            .unwrap();
+        let mut file = updater.open_node(id, true).await.unwrap();
+        file.set_executable(false).await.unwrap();
+        file.close().await.unwrap();
+
+        assert_eq!(
+            inner.pinned_attr(id).await.unwrap().unwrap().perm,
+            0o555,
+            "a live read-only descriptor was not pinned to its executable metadata"
+        );
+        drop(pinned);
+        assert!(
+            inner.pinned_attr(id).await.unwrap().is_none(),
+            "a zero-reference observation remained visible to path metadata"
+        );
+        let fresh = inner.mount.open_read_only_node(id).await.unwrap();
+        assert_eq!(inner.pinned_attr(id).await.unwrap().unwrap().perm, 0o444);
+        drop(fresh);
     }
 }
