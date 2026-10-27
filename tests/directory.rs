@@ -552,6 +552,81 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
     );
 }
 
+#[tokio::test]
+async fn journal_local_confirmation_failure_remains_typed_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    journal.prepare(&observed, &input, id).await.unwrap();
+
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_local_confirmation
+             BEFORE UPDATE OF state ON publications
+             WHEN NEW.state=2
+             BEGIN
+                 SELECT RAISE(ABORT, 'confirmation unavailable');
+             END;",
+        )
+        .unwrap();
+    let error = journal.publish(id).await.unwrap_err();
+    assert_eq!(error.kind(), RuntimeErrorKind::Unknown);
+    assert_eq!(error.commit_id(), Some(id));
+    assert_eq!(
+        journal.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Unknown
+    );
+
+    database
+        .execute_batch("DROP TRIGGER fail_local_confirmation;")
+        .unwrap();
+    let receipt = journal.publish(id).await.unwrap();
+    assert_eq!(receipt.commit_id, id);
+    assert_eq!(
+        journal.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Committed(receipt)
+    );
+}
+
+#[tokio::test]
+async fn separately_opened_journals_replay_one_exact_request_safely() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let first = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let second = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    first.prepare(&observed, &input, id).await.unwrap();
+
+    let (left, right) = tokio::join!(first.publish(id), second.publish(id));
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left, right);
+    assert_eq!(
+        first.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Committed(left)
+    );
+    let output = temp.path().join("published");
+    yinyang::restore_directory_revision(&fs, left.cursor.revision, &output)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read(output.join("nested/hello")).await.unwrap(),
+        b"hello"
+    );
+}
+
 #[test]
 fn cli_help_lists_commands() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
