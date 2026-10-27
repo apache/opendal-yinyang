@@ -24,7 +24,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use yinyang_core::{CommitId, CommitOutcome, Fs, NodeId, Receipt, Revision, Snapshot, Transaction};
+use yinyang_core::{
+    Authority, CommitId, CommitOutcome, Fs, NodeId, Receipt, Revision, Snapshot, Transaction,
+};
 
 const PROFILE: &str = "yinyang-directory-1";
 const PREPARED: u8 = 0;
@@ -466,9 +468,9 @@ impl DirectoryJournal {
         let row = load_async(self, commit_id)
             .await?
             .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown directory intent"))?;
-        row.status(commit_id)?;
+        let status = row.status(commit_id)?;
         let (baseline, request_id, digest) = Transaction::inspect_identity(&row.request)?;
-        if baseline != row.baseline || request_id != commit_id || digest != row.digest() {
+        if baseline != status.intent.baseline || request_id != commit_id || digest != row.digest() {
             return Err(Error::local_kind(
                 ErrorKind::Corrupt,
                 "retained directory transaction identity disagrees",
