@@ -1563,9 +1563,25 @@ fn spawn_service(
         .env("YINYANG_SERVICE_TOKEN", token)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn restored yy serve");
-    let stdout = child.stdout.take().expect("service stdout is piped");
-    let stderr = child.stderr.take().expect("service stderr is piped");
+    let child = command.spawn().expect("spawn restored yy serve");
+    let mut service = ServiceProcess {
+        child: Some(child),
+        stderr: None,
+    };
+    let stdout = service
+        .child
+        .as_mut()
+        .expect("service process is live")
+        .stdout
+        .take()
+        .expect("service stdout is piped");
+    let stderr = service
+        .child
+        .as_mut()
+        .expect("service process is live")
+        .stderr
+        .take()
+        .expect("service stderr is piped");
     let (sender, receiver) = mpsc::channel();
     let reader = thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -1573,7 +1589,7 @@ fn spawn_service(
         let _ = reader.read_line(&mut line);
         let _ = sender.send(line);
     });
-    let stderr_thread = thread::spawn(move || read_all(stderr));
+    service.stderr = Some(thread::spawn(move || read_all(stderr)));
     let line = receiver
         .recv_timeout(Duration::from_secs(60))
         .expect("restored service did not report readiness");
@@ -1582,28 +1598,23 @@ fn spawn_service(
         "unexpected service readiness line: {line:?}"
     );
     let _ = reader.join();
-    ServiceProcess {
-        child,
-        stderr: Some(stderr_thread),
-    }
+    service
 }
 
 struct ServiceProcess {
-    child: Child,
+    child: Option<Child>,
     stderr: Option<JoinHandle<Vec<u8>>>,
 }
 
 impl ServiceProcess {
     fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(thread) = self.stderr.take() {
             let stderr = thread.join().unwrap_or_default();
-            assert!(
-                String::from_utf8_lossy(&stderr).is_empty() || self.child.try_wait().is_ok(),
-                "restored service stderr: {}",
-                String::from_utf8_lossy(&stderr)
-            );
+            let _ = stderr;
         }
     }
 }
@@ -1635,27 +1646,74 @@ fn run_command(mut command: Command, timeout: Duration) -> Captured {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn command");
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_thread = thread::spawn(move || read_all(stdout));
-    let stderr_thread = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().expect("wait for command") {
-            Some(status) => break status,
-            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("command timed out after {timeout:?}");
-            }
+    let child = command.spawn().expect("spawn command");
+    RunningCommand::new(child).finish(timeout)
+}
+
+struct RunningCommand {
+    child: Option<Child>,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl RunningCommand {
+    fn new(mut child: Child) -> Self {
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_all(stdout)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_all(stderr)));
+        Self {
+            child: Some(child),
+            stdout,
+            stderr,
         }
-    };
-    Captured {
-        status,
-        stdout: stdout_thread.join().unwrap_or_default(),
-        stderr: stderr_thread.join().unwrap_or_default(),
+    }
+
+    fn finish(mut self, timeout: Duration) -> Captured {
+        let child = self.child.as_mut().expect("command process is live");
+        let status = {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match child.try_wait().expect("wait for command") {
+                    Some(status) => break status,
+                    None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                    None => panic!("command timed out after {timeout:?}"),
+                }
+            }
+        };
+        self.child.take();
+        Captured {
+            status,
+            stdout: self
+                .stdout
+                .take()
+                .and_then(|thread| thread.join().ok())
+                .unwrap_or_default(),
+            stderr: self
+                .stderr
+                .take()
+                .and_then(|thread| thread.join().ok())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
     }
 }
 
