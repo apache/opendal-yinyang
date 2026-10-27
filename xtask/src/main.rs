@@ -60,6 +60,8 @@ impl Command {
             SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
+            SubCommand::TestLinuxOperations(cmd) => cmd.run(),
+            SubCommand::TestLinuxRecovery(cmd) => cmd.run(),
         }
     }
 }
@@ -86,6 +88,14 @@ enum SubCommand {
         about = "Run real Linux FUSE acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
     TestLinuxFuse(CommandTestLinuxFuse),
+    #[clap(
+        about = "Run installed Linux CLI operations through yy and /dev/fuse (requires isolated storage)."
+    )]
+    TestLinuxOperations(CommandTestLinuxOperations),
+    #[clap(
+        about = "Run isolated Linux backup, restore, pending-state, and disk-exhaustion recovery."
+    )]
+    TestLinuxRecovery(CommandTestLinuxRecovery),
     #[clap(about = "Build the macOS native prototypes (requires Xcode 27 and XcodeGen).")]
     Macos(CommandMacos),
 }
@@ -479,6 +489,117 @@ impl CommandTestLinuxFuse {
         cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
         run_command(cmd);
     }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-operations")]
+struct CommandTestLinuxOperations {
+    #[arg(
+        long,
+        conflicts_with = "systemd",
+        help = "Use real Amazon S3 and run the installed CLI smoke."
+    )]
+    amazon_s3: bool,
+    #[arg(
+        long,
+        conflicts_with = "amazon_s3",
+        help = "Run the explicit qualified-host user-systemd lifecycle instead of the CLI smoke."
+    )]
+    systemd: bool,
+}
+
+impl CommandTestLinuxOperations {
+    fn run(self) {
+        require_linux("Linux operations acceptance");
+        require_fuse("Linux operations acceptance");
+        if self.amazon_s3 {
+            for name in [
+                "YINYANG_S3_BUCKET",
+                "YINYANG_S3_REGION",
+                "YINYANG_S3_ACCESS_KEY_ID",
+                "YINYANG_S3_SECRET_ACCESS_KEY",
+            ] {
+                if std::env::var_os(name).is_none() {
+                    panic!("{name} is unset; Amazon S3 operations fail hard instead of skipping");
+                }
+            }
+        } else {
+            require_isolated_storage("Linux operations acceptance");
+        }
+        let filter = if self.amazon_s3 {
+            "real_amazon_s3_cli_smoke"
+        } else if self.systemd {
+            "isolated_user_service_lifecycle"
+        } else {
+            "isolated_s3_cli_smoke"
+        };
+        run_ignored_test("linux_operations", Some(filter));
+    }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-recovery")]
+struct CommandTestLinuxRecovery {}
+
+impl CommandTestLinuxRecovery {
+    fn run(self) {
+        require_linux("Linux recovery acceptance");
+        require_isolated_storage("Linux recovery acceptance");
+        if which::which("sqlite3").is_err() {
+            panic!(
+                "sqlite3 is unavailable; Linux recovery acceptance requires consistent SQLite backup"
+            );
+        }
+        if !find_command("sudo")
+            .args(["-n", "true"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            panic!(
+                "passwordless sudo is unavailable; Linux recovery acceptance needs a bounded tmpfs"
+            );
+        }
+        run_ignored_test("linux_recovery", None);
+    }
+}
+
+fn require_linux(context: &str) {
+    if !cfg!(target_os = "linux") {
+        panic!("{context} requires Linux");
+    }
+}
+
+fn require_fuse(context: &str) {
+    if !std::path::Path::new("/dev/fuse").exists() {
+        panic!("{context} requires /dev/fuse");
+    }
+    if which::which("fusermount3").is_err() {
+        panic!("{context} requires fusermount3");
+    }
+}
+
+fn require_isolated_storage(context: &str) {
+    for name in [
+        "YINYANG_S3_BUCKET",
+        "YINYANG_S3_ENDPOINT",
+        "YINYANG_S3_REGION",
+        "YINYANG_S3_ACCESS_KEY_ID",
+        "YINYANG_S3_SECRET_ACCESS_KEY",
+    ] {
+        if std::env::var_os(name).is_none() {
+            panic!("{name} is unset; {context} fails hard instead of skipping");
+        }
+    }
+}
+
+fn run_ignored_test(target: &str, filter: Option<&str>) {
+    let mut cmd = find_command("cargo");
+    cmd.args(["test", "-p", "yinyang", "--test", target]);
+    if let Some(filter) = filter {
+        cmd.arg(filter);
+    }
+    cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
+    run_command(cmd);
 }
 
 fn find_command(cmd: &str) -> StdCommand {

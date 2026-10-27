@@ -5,6 +5,13 @@ production capacity claim. The measured commit, binary digest, host, cache
 policy, completion semantics, raw samples, and space series are retained in the
 JSONL evidence.
 
+> **Collector history:** this baseline used schema v1/v2 collection with a
+> 5 ms S3 proxy accept poll and default Nagle on relay sockets. Its latency
+> values remain historical instrumented observations and must not be compared
+> directly with schema v3 results. Request, payload, and space observations
+> remain usable. See the corrected read-only range
+> [control](linux-range-cost-results.md).
+
 ## Tested identity
 
 - Source: `c5c74589f61726100e6a0c5090e2c0c5b8ea6db2`
