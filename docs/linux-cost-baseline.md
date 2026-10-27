@@ -15,6 +15,9 @@ JSONL evidence.
 - Backend: isolated loopback Silo, MinIO-compatible S3 over HTTP
 - Runner label: `cost-c5c7458-full-r1`
 - Runner result: `1 passed`, exit `0`
+- Evidence:
+  [linux-cost-2026-10-27-c5c7458.jsonl](benchmarks/linux-cost-2026-10-27-c5c7458.jsonl)
+  (`129,999` bytes)
 - Evidence JSONL SHA-256:
   `91eb5a0cd531f6f25060bf0e42887e348c6e35e0221727c4147a7936f538bff2`
 
@@ -61,11 +64,13 @@ authority at this commit.
 ## Retained history and space
 
 Four 4 KiB sparse updates retained a complete new content version each time.
-The object-authority 32 MiB fixture grew from `67,380,571` bytes in 17 S3 objects
-to `168,455,998` bytes in 35 objects. Mount staging stayed near 38 MiB. The
-service-authority fixture grew from `67,376,806` bytes in 3 S3 objects to
-`168,441,955` bytes in 6 S3 objects; its allocated SQLite state remained about
-40-48 KiB during the sequence.
+Before any update, the object-authority 32 MiB fixture used `33,690,184` bytes
+in 11 S3 objects. The first update raised that to `67,380,571` bytes in 17
+objects; the fourth reached `168,455,998` bytes in 35 objects. Mount staging
+stayed near 38 MiB. The service-authority fixture started at `33,688,423` bytes
+in 2 S3 objects, reached `67,376,806` bytes in 3 objects after the first update,
+and `168,441,955` bytes in 6 objects after the fourth. Its allocated SQLite
+state remained about 40-48 KiB during the sequence.
 
 For Sync, the measured space series covers each completed edit and rename. One
 small object-authority edit increased S3 storage from 720,507 to 741,129 bytes

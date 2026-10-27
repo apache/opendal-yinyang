@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-#[allow(dead_code)]
 #[path = "linux_sync/harness.rs"]
 mod fixture;
 
@@ -281,7 +280,7 @@ fn run_sync_matrix(
         fixture.yy_command(&["--volume", path_str(&paths.config), "sync", "run"]),
         "initial Sync push",
     );
-    assert_sync_in_sync(&fixture, &paths, "after initial Sync push");
+    assert_sync_in_sync(fixture, &paths, "after initial Sync push");
     recorder.record(
         context,
         "sync_initial",
@@ -293,7 +292,7 @@ fn run_sync_matrix(
         initial.io,
         initial.network,
         vec![],
-        space_snapshot(&fixture, Some(&paths.directory), Some(&paths.state), None),
+        space_snapshot(fixture, Some(&paths.directory), Some(&paths.state), None),
         vec!["status.in_sync=true".to_owned()],
     );
 
@@ -306,7 +305,7 @@ fn run_sync_matrix(
         );
         noop.push(measured);
     }
-    assert_sync_in_sync(&fixture, &paths, "after Sync no-op runs");
+    assert_sync_in_sync(fixture, &paths, "after Sync no-op runs");
     noop.record(
         recorder,
         context,
@@ -315,7 +314,7 @@ fn run_sync_matrix(
         scale,
         dataset.clone(),
         completion,
-        space_snapshot(&fixture, Some(&paths.directory), Some(&paths.state), None),
+        space_snapshot(fixture, Some(&paths.directory), Some(&paths.state), None),
         vec!["status.in_sync=true".to_owned()],
     );
 
@@ -335,13 +334,13 @@ fn run_sync_matrix(
         );
         edits.push(measured);
         edit_spaces.push(space_snapshot(
-            &fixture,
+            fixture,
             Some(&paths.directory),
             Some(&paths.state),
             None,
         ));
     }
-    assert_sync_in_sync(&fixture, &paths, "after Sync edits");
+    assert_sync_in_sync(fixture, &paths, "after Sync edits");
     edits.record_with_spaces(
         recorder,
         context,
@@ -376,14 +375,14 @@ fn run_sync_matrix(
         );
         renames.push(measured);
         rename_spaces.push(space_snapshot(
-            &fixture,
+            fixture,
             Some(&paths.directory),
             Some(&paths.state),
             None,
         ));
         std::mem::swap(&mut source, &mut destination);
     }
-    assert_sync_in_sync(&fixture, &paths, "after Sync renames");
+    assert_sync_in_sync(fixture, &paths, "after Sync renames");
     renames.record_with_spaces(
         recorder,
         context,
@@ -414,11 +413,11 @@ fn run_fuse_matrix(
     let mut expected_large = payload(size, 0x5a);
     fixture.remote_create_file("large.bin", &expected_large, false);
     let (config, staging, mountpoint) = mount_paths(
-        &fixture,
+        fixture,
         &format!("fuse-{}-{}", publication.as_str(), scale.as_str()),
     );
     fs::create_dir(&mountpoint).expect("create benchmark mountpoint");
-    let (mut mounted, mount_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
     let dataset = Dataset {
         kind: "single_large_file".to_owned(),
         files: 1,
@@ -439,7 +438,7 @@ fn run_fuse_matrix(
         mount_ready.io,
         mount_ready.network,
         vec![],
-        space_snapshot(&fixture, None, None, Some(&staging)),
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec!["mount type=fuse.yinyang".to_owned()],
     );
 
@@ -464,7 +463,7 @@ fn run_fuse_matrix(
         cold.io,
         cold.network,
         vec![],
-        space_snapshot(&fixture, None, None, Some(&staging)),
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec!["range bytes verified".to_owned()],
     );
 
@@ -491,7 +490,7 @@ fn run_fuse_matrix(
         scale,
         dataset.clone(),
         "five 4 KiB reads on one already-open descriptor",
-        space_snapshot(&fixture, None, None, Some(&staging)),
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec!["range bytes verified".to_owned()],
     );
 
@@ -514,10 +513,10 @@ fn run_fuse_matrix(
             drop(file);
         });
         sparse.push(measured);
-        spaces.push(space_snapshot(&fixture, None, None, Some(&staging)));
+        spaces.push(space_snapshot(fixture, None, None, Some(&staging)));
     }
     assert_eq!(
-        remote_file_bytes(&fixture, "large.bin"),
+        remote_file_bytes(fixture, "large.bin"),
         expected_large,
         "remote content did not reflect every sparse update"
     );
@@ -537,7 +536,7 @@ fn run_fuse_matrix(
     );
 
     mounted.unmount();
-    let (mut restarted, restart_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
     recorder.record(
         context,
         "fuse_restart_mount_ready",
@@ -549,7 +548,7 @@ fn run_fuse_matrix(
         restart_ready.io,
         restart_ready.network,
         vec![],
-        space_snapshot(&fixture, None, None, Some(&staging)),
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec!["replacement mount type=fuse.yinyang".to_owned()],
     );
     let restart = measure_mount_operation(&meter, restarted.pid(), || {
@@ -577,7 +576,7 @@ fn run_fuse_matrix(
         restart.io,
         restart.network,
         vec![],
-        space_snapshot(&fixture, None, None, Some(&staging)),
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec!["restarted mount served the original range bytes".to_owned()],
     );
     restarted.unmount();
@@ -595,11 +594,11 @@ fn run_concurrent_matrix(
     let meter = bench.network(proxy);
     fixture.remote_create_directory("concurrent");
     let (config, staging, mountpoint) = mount_paths(
-        &fixture,
+        fixture,
         &format!("concurrent-{}-{}", publication.as_str(), scale.as_str()),
     );
     fs::create_dir(&mountpoint).expect("create concurrent mountpoint");
-    let (mut mounted, _) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    let (mut mounted, _) = FuseMount::start(fixture, &config, &mountpoint, &meter);
     let writers = scale.writers();
     let writer_bytes = 256 * 1024;
     let dataset = Dataset {
@@ -621,10 +620,9 @@ fn run_concurrent_matrix(
         .collect::<Vec<_>>();
     let start = Arc::new((Mutex::new(false), Condvar::new()));
     let mut threads = Vec::with_capacity(writers);
-    for index in 0..writers {
+    for (index, value) in expected.iter().cloned().enumerate() {
         let start = start.clone();
         let path = mountpoint.join(format!("concurrent/writer-{index:02}.bin"));
-        let value = expected[index].clone();
         threads.push(thread::spawn(move || {
             let (started, ready) = &*start;
             let mut started = started
@@ -681,7 +679,7 @@ fn run_concurrent_matrix(
         io,
         network,
         vec![],
-        space_snapshot(&fixture, None, None, Some(&staging)),
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec![
             format!("wall_ms={wall_ms:.3}"),
             "all writer files matched their complete expected remote bytes".to_owned(),
