@@ -12,14 +12,16 @@ that the same result will hold for another authority, backend, dataset, or host.
 | Object baseline | `c5c74589f61726100e6a0c5090e2c0c5b8ea6db2` | `2e7cd592270e280cc5c2cd81fc3a28f8da38c0646107800c02cd4e9f12181da7` | `cost-c5c7458-full-r1` |
 | Object optimized | `bcd5a308b8af779e6e786956703f1b9cd62d2a4c` | `97ed9e6af6b8b9e95ac6fcb6295432b42090e3dd005389b4eb3ee9720020d9de` | `cost-bcd5a30-full-r1` |
 | Service baseline | `1302ceab5d29781d944e70e3e034248b94dac65f` | `2e7cd592270e280cc5c2cd81fc3a28f8da38c0646107800c02cd4e9f12181da7` | `cost-1302cea-service-r1` |
-| Service optimized | `f18a3151fb76ef6dbf624a0abdde0d4d7fedca02f` | `97ed9e6af6b8b9e95ac6fcb6295432b42090e3dd005389b4eb3ee9720020d9de` | `cost-f18a315-service-r1` |
+| Service optimized | `f18a3151fb76ef6dbf624a0abdde0d4d7fedca02` | `97ed9e6af6b8b9e95ac6fcb6295432b42090e3dd005389b4eb3ee9720020d9de` | `cost-f18a315-service-r1` |
 
-The object pair uses the same full-profile harness and workload definitions.
-The measured source revisions differ only in the production Snapshot cache;
-later harness changes add reporting and raw evidence. The service pair uses the
-corrected per-publication collector at both identities and unchanged production
-code. Equal binary hashes within each service run demonstrate that the binary was
-not silently rebuilt with different source.
+The object pair preserves the same full-profile harness, workload, and timed
+paths. Their production-code difference is the object Snapshot reuse; the
+optimized source also includes reporting-only unsupported-summary rendering. The
+service pair uses the corrected per-publication collector at both identities.
+Its production service path is unchanged between baseline and optimized, while
+each corrected service binary has the same BLAKE3 as its corresponding original
+object run (baseline `2e7cd592...`, optimized `97ed9e6a...`). These cross-run
+matches verify that the collector-only reruns did not change the measured binary.
 
 Raw evidence:
 
