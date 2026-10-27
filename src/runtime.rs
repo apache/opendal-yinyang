@@ -44,6 +44,10 @@ pub struct HandleStatus {
     pub frozen: bool,
     pub conflict: bool,
     pub error: Option<Failure>,
+    /// Commit identity of the frozen request, available without network or
+    /// recovery. Definitive Conflict/Retryable keeps its existing error; any
+    /// other frozen record is an uncertain dispatch candidate.
+    pub frozen_commit_id: Option<CommitId>,
 }
 #[derive(Clone, Debug)]
 pub struct WritebackError {
@@ -634,27 +638,35 @@ impl FileHandle {
             stage.save(r.clone()).await?;
             request
         };
-        match self.runtime.authority().commit(&request).await? {
-            CommitOutcome::Committed(receipt) => {
-                r.base = receipt.cursor.revision.to_bytes();
-                r.remote = r.local;
-                r.plan = None;
-                r.error = None;
-                r.failure = None;
-                r.conflict = false;
-                stage.save(r).await?;
-                if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
-                    errors.remove(&self.id);
+        match self.runtime.authority().commit(&request).await {
+            Err(error) => {
+                // The plan is already frozen and dispatch may still publish.
+                // A generic response or transport error cannot be a definitive
+                // failure; identity and digest stay available on the handle.
+                Err(Error::Retained(Failure::unknown_with(request.id(), error)))
+            }
+            Ok(outcome) => match outcome {
+                CommitOutcome::Committed(receipt) => {
+                    r.base = receipt.cursor.revision.to_bytes();
+                    r.remote = r.local;
+                    r.plan = None;
+                    r.error = None;
+                    r.failure = None;
+                    r.conflict = false;
+                    stage.save(r).await?;
+                    if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
+                        errors.remove(&self.id);
+                    }
+                    Ok(Some(receipt))
                 }
-                Ok(Some(receipt))
-            }
-            CommitOutcome::Conflict => {
-                r.conflict = true;
-                stage.save(r).await?;
-                Err(Error::Conflict)
-            }
-            CommitOutcome::Retryable => Err(Error::Retryable),
-            CommitOutcome::Unknown(id) => Err(Error::Unknown(id)),
+                CommitOutcome::Conflict => {
+                    r.conflict = true;
+                    stage.save(r).await?;
+                    Err(Error::Conflict)
+                }
+                CommitOutcome::Retryable => Err(Error::Retryable),
+                CommitOutcome::Unknown(id) => Err(Error::Unknown(id)),
+            },
         }
     }
     /// Abort only a request that was never dispatched or is definitively
