@@ -267,10 +267,12 @@ fn project_inspection(
         })
         .map(project_status)
         .collect::<Vec<_>>();
-    if selected.is_some() && intents.is_empty() {
+    if intents.is_empty()
+        && let Some(selected) = selected
+    {
         return Err(format!(
             "publication intent {} is not present in the journal",
-            selected.expect("selected identity")
+            selected
         ));
     }
     intents.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
