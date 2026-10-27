@@ -615,14 +615,7 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     let wrong_state = wrong.path("wrong-state");
     let wrong_root = wrong.path("wrong-root");
     let wrong_config = wrong.path("wrong.json");
-    write_sync_config(
-        &wrong_config,
-        "wrong",
-        &wrong_root,
-        &wrong_state,
-        true,
-        None,
-    );
+    write_sync_config(&wrong_config, "wrong", &wrong_state, true, None);
     let wrong_restore = wrong.yy(&[
         "--volume",
         text(&wrong_config),
@@ -648,7 +641,6 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     write_sync_config(
         &restored_config,
         "sync-restored",
-        &restored_root,
         &restored_state,
         false,
         Some(fixture.service_address()),
@@ -964,7 +956,6 @@ fn inspect(staging: &Path) -> RuntimeStatus {
 fn write_sync_config(
     path: &Path,
     name: &str,
-    root: &Path,
     state: &Path,
     object: bool,
     service: Option<SocketAddr>,
@@ -983,7 +974,6 @@ fn write_sync_config(
     if let Some(service) = service {
         value["service_address"] = serde_json::Value::String(service.to_string());
     }
-    let _ = root;
     fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 }
 
