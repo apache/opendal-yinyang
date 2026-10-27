@@ -28,6 +28,14 @@ each 1 KiB. FUSE large-file workloads used 8 MiB and 32 MiB files, 4 KiB range
 reads, and four sparse updates. Concurrent writers used two and four 256 KiB
 files.
 
+> **Service timing correction:** this raw c5c7458 evidence was collected with a
+> counting service proxy that polled nonblocking accept with a 5 ms sleep.
+> Because the current metadata transport opens one connection per RPC, that
+> collector delay inflated service latency. Do not use service-authority p50
+> values from this file. Service connection/request/byte counts and space
+> observations remain inspectable, and the raw file is retained unchanged.
+> A corrected collector run supersedes service latency.
+
 ## Representative results
 
 Latency is the batch p50. Network values are per latency sample. Object and
@@ -39,17 +47,20 @@ service rows use separate collection paths and are not interchangeable.
 | Sync no-op | Object | 32 files | 3.216 s | 486 | 0 |
 | Sync single edit | Object | 32 files | 3.449 s | 528 | 0 |
 | Sync rename | Object | 32 files | 4.041 s | 631 | 0 |
-| Sync initial | Service | 128 files | 22.285 s | 897 | 3122 |
-| Sync no-op | Service | 128 files | 4.372 s | 1 | 857 |
-| Sync single edit | Service | 128 files | 4.499 s | 5.7 | 862.3 |
-| Sync rename | Service | 128 files | 4.561 s | 1 | 886 |
+| Sync initial | Service | 128 files | invalid* | 897 | 3122 |
+| Sync no-op | Service | 128 files | invalid* | 1 | 857 |
+| Sync single edit | Service | 128 files | invalid* | 5.7 | 862.3 |
+| Sync rename | Service | 128 files | invalid* | 1 | 886 |
 | FUSE cold open + 4 KiB read | Object | 8 MiB | 5.383 s | 1161 | 0 |
-| FUSE cold open + 4 KiB read | Service | 32 MiB | 22.074 s | 5632 | 7 |
+| FUSE cold open + 4 KiB read | Service | 32 MiB | invalid* | 5632 | 7 |
 | FUSE warm 4 KiB read | Object | 32 MiB | 0.096 ms | 0 | 0 |
 | FUSE sparse update | Object | 32 MiB | 36.551 s | 6194 | 0 |
-| FUSE sparse update | Service | 32 MiB | 55.065 s | 7692 | 11 |
+| FUSE sparse update | Service | 32 MiB | invalid* | 7692 | 11 |
 | Concurrent writers | Object | 4 writers | 0.462 s | 127.8 | 0 |
-| Concurrent writers | Service | 4 writers | 0.561 s | 18 | 18.2 |
+| Concurrent writers | Service | 4 writers | invalid* | 18 | 18.2 |
+
+`invalid*` marks service latency from the superseded nonblocking-accept
+collector. No service timing claim is made from those cells.
 
 Every cold FUSE read transferred approximately the complete file: 8.875 MiB of
 S3 response for the 8 MiB file and 36.298 MiB for the 32 MiB file. Warm reads on

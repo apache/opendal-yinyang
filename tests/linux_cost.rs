@@ -58,6 +58,23 @@ enum Profile {
 }
 
 #[derive(Clone, Copy)]
+enum PublicationFilter {
+    All,
+    Object,
+    Service,
+}
+
+impl PublicationFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Object => "object",
+            Self::Service => "service",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Scale {
     Small,
     Medium,
@@ -102,6 +119,7 @@ impl Scale {
 
 struct RunContext {
     profile: Profile,
+    publication_filter: PublicationFilter,
     source_sha: String,
     source_dirty: bool,
     binary_path: String,
@@ -166,6 +184,16 @@ fn linux_cost_benchmark() {
         Ok("full") => Profile::Full,
         value => panic!("YINYANG_COST_PROFILE must be early or full, got {value:?}"),
     };
+    let publication_filter = match std::env::var("YINYANG_COST_PUBLICATION").as_deref() {
+        Ok("all") | Err(_) => PublicationFilter::All,
+        Ok("object") => PublicationFilter::Object,
+        Ok("service") => PublicationFilter::Service,
+        value => panic!("YINYANG_COST_PUBLICATION must be all, object, or service, got {value:?}"),
+    };
+    if matches!(profile, Profile::Early) && matches!(publication_filter, PublicationFilter::Service)
+    {
+        panic!("service publication selection requires the full profile");
+    }
     let output = PathBuf::from(
         std::env::var_os("YINYANG_COST_OUTPUT")
             .expect("set YINYANG_COST_OUTPUT to the benchmark JSONL path"),
@@ -179,6 +207,7 @@ fn linux_cost_benchmark() {
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
     let context = RunContext {
         profile,
+        publication_filter,
         source_sha,
         source_dirty,
         binary_blake3: blake3_file(&binary_path),
@@ -202,9 +231,14 @@ fn linux_cost_benchmark() {
         proxy.endpoint()
     );
 
-    let publications: &[Publication] = match profile {
-        Profile::Early => &[Publication::Object],
-        Profile::Full => &[Publication::Object, Publication::Service],
+    let publications: &[Publication] = match (profile, publication_filter) {
+        (Profile::Early, PublicationFilter::All | PublicationFilter::Object) => {
+            &[Publication::Object]
+        }
+        (Profile::Early, PublicationFilter::Service) => unreachable!(),
+        (Profile::Full, PublicationFilter::All) => &[Publication::Object, Publication::Service],
+        (Profile::Full, PublicationFilter::Object) => &[Publication::Object],
+        (Profile::Full, PublicationFilter::Service) => &[Publication::Service],
     };
     let scales: &[Scale] = match profile {
         Profile::Early => &[Scale::Small],
@@ -220,8 +254,12 @@ fn linux_cost_benchmark() {
         }
     }
     for &scale in scales {
-        run_publish_restore_matrix(&context, &proxy, scale, &mut recorder);
-        if matches!(profile, Profile::Full) {
+        if !matches!(publication_filter, PublicationFilter::Service) {
+            run_publish_restore_matrix(&context, &proxy, scale, &mut recorder);
+        }
+        if matches!(profile, Profile::Full)
+            && !matches!(publication_filter, PublicationFilter::Object)
+        {
             recorder.unsupported(
                 &context,
                 "publish_restore",
@@ -1428,9 +1466,6 @@ struct CountingServiceProxy {
 impl CountingServiceProxy {
     fn start(upstream: SocketAddr) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting service proxy");
-        listener
-            .set_nonblocking(true)
-            .expect("make counting service proxy listener nonblocking");
         let address = listener
             .local_addr()
             .expect("counting service proxy address");
@@ -1439,18 +1474,16 @@ impl CountingServiceProxy {
         let thread_counters = counters.clone();
         let thread_stop = stop.clone();
         let thread = thread::spawn(move || {
-            while !thread_stop.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((client, _)) => {
-                        thread_counters.connections.fetch_add(1, Ordering::Relaxed);
-                        let counters = thread_counters.clone();
-                        thread::spawn(move || service_proxy_connection(client, upstream, counters));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            loop {
+                let Ok((client, _)) = listener.accept() else {
+                    break;
+                };
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                thread_counters.connections.fetch_add(1, Ordering::Relaxed);
+                let counters = thread_counters.clone();
+                thread::spawn(move || service_proxy_connection(client, upstream, counters));
             }
         });
         Self {
@@ -1918,6 +1951,7 @@ struct CostRecord {
     schema: &'static str,
     scenario: String,
     profile: String,
+    publication_filter: String,
     publication: String,
     scale: String,
     supported: bool,
@@ -1969,6 +2003,7 @@ impl Recorder {
             summary_path: summary.to_path_buf(),
             context: RunContext {
                 profile: context.profile,
+                publication_filter: context.publication_filter,
                 source_sha: context.source_sha.clone(),
                 source_dirty: context.source_dirty,
                 binary_path: context.binary_path.clone(),
@@ -2008,6 +2043,7 @@ impl Recorder {
                 Profile::Full => "full",
             }
             .to_owned(),
+            publication_filter: context.publication_filter.as_str().to_owned(),
             publication: publication.as_str().to_owned(),
             scale: scale.as_str().to_owned(),
             supported: true,
@@ -2074,6 +2110,7 @@ impl Recorder {
                 Profile::Full => "full",
             }
             .to_owned(),
+            publication_filter: context.publication_filter.as_str().to_owned(),
             publication: publication.as_str().to_owned(),
             scale: scale.as_str().to_owned(),
             supported: false,
@@ -2124,10 +2161,20 @@ impl Recorder {
 
     fn finish(mut self) {
         self.output.flush().expect("flush benchmark JSONL output");
+        let measured = self
+            .records
+            .iter()
+            .filter(|record| record.supported)
+            .count();
+        let unsupported = self
+            .records
+            .iter()
+            .filter(|record| !record.supported)
+            .count();
         let mut markdown = String::new();
         markdown.push_str("# Linux cost baseline\n\n");
         markdown.push_str(&format!(
-            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Profile: {}\n\n",
+            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
             self.context.source_sha,
             self.context.source_dirty,
             self.context.binary_path,
@@ -2137,7 +2184,10 @@ impl Recorder {
             match self.context.profile {
                 Profile::Early => "early",
                 Profile::Full => "full",
-            }
+            },
+            self.context.publication_filter.as_str(),
+            measured,
+            unsupported,
         ));
         markdown.push_str(
             "| Scenario | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
@@ -2189,8 +2239,11 @@ impl Recorder {
         );
         fs::write(&self.summary_path, markdown).expect("write benchmark Markdown summary");
         println!(
-            "linux-cost: wrote {} records to {} and {}",
+            "linux-cost: filter={} wrote {} records ({} measured, {} unsupported) to {} and {}",
+            self.context.publication_filter.as_str(),
             self.records.len(),
+            measured,
+            unsupported,
             self.output_path.display(),
             self.summary_path.display()
         );

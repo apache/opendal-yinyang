@@ -276,11 +276,25 @@ enum BenchProfile {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchPublication {
+    All,
+    Object,
+    Service,
+}
+
 #[derive(Parser)]
 #[clap(name = "bench-linux-cost")]
 struct CommandBenchLinuxCost {
     #[arg(long, value_enum, default_value = "early")]
     profile: BenchProfile,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "all",
+        help = "Limit authority-specific workloads while preserving the selected profile's scales."
+    )]
+    publication: BenchPublication,
     #[arg(
         long,
         help = "Write JSONL evidence here; a Markdown summary uses the same path with .md."
@@ -314,6 +328,11 @@ impl CommandBenchLinuxCost {
             BenchProfile::Early => "early",
             BenchProfile::Full => "full",
         };
+        let publication = match self.publication {
+            BenchPublication::All => "all",
+            BenchPublication::Object => "object",
+            BenchPublication::Service => "service",
+        };
         let mut cmd = find_command("cargo");
         cmd.args([
             "test",
@@ -329,6 +348,7 @@ impl CommandBenchLinuxCost {
             "--test-threads=1",
         ]);
         cmd.env("YINYANG_COST_PROFILE", profile);
+        cmd.env("YINYANG_COST_PUBLICATION", publication);
         cmd.env("YINYANG_COST_OUTPUT", &self.output);
         cmd.env("YINYANG_COST_SUMMARY", self.output.with_extension("md"));
         cmd.env(
