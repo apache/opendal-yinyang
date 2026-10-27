@@ -112,6 +112,14 @@ assume consecutive numeric values. One revision may contain several accepted
 transactions. A commit cursor orders transactions within a revision and across
 revisions; intermediate batch states need not be exposed as snapshots.
 
+An object-backed `Snapshot` may reuse authenticated metadata page and external
+value bytes within that one observation. The cache is not persistent and is not
+shared with another snapshot or process. It is bounded per snapshot to at most
+256 pages (16 MiB at the 64 KiB page limit) and 4096 external values totaling at
+most 32 MiB. Cached page bytes are decoded and validated again for every root or
+child use, so context-dependent shape and occupancy checks still apply. A new
+observation starts cold and reflects its own head.
+
 Published observations, their referenced bytes, and successful commit identities
 are retained by default. Neither binding may silently expire them because an
 underlying database has a short MVCC retention window. Garbage collection and

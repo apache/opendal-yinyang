@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::data::{DataStore, PackedRef, RefWire};
-use crate::index::Index;
+use crate::index::{Index, IndexCache};
 use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
 use crate::transaction::Transaction;
 use crate::{Error, ErrorKind, NodeId, Result};
@@ -71,6 +71,7 @@ impl ObjectState {
             revision: self.revision,
             reader: Arc::new(ObjectRecords {
                 data: self.data.clone(),
+                cache: IndexCache::default(),
                 indexes: [
                     self.nodes.clone(),
                     self.entries.clone(),
@@ -106,11 +107,12 @@ impl ObjectState {
 #[derive(Debug)]
 struct ObjectRecords {
     data: DataStore,
+    cache: IndexCache,
     indexes: [Index; 4],
 }
 impl RecordReader for ObjectRecords {
     fn get<'a>(&'a self, table: Table, key: &'a [u8]) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
-        Box::pin(self.indexes[table as usize].get(&self.data, key))
+        Box::pin(self.indexes[table as usize].get(&self.data, Some(&self.cache), key))
     }
     fn scan<'a>(
         &'a self,
@@ -120,7 +122,14 @@ impl RecordReader for ObjectRecords {
         after: Option<&'a [u8]>,
         limit: usize,
     ) -> BoxFuture<'a, Result<Rows>> {
-        Box::pin(self.indexes[table as usize].scan(&self.data, lower, upper, after, limit))
+        Box::pin(self.indexes[table as usize].scan(
+            &self.data,
+            Some(&self.cache),
+            lower,
+            upper,
+            after,
+            limit,
+        ))
     }
 }
 #[derive(Clone, Debug)]
@@ -273,7 +282,7 @@ impl ObjectFs {
         }
         let bytes = latest
             .history
-            .get(&self.data, &revision.to_bytes())
+            .get(&self.data, None, &revision.to_bytes())
             .await?
             .ok_or_else(|| {
                 Error::new(
