@@ -99,6 +99,8 @@ materialization even if a later release reclaims a clean staged file.
 Warm here means repeated reads through the same `FileVersion`; it does not imply
 local staging or a persistent content cache. The measured requests and bytes
 must determine whether those reads still fetch remote units or proofs.
+The bounded 2026-10-27 matched result is recorded in
+[`linux-range-cost-results.md`](linux-range-cost-results.md).
 
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
