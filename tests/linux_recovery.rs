@@ -22,7 +22,9 @@
 #[path = "linux_sync/harness.rs"]
 mod fixture;
 
-use fixture::{Captured, EntryState, Fixture, Publication, RemoteEntry, SyncStatus, runtime};
+use fixture::{
+    ArtifactKind, Captured, EntryState, Fixture, Publication, RemoteEntry, SyncStatus, runtime,
+};
 use nix::unistd::{Gid, Uid};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -509,23 +511,34 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     let mut fixture = Fixture::new(Publication::Service);
     fixture.remote_create_file("rename.txt", b"rename-base", false);
     fixture.remote_create_file("conflict.txt", b"remote-base", false);
+    fixture.remote_create_file("replaced.txt", b"old-retained", false);
     let source = fixture.sync_client("sync-source");
     fixture.sync_run_ok(&source);
 
     fixture.remote_write_file("conflict.txt", b"remote-change");
+    fixture.remote_write_file("replaced.txt", b"new-remote");
     fs::write(source.directory.join("conflict.txt"), b"local-change").unwrap();
     fixture.sync_run_ok(&source);
     let conflict_status = fixture.sync_status(&source);
     let conflict = conflict_status.conflict("conflict.txt").clone();
-    let artifact_id = conflict
+    let conflict_artifact = conflict
         .local_artifact
         .clone()
         .expect("conflict must retain local bytes");
+    let replaced_artifact = conflict_status
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.kind == ArtifactKind::ReplacedFile && artifact.origin == "replaced.txt"
+        })
+        .expect("remote replacement must retain the displaced inode")
+        .clone();
+    let artifact_id = replaced_artifact.id;
     let artifact_path = conflict_status
         .artifacts
         .iter()
         .find(|artifact| artifact.id == artifact_id)
-        .expect("conflict artifact disappeared")
+        .expect("retained replacement artifact disappeared")
         .path
         .clone();
     fs::write(&artifact_path, b"changed-retained").unwrap();
@@ -573,7 +586,7 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     assert_eq!(before_backup.summary.unknown, 1);
     assert_eq!(
         before_backup.conflict("conflict.txt").local_artifact,
-        Some(artifact_id.clone())
+        Some(conflict_artifact)
     );
 
     let backup = fixture.path("sync-backup");
