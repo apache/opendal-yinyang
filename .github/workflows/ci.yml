@@ -133,7 +133,11 @@ jobs:
           docker exec yinyang-silo mcli mb local/yinyang-test
 
       - name: Exercise core publication and CLI round trips
-        run: cargo test --workspace --all-targets s3_ -- --ignored --nocapture
+        run: |
+          cargo test --workspace --all-targets s3_ -- \
+            --ignored --nocapture \
+            --skip isolated_s3_cli_smoke \
+            --skip real_amazon_s3_cli_smoke
 
       - name: Show storage logs on failure
         if: failure()
