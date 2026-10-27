@@ -103,7 +103,7 @@ fn retry_uses_the_documented_storage_entry_point() {
     let output = yy_command(&[
         "publication",
         "retry",
-        &"00000000-0000-4000-8000-000000000000",
+        "00000000-0000-4000-8000-000000000000",
         "--state",
         state.to_str().unwrap(),
     ])
