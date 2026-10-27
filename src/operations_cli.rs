@@ -406,8 +406,7 @@ fn storage_environment(config: &VolumeConfig) -> Result<String, String> {
     if bucket.trim().is_empty() {
         return Err("YINYANG_S3_BUCKET is not set".to_owned());
     }
-    let access_key =
-        std::env::var_os("YINYANG_S3_ACCESS_KEY_ID").filter(|value| !value.is_empty());
+    let access_key = std::env::var_os("YINYANG_S3_ACCESS_KEY_ID").filter(|value| !value.is_empty());
     let secret_key =
         std::env::var_os("YINYANG_S3_SECRET_ACCESS_KEY").filter(|value| !value.is_empty());
     if access_key.is_some() != secret_key.is_some() {
@@ -691,7 +690,7 @@ fn executable_on_path(name: &str) -> bool {
     };
     std::env::split_paths(&path).any(|directory| {
         let candidate = directory.join(name);
-        let Ok(metadata) = std::fs::metadata(candidate) else {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
             return false;
         };
         if !metadata.is_file() {

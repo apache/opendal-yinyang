@@ -35,7 +35,9 @@ const SERVICE_TOKEN: &str = "yinyang-operations-test-token-0000000000000000";
 
 #[test]
 fn doctor_requires_a_volume() {
-    let output = clean_yy(&["doctor", "--json"]);
+    let output = clean_yy(&["doctor", "--json"])
+        .output()
+        .expect("run yy doctor");
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("requires --volume CONFIG.json"),
