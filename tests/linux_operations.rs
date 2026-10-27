@@ -204,11 +204,19 @@ fn isolated_user_service_lifecycle() {
     units.start(&units.mount_instance("service"));
     units.wait_active(&units.mount_instance("service"));
     wait_mount(&mounts.join("service"), None);
-    write_and_sync(&mounts.join("service"), "service-before-restart", b"service mount bytes");
+    write_and_sync(
+        &mounts.join("service"),
+        "service-before-restart",
+        b"service mount bytes",
+    );
     units.restart(&units.mount_instance("service"));
     units.wait_active(&units.mount_instance("service"));
     wait_mount(&mounts.join("service"), None);
-    assert_mount_bytes(&mounts.join("service"), "service-before-restart", b"service mount bytes");
+    assert_mount_bytes(
+        &mounts.join("service"),
+        "service-before-restart",
+        b"service mount bytes",
+    );
     units.stop(&units.mount_instance("service"));
     assert!(state.join("service/staging.db").exists());
 
@@ -280,11 +288,19 @@ fn isolated_user_service_lifecycle() {
         &mount_root,
         &units.mount_instance("object"),
     );
-    write_and_sync(&mounts.join("object"), "object-before-restart", b"object mount bytes");
+    write_and_sync(
+        &mounts.join("object"),
+        "object-before-restart",
+        b"object mount bytes",
+    );
     units.restart(&units.mount_instance("object"));
     units.wait_active(&units.mount_instance("object"));
     wait_mount(&mounts.join("object"), None);
-    assert_mount_bytes(&mounts.join("object"), "object-before-restart", b"object mount bytes");
+    assert_mount_bytes(
+        &mounts.join("object"),
+        "object-before-restart",
+        b"object mount bytes",
+    );
     units.stop(&units.mount_instance("object"));
     assert!(state.join("object/staging.db").exists());
 
@@ -1038,7 +1054,10 @@ fn assert_mount_bytes(mountpoint: &Path, name: &str, expected: &[u8]) {
     let path = mountpoint.join(name);
     let actual = fs::read(&path)
         .unwrap_or_else(|error| panic!("read {name} through {}: {error}", mountpoint.display()));
-    assert_eq!(actual, expected, "{name} did not preserve installed-mount bytes");
+    assert_eq!(
+        actual, expected,
+        "{name} did not preserve installed-mount bytes"
+    );
 }
 
 struct UserUnits {
