@@ -21,6 +21,7 @@ use std::process::Command as StdCommand;
 
 use clap::Parser;
 use clap::Subcommand;
+use clap::ValueEnum;
 use clap::error::ErrorKind;
 
 fn main() {
@@ -56,6 +57,7 @@ impl Command {
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
             SubCommand::Macos(cmd) => cmd.run(),
+            SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
         }
@@ -72,6 +74,10 @@ enum SubCommand {
     Lint(CommandLint),
     #[clap(about = "Run all workspace tests.")]
     Test(CommandTest),
+    #[clap(
+        about = "Measure Linux FUSE, Managed Sync, and one-shot transfer product costs (requires isolated S3 and /dev/fuse)."
+    )]
+    BenchLinuxCost(CommandBenchLinuxCost),
     #[clap(
         about = "Run real Linux Managed Sync acceptance through yy and ordinary directories (requires isolated S3 settings)."
     )]
@@ -264,6 +270,103 @@ impl CommandTest {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchProfile {
+    Early,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchPublication {
+    All,
+    Object,
+    Service,
+}
+
+#[derive(Parser)]
+#[clap(name = "bench-linux-cost")]
+struct CommandBenchLinuxCost {
+    #[arg(long, value_enum, default_value = "early")]
+    profile: BenchProfile,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "all",
+        help = "Limit authority-specific workloads while preserving the selected profile's scales."
+    )]
+    publication: BenchPublication,
+    #[arg(
+        long,
+        help = "Write JSONL evidence here; a Markdown summary uses the same path with .md."
+    )]
+    output: std::path::PathBuf,
+}
+
+impl CommandBenchLinuxCost {
+    fn run(self) {
+        if !cfg!(target_os = "linux") {
+            panic!("Linux cost benchmark requires Linux");
+        }
+        if !std::path::Path::new("/dev/fuse").exists() {
+            panic!("/dev/fuse is unavailable; refusing to benchmark without a real mount");
+        }
+        if which::which("fusermount3").is_err() {
+            panic!("fusermount3 is unavailable; install fuse3 before running the benchmark");
+        }
+        for name in [
+            "YINYANG_S3_BUCKET",
+            "YINYANG_S3_ENDPOINT",
+            "YINYANG_S3_REGION",
+            "YINYANG_S3_ACCESS_KEY_ID",
+            "YINYANG_S3_SECRET_ACCESS_KEY",
+        ] {
+            if std::env::var_os(name).is_none() {
+                panic!("{name} is unset; the Linux cost benchmark fails hard instead of skipping");
+            }
+        }
+        let profile = match self.profile {
+            BenchProfile::Early => "early",
+            BenchProfile::Full => "full",
+        };
+        let publication = match self.publication {
+            BenchPublication::All => "all",
+            BenchPublication::Object => "object",
+            BenchPublication::Service => "service",
+        };
+        let mut cmd = find_command("cargo");
+        cmd.args([
+            "test",
+            "--release",
+            "-p",
+            "yinyang",
+            "--test",
+            "linux_cost",
+            "linux_cost_benchmark",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        cmd.env("YINYANG_COST_PROFILE", profile);
+        cmd.env("YINYANG_COST_PUBLICATION", publication);
+        cmd.env("YINYANG_COST_OUTPUT", &self.output);
+        cmd.env("YINYANG_COST_SUMMARY", self.output.with_extension("md"));
+        cmd.env(
+            "YINYANG_COST_SOURCE_SHA",
+            git_output(&["rev-parse", "HEAD"]),
+        );
+        cmd.env(
+            "YINYANG_COST_SOURCE_DIRTY",
+            if git_output(&["status", "--porcelain"]).is_empty() {
+                "0"
+            } else {
+                "1"
+            },
+        );
+        run_command(cmd);
+    }
+}
+
 #[derive(Parser)]
 #[clap(name = "test-managed-sync")]
 struct CommandTestManagedSync {}
@@ -360,6 +463,22 @@ fn find_command(cmd: &str) -> StdCommand {
             panic!("{cmd} not found: {err}");
         }
     }
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = find_command("git")
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        output.status
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git output is UTF-8")
+        .trim()
+        .to_owned()
 }
 
 fn ensure_installed(bin: &str, crate_name: &str) {
