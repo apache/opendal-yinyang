@@ -373,6 +373,16 @@ fn validate_install_entries(fs: &Fs, entries: &[InstallEntry]) -> Result<()> {
             }
             continue;
         }
+        if entry.path.starts_with('/')
+            || entry.path.ends_with('/')
+            || entry.path.contains("//")
+            || entry.path.contains('\\')
+        {
+            return Err(invalid("directory manifest contains a non-relative path"));
+        }
+        for name in entry.path.split('/') {
+            yinyang_core::namespace::name_key(name)?;
+        }
     }
     if !matches!(
         paths.get("").map(|entry| entry.kind),
@@ -385,7 +395,6 @@ fn validate_install_entries(fs: &Fs, entries: &[InstallEntry]) -> Result<()> {
         if name.is_empty() {
             return Err(invalid("directory manifest contains an empty name"));
         }
-        yinyang_core::namespace::name_key(name)?;
         let parent_entry = paths
             .get(parent)
             .ok_or_else(|| invalid("directory manifest parent is missing"))?;
@@ -550,4 +559,55 @@ fn io_error(path: &Path, error: std::io::Error) -> Error {
         "access local directory",
         format!("{}: {error}", path.display()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use yinyang_core::BackendProfile;
+
+    #[tokio::test]
+    async fn install_rejects_noncanonical_paths_before_creating_the_destination() {
+        let backend = TestBackend::default();
+        let fs = Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        for (index, path) in [
+            "/outside",
+            "../outside",
+            "nested//outside",
+            "nested/",
+            "nested\\outside",
+            "C:/outside",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = temp.path().join(format!("destination-{index}"));
+            let entries = vec![
+                InstallEntry {
+                    path: String::new(),
+                    kind: ManifestKind::Directory,
+                    executable: false,
+                    content: None,
+                },
+                InstallEntry {
+                    path: path.to_owned(),
+                    kind: ManifestKind::Directory,
+                    executable: false,
+                    content: None,
+                },
+            ];
+            let error = install_directory(&fs, &destination, entries)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error.kind(), ErrorKind::Invalid | ErrorKind::InvalidName),
+                "{path}: {error}"
+            );
+            assert!(!destination.exists(), "{path} created the destination");
+        }
+    }
 }

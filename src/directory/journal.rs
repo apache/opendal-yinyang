@@ -36,6 +36,13 @@ const CONFLICT: u8 = 3;
 const RETRYABLE: u8 = 4;
 const FAILED: u8 = 5;
 
+#[derive(Clone, Copy)]
+enum StateFilter {
+    Active,
+    Local,
+    Unknown,
+}
+
 /// Stable identity and baseline of one durable directory publication request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectoryIntent {
@@ -299,15 +306,30 @@ impl DirectoryJournal {
         if matches!(&status.state, DirectoryState::Unknown) {
             match receipt_for(&self.inner.fs, &status.intent).await {
                 Ok(Some(receipt)) => {
-                    save_state_async(self, commit_id, COMMITTED, Some(receipt.clone()), None)
-                        .await?;
+                    if let Err(error) = save_state_async(
+                        self,
+                        commit_id,
+                        COMMITTED,
+                        Some(receipt.clone()),
+                        None,
+                        StateFilter::Unknown,
+                    )
+                    .await
+                    {
+                        return Err(unknown_after_dispatch(
+                            self,
+                            commit_id,
+                            format!(
+                                "original receipt was found but local confirmation failed: {error}"
+                            ),
+                        )
+                        .await);
+                    }
                     return Ok(receipt);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let failure = Failure::capture(&error);
-                    save_state_async(self, commit_id, UNKNOWN, None, Some(failure.clone())).await?;
-                    return Err(Error::Retained(failure));
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
                 }
             }
         }
@@ -315,16 +337,23 @@ impl DirectoryJournal {
             Ok(request) => request,
             Err(error) => {
                 let error = Error::from(error);
-                let state = if matches!(&status.state, DirectoryState::Unknown) {
-                    UNKNOWN
-                } else {
-                    match error.kind() {
-                        ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => FAILED,
-                        _ => RETRYABLE,
-                    }
+                if matches!(&status.state, DirectoryState::Unknown) {
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
+                }
+                let state = match error.kind() {
+                    ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => FAILED,
+                    _ => RETRYABLE,
                 };
                 let failure = Failure::capture(&error);
-                save_state_async(self, commit_id, state, None, Some(failure.clone())).await?;
+                save_state_async(
+                    self,
+                    commit_id,
+                    state,
+                    None,
+                    Some(failure.clone()),
+                    StateFilter::Local,
+                )
+                .await?;
                 return Err(Error::Retained(failure));
             }
         };
@@ -333,28 +362,64 @@ impl DirectoryJournal {
                 ErrorKind::Corrupt,
                 "restored directory transaction identity disagrees",
             );
-            let state = if matches!(&status.state, DirectoryState::Unknown) {
-                UNKNOWN
-            } else {
-                FAILED
-            };
+            if matches!(&status.state, DirectoryState::Unknown) {
+                return Err(unknown_after_dispatch(self, commit_id, error).await);
+            }
             let failure = Failure::capture(&error);
-            save_state_async(self, commit_id, state, None, Some(failure.clone())).await?;
+            save_state_async(
+                self,
+                commit_id,
+                FAILED,
+                None,
+                Some(failure.clone()),
+                StateFilter::Local,
+            )
+            .await?;
             return Err(Error::Retained(failure));
         }
         // From this point a dispatch may occur. Unknown is durable first.
-        save_state_async(self, commit_id, UNKNOWN, None, None).await?;
+        match claim_dispatch(self, commit_id).await {
+            Ok(DispatchClaim::Dispatch) => {}
+            Ok(DispatchClaim::Resolved(receipt)) => return Ok(receipt),
+            Ok(DispatchClaim::Stopped(status)) => {
+                return Err(Error::Retained(status.failure.ok_or_else(|| {
+                    Error::local_kind(ErrorKind::Corrupt, "terminal intent has no failure")
+                })?));
+            }
+            Err(error) => {
+                if matches!(&status.state, DirectoryState::Unknown) {
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
+                }
+                return Err(error);
+            }
+        }
         match self.inner.fs.commit(&request).await {
             Ok(CommitOutcome::Committed(receipt)) => {
                 if receipt.commit_id != commit_id || receipt.request_digest != row.digest() {
-                    let failure = Failure::capture(&Error::local_kind(
-                        ErrorKind::Corrupt,
+                    return Err(unknown_after_dispatch(
+                        self,
+                        commit_id,
                         "authority returned a receipt for another directory request",
-                    ));
-                    save_state_async(self, commit_id, UNKNOWN, None, Some(failure.clone())).await?;
-                    return Err(Error::Retained(failure));
+                    )
+                    .await);
                 }
-                save_state_async(self, commit_id, COMMITTED, Some(receipt.clone()), None).await?;
+                if let Err(error) = save_state_async(
+                    self,
+                    commit_id,
+                    COMMITTED,
+                    Some(receipt.clone()),
+                    None,
+                    StateFilter::Unknown,
+                )
+                .await
+                {
+                    return Err(unknown_after_dispatch(
+                        self,
+                        commit_id,
+                        format!("authority committed but local confirmation failed: {error}"),
+                    )
+                    .await);
+                }
                 Ok(receipt)
             }
             Ok(CommitOutcome::Conflict) => {
@@ -363,24 +428,40 @@ impl DirectoryJournal {
                     "directory predicates changed; the original request is retained",
                 );
                 let failure = Failure::capture(&error);
-                save_state_async(self, commit_id, CONFLICT, None, Some(failure.clone())).await?;
+                if let Err(error) = save_state_async(
+                    self,
+                    commit_id,
+                    CONFLICT,
+                    None,
+                    Some(failure.clone()),
+                    StateFilter::Unknown,
+                )
+                .await
+                {
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
+                }
                 Err(Error::Retained(failure))
             }
             Ok(CommitOutcome::Retryable) => {
                 let failure = Failure::capture(&Error::Retryable);
-                save_state_async(self, commit_id, RETRYABLE, None, Some(failure.clone())).await?;
+                if let Err(error) = save_state_async(
+                    self,
+                    commit_id,
+                    RETRYABLE,
+                    None,
+                    Some(failure.clone()),
+                    StateFilter::Unknown,
+                )
+                .await
+                {
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
+                }
                 Err(Error::Retained(failure))
             }
             Ok(CommitOutcome::Unknown(commit)) => {
-                let failure = Failure::capture(&Error::Unknown(commit));
-                save_state_async(self, commit_id, UNKNOWN, None, Some(failure.clone())).await?;
-                Err(Error::Retained(failure))
+                Err(unknown_after_dispatch(self, commit_id, Error::Unknown(commit)).await)
             }
-            Err(error) => {
-                let failure = Failure::unknown_with(commit_id, error);
-                save_state_async(self, commit_id, UNKNOWN, None, Some(failure.clone())).await?;
-                Err(Error::Retained(failure))
-            }
+            Err(error) => Err(unknown_after_dispatch(self, commit_id, error).await),
         }
     }
 
@@ -609,15 +690,31 @@ fn save_state(
     state: u8,
     receipt: Option<&Receipt>,
     failure: Option<&Failure>,
+    filter: StateFilter,
 ) -> Result<()> {
     let receipt_revision = receipt.map(|receipt| receipt.cursor.revision.to_bytes().to_vec());
     let receipt_ordinal = receipt.map(|receipt| i64::from(receipt.cursor.ordinal));
     let failure = failure.map(borsh::to_vec).transpose().map_err(local)?;
-    let changed = connection
-        .execute(
+    let statement = match filter {
+        StateFilter::Active => {
             "UPDATE publications
              SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
-             WHERE commit_id=?1",
+             WHERE commit_id=?1 AND state IN (0,1,4)"
+        }
+        StateFilter::Local => {
+            "UPDATE publications
+             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
+             WHERE commit_id=?1 AND state IN (0,4)"
+        }
+        StateFilter::Unknown => {
+            "UPDATE publications
+             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
+             WHERE commit_id=?1 AND state=1"
+        }
+    };
+    let changed = connection
+        .execute(
+            statement,
             params![
                 id.as_bytes().as_slice(),
                 state,
@@ -629,8 +726,8 @@ fn save_state(
         .map_err(sql)?;
     if changed != 1 {
         return Err(Error::local_kind(
-            ErrorKind::NotFound,
-            "directory intent disappeared",
+            ErrorKind::Busy,
+            "directory intent state changed concurrently; inspect it before retrying",
         ));
     }
     Ok(())
@@ -642,16 +739,79 @@ async fn save_state_async(
     state: u8,
     receipt: Option<Receipt>,
     failure: Option<Failure>,
+    filter: StateFilter,
 ) -> Result<()> {
     journal
         .call(move |connection| {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            save_state(&tx, id, state, receipt.as_ref(), failure.as_ref())?;
+            save_state(&tx, id, state, receipt.as_ref(), failure.as_ref(), filter)?;
             tx.commit().map_err(sql)
         })
         .await
+}
+
+async fn unknown_after_dispatch(
+    journal: &DirectoryJournal,
+    id: CommitId,
+    cause: impl std::fmt::Display,
+) -> Error {
+    let cause = cause.to_string();
+    let failure = Failure::unknown_with(id, &cause);
+    match save_state_async(
+        journal,
+        id,
+        UNKNOWN,
+        None,
+        Some(failure.clone()),
+        StateFilter::Unknown,
+    )
+    .await
+    {
+        Ok(()) => Error::Retained(failure),
+        Err(error) => Error::Retained(Failure::unknown_with(
+            id,
+            format!("{cause}; failed to persist Unknown diagnostic: {error}"),
+        )),
+    }
+}
+
+enum DispatchClaim {
+    Dispatch,
+    Resolved(Receipt),
+    Stopped(DirectoryStatus),
+}
+
+async fn claim_dispatch(journal: &DirectoryJournal, id: CommitId) -> Result<DispatchClaim> {
+    for _ in 0..2 {
+        match save_state_async(journal, id, UNKNOWN, None, None, StateFilter::Active).await {
+            Ok(()) => return Ok(DispatchClaim::Dispatch),
+            Err(error) if error.kind() == ErrorKind::Busy => {
+                let row = load_async(journal, id).await?.ok_or_else(|| {
+                    Error::local_kind(ErrorKind::NotFound, "directory intent disappeared")
+                })?;
+                let status = row.status(id)?;
+                match &status.state {
+                    DirectoryState::Committed(receipt) => {
+                        return Ok(DispatchClaim::Resolved(receipt.clone()));
+                    }
+                    DirectoryState::Conflict | DirectoryState::Failed => {
+                        return Ok(DispatchClaim::Stopped(status));
+                    }
+                    // Another exact dispatcher claimed the request. Replay is
+                    // idempotent, so this process may continue with the same plan.
+                    DirectoryState::Unknown => return Ok(DispatchClaim::Dispatch),
+                    DirectoryState::Prepared | DirectoryState::Retryable => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::local_kind(
+        ErrorKind::Busy,
+        "directory intent remained busy while claiming dispatch",
+    ))
 }
 
 async fn receipt_for(fs: &Fs, intent: &DirectoryIntent) -> Result<Option<Receipt>> {
