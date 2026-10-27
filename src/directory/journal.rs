@@ -39,6 +39,7 @@ const FAILED: u8 = 5;
 #[derive(Clone, Copy)]
 enum StateFilter {
     Active,
+    Any,
     Local,
     Unknown,
 }
@@ -322,7 +323,7 @@ impl DirectoryJournal {
                         COMMITTED,
                         Some(receipt.clone()),
                         None,
-                        StateFilter::Unknown,
+                        StateFilter::Any,
                     )
                     .await
                     {
@@ -419,7 +420,7 @@ impl DirectoryJournal {
                     COMMITTED,
                     Some(receipt.clone()),
                     None,
-                    StateFilter::Unknown,
+                    StateFilter::Any,
                 )
                 .await
                 {
@@ -715,6 +716,11 @@ fn save_state(
             "UPDATE publications
              SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
              WHERE commit_id=?1 AND state IN (0,1,4)"
+        }
+        StateFilter::Any => {
+            "UPDATE publications
+             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
+             WHERE commit_id=?1"
         }
         StateFilter::Local => {
             "UPDATE publications
