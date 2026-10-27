@@ -124,7 +124,7 @@ fn fuse_read_only_range_hydration_and_staging_bound_both_publications() {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_read_only_remote_replacement_preserves_old_fd_and_fresh_open_both_publications() {
+fn fuse_read_only_range_replacement_preserves_old_fd_and_fresh_open_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         let fixture = Fixture::new(publication);
         let suffix = fixture.publication().as_str();
@@ -212,7 +212,7 @@ fn fuse_read_only_remote_replacement_preserves_old_fd_and_fresh_open_both_public
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_read_only_corrupt_proof_and_data_report_eio_both_publications() {
+fn fuse_read_only_range_corrupt_proof_and_data_report_eio_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         let fixture = Fixture::new(publication);
         let suffix = fixture.publication().as_str();
@@ -249,7 +249,7 @@ fn fuse_read_only_corrupt_proof_and_data_report_eio_both_publications() {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_read_only_admission_rejects_dirty_staging_both_publications() {
+fn fuse_read_only_range_admission_rejects_dirty_staging_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         let fixture = Fixture::new(publication);
         let suffix = fixture.publication().as_str();
@@ -298,7 +298,7 @@ fn fuse_read_only_admission_rejects_dirty_staging_both_publications() {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_read_only_admission_rejects_frozen_service_staging() {
+fn fuse_read_only_range_admission_rejects_frozen_service_staging() {
     let fixture = Fixture::new(Publication::Service);
     let library = fixture.volume_config("lib-read-frozen", Frontend::Library, false);
     fixture.library_seed(&library, "frozen.txt", b"seed");
