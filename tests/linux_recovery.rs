@@ -22,21 +22,21 @@
 #[path = "linux_sync/harness.rs"]
 mod fixture;
 
-use fixture::{Captured, Fixture, Publication, runtime};
+use fixture::{Captured, EntryState, Fixture, Publication, SyncStatus, runtime};
+use nix::unistd::{Gid, Uid};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, CommitId};
+use yinyang::core::{Authority, CommitId, NodeId};
 use yinyang::runtime::{Runtime, RuntimeStatus};
 
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
@@ -384,10 +384,511 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
     service.stop();
 }
 
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage and passwordless sudo for a bounded tmpfs"]
+fn mount_staging_enospc_preserves_acknowledged_prefix_across_process_restart() {
+    let fixture = Fixture::new(Publication::Service);
+    fixture.remote_create_file("full.txt", b"base", false);
+    let mountpoint = fixture.path("bounded-tmpfs");
+    fs::create_dir(&mountpoint).unwrap();
+    let tmpfs = Tmpfs::mount(&mountpoint, "8m");
+    let staging = mountpoint.join("staging");
+    let config = fixture.path("full.json");
+    write_volume_config(
+        &config,
+        "full",
+        &staging,
+        false,
+        Some(fixture.service_address()),
+    );
+
+    let handle = parse_handle(&fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "open",
+        "full.txt",
+        "--write",
+    ]));
+    let input = fixture.path("large-input");
+    fs::write(&input, vec![b'x'; 12 * 1024 * 1024]).unwrap();
+    let failed = fixture.yy(&[
+        "--volume",
+        text(&config),
+        "file",
+        "write",
+        &handle.to_string(),
+        text(&input),
+    ]);
+    let diagnostic = String::from_utf8_lossy(&failed.stderr).to_ascii_lowercase();
+    assert!(
+        !failed.status.success(),
+        "12 MiB into an 8 MiB state filesystem must fail"
+    );
+    assert!(
+        diagnostic.contains("full") || diagnostic.contains("space"),
+        "the failure must surface the storage exhaustion: {diagnostic}"
+    );
+
+    let status = inspect(&staging);
+    let length = status
+        .handles
+        .iter()
+        .find(|candidate| candidate.id == handle)
+        .map(|candidate| candidate.length)
+        .expect("failed write discarded its staged handle");
+    assert!(length > 0, "no acknowledged prefix remained: {status:#?}");
+    assert!(
+        length < 12 * 1024 * 1024,
+        "the simulated ENOSPC accepted the complete input"
+    );
+    let read = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "read",
+        &handle.to_string(),
+        "--length",
+        "65536",
+    ]);
+    let expected = usize::try_from(length.min(65536)).unwrap();
+    assert_eq!(read.stdout.len(), expected);
+    assert!(read.stdout.iter().all(|byte| *byte == b'x'));
+    drop(tmpfs);
+}
+
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
+fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
+    let mut fixture = Fixture::new(Publication::Service);
+    fixture.remote_create_file("rename.txt", b"rename-base", false);
+    fixture.remote_create_file("conflict.txt", b"remote-base", false);
+    let source = fixture.sync_client("sync-source");
+    fixture.sync_run_ok(&source);
+
+    fixture.remote_write_file("conflict.txt", b"remote-change");
+    fs::write(source.directory.join("conflict.txt"), b"local-change").unwrap();
+    fixture.sync_run_ok(&source);
+    let conflict_status = fixture.sync_status(&source);
+    let conflict = conflict_status.conflict("conflict.txt").clone();
+    let artifact_id = conflict
+        .local_artifact
+        .clone()
+        .expect("conflict must retain local bytes");
+    let artifact_path = conflict_status
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == artifact_id)
+        .expect("conflict artifact disappeared")
+        .path
+        .clone();
+    fs::write(&artifact_path, b"changed-retained").unwrap();
+    fs::write(
+        source.directory.join("conflict.txt"),
+        b"newer-local-conflict",
+    )
+    .unwrap();
+
+    fixture.remote_create_file("unknown.txt", b"unknown-base", false);
+    fixture.sync_run_ok(&source);
+    fs::write(source.directory.join("unknown.txt"), b"uncertain").unwrap();
+    let gate = fixture.service_gate(true);
+    let gate_paths = fixture.sync_paths_at("sync-source", Some(gate.address()));
+    let unknown_run = fixture.sync_run(&gate_paths);
+    assert!(
+        !unknown_run.status.success(),
+        "an unknown Sync outcome must fail the run"
+    );
+    gate.wait_for_commit_response(Duration::from_secs(30))
+        .expect("service gate did not observe the Sync commit response");
+    drop(gate);
+    let source = fixture.sync_paths_at("sync-source", None);
+    let unknown_status = fixture.sync_status(&source);
+    let unknown = unknown_status.entry("unknown.txt");
+    assert_eq!(unknown.state, EntryState::Unknown);
+    let unknown_commit = unknown
+        .intent
+        .commit_id
+        .clone()
+        .expect("unknown Sync work lost its commit identity");
+    fs::write(source.directory.join("unknown.txt"), b"newer-unknown").unwrap();
+
+    let rename_node = fixture.remote_file_version("rename.txt").0;
+    fs::rename(
+        source.directory.join("rename.txt"),
+        source.directory.join("renamed.txt"),
+    )
+    .unwrap();
+    let before_backup = fixture.sync_status(&source);
+    assert_eq!(
+        before_backup.entry("renamed.txt").state,
+        EntryState::LocalPending
+    );
+    assert_eq!(before_backup.summary.unknown, 1);
+    assert_eq!(
+        before_backup.conflict("conflict.txt").local_artifact,
+        Some(artifact_id.clone())
+    );
+
+    let backup = fixture.path("sync-backup");
+    fixture.yy_ok(&[
+        "--volume",
+        text(&source.config),
+        "sync",
+        "backup",
+        "--output",
+        text(&backup),
+    ]);
+    fixture.stop_service();
+    let destination_root_name = remote_root("sync-restore");
+    copy_prefix(
+        fixture.operator(),
+        operator_for_root(&destination_root_name),
+    );
+    let metadata_backup = fixture.path("sync-metadata.db");
+    sqlite_backup(&fixture.path("metadata.db"), &metadata_backup);
+
+    let wrong = Fixture::new(Publication::Object);
+    let wrong_state = wrong.path("wrong-state");
+    let wrong_root = wrong.path("wrong-root");
+    let wrong_config = wrong.path("wrong.json");
+    write_sync_config(
+        &wrong_config,
+        "wrong",
+        &wrong_root,
+        &wrong_state,
+        true,
+        None,
+    );
+    let wrong_restore = wrong.yy(&[
+        "--volume",
+        text(&wrong_config),
+        "sync",
+        "restore",
+        "--backup",
+        text(&backup),
+        "--directory",
+        text(&wrong_root),
+    ]);
+    assert!(
+        !wrong_restore.status.success(),
+        "restore into another filesystem must fail"
+    );
+    assert!(
+        !wrong_root.exists() && !wrong_state.exists(),
+        "wrong-filesystem preflight must not create restore destinations"
+    );
+
+    let restored_state = fixture.path("sync-restored-state");
+    let restored_root = fixture.path("sync-restored-root");
+    let restored_config = fixture.path("sync-restored.json");
+    write_sync_config(
+        &restored_config,
+        "sync-restored",
+        &restored_root,
+        &restored_state,
+        false,
+        Some(fixture.service_address()),
+    );
+    let mut service = spawn_service(
+        &fixture,
+        &metadata_backup,
+        &destination_root_name,
+        SERVICE_TOKEN,
+        fixture.service_address(),
+    );
+    fixture
+        .yy_with_env(
+            &[
+                "--volume",
+                text(&restored_config),
+                "sync",
+                "restore",
+                "--backup",
+                text(&backup),
+                "--directory",
+                text(&restored_root),
+            ],
+            &[
+                ("YINYANG_S3_ROOT", &destination_root_name),
+                ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
+            ],
+        )
+        .success_or("restore isolated Sync backup");
+    let restored = sync_status_with_env(
+        &fixture,
+        &restored_config,
+        &destination_root_name,
+        SERVICE_TOKEN,
+    );
+    assert_eq!(restored.entry("unknown.txt").state, EntryState::Unknown);
+    assert_eq!(
+        restored.entry("unknown.txt").intent.commit_id.as_deref(),
+        Some(unknown_commit.as_str())
+    );
+    assert_eq!(
+        fs::read(restored_root.join("unknown.txt")).unwrap(),
+        b"newer-unknown"
+    );
+    assert_eq!(
+        fs::read(restored_root.join("conflict.txt")).unwrap(),
+        b"newer-local-conflict"
+    );
+    assert_eq!(
+        restored.conflict("conflict.txt").local_artifact.as_deref(),
+        Some(artifact_id.as_str())
+    );
+    let artifact = restored
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == artifact_id)
+        .expect("restored backup lost the changed artifact");
+    assert_eq!(artifact.phase, fixture::ArtifactPhase::Conflict);
+    let exported = fixture.path("restored-artifact");
+    fixture
+        .yy_with_env(
+            &[
+                "--volume",
+                text(&restored_config),
+                "sync",
+                "export",
+                "--artifact",
+                &artifact_id,
+                "--output",
+                text(&exported),
+            ],
+            &[
+                ("YINYANG_S3_ROOT", &destination_root_name),
+                ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
+            ],
+        )
+        .success_or("export changed retained artifact");
+    assert_eq!(fs::read(&exported).unwrap(), b"changed-retained");
+
+    service.stop();
+    let outage = fixture.yy_with_env(
+        &["--volume", text(&restored_config), "sync", "run"],
+        &[
+            ("YINYANG_S3_ROOT", &destination_root_name),
+            ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
+        ],
+    );
+    assert!(
+        !outage.status.success(),
+        "backend outage must fail Sync rather than report convergence"
+    );
+    let offline = sync_status_with_env(
+        &fixture,
+        &restored_config,
+        &destination_root_name,
+        SERVICE_TOKEN,
+    );
+    assert_eq!(
+        offline.remote.availability,
+        fixture::RemoteAvailability::Unavailable
+    );
+    assert_eq!(offline.summary.unknown, 1);
+    assert_eq!(
+        offline.entry("unknown.txt").intent.commit_id.as_deref(),
+        Some(unknown_commit.as_str())
+    );
+
+    service = spawn_service(
+        &fixture,
+        &metadata_backup,
+        &destination_root_name,
+        SERVICE_TOKEN,
+        fixture.service_address(),
+    );
+    let credential_failure = fixture.yy_with_env(
+        &["--volume", text(&restored_config), "sync", "run"],
+        &[
+            ("YINYANG_S3_ROOT", &destination_root_name),
+            ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
+            ("YINYANG_S3_ACCESS_KEY_ID", "invalid"),
+            ("YINYANG_S3_SECRET_ACCESS_KEY", "invalid"),
+        ],
+    );
+    assert!(
+        !credential_failure.status.success(),
+        "credential failure must fail Sync"
+    );
+    let after_credentials = sync_status_with_env(
+        &fixture,
+        &restored_config,
+        &destination_root_name,
+        SERVICE_TOKEN,
+    );
+    assert_eq!(after_credentials.summary.unknown, 1);
+
+    fixture
+        .yy_with_env(
+            &["--volume", text(&restored_config), "sync", "run"],
+            &[
+                ("YINYANG_S3_ROOT", &destination_root_name),
+                ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
+            ],
+        )
+        .success_or("retry restored Sync state");
+    let converged = sync_status_with_env(
+        &fixture,
+        &restored_config,
+        &destination_root_name,
+        SERVICE_TOKEN,
+    );
+    assert_eq!(converged.summary.unknown, 0, "{converged:#?}");
+    let authority = service_authority(
+        fixture.service_address(),
+        SERVICE_TOKEN,
+        operator_for_root(&destination_root_name),
+    );
+    let receipt = runtime()
+        .block_on(async {
+            authority
+                .observe_latest()
+                .await?
+                .receipt(CommitId::from_bytes(
+                    *uuid::Uuid::parse_str(&unknown_commit).unwrap().as_bytes(),
+                ))
+                .await
+        })
+        .expect("query original unknown Sync receipt");
+    assert!(receipt.is_some(), "restored Sync lost the original commit");
+    assert_eq!(
+        remote_node(&authority, "renamed.txt"),
+        Some(rename_node),
+        "restored identity mapping must preserve the unscanned rename"
+    );
+    assert!(remote_node(&authority, "rename.txt").is_none());
+    assert_eq!(
+        remote_bytes(&authority, "unknown.txt").as_deref(),
+        Some(b"newer-unknown".as_slice())
+    );
+    assert_eq!(
+        remote_bytes(&authority, "conflict.txt").as_deref(),
+        Some(b"remote-change".as_slice())
+    );
+    service.stop();
+}
+
 fn inspect(staging: &Path) -> RuntimeStatus {
     runtime()
         .block_on(Runtime::inspect(staging))
         .expect("inspect staging")
+}
+
+fn write_sync_config(
+    path: &Path,
+    name: &str,
+    root: &Path,
+    state: &Path,
+    object: bool,
+    service: Option<SocketAddr>,
+) {
+    let mut value = serde_json::json!({
+        "name": name,
+        "model": "managed",
+        "access": "sync",
+        "frontend": "library",
+        "publication": if object { "object" } else { "service" },
+        "storage_profile": "minio",
+        "staging": state,
+        "read_only": false,
+        "require": [],
+    });
+    if let Some(service) = service {
+        value["service_address"] = serde_json::Value::String(service.to_string());
+    }
+    let _ = root;
+    fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+}
+
+fn sync_status_with_env(fixture: &Fixture, config: &Path, root: &str, token: &str) -> SyncStatus {
+    let output = fixture.yy_with_env(
+        &["--volume", text(config), "sync", "status", "--json"],
+        &[("YINYANG_S3_ROOT", root), ("YINYANG_SERVICE_TOKEN", token)],
+    );
+    output.success_or("restored sync status");
+    let status: SyncStatus = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse restored sync status: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    status.validate();
+    status
+}
+
+fn remote_node(authority: &std::sync::Arc<dyn Authority>, path: &str) -> Option<NodeId> {
+    runtime()
+        .block_on(async {
+            let snapshot = authority.observe_latest().await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                snapshot.resolve(path).await?.map(|node| node.id()),
+            )
+        })
+        .expect("resolve restored remote node")
+}
+
+fn remote_bytes(authority: &std::sync::Arc<dyn Authority>, path: &str) -> Option<Vec<u8>> {
+    runtime()
+        .block_on(async {
+            let snapshot = authority.observe_latest().await?;
+            let Some(node) = snapshot.resolve(path).await? else {
+                return Ok(None);
+            };
+            let file = snapshot.open_file(node.id()).await?;
+            let mut bytes = Vec::new();
+            file.read_range(0..file.descriptor().content_id().length(), &mut bytes)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Some(bytes))
+        })
+        .expect("read restored remote file")
+}
+
+struct Tmpfs {
+    path: PathBuf,
+}
+
+impl Tmpfs {
+    fn mount(path: &Path, size: &str) -> Self {
+        let option = format!("size={size}");
+        run_external(
+            "sudo",
+            &[
+                "-n",
+                "mount",
+                "-t",
+                "tmpfs",
+                "-o",
+                &option,
+                "tmpfs",
+                text(path),
+            ],
+            Duration::from_secs(30),
+        )
+        .success_or("mount bounded tmpfs");
+        let owner = format!("{}:{}", Uid::current().as_raw(), Gid::current().as_raw());
+        run_external(
+            "sudo",
+            &["-n", "chown", &owner, text(path)],
+            Duration::from_secs(30),
+        )
+        .success_or("own bounded tmpfs");
+        Self {
+            path: path.to_owned(),
+        }
+    }
+}
+
+impl Drop for Tmpfs {
+    fn drop(&mut self) {
+        let _ = run_external(
+            "sudo",
+            &["-n", "umount", "-l", text(&self.path)],
+            Duration::from_secs(30),
+        );
+    }
 }
 
 fn parse_handle(output: &Captured) -> uuid::Uuid {
