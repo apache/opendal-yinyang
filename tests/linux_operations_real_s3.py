@@ -103,7 +103,14 @@ def main() -> int:
         ],
         env=environment,
         check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
+    output = completed.stdout
+    for value in credentials.values():
+        output = output.replace(value, "<redacted>")
+    print(output, end="", flush=True)
     return completed.returncode
 
 
