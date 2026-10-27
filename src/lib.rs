@@ -29,7 +29,11 @@ pub mod runtime;
 pub mod sync;
 pub mod volume;
 
-pub use directory::{directory_nodes, prepare_directory, publish_directory, restore_directory};
+pub use directory::{
+    DirectoryInspection, DirectoryIntent, DirectoryJournal, DirectoryState, DirectoryStatus,
+    directory_nodes, prepare_directory, publish_directory, restore_directory,
+    restore_directory_revision,
+};
 pub use yinyang_core as core;
 
 #[cfg(test)]
