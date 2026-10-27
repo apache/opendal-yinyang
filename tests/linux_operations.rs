@@ -847,12 +847,14 @@ impl Install {
         args: &[&str],
         root: &str,
         token: Option<&str>,
-    ) -> Child {
-        self.command(storage, work, args, root, token)
+    ) -> ChildGuard {
+        let child = self
+            .command(storage, work, args, root, token)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn installed yy")
+            .expect("spawn installed yy");
+        ChildGuard(child)
     }
 
     fn command(
@@ -964,7 +966,7 @@ fn start_service(
     work: &Path,
     database: &Path,
     root: &str,
-) -> Child {
+) -> ChildGuard {
     install.spawn(
         storage,
         work,
@@ -1014,7 +1016,7 @@ fn wait_doctor_ready(
     }
 }
 
-fn wait_service(child: &mut Child) -> SocketAddr {
+fn wait_service(child: &mut ChildGuard) -> SocketAddr {
     let stdout = child.stdout.take().expect("service stdout");
     let mut line = String::new();
     BufReader::new(stdout)
@@ -1027,7 +1029,7 @@ fn wait_service(child: &mut Child) -> SocketAddr {
         .expect("parse service address")
 }
 
-fn wait_mount(mountpoint: &Path, mut child: Option<&mut Child>) {
+fn wait_mount(mountpoint: &Path, mut child: Option<&mut ChildGuard>) {
     let expected = mountpoint.display().to_string();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -1319,7 +1321,7 @@ impl ExitStatusExt for Output {
     }
 }
 
-fn stop(child: &mut Child) {
+fn stop(child: &mut ChildGuard) {
     if let Some(status) = child.try_wait().expect("poll process") {
         assert!(status.success(), "process exited before stop: {status}");
         return;
@@ -1336,6 +1338,31 @@ fn stop(child: &mut Child) {
             panic!("process did not stop within 15s after SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct ChildGuard(Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
