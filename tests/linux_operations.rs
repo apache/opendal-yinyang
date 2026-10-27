@@ -943,10 +943,10 @@ fn wait_mount(mountpoint: &Path, mut child: Option<&mut Child>) {
     let expected = mountpoint.display().to_string();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if let Some(child) = child.as_deref_mut() {
-            if let Some(status) = child.try_wait().expect("poll mount process") {
-                panic!("mount exited before becoming ready: {status}");
-            }
+        if let Some(child) = child.as_deref_mut()
+            && let Some(status) = child.try_wait().expect("poll mount process")
+        {
+            panic!("mount exited before becoming ready: {status}");
         }
         let mounts = fs::read_to_string("/proc/mounts").unwrap();
         for line in mounts.lines() {
