@@ -86,6 +86,14 @@ intersecting authenticated content units. `getattr` with the handle, and path
 attributes while that observation is active, use its node metadata, executable
 bit, length and revision. `release` drops the reference and reclaims a
 zero-reference observation, so the next open pins the current remote revision.
+Before replying to a read-only open, the frontend sends
+`inval_inode(ino, -1, 0)` so a cached pre-transition attribute cannot survive
+while READ uses the newly pinned version. The open reply becomes visible only
+after the notification send has completed. If the notifier is unavailable or
+the kernel cannot accept that invalidation, OPEN fails rather than exposing a
+descriptor whose first fstat can combine the new content with a cached old
+length. The notifier is installed from the session channel before the request
+loop starts.
 If an interrupted read still owns the observation after release, reclaim is
 `Busy`; a later open retries reclaim before observing latest, preserving the
 old handle until its operation finishes without reusing a stale zero-reference
