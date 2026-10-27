@@ -379,6 +379,59 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn revision_syntax_is_rejected_before_backend_admission() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args(["status", "--revision", "00"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("revision must be exactly 48 hexadecimal characters"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn volume_status_rejects_historical_revision_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("volume.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "name": "revision-admission",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": temp.path().join("state"),
+            "read_only": false,
+            "require": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let revision = "01".repeat(24);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args([
+            "--volume",
+            config.to_str().unwrap(),
+            "status",
+            "--revision",
+            &revision,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--revision is only supported by object-storage `yy status`"),
+        "{stderr}"
+    );
+}
+
+#[test]
 #[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
 fn s3_cli_directory_round_trip() {
     let temp = tempfile::tempdir().unwrap();

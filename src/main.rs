@@ -18,6 +18,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
 mod file_cli;
 #[cfg(target_os = "linux")]
@@ -78,14 +79,25 @@ enum Command {
         destination: PathBuf,
         /// Retained revision to restore; defaults to the latest revision.
         #[arg(long)]
-        revision: Option<String>,
+        revision: Option<RevisionArg>,
     },
     /// Enumerate a pinned namespace and report its size.
     Status {
         /// Retained revision to inspect; defaults to the latest revision.
         #[arg(long)]
-        revision: Option<String>,
+        revision: Option<RevisionArg>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevisionArg(Revision);
+
+impl FromStr for RevisionArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_revision(value).map(Self)
+    }
 }
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -157,7 +169,6 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
     let fs = Fs::open(operator, profile).await?;
-    let observed = fs.observe_latest().await?;
     match cli.command {
         Command::Create
         | Command::Serve { .. }
@@ -171,6 +182,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             replace,
             commit_id,
         } => {
+            let observed = fs.observe_latest().await?;
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
             let id = CommitId::from_bytes(*uuid.as_bytes());
             if observed.receipt(id).await?.is_some() {
@@ -197,6 +209,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         Command::Receipt { commit_id } => {
             let id = CommitId::from_bytes(*commit_id.as_bytes());
+            let observed = fs.observe_latest().await?;
             let receipt = observed.receipt(id).await?.ok_or("receipt not found; a delayed attempt may still publish, so absence is not proof of failure")?;
             println!(
                 "commit: {commit_id}\nrevision: {}\nordinal: {}\nrequest digest: {}",
@@ -210,11 +223,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             revision: selected,
         } => {
             let snapshot = match selected {
-                Some(value) => {
-                    let selected = parse_revision(&value)?;
-                    fs.observe_revision(selected).await?
-                }
-                None => observed,
+                Some(selected) => fs.observe_revision(selected.0).await?,
+                None => fs.observe_latest().await?,
             };
             yinyang::restore_directory(&fs, &snapshot, &destination).await?;
             println!(
@@ -225,11 +235,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         Command::Status { revision: selected } => {
             let snapshot = match selected {
-                Some(value) => {
-                    let selected = parse_revision(&value)?;
-                    fs.observe_revision(selected).await?
-                }
-                None => observed,
+                Some(selected) => fs.observe_revision(selected.0).await?,
+                None => fs.observe_latest().await?,
             };
             let nodes = yinyang::directory_nodes(&snapshot).await?;
             let directories = nodes.values().filter(|n| n.is_directory()).count();
@@ -250,10 +257,10 @@ fn revision(value: Revision) -> String {
         .collect()
 }
 
-fn parse_revision(value: &str) -> Result<Revision, Box<dyn std::error::Error>> {
+fn parse_revision(value: &str) -> Result<Revision, String> {
     let value = value.as_bytes();
     if value.len() != 48 {
-        return Err("revision must be exactly 48 hexadecimal characters".into());
+        return Err("revision must be exactly 48 hexadecimal characters".to_owned());
     }
     let mut bytes = [0_u8; 24];
     for (index, byte) in bytes.iter_mut().enumerate() {
@@ -263,12 +270,12 @@ fn parse_revision(value: &str) -> Result<Revision, Box<dyn std::error::Error>> {
     Ok(Revision::from_bytes(bytes))
 }
 
-fn hex_nibble(value: u8) -> Result<u8, Box<dyn std::error::Error>> {
+fn hex_nibble(value: u8) -> Result<u8, String> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err("revision contains a non-hexadecimal character".into()),
+        _ => Err("revision contains a non-hexadecimal character".to_owned()),
     }
 }
 
