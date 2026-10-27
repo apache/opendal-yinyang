@@ -44,7 +44,7 @@ mod fixture;
 
 use fixture::{Fixture, Publication, SyncPaths};
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v2";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v3";
 const CHUNK: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -1601,27 +1601,25 @@ struct CountingProxy {
 impl CountingProxy {
     fn start(upstream: SocketAddr) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting S3 proxy");
-        listener
-            .set_nonblocking(true)
-            .expect("make counting proxy listener nonblocking");
         let address = listener.local_addr().expect("counting proxy address");
         let counters = Arc::new(ProxyCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_counters = counters.clone();
         let thread_stop = stop.clone();
         let thread = thread::spawn(move || {
-            while !thread_stop.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((client, _)) => {
-                        thread_counters.connections.fetch_add(1, Ordering::Relaxed);
-                        let counters = thread_counters.clone();
-                        thread::spawn(move || proxy_connection(client, upstream, counters));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            loop {
+                let Ok((client, _)) = listener.accept() else {
+                    break;
+                };
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                client
+                    .set_nodelay(true)
+                    .expect("disable Nagle on counting S3 client");
+                thread_counters.connections.fetch_add(1, Ordering::Relaxed);
+                let counters = thread_counters.clone();
+                thread::spawn(move || proxy_connection(client, upstream, counters));
             }
         });
         Self {
@@ -1704,6 +1702,9 @@ impl CountingServiceProxy {
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
                 }
+                client
+                    .set_nodelay(true)
+                    .expect("disable Nagle on counting service client");
                 thread_counters.connections.fetch_add(1, Ordering::Relaxed);
                 let counters = thread_counters.clone();
                 thread::spawn(move || service_proxy_connection(client, upstream, counters));
@@ -1748,6 +1749,9 @@ fn service_proxy_connection(
     let Ok(server) = TcpStream::connect(upstream) else {
         return;
     };
+    server
+        .set_nodelay(true)
+        .expect("disable Nagle on counting service upstream");
     let (Ok(mut client_read), Ok(mut server_write)) = (client.try_clone(), server.try_clone())
     else {
         return;
@@ -1797,6 +1801,9 @@ fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<Proxy
     let Ok(server) = TcpStream::connect(upstream) else {
         return;
     };
+    server
+        .set_nodelay(true)
+        .expect("disable Nagle on counting S3 upstream");
     let (Ok(mut client_read), Ok(mut server_write)) = (client.try_clone(), server.try_clone())
     else {
         return;
@@ -2160,9 +2167,7 @@ impl NetworkPerSample {
 }
 
 fn cache_policy(scenario: &str) -> &'static str {
-    if scenario.starts_with("fuse_read_only_range_") {
-        "read-only FUSE FOPEN_DIRECT_IO; authenticated ranges are read from an immutable FileVersion without whole-file staging"
-    } else if scenario.starts_with("fuse_") {
+    if scenario.starts_with("fuse_") {
         "FUSE FOPEN_DIRECT_IO; no kernel page cache for file pages; clean nodes are reclaimed on last release"
     } else if scenario.starts_with("sync_") {
         "one CLI process per finite run; no OS page-cache drop and no cross-run content cache state"
