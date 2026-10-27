@@ -185,10 +185,11 @@ async fn object_snapshot_reuses_authenticated_index_reads() {
         .unwrap();
     committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
 
-    backend.state.lock().unwrap().data_reads = 0;
     let fresh = fs.observe_latest().await.unwrap();
-    assert!(fresh.resolve("anchor/file-new").await.unwrap().is_some());
+    backend.state.lock().unwrap().data_reads = 0;
+    assert!(fresh.resolve("anchor/file-0042").await.unwrap().is_some());
     assert!(backend.state.lock().unwrap().data_reads > 0);
+    assert!(fresh.resolve("anchor/file-new").await.unwrap().is_some());
     assert!(snapshot.resolve("anchor/file-new").await.unwrap().is_none());
 }
 
