@@ -260,6 +260,49 @@ systemctl --user is-active yinyang-serve.service
 journalctl --user -u yinyang-serve.service --since "10 minutes ago"
 ```
 
+For the service-authority Mount and Sync examples, create separate volume
+documents that point at the same loopback listener:
+
+```shell
+cat > "$HOME/.config/yinyang/volumes/service.json" <<EOF
+{
+  "name": "service",
+  "model": "managed",
+  "access": "mount",
+  "frontend": "fuse",
+  "publication": "service",
+  "storage_profile": "amazon-s3",
+  "staging": "$HOME/.local/state/yinyang/service",
+  "read_only": false,
+  "require": [],
+  "service_address": "127.0.0.1:7447"
+}
+EOF
+
+cat > "$HOME/.config/yinyang/volumes/service-sync.json" <<EOF
+{
+  "name": "service-sync",
+  "model": "managed",
+  "access": "sync",
+  "frontend": "library",
+  "publication": "service",
+  "storage_profile": "amazon-s3",
+  "staging": "$HOME/.local/state/yinyang/service-sync",
+  "read_only": false,
+  "require": [],
+  "service_address": "127.0.0.1:7447"
+}
+EOF
+
+chmod 0600 "$HOME/.config/yinyang/volumes/service.json" \
+  "$HOME/.config/yinyang/volumes/service-sync.json"
+mkdir -p "$HOME/YinYang/service"
+yyvol service --volume "$HOME/.config/yinyang/volumes/service.json" doctor
+yyvol service-sync --volume "$HOME/.config/yinyang/volumes/service-sync.json" \
+  sync init --directory "$HOME/YinYang/service-sync"
+systemctl --user start yinyang-mount@service.service
+```
+
 Start a Managed Mount user service and verify the kernel mount identity:
 
 ```shell
@@ -311,8 +354,10 @@ Stop services without deleting state:
 
 ```shell
 systemctl --user stop yinyang-mount@object.service
+systemctl --user stop yinyang-mount@service.service
 systemctl --user stop yinyang-serve.service
 systemctl --user stop yinyang-sync@sync.service
+systemctl --user stop yinyang-sync@service-sync.service
 ```
 
 Use `systemctl --user restart yinyang-mount@object.service` or
