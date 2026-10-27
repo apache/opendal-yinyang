@@ -106,9 +106,9 @@ jobs:
         run: cargo x licenses
 
   s3:
-    name: S3 transfer
+    name: S3 and recovery acceptance
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       YINYANG_S3_BUCKET: yinyang-test
       YINYANG_S3_ENDPOINT: http://127.0.0.1:9000
@@ -118,6 +118,11 @@ jobs:
       YINYANG_STORAGE_PROFILE: minio
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install recovery tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
 
       - name: Start isolated S3-compatible storage
         run: |
@@ -133,7 +138,14 @@ jobs:
           docker exec yinyang-silo mcli mb local/yinyang-test
 
       - name: Exercise core publication and CLI round trips
-        run: cargo test --workspace --all-targets s3_ -- --ignored --nocapture
+        run: |
+          cargo test --workspace --all-targets s3_ -- \
+            --ignored --nocapture \
+            --skip isolated_s3_cli_smoke \
+            --skip real_amazon_s3_cli_smoke
+
+      - name: Run isolated recovery acceptance
+        run: cargo x test-linux-recovery
 
       - name: Show storage logs on failure
         if: failure()
@@ -214,6 +226,9 @@ jobs:
 
       - name: Run real Linux FUSE acceptance
         run: cargo x test-linux-fuse
+
+      - name: Run installed CLI operations acceptance
+        run: cargo x test-linux-operations
 
       - name: Show storage logs on failure
         if: failure()
