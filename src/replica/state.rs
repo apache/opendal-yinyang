@@ -608,8 +608,8 @@ impl Store {
                         expected_ino.as_slice(),
                         parent_dev.as_slice(),
                         parent_ino.as_slice(),
-                        temporary_dev.as_ref().map(|value| value.as_slice()),
-                        temporary_ino.as_ref().map(|value| value.as_slice()),
+                        temporary_dev.as_deref(),
+                        temporary_ino.as_deref(),
                     ],
                 )
                 .map_err(|e| Error::corrupt(format!("rebind install identity: {e}")))?;
@@ -1550,8 +1550,8 @@ fn map_identity(
         return Ok(None);
     };
     let old = (
-        number(&dev, "device").map_err(|e| Error::corrupt(format!("decode device: {e}")))?,
-        number(&ino, "inode").map_err(|e| Error::corrupt(format!("decode inode: {e}")))?,
+        number(dev, "device").map_err(|e| Error::corrupt(format!("decode device: {e}")))?,
+        number(ino, "inode").map_err(|e| Error::corrupt(format!("decode inode: {e}")))?,
     );
     if let Some(mapped) = identities.get(&old) {
         return Ok(Some(*mapped));
