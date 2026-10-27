@@ -19,7 +19,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
+use yinyang::core::{BackendProfile, CommitId, Fs, Revision};
+mod directory_cli;
 mod file_cli;
 #[cfg(target_os = "linux")]
 mod sync_cli;
@@ -71,9 +72,17 @@ enum Command {
         /// Unique UUID for a new request, not a request to replan an old attempt.
         #[arg(long)]
         commit_id: Option<uuid::Uuid>,
+        /// Explicit state directory for durable, source-free recovery.
+        #[arg(long, requires = "commit_id")]
+        state: Option<PathBuf>,
     },
     /// Query an existing request without rescanning or republishing local files.
     Receipt { commit_id: uuid::Uuid },
+    /// Inspect, retry, or export durable one-shot directory publications.
+    Publication {
+        #[command(subcommand)]
+        command: directory_cli::PublicationCommand,
+    },
     /// Restore a pinned snapshot into a directory that does not exist.
     Restore {
         destination: PathBuf,
@@ -111,14 +120,28 @@ async fn main() -> ExitCode {
 }
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     opendal::install_default();
+    if let Command::Publication {
+        command:
+            directory_cli::PublicationCommand::Inspect {
+                commit_id,
+                state,
+                json,
+            },
+    } = &cli.command
+    {
+        if cli.volume.is_some() {
+            return Err("publication commands do not use --volume; configure object storage with YINYANG_S3_* instead".into());
+        }
+        return directory_cli::inspect(*commit_id, state, *json).await;
+    }
+    if cli.volume.is_some() && matches!(cli.command, Command::Publication { .. }) {
+        return Err("publication commands do not use --volume; configure object storage with YINYANG_S3_* instead".into());
+    }
     if let Some(path) = &cli.volume {
         return match cli.command {
             #[cfg(target_os = "linux")]
             Command::Sync { command } => sync_cli::run(path, command).await,
-            command => {
-                file_cli::run(path, command).await?;
-                Ok(ExitCode::SUCCESS)
-            }
+            command => file_cli::run(path, command).await,
         };
     }
     match cli.command {
@@ -181,6 +204,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             source,
             replace,
             commit_id,
+            state,
         } => {
             let observed = fs.observe_latest().await?;
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
@@ -195,28 +219,49 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 );
             }
             eprintln!("publication ID: {uuid}");
+            if let Some(state) = state {
+                let journal = yinyang::DirectoryJournal::open(&fs, &state).await?;
+                if journal.status(id).await?.is_some() {
+                    return Err(format!(
+                        "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",
+                        state.display(),
+                        state.display()
+                    )
+                    .into());
+                }
+                let status = journal.prepare(&observed, &source, id).await?;
+                eprintln!(
+                    "request digest: {}\njournal state: {}",
+                    blake3::Hash::from(status.intent.request_digest).to_hex(),
+                    state.display()
+                );
+                return directory_cli::publish(&journal, id).await;
+            }
             let request = yinyang::prepare_directory(&fs, &observed, &source, id).await?;
             eprintln!(
                 "request digest: {}",
                 blake3::Hash::from(request.digest()).to_hex()
             );
-            match fs.commit(&request).await? {
-                CommitOutcome::Committed(receipt) => println!("published revision {} (commit {uuid})",revision(receipt.cursor.revision)),
-                CommitOutcome::Conflict => return Err("original namespace predicates changed; inspect the remote state before planning a new request".into()),
-                CommitOutcome::Retryable => return Err("publication opportunity was exhausted without an unresolved write; submit a new directory request or retry the frozen Transaction through the library".into()),
-                CommitOutcome::Unknown(_) => return Err(format!("publication may still complete; query yy receipt {uuid}; an absent receipt does not prove failure").into()),
-            }
+            return directory_cli::classify_outcome(fs.commit(&request).await?, uuid);
         }
         Command::Receipt { commit_id } => {
             let id = CommitId::from_bytes(*commit_id.as_bytes());
             let observed = fs.observe_latest().await?;
-            let receipt = observed.receipt(id).await?.ok_or("receipt not found; a delayed attempt may still publish, so absence is not proof of failure")?;
+            let Some(receipt) = observed.receipt(id).await? else {
+                eprintln!(
+                    "yy: receipt not found; a delayed attempt may still publish, so absence is not proof of failure"
+                );
+                return Ok(ExitCode::from(3));
+            };
             println!(
                 "commit: {commit_id}\nrevision: {}\nordinal: {}\nrequest digest: {}",
                 revision(receipt.cursor.revision),
                 receipt.cursor.ordinal,
                 blake3::Hash::from(receipt.request_digest).to_hex()
             );
+        }
+        Command::Publication { command } => {
+            return directory_cli::run(&fs, command).await;
         }
         Command::Restore {
             destination,
