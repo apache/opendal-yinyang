@@ -235,12 +235,14 @@ fn fuse_read_only_range_corrupt_proof_and_data_report_eio_both_publications() {
         fixture.corrupt_content("data.bin", ContentCorruption::Data);
 
         for name in ["proof.bin", "data.bin"] {
-            let file = File::open(mounted.mountpoint().join(name))
-                .unwrap_or_else(|error| panic!("open corrupted {name}: {error}"));
-            let mut value = [0_u8; 1];
-            let error = file
-                .read_at(&mut value, 0)
-                .expect_err("corrupt content must not release bytes");
+            let error = match File::open(mounted.mountpoint().join(name)) {
+                Ok(file) => {
+                    let mut value = [0_u8; 1];
+                    file.read_at(&mut value, 0)
+                        .expect_err("corrupt content must not release bytes")
+                }
+                Err(error) => error,
+            };
             assert_errno(error, &[EIO], name);
         }
         mounted.unmount();
