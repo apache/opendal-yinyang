@@ -132,7 +132,7 @@ pub async fn run(path: &Path, command: Command) -> Result<(), Box<dyn std::error
             .join(&config.staging);
     }
     let token = std::env::var("YINYANG_SERVICE_TOKEN").ok();
-    if matches!(command, Command::Status) {
+    if matches!(command, Command::Status { .. }) {
         println!(
             "volume: {} access: {:?} frontend: {:?} read-only: {}",
             config.name, config.access, config.frontend, config.read_only

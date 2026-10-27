@@ -73,10 +73,19 @@ enum Command {
     },
     /// Query an existing request without rescanning or republishing local files.
     Receipt { commit_id: uuid::Uuid },
-    /// Restore the current pinned snapshot into a directory that does not exist.
-    Restore { destination: PathBuf },
-    /// Enumerate the pinned namespace and report its size.
-    Status,
+    /// Restore a pinned snapshot into a directory that does not exist.
+    Restore {
+        destination: PathBuf,
+        /// Retained revision to restore; defaults to the latest revision.
+        #[arg(long)]
+        revision: Option<String>,
+    },
+    /// Enumerate a pinned namespace and report its size.
+    Status {
+        /// Retained revision to inspect; defaults to the latest revision.
+        #[arg(long)]
+        revision: Option<String>,
+    },
 }
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -196,20 +205,37 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 blake3::Hash::from(receipt.request_digest).to_hex()
             );
         }
-        Command::Restore { destination } => {
-            yinyang::restore_directory(&fs, &observed, &destination).await?;
+        Command::Restore {
+            destination,
+            revision: selected,
+        } => {
+            let snapshot = match selected {
+                Some(value) => {
+                    let selected = parse_revision(&value)?;
+                    fs.observe_revision(selected).await?
+                }
+                None => observed,
+            };
+            yinyang::restore_directory(&fs, &snapshot, &destination).await?;
             println!(
                 "restored revision {} to {}",
-                revision(observed.revision()),
+                revision(snapshot.revision()),
                 destination.display()
             );
         }
-        Command::Status => {
-            let nodes = yinyang::directory_nodes(&observed).await?;
+        Command::Status { revision: selected } => {
+            let snapshot = match selected {
+                Some(value) => {
+                    let selected = parse_revision(&value)?;
+                    fs.observe_revision(selected).await?
+                }
+                None => observed,
+            };
+            let nodes = yinyang::directory_nodes(&snapshot).await?;
             let directories = nodes.values().filter(|n| n.is_directory()).count();
             println!(
                 "revision: {}\nfiles: {}\ndirectories: {directories}",
-                revision(observed.revision()),
+                revision(snapshot.revision()),
                 nodes.len() - directories
             );
         }
@@ -222,4 +248,45 @@ fn revision(value: Revision) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn parse_revision(value: &str) -> Result<Revision, Box<dyn std::error::Error>> {
+    let value = value.as_bytes();
+    if value.len() != 48 {
+        return Err("revision must be exactly 48 hexadecimal characters".into());
+    }
+    let mut bytes = [0_u8; 24];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = (hex_nibble(value[offset])? << 4) | hex_nibble(value[offset + 1])?;
+    }
+    Ok(Revision::from_bytes(bytes))
+}
+
+fn hex_nibble(value: u8) -> Result<u8, Box<dyn std::error::Error>> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err("revision contains a non-hexadecimal character".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_revision;
+
+    #[test]
+    fn revision_requires_exactly_24_hex_bytes() {
+        assert!(parse_revision("00").is_err());
+        assert!(parse_revision(&"é".repeat(24)).is_err());
+        assert!(parse_revision(&"g".repeat(48)).is_err());
+        assert_eq!(
+            parse_revision(&"01".repeat(24))
+                .unwrap()
+                .to_bytes()
+                .as_slice(),
+            &[1; 24]
+        );
+    }
 }
