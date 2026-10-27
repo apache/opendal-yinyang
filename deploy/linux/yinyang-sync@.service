@@ -1,0 +1,18 @@
+[Unit]
+Description=Apache OpenDAL YinYang finite Managed Sync pass for %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h
+EnvironmentFile=%h/.config/yinyang/environment
+EnvironmentFile=-%h/.config/yinyang/environment-%i
+ExecStart=${YINYANG_BIN} --volume ${YINYANG_CONFIG_DIR}/%i.json sync run
+TimeoutStartSec=1h
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

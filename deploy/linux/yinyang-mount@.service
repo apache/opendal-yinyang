@@ -1,0 +1,18 @@
+[Unit]
+Description=Apache OpenDAL YinYang Managed FUSE volume %i
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=%h/.config/yinyang/environment
+EnvironmentFile=-%h/.config/yinyang/environment-%i
+ExecStart=${YINYANG_BIN} --volume ${YINYANG_CONFIG_DIR}/%i.json mount ${YINYANG_MOUNT_ROOT}/%i
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+KillMode=mixed
+UMask=0022
+
+[Install]
+WantedBy=default.target
