@@ -774,6 +774,8 @@ struct UserUnits {
     directory: PathBuf,
     environment: PathBuf,
     overlays: Vec<PathBuf>,
+    created_config_root: bool,
+    created_unit_directory: bool,
     serve: String,
     mount: String,
     sync: String,
@@ -790,8 +792,10 @@ impl UserUnits {
         roots: [&str; 3],
     ) -> Self {
         let directory = user_unit_directory();
+        let created_unit_directory = !directory.exists();
         fs::create_dir_all(&directory).unwrap();
         let config_root = user_config_root();
+        let created_config_root = !config_root.exists();
         fs::create_dir_all(&config_root).unwrap();
         let environment = config_root.join("environment");
         let overlays = [
@@ -831,6 +835,8 @@ impl UserUnits {
             directory: directory.clone(),
             environment: environment.clone(),
             overlays: overlays.to_vec(),
+            created_config_root,
+            created_unit_directory,
             serve: "yinyang-serve.service".to_owned(),
             mount: "yinyang-mount@.service".to_owned(),
             sync: "yinyang-sync@.service".to_owned(),
@@ -916,20 +922,27 @@ impl Drop for UserUnits {
         for overlay in &self.overlays {
             let _ = fs::remove_file(overlay);
         }
+        if self.created_config_root {
+            let _ = fs::remove_dir(&self.environment.parent().unwrap());
+        }
+        if self.created_unit_directory {
+            let _ = fs::remove_dir(&self.directory);
+        }
         let _ = systemctl(&["daemon-reload"]);
     }
 }
 
 fn user_unit_directory() -> PathBuf {
-    user_config_root().join("systemd/user")
-}
-
-fn user_config_root() -> PathBuf {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .expect("HOME or XDG_CONFIG_HOME is required");
-    config.join("yinyang")
+    config.join("systemd/user")
+}
+
+fn user_config_root() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME is required by the user units");
+    PathBuf::from(home).join(".config/yinyang")
 }
 
 fn write_systemd_environment(
