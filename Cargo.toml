@@ -61,6 +61,7 @@ nix = { version = "0.30.0", features = ["signal", "user"] }
 rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
+futures-util.workspace = true
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
 tempfile = "3"
 

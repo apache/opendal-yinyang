@@ -26,6 +26,7 @@
 #[path = "linux_sync/harness.rs"]
 mod support;
 
+use futures_util::TryStreamExt as _;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -639,6 +640,53 @@ fn assert_tree(actual: &Tree, expected: &Tree, context: &str) {
     assert_eq!(actual, expected, "{context}");
 }
 
+fn independent_operator(fixture: &Fixture) -> opendal::Operator {
+    opendal::install_default();
+    let command = fixture.yy_command(&[]);
+    let config = command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            let key = key
+                .to_str()?
+                .strip_prefix("YINYANG_S3_")?
+                .to_ascii_lowercase();
+            Some((key, value?.to_str()?.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    opendal::Operator::via_iter("s3", config).expect("construct independent S3 operator")
+}
+
+fn delete_content_pack(fixture: &Fixture, marker: &[u8]) {
+    let operator = independent_operator(fixture);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut lister = operator
+            .lister_with("/")
+            .recursive(true)
+            .await
+            .expect("list isolated storage");
+        while let Some(entry) = lister.try_next().await.expect("read storage entry") {
+            if entry.metadata().mode() != opendal::EntryMode::FILE {
+                continue;
+            }
+            let path = entry.path().to_owned();
+            let bytes = operator
+                .read(&path)
+                .await
+                .expect("read immutable object")
+                .to_bytes();
+            if bytes.windows(marker.len()).any(|window| window == marker) {
+                operator.delete(&path).await.expect("delete content pack");
+                return;
+            }
+        }
+        panic!("no immutable pack contained the expected file marker");
+    });
+}
+
 fn process_death_case(action: CommitAction, delayed_original_succeeds: bool) {
     let fixture = Fixture::new(Publication::Object);
     let source = fixture.path("source");
@@ -870,4 +918,35 @@ fn s3_historical_restore_and_publication_export_are_explicit_and_no_clobber() {
     ]);
     assert!(!refused.status.success());
     assert_eq!(std::fs::read(existing.join("marker")).unwrap(), b"keep");
+}
+
+#[test]
+#[ignore = "requires an isolated S3 bucket configured with YINYANG_S3_* variables"]
+fn s3_restore_exposes_a_partial_destination_without_overwriting() {
+    let fixture = Fixture::new(Publication::Object);
+    let source = fixture.path("source");
+    std::fs::create_dir_all(source.join("nested/empty-dir")).unwrap();
+    let marker = b"directory-recovery-partial-destination-marker";
+    std::fs::write(source.join("nested/payload"), marker).unwrap();
+    fixture.yy_ok(&["publish", source.to_str().unwrap()]);
+    delete_content_pack(&fixture, marker);
+
+    let destination = fixture.path("partial");
+    let failed = fixture.yy(&["restore", destination.to_str().unwrap()]);
+    assert!(!failed.status.success());
+    assert!(destination.is_dir(), "restore created the destination root");
+    assert!(
+        destination.join("nested/empty-dir").is_dir(),
+        "restore created verified directory structure before failing"
+    );
+    assert!(!destination.join("nested/payload").exists());
+    std::fs::write(destination.join("partial-marker"), b"keep").unwrap();
+
+    let refused = fixture.yy(&["restore", destination.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        std::fs::read(destination.join("partial-marker")).unwrap(),
+        b"keep"
+    );
+    assert!(!destination.join("nested/payload").exists());
 }
