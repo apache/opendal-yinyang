@@ -30,11 +30,24 @@ cargo x bench-linux-cost \
   --output target/linux-cost/early.jsonl
 ```
 
+Run only one authority for a targeted rerun while preserving the selected
+profile's scales:
+
+```shell
+cargo x bench-linux-cost \
+  --profile full \
+  --publication service \
+  --output target/linux-cost/service.jsonl
+```
+
 The `early` profile runs the small object-authority Sync, FUSE, concurrent-writer,
 and one-shot transfer scenarios. The `full` profile adds the service authority,
 the medium scale, and the explicit service-authority one-shot boundary. The
-command writes JSONL evidence to `--output` and a Markdown summary to the same
-path with an `.md` extension.
+`--publication` filter defaults to `all`; `object` and `service` select only
+that authority. The command writes JSONL evidence to `--output` and a Markdown
+summary to the same path with an `.md` extension. Every record and summary
+reports the publication filter and the measured/unsupported record counts so a
+filtered run cannot be mistaken for the complete matrix.
 
 The summary marks combinations that the product does not support as
 `unsupported` with dashes for measurement fields. This prevents a not-run
