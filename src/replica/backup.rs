@@ -17,11 +17,14 @@
 
 //! Experimental quiesced backup package for Linux Managed Sync.
 
-use super::linux::{Identity, LocalKind, LocalNode, LocalSnapshot, Replica, observe_path};
+use super::linux::{
+    Identity, LocalKind, LocalNode, LocalSnapshot, Replica, observe_path, validate_path,
+};
 use super::state::{Binding, IdentityMap};
 use super::{Error, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::Connection;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -118,6 +121,53 @@ struct DatabaseEvidence {
     path: String,
     length: u64,
     hash: [u8; 32],
+}
+
+fn valid_artifact_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && yinyang_core::namespace::name_key(name).is_ok()
+}
+
+fn validate_nodes(nodes: &[SnapshotNode], context: &str) -> Result<()> {
+    let mut paths = BTreeSet::new();
+    for node in nodes {
+        validate_path(&node.path)
+            .map_err(|error| Error::corrupt(format!("{context} has an invalid path: {error}")))?;
+        if !paths.insert(node.path.as_str()) {
+            return Err(Error::corrupt(format!(
+                "{context} contains duplicate path {:?}",
+                node.path
+            )));
+        }
+        if node.directory {
+            if node.length.is_some() || node.digest.is_some() || node.executable {
+                return Err(Error::corrupt(format!(
+                    "{context} contains invalid directory metadata"
+                )));
+            }
+        } else if node.length.is_none() || node.digest.is_none() {
+            return Err(Error::corrupt(format!(
+                "{context} contains a file without a length or digest"
+            )));
+        }
+        if node.path.is_empty() == node.parent_dev.is_some()
+            || node.parent_dev.is_some() != node.parent_ino.is_some()
+        {
+            return Err(Error::corrupt(format!(
+                "{context} contains inconsistent parent identity"
+            )));
+        }
+    }
+    let roots = nodes.iter().filter(|node| node.path.is_empty()).count();
+    if roots != 1 {
+        return Err(Error::corrupt(format!(
+            "{context} must contain exactly one root"
+        )));
+    }
+    Ok(())
 }
 
 impl BackupManifest {
@@ -235,9 +285,12 @@ impl BackupManifest {
             .map_err(|error| Error::io("create backup root", &root_output, error))?;
         fs::create_dir(&state_output)
             .map_err(|error| Error::io("create backup state", &state_output, error))?;
+        sync_directory(&parent)?;
+        sync_directory(&output)?;
 
         let mut seen = BTreeMap::new();
         copy_snapshot(&root, &root_output, &self.root, &mut seen)?;
+        sync_snapshot_directories(&root_output, &self.root)?;
         fs::create_dir_all(state_output.join("content"))
             .map_err(|error| Error::io("create backup content state", &state_output, error))?;
         fs::create_dir(state_output.join("quarantine"))
@@ -251,6 +304,10 @@ impl BackupManifest {
                 &state_output.join("quarantine").join(&artifact.name),
                 &artifact.nodes,
                 &mut seen,
+            )?;
+            sync_snapshot_directories(
+                &state_output.join("quarantine").join(&artifact.name),
+                &artifact.nodes,
             )?;
         }
         self.databases.clear();
@@ -268,9 +325,12 @@ impl BackupManifest {
             });
         }
         self.save(&output.join(MANIFEST))?;
+        sync_directory(&state_output.join("content"))?;
+        sync_directory(&state_output.join("quarantine"))?;
         sync_directory(&root_output)?;
         sync_directory(&state_output)?;
         sync_directory(&output)?;
+        sync_directory(&parent)?;
         Ok(())
     }
 
@@ -290,7 +350,36 @@ impl BackupManifest {
         if manifest.magic != MAGIC || manifest.version != VERSION {
             return Err(Error::unsupported("unsupported backup manifest profile"));
         }
+        manifest.validate_shape()?;
         Ok(manifest)
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        let mut artifact_ids = BTreeSet::new();
+        let mut artifact_names = BTreeSet::new();
+        for artifact in &self.artifacts {
+            if !valid_artifact_name(&artifact.name) {
+                return Err(Error::corrupt(
+                    "backup manifest contains an unsafe artifact name",
+                ));
+            }
+            if !artifact_ids.insert(artifact.id.as_str())
+                || !artifact_names.insert(artifact.name.as_str())
+            {
+                return Err(Error::corrupt(
+                    "backup manifest contains duplicate artifact identities",
+                ));
+            }
+            if !artifact.present && !artifact.nodes.is_empty() {
+                return Err(Error::corrupt(
+                    "backup manifest has nodes for an absent artifact",
+                ));
+            }
+            if artifact.present {
+                validate_nodes(&artifact.nodes, "backup artifact")?;
+            }
+        }
+        validate_nodes(&self.root, "backup root")
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -415,6 +504,10 @@ impl BackupManifest {
         }
         fs::create_dir(&root).map_err(|error| Error::io("create restore root", &root, error))?;
         fs::create_dir(&state).map_err(|error| Error::io("create restore state", &state, error))?;
+        sync_parent_directory(&root)?;
+        sync_parent_directory(&state)?;
+        sync_directory(&root)?;
+        sync_directory(&state)?;
         let root_identity =
             fs::metadata(&root).map_err(|error| Error::io("inspect restore root", &root, error))?;
         let state_identity = fs::metadata(&state)
@@ -426,6 +519,7 @@ impl BackupManifest {
         }
         let mut seen = BTreeMap::new();
         copy_snapshot(&backup.join("root"), &root, &self.root, &mut seen)?;
+        sync_snapshot_directories(&root, &self.root)?;
         fs::create_dir_all(state.join("content"))
             .map_err(|error| Error::io("create restored content state", &state, error))?;
         fs::create_dir(state.join("quarantine"))
@@ -440,12 +534,18 @@ impl BackupManifest {
                 &artifact.nodes,
                 &mut seen,
             )?;
+            sync_snapshot_directories(
+                &state.join("quarantine").join(&artifact.name),
+                &artifact.nodes,
+            )?;
         }
         for relative in DATABASES {
             let source = backup.join(relative);
             let destination = state.join(relative.trim_start_matches("state/"));
             copy_file(&source, &destination)?;
         }
+        sync_directory(&state.join("content"))?;
+        sync_directory(&state.join("quarantine"))?;
         sync_directory(&root)?;
         sync_directory(&state)?;
         Ok(())
@@ -673,4 +773,91 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| Error::io("persist directory", path, error))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_snapshot_directories(destination: &Path, nodes: &[SnapshotNode]) -> Result<()> {
+    let mut directories = nodes
+        .iter()
+        .filter(|node| node.directory)
+        .map(|node| node.path.as_str())
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| Reverse(path.split('/').count()));
+    for path in directories {
+        let target = if path.is_empty() {
+            destination.to_owned()
+        } else {
+            destination.join(path)
+        };
+        sync_directory(&target)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_path_traversal_is_rejected_before_restore_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"keep").unwrap();
+        let target = temp.path().join("target");
+        let manifest = BackupManifest {
+            magic: MAGIC,
+            version: VERSION,
+            filesystem: [1; 16],
+            binding: BackupBinding {
+                root: "/original".to_owned(),
+                root_dev: 1,
+                root_ino: 2,
+                state_dev: 1,
+                state_ino: 3,
+            },
+            root: vec![SnapshotNode {
+                path: String::new(),
+                directory: true,
+                length: None,
+                digest: None,
+                executable: false,
+                dev: 1,
+                ino: 2,
+                parent_dev: None,
+                parent_ino: None,
+            }],
+            artifacts: vec![ArtifactSnapshot {
+                id: "artifact".to_owned(),
+                name: "../outside".to_owned(),
+                present: true,
+                nodes: vec![SnapshotNode {
+                    path: String::new(),
+                    directory: false,
+                    length: Some(1),
+                    digest: Some([0; 32]),
+                    executable: false,
+                    dev: 1,
+                    ino: 4,
+                    parent_dev: None,
+                    parent_ino: None,
+                }],
+            }],
+            databases: Vec::new(),
+        };
+        manifest.save(&temp.path().join(MANIFEST)).unwrap();
+        let error = match BackupManifest::load(temp.path()) {
+            Ok(_) => panic!("unsafe manifest was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsafe artifact name"));
+        assert!(!target.exists());
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+    }
 }

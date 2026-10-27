@@ -2494,7 +2494,7 @@ fn same_tree(expected: &BTreeMap<String, LocalNode>, actual: &BTreeMap<String, L
         })
 }
 
-fn validate_path(path: &str) -> Result<()> {
+pub(super) fn validate_path(path: &str) -> Result<()> {
     if path.is_empty() {
         return Ok(());
     }
