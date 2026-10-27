@@ -75,6 +75,13 @@ pub struct Runtime {
     inner: Arc<Inner>,
 }
 impl Runtime {
+    pub(crate) async fn validate_staging(
+        staging: impl AsRef<Path>,
+        filesystem: NodeId,
+    ) -> Result<()> {
+        Stage::validate(staging.as_ref().join("staging.db"), filesystem).await
+    }
+
     pub async fn open(authority: Arc<dyn Authority>, staging: impl AsRef<Path>) -> Result<Self> {
         Self::open_mode(authority, staging, false).await
     }

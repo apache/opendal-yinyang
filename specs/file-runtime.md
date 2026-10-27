@@ -204,6 +204,11 @@ after dispatch is reported as `Unknown`: the original diagnostic and commit ID
 remain available, and retry uses the same frozen request rather than treating
 the missing response as a definitive failure.
 
+For a quiesced backup, stop the file or Mount owner and create a consistent
+SQLite backup of `staging.db`. The chunks, frozen requests, generations, and
+error ledger are all in that database; `runtime.lock` is only a process lease.
+See [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
+
 ## Validation and limits
 
 The file-operation tests exercise public Runtime/FileHandle methods against

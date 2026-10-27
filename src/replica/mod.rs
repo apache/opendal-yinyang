@@ -21,6 +21,7 @@
 //! binding, observation, fd-relative materialization and retained displaced
 //! bytes. It never recursively deletes a local path.
 
+mod backup;
 pub mod directory;
 mod error;
 pub(super) mod linux;

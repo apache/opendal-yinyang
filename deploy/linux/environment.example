@@ -1,0 +1,19 @@
+# Copy to ~/.config/yinyang/environment and chmod 600.
+# This file is read by the user units and must remain owner-only.
+YINYANG_BIN=replace-with-absolute-path/yinyang/current/bin/yy
+YINYANG_CONFIG_DIR=replace-with-absolute-home/.config/yinyang/volumes
+YINYANG_MOUNT_ROOT=replace-with-absolute-home/YinYang
+YINYANG_METADATA_DB=replace-with-absolute-home/.local/state/yinyang/metadata/metadata.db
+YINYANG_SERVICE_LISTEN=127.0.0.1:7447
+YINYANG_STORAGE_PROFILE=amazon-s3
+YINYANG_S3_BUCKET=replace-with-bucket
+YINYANG_S3_REGION=replace-with-region
+YINYANG_S3_ACCESS_KEY_ID=replace-or-remove-to-use-the-ambient-AWS-chain
+YINYANG_S3_SECRET_ACCESS_KEY=replace-or-remove-to-use-the-ambient-AWS-chain
+# Set these only for temporary AWS credentials or a MinIO-compatible endpoint.
+# YINYANG_S3_SESSION_TOKEN=replace-with-temporary-session-token
+# YINYANG_S3_ENDPOINT=http://127.0.0.1:9000
+# Required by a volume with publication=service. Generate 32 or more random bytes.
+YINYANG_SERVICE_TOKEN=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+# Put YINYANG_S3_ROOT in environment-object, environment-sync and
+# environment-service so each authority prefix stays isolated.

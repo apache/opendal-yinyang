@@ -106,6 +106,7 @@ authority with `yy serve --database metadata.db`. Then:
 ```shell
 yy --volume volume.json mount /mnt/workspace
 yy --volume volume.json capabilities
+yy --volume volume.json doctor --json
 yy --volume volume.json file create hello
 yy --volume volume.json file open hello --write
 # Use the returned handle UUID:
@@ -133,6 +134,21 @@ to abort it.
 An absent receipt never proves a delayed request cannot complete. One-shot
 `publish/restore` retain their original object-mode CLI and do not accept
 `--volume`; they are separate from the new handle lifecycle.
+
+`doctor` is the non-destructive operator-readiness projection. It reads the
+strict volume document, reports whether the current host is the tested
+operational combination, checks FUSE device/helper access, performs one
+owner-only temporary state-path write probe and removes it, inspects persisted
+Mount records read-only, validates admission, and observes the selected
+authority. It does not create the configured staging directory, initialize
+`staging.db` or `sync.db`, run recovery, acquire a runtime or publication
+lease, or publish. Its JSON form and exit codes are specified in
+[`linux-operations.md`](linux-operations.md).
+
+`doctor` reports readiness, not reconciliation convergence. In particular, a
+successful finite `sync run` and a successful `doctor` check do not establish
+that local and remote state match; only `sync status --json` with
+`summary.in_sync=true` and an available remote does.
 
 ## Status and limits
 

@@ -105,3 +105,14 @@ after the exchange. A conflict side exports its retained artifact or live local
 bytes (`local`) or the recorded remote node version (`remote`). Directory
 artifacts expose their retained path; byte-stream export of a directory is
 unsupported.
+
+## Backup and isolated restore
+
+`DirectorySync::backup` captures a quiesced package containing the local root,
+`replica.db`, `sync.db`, content staging, retained artifacts, and a
+checksum-protected manifest. `DirectorySync::restore` validates the package
+before creating destination trees, copies it to absent root/state paths, and
+maps the original root/quarantine identities to their copied identities. Work
+records, accepted fingerprints, CommitIds, and historical artifact digests
+remain unchanged. Incomplete installs are rejected rather than reinterpreted.
+See [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).

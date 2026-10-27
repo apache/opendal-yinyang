@@ -24,6 +24,7 @@ use std::path::Path;
 use yinyang_core::{Node, NodeId, NodeKind, Revision};
 
 pub(super) const PROFILE: &str = "yinyang-directory-replica-1";
+pub(super) type IdentityMap = BTreeMap<(u64, u64), (u64, u64)>;
 
 #[derive(Clone, Debug)]
 pub(super) struct Binding {
@@ -401,6 +402,223 @@ impl Store {
                 .map_err(|e| Error::corrupt(format!("decode state inode: {e}")))?
                 == binding.state_ino;
         Ok(matches)
+    }
+
+    /// Move a restored database to the filesystem identities of the isolated
+    /// root and state directories. Accepted fingerprints, commit identities
+    /// and historical artifact digests stay unchanged.
+    pub fn rebind(&mut self, binding: &Binding, identities: &IdentityMap) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|e| Error::corrupt(format!("begin replica rebind: {e}")))?;
+        let updated = transaction
+            .execute(
+                "UPDATE binding SET
+                   profile=?1,filesystem=?2,root=?3,root_dev=?4,root_ino=?5,
+                   state_dev=?6,state_ino=?7
+                 WHERE singleton=1",
+                params![
+                    PROFILE,
+                    binding.filesystem.as_bytes().as_slice(),
+                    binding.root,
+                    binding.root_dev.to_be_bytes().as_slice(),
+                    binding.root_ino.to_be_bytes().as_slice(),
+                    binding.state_dev.to_be_bytes().as_slice(),
+                    binding.state_ino.to_be_bytes().as_slice(),
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("rebind replica: {e}")))?;
+        if updated != 1 {
+            return Err(Error::invalid(
+                "sync state is not initialized; run sync init",
+            ));
+        }
+
+        let baseline = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT path,local_dev,local_ino,local_parent_dev,local_parent_ino
+                     FROM baseline WHERE local_present=1",
+                )
+                .map_err(|e| Error::corrupt(format!("read baseline identities: {e}")))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                })
+                .map_err(|e| Error::corrupt(format!("read baseline identities: {e}")))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| Error::corrupt(format!("read baseline identities: {e}")))?
+        };
+        for (path, dev, ino, parent_dev, parent_ino) in baseline {
+            let own = map_identity(identities, dev.as_deref(), ino.as_deref())?;
+            let parent = map_identity(identities, parent_dev.as_deref(), parent_ino.as_deref())?;
+            if own.is_none() && parent.is_none() {
+                continue;
+            }
+            transaction
+                .execute(
+                    "UPDATE baseline SET
+                       local_dev=?2,local_ino=?3,local_parent_dev=?4,local_parent_ino=?5
+                     WHERE path=?1",
+                    params![
+                        path,
+                        own.map(|value| value.0.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(dev.as_deref()),
+                        own.map(|value| value.1.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(ino.as_deref()),
+                        parent
+                            .map(|parent| parent.0.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(parent_dev.as_deref()),
+                        parent
+                            .map(|parent| parent.1.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(parent_ino.as_deref()),
+                    ],
+                )
+                .map_err(|e| Error::corrupt(format!("rebind baseline identity: {e}")))?;
+        }
+
+        let work = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id,local_dev,local_ino,local_parent_dev,local_parent_ino FROM work
+                     WHERE local_kind IS NOT NULL",
+                )
+                .map_err(|e| Error::corrupt(format!("read work identities: {e}")))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                })
+                .map_err(|e| Error::corrupt(format!("read work identities: {e}")))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| Error::corrupt(format!("read work identities: {e}")))?
+        };
+        for (id, dev, ino, parent_dev, parent_ino) in work {
+            let own = map_identity(identities, dev.as_deref(), ino.as_deref())?;
+            let parent = map_identity(identities, parent_dev.as_deref(), parent_ino.as_deref())?;
+            if own.is_none() && parent.is_none() {
+                continue;
+            }
+            transaction
+                .execute(
+                    "UPDATE work SET
+                       local_dev=?2,local_ino=?3,local_parent_dev=?4,local_parent_ino=?5
+                     WHERE id=?1",
+                    params![
+                        id,
+                        own.map(|value| value.0.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(dev.as_deref()),
+                        own.map(|value| value.1.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(ino.as_deref()),
+                        parent
+                            .map(|parent| parent.0.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(parent_dev.as_deref()),
+                        parent
+                            .map(|parent| parent.1.to_be_bytes())
+                            .as_ref()
+                            .map(|value| value.as_slice())
+                            .or(parent_ino.as_deref()),
+                    ],
+                )
+                .map_err(|e| Error::corrupt(format!("rebind work identity: {e}")))?;
+        }
+
+        let installs = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id,expected_dev,expected_ino,parent_dev,parent_ino,
+                            temporary_dev,temporary_ino
+                     FROM installs",
+                )
+                .map_err(|e| Error::corrupt(format!("read install identities: {e}")))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                    ))
+                })
+                .map_err(|e| Error::corrupt(format!("read install identities: {e}")))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| Error::corrupt(format!("read install identities: {e}")))?
+        };
+        for (id, expected_dev, expected_ino, parent_dev, parent_ino, temp_dev, temp_ino) in installs
+        {
+            let expected = map_identity(identities, Some(&expected_dev), Some(&expected_ino))?;
+            let parent = map_identity(identities, Some(&parent_dev), Some(&parent_ino))?;
+            let temporary = map_identity(identities, temp_dev.as_deref(), temp_ino.as_deref())?;
+            let expected_dev = expected
+                .map(|value| value.0.to_be_bytes().to_vec())
+                .unwrap_or(expected_dev);
+            let expected_ino = expected
+                .map(|value| value.1.to_be_bytes().to_vec())
+                .unwrap_or(expected_ino);
+            let parent_dev = parent
+                .map(|value| value.0.to_be_bytes().to_vec())
+                .unwrap_or(parent_dev);
+            let parent_ino = parent
+                .map(|value| value.1.to_be_bytes().to_vec())
+                .unwrap_or(parent_ino);
+            let temporary_dev = temporary
+                .map(|value| value.0.to_be_bytes().to_vec())
+                .or(temp_dev);
+            let temporary_ino = temporary
+                .map(|value| value.1.to_be_bytes().to_vec())
+                .or(temp_ino);
+            transaction
+                .execute(
+                    "UPDATE installs SET
+                       expected_dev=?2,expected_ino=?3,parent_dev=?4,parent_ino=?5,
+                       temporary_dev=?6,temporary_ino=?7
+                     WHERE id=?1",
+                    params![
+                        id,
+                        expected_dev.as_slice(),
+                        expected_ino.as_slice(),
+                        parent_dev.as_slice(),
+                        parent_ino.as_slice(),
+                        temporary_dev.as_deref(),
+                        temporary_ino.as_deref(),
+                    ],
+                )
+                .map_err(|e| Error::corrupt(format!("rebind install identity: {e}")))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|e| Error::corrupt(format!("commit replica rebind: {e}")))?;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1321,6 +1539,30 @@ fn ensure_column(
 
 fn number(bytes: &[u8], name: &str) -> rusqlite::Result<u64> {
     Ok(u64::from_be_bytes(fixed(bytes, name)?))
+}
+
+fn map_identity(
+    identities: &IdentityMap,
+    dev: Option<&[u8]>,
+    ino: Option<&[u8]>,
+) -> Result<Option<(u64, u64)>> {
+    let (Some(dev), Some(ino)) = (dev, ino) else {
+        return Ok(None);
+    };
+    let old = (
+        number(dev, "device").map_err(|e| Error::corrupt(format!("decode device: {e}")))?,
+        number(ino, "inode").map_err(|e| Error::corrupt(format!("decode inode: {e}")))?,
+    );
+    if let Some(mapped) = identities.get(&old) {
+        return Ok(Some(*mapped));
+    }
+    if identities.values().any(|value| *value == old) {
+        return Err(Error::corrupt(format!(
+            "stored local identity {}/{} is absent from the manifest but collides with a restored inode",
+            old.0, old.1
+        )));
+    }
+    Ok(None)
 }
 
 fn corrupt_sql(message: impl Into<String>) -> rusqlite::Error {
