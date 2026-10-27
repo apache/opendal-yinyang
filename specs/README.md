@@ -12,6 +12,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Mount runtime](mount-runtime.md) | Instance-local shared nodes, explicit refresh, remote fsync, and retained failures. |
 | [Sync runtime](sync-runtime.md) | Experimental content and namespace coordinator against an explicit remote baseline. |
 | [Linux Managed Sync](linux-sync.md) | The `yy ... sync` ordinary-directory CLI: admission, exit codes, offline retained-byte export, and the `yinyang.sync.status.v1` document. |
+| [Managed Sync acceptance](managed-sync-acceptance.md) | Real-process Linux acceptance for ordinary-directory reconciliation, conflicts, artifacts, and recovery. |
 | [Native bridge](native-bridge.md) | In-process ownership and private adapter request semantics. |
 | [Experimental macOS frontends](macos-frontends.md) | Isolated FSKit and File Provider prototypes; not ordinary CLI admission. |
 | [Volume capabilities](volume-capabilities.md) | Configuration, four-layer admission, Managed write policy, and CLI status. |
