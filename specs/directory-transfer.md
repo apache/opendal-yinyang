@@ -62,6 +62,13 @@ directory manifest derived during that same successful preparation. Unknown or
 mismatched profiles and filesystem bindings are rejected. This local format has
 no stable released migration promise.
 
+The canonical journal directory must be outside the canonical source tree. A
+preparation that would publish the journal's own `directory.db` or WAL files is
+rejected after the existing-identity check but before local scanning or content
+upload. Path aliases and symlinked source roots are resolved before this check.
+A source located below a larger state directory is allowed when the journal
+files themselves remain outside that source.
+
 The manifest includes the root, empty directories, unchanged files, prepared
 files and executable flags. It exists to project paths for status and export; it
 does not replace the frozen transaction as publication authority. Export never
