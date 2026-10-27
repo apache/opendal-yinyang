@@ -28,12 +28,18 @@ still be used on other Linux hosts without claiming they are qualified.
 | Frontend | Object publication | Loopback service publication |
 | --- | --- | --- |
 | Managed Mount | Qualified by the object lifecycle smoke | Qualified by the service lifecycle smoke |
-| Finite Managed Sync | Qualified by the object lifecycle smoke | Requires a service-volume Sync smoke |
+| Finite Managed Sync | Qualified by the object lifecycle smoke | Qualified by the service lifecycle smoke |
 
 Amazon S3 and MinIO-compatible storage are separate matrix entries even when
 they use the same S3 provider code. Record the exact backend and endpoint in
 qualification evidence; a MinIO run does not qualify Amazon S3 or another
 non-loopback deployment.
+
+The initial isolated-Silo evidence covers the foreground exact-CLI lifecycle at
+`20fdbae` and the actual `systemctl --user` unit lifecycle at `20fdbae`; the
+live-Mount and unstarted-state doctor regression passed at `ee3046b`. Both
+include object and authenticated-loopback-service Mount/Sync combinations.
+These MinIO results do not claim Amazon S3 or non-loopback deployment support.
 
 Managed Mount and Managed Sync remain experimental. The metadata service is one
 authenticated single-host loopback authority, not TLS, HA or a network-safe
