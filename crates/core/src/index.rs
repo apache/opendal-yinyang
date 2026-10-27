@@ -17,6 +17,8 @@
 
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::{Error, Result};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const MAX: usize = 32;
 const MIN: usize = MAX / 2;
@@ -24,18 +26,77 @@ const PAGE_BYTES: u32 = 64 * 1024;
 const VALUE_BYTES: u32 = 16 * 1024 * 1024;
 const INLINE: usize = 512;
 const KEY_BYTES: usize = 1024;
+const CACHED_PAGES: usize = 256;
+const CACHED_VALUES: usize = 4096;
+const CACHED_VALUE_BYTES: usize = 32 * 1024 * 1024;
 type Wire = ([u8; 8], u8, Vec<(Vec<u8>, Vec<u8>, Option<RefWire>)>);
 
 /// An immutable, authenticated B+ tree. Branch separators are inclusive maxima.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index(pub(crate) Option<PackedRef>);
 
-#[derive(Clone)]
+/// Operation-local memoization for one immutable snapshot view.
+///
+/// Index pages and external values are content-addressed, so reuse cannot
+/// change what the pinned snapshot observes. Writers never use this cache.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IndexCache {
+    state: Arc<Mutex<IndexCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct IndexCacheState {
+    pages: HashMap<PackedRef, Page>,
+    values: HashMap<PackedRef, Vec<u8>>,
+    value_bytes: usize,
+}
+
+impl IndexCache {
+    fn page(&self, reference: &PackedRef) -> Option<Page> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pages.get(reference).cloned()
+    }
+
+    fn insert_page(&self, reference: PackedRef, page: Page) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.pages.len() < CACHED_PAGES {
+            state.pages.entry(reference).or_insert(page);
+        }
+    }
+
+    fn value(&self, reference: &PackedRef) -> Option<Vec<u8>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.values.get(reference).cloned()
+    }
+
+    fn insert_value(&self, reference: PackedRef, bytes: Vec<u8>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = state.value_bytes.saturating_add(bytes.len());
+        if state.values.len() < CACHED_VALUES && next <= CACHED_VALUE_BYTES {
+            state.value_bytes = next;
+            state.values.entry(reference).or_insert(bytes);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 enum Value {
     Inline(Vec<u8>),
     External(PackedRef),
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Page {
     Leaf(Vec<(Vec<u8>, Value)>),
     Branch(u8, Vec<(Vec<u8>, PackedRef)>),
@@ -180,6 +241,37 @@ impl Index {
             }
         }
     }
+    pub(crate) async fn get_cached(
+        &self,
+        store: &DataStore,
+        cache: &IndexCache,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(root) = &self.0 else {
+            return Ok(None);
+        };
+        let mut page = Self::page_cached(store, cache, root, true).await?;
+        loop {
+            match page {
+                Page::Leaf(entries) => {
+                    return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                        Ok(i) => Self::value_cached(store, cache, &entries[i].1)
+                            .await
+                            .map(Some),
+                        Err(_) => Ok(None),
+                    };
+                }
+                Page::Branch(level, children) => {
+                    let i = children.partition_point(|(k, _)| k.as_slice() < key);
+                    if i == children.len() {
+                        return Ok(None);
+                    }
+                    page = Self::child_cached(store, cache, level, &children[i].0, &children[i].1)
+                        .await?;
+                }
+            }
+        }
+    }
     pub(crate) async fn set(
         &mut self,
         store: &DataStore,
@@ -310,6 +402,26 @@ impl Index {
         }
         Ok(output)
     }
+    pub(crate) async fn scan_cached(
+        &self,
+        store: &DataStore,
+        cache: &IndexCache,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut output = Vec::new();
+        if limit == 0 {
+            return Ok(output);
+        }
+        if let Some(root) = &self.0 {
+            let page = Self::page_cached(store, cache, root, true).await?;
+            Self::scan_page_cached(store, cache, page, lower, upper, after, limit, &mut output)
+                .await?;
+        }
+        Ok(output)
+    }
     async fn scan_page(
         store: &DataStore,
         page: Page,
@@ -345,6 +457,91 @@ impl Index {
                         let child = Self::child(store, level, &key, &reference).await?;
                         Box::pin(Self::scan_page(
                             store, child, lower, upper, after, limit, output,
+                        ))
+                        .await?;
+                    }
+                    previous = Some(key);
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn page_cached(
+        store: &DataStore,
+        cache: &IndexCache,
+        reference: &PackedRef,
+        root: bool,
+    ) -> Result<Page> {
+        if let Some(page) = cache.page(reference) {
+            return Ok(page);
+        }
+        let page = Self::page(store, reference, root).await?;
+        cache.insert_page(reference.clone(), page.clone());
+        Ok(page)
+    }
+    async fn child_cached(
+        store: &DataStore,
+        cache: &IndexCache,
+        level: u8,
+        key: &[u8],
+        reference: &PackedRef,
+    ) -> Result<Page> {
+        let page = Self::page_cached(store, cache, reference, false).await?;
+        if page.level() + 1 != level || page.last() != key {
+            return Err(corrupt("child separator or level disagrees"));
+        }
+        Ok(page)
+    }
+    async fn value_cached(store: &DataStore, cache: &IndexCache, value: &Value) -> Result<Vec<u8>> {
+        match value {
+            Value::Inline(v) => Ok(v.clone()),
+            Value::External(reference) => {
+                if let Some(bytes) = cache.value(reference) {
+                    return Ok(bytes);
+                }
+                let bytes = store.read_extent(reference, VALUE_BYTES).await?;
+                cache.insert_value(reference.clone(), bytes.clone());
+                Ok(bytes)
+            }
+        }
+    }
+    async fn scan_page_cached(
+        store: &DataStore,
+        cache: &IndexCache,
+        page: Page,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+        output: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        match page {
+            Page::Leaf(entries) => {
+                for (key, value) in entries {
+                    if key.as_slice() < lower || after.is_some_and(|a| key.as_slice() <= a) {
+                        continue;
+                    }
+                    if upper.is_some_and(|u| key.as_slice() >= u) || output.len() == limit {
+                        break;
+                    }
+                    output.push((key, Self::value_cached(store, cache, &value).await?));
+                }
+            }
+            Page::Branch(level, children) => {
+                let mut previous: Option<Vec<u8>> = None;
+                for (key, reference) in children {
+                    if output.len() == limit
+                        || previous
+                            .as_ref()
+                            .is_some_and(|p| upper.is_some_and(|u| p.as_slice() >= u))
+                    {
+                        break;
+                    }
+                    if key.as_slice() >= lower && !after.is_some_and(|a| key.as_slice() <= a) {
+                        let child =
+                            Self::child_cached(store, cache, level, &key, &reference).await?;
+                        Box::pin(Self::scan_page_cached(
+                            store, cache, child, lower, upper, after, limit, output,
                         ))
                         .await?;
                     }

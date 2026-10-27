@@ -152,6 +152,34 @@ async fn indexed_costs_follow_changed_paths_not_namespace_or_history_size() {
 }
 
 #[tokio::test]
+async fn object_snapshot_reuses_authenticated_index_reads() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let anchor = plan.create_directory(fs.root(), "anchor").await.unwrap();
+    for i in 0..64 {
+        let empty = fs.data().prepare(&mut b"".as_slice()).await.unwrap();
+        plan.create_file(anchor, &format!("file-{i:04}"), empty, false)
+            .await
+            .unwrap();
+    }
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+
+    let snapshot = fs.observe_latest().await.unwrap();
+    snapshot.resolve("anchor/file-0042").await.unwrap().unwrap();
+    snapshot.scan(fs.root(), None, 4096).await.unwrap();
+    snapshot.scan(anchor, None, 4096).await.unwrap();
+
+    backend.state.lock().unwrap().data_reads = 0;
+    for _ in 0..64 {
+        snapshot.resolve("anchor/file-0042").await.unwrap().unwrap();
+        snapshot.scan(fs.root(), None, 4096).await.unwrap();
+        snapshot.scan(anchor, None, 4096).await.unwrap();
+    }
+    assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+}
+
+#[tokio::test]
 async fn indexed_deep_paths_names_and_invalid_profiles() {
     use yinyang_core::namespace::name_key;
     for name in [
