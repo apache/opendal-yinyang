@@ -850,10 +850,6 @@ impl UserUnits {
             );
         }
         systemctl(&["daemon-reload"]).success_or("systemctl --user daemon-reload");
-        let paths = [&units.serve, &units.mount, &units.sync]
-            .map(|unit| directory.join(unit).display().to_string());
-        systemd_analyze(&paths.iter().map(String::as_str).collect::<Vec<_>>())
-            .success_or("systemd-analyze --user verify");
         units
     }
 
@@ -977,15 +973,6 @@ fn systemctl(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("run systemctl --user")
-}
-
-fn systemd_analyze(args: &[&str]) -> Output {
-    Command::new("systemd-analyze")
-        .arg("--user")
-        .arg("verify")
-        .args(args)
-        .output()
-        .expect("run systemd-analyze --user verify")
 }
 
 trait ExitStatusExt {
