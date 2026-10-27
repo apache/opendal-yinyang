@@ -19,3 +19,4 @@
 
 mod acceptance;
 mod harness;
+mod read_only_range;

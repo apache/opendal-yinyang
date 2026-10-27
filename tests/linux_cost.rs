@@ -44,17 +44,33 @@ mod fixture;
 
 use fixture::{Fixture, Publication, SyncPaths};
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v1";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v3";
 const CHUNK: usize = 64 * 1024;
+const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
 const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io while alive; terminal increments can be missed, so values are lower bounds and character I/O includes sockets";
 const STORAGE_BACKEND: &str = "loopback Silo, MinIO-compatible S3 over HTTP";
 const METADATA_TRANSPORT: &str = "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
     Early,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Workload {
+    Full,
+    ReadOnlyRange,
+}
+
+impl Workload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReadOnlyRange => "read-only-range",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +135,7 @@ impl Scale {
 
 struct RunContext {
     profile: Profile,
+    workload: Workload,
     publication_filter: PublicationFilter,
     source_sha: String,
     source_dirty: bool,
@@ -184,13 +201,23 @@ fn linux_cost_benchmark() {
         Ok("full") => Profile::Full,
         value => panic!("YINYANG_COST_PROFILE must be early or full, got {value:?}"),
     };
+    let workload = match std::env::var("YINYANG_COST_WORKLOAD").as_deref() {
+        Ok("full") | Err(_) => Workload::Full,
+        Ok("read-only-range") => Workload::ReadOnlyRange,
+        value => panic!("YINYANG_COST_WORKLOAD must be full or read-only-range, got {value:?}"),
+    };
     let publication_filter = match std::env::var("YINYANG_COST_PUBLICATION").as_deref() {
         Ok("all") | Err(_) => PublicationFilter::All,
         Ok("object") => PublicationFilter::Object,
         Ok("service") => PublicationFilter::Service,
         value => panic!("YINYANG_COST_PUBLICATION must be all, object, or service, got {value:?}"),
     };
-    if matches!(profile, Profile::Early) && matches!(publication_filter, PublicationFilter::Service)
+    if matches!(workload, Workload::ReadOnlyRange) && profile != Profile::Full {
+        panic!("read-only-range workload requires YINYANG_COST_PROFILE=full");
+    }
+    if matches!(workload, Workload::Full)
+        && matches!(profile, Profile::Early)
+        && matches!(publication_filter, PublicationFilter::Service)
     {
         panic!("service publication selection requires the full profile");
     }
@@ -207,6 +234,7 @@ fn linux_cost_benchmark() {
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
     let context = RunContext {
         profile,
+        workload,
         publication_filter,
         source_sha,
         source_dirty,
@@ -219,11 +247,12 @@ fn linux_cost_benchmark() {
     let upstream = s3_upstream();
     let proxy = Arc::new(CountingProxy::start(upstream));
     println!(
-        "linux-cost: source={} dirty={} binary={} binary_blake3={} profile={:?} proxy={} silo={upstream}",
+        "linux-cost: source={} dirty={} binary={} binary_blake3={} workload={} profile={:?} proxy={} silo={upstream}",
         context.source_sha,
         context.source_dirty,
         context.binary_path,
         context.binary_blake3,
+        context.workload.as_str(),
         match context.profile {
             Profile::Early => "early",
             Profile::Full => "full",
@@ -240,11 +269,23 @@ fn linux_cost_benchmark() {
         (Profile::Full, PublicationFilter::Object) => &[Publication::Object],
         (Profile::Full, PublicationFilter::Service) => &[Publication::Service],
     };
-    let scales: &[Scale] = match profile {
-        Profile::Early => &[Scale::Small],
-        Profile::Full => &[Scale::Small, Scale::Medium],
+    let scales: &[Scale] = match (workload, profile) {
+        (Workload::ReadOnlyRange, _) | (Workload::Full, Profile::Full) => {
+            &[Scale::Small, Scale::Medium]
+        }
+        (Workload::Full, Profile::Early) => &[Scale::Small],
     };
     let mut recorder = Recorder::new(&context, &output, &summary);
+
+    if matches!(workload, Workload::ReadOnlyRange) {
+        for &publication in publications {
+            for &scale in scales {
+                run_read_only_range_matrix(&context, &proxy, publication, scale, &mut recorder);
+            }
+        }
+        recorder.finish();
+        return;
+    }
 
     for &publication in publications {
         for &scale in scales {
@@ -453,6 +494,7 @@ fn run_fuse_matrix(
     let (config, staging, mountpoint) = mount_paths(
         fixture,
         &format!("fuse-{}-{}", publication.as_str(), scale.as_str()),
+        false,
     );
     fs::create_dir(&mountpoint).expect("create benchmark mountpoint");
     let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
@@ -620,6 +662,186 @@ fn run_fuse_matrix(
     restarted.unmount();
 }
 
+fn run_read_only_range_matrix(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    scale: Scale,
+    recorder: &mut Recorder,
+) {
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
+    let size = scale.file_size();
+    let expected = payload(size, 0x6d);
+    fixture.remote_create_file("large.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        fixture,
+        &format!(
+            "read-only-range-{}-{}",
+            publication.as_str(),
+            scale.as_str()
+        ),
+        true,
+    );
+    fs::create_dir(&mountpoint).expect("create read-only benchmark mountpoint");
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    let dataset = Dataset {
+        kind: "single_large_read_only_file".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: Some(RANGE_BYTES as u64),
+        writers: None,
+    };
+    recorder.record(
+        context,
+        "fuse_read_only_range_mount_ready",
+        publication,
+        scale,
+        dataset.clone(),
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["read-only mount type=fuse.yinyang".to_owned()],
+    );
+
+    let large = mountpoint.join("large.bin");
+    let midpoint = (size / 2) as u64;
+    let cold_remote_space = space_snapshot(fixture, None, None, None);
+    let cold = measure_mount_operation(&meter, mounted.pid(), || {
+        let file = File::open(&large).expect("cold open read-only FUSE file");
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&file, &mut value, midpoint);
+        let staging_bytes = tree_bytes(&staging);
+        (file, value, staging_bytes)
+    });
+    let Measurement {
+        value: (cold_file, cold_bytes, cold_staging_bytes),
+        latency_ms,
+        io,
+        network,
+    } = cold;
+    let cold_space = SpaceSnapshot {
+        mount_staging_bytes: cold_staging_bytes,
+        ..cold_remote_space
+    };
+    assert_eq!(
+        cold_bytes,
+        expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+    );
+    let cold_after = space_snapshot(fixture, None, None, Some(&staging));
+    recorder.record(
+        context,
+        "fuse_read_only_range_cold_4k",
+        publication,
+        scale,
+        dataset.clone(),
+        "cold open plus one 4 KiB pread while the descriptor remains open",
+        vec![latency_ms],
+        io,
+        network,
+        vec![cold_space, cold_after.clone()],
+        cold_after,
+        vec!["middle 4 KiB range verified".to_owned()],
+    );
+
+    let mut warm = OperationBatch::default();
+    for index in 0..5 {
+        let offset = midpoint + (index * RANGE_BYTES) as u64;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&cold_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+        warm.push(measured);
+    }
+    warm.record(
+        recorder,
+        context,
+        "fuse_read_only_range_warm_4k",
+        publication,
+        scale,
+        dataset.clone(),
+        "five 4 KiB reads on the already-open read-only descriptor",
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["all warm range bytes verified".to_owned()],
+    );
+    drop(cold_file);
+    mounted.unmount();
+
+    let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_read_only_range_restart_mount_ready",
+        publication,
+        scale,
+        dataset.clone(),
+        "interval begins before the replacement read-only mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["replacement mount type=fuse.yinyang and read-only policy".to_owned()],
+    );
+
+    let boundary = (RANGE_BYTES / 2) as u64;
+    let boundary_offset = BLOCK_BYTES as u64 - boundary;
+    let boundary_length = RANGE_BYTES * 2;
+    let boundary_remote_space = space_snapshot(fixture, None, None, None);
+    let crossing = measure_mount_operation(&meter, restarted.pid(), || {
+        let file = File::open(&large).expect("open read-only boundary file after restart");
+        let mut value = vec![0_u8; boundary_length];
+        read_exact_at(&file, &mut value, boundary_offset);
+        let staging_bytes = tree_bytes(&staging);
+        (file, value, staging_bytes)
+    });
+    let Measurement {
+        value: (boundary_file, boundary_bytes, boundary_staging_bytes),
+        latency_ms,
+        io,
+        network,
+    } = crossing;
+    let boundary_space = SpaceSnapshot {
+        mount_staging_bytes: boundary_staging_bytes,
+        ..boundary_remote_space
+    };
+    assert_eq!(
+        boundary_bytes,
+        expected[boundary_offset as usize..boundary_offset as usize + boundary_length],
+        "restarted read-only mount did not preserve bytes across a verification-unit boundary"
+    );
+    drop(boundary_file);
+    let boundary_dataset = Dataset {
+        range_bytes: Some(boundary_length as u64),
+        ..dataset
+    };
+    let boundary_after = space_snapshot(fixture, None, None, Some(&staging));
+    recorder.record(
+        context,
+        "fuse_read_only_range_restart_boundary_crossing",
+        publication,
+        scale,
+        boundary_dataset,
+        "cold open after restart plus one 8 KiB pread spanning a 64 KiB verification-unit boundary",
+        vec![latency_ms],
+        io,
+        network,
+        vec![boundary_space, boundary_after.clone()],
+        boundary_after,
+        vec!["boundary-crossing range bytes verified".to_owned()],
+    );
+    restarted.unmount();
+}
+
 fn run_concurrent_matrix(
     context: &RunContext,
     proxy: &Arc<CountingProxy>,
@@ -634,6 +856,7 @@ fn run_concurrent_matrix(
     let (config, staging, mountpoint) = mount_paths(
         fixture,
         &format!("concurrent-{}-{}", publication.as_str(), scale.as_str()),
+        false,
     );
     fs::create_dir(&mountpoint).expect("create concurrent mountpoint");
     let (mut mounted, _) = FuseMount::start(fixture, &config, &mountpoint, &meter);
@@ -874,7 +1097,7 @@ fn remote_file_bytes(fixture: &Fixture, path: &str) -> Vec<u8> {
     }
 }
 
-fn mount_paths(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+fn mount_paths(fixture: &Fixture, name: &str, read_only: bool) -> (PathBuf, PathBuf, PathBuf) {
     let staging = fixture.path(format!("{name}-state"));
     let mountpoint = fixture.path(format!("{name}-mount"));
     let config = fixture.path(format!("{name}.json"));
@@ -886,7 +1109,7 @@ fn mount_paths(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf) {
         "publication": fixture.publication.as_str(),
         "storage_profile": "minio",
         "staging": staging,
-        "read_only": false,
+        "read_only": read_only,
         "require": [],
     });
     if fixture.publication == Publication::Service {
@@ -1378,27 +1601,25 @@ struct CountingProxy {
 impl CountingProxy {
     fn start(upstream: SocketAddr) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting S3 proxy");
-        listener
-            .set_nonblocking(true)
-            .expect("make counting proxy listener nonblocking");
         let address = listener.local_addr().expect("counting proxy address");
         let counters = Arc::new(ProxyCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_counters = counters.clone();
         let thread_stop = stop.clone();
         let thread = thread::spawn(move || {
-            while !thread_stop.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((client, _)) => {
-                        thread_counters.connections.fetch_add(1, Ordering::Relaxed);
-                        let counters = thread_counters.clone();
-                        thread::spawn(move || proxy_connection(client, upstream, counters));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            loop {
+                let Ok((client, _)) = listener.accept() else {
+                    break;
+                };
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                client
+                    .set_nodelay(true)
+                    .expect("disable Nagle on counting S3 client");
+                thread_counters.connections.fetch_add(1, Ordering::Relaxed);
+                let counters = thread_counters.clone();
+                thread::spawn(move || proxy_connection(client, upstream, counters));
             }
         });
         Self {
@@ -1481,6 +1702,9 @@ impl CountingServiceProxy {
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
                 }
+                client
+                    .set_nodelay(true)
+                    .expect("disable Nagle on counting service client");
                 thread_counters.connections.fetch_add(1, Ordering::Relaxed);
                 let counters = thread_counters.clone();
                 thread::spawn(move || service_proxy_connection(client, upstream, counters));
@@ -1525,6 +1749,9 @@ fn service_proxy_connection(
     let Ok(server) = TcpStream::connect(upstream) else {
         return;
     };
+    server
+        .set_nodelay(true)
+        .expect("disable Nagle on counting service upstream");
     let (Ok(mut client_read), Ok(mut server_write)) = (client.try_clone(), server.try_clone())
     else {
         return;
@@ -1574,6 +1801,9 @@ fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<Proxy
     let Ok(server) = TcpStream::connect(upstream) else {
         return;
     };
+    server
+        .set_nodelay(true)
+        .expect("disable Nagle on counting S3 upstream");
     let (Ok(mut client_read), Ok(mut server_write)) = (client.try_clone(), server.try_clone())
     else {
         return;
@@ -1946,10 +2176,20 @@ fn cache_policy(scenario: &str) -> &'static str {
     }
 }
 
+fn volume_mode(scenario: &str) -> &'static str {
+    if scenario.starts_with("fuse_read_only_") {
+        "read_only"
+    } else {
+        "read_write"
+    }
+}
+
 #[derive(Serialize)]
 struct CostRecord {
     schema: &'static str,
     scenario: String,
+    workload: String,
+    volume_mode: &'static str,
     profile: String,
     publication_filter: String,
     publication: String,
@@ -2003,6 +2243,7 @@ impl Recorder {
             summary_path: summary.to_path_buf(),
             context: RunContext {
                 profile: context.profile,
+                workload: context.workload,
                 publication_filter: context.publication_filter,
                 source_sha: context.source_sha.clone(),
                 source_dirty: context.source_dirty,
@@ -2038,6 +2279,8 @@ impl Recorder {
         let record = CostRecord {
             schema: RESULT_SCHEMA,
             scenario: scenario.to_owned(),
+            workload: context.workload.as_str().to_owned(),
+            volume_mode: volume_mode(scenario),
             profile: match context.profile {
                 Profile::Early => "early",
                 Profile::Full => "full",
@@ -2105,6 +2348,8 @@ impl Recorder {
         let record = CostRecord {
             schema: RESULT_SCHEMA,
             scenario: scenario.to_owned(),
+            workload: context.workload.as_str().to_owned(),
+            volume_mode: volume_mode(scenario),
             profile: match context.profile {
                 Profile::Early => "early",
                 Profile::Full => "full",
@@ -2174,13 +2419,14 @@ impl Recorder {
         let mut markdown = String::new();
         markdown.push_str("# Linux cost baseline\n\n");
         markdown.push_str(&format!(
-            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
+            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Workload: `{}`\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
             self.context.source_sha,
             self.context.source_dirty,
             self.context.binary_path,
             self.context.binary_blake3,
             self.context.host,
             self.context.rustc,
+            self.context.workload.as_str(),
             match self.context.profile {
                 Profile::Early => "early",
                 Profile::Full => "full",
@@ -2190,16 +2436,18 @@ impl Recorder {
             unsupported,
         ));
         markdown.push_str(
-            "| Scenario | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
+            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
         );
         markdown.push_str(
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for record in &self.records {
             if !record.supported {
                 markdown.push_str(&format!(
-                    "| {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - |\n",
+                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - |\n",
                     record.scenario,
+                    record.workload,
+                    record.volume_mode,
                     record.publication,
                     record.scale,
                     record
@@ -2211,8 +2459,10 @@ impl Recorder {
             }
             let network = &record.network_per_sample;
             markdown.push_str(&format!(
-                "| {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
                 record.scenario,
+                record.workload,
+                record.volume_mode,
                 record.publication,
                 record.scale,
                 record.iterations,
@@ -2239,7 +2489,8 @@ impl Recorder {
         );
         fs::write(&self.summary_path, markdown).expect("write benchmark Markdown summary");
         println!(
-            "linux-cost: filter={} wrote {} records ({} measured, {} unsupported) to {} and {}",
+            "linux-cost: workload={} filter={} wrote {} records ({} measured, {} unsupported) to {} and {}",
+            self.context.workload.as_str(),
             self.context.publication_filter.as_str(),
             self.records.len(),
             measured,

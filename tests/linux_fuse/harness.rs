@@ -22,6 +22,7 @@ use nix::unistd::Pid;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::linux::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -153,6 +154,12 @@ impl Frontend {
             Self::Fuse => "fuse",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ContentCorruption {
+    Proof,
+    Data,
 }
 
 pub struct Fixture {
@@ -482,6 +489,43 @@ impl Fixture {
         self.remote_write(config, path, bytes);
     }
 
+    pub fn remote_create_file(&self, path: &str, mut bytes: &[u8], executable: bool) {
+        let authority = self.in_process_authority();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process create-file runtime");
+        runtime.block_on(async move {
+            let snapshot = authority
+                .observe_latest()
+                .await
+                .expect("observe in-process create-file base");
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let parent = snapshot
+                .resolve(parent)
+                .await
+                .expect("resolve in-process create-file parent")
+                .expect("in-process create-file parent exists");
+            let prepared = authority
+                .prepare(&mut bytes)
+                .await
+                .expect("prepare in-process file content");
+            let mut plan = Planner::new(&snapshot, CommitId::generate());
+            plan.create_file(parent.id(), name, prepared, executable)
+                .await
+                .expect("plan in-process file creation");
+            let request = plan.finish().expect("finish in-process file creation");
+            let outcome = authority
+                .commit(&request)
+                .await
+                .expect("commit in-process file creation");
+            assert!(
+                matches!(&outcome, CommitOutcome::Committed(_)),
+                "in-process file creation did not commit: {outcome:?}"
+            );
+        });
+    }
+
     pub fn remote_write(&self, _config: &Path, path: &str, bytes: &[u8]) {
         let authority = self.in_process_authority();
         let staging = self.in_process_staging("write");
@@ -504,6 +548,161 @@ impl Fixture {
                 .await
                 .expect("fsync in-process authority write");
             file.close().await.expect("close in-process write handle");
+        });
+    }
+
+    pub fn remote_replace_file(&self, path: &str, mut bytes: &[u8]) {
+        let authority = self.in_process_authority();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build in-process replace runtime");
+        runtime.block_on(async move {
+            let snapshot = authority
+                .observe_latest()
+                .await
+                .expect("observe in-process replace base");
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let parent = snapshot
+                .resolve(parent)
+                .await
+                .expect("resolve in-process replace parent")
+                .expect("in-process replace parent exists");
+            snapshot
+                .resolve(path)
+                .await
+                .expect("resolve in-process replace target")
+                .expect("in-process replace target exists");
+            let prepared = authority
+                .prepare(&mut bytes)
+                .await
+                .expect("prepare in-process replacement content");
+            let replacement = format!(".replace-{}", uuid::Uuid::new_v4().simple());
+            let mut plan = Planner::new(&snapshot, CommitId::generate());
+            let replacement = plan
+                .create_file(parent.id(), &replacement, prepared, false)
+                .await
+                .expect("plan in-process replacement file");
+            plan.rename_replace(replacement, parent.id(), name)
+                .await
+                .expect("plan in-process replacement rename");
+            let request = plan.finish().expect("finish in-process replacement");
+            let outcome = authority
+                .commit(&request)
+                .await
+                .expect("commit in-process replacement");
+            assert!(
+                matches!(&outcome, CommitOutcome::Committed(_)),
+                "in-process replacement did not commit: {outcome:?}"
+            );
+        });
+    }
+
+    /// Flips one byte in a referenced content extent. `Proof` targets the
+    /// content descriptor's root index node; `Data` follows the hash tree to
+    /// its first data leaf. Both corruptions therefore exercise the same
+    /// authenticated pack envelope through different logical references.
+    pub fn corrupt_content(&self, path: &str, corruption: ContentCorruption) {
+        const HASH_MAGIC: &[u8; 8] = b"YYHASH02";
+        type PackedRef = ([u8; 16], u64, u32, [u8; 32]);
+        type ContentChild = ([u8; 32], PackedRef);
+        type ContentFile = ([u8; 8], [u8; 16], u64, Option<ContentChild>);
+
+        fn key(filesystem: [u8; 16], object: [u8; 16]) -> String {
+            format!(
+                ".yinyang/v2/{}/packs/{}",
+                uuid::Uuid::from_bytes(filesystem).simple(),
+                uuid::Uuid::from_bytes(object).simple()
+            )
+        }
+
+        fn decode_node(bytes: &[u8]) -> (u8, Option<PackedRef>, Option<ContentChild>) {
+            assert_eq!(
+                bytes.get(..8),
+                Some(HASH_MAGIC.as_slice()),
+                "content index does not use the YYHASH02 profile"
+            );
+            match bytes.get(8).copied().expect("content index has a tag") {
+                0 => {
+                    let ((magic, tag), reference): (([u8; 8], u8), PackedRef) =
+                        borsh::from_slice(bytes).expect("decode content leaf");
+                    assert_eq!((&magic, tag), (HASH_MAGIC, 0));
+                    (tag, Some(reference), None)
+                }
+                1 => {
+                    let ((magic, tag), left, _right): (([u8; 8], u8), ContentChild, ContentChild) =
+                        borsh::from_slice(bytes).expect("decode content branch");
+                    assert_eq!((&magic, tag), (HASH_MAGIC, 1));
+                    (tag, None, Some(left))
+                }
+                tag => panic!("unknown content index tag {tag}"),
+            }
+        }
+
+        let authority = self.in_process_authority();
+        let operator = self.operator();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build corruption runtime");
+        runtime.block_on(async move {
+            let snapshot = authority
+                .observe_latest()
+                .await
+                .expect("observe corruption base");
+            let node = snapshot
+                .resolve(path)
+                .await
+                .expect("resolve corruption file")
+                .expect("corruption file exists");
+            let version = snapshot
+                .open_file(node.id())
+                .await
+                .expect("open corruption file version");
+            let descriptor = version.descriptor().to_bytes();
+            let (_, filesystem, _, root): ContentFile =
+                borsh::from_slice(&descriptor).expect("decode corruption content descriptor");
+            let (_, root_reference) = root.expect("corruption file is nonempty");
+            let mut target = root_reference;
+            if matches!(corruption, ContentCorruption::Data) {
+                loop {
+                    let end = target
+                        .1
+                        .checked_add(u64::from(target.2))
+                        .expect("corruption reference range");
+                    let bytes = operator
+                        .read_with(&key(filesystem, target.0))
+                        .range(target.1..end)
+                        .await
+                        .expect("read corruption index node")
+                        .to_bytes()
+                        .to_vec();
+                    match decode_node(&bytes) {
+                        (0, Some(reference), None) => {
+                            target = reference;
+                            break;
+                        }
+                        (1, None, Some(left)) => target = left.1,
+                        _ => panic!("content index shape does not match its tag"),
+                    }
+                }
+            }
+            let object = key(filesystem, target.0);
+            let mut bytes = operator
+                .read(&object)
+                .await
+                .expect("read corruption pack")
+                .to_bytes()
+                .to_vec();
+            let offset = usize::try_from(target.1).expect("corruption offset fits usize");
+            let byte = bytes
+                .get_mut(offset)
+                .unwrap_or_else(|| panic!("corruption offset {offset} exceeds {object}"));
+            *byte ^= 1;
+            operator
+                .write(&object, bytes)
+                .await
+                .expect("write corrupted pack");
         });
     }
 
@@ -694,6 +893,58 @@ impl Fixture {
         };
         mounted.wait_mounted();
         mounted
+    }
+
+    pub fn reject_mount(&self, config: &Path, mountpoint: &Path, timeout: Duration) -> Captured {
+        let config = config.to_str().expect("UTF-8 config path");
+        let mountpoint_text = mountpoint.to_str().expect("UTF-8 mountpoint");
+        let mut cmd = self.yy_command(&["--volume", config, "mount", mountpoint_text]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to spawn rejected mount probe: {error}"));
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let stdout_thread = thread::spawn(move || read_all(stdout));
+        let stderr_thread = thread::spawn(move || read_all(stderr));
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("wait for rejected mount probe: {error}"))
+            {
+                return Captured {
+                    status,
+                    stdout: stdout_thread.join().unwrap_or_default(),
+                    stderr: stderr_thread.join().unwrap_or_default(),
+                };
+            }
+            if mount_fs_type(mountpoint).is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let stderr = stderr_thread.join().unwrap_or_default();
+                unmount_force(mountpoint);
+                panic!(
+                    "mount unexpectedly became visible instead of being rejected:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let stderr = stderr_thread.join().unwrap_or_default();
+                unmount_force(mountpoint);
+                panic!(
+                    "mount probe did not exit within {timeout:?}; an admission hang is not acceptance:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
@@ -1103,6 +1354,37 @@ pub fn mount_fs_type(mountpoint: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn unmount_force(mountpoint: &Path) {
+    if mount_fs_type(mountpoint).is_some() {
+        let mountpoint = mountpoint.to_str().expect("UTF-8 mountpoint");
+        let _ = run_external(
+            "fusermount3",
+            &["-u", "-z", mountpoint],
+            Duration::from_secs(30),
+        );
+    }
+}
+
+pub fn directory_bytes(root: &Path) -> u64 {
+    fn walk(path: &Path, total: &mut u64) {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    walk(&entry.path(), total);
+                }
+            }
+        } else if metadata.is_file() {
+            *total = total.saturating_add(metadata.st_blocks().saturating_mul(512));
+        }
+    }
+    let mut total = 0;
+    walk(root, &mut total);
+    total
 }
 
 pub fn json_string(value: &str) -> String {
