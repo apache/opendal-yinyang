@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use yinyang_core::NodeId;
 const MAGIC: [u8; 8] = *b"YYBK0001";
