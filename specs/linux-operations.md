@@ -165,3 +165,11 @@ The real Amazon S3 smoke inherits `YINYANG_S3_SESSION_TOKEN` when temporary
 credentials are used. It must not inherit a MinIO endpoint and does not use a
 counting proxy. A real Amazon S3 result is recorded only when the actual CLI
 completes the isolated smoke against the named bucket and region.
+
+At `77595182c1447177f9d0b748ca2526773853f8e1`, the
+`ops-real-s3-7759518-role-r1` run passed in `us-east-2` with the provider
+endpoint and no endpoint override. Exit status was zero and the single native
+test completed in 7.97s. It exercised the installed-prefix object and
+authenticated-loopback-service Mount write/fsync/read/remount paths and finite
+Sync convergence. This is one scoped backend and host result, not a capacity,
+multi-host or HA claim.
