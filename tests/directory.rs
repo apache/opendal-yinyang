@@ -20,6 +20,8 @@ mod support;
 use std::path::Path;
 use support::TestBackend;
 use yinyang::core::{BackendProfile, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
+use yinyang::runtime::ErrorKind as RuntimeErrorKind;
+use yinyang::{DirectoryJournal, DirectoryState};
 
 async fn filesystem(backend: &TestBackend) -> Fs {
     Fs::create(backend.operator(), BackendProfile::Minio)
@@ -110,7 +112,7 @@ async fn round_trip_replacement_retry_and_pinned_restore() {
         .await
         .unwrap();
     let old_output = temp.path().join("old");
-    yinyang::restore_directory(&reopened, &pinned, &old_output)
+    yinyang::restore_directory_revision(&reopened, pinned.revision(), &old_output)
         .await
         .unwrap();
     assert_eq!(
@@ -353,6 +355,276 @@ async fn invalid_names_fail_before_upload() {
         ErrorKind::InvalidName
     );
     assert_eq!(backend.state.lock().unwrap().objects.len(), count);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn journal_reopens_exact_intent_and_exports_without_the_source() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    tokio::fs::set_permissions(
+        input.join("nested/hello"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .await
+    .unwrap();
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let foreign = filesystem(&TestBackend::default()).await;
+    assert_eq!(
+        DirectoryJournal::open(&foreign, &state)
+            .await
+            .unwrap_err()
+            .kind(),
+        RuntimeErrorKind::Invalid
+    );
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    let prepared = journal.prepare(&observed, &input, id).await.unwrap();
+    assert_eq!(prepared.state, DirectoryState::Prepared);
+    assert!(prepared.can_retry());
+    assert!(prepared.can_export());
+
+    let moved = temp.path().join("moved");
+    tokio::fs::rename(&input, &moved).await.unwrap();
+    assert_eq!(
+        journal
+            .prepare(&observed, &input, id)
+            .await
+            .unwrap_err()
+            .kind(),
+        RuntimeErrorKind::AlreadyExists,
+        "an existing identity must be rejected before scanning the missing source"
+    );
+    backend.state.lock().unwrap().offline = true;
+    let inspection = DirectoryJournal::inspect(&state).await.unwrap();
+    let inspected = inspection.status(id).unwrap();
+    assert_eq!(inspected.state, DirectoryState::Prepared);
+    assert_eq!(
+        inspected.intent.request_digest,
+        prepared.intent.request_digest
+    );
+    backend.state.lock().unwrap().offline = false;
+
+    drop(journal);
+    drop(fs);
+    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    let journal = DirectoryJournal::open(&reopened, &state).await.unwrap();
+    let receipt = journal.publish(id).await.unwrap();
+    assert_eq!(receipt.request_digest, prepared.intent.request_digest);
+    let exported = temp.path().join("exported");
+    journal.export(id, &exported).await.unwrap();
+    assert_eq!(
+        tokio::fs::read(exported.join("nested/hello"))
+            .await
+            .unwrap(),
+        b"hello"
+    );
+    assert_eq!(tokio::fs::read(exported.join("empty")).await.unwrap(), b"");
+    assert!(exported.join("empty-dir").is_dir());
+    assert_ne!(
+        std::fs::metadata(exported.join("nested/hello"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert_eq!(
+        journal.export(id, &exported).await.unwrap_err().kind(),
+        RuntimeErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        tokio::fs::read(exported.join("nested/hello"))
+            .await
+            .unwrap(),
+        b"hello"
+    );
+
+    let second = CommitId::generate();
+    let observed = reopened.observe_latest().await.unwrap();
+    let prepared = journal.prepare(&observed, &moved, second).await.unwrap();
+    tokio::fs::write(moved.join("nested/hello"), b"changed after second prepare")
+        .await
+        .unwrap();
+    tokio::fs::remove_file(moved.join("empty")).await.unwrap();
+    tokio::fs::remove_dir(moved.join("empty-dir"))
+        .await
+        .unwrap();
+    let receipt = journal.publish(second).await.unwrap();
+    assert_eq!(receipt.request_digest, prepared.intent.request_digest);
+    let second_export = temp.path().join("second-export");
+    journal.export(second, &second_export).await.unwrap();
+    assert_eq!(
+        tokio::fs::read(second_export.join("nested/hello"))
+            .await
+            .unwrap(),
+        b"hello",
+        "unchanged content and the accepted manifest must survive source mutation"
+    );
+    assert_eq!(
+        tokio::fs::read(second_export.join("large")).await.unwrap(),
+        vec![91; 700_000]
+    );
+    assert!(second_export.join("empty-dir").is_dir());
+    assert_eq!(
+        tokio::fs::read(second_export.join("empty")).await.unwrap(),
+        b""
+    );
+}
+
+#[tokio::test]
+async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    let prepared = journal.prepare(&observed, &input, id).await.unwrap();
+    tokio::fs::write(input.join("nested/hello"), b"changed after prepare")
+        .await
+        .unwrap();
+
+    backend.lose_next_head_response_and_go_offline();
+    let error = journal.publish(id).await.unwrap_err();
+    assert_eq!(error.kind(), RuntimeErrorKind::Unknown);
+    assert_eq!(error.commit_id(), Some(id));
+    assert_eq!(
+        journal.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Unknown
+    );
+
+    let error = journal.publish(id).await.unwrap_err();
+    assert_eq!(error.kind(), RuntimeErrorKind::Unknown);
+    let inspection = DirectoryJournal::inspect(&state).await.unwrap();
+    assert_eq!(
+        inspection.status(id).unwrap().state,
+        DirectoryState::Unknown
+    );
+
+    backend.state.lock().unwrap().offline = false;
+    drop(journal);
+    drop(fs);
+    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    let journal = DirectoryJournal::open(&reopened, &state).await.unwrap();
+    let receipt = journal.publish(id).await.unwrap();
+    assert_eq!(receipt.commit_id, id);
+    assert_eq!(receipt.request_digest, prepared.intent.request_digest);
+    let status = journal.status(id).await.unwrap().unwrap();
+    assert_eq!(status.state, DirectoryState::Committed(receipt));
+    assert!(status.failure.is_none());
+    assert!(
+        !status.can_retry(),
+        "committed work is resolved rather than retryable"
+    );
+    assert!(
+        reopened
+            .observe_revision(prepared.intent.baseline)
+            .await
+            .is_ok()
+    );
+    let restored = temp.path().join("restored");
+    yinyang::restore_directory_revision(&reopened, prepared.intent.baseline, &restored)
+        .await
+        .unwrap();
+    assert!(restored.is_dir());
+    let output = temp.path().join("published");
+    yinyang::restore_directory_revision(&reopened, receipt.cursor.revision, &output)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read(output.join("nested/hello")).await.unwrap(),
+        b"hello",
+        "retry must publish the original prepared bytes, not the changed source"
+    );
+}
+
+#[tokio::test]
+async fn journal_local_confirmation_failure_remains_typed_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    journal.prepare(&observed, &input, id).await.unwrap();
+
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_local_confirmation
+             BEFORE UPDATE OF state ON publications
+             WHEN NEW.state=2
+             BEGIN
+                 SELECT RAISE(ABORT, 'confirmation unavailable');
+             END;",
+        )
+        .unwrap();
+    let error = journal.publish(id).await.unwrap_err();
+    assert_eq!(error.kind(), RuntimeErrorKind::Unknown);
+    assert_eq!(error.commit_id(), Some(id));
+    assert_eq!(
+        journal.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Unknown
+    );
+
+    database
+        .execute_batch("DROP TRIGGER fail_local_confirmation;")
+        .unwrap();
+    let receipt = journal.publish(id).await.unwrap();
+    assert_eq!(receipt.commit_id, id);
+    assert_eq!(
+        journal.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Committed(receipt)
+    );
+}
+
+#[tokio::test]
+async fn separately_opened_journals_replay_one_exact_request_safely() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let first = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let second = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    first.prepare(&observed, &input, id).await.unwrap();
+
+    let (left, right) = tokio::join!(first.publish(id), second.publish(id));
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left, right);
+    assert_eq!(
+        first.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Committed(left)
+    );
+    let output = temp.path().join("published");
+    yinyang::restore_directory_revision(&fs, left.cursor.revision, &output)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read(output.join("nested/hello")).await.unwrap(),
+        b"hello"
+    );
 }
 
 #[test]
