@@ -791,7 +791,7 @@ fn sync_snapshot_directories(destination: &Path, nodes: &[SnapshotNode]) -> Resu
         .filter(|node| node.directory)
         .map(|node| node.path.as_str())
         .collect::<Vec<_>>();
-    directories.sort_by_key(|path| Reverse(path.split('/').count()));
+    directories.sort_by_key(|path| Reverse(Path::new(path).components().count()));
     for path in directories {
         let target = if path.is_empty() {
             destination.to_owned()
