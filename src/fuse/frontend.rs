@@ -168,7 +168,8 @@ impl Inner {
         self.next_handle.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Install the kernel notification handle once the session is spawned.
+    /// Install the kernel notification handle as soon as the session channel
+    /// exists, before its request loop starts.
     pub(super) fn install_notifier(&self, notifier: Notifier) {
         guard(&self.notifier).replace(notifier);
     }
@@ -331,6 +332,36 @@ impl Inner {
             .observe_latest()
             .await
             .map_err(|e| core_errno(&e))
+    }
+
+    /// Clear cached attributes before a read-only open can expose a new
+    /// immutable version through the same inode. Without this notification the
+    /// kernel can combine fresh READ bytes with a pre-transition cached length.
+    async fn invalidate_before_read_only_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
+        let Some(notifier) = guard(&self.notifier).clone() else {
+            eprintln!(
+                "yy: fuse open: inode {} invalidation requested before notifier installation",
+                ino.0
+            );
+            return Err(fuser::Errno::EIO);
+        };
+        match tokio::task::spawn_blocking(move || notifier.inval_inode(ino, -1, 0)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if is_connection_ended(&error) => Err(fuser::Errno::EIO),
+            Ok(Err(error)) => {
+                eprintln!("yy: fuse open: cannot invalidate inode {}: {error}", ino.0);
+                Err(fuser::Errno::from_i32(
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                ))
+            }
+            Err(error) => {
+                eprintln!(
+                    "yy: fuse open: inode {} invalidation task failed: {error}",
+                    ino.0
+                );
+                Err(fuser::Errno::EIO)
+            }
+        }
     }
 
     /// Drop a stale clean version before opening. Busy means another reference
@@ -529,6 +560,9 @@ impl Inner {
             }
             return match self.mount.open_read_only_node(id).await {
                 Ok(file) => {
+                    if let Err(errno) = self.invalidate_before_read_only_open(ino).await {
+                        return reply.error(errno);
+                    }
                     let fh = self.next_handle();
                     guard(&self.files).insert(
                         fh,
