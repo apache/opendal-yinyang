@@ -1050,10 +1050,17 @@ fn sighup_refresh(fixture: &Fixture, read_only: bool) {
     fresh
         .read_to_end(&mut fresh_bytes)
         .expect("fresh read after old close");
-    assert_eq!(fresh_bytes, new_payload);
+    assert_eq!(
+        fresh_bytes,
+        new_payload,
+        "fresh bytes after old close for publication={} read_only={read_only}",
+        fixture.publication().as_str()
+    );
     assert_eq!(
         fresh.metadata().expect("fresh fstat after old close").len(),
-        new_payload.len() as u64
+        new_payload.len() as u64,
+        "fresh fstat after old close for publication={} read_only={read_only}",
+        fixture.publication().as_str()
     );
     drop(fresh);
     mounted.unmount();
