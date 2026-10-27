@@ -156,7 +156,7 @@ fn isolated_user_service_lifecycle() {
     let sync_root = storage.root("systemd-sync");
     install.require_ok(&storage, &work, &["create"], &mount_root);
     install.require_ok(&storage, &work, &["create"], &sync_root);
-    let mut units = UserUnits::install(
+    let units = UserUnits::install(
         &install,
         &storage,
         &configs,
