@@ -22,6 +22,7 @@ use std::str::FromStr;
 use yinyang::core::{BackendProfile, CommitId, Fs, Revision};
 mod directory_cli;
 mod file_cli;
+mod operations_cli;
 #[cfg(target_os = "linux")]
 mod sync_cli;
 
@@ -41,6 +42,12 @@ struct Cli {
 enum Command {
     /// Inspect each capability layer and its effective intersection.
     Capabilities,
+    /// Diagnose platform, configuration, storage, service and local-state readiness.
+    Doctor {
+        /// Emit the versioned `yinyang.operational-health.v1` document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mount a Managed volume through the Linux FUSE frontend.
     Mount { mountpoint: PathBuf },
     /// Operate recoverable file handles (requires --volume).
@@ -139,6 +146,9 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
     if let Some(path) = &cli.volume {
         return match cli.command {
+            Command::Doctor { json } => {
+                return Ok(operations_cli::run(path, json).await);
+            }
             #[cfg(target_os = "linux")]
             Command::Sync { command } => sync_cli::run(path, command).await,
             command => file_cli::run(path, command).await,
@@ -148,7 +158,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::Mount { .. } => {
             return Err("mount requires --volume CONFIG.json with frontend=fuse".into());
         }
-        Command::File { .. } | Command::Capabilities => {
+        Command::File { .. } | Command::Capabilities | Command::Doctor { .. } => {
             return Err("this command requires --volume CONFIG.json".into());
         }
         #[cfg(target_os = "linux")]
@@ -197,6 +207,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         | Command::Serve { .. }
         | Command::File { .. }
         | Command::Capabilities
+        | Command::Doctor { .. }
         | Command::Mount { .. } => unreachable!(),
         #[cfg(target_os = "linux")]
         Command::Sync { .. } => unreachable!(),
