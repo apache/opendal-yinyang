@@ -591,6 +591,17 @@ fn response_loss_replays_the_frozen_directory_without_rescanning_source() {
         exported.to_str().unwrap(),
     ]);
     assert_eq!(local_tree(&exported).unwrap(), original);
+    let occupied_export = fixture.yy(&[
+        "publication",
+        "export",
+        &commit_id,
+        "--state",
+        state.to_str().unwrap(),
+        "--destination",
+        exported.to_str().unwrap(),
+    ]);
+    assert!(!occupied_export.status.success());
+    assert_eq!(local_tree(&exported).unwrap(), original);
 
     let retried = fixture.yy_ok(&[
         "publication",

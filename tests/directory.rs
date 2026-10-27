@@ -363,7 +363,14 @@ fn cli_help_lists_commands() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for name in ["create", "publish", "restore", "status", "receipt"] {
+    for name in [
+        "create",
+        "publish",
+        "restore",
+        "status",
+        "receipt",
+        "publication",
+    ] {
         assert!(text.contains(name));
     }
     let restore = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
