@@ -17,7 +17,7 @@
 
 use std::process::{Command, Output};
 
-fn yy(args: &[&str]) -> Output {
+fn yy_command(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
     command.args(args);
     for (name, _) in std::env::vars_os() {
@@ -28,7 +28,11 @@ fn yy(args: &[&str]) -> Output {
             command.env_remove(name);
         }
     }
-    command.output().expect("run yy")
+    command
+}
+
+fn yy(args: &[&str]) -> Output {
+    yy_command(args).output().expect("run yy")
 }
 
 fn stderr(output: &Output) -> String {
@@ -96,13 +100,16 @@ fn inspect_is_attempted_without_storage_configuration() {
 fn retry_uses_the_documented_storage_entry_point() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
-    let output = yy(&[
+    let output = yy_command(&[
         "publication",
         "retry",
         &"00000000-0000-4000-8000-000000000000",
         "--state",
         state.to_str().unwrap(),
-    ]);
+    ])
+    .env("YINYANG_S3_ENDPOINT", "http://127.0.0.1:9")
+    .output()
+    .expect("run yy");
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("set YINYANG_STORAGE_PROFILE"),
