@@ -565,7 +565,7 @@ impl DataStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PackedRef {
     pub(crate) object: [u8; 16],
     pub(crate) offset: u64,

@@ -153,8 +153,10 @@ pub struct Fixture {
     pub publication: Publication,
     root: String,
     token: String,
+    storage_endpoint: Option<String>,
     service: Option<ServiceProcess>,
     last_service_address: Option<SocketAddr>,
+    service_client_address: Option<SocketAddr>,
     service_database: Option<PathBuf>,
 }
 
@@ -511,6 +513,16 @@ pub enum ArtifactPhase {
 
 impl Fixture {
     pub fn new(publication: Publication) -> Self {
+        Self::new_with_storage_endpoint(publication, None)
+    }
+
+    /// Create a fixture whose storage traffic goes through an explicit
+    /// endpoint. Benchmarks use this to measure the product path through a
+    /// counting proxy without changing the application.
+    pub fn new_with_storage_endpoint(
+        publication: Publication,
+        storage_endpoint: Option<String>,
+    ) -> Self {
         require_acceptance();
         let temp = tempfile::tempdir().expect("create isolated acceptance directory");
         let root = format!(
@@ -523,8 +535,10 @@ impl Fixture {
             publication,
             root,
             token: "managed-sync-acceptance-token-000000000000".to_owned(),
+            storage_endpoint,
             service: None,
             last_service_address: None,
+            service_client_address: None,
             service_database: None,
         };
         match publication {
@@ -543,7 +557,14 @@ impl Fixture {
     fn storage_env(&self) -> Vec<(&'static str, String)> {
         let mut env = Vec::with_capacity(STORAGE_VARIABLES.len() + 3);
         for name in STORAGE_VARIABLES {
-            let value = std::env::var(name).unwrap_or_else(|_| {
+            let value = if name == "YINYANG_S3_ENDPOINT" {
+                self.storage_endpoint
+                    .clone()
+                    .or_else(|| std::env::var(name).ok())
+            } else {
+                std::env::var(name).ok()
+            }
+            .unwrap_or_else(|| {
                 panic!("{name} disappeared after acceptance preflight; refusing to skip")
             });
             env.push((name, value));
@@ -603,7 +624,7 @@ impl Fixture {
         if self.publication == Publication::Service {
             value["service_address"] = serde_json::Value::String(
                 service_address
-                    .unwrap_or_else(|| self.service_address())
+                    .unwrap_or_else(|| self.service_client_address())
                     .to_string(),
             );
         }
@@ -912,6 +933,16 @@ impl Fixture {
             .expect("service publication needs a loopback metadata address")
     }
 
+    pub fn set_service_client_address(&mut self, address: SocketAddr) {
+        assert_eq!(self.publication, Publication::Service);
+        self.service_client_address = Some(address);
+    }
+
+    pub fn service_client_address(&self) -> SocketAddr {
+        self.service_client_address
+            .unwrap_or_else(|| self.service_address())
+    }
+
     pub fn service_gate(&self, drop_commit_response: bool) -> ServiceGate {
         assert_eq!(
             self.publication,
@@ -1114,15 +1145,19 @@ impl Fixture {
                         .expect("open independent object authority"),
                 ) as Arc<dyn Authority>,
                 Publication::Service => Arc::new(
-                    ServiceClient::connect(self.service_address(), self.token.clone(), operator)
-                        .await
-                        .expect("connect independent service authority"),
+                    ServiceClient::connect(
+                        self.service_client_address(),
+                        self.token.clone(),
+                        operator,
+                    )
+                    .await
+                    .expect("connect independent service authority"),
                 ) as Arc<dyn Authority>,
             }
         })
     }
 
-    fn operator(&self) -> opendal::Operator {
+    pub fn operator(&self) -> opendal::Operator {
         opendal::install_default();
         let config = self
             .storage_env()
