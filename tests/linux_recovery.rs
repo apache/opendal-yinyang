@@ -22,17 +22,17 @@
 #[path = "linux_sync/harness.rs"]
 mod fixture;
 
-use fixture::{Captured, Fixture, Publication};
+use fixture::{Captured, Fixture, Publication, runtime};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, BackendProfile, CommitId, Fs, NodeId, Receipt, Revision};
+use yinyang::core::{Authority, CommitId};
 use yinyang::runtime::{Runtime, RuntimeStatus};
 
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
@@ -134,7 +134,7 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
         "--volume",
         text(&source_config),
         "receipt",
-        &uncertain_commit.to_string(),
+        &commit_text(uncertain_commit),
     ]);
     assert!(String::from_utf8_lossy(&original_receipt.stdout).contains("revision:"));
     fixture.stop_service();
@@ -244,7 +244,7 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
     );
     uncertain_fsync.success_or("retry restored uncertain commit");
     assert!(
-        String::from_utf8_lossy(&uncertain_fsync.stdout).contains(&uncertain_commit.to_string()),
+        String::from_utf8_lossy(&uncertain_fsync.stdout).contains(&commit_text(uncertain_commit)),
         "retry must retain the exact commit identity: {}",
         String::from_utf8_lossy(&uncertain_fsync.stdout)
     );
@@ -436,6 +436,10 @@ fn remote_root(label: &str) -> String {
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     )
+}
+
+fn commit_text(commit: CommitId) -> String {
+    uuid::Uuid::from_bytes(*commit.as_bytes()).to_string()
 }
 
 fn operator_for_root(root: &str) -> opendal::Operator {
