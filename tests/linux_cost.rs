@@ -22,8 +22,8 @@
 //! Every workload enters through the `yy` executable. FUSE scenarios use an
 //! ordinary kernel mount and POSIX descriptors, Sync scenarios use the managed
 //! directory CLI, and one-shot transfer scenarios use `yy publish`/`yy restore`.
-//! A loopback counting proxy in front of Silo supplies request and byte counts
-//! without instrumenting production code.
+//! Loopback counting proxies in front of Silo and the metadata service supply
+//! distinct request, connection, and byte counts without production hooks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -49,6 +49,8 @@ const RESULT_SCHEMA: &str = "yinyang.linux-cost.v1";
 const CHUNK: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
 const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io while alive; terminal increments can be missed, so values are lower bounds and character I/O includes sockets";
+const STORAGE_BACKEND: &str = "loopback Silo, MinIO-compatible S3 over HTTP";
+const METADATA_TRANSPORT: &str = "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC";
 
 #[derive(Clone, Copy)]
 enum Profile {
@@ -107,6 +109,53 @@ struct RunContext {
     binary_blake3: String,
     host: String,
     rustc: String,
+}
+
+struct BenchFixture {
+    fixture: Fixture,
+    service_proxy: Option<CountingServiceProxy>,
+}
+
+impl BenchFixture {
+    fn new(publication: Publication, storage_endpoint: String) -> Self {
+        let mut fixture = Fixture::new_with_storage_endpoint(publication, Some(storage_endpoint));
+        let service_proxy = if publication == Publication::Service {
+            let proxy = CountingServiceProxy::start(fixture.service_address());
+            fixture.set_service_client_address(proxy.address());
+            Some(proxy)
+        } else {
+            None
+        };
+        Self {
+            fixture,
+            service_proxy,
+        }
+    }
+
+    fn network<'a>(&'a self, storage: &'a CountingProxy) -> NetworkMeter<'a> {
+        NetworkMeter {
+            storage,
+            service: self.service_proxy.as_ref(),
+        }
+    }
+}
+
+struct NetworkMeter<'a> {
+    storage: &'a CountingProxy,
+    service: Option<&'a CountingServiceProxy>,
+}
+
+impl NetworkMeter<'_> {
+    fn snapshot(&self) -> NetworkSnapshot {
+        let mut snapshot = self.storage.snapshot();
+        if let Some(service) = self.service {
+            let service = service.snapshot();
+            snapshot.service_connections = service.connections;
+            snapshot.service_request_bytes = service.request_bytes;
+            snapshot.service_response_bytes = service.response_bytes;
+        }
+        snapshot
+    }
 }
 
 #[test]
@@ -217,7 +266,9 @@ fn run_sync_matrix(
     scale: Scale,
     recorder: &mut Recorder,
 ) {
-    let fixture = Fixture::new_with_storage_endpoint(publication, Some(proxy.endpoint()));
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
     let paths = fixture.sync_paths(&format!("sync-{}-{}", publication.as_str(), scale.as_str()));
     fs::create_dir(&paths.directory).expect("create benchmark sync root");
     populate_small_tree(&paths.directory, scale);
@@ -226,7 +277,7 @@ fn run_sync_matrix(
     let completion = "latency is one finite yy sync run; in_sync status was read separately after the measured run";
 
     let initial = run_yy_operation(
-        proxy,
+        &meter,
         fixture.yy_command(&["--volume", path_str(&paths.config), "sync", "run"]),
         "initial Sync push",
     );
@@ -249,7 +300,7 @@ fn run_sync_matrix(
     let mut noop = OperationBatch::default();
     for index in 0..5 {
         let measured = run_yy_operation(
-            proxy,
+            &meter,
             fixture.yy_command(&["--volume", path_str(&paths.config), "sync", "run"]),
             &format!("Sync no-op {}", index + 1),
         );
@@ -270,6 +321,7 @@ fn run_sync_matrix(
 
     let edit = paths.directory.join("dir-0000/file-0000");
     let mut edits = OperationBatch::default();
+    let mut edit_spaces = Vec::new();
     for index in 0..3 {
         fs::write(
             &edit,
@@ -277,14 +329,20 @@ fn run_sync_matrix(
         )
         .expect("write one Sync edit");
         let measured = run_yy_operation(
-            proxy,
+            &meter,
             fixture.yy_command(&["--volume", path_str(&paths.config), "sync", "run"]),
             &format!("Sync single edit {}", index + 1),
         );
         edits.push(measured);
+        edit_spaces.push(space_snapshot(
+            &fixture,
+            Some(&paths.directory),
+            Some(&paths.state),
+            None,
+        ));
     }
     assert_sync_in_sync(&fixture, &paths, "after Sync edits");
-    edits.record(
+    edits.record_with_spaces(
         recorder,
         context,
         "sync_single_edit",
@@ -292,13 +350,17 @@ fn run_sync_matrix(
         scale,
         dataset.clone(),
         completion,
-        space_snapshot(&fixture, Some(&paths.directory), Some(&paths.state), None),
-        vec!["status.in_sync=true".to_owned()],
+        edit_spaces,
+        vec![
+            "status.in_sync=true".to_owned(),
+            "space series covers each completed edit publish".to_owned(),
+        ],
     );
 
     let mut source = edit.clone();
     let mut destination = paths.directory.join("dir-0000/file-renamed");
     let mut renames = OperationBatch::default();
+    let mut rename_spaces = Vec::new();
     for index in 0..3 {
         fs::rename(&source, &destination).unwrap_or_else(|error| {
             panic!(
@@ -308,15 +370,21 @@ fn run_sync_matrix(
             )
         });
         let measured = run_yy_operation(
-            proxy,
+            &meter,
             fixture.yy_command(&["--volume", path_str(&paths.config), "sync", "run"]),
             &format!("Sync rename {}", index + 1),
         );
         renames.push(measured);
+        rename_spaces.push(space_snapshot(
+            &fixture,
+            Some(&paths.directory),
+            Some(&paths.state),
+            None,
+        ));
         std::mem::swap(&mut source, &mut destination);
     }
     assert_sync_in_sync(&fixture, &paths, "after Sync renames");
-    renames.record(
+    renames.record_with_spaces(
         recorder,
         context,
         "sync_rename",
@@ -324,8 +392,11 @@ fn run_sync_matrix(
         scale,
         dataset,
         completion,
-        space_snapshot(&fixture, Some(&paths.directory), Some(&paths.state), None),
-        vec!["status.in_sync=true".to_owned()],
+        rename_spaces,
+        vec![
+            "status.in_sync=true".to_owned(),
+            "space series covers each completed rename publish".to_owned(),
+        ],
     );
 }
 
@@ -336,7 +407,9 @@ fn run_fuse_matrix(
     scale: Scale,
     recorder: &mut Recorder,
 ) {
-    let fixture = Fixture::new_with_storage_endpoint(publication, Some(proxy.endpoint()));
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
     let size = scale.file_size();
     let mut expected_large = payload(size, 0x5a);
     fixture.remote_create_file("large.bin", &expected_large, false);
@@ -373,7 +446,7 @@ fn run_fuse_matrix(
     );
 
     let large = mountpoint.join("large.bin");
-    let cold = measure_mount_operation(proxy, mounted.pid(), || {
+    let cold = measure_mount_operation(&meter, mounted.pid(), || {
         let file = File::open(&large).expect("cold open large FUSE file");
         let mut value = vec![0_u8; RANGE_BYTES];
         read_exact_at(&file, &mut value, (size / 2) as u64);
@@ -401,7 +474,7 @@ fn run_fuse_matrix(
     let mut warm = OperationBatch::default();
     for index in 0..5 {
         let offset = ((index * RANGE_BYTES) as u64).min((size - RANGE_BYTES) as u64);
-        let measured = measure_mount_operation(proxy, mounted.pid(), || {
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
             let mut value = vec![0_u8; RANGE_BYTES];
             read_exact_at(&warm_file, &mut value, offset);
             assert_eq!(
@@ -433,7 +506,7 @@ fn run_fuse_matrix(
             0x80 + u8::try_from(index).expect("four updates"),
         );
         expected_large[offset as usize..offset as usize + RANGE_BYTES].copy_from_slice(&value);
-        let measured = measure_mount_operation(proxy, mounted.pid(), || {
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
             let file = OpenOptions::new()
                 .write(true)
                 .open(&large)
@@ -467,7 +540,7 @@ fn run_fuse_matrix(
 
     mounted.unmount();
     let mut restarted = FuseMount::start(&fixture, &config, &mountpoint);
-    let restart = measure_mount_operation(proxy, restarted.pid(), || {
+    let restart = measure_mount_operation(&meter, restarted.pid(), || {
         let file = File::open(&large).expect("open after FUSE restart");
         let verify_offset = (size as u64 - RANGE_BYTES as u64) / 2 - RANGE_BYTES as u64;
         let mut value = vec![0_u8; 6 * RANGE_BYTES];
@@ -505,7 +578,9 @@ fn run_concurrent_matrix(
     scale: Scale,
     recorder: &mut Recorder,
 ) {
-    let fixture = Fixture::new_with_storage_endpoint(publication, Some(proxy.endpoint()));
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
     fixture.remote_create_directory("concurrent");
     let (config, staging, mountpoint) = mount_paths(
         &fixture,
@@ -557,7 +632,7 @@ fn run_concurrent_matrix(
             started.elapsed().as_secs_f64() * 1000.0
         }));
     }
-    let net_before = proxy.snapshot();
+    let net_before = meter.snapshot();
     let io_before = read_proc_io(mounted.pid());
     let started = Instant::now();
     {
@@ -572,7 +647,7 @@ fn run_concurrent_matrix(
         samples.push(thread.join().expect("concurrent FUSE writer panicked"));
     }
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let network = proxy.snapshot().since(net_before);
+    let network = meter.snapshot().since(net_before);
     let io = read_proc_io(mounted.pid()).since(io_before);
     let remote = fixture.remote_tree().expect("read concurrent remote tree");
     for (index, expected) in expected.iter().enumerate() {
@@ -610,11 +685,15 @@ fn run_publish_restore_matrix(
     recorder: &mut Recorder,
 ) {
     let fixture = Fixture::new_with_storage_endpoint(Publication::Object, Some(proxy.endpoint()));
+    let meter = NetworkMeter {
+        storage: proxy,
+        service: None,
+    };
     let source = fixture.path(format!("publish-source-{}", scale.as_str()));
     populate_small_tree(&source, scale);
     let dataset = tree_dataset(&source);
     let publish = run_yy_operation(
-        proxy,
+        &meter,
         fixture.yy_command(&["publish", path_str(&source), "--replace"]),
         "one-shot publish",
     );
@@ -635,7 +714,7 @@ fn run_publish_restore_matrix(
 
     let restored = fixture.path(format!("publish-restored-{}", scale.as_str()));
     let restore = run_yy_operation(
-        proxy,
+        &meter,
         fixture.yy_command(&["restore", path_str(&restored)]),
         "one-shot restore",
     );
@@ -763,7 +842,8 @@ fn mount_paths(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf) {
         "require": [],
     });
     if fixture.publication == Publication::Service {
-        value["service_address"] = serde_json::Value::String(fixture.service_address().to_string());
+        value["service_address"] =
+            serde_json::Value::String(fixture.service_client_address().to_string());
     }
     fs::write(
         &config,
@@ -929,11 +1009,11 @@ struct Measurement<T> {
 }
 
 fn measure_mount_operation<T>(
-    proxy: &Arc<CountingProxy>,
+    network: &NetworkMeter<'_>,
     pid: u32,
     operation: impl FnOnce() -> T,
 ) -> Measurement<T> {
-    let net_before = proxy.snapshot();
+    let net_before = network.snapshot();
     let io_before = read_proc_io(pid);
     let started = Instant::now();
     let value = operation();
@@ -942,16 +1022,16 @@ fn measure_mount_operation<T>(
         value,
         latency_ms,
         io: read_proc_io(pid).since(io_before),
-        network: proxy.snapshot().since(net_before),
+        network: network.snapshot().since(net_before),
     }
 }
 
 fn run_yy_operation(
-    proxy: &Arc<CountingProxy>,
+    network: &NetworkMeter<'_>,
     command: Command,
     context: &str,
 ) -> Measurement<()> {
-    let net_before = proxy.snapshot();
+    let net_before = network.snapshot();
     let started = Instant::now();
     let output = run_observed(command, Duration::from_secs(300));
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -966,7 +1046,7 @@ fn run_yy_operation(
         value: (),
         latency_ms,
         io: output.io,
-        network: proxy.snapshot().since(net_before),
+        network: network.snapshot().since(net_before),
     }
 }
 
@@ -1151,6 +1231,9 @@ struct NetworkSnapshot {
     post: u64,
     delete: u64,
     other: u64,
+    service_connections: u64,
+    service_request_bytes: u64,
+    service_response_bytes: u64,
 }
 
 impl NetworkSnapshot {
@@ -1166,6 +1249,15 @@ impl NetworkSnapshot {
             post: self.post.saturating_sub(before.post),
             delete: self.delete.saturating_sub(before.delete),
             other: self.other.saturating_sub(before.other),
+            service_connections: self
+                .service_connections
+                .saturating_sub(before.service_connections),
+            service_request_bytes: self
+                .service_request_bytes
+                .saturating_sub(before.service_request_bytes),
+            service_response_bytes: self
+                .service_response_bytes
+                .saturating_sub(before.service_response_bytes),
         }
     }
 
@@ -1180,6 +1272,15 @@ impl NetworkSnapshot {
         self.post = self.post.saturating_add(other.post);
         self.delete = self.delete.saturating_add(other.delete);
         self.other = self.other.saturating_add(other.other);
+        self.service_connections = self
+            .service_connections
+            .saturating_add(other.service_connections);
+        self.service_request_bytes = self
+            .service_request_bytes
+            .saturating_add(other.service_request_bytes);
+        self.service_response_bytes = self
+            .service_response_bytes
+            .saturating_add(other.service_response_bytes);
     }
 }
 
@@ -1254,6 +1355,9 @@ impl CountingProxy {
             post: self.counters.post.load(Ordering::Relaxed),
             delete: self.counters.delete.load(Ordering::Relaxed),
             other: self.counters.other.load(Ordering::Relaxed),
+            service_connections: 0,
+            service_request_bytes: 0,
+            service_response_bytes: 0,
         }
     }
 }
@@ -1266,6 +1370,139 @@ impl Drop for CountingProxy {
             let _ = thread.join();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct ServiceSnapshot {
+    connections: u64,
+    request_bytes: u64,
+    response_bytes: u64,
+}
+
+#[derive(Default)]
+struct ServiceProxyCounters {
+    connections: AtomicU64,
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
+}
+
+struct CountingServiceProxy {
+    address: SocketAddr,
+    counters: Arc<ServiceProxyCounters>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CountingServiceProxy {
+    fn start(upstream: SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting service proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("make counting service proxy listener nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("counting service proxy address");
+        let counters = Arc::new(ServiceProxyCounters::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_counters = counters.clone();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        thread_counters.connections.fetch_add(1, Ordering::Relaxed);
+                        let counters = thread_counters.clone();
+                        thread::spawn(move || service_proxy_connection(client, upstream, counters));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            counters,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn snapshot(&self) -> ServiceSnapshot {
+        ServiceSnapshot {
+            connections: self.counters.connections.load(Ordering::Relaxed),
+            request_bytes: self.counters.request_bytes.load(Ordering::Relaxed),
+            response_bytes: self.counters.response_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for CountingServiceProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn service_proxy_connection(
+    client: TcpStream,
+    upstream: SocketAddr,
+    counters: Arc<ServiceProxyCounters>,
+) {
+    let Ok(server) = TcpStream::connect(upstream) else {
+        return;
+    };
+    let (Ok(mut client_read), Ok(mut server_write)) = (client.try_clone(), server.try_clone())
+    else {
+        return;
+    };
+    let (Ok(mut server_read), Ok(mut client_write)) = (server.try_clone(), client.try_clone())
+    else {
+        return;
+    };
+    let request_counters = counters.clone();
+    let request = thread::spawn(move || {
+        pump_service(
+            &mut client_read,
+            &mut server_write,
+            &request_counters.request_bytes,
+        )
+    });
+    let response = thread::spawn(move || {
+        pump_service(
+            &mut server_read,
+            &mut client_write,
+            &counters.response_bytes,
+        )
+    });
+    let _ = request.join();
+    let _ = response.join();
+    let _ = client.shutdown(Shutdown::Both);
+}
+
+fn pump_service(reader: &mut TcpStream, writer: &mut TcpStream, counter: &AtomicU64) {
+    let mut buffer = vec![0_u8; CHUNK];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        counter.fetch_add(count as u64, Ordering::Relaxed);
+        if writer.write_all(&buffer[..count]).is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown(Shutdown::Write);
 }
 
 fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<ProxyCounters>) {
@@ -1507,7 +1744,7 @@ fn space_snapshot(
     let metadata_database_bytes = ["metadata.db", "metadata.db-wal", "metadata.db-shm"]
         .into_iter()
         .filter_map(|name| fixture.temp.path().join(name).metadata().ok())
-        .map(|metadata| metadata.len())
+        .map(|metadata| metadata.st_blocks().saturating_mul(512))
         .fold(0_u64, u64::saturating_add);
     let (remote_stored_bytes, remote_objects) = remote_storage(fixture);
     SpaceSnapshot {
@@ -1609,6 +1846,42 @@ fn percentile(sorted: &[f64], value: f64) -> f64 {
 }
 
 #[derive(Serialize)]
+struct NetworkPerSample {
+    s3_requests: f64,
+    s3_request_bytes: f64,
+    s3_response_bytes: f64,
+    service_connections: f64,
+    service_request_bytes: f64,
+    service_response_bytes: f64,
+    note: &'static str,
+}
+
+impl NetworkPerSample {
+    fn new(network: &NetworkSnapshot, samples: usize) -> Self {
+        let samples = samples.max(1) as f64;
+        Self {
+            s3_requests: network.requests as f64 / samples,
+            s3_request_bytes: network.request_bytes as f64 / samples,
+            s3_response_bytes: network.response_bytes as f64 / samples,
+            service_connections: network.service_connections as f64 / samples,
+            service_request_bytes: network.service_request_bytes as f64 / samples,
+            service_response_bytes: network.service_response_bytes as f64 / samples,
+            note: "per latency sample; concurrent samples overlap and share the batch network total",
+        }
+    }
+}
+
+fn cache_policy(scenario: &str) -> &'static str {
+    if scenario.starts_with("fuse_") {
+        "FUSE FOPEN_DIRECT_IO; no kernel page cache for file pages; clean nodes are reclaimed on last release"
+    } else if scenario.starts_with("sync_") {
+        "one CLI process per finite run; no OS page-cache drop and no cross-run content cache state"
+    } else {
+        "one CLI process; no OS page-cache drop and no retained application cache"
+    }
+}
+
+#[derive(Serialize)]
 struct CostRecord {
     schema: &'static str,
     scenario: String,
@@ -1623,14 +1896,19 @@ struct CostRecord {
     binary_blake3: String,
     host: String,
     rustc: String,
+    storage_backend: &'static str,
+    metadata_transport: &'static str,
+    cache_policy: &'static str,
     dataset: Dataset,
     completion: String,
     iterations: usize,
     wall_ms: f64,
     latency: LatencyStats,
+    latency_samples_ms: Vec<f64>,
     local_process_io: IoSnapshot,
     local_process_io_note: String,
     network: NetworkSnapshot,
+    network_per_sample: NetworkPerSample,
     space_series: Vec<SpaceSnapshot>,
     space: SpaceSnapshot,
     failures: u64,
@@ -1688,6 +1966,8 @@ impl Recorder {
     ) {
         assert!(!latencies.is_empty(), "{scenario} has no latency samples");
         let latency = LatencyStats::new(&latencies);
+        let latency_samples_ms = latencies.clone();
+        let network_per_sample = NetworkPerSample::new(&network, latencies.len());
         let record = CostRecord {
             schema: RESULT_SCHEMA,
             scenario: scenario.to_owned(),
@@ -1706,14 +1986,19 @@ impl Recorder {
             binary_blake3: context.binary_blake3.clone(),
             host: context.host.clone(),
             rustc: context.rustc.clone(),
+            storage_backend: STORAGE_BACKEND,
+            metadata_transport: METADATA_TRANSPORT,
+            cache_policy: cache_policy(scenario),
             dataset,
             completion: completion.to_owned(),
             iterations: latencies.len(),
             wall_ms: latencies.iter().sum(),
             latency,
+            latency_samples_ms,
             local_process_io: io,
             local_process_io_note: PROCESS_IO_NOTE.to_owned(),
             network,
+            network_per_sample,
             space_series,
             space,
             failures: 0,
@@ -1725,14 +2010,18 @@ impl Recorder {
             .expect("terminate benchmark JSONL record");
         self.output.flush().expect("flush benchmark JSONL output");
         println!(
-            "linux-cost: {} publication={} scale={} p50={:.3}ms requests={} request_bytes={} response_bytes={}",
+            "linux-cost: {} publication={} scale={} samples={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
             record.scenario,
             record.publication,
             record.scale,
+            record.iterations,
             record.latency.p50_ms,
             record.network.requests,
             record.network.request_bytes,
-            record.network.response_bytes
+            record.network.response_bytes,
+            record.network.service_connections,
+            record.network.service_request_bytes,
+            record.network.service_response_bytes,
         );
         self.records.push(record);
     }
@@ -1763,6 +2052,9 @@ impl Recorder {
             binary_blake3: context.binary_blake3.clone(),
             host: context.host.clone(),
             rustc: context.rustc.clone(),
+            storage_backend: STORAGE_BACKEND,
+            metadata_transport: METADATA_TRANSPORT,
+            cache_policy: cache_policy(scenario),
             dataset: Dataset {
                 kind: "not_run".to_owned(),
                 files: 0,
@@ -1781,9 +2073,11 @@ impl Recorder {
                 min_ms: 0.0,
                 max_ms: 0.0,
             },
+            latency_samples_ms: Vec::new(),
             local_process_io: IoSnapshot::default(),
             local_process_io_note: PROCESS_IO_NOTE.to_owned(),
             network: NetworkSnapshot::default(),
+            network_per_sample: NetworkPerSample::new(&NetworkSnapshot::default(), 1),
             space_series: Vec::new(),
             space: SpaceSnapshot::default(),
             failures: 0,
@@ -1814,14 +2108,15 @@ impl Recorder {
             }
         ));
         markdown.push_str(
-            "| Scenario | Publication | Scale | Iters | p50 ms | p95 ms | Requests | Request MiB | Response MiB | Remote MiB | Staging MiB |\n",
+            "| Scenario | Publication | Scale | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
         );
         markdown.push_str(
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for record in &self.records {
+            let network = &record.network_per_sample;
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {:.3} | {:.3} | {} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
                 record.scenario,
                 record.publication,
                 record.scale,
@@ -1829,14 +2124,23 @@ impl Recorder {
                 record.latency.p50_ms,
                 record.latency.p95_ms,
                 record.network.requests,
+                network.s3_requests,
                 record.network.request_bytes as f64 / 1024.0 / 1024.0,
+                network.s3_request_bytes / 1024.0 / 1024.0,
                 record.network.response_bytes as f64 / 1024.0 / 1024.0,
+                network.s3_response_bytes / 1024.0 / 1024.0,
+                record.network.service_connections,
+                network.service_connections,
+                record.network.service_request_bytes as f64 / 1024.0,
+                network.service_request_bytes / 1024.0,
+                record.network.service_response_bytes as f64 / 1024.0,
+                network.service_response_bytes / 1024.0,
                 record.space.remote_stored_bytes as f64 / 1024.0 / 1024.0,
                 record.space.mount_staging_bytes as f64 / 1024.0 / 1024.0,
             ));
         }
         markdown.push_str(
-            "\nRequest and byte values cover storage HTTP traffic through the counting proxy. Process I/O values are sampled lower bounds, not exact local scan or hash costs. Space series and completion semantics are preserved in the JSONL evidence.\n",
+            "\nThe `total/sample` columns divide batch counters by the actual number of latency samples so a five-run batch is not presented as one run. For concurrent writers, samples overlap and share the same batch totals. S3 and metadata-service counters are separate: S3 columns come from parsed HTTP requests to Silo, while service columns count authenticated TCP connections and raw framed bytes. Process I/O values are sampled lower bounds, not exact local scan or hash costs. Space series, raw latency samples, cache policy, and completion semantics are preserved in the JSONL evidence.\n",
         );
         fs::write(&self.summary_path, markdown).expect("write benchmark Markdown summary");
         println!(

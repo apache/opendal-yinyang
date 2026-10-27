@@ -10,9 +10,14 @@ The benchmark uses isolated Silo (S3-compatible) settings, a unique remote root,
 and a new staging directory. A loopback HTTP counting proxy sits between YinYang
 and Silo. It parses HTTP/1 request framing before counting request methods, and
 counts request and response bytes without instrumenting production code.
-Metadata-service traffic is direct; the byte counts cover storage traffic only.
-The extra loopback hop is visible in latency but not in byte or request counts;
-compare runs only with the same proxy.
+
+Service publication uses a second transparent TCP proxy in front of the metadata
+service. The current transport creates one loopback TCP connection for each RPC,
+so connection count is also the RPC count. The proxy counts raw authenticated
+frame bytes in both directions without decoding the private protocol. S3 and
+service counters are separate in every record. The extra loopback hops are
+visible in latency but not in byte or request counts; compare runs only with the
+same proxies.
 
 ## Run
 
@@ -67,11 +72,20 @@ Each JSONL record includes:
 - every latency sample and p50/p95/min/max;
 - sampled process `rchar`, `wchar`, syscall counts, and block-layer read/write
   bytes from `/proc/<pid>/io`;
-- storage requests by HTTP method, total request bytes, and total response bytes;
-- local payload, Sync state, mount staging, metadata database, and persistent S3
-  object bytes and object counts;
+- S3 requests by HTTP method, total request bytes, and total response bytes;
+- service TCP connections and raw framed bytes in both directions;
+- batch totals and per-sample network values, where per-sample divides only a
+  sequential batch and explicitly notes that concurrent samples overlap;
+- allocated local payload, Sync state, mount staging, SQLite database plus
+  `-wal`/`-shm`, and persistent S3 object bytes and counts;
 - assertions that completed successfully and the failure count (zero for a
   completed scenario).
+
+Raw network counters aggregate over all iterations in a scenario. `iterations`
+is the actual latency sample count. The summary shows both `total/sample` values
+so a five-run no-op batch is not presented as one run. A concurrent writer batch
+shares one network interval, so its per-sample network values are descriptive
+shares, not independent operation costs.
 
 `/proc/<pid>/io` is polled while the process is alive, so terminal increments can
 be missed and every value is a lower bound. Character counts also include socket
