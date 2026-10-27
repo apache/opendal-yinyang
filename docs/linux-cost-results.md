@@ -5,6 +5,12 @@ an object-backed `Snapshot` reuses authenticated metadata pages and external
 values for its own lifetime. It is not a production capacity claim or a promise
 that the same result will hold for another authority, backend, dataset, or host.
 
+> **Collector history:** this report's schema v1/v2 timings include the earlier
+> S3 proxy accept polling and default Nagle relay behavior. They remain
+> historical instrumented observations and must not be compared directly with
+> schema v3 timings. Request, payload, and space evidence remains inspectable.
+> See the corrected read-only range [control](linux-range-cost-results.md).
+
 ## Tested identities
 
 | Role | Source | Binary BLAKE3 | Runner |
