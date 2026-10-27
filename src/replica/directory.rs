@@ -266,8 +266,8 @@ impl DirectorySync {
         if manifest.filesystem() != authority.filesystem() {
             return Err(format!(
                 "backup belongs to filesystem {}, not {}",
-                hex(manifest.filesystem().as_bytes()),
-                hex(authority.filesystem().as_bytes())
+                hex_bytes(manifest.filesystem().as_bytes()),
+                hex_bytes(authority.filesystem().as_bytes())
             )
             .into());
         }
@@ -2725,6 +2725,10 @@ fn artifact_conflict_identity(artifact_id: &str) -> String {
     hasher.update(b"yinyang-retained-conflict-1");
     hasher.update(artifact_id.as_bytes());
     hex16(&hasher.finalize())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn hex16(digest: &blake3::Hash) -> String {

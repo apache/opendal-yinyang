@@ -240,7 +240,7 @@ impl Replica {
             ));
         }
         let lease = acquire_state_lease(&state_fd, &state)?;
-        let store = Store::open(&state.join("replica.db"))?;
+        let mut store = Store::open(&state.join("replica.db"))?;
         let requested = super::state::Binding {
             filesystem,
             root: root_text,
@@ -312,7 +312,7 @@ impl Replica {
             ));
         }
         let lease = acquire_state_lease(&state_fd, &state)?;
-        let mut store = Store::open(&state.join("replica.db"))?;
+        let store = Store::open(&state.join("replica.db"))?;
         let previous = store
             .binding()?
             .ok_or_else(|| Error::invalid("sync state is not initialized; run sync init"))?;
