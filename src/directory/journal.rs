@@ -282,21 +282,21 @@ impl DirectoryJournal {
         if load_async(self, commit_id).await?.is_some() {
             return Err(existing_identity(commit_id));
         }
-        let source = tokio::fs::canonicalize(source).await.map_err(local)?;
-        if self.inner.journal_directory == source
-            || self.inner.journal_directory.starts_with(&source)
+        let canonical_source = tokio::fs::canonicalize(source).await.map_err(local)?;
+        if self.inner.journal_directory == canonical_source
+            || self.inner.journal_directory.starts_with(&canonical_source)
         {
             return Err(Error::local_kind(
                 ErrorKind::Invalid,
                 format!(
                     "directory journal {} is inside source {}; keep journal state outside the published input tree",
                     self.inner.journal_directory.display(),
-                    source.display()
+                    canonical_source.display()
                 ),
             ));
         }
         let prepared =
-            prepare_directory_request(&self.inner.fs, observed, &source, commit_id).await?;
+            prepare_directory_request(&self.inner.fs, observed, source, commit_id).await?;
         let request = prepared.transaction.to_bytes()?;
         let (baseline, stored_id, digest) = Transaction::inspect_identity(&request)?;
         if stored_id != commit_id || digest != prepared.transaction.digest() {
