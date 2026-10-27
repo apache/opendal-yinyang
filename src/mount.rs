@@ -28,6 +28,7 @@ struct Node {
     handle: Mutex<FileHandle>,
     references: AtomicUsize,
 }
+#[derive(Debug)]
 struct ReadOnlyNode {
     version: FileVersion,
     references: AtomicUsize,
@@ -409,6 +410,7 @@ pub struct MountFile {
 /// A read-only reference to one authenticated pinned file version. Dropping it
 /// performs no I/O; the caller reclaims the observation when the last kernel
 /// handle is released.
+#[derive(Debug)]
 pub struct MountReadOnlyFile {
     node: Arc<ReadOnlyNode>,
 }
