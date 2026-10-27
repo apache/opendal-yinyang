@@ -267,6 +267,14 @@ fn isolated_user_service_lifecycle() {
     units.start(&units.mount_instance("object"));
     units.wait_active(&units.mount_instance("object"));
     wait_mount(&mounts.join("object"), None);
+    wait_doctor_ready(
+        &install,
+        &storage,
+        &work,
+        &mount_config,
+        &mount_root,
+        &units.mount_instance("object"),
+    );
     units.restart(&units.mount_instance("object"));
     units.wait_active(&units.mount_instance("object"));
     wait_mount(&mounts.join("object"), None);
@@ -356,6 +364,10 @@ fn cli_smoke_with(storage: Storage) {
     let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
     assert_eq!(doctor["schema"], "yinyang.operational-health.v1");
     assert_eq!(doctor["status"], "pass");
+    assert!(
+        !state.join("object").exists(),
+        "doctor initialized the unstarted mount state"
+    );
 
     let mountpoint = work.join("object-mount");
     fs::create_dir(&mountpoint).unwrap();
@@ -372,6 +384,19 @@ fn cli_smoke_with(storage: Storage) {
         None,
     );
     wait_mount(&mountpoint, Some(&mut mount));
+    let doctor = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            object_config.to_str().unwrap(),
+            "doctor",
+            "--json",
+        ],
+        &object_root,
+        None,
+    );
+    doctor.success_or("doctor while the Managed Mount holds its lease");
     stop(&mut mount);
     assert!(
         state.join("object/staging.db").exists(),
