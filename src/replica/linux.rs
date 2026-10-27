@@ -348,7 +348,6 @@ impl Replica {
             _lease: Some(lease),
             store,
         };
-        replica.validate_restore_artifacts()?;
         manifest.apply(&mut replica, &binding)?;
         replica.verify_retained_artifacts()?;
         Ok(replica)

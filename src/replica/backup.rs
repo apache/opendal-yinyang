@@ -19,7 +19,7 @@
 
 use super::linux::{ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, Replica};
 use super::state::{Binding, IdentityMap};
-use super::{Error, Result};
+use super::{Error, ErrorKind, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,8 +27,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use yinyang_core::NodeId;
-
 const MAGIC: [u8; 8] = *b"YYBK0001";
 const VERSION: u8 = 1;
 const MANIFEST: &str = "manifest.bin";
@@ -153,18 +151,16 @@ impl BackupManifest {
                     id: artifact.id,
                     name: artifact.name,
                     present: true,
-                    nodes: nodes
-                        .nodes()
-                        .values()
-                        .map(SnapshotNode::from_local)
-                        .collect(),
+                    nodes: nodes.values().map(SnapshotNode::from_local).collect(),
                 }),
-                Err(_) if artifact.phase == "failed" => artifacts.push(ArtifactSnapshot {
-                    id: artifact.id,
-                    name: artifact.name,
-                    present: false,
-                    nodes: Vec::new(),
-                }),
+                Err(error) if artifact.phase == "failed" && error.kind() == ErrorKind::NotFound => {
+                    artifacts.push(ArtifactSnapshot {
+                        id: artifact.id,
+                        name: artifact.name,
+                        present: false,
+                        nodes: Vec::new(),
+                    })
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -274,10 +270,7 @@ impl BackupManifest {
         let manifest: Self = borsh::from_slice(&bytes)
             .map_err(|_| Error::corrupt("backup manifest is malformed"))?;
         if manifest.magic != MAGIC || manifest.version != VERSION {
-            return Err(Error::unsupported(
-                "read backup manifest",
-                "unsupported backup manifest profile",
-            ));
+            return Err(Error::unsupported("unsupported backup manifest profile"));
         }
         Ok(manifest)
     }
@@ -304,19 +297,34 @@ impl BackupManifest {
         let mut identities = IdentityMap::new();
         self.validate_databases(backup)?;
         let root = snapshot(&backup.join("root"))?;
+        let root = root
+            .nodes()
+            .values()
+            .map(SnapshotNode::from_local)
+            .collect::<Vec<_>>();
         verify_snapshot(&self.root, &root, &mut identities, "backup root")?;
         for artifact in &self.artifacts {
             let path = backup.join("state/quarantine").join(&artifact.name);
             if !artifact.present {
-                if path.exists() {
-                    return Err(Error::corrupt(format!(
-                        "failed artifact {} unexpectedly exists in the backup",
-                        artifact.id
-                    )));
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        return Err(Error::corrupt(format!(
+                            "failed artifact {} unexpectedly exists in the backup",
+                            artifact.id
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(Error::io("inspect absent backup artifact", &path, error));
+                    }
                 }
-                continue;
             }
             let actual = snapshot(&path)?;
+            let actual = actual
+                .nodes()
+                .values()
+                .map(SnapshotNode::from_local)
+                .collect::<Vec<_>>();
             verify_snapshot(
                 &artifact.nodes,
                 &actual,
@@ -355,6 +363,26 @@ impl BackupManifest {
 
     pub(super) fn copy_to(&self, backup: &Path, root: &Path, state: &Path) -> Result<()> {
         self.validate_package(backup)?;
+        let backup = fs::canonicalize(backup)
+            .map_err(|error| Error::io("canonicalize backup package", backup, error))?;
+        let root = canonical_target(root)?;
+        let state = canonical_target(state)?;
+        if root == state {
+            return Err(Error::invalid(
+                "restore root and state destinations must be different",
+            ));
+        }
+        if root.starts_with(&backup) || backup.starts_with(&root) {
+            return Err(Error::invalid("restore root overlaps the backup package"));
+        }
+        if state.starts_with(&backup) || backup.starts_with(&state) {
+            return Err(Error::invalid("restore state overlaps the backup package"));
+        }
+        if root.starts_with(&state) || state.starts_with(&root) {
+            return Err(Error::invalid(
+                "restore root and state must not contain each other",
+            ));
+        }
         if root.exists() {
             return Err(Error::invalid(format!(
                 "restore root {} already exists",
@@ -367,23 +395,23 @@ impl BackupManifest {
                 state.display()
             )));
         }
-        fs::create_dir(root).map_err(|error| Error::io("create restore root", root, error))?;
-        fs::create_dir(state).map_err(|error| Error::io("create restore state", state, error))?;
+        fs::create_dir(&root).map_err(|error| Error::io("create restore root", &root, error))?;
+        fs::create_dir(&state).map_err(|error| Error::io("create restore state", &state, error))?;
         let root_identity =
-            fs::metadata(root).map_err(|error| Error::io("inspect restore root", root, error))?;
-        let state_identity = fs::metadata(state)
-            .map_err(|error| Error::io("inspect restore state", state, error))?;
+            fs::metadata(&root).map_err(|error| Error::io("inspect restore root", &root, error))?;
+        let state_identity = fs::metadata(&state)
+            .map_err(|error| Error::io("inspect restore state", &state, error))?;
         if root_identity.dev() != state_identity.dev() {
             return Err(Error::unsupported(
                 "restore root and state must be on the same filesystem",
             ));
         }
         let mut seen = BTreeMap::new();
-        copy_snapshot(&backup.join("root"), root, &self.root, &mut seen)?;
+        copy_snapshot(&backup.join("root"), &root, &self.root, &mut seen)?;
         fs::create_dir_all(state.join("content"))
-            .map_err(|error| Error::io("create restored content state", state, error))?;
+            .map_err(|error| Error::io("create restored content state", &state, error))?;
         fs::create_dir(state.join("quarantine"))
-            .map_err(|error| Error::io("create restored artifacts", state, error))?;
+            .map_err(|error| Error::io("create restored artifacts", &state, error))?;
         for artifact in &self.artifacts {
             if !artifact.present {
                 continue;
@@ -400,8 +428,8 @@ impl BackupManifest {
             let destination = state.join(relative.trim_start_matches("state/"));
             copy_file(&source, &destination)?;
         }
-        sync_directory(root)?;
-        sync_directory(state)?;
+        sync_directory(&root)?;
+        sync_directory(&state)?;
         Ok(())
     }
 
@@ -417,11 +445,12 @@ impl BackupManifest {
         for artifact in &self.artifacts {
             let actual = match replica.scan_artifact(&artifact.name) {
                 Ok(nodes) => nodes
-                    .nodes()
                     .values()
                     .map(SnapshotNode::from_local)
                     .collect::<Vec<_>>(),
-                Err(_) if !artifact.present => Vec::new(),
+                Err(error) if !artifact.present && error.kind() == ErrorKind::NotFound => {
+                    Vec::new()
+                }
                 Err(error) => return Err(error),
             };
             if !artifact.present {
@@ -451,14 +480,31 @@ impl BackupManifest {
 fn snapshot(root: &Path) -> Result<LocalSnapshot> {
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| Error::io("inspect backup tree", root, error))?;
+    let root_identity = identity(&root_metadata);
+    let mut nodes = BTreeMap::new();
+    if root_metadata.file_type().is_file() {
+        let (length, digest) = hash_file(root)?;
+        nodes.insert(
+            String::new(),
+            LocalNode {
+                path: String::new(),
+                kind: LocalKind::File {
+                    length,
+                    digest: ContentHash::from_bytes(digest),
+                },
+                executable: root_metadata.permissions().mode() & 0o111 != 0,
+                identity: root_identity,
+                parent: None,
+            },
+        );
+        return Ok(LocalSnapshot::from_nodes(nodes));
+    }
     if !root_metadata.file_type().is_dir() {
         return Err(Error::corrupt(format!(
-            "backup tree {} is not a directory",
+            "backup tree {} is a symlink or special file",
             root.display()
         )));
     }
-    let root_identity = identity(&root_metadata);
-    let mut nodes = BTreeMap::new();
     nodes.insert(
         String::new(),
         LocalNode {
@@ -472,6 +518,20 @@ fn snapshot(root: &Path) -> Result<LocalSnapshot> {
     scan_directory(root, "", root_identity, &mut nodes)
         .map_err(|error| Error::io("scan backup tree", root, error))?;
     Ok(LocalSnapshot::from_nodes(nodes))
+}
+
+fn canonical_target(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path)
+            .map_err(|error| Error::io("canonicalize restore destination", path, error));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| Error::io("canonicalize restore parent", parent, error))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::invalid("restore destination requires a directory name"))?;
+    Ok(parent.join(name))
 }
 
 fn scan_directory(
@@ -506,7 +566,8 @@ fn scan_directory(
             );
             scan_directory(&entry.path(), &path, current, nodes)?;
         } else if file_type.is_file() {
-            let (length, digest) = hash_file(&entry.path())?;
+            let (length, digest) = hash_file(&entry.path())
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
             nodes.insert(
                 path.clone(),
                 LocalNode {
@@ -552,7 +613,7 @@ fn hash_file(path: &Path) -> Result<(u64, [u8; 32])> {
         hasher.update(&buffer[..count]);
         length = length
             .checked_add(count as u64)
-            .ok_or_else(|| Error::unsupported("checksum", "file length overflow"))?;
+            .ok_or_else(|| Error::unsupported("file length overflow"))?;
     }
     Ok((length, *hasher.finalize().as_bytes()))
 }
@@ -627,7 +688,7 @@ fn vacuum(source: &Path, destination: &Path) -> Result<()> {
         .map_err(|error| Error::io("open SQLite database for backup", source, error))?;
     let destination_text = destination
         .to_str()
-        .ok_or_else(|| Error::unsupported("backup SQLite database", "non-UTF-8 path"))?;
+        .ok_or_else(|| Error::unsupported("backup database path is not UTF-8"))?;
     connection
         .execute("VACUUM INTO ?1", [destination_text])
         .map_err(|error| Error::io("backup SQLite database", source, error))?;

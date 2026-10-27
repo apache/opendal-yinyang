@@ -250,7 +250,8 @@ impl DirectorySync {
         Sync::validate_restore(self.replica.state(), self.sync.authority().filesystem())
             .await
             .map_err(Box::new)?;
-        BackupManifest::create(&self.replica, output).map_err(Box::new)
+        BackupManifest::create(&self.replica, output).map_err(Box::new)?;
+        Ok(())
     }
 
     /// Complete an isolated restore after both the state directory and bound
