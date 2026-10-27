@@ -118,6 +118,7 @@ pub async fn run(
         }
     };
     let session = Session::new(filesystem, &mountpoint, &options)?;
+    inner.install_notifier(session.notifier());
     println!(
         "yy: mounted {} {} at {} (fuse.yinyang)",
         config.name,
@@ -131,7 +132,6 @@ pub async fn run(
     // and receives the local teardown request. Exactly one `join` or
     // `umount_and_join` runs under the shared grace period.
     let background = session.spawn()?;
-    inner.install_notifier(background.notifier());
     let (stop_refresh, stop_refresh_rx) = tokio::sync::oneshot::channel::<()>();
     let refresh_task = hangup.map(|signal| {
         let refresh = inner.clone();
