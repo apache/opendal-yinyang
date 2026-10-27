@@ -1630,6 +1630,10 @@ fn run_external(program: &str, args: &[&str], timeout: Duration) -> Captured {
 }
 
 fn run_command(mut command: Command, timeout: Duration) -> Captured {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn command");
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
