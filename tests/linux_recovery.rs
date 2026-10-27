@@ -30,6 +30,7 @@ use nix::unistd::{Gid, Uid};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -602,6 +603,9 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
         "--output",
         text(&backup),
     ]);
+    assert_private_directory(&backup);
+    assert_private_directory(&backup.join("root"));
+    assert_private_directory(&backup.join("state"));
     fixture.stop_service();
     let destination_root_name = remote_root("sync-restore");
     copy_prefix(
@@ -670,6 +674,8 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
             ],
         )
         .success_or("restore isolated Sync backup");
+    assert_private_directory(&restored_root);
+    assert_private_directory(&restored_state);
     let restored = sync_status_with_env(
         &fixture,
         &restored_config,
@@ -951,6 +957,20 @@ fn inspect(staging: &Path) -> RuntimeStatus {
     runtime()
         .block_on(Runtime::inspect(staging))
         .expect("inspect staging")
+}
+
+fn assert_private_directory(path: &Path) {
+    let mode = fs::metadata(path)
+        .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode,
+        0o700,
+        "recovery output {} must not expose pending payloads",
+        path.display()
+    );
 }
 
 fn write_sync_config(

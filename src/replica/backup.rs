@@ -28,7 +28,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use yinyang_core::NodeId;
 const MAGIC: [u8; 8] = *b"YYBK0001";
@@ -277,14 +277,11 @@ impl BackupManifest {
                 "backup destination must be outside the synchronized root and state directories",
             ));
         }
-        fs::create_dir(&output)
-            .map_err(|error| Error::io("create backup destination", &output, error))?;
+        create_private_directory(&output, "create backup destination")?;
         let root_output = output.join("root");
         let state_output = output.join("state");
-        fs::create_dir(&root_output)
-            .map_err(|error| Error::io("create backup root", &root_output, error))?;
-        fs::create_dir(&state_output)
-            .map_err(|error| Error::io("create backup state", &state_output, error))?;
+        create_private_directory(&root_output, "create backup root")?;
+        create_private_directory(&state_output, "create backup state")?;
         sync_directory(&parent)?;
         sync_directory(&output)?;
 
@@ -502,8 +499,8 @@ impl BackupManifest {
                 state.display()
             )));
         }
-        fs::create_dir(&root).map_err(|error| Error::io("create restore root", &root, error))?;
-        fs::create_dir(&state).map_err(|error| Error::io("create restore state", &state, error))?;
+        create_private_directory(&root, "create restore root")?;
+        create_private_directory(&state, "create restore state")?;
         sync_parent_directory(&root)?;
         sync_parent_directory(&state)?;
         sync_directory(&root)?;
@@ -707,6 +704,13 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     output
         .sync_all()
         .map_err(|error| Error::io("persist backup file", destination, error))
+}
+
+fn create_private_directory(path: &Path, operation: &str) -> Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| Error::io(operation, path, error))
 }
 
 fn vacuum(source: &Path, destination: &Path) -> Result<()> {
