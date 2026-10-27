@@ -36,6 +36,11 @@ the medium scale, and the explicit service-authority one-shot boundary. The
 command writes JSONL evidence to `--output` and a Markdown summary to the same
 path with an `.md` extension.
 
+The summary marks combinations that the product does not support as
+`unsupported` with dashes for measurement fields. This prevents a not-run
+service-authority one-shot transfer from looking like a measured zero-cost
+operation.
+
 Use an empty output path for each run. Keep `--release` output on one commit and
 host while comparing implementations; the tool records the source commit, dirty
 state, binary path, and binary BLAKE3 digest in every record.

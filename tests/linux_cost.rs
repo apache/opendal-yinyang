@@ -2142,15 +2142,28 @@ impl Recorder {
             }
         ));
         markdown.push_str(
-            "| Scenario | Publication | Scale | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
+            "| Scenario | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
         );
         markdown.push_str(
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for record in &self.records {
+            if !record.supported {
+                markdown.push_str(&format!(
+                    "| {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - |\n",
+                    record.scenario,
+                    record.publication,
+                    record.scale,
+                    record
+                        .limitation
+                        .as_deref()
+                        .expect("unsupported record has a limitation"),
+                ));
+                continue;
+            }
             let network = &record.network_per_sample;
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
                 record.scenario,
                 record.publication,
                 record.scale,
@@ -2174,7 +2187,7 @@ impl Recorder {
             ));
         }
         markdown.push_str(
-            "\nThe `total/sample` columns divide batch counters by the actual number of latency samples so a five-run batch is not presented as one run. For concurrent writers, samples overlap and share the same batch totals. S3 and metadata-service counters are separate: S3 columns come from parsed HTTP requests to Silo, while service columns count authenticated TCP connections and raw framed bytes. Process I/O values are sampled lower bounds, not exact local scan or hash costs. Space series, raw latency samples, cache policy, and completion semantics are preserved in the JSONL evidence.\n",
+            "\nRows marked unsupported were not executed; dashes distinguish them from measured zero-cost operations. The `total/sample` columns divide batch counters by the actual number of latency samples so a five-run batch is not presented as one run. For concurrent writers, samples overlap and share the same batch totals. S3 and metadata-service counters are separate: S3 columns come from parsed HTTP requests to Silo, while service columns count authenticated TCP connections and raw framed bytes. Process I/O values are sampled lower bounds, not exact local scan or hash costs. Space series, raw latency samples, cache policy, and completion semantics are preserved in the JSONL evidence.\n",
         );
         fs::write(&self.summary_path, markdown).expect("write benchmark Markdown summary");
         println!(
