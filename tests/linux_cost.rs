@@ -338,9 +338,8 @@ fn run_fuse_matrix(
 ) {
     let fixture = Fixture::new_with_storage_endpoint(publication, Some(proxy.endpoint()));
     let size = scale.file_size();
-    let bytes = payload(size, 0x5a);
-    fixture.remote_create_file("large.bin", &bytes, false);
-    drop(bytes);
+    let mut expected_large = payload(size, 0x5a);
+    fixture.remote_create_file("large.bin", &expected_large, false);
     let (config, staging, mountpoint) = mount_paths(
         &fixture,
         &format!("fuse-{}-{}", publication.as_str(), scale.as_str()),
@@ -382,7 +381,7 @@ fn run_fuse_matrix(
         value
     });
     let cold_bytes = cold.value;
-    assert_eq!(cold_bytes, payload(RANGE_BYTES, 0x5a));
+    assert_eq!(cold_bytes, expected_large[size / 2..size / 2 + RANGE_BYTES]);
     recorder.record(
         context,
         "fuse_cold_open_range_read",
@@ -405,7 +404,10 @@ fn run_fuse_matrix(
         let measured = measure_mount_operation(proxy, mounted.pid(), || {
             let mut value = vec![0_u8; RANGE_BYTES];
             read_exact_at(&warm_file, &mut value, offset);
-            assert_eq!(value, payload(RANGE_BYTES, 0x5a));
+            assert_eq!(
+                value,
+                expected_large[offset as usize..offset as usize + RANGE_BYTES]
+            );
         });
         warm.push(measured);
     }
@@ -422,7 +424,6 @@ fn run_fuse_matrix(
         vec!["range bytes verified".to_owned()],
     );
 
-    let mut expected_large = payload(size, 0x5a);
     let mut sparse = OperationBatch::default();
     let mut spaces = Vec::new();
     for index in 0..4_u64 {
