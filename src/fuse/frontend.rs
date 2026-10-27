@@ -540,7 +540,7 @@ impl Inner {
                     );
                     reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
                 }
-                Err(error) => reply.error(core_errno(&error)),
+                Err(error) => reply.error(runtime_errno(&error)),
             };
         }
         if let Err(errno) = self.reclaim_clean_state(id).await {
