@@ -163,7 +163,12 @@ fn isolated_user_service_lifecycle() {
         &state,
         &mounts,
         service_address,
-        [&service_root, &mount_root, &sync_root],
+        &[
+            ("service", &service_root),
+            ("object", &mount_root),
+            ("sync", &sync_root),
+            ("service-sync", &service_root),
+        ],
     );
 
     let service_config = write_config(
@@ -195,8 +200,66 @@ fn isolated_user_service_lifecycle() {
         &service_root,
         &units.serve,
     );
+    fs::create_dir(mounts.join("service")).unwrap();
+    units.start(&units.mount_instance("service"));
+    units.wait_active(&units.mount_instance("service"));
+    wait_mount(&mounts.join("service"), None);
+    units.stop(&units.mount_instance("service"));
+    assert!(state.join("service/staging.db").exists());
+
+    let service_sync_config = write_config(
+        &configs,
+        "service-sync",
+        "sync",
+        "library",
+        "service",
+        Some(&service_address.to_string()),
+    );
+    rewrite_staging(&service_sync_config, &state.join("service-sync"));
+    let service_sync_root = work.join("service-sync-root");
+    let init = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_sync_config.to_str().unwrap(),
+            "sync",
+            "init",
+            "--directory",
+            service_sync_root.to_str().unwrap(),
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    init.success_or("service-authority sync init");
+    fs::write(
+        service_sync_root.join("service.txt"),
+        b"service finite sync",
+    )
+    .unwrap();
+    units.start(&units.sync_instance("service-sync"));
+    units.wait_active(&units.sync_instance("service-sync"));
+    let status = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_sync_config.to_str().unwrap(),
+            "sync",
+            "status",
+            "--json",
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    status.success_or("service-authority sync status");
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["summary"]["in_sync"], true, "{status:#}");
+    units.stop(&units.sync_instance("service-sync"));
+
     units.stop(&units.serve);
     assert!(state.join("metadata/metadata.db").exists());
+    assert!(state.join("service-sync/sync.db").exists());
 
     let mount_config = write_config(&configs, "object", "mount", "fuse", "object", None);
     rewrite_staging(&mount_config, &state.join("object"));
@@ -400,6 +463,83 @@ fn cli_smoke_with(storage: Storage) {
         doctor["volume"]["authority"],
         "authenticated-loopback-service"
     );
+
+    let service_mountpoint = work.join("service-mount");
+    fs::create_dir(&service_mountpoint).unwrap();
+    let mut service_mount = install.spawn(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_config.to_str().unwrap(),
+            "mount",
+            service_mountpoint.to_str().unwrap(),
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    wait_mount(&service_mountpoint, Some(&mut service_mount));
+    stop(&mut service_mount);
+
+    let service_sync_config = write_config(
+        &configs,
+        "service-sync",
+        "sync",
+        "library",
+        "service",
+        Some(&address.to_string()),
+    );
+    rewrite_staging(&service_sync_config, &state.join("service-sync"));
+    let service_sync_root = work.join("service-sync-root");
+    let init = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_sync_config.to_str().unwrap(),
+            "sync",
+            "init",
+            "--directory",
+            service_sync_root.to_str().unwrap(),
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    init.success_or("service-authority sync init");
+    fs::write(
+        service_sync_root.join("service.txt"),
+        b"service finite sync",
+    )
+    .unwrap();
+    let run = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_sync_config.to_str().unwrap(),
+            "sync",
+            "run",
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    run.success_or("service-authority finite sync");
+    let status = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_sync_config.to_str().unwrap(),
+            "sync",
+            "status",
+            "--json",
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    status.success_or("service-authority sync status");
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["summary"]["in_sync"], true, "{status:#}");
     stop(&mut service);
 
     let mut restarted = start_service(&install, &storage, &work, &service_database, &service_root);
@@ -441,12 +581,16 @@ fn cli_smoke_with(storage: Storage) {
         service_database.exists(),
         "metadata service stop discarded its authority database"
     );
+    assert!(state.join("service/staging.db").exists());
+    assert!(state.join("service-sync/sync.db").exists());
 
     fs::remove_dir_all(&install.prefix).unwrap();
     assert!(local.join("hello.txt").exists());
     assert!(state.join("object/staging.db").exists());
     assert!(state.join("sync/sync.db").exists());
     assert!(service_database.exists());
+    assert!(state.join("service/staging.db").exists());
+    assert!(state.join("service-sync/sync.db").exists());
     assert!(object_config.exists());
     assert!(sync_config.exists());
     assert!(service_config.exists());
@@ -822,7 +966,7 @@ impl UserUnits {
         state: &Path,
         mounts: &Path,
         service_address: SocketAddr,
-        roots: [&str; 3],
+        roots: &[(&str, &str)],
     ) -> Self {
         let directory = user_unit_directory();
         let created_unit_directory = !directory.exists();
@@ -831,20 +975,18 @@ impl UserUnits {
         let created_config_root = !config_root.exists();
         fs::create_dir_all(&config_root).unwrap();
         let environment = config_root.join("environment");
-        let overlays = [
-            config_root.join("environment-service"),
-            config_root.join("environment-object"),
-            config_root.join("environment-sync"),
-        ];
-        for path in [
-            environment.clone(),
-            overlays[0].clone(),
-            overlays[1].clone(),
-            overlays[2].clone(),
+        let overlays = roots
+            .iter()
+            .map(|(name, _)| config_root.join(format!("environment-{name}")))
+            .collect::<Vec<_>>();
+        let mut paths = vec![environment.clone()];
+        paths.extend(overlays.iter().cloned());
+        paths.extend([
             directory.join("yinyang-serve.service"),
             directory.join("yinyang-mount@.service"),
             directory.join("yinyang-sync@.service"),
-        ] {
+        ]);
+        for path in paths {
             assert!(
                 !path.exists(),
                 "refusing to overwrite pre-existing systemd qualification path {}",
@@ -860,7 +1002,7 @@ impl UserUnits {
             state,
             service_address,
         );
-        for (path, root) in overlays.iter().zip(roots) {
+        for ((_, root), path) in roots.iter().zip(&overlays) {
             write_private_file(path, format!("YINYANG_S3_ROOT={root}\n"));
         }
         let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/linux");
@@ -943,7 +1085,9 @@ impl Drop for UserUnits {
     fn drop(&mut self) {
         for unit in [
             self.mount_instance("object"),
+            self.mount_instance("service"),
             self.sync_instance("sync"),
+            self.sync_instance("service-sync"),
             self.serve.clone(),
         ] {
             let _ = systemctl(&["stop", &unit]);
