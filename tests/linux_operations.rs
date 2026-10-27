@@ -245,12 +245,19 @@ fn isolated_user_service_lifecycle() {
         Some(SERVICE_TOKEN),
     );
     init.success_or("service-authority sync init");
+    units.start(&units.sync_instance("service-sync"));
+    units.wait_active(&units.sync_instance("service-sync"));
+    assert_mount_bytes(
+        &service_sync_root,
+        "service-before-restart",
+        b"service mount bytes",
+    );
     fs::write(
         service_sync_root.join("service.txt"),
         b"service finite sync",
     )
     .unwrap();
-    units.start(&units.sync_instance("service-sync"));
+    units.restart(&units.sync_instance("service-sync"));
     units.wait_active(&units.sync_instance("service-sync"));
     let status = install.run(
         &storage,
@@ -594,6 +601,24 @@ fn cli_smoke_with(storage: Storage) {
         Some(SERVICE_TOKEN),
     );
     init.success_or("service-authority sync init");
+    let run = install.run(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_sync_config.to_str().unwrap(),
+            "sync",
+            "run",
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    run.success_or("service-authority initial sync");
+    assert_mount_bytes(
+        &service_sync_root,
+        "service-before-restart",
+        b"service mount bytes",
+    );
     fs::write(
         service_sync_root.join("service.txt"),
         b"service finite sync",
