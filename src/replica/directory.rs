@@ -263,6 +263,17 @@ impl DirectorySync {
         root: &Path,
     ) -> Result<Self> {
         let manifest = BackupManifest::load(backup).map_err(Box::new)?;
+        if manifest.filesystem() != authority.filesystem() {
+            return Err(format!(
+                "backup belongs to filesystem {}, not {}",
+                hex(manifest.filesystem().as_bytes()),
+                hex(authority.filesystem().as_bytes())
+            )
+            .into());
+        }
+        Sync::validate_restore(backup.join("state"), authority.filesystem())
+            .await
+            .map_err(Box::new)?;
         manifest.copy_to(backup, root, state).map_err(Box::new)?;
         Sync::validate_restore(state, authority.filesystem()).await?;
         let replica =

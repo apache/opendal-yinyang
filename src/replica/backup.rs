@@ -19,7 +19,7 @@
 
 use super::linux::{ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, Replica};
 use super::state::{Binding, IdentityMap};
-use super::{Error, ErrorKind, Result};
+use super::{Error, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +27,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use yinyang_core::NodeId;
 const MAGIC: [u8; 8] = *b"YYBK0001";
 const VERSION: u8 = 1;
 const MANIFEST: &str = "manifest.bin";
@@ -120,6 +121,10 @@ struct DatabaseEvidence {
 }
 
 impl BackupManifest {
+    pub(super) fn filesystem(&self) -> NodeId {
+        NodeId::from_bytes(self.filesystem)
+    }
+
     pub(super) fn create(replica: &Replica, output: &Path) -> Result<()> {
         Self::capture(replica)?.write(replica, output)
     }
@@ -146,14 +151,12 @@ impl BackupManifest {
                     "retained artifact has an unsafe stored name",
                 ));
             }
-            match replica.scan_artifact(&artifact.name) {
-                Ok(nodes) => artifacts.push(ArtifactSnapshot {
-                    id: artifact.id,
-                    name: artifact.name,
-                    present: true,
-                    nodes: nodes.values().map(SnapshotNode::from_local).collect(),
-                }),
-                Err(error) if artifact.phase == "failed" && error.kind() == ErrorKind::NotFound => {
+            let artifact_path = replica.artifact_path(&artifact.id)?;
+            match fs::symlink_metadata(&artifact_path) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && artifact.phase == "failed" =>
+                {
                     artifacts.push(ArtifactSnapshot {
                         id: artifact.id,
                         name: artifact.name,
@@ -161,7 +164,22 @@ impl BackupManifest {
                         nodes: Vec::new(),
                     })
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(Error::io(
+                        "inspect retained artifact",
+                        &artifact_path,
+                        error,
+                    ));
+                }
+                Ok(_) => {
+                    let nodes = replica.scan_artifact(&artifact.name)?;
+                    artifacts.push(ArtifactSnapshot {
+                        id: artifact.id,
+                        name: artifact.name,
+                        present: true,
+                        nodes: nodes.values().map(SnapshotNode::from_local).collect(),
+                    });
+                }
             }
         }
         Ok(Self {
@@ -443,15 +461,23 @@ impl BackupManifest {
         let mut identities = IdentityMap::new();
         verify_snapshot(&self.root, &actual_root, &mut identities, "restored root")?;
         for artifact in &self.artifacts {
-            let actual = match replica.scan_artifact(&artifact.name) {
-                Ok(nodes) => nodes
+            let artifact_path = replica.artifact_path(&artifact.id)?;
+            let actual = match fs::symlink_metadata(&artifact_path) {
+                Err(error) if !artifact.present && error.kind() == std::io::ErrorKind::NotFound => {
+                    Vec::new()
+                }
+                Err(error) => {
+                    return Err(Error::io(
+                        "inspect restored retained artifact",
+                        &artifact_path,
+                        error,
+                    ));
+                }
+                Ok(_) => replica
+                    .scan_artifact(&artifact.name)?
                     .values()
                     .map(SnapshotNode::from_local)
                     .collect::<Vec<_>>(),
-                Err(error) if !artifact.present && error.kind() == ErrorKind::NotFound => {
-                    Vec::new()
-                }
-                Err(error) => return Err(error),
             };
             if !artifact.present {
                 if !actual.is_empty() {

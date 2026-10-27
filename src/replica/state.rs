@@ -579,19 +579,23 @@ impl Store {
             let parent = map_identity(identities, Some(&parent_dev), Some(&parent_ino))?;
             let temporary = map_identity(identities, temp_dev.as_deref(), temp_ino.as_deref())?;
             let expected_dev = expected
-                .map(|value| value.0.to_be_bytes())
+                .map(|value| value.0.to_be_bytes().to_vec())
                 .unwrap_or(expected_dev);
             let expected_ino = expected
-                .map(|value| value.1.to_be_bytes())
+                .map(|value| value.1.to_be_bytes().to_vec())
                 .unwrap_or(expected_ino);
             let parent_dev = parent
-                .map(|value| value.0.to_be_bytes())
+                .map(|value| value.0.to_be_bytes().to_vec())
                 .unwrap_or(parent_dev);
             let parent_ino = parent
-                .map(|value| value.1.to_be_bytes())
+                .map(|value| value.1.to_be_bytes().to_vec())
                 .unwrap_or(parent_ino);
-            let temporary_dev = temporary.map(|value| value.0.to_be_bytes()).or(temp_dev);
-            let temporary_ino = temporary.map(|value| value.1.to_be_bytes()).or(temp_ino);
+            let temporary_dev = temporary
+                .map(|value| value.0.to_be_bytes().to_vec())
+                .or(temp_dev);
+            let temporary_ino = temporary
+                .map(|value| value.1.to_be_bytes().to_vec())
+                .or(temp_ino);
             transaction
                 .execute(
                     "UPDATE installs SET
