@@ -151,9 +151,9 @@ work tracked by issue #79.
 - `doctor` admission, action reporting and secret redaction through the real
   binary;
 - a clean copied installation prefix with a separate working directory;
-- object-backed Managed Mount start, readiness, SIGTERM stop and retained
-  staging;
-- object-backed finite Sync whose result is accepted only through
+- object- and service-backed Managed Mount start, mounted write, fsync, read,
+  restart, stop and retained staging;
+- object- and service-backed finite Sync whose result is accepted only through
   `summary.in_sync=true`;
 - authenticated loopback service start, stop and restart against retained
   SQLite authority;
@@ -166,13 +166,10 @@ credentials are used. It must not inherit a MinIO endpoint and does not use a
 counting proxy. A real Amazon S3 result is recorded only when the actual CLI
 completes the isolated smoke against the named bucket and region.
 
-At `77595182c1447177f9d0b748ca2526773853f8e1`, the
-`ops-real-s3-7759518-role-r1` run passed in `us-east-2` with the provider
-endpoint and no endpoint override. Exit status was zero and the single native
-test completed in 7.97s. It exercised the installed-prefix object and
-authenticated-loopback-service Mount write/fsync/read/remount paths and finite
-Sync convergence. The tested `target/debug/yy` SHA-256 was
-`b9acff232c66f6dd898deeccb315e2a1f70af4e9e37959793bc7ba98425ed705`; the task
-bucket held 5,861 bytes of fixtures when observed, and bucket plus temporary
-credential-policy cleanup were verified complete. This is one scoped backend
-and host result, not a capacity, multi-host or HA claim.
+Current evidence covers the installed exact CLI and systemd user-unit
+lifecycles for object and authenticated-loopback-service Mount and Sync,
+including mounted write, fsync, read, restart and convergence checks. Exact
+source, binary, backend and region identities are recorded in the
+[Linux operations guide](../docs/linux-operations.md#qualification-matrix).
+This scoped backend and host evidence is not a capacity, multi-host or HA
+claim.
