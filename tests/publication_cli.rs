@@ -107,6 +107,8 @@ fn retry_uses_the_documented_storage_entry_point() {
         "--state",
         state.to_str().unwrap(),
     ])
+    .env("YINYANG_S3_BUCKET", "publication-admission")
+    .env("YINYANG_S3_REGION", "us-east-1")
     .env("YINYANG_S3_ENDPOINT", "http://127.0.0.1:9")
     .output()
     .expect("run yy");
