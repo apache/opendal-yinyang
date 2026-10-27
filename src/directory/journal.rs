@@ -39,6 +39,7 @@ const FAILED: u8 = 5;
 #[derive(Clone, Copy)]
 enum StateFilter {
     Active,
+    Any,
     Local,
     Unknown,
 }
@@ -138,6 +139,16 @@ pub struct DirectoryJournal {
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for DirectoryJournal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectoryJournal")
+            .field("filesystem", &self.filesystem())
+            .field("root", &self.root())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DirectoryJournal {
     /// Open or create a journal bound to one object publication authority.
     pub async fn open(fs: &Fs, directory: impl AsRef<Path>) -> Result<Self> {
@@ -151,16 +162,61 @@ impl DirectoryJournal {
             connection
                 .busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(sql)?;
-            connection
-                .execute_batch(
-                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-                     CREATE TABLE IF NOT EXISTS binding(
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let has_binding: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master WHERE type='table' AND name='binding'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if has_binding {
+                validate_binding(&tx, filesystem, root)?;
+                let has_publications: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_master
+                            WHERE type='table' AND name='publications'
+                         )",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                if !has_publications {
+                    return Err(Error::local_kind(
+                        ErrorKind::Corrupt,
+                        "directory journal is missing its publications table",
+                    ));
+                }
+            } else {
+                let has_tables: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_master
+                            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                         )",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                if has_tables {
+                    return Err(Error::local_kind(
+                        ErrorKind::Corrupt,
+                        "directory journal is missing its binding",
+                    ));
+                }
+                tx.execute_batch(
+                    "CREATE TABLE binding(
                          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                          profile TEXT NOT NULL,
                          filesystem BLOB NOT NULL,
                          root BLOB NOT NULL
                      );
-                     CREATE TABLE IF NOT EXISTS publications(
+                     CREATE TABLE publications(
                          commit_id BLOB PRIMARY KEY,
                          baseline BLOB NOT NULL,
                          request_digest BLOB NOT NULL,
@@ -174,38 +230,16 @@ impl DirectoryJournal {
                      );",
                 )
                 .map_err(sql)?;
-            let tx = connection.transaction().map_err(sql)?;
-            let binding: Option<(String, Vec<u8>, Vec<u8>)> = tx
-                .query_row("SELECT profile,filesystem,root FROM binding", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .optional()
+                tx.execute(
+                    "INSERT INTO binding VALUES(1,?1,?2,?3)",
+                    params![PROFILE, filesystem.as_slice(), root.as_slice()],
+                )
                 .map_err(sql)?;
-            match binding {
-                None => {
-                    tx.execute(
-                        "INSERT INTO binding VALUES(1,?1,?2,?3)",
-                        params![PROFILE, filesystem.as_slice(), root.as_slice()],
-                    )
-                    .map_err(sql)?;
-                }
-                Some((profile, _, _)) if profile != PROFILE => {
-                    return Err(Error::local_kind(
-                        ErrorKind::Unsupported,
-                        "directory journal uses an unsupported profile",
-                    ));
-                }
-                Some((_, bound_filesystem, bound_root))
-                    if bound_filesystem != filesystem || bound_root != root =>
-                {
-                    return Err(Error::local_kind(
-                        ErrorKind::Invalid,
-                        "directory journal belongs to another filesystem",
-                    ));
-                }
-                Some(_) => {}
             }
             tx.commit().map_err(sql)?;
+            connection
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+                .map_err(sql)?;
             Ok(connection)
         })
         .await
@@ -312,7 +346,7 @@ impl DirectoryJournal {
                         COMMITTED,
                         Some(receipt.clone()),
                         None,
-                        StateFilter::Unknown,
+                        StateFilter::Any,
                     )
                     .await
                     {
@@ -409,7 +443,7 @@ impl DirectoryJournal {
                     COMMITTED,
                     Some(receipt.clone()),
                     None,
-                    StateFilter::Unknown,
+                    StateFilter::Any,
                 )
                 .await
                 {
@@ -550,6 +584,11 @@ impl DirectoryJournal {
             .await?
             .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown directory intent"))?;
         let status = row.status(commit_id)?;
+        if !status.can_export() {
+            return Err(Error::Retained(status.failure.ok_or_else(|| {
+                Error::local_kind(ErrorKind::Corrupt, "failed intent has no diagnostic")
+            })?));
+        }
         let (baseline, request_id, digest) = Transaction::inspect_identity(&row.request)?;
         if baseline != status.intent.baseline || request_id != commit_id || digest != row.digest() {
             return Err(Error::local_kind(
@@ -611,6 +650,22 @@ impl StoredRow {
         let digest: [u8; 32] = self.digest.as_slice().try_into().map_err(|_| {
             Error::local_kind(ErrorKind::Corrupt, "invalid directory request digest")
         })?;
+        let (request_baseline, request_id, request_digest) =
+            Transaction::inspect_identity(&self.request).map_err(|error| {
+                Error::local_kind(
+                    ErrorKind::Corrupt,
+                    format!("invalid retained frozen request: {error}"),
+                )
+            })?;
+        if request_baseline != Revision::from_bytes(baseline)
+            || request_id != id
+            || request_digest != digest
+        {
+            return Err(Error::local_kind(
+                ErrorKind::Corrupt,
+                "stored directory request identity disagrees",
+            ));
+        }
         let state = match self.state {
             PREPARED => DirectoryState::Prepared,
             UNKNOWN => DirectoryState::Unknown,
@@ -667,6 +722,27 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
     })
 }
 
+fn validate_binding(connection: &Connection, filesystem: [u8; 16], root: [u8; 16]) -> Result<()> {
+    let (profile, bound_filesystem, bound_root): (String, Vec<u8>, Vec<u8>) = connection
+        .query_row("SELECT profile,filesystem,root FROM binding", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(sql)?;
+    if profile != PROFILE {
+        return Err(Error::local_kind(
+            ErrorKind::Unsupported,
+            "directory journal uses an unsupported profile",
+        ));
+    }
+    if bound_filesystem != filesystem || bound_root != root {
+        return Err(Error::local_kind(
+            ErrorKind::Invalid,
+            "directory journal belongs to another filesystem",
+        ));
+    }
+    Ok(())
+}
+
 fn load(connection: &Connection, id: CommitId) -> Result<Option<StoredRow>> {
     connection
         .query_row(
@@ -700,6 +776,11 @@ fn save_state(
             "UPDATE publications
              SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
              WHERE commit_id=?1 AND state IN (0,1,4)"
+        }
+        StateFilter::Any => {
+            "UPDATE publications
+             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
+             WHERE commit_id=?1"
         }
         StateFilter::Local => {
             "UPDATE publications

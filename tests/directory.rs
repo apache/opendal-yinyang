@@ -524,7 +524,7 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
     assert_eq!(receipt.commit_id, id);
     assert_eq!(receipt.request_digest, prepared.intent.request_digest);
     let status = journal.status(id).await.unwrap().unwrap();
-    assert_eq!(status.state, DirectoryState::Committed(receipt));
+    assert_eq!(status.state, DirectoryState::Committed(receipt.clone()));
     assert!(status.failure.is_none());
     assert!(
         !status.can_retry(),
@@ -615,7 +615,7 @@ async fn separately_opened_journals_replay_one_exact_request_safely() {
     assert_eq!(left, right);
     assert_eq!(
         first.status(id).await.unwrap().unwrap().state,
-        DirectoryState::Committed(left)
+        DirectoryState::Committed(left.clone())
     );
     let output = temp.path().join("published");
     yinyang::restore_directory_revision(&fs, left.cursor.revision, &output)
@@ -624,6 +624,81 @@ async fn separately_opened_journals_replay_one_exact_request_safely() {
     assert_eq!(
         tokio::fs::read(output.join("nested/hello")).await.unwrap(),
         b"hello"
+    );
+}
+
+#[tokio::test]
+async fn journal_rejects_a_future_profile_before_changing_its_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("journal");
+    tokio::fs::create_dir(&state).await.unwrap();
+    {
+        let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE binding(
+                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                     profile TEXT NOT NULL,
+                     filesystem BLOB NOT NULL,
+                     root BLOB NOT NULL
+                 );
+                 INSERT INTO binding VALUES(1,'yinyang-directory-99',zeroblob(16),zeroblob(16));",
+            )
+            .unwrap();
+    }
+    let fs = filesystem(&TestBackend::default()).await;
+    assert_eq!(
+        DirectoryJournal::open(&fs, &state)
+            .await
+            .unwrap_err()
+            .kind(),
+        RuntimeErrorKind::Unsupported
+    );
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    let mode: String = database
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let publications: bool = database
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='publications'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !publications,
+        "rejecting a future profile must not initialize the v1 schema"
+    );
+}
+
+#[tokio::test]
+async fn journal_inspection_rejects_a_malformed_frozen_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let fs = filesystem(&TestBackend::default()).await;
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    journal.prepare(&observed, &input, id).await.unwrap();
+    rusqlite::Connection::open(state.join("directory.db"))
+        .unwrap()
+        .execute(
+            "UPDATE publications SET request=?2 WHERE commit_id=?1",
+            rusqlite::params![id.as_bytes().as_slice(), b"malformed"],
+        )
+        .unwrap();
+    assert_eq!(
+        journal.status(id).await.unwrap_err().kind(),
+        RuntimeErrorKind::Corrupt
+    );
+    assert_eq!(
+        DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
+        RuntimeErrorKind::Corrupt
     );
 }
 
