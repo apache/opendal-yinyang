@@ -22,7 +22,7 @@ use nix::unistd::Pid;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::MetadataExt;
+use std::os::linux::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};

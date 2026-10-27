@@ -23,10 +23,9 @@ use crate::harness::{
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
-use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -145,7 +144,7 @@ fn fuse_read_only_remote_replacement_preserves_old_fd_and_fresh_open_both_public
         let mut mounted = fixture.mount(&config, &mountpoint);
         let root = mounted.mountpoint().to_path_buf();
         let path = root.join("replace.bin");
-        let old = File::open(&path).expect("open old replacement descriptor");
+        let mut old = File::open(&path).expect("open old replacement descriptor");
         let old_inode = old.metadata().expect("fstat old descriptor").ino();
         let mut prefix = vec![0_u8; RANGE_BYTES];
         read_exact_at(&old, &mut prefix, BLOCK_BYTES as u64 - 2048);
@@ -172,7 +171,7 @@ fn fuse_read_only_remote_replacement_preserves_old_fd_and_fresh_open_both_public
             "replacement refresh reported notification errors: {completion}"
         );
 
-        let fresh = File::open(&path).expect("fresh open of remotely replaced file");
+        let mut fresh = File::open(&path).expect("fresh open of remotely replaced file");
         let fresh_inode = fresh.metadata().expect("fstat fresh descriptor").ino();
         assert_ne!(
             fresh_inode, old_inode,
