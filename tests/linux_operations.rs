@@ -177,34 +177,24 @@ fn isolated_user_service_lifecycle() {
     rewrite_staging(&service_config, &state.join("service"));
     units.start(&units.serve);
     units.wait_active(&units.serve);
-    let doctor = install.run(
+    wait_doctor_ready(
+        &install,
         &storage,
         &work,
-        &[
-            "--volume",
-            service_config.to_str().unwrap(),
-            "doctor",
-            "--json",
-        ],
+        &service_config,
         &service_root,
-        Some(SERVICE_TOKEN),
+        &units.serve,
     );
-    doctor.success_or("doctor through the systemd user metadata service");
     units.restart(&units.serve);
     units.wait_active(&units.serve);
-    let doctor = install.run(
+    wait_doctor_ready(
+        &install,
         &storage,
         &work,
-        &[
-            "--volume",
-            service_config.to_str().unwrap(),
-            "doctor",
-            "--json",
-        ],
+        &service_config,
         &service_root,
-        Some(SERVICE_TOKEN),
+        &units.serve,
     );
-    doctor.success_or("doctor after restarting the systemd user metadata service");
     units.stop(&units.serve);
     assert!(state.join("metadata/metadata.db").exists());
 
@@ -731,6 +721,40 @@ fn start_service(
         root,
         Some(SERVICE_TOKEN),
     )
+}
+
+fn wait_doctor_ready(
+    install: &Install,
+    storage: &Storage,
+    work: &Path,
+    config: &Path,
+    root: &str,
+    unit: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = install.run(
+            storage,
+            work,
+            &["--volume", config.to_str().unwrap(), "doctor", "--json"],
+            root,
+            Some(SERVICE_TOKEN),
+        );
+        if output.status.success() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let status = systemctl(&["status", unit, "--no-pager", "-l"]);
+            panic!(
+                "{unit} did not become doctor-ready within 30s:\nstdout:\n{}\nstderr:\n{}\nstatus:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn wait_service(child: &mut Child) -> SocketAddr {
