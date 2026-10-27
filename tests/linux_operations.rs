@@ -780,11 +780,20 @@ fn wait_mount(mountpoint: &Path, mut child: Option<&mut Child>) {
             }
         }
         let mounts = fs::read_to_string("/proc/mounts").unwrap();
-        if mounts.lines().any(|line| {
+        for line in mounts.lines() {
             let mut fields = line.split_whitespace();
-            fields.next() == Some(expected.as_str()) && fields.next() == Some("fuse.yinyang")
-        }) {
-            return;
+            let _source = fields.next();
+            let point = fields.next().unwrap_or_default();
+            let kind = fields.next().unwrap_or_default();
+            if Path::new(point) == mountpoint {
+                assert_eq!(
+                    kind,
+                    "fuse.yinyang",
+                    "{} is mounted as {kind}, not fuse.yinyang",
+                    mountpoint.display()
+                );
+                return;
+            }
         }
         assert!(
             Instant::now() < deadline,
