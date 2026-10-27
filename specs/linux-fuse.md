@@ -73,17 +73,43 @@ size, and revision-derived timestamps are synthesized. `getxattr`,
 `listxattr`, `readlink`, links and special nodes return explicit unsupported
 errors.
 
-`open` validates the access mode, rejects cached directories with `EISDIR`, and
-takes one reference on the node's shared staged version through
-`Mount::open_node`. The reply opens with `FOPEN_DIRECT_IO`, so the kernel does
-not cache file pages. Reads stream from the staged version. `getattr` with an
-open handle reports the staged record's length, so `fstat` and read bytes
-always describe the same pinned version even when the remote side changed;
-`release` drops the reference and then reclaims a clean node, so the next open
-materializes the current remote revision. A release whose reclaim loses to an
-interrupted read leaves a clean references-zero record; `open` reclaims such a
-record before materializing, so a fresh open still observes the current
-revision instead of reusing the stale clean snapshot.
+`open` validates the access mode and rejects cached directories with `EISDIR`.
+The reply opens with `FOPEN_DIRECT_IO`, so the kernel does not cache file pages.
+The pinned state depends on the volume write policy.
+
+For a read-only whole-volume mount, `Mount::open_read_only_node` observes latest
+and pins the authenticated `Snapshot::open_file` result without creating a
+staging record or reading the complete payload. Concurrent opens of one NodeId
+share that immutable `FileVersion`; a later remote revision does not rebase an
+existing descriptor. `read` asks the `FileVersion` range reader for only the
+intersecting authenticated content units. `getattr` with the handle, and path
+attributes while that observation is active, use its node metadata, executable
+bit, length and revision. `release` drops the reference and reclaims a
+zero-reference observation, so the next open pins the current remote revision.
+Before replying to a read-only open, the frontend sends
+`inval_inode(ino, -1, 0)` so a cached pre-transition attribute cannot survive
+while READ uses the newly pinned version. The open reply becomes visible only
+after the notification send has completed. If the notifier is unavailable or
+the kernel cannot accept that invalidation, OPEN fails rather than exposing a
+descriptor whose first fstat can combine the new content with a cached old
+length. The notifier is installed from the session channel before the request
+loop starts.
+If an interrupted read still owns the observation after release, reclaim is
+`Busy`; a later open retries reclaim before observing latest, preserving the
+old handle until its operation finishes without reusing a stale zero-reference
+entry indefinitely. A path metadata lookup also retires a zero-reference
+observation under the Mount map lock, so it falls back to a fresh latest
+observation instead of continuing to report the finished operation's version.
+
+For writable volumes, both writable descriptors and read-only descriptors take
+one reference on the node's shared staged version through `Mount::open_node`.
+This keeps a reader on the same accepted dirty view as other descriptors.
+Reads return staged bytes, and `getattr` with an open handle reports the staged
+record's length, so `fstat` and read bytes always describe the same version
+even when the remote side changed. Release and fresh-open rules retain the
+staged-node behavior: only the last clean reference is reclaimed, and a
+references-zero result left by an interrupted operation is reclaimed before a
+later open materializes current remote content.
 
 A clean node is only reclaimed when its last adapter reference is released. If
 an interrupted read still shares the node, reclaim reports busy and the pinned
@@ -91,10 +117,10 @@ version remains coherent until a later release becomes the final reference;
 that open's metadata and content never disagree. The frontend does not call
 `Mount::refresh` while references exist, because refresh rebases live handles;
 a writable layer that in-place refreshes must first define its open-fd and
-kernel-cache invalidation policy. Before a new open or a path attribute, the
-adapter retries reclaiming a clean unreferenced NodeId; a successful reclaim
-makes the next observation use the latest remote version, while Busy retains
-all still-pinned or dirty/frozen/error state.
+kernel-cache invalidation policy. Before a new staged open or a staged path
+attribute, the adapter retries reclaiming a clean unreferenced NodeId; a
+successful reclaim makes the next observation use the latest remote version,
+while Busy retains all still-pinned or dirty/frozen/error state.
 
 ## Writable callbacks
 
@@ -150,7 +176,8 @@ change-feed watcher, and no whole-tree enumeration. The refresh observes the
 latest snapshot once and then:
 
 - reclaims every clean, unreferenced node through the shared `Mount` contract,
-  so the next open materializes the current remote revision; nodes with live
+  including zero-reference read-only range observations, so the next open
+  observes or materializes the current remote revision; nodes with live
   references or retained state are left pinned (`Busy`);
 - invalidates known inode attributes with `inval_inode(ino, -1, 0)` and
   replied dentries with `inval_entry(parent, name)` through the fuser
@@ -236,9 +263,11 @@ there is no mid-session cancellation signal.
 
 ## Boundaries and known limits
 
-- Every open materializes the complete file through the existing shared Mount
-  staging contract; there is no partial-download or mmap coherence claim, and
-  `FOPEN_DIRECT_IO` does not provide page-cache-backed mmap behavior.
+- A writable-volume open materializes the complete file through the shared
+  Mount staging contract. A read-only whole-volume open pins immutable metadata
+  and reads only authenticated intersecting content ranges. Neither path claims
+  mmap coherence, and `FOPEN_DIRECT_IO` does not provide page-cache-backed mmap
+  behavior.
 - Hard links, symlinks, mknod, xattrs, ioctl, poll, fallocate and capacity
   accounting are not implemented and return explicit `EOPNOTSUPP`/`ENOSYS`.
 - The frontend does not negotiate `FUSE_POSIX_LOCKS` or `FLOCK_LOCKS`, and its
@@ -248,8 +277,9 @@ there is no mid-session cancellation signal.
   claimed. A writable mount must not claim that locking is rejected outright,
   because the kernel may return success for its own local lock manager.
 - Node cache lookup and open-gate registration share a short-lived node-map
-  critical section. First materialization is serialized per NodeId by that
-  gate; neither lock is held across remote observation or staging I/O, and
-  different nodes initialize independently.
-- The session `Notifier` is used only by the explicit `SIGHUP` refresh above;
-  there is no automatic external-change watch.
+  critical section. First materialization or range pinning is serialized per
+  NodeId by that gate; neither lock is held across remote observation or
+  staging I/O, and different nodes initialize independently.
+- The session `Notifier` serves explicit `SIGHUP` refresh invalidation and the
+  pre-open inode attribute invalidation required by read-only range opens.
+  There is no automatic external-change watch.
