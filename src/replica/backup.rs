@@ -17,7 +17,7 @@
 
 //! Experimental quiesced backup package for Linux Managed Sync.
 
-use super::linux::{ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, Replica};
+use super::linux::{Identity, LocalKind, LocalNode, LocalSnapshot, Replica, observe_path};
 use super::state::{Binding, IdentityMap};
 use super::{Error, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use yinyang_core::NodeId;
 const MAGIC: [u8; 8] = *b"YYBK0001";
@@ -504,46 +504,7 @@ impl BackupManifest {
 }
 
 fn snapshot(root: &Path) -> Result<LocalSnapshot> {
-    let root_metadata = fs::symlink_metadata(root)
-        .map_err(|error| Error::io("inspect backup tree", root, error))?;
-    let root_identity = identity(&root_metadata);
-    let mut nodes = BTreeMap::new();
-    if root_metadata.file_type().is_file() {
-        let (length, digest) = hash_file(root)?;
-        nodes.insert(
-            String::new(),
-            LocalNode {
-                path: String::new(),
-                kind: LocalKind::File {
-                    length,
-                    digest: ContentHash::from_bytes(digest),
-                },
-                executable: root_metadata.permissions().mode() & 0o111 != 0,
-                identity: root_identity,
-                parent: None,
-            },
-        );
-        return Ok(LocalSnapshot::from_nodes(nodes));
-    }
-    if !root_metadata.file_type().is_dir() {
-        return Err(Error::corrupt(format!(
-            "backup tree {} is a symlink or special file",
-            root.display()
-        )));
-    }
-    nodes.insert(
-        String::new(),
-        LocalNode {
-            path: String::new(),
-            kind: LocalKind::Directory,
-            executable: false,
-            identity: root_identity,
-            parent: None,
-        },
-    );
-    scan_directory(root, "", root_identity, &mut nodes)
-        .map_err(|error| Error::io("scan backup tree", root, error))?;
-    Ok(LocalSnapshot::from_nodes(nodes))
+    observe_path(root)
 }
 
 fn canonical_target(path: &Path) -> Result<PathBuf> {
@@ -558,70 +519,6 @@ fn canonical_target(path: &Path) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| Error::invalid("restore destination requires a directory name"))?;
     Ok(parent.join(name))
-}
-
-fn scan_directory(
-    directory: &Path,
-    prefix: &str,
-    directory_identity: Identity,
-    nodes: &mut BTreeMap<String, LocalNode>,
-) -> std::io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name().into_string().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 filename")
-        })?;
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let metadata = fs::symlink_metadata(entry.path())?;
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            let current = identity(&metadata);
-            nodes.insert(
-                path.clone(),
-                LocalNode {
-                    path: path.clone(),
-                    kind: LocalKind::Directory,
-                    executable: false,
-                    identity: current,
-                    parent: Some(directory_identity),
-                },
-            );
-            scan_directory(&entry.path(), &path, current, nodes)?;
-        } else if file_type.is_file() {
-            let (length, digest) = hash_file(&entry.path())
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            nodes.insert(
-                path.clone(),
-                LocalNode {
-                    path,
-                    kind: LocalKind::File {
-                        length,
-                        digest: ContentHash::from_bytes(digest),
-                    },
-                    executable: metadata.permissions().mode() & 0o111 != 0,
-                    identity: identity(&metadata),
-                    parent: Some(directory_identity),
-                },
-            );
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is a symlink or special file", entry.path().display()),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn identity(metadata: &fs::Metadata) -> Identity {
-    Identity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    }
 }
 
 fn hash_file(path: &Path) -> Result<(u64, [u8; 32])> {

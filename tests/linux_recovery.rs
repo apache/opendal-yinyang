@@ -343,6 +343,24 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
         ],
     );
     assert!(!outage_failure.status.success());
+    let outage_status = inspect(&restored_staging);
+    assert_eq!(
+        outage_status
+            .handles
+            .iter()
+            .find(|handle| handle.id == outage)
+            .map(|handle| handle.length),
+        Some(b"offline-accepted".len() as u64),
+        "backend outage must retain the locally accepted bytes"
+    );
+
+    service = spawn_service(
+        &fixture,
+        &metadata_backup,
+        &destination_root,
+        SERVICE_TOKEN,
+        fixture.service_address(),
+    );
     let staged = fixture.yy_with_env(
         &[
             "--volume",
@@ -356,16 +374,8 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
             ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
         ],
     );
-    staged.success_or("read staged bytes during backend outage");
+    staged.success_or("read staged bytes after backend recovery");
     assert_eq!(staged.stdout, b"offline-accepted");
-
-    service = spawn_service(
-        &fixture,
-        &metadata_backup,
-        &destination_root,
-        SERVICE_TOKEN,
-        fixture.service_address(),
-    );
     fixture
         .yy_with_env(
             &[

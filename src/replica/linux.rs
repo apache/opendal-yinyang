@@ -1297,93 +1297,14 @@ impl Replica {
         directory_identity: Identity,
         nodes: &mut BTreeMap<String, LocalNode>,
     ) -> Result<()> {
-        let mut reader =
-            Dir::read_from(directory).map_err(|e| Error::errno("read directory", &self.root, e))?;
-        let mut slots = BTreeSet::new();
-        while let Some(entry) = reader.read() {
-            let entry = entry.map_err(|e| Error::errno("read directory", &self.root, e))?;
-            let name = entry
-                .file_name()
-                .to_str()
-                .map_err(|_| Error::unsupported("non-UTF-8 local filename"))?;
-            if name == "." || name == ".." {
-                continue;
-            }
-            if name.starts_with(".yy-install-") || name.starts_with(".yy-rollback-") {
-                return Err(Error::conflict(format!(
-                    "unrecovered internal installation entry is present: {}",
-                    join(prefix, name)
-                )));
-            }
-            let folded = yinyang_core::namespace::name_key(name)
-                .map_err(|e| Error::invalid(format!("invalid local name {name:?}: {e}")))?;
-            if !slots.insert(folded) {
-                return Err(Error::invalid(format!(
-                    "case-folded local name collision below {prefix:?}"
-                )));
-            }
-            let path = join(prefix, name);
-            let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|e| Error::errno("inspect local entry", &self.root.join(&path), e))?;
-            let file_type = FileType::from_raw_mode(stat.st_mode);
-            match file_type {
-                FileType::Directory => {
-                    let fd = openat(
-                        directory,
-                        name,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .map_err(|e| Error::errno("open local directory", &self.root.join(&path), e))?;
-                    let opened = fstat(&fd).map_err(|e| {
-                        Error::errno("inspect local directory", &self.root.join(&path), e)
-                    })?;
-                    if opened.st_dev != self.root_identity.dev {
-                        return Err(Error::unsupported(format!(
-                            "local directory {} crosses a filesystem boundary",
-                            path
-                        )));
-                    }
-                    let identity = stat_identity(&opened);
-                    nodes.insert(
-                        path.clone(),
-                        LocalNode {
-                            path: path.clone(),
-                            kind: LocalKind::Directory,
-                            executable: false,
-                            identity,
-                            parent: Some(directory_identity),
-                        },
-                    );
-                    self.scan_directory(&fd, &path, identity, nodes)?;
-                }
-                FileType::RegularFile => {
-                    let (length, digest, identity, executable) =
-                        hash_file_at(directory, name, &self.root.join(&path))?;
-                    nodes.insert(
-                        path.clone(),
-                        LocalNode {
-                            path,
-                            kind: LocalKind::File { length, digest },
-                            executable,
-                            identity,
-                            parent: Some(directory_identity),
-                        },
-                    );
-                }
-                FileType::Symlink => {
-                    return Err(Error::unsupported(format!(
-                        "local symlink is not supported: {path}"
-                    )));
-                }
-                _ => {
-                    return Err(Error::unsupported(format!(
-                        "local special file is not supported: {path}"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        scan_directory(
+            directory,
+            prefix,
+            directory_identity,
+            &self.root,
+            self.root_identity.dev,
+            nodes,
+        )
     }
 
     pub(super) fn scan_artifact(&self, name: &str) -> Result<BTreeMap<String, LocalNode>> {
@@ -1410,7 +1331,14 @@ impl Replica {
                         parent: None,
                     },
                 );
-                self.scan_directory(&fd, "", identity, &mut nodes)?;
+                scan_directory(
+                    &fd,
+                    "",
+                    identity,
+                    &self.state,
+                    self.state_identity.dev,
+                    &mut nodes,
+                )?;
             }
             FileType::RegularFile => {
                 let (length, digest, identity, executable) =
@@ -2158,6 +2086,171 @@ impl From<ConflictRecord> for Conflict {
             error: value.error,
         }
     }
+}
+
+pub(super) fn observe_path(path: &Path) -> Result<LocalSnapshot> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::unsupported("observation path requires a UTF-8 file name"))?;
+    let (parent_fd, _) = open_bound_directory(parent, "open observation parent")?;
+    let stat = statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| Error::errno("inspect observation path", path, error))?;
+    let root_identity = stat_identity(&stat);
+    let mut nodes = BTreeMap::new();
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Directory => {
+            let fd = openat(
+                &parent_fd,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| Error::errno("open observation directory", path, error))?;
+            let opened = fstat(&fd)
+                .map_err(|error| Error::errno("inspect observation directory", path, error))?;
+            if opened.st_dev != root_identity.dev {
+                return Err(Error::unsupported(format!(
+                    "observation directory {} changed filesystem",
+                    path.display()
+                )));
+            }
+            nodes.insert(
+                String::new(),
+                LocalNode {
+                    path: String::new(),
+                    kind: LocalKind::Directory,
+                    executable: false,
+                    identity: root_identity,
+                    parent: None,
+                },
+            );
+            scan_directory(&fd, "", root_identity, path, root_identity.dev, &mut nodes)?;
+        }
+        FileType::RegularFile => {
+            let (length, digest, identity, executable) = hash_file_at(&parent_fd, name, path)?;
+            nodes.insert(
+                String::new(),
+                LocalNode {
+                    path: String::new(),
+                    kind: LocalKind::File { length, digest },
+                    executable,
+                    identity,
+                    parent: None,
+                },
+            );
+        }
+        FileType::Symlink => {
+            return Err(Error::unsupported(format!(
+                "{} is a symlink",
+                path.display()
+            )));
+        }
+        _ => {
+            return Err(Error::unsupported(format!(
+                "{} is a special file",
+                path.display()
+            )));
+        }
+    }
+    Ok(LocalSnapshot::from_nodes(nodes))
+}
+
+fn scan_directory(
+    directory: &OwnedFd,
+    prefix: &str,
+    directory_identity: Identity,
+    display_root: &Path,
+    filesystem_dev: u64,
+    nodes: &mut BTreeMap<String, LocalNode>,
+) -> Result<()> {
+    let mut reader =
+        Dir::read_from(directory).map_err(|e| Error::errno("read directory", display_root, e))?;
+    let mut slots = BTreeSet::new();
+    while let Some(entry) = reader.read() {
+        let entry = entry.map_err(|e| Error::errno("read directory", display_root, e))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| Error::unsupported("non-UTF-8 local filename"))?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        if name.starts_with(".yy-install-") || name.starts_with(".yy-rollback-") {
+            return Err(Error::conflict(format!(
+                "unrecovered internal installation entry is present: {}",
+                join(prefix, name)
+            )));
+        }
+        let folded = yinyang_core::namespace::name_key(name)
+            .map_err(|e| Error::invalid(format!("invalid local name {name:?}: {e}")))?;
+        if !slots.insert(folded) {
+            return Err(Error::invalid(format!(
+                "case-folded local name collision below {prefix:?}"
+            )));
+        }
+        let path = join(prefix, name);
+        let display = display_root.join(&path);
+        let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| Error::errno("inspect local entry", &display, e))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let fd = openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| Error::errno("open local directory", &display, e))?;
+                let opened =
+                    fstat(&fd).map_err(|e| Error::errno("inspect local directory", &display, e))?;
+                if opened.st_dev != filesystem_dev {
+                    return Err(Error::unsupported(format!(
+                        "local directory {} crosses a filesystem boundary",
+                        path
+                    )));
+                }
+                let identity = stat_identity(&opened);
+                nodes.insert(
+                    path.clone(),
+                    LocalNode {
+                        path: path.clone(),
+                        kind: LocalKind::Directory,
+                        executable: false,
+                        identity,
+                        parent: Some(directory_identity),
+                    },
+                );
+                scan_directory(&fd, &path, identity, display_root, filesystem_dev, nodes)?;
+            }
+            FileType::RegularFile => {
+                let (length, digest, identity, executable) =
+                    hash_file_at(directory, name, &display)?;
+                nodes.insert(
+                    path.clone(),
+                    LocalNode {
+                        path,
+                        kind: LocalKind::File { length, digest },
+                        executable,
+                        identity,
+                        parent: Some(directory_identity),
+                    },
+                );
+            }
+            FileType::Symlink => {
+                return Err(Error::unsupported(format!(
+                    "local symlink is not supported: {path}"
+                )));
+            }
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "local special file is not supported: {path}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn open_bound_directory(path: &Path, operation: &str) -> Result<(OwnedFd, Identity)> {
