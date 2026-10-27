@@ -282,7 +282,7 @@ impl ObjectFs {
         }
         let bytes = latest
             .history
-            .get(&self.data, &revision.to_bytes())
+            .get(&self.data, None, &revision.to_bytes())
             .await?
             .ok_or_else(|| {
                 Error::new(
