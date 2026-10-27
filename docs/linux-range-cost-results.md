@@ -25,6 +25,14 @@ Ubuntu 24.04, kernel `7.0.0-1014-aws`, and Rust `1.99.1`. The backend was
 isolated loopback Silo, MinIO-compatible S3 over HTTP. Service publication used
 the authenticated loopback TCP proxy and one connection per RPC.
 
+The first evidence used a counting proxy whose S3 accept loop polled every
+5 ms and whose relay sockets left Nagle enabled. Its raw `cache_policy` field
+also described the optimized `FileVersion` path for both baseline and optimized
+rows. That claim was wrong for the pre-range baseline. The behavior-neutral
+field in later schema v3 evidence is authoritative. The original raw JSONL is
+retained unchanged; its latency values are superseded by the corrected
+collector control.
+
 Commands:
 
 ```shell

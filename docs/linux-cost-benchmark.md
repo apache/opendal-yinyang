@@ -9,7 +9,9 @@ only authority supported by those commands.
 The benchmark uses isolated Silo (S3-compatible) settings, a unique remote root,
 and a new staging directory. A loopback HTTP counting proxy sits between YinYang
 and Silo. It parses HTTP/1 request framing before counting request methods, and
-counts request and response bytes without instrumenting production code.
+counts request and response bytes without instrumenting production code. The
+proxy accepts connections without polling and disables Nagle on both relay
+sockets so collector delay does not dominate small range and proof requests.
 
 Service publication uses a second transparent TCP proxy in front of the metadata
 service. The current transport creates one loopback TCP connection for each RPC,
