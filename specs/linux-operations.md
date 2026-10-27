@@ -171,5 +171,8 @@ At `77595182c1447177f9d0b748ca2526773853f8e1`, the
 endpoint and no endpoint override. Exit status was zero and the single native
 test completed in 7.97s. It exercised the installed-prefix object and
 authenticated-loopback-service Mount write/fsync/read/remount paths and finite
-Sync convergence. This is one scoped backend and host result, not a capacity,
-multi-host or HA claim.
+Sync convergence. The tested `target/debug/yy` SHA-256 was
+`b9acff232c66f6dd898deeccb315e2a1f70af4e9e37959793bc7ba98425ed705`; the task
+bucket held 5,861 bytes of fixtures when observed, and bucket plus temporary
+credential-policy cleanup were verified complete. This is one scoped backend
+and host result, not a capacity, multi-host or HA claim.

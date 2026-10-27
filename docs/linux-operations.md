@@ -37,7 +37,7 @@ non-loopback deployment.
 
 | Storage backend | Operational evidence |
 | --- | --- |
-| Amazon S3, `us-east-2`, provider endpoint | Passed at `7759518`: `ops-real-s3-7759518-role-r1`, exit 0, one test passed in 7.97s on 2026-10-28 |
+| Amazon S3, `us-east-2`, provider endpoint | Passed at source `7759518`: `ops-real-s3-7759518-role-r1`, exit 0, one test passed in 7.97s on 2026-10-28 |
 | Isolated MinIO-compatible Silo, loopback endpoint | Exact-CLI and systemd user-unit lifecycle passed at `20fdbae` and `ee3046b` |
 
 The initial isolated-Silo evidence covers the foreground exact-CLI lifecycle at
@@ -48,6 +48,11 @@ backend runs exercised object and authenticated-loopback-service Mount/Sync,
 including Mount write, fsync, read, restart and finite Sync convergence. The
 evidence is limited to the named backend class and host; it is not a capacity,
 multi-host or HA claim.
+
+The tested `target/debug/yy` from source `7759518` had SHA-256
+`b9acff232c66f6dd898deeccb315e2a1f70af4e9e37959793bc7ba98425ed705`. The task
+bucket held 5,861 bytes of fixtures when observed; deletion and temporary
+credential-policy cleanup were then verified complete.
 
 Managed Mount and Managed Sync remain experimental. The metadata service is one
 authenticated single-host loopback authority, not TLS, HA or a network-safe
