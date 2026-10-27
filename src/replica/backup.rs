@@ -680,6 +680,9 @@ fn copy_snapshot(
         let mode = if node.executable { 0o700 } else { 0o600 };
         fs::set_permissions(&target, fs::Permissions::from_mode(mode))
             .map_err(|error| Error::io("set backup file mode", &target, error))?;
+        File::open(&target)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| Error::io("persist backup file mode", &target, error))?;
         let (length, hash) = hash_file(&target)?;
         if Some(length) != node.length || Some(hash) != node.digest {
             return Err(Error::corrupt(format!(
