@@ -18,6 +18,7 @@
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::{Error, Result};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 
 const MAX: usize = 32;
@@ -46,13 +47,13 @@ pub(crate) struct IndexCache {
 
 #[derive(Debug, Default)]
 struct IndexCacheState {
-    pages: HashMap<PackedRef, Page>,
+    pages: HashMap<PackedRef, Vec<u8>>,
     values: HashMap<PackedRef, Vec<u8>>,
     value_bytes: usize,
 }
 
 impl IndexCache {
-    fn page(&self, reference: &PackedRef) -> Option<Page> {
+    fn page(&self, reference: &PackedRef) -> Option<Vec<u8>> {
         let state = self
             .state
             .lock()
@@ -60,13 +61,13 @@ impl IndexCache {
         state.pages.get(reference).cloned()
     }
 
-    fn insert_page(&self, reference: PackedRef, page: Page) {
+    fn insert_page(&self, reference: PackedRef, bytes: Vec<u8>) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.pages.len() < CACHED_PAGES {
-            state.pages.entry(reference).or_insert(page);
+            state.pages.entry(reference).or_insert(bytes);
         }
     }
 
@@ -83,10 +84,16 @@ impl IndexCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let next = state.value_bytes.saturating_add(bytes.len());
-        if state.values.len() < CACHED_VALUES && next <= CACHED_VALUE_BYTES {
-            state.value_bytes = next;
-            state.values.entry(reference).or_insert(bytes);
+        if state.values.len() >= CACHED_VALUES {
+            return;
+        }
+        let state = &mut *state;
+        if let Entry::Vacant(entry) = state.values.entry(reference) {
+            let next = state.value_bytes.saturating_add(bytes.len());
+            if next <= CACHED_VALUE_BYTES {
+                state.value_bytes = next;
+                entry.insert(bytes);
+            }
         }
     }
 }
@@ -158,10 +165,27 @@ impl Page {
     }
 }
 impl Index {
-    async fn page(store: &DataStore, reference: &PackedRef, root: bool) -> Result<Page> {
-        let bytes = store.read_extent(reference, PAGE_BYTES).await?;
+    async fn page(
+        store: &DataStore,
+        cache: Option<&IndexCache>,
+        reference: &PackedRef,
+        root: bool,
+    ) -> Result<Page> {
+        let bytes = match cache.and_then(|cache| cache.page(reference)) {
+            Some(bytes) => bytes,
+            None => {
+                let bytes = store.read_extent(reference, PAGE_BYTES).await?;
+                if let Some(cache) = cache {
+                    cache.insert_page(reference.clone(), bytes.clone());
+                }
+                bytes
+            }
+        };
+        Self::decode_page(&bytes, root)
+    }
+    fn decode_page(bytes: &[u8], root: bool) -> Result<Page> {
         let (magic, level, records): Wire =
-            borsh::from_slice(&bytes).map_err(|e| corrupt(e.to_string()))?;
+            borsh::from_slice(bytes).map_err(|e| corrupt(e.to_string()))?;
         if magic != *b"YYINDEX2"
             || level > 32
             || records.is_empty()
@@ -202,62 +226,51 @@ impl Index {
     }
     async fn child(
         store: &DataStore,
+        cache: Option<&IndexCache>,
         level: u8,
         key: &[u8],
         reference: &PackedRef,
     ) -> Result<Page> {
-        let page = Self::page(store, reference, false).await?;
+        let page = Self::page(store, cache, reference, false).await?;
         if page.level() + 1 != level || page.last() != key {
             return Err(corrupt("child separator or level disagrees"));
         }
         Ok(page)
     }
-    async fn value(store: &DataStore, value: &Value) -> Result<Vec<u8>> {
+    async fn value(
+        store: &DataStore,
+        cache: Option<&IndexCache>,
+        value: &Value,
+    ) -> Result<Vec<u8>> {
         match value {
             Value::Inline(v) => Ok(v.clone()),
-            Value::External(r) => store.read_extent(r, VALUE_BYTES).await,
-        }
-    }
-    pub(crate) async fn get(&self, store: &DataStore, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let Some(root) = &self.0 else {
-            return Ok(None);
-        };
-        let mut page = Self::page(store, root, true).await?;
-        loop {
-            match page {
-                Page::Leaf(entries) => {
-                    return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                        Ok(i) => Self::value(store, &entries[i].1).await.map(Some),
-                        Err(_) => Ok(None),
-                    };
+            Value::External(reference) => {
+                if let Some(bytes) = cache.and_then(|cache| cache.value(reference)) {
+                    return Ok(bytes);
                 }
-                Page::Branch(level, children) => {
-                    let i = children.partition_point(|(k, _)| k.as_slice() < key);
-                    if i == children.len() {
-                        return Ok(None);
-                    }
-                    page = Self::child(store, level, &children[i].0, &children[i].1).await?;
+                let bytes = store.read_extent(reference, VALUE_BYTES).await?;
+                if let Some(cache) = cache {
+                    cache.insert_value(reference.clone(), bytes.clone());
                 }
+                Ok(bytes)
             }
         }
     }
-    pub(crate) async fn get_cached(
+    pub(crate) async fn get(
         &self,
         store: &DataStore,
-        cache: &IndexCache,
+        cache: Option<&IndexCache>,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         let Some(root) = &self.0 else {
             return Ok(None);
         };
-        let mut page = Self::page_cached(store, cache, root, true).await?;
+        let mut page = Self::page(store, cache, root, true).await?;
         loop {
             match page {
                 Page::Leaf(entries) => {
                     return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                        Ok(i) => Self::value_cached(store, cache, &entries[i].1)
-                            .await
-                            .map(Some),
+                        Ok(i) => Self::value(store, cache, &entries[i].1).await.map(Some),
                         Err(_) => Ok(None),
                     };
                 }
@@ -266,8 +279,7 @@ impl Index {
                     if i == children.len() {
                         return Ok(None);
                     }
-                    page = Self::child_cached(store, cache, level, &children[i].0, &children[i].1)
-                        .await?;
+                    page = Self::child(store, cache, level, &children[i].0, &children[i].1).await?;
                 }
             }
         }
@@ -290,7 +302,7 @@ impl Index {
             None => None,
         };
         let page = match &self.0 {
-            Some(r) => Self::page(store, r, true).await?,
+            Some(r) => Self::page(store, None, r, true).await?,
             None => Page::Leaf(Vec::new()),
         };
         let mut page = Self::edit(store, page, &key, value).await?;
@@ -344,12 +356,14 @@ impl Index {
                 let i = children
                     .partition_point(|(k, _)| k.as_slice() < key)
                     .min(children.len() - 1);
-                let child = Self::child(store, *level, &children[i].0, &children[i].1).await?;
+                let child =
+                    Self::child(store, None, *level, &children[i].0, &children[i].1).await?;
                 let mut child = Box::pin(Self::edit(store, child, key, value)).await?;
                 if child.len() < MIN && children.len() > 1 {
                     let sibling_index = if i > 0 { i - 1 } else { i + 1 };
                     let sibling = Self::child(
                         store,
+                        None,
                         *level,
                         &children[sibling_index].0,
                         &children[sibling_index].1,
@@ -387,6 +401,7 @@ impl Index {
     pub(crate) async fn scan(
         &self,
         store: &DataStore,
+        cache: Option<&IndexCache>,
         lower: &[u8],
         upper: Option<&[u8]>,
         after: Option<&[u8]>,
@@ -397,33 +412,14 @@ impl Index {
             return Ok(output);
         }
         if let Some(root) = &self.0 {
-            let page = Self::page(store, root, true).await?;
-            Self::scan_page(store, page, lower, upper, after, limit, &mut output).await?;
-        }
-        Ok(output)
-    }
-    pub(crate) async fn scan_cached(
-        &self,
-        store: &DataStore,
-        cache: &IndexCache,
-        lower: &[u8],
-        upper: Option<&[u8]>,
-        after: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut output = Vec::new();
-        if limit == 0 {
-            return Ok(output);
-        }
-        if let Some(root) = &self.0 {
-            let page = Self::page_cached(store, cache, root, true).await?;
-            Self::scan_page_cached(store, cache, page, lower, upper, after, limit, &mut output)
-                .await?;
+            let page = Self::page(store, cache, root, true).await?;
+            Self::scan_page(store, cache, page, lower, upper, after, limit, &mut output).await?;
         }
         Ok(output)
     }
     async fn scan_page(
         store: &DataStore,
+        cache: Option<&IndexCache>,
         page: Page,
         lower: &[u8],
         upper: Option<&[u8]>,
@@ -440,7 +436,7 @@ impl Index {
                     if upper.is_some_and(|u| key.as_slice() >= u) || output.len() == limit {
                         break;
                     }
-                    output.push((key, Self::value(store, &value).await?));
+                    output.push((key, Self::value(store, cache, &value).await?));
                 }
             }
             Page::Branch(level, children) => {
@@ -454,93 +450,8 @@ impl Index {
                         break;
                     }
                     if key.as_slice() >= lower && !after.is_some_and(|a| key.as_slice() <= a) {
-                        let child = Self::child(store, level, &key, &reference).await?;
+                        let child = Self::child(store, cache, level, &key, &reference).await?;
                         Box::pin(Self::scan_page(
-                            store, child, lower, upper, after, limit, output,
-                        ))
-                        .await?;
-                    }
-                    previous = Some(key);
-                }
-            }
-        }
-        Ok(())
-    }
-    async fn page_cached(
-        store: &DataStore,
-        cache: &IndexCache,
-        reference: &PackedRef,
-        root: bool,
-    ) -> Result<Page> {
-        if let Some(page) = cache.page(reference) {
-            return Ok(page);
-        }
-        let page = Self::page(store, reference, root).await?;
-        cache.insert_page(reference.clone(), page.clone());
-        Ok(page)
-    }
-    async fn child_cached(
-        store: &DataStore,
-        cache: &IndexCache,
-        level: u8,
-        key: &[u8],
-        reference: &PackedRef,
-    ) -> Result<Page> {
-        let page = Self::page_cached(store, cache, reference, false).await?;
-        if page.level() + 1 != level || page.last() != key {
-            return Err(corrupt("child separator or level disagrees"));
-        }
-        Ok(page)
-    }
-    async fn value_cached(store: &DataStore, cache: &IndexCache, value: &Value) -> Result<Vec<u8>> {
-        match value {
-            Value::Inline(v) => Ok(v.clone()),
-            Value::External(reference) => {
-                if let Some(bytes) = cache.value(reference) {
-                    return Ok(bytes);
-                }
-                let bytes = store.read_extent(reference, VALUE_BYTES).await?;
-                cache.insert_value(reference.clone(), bytes.clone());
-                Ok(bytes)
-            }
-        }
-    }
-    async fn scan_page_cached(
-        store: &DataStore,
-        cache: &IndexCache,
-        page: Page,
-        lower: &[u8],
-        upper: Option<&[u8]>,
-        after: Option<&[u8]>,
-        limit: usize,
-        output: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<()> {
-        match page {
-            Page::Leaf(entries) => {
-                for (key, value) in entries {
-                    if key.as_slice() < lower || after.is_some_and(|a| key.as_slice() <= a) {
-                        continue;
-                    }
-                    if upper.is_some_and(|u| key.as_slice() >= u) || output.len() == limit {
-                        break;
-                    }
-                    output.push((key, Self::value_cached(store, cache, &value).await?));
-                }
-            }
-            Page::Branch(level, children) => {
-                let mut previous: Option<Vec<u8>> = None;
-                for (key, reference) in children {
-                    if output.len() == limit
-                        || previous
-                            .as_ref()
-                            .is_some_and(|p| upper.is_some_and(|u| p.as_slice() >= u))
-                    {
-                        break;
-                    }
-                    if key.as_slice() >= lower && !after.is_some_and(|a| key.as_slice() <= a) {
-                        let child =
-                            Self::child_cached(store, cache, level, &key, &reference).await?;
-                        Box::pin(Self::scan_page_cached(
                             store, cache, child, lower, upper, after, limit, output,
                         ))
                         .await?;
@@ -559,7 +470,36 @@ fn corrupt(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NodeId, support::TestBackend};
+    use crate::{ErrorKind, NodeId, support::TestBackend};
+
+    #[test]
+    fn cache_charges_duplicate_values_once_and_respects_its_bounds() {
+        let cache = IndexCache::default();
+        let reference = PackedRef {
+            object: [1; 16],
+            offset: 0,
+            length: 4,
+            digest: [2; 32],
+        };
+        cache.insert_value(reference.clone(), vec![1, 2, 3, 4]);
+        cache.insert_value(reference, vec![1, 2, 3, 4]);
+        {
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.values.len(), 1);
+            assert_eq!(state.value_bytes, 4);
+        }
+
+        for i in 0..CACHED_VALUES + 1 {
+            let reference = PackedRef {
+                object: (i as u128).to_be_bytes(),
+                offset: i as u64,
+                length: 1,
+                digest: [3; 32],
+            };
+            cache.insert_value(reference, vec![0]);
+        }
+        assert_eq!(cache.state.lock().unwrap().values.len(), CACHED_VALUES);
+    }
 
     #[tokio::test]
     async fn splits_merges_external_values_and_bounded_lookup() {
@@ -579,14 +519,23 @@ mod tests {
         }
         let pinned = index.clone();
         for (key, value) in &expected {
-            assert_eq!(index.get(&store, key).await.unwrap().as_ref(), Some(value));
+            assert_eq!(
+                index.get(&store, None, key).await.unwrap().as_ref(),
+                Some(value)
+            );
         }
-        let rows = index.scan(&store, &[], None, None, 2000).await.unwrap();
+        let rows = index
+            .scan(&store, None, &[], None, None, 2000)
+            .await
+            .unwrap();
         assert_eq!(rows, expected.clone().into_iter().collect::<Vec<_>>());
         backend.state.lock().unwrap().data_reads = 0;
-        index.get(&store, &500_u64.to_be_bytes()).await.unwrap();
+        index
+            .get(&store, None, &500_u64.to_be_bytes())
+            .await
+            .unwrap();
         assert!(backend.state.lock().unwrap().data_reads <= 4);
-        let root = Index::page(&store, index.0.as_ref().unwrap(), true)
+        let root = Index::page(&store, None, index.0.as_ref().unwrap(), true)
             .await
             .unwrap();
         assert_eq!(root.level(), 2);
@@ -597,7 +546,10 @@ mod tests {
             expected.remove(&key);
             if i % 79 == 0 {
                 assert_eq!(
-                    index.scan(&store, &[], None, None, 2000).await.unwrap(),
+                    index
+                        .scan(&store, None, &[], None, None, 2000)
+                        .await
+                        .unwrap(),
                     expected.clone().into_iter().collect::<Vec<_>>()
                 );
             }
@@ -605,12 +557,36 @@ mod tests {
         assert!(index.0.is_none());
         assert_eq!(
             pinned
-                .scan(&store, &[], None, None, 2000)
+                .scan(&store, None, &[], None, None, 2000)
                 .await
                 .unwrap()
                 .len(),
             1100
         );
+    }
+
+    #[tokio::test]
+    async fn cached_page_bytes_are_revalidated_for_root_and_child_contexts() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let mut index = Index::default();
+        for i in 0..MAX + 1 {
+            index
+                .set(&store, (i as u64).to_be_bytes().to_vec(), Some(vec![1]))
+                .await
+                .unwrap();
+        }
+        let cache = IndexCache::default();
+        let root = index.0.as_ref().unwrap();
+        let page = Index::page(&store, Some(&cache), root, true).await.unwrap();
+        assert!(matches!(&page, Page::Branch(1, children) if children.len() == 2));
+
+        backend.state.lock().unwrap().data_reads = 0;
+        let error = Index::page(&store, Some(&cache), root, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
     }
     #[tokio::test]
     async fn malformed_index_pages_are_rejected() {
@@ -627,7 +603,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Index(Some(root))
-                .get(&store, b"a")
+                .get(&store, None, b"a")
                 .await
                 .unwrap_err()
                 .kind(),

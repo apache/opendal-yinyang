@@ -112,7 +112,7 @@ struct ObjectRecords {
 }
 impl RecordReader for ObjectRecords {
     fn get<'a>(&'a self, table: Table, key: &'a [u8]) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
-        Box::pin(self.indexes[table as usize].get_cached(&self.data, &self.cache, key))
+        Box::pin(self.indexes[table as usize].get(&self.data, Some(&self.cache), key))
     }
     fn scan<'a>(
         &'a self,
@@ -122,9 +122,9 @@ impl RecordReader for ObjectRecords {
         after: Option<&'a [u8]>,
         limit: usize,
     ) -> BoxFuture<'a, Result<Rows>> {
-        Box::pin(self.indexes[table as usize].scan_cached(
+        Box::pin(self.indexes[table as usize].scan(
             &self.data,
-            &self.cache,
+            Some(&self.cache),
             lower,
             upper,
             after,

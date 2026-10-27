@@ -177,6 +177,19 @@ async fn object_snapshot_reuses_authenticated_index_reads() {
         snapshot.scan(anchor, None, 4096).await.unwrap();
     }
     assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+    let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let empty = fs.data().prepare(&mut b"".as_slice()).await.unwrap();
+    plan.create_file(anchor, "file-new", empty, false)
+        .await
+        .unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+
+    backend.state.lock().unwrap().data_reads = 0;
+    let fresh = fs.observe_latest().await.unwrap();
+    assert!(fresh.resolve("anchor/file-new").await.unwrap().is_some());
+    assert!(backend.state.lock().unwrap().data_reads > 0);
+    assert!(snapshot.resolve("anchor/file-new").await.unwrap().is_none());
 }
 
 #[tokio::test]
