@@ -23,6 +23,8 @@ mod directory;
 #[cfg(target_os = "linux")]
 pub mod fuse;
 pub mod mount;
+#[cfg(target_os = "linux")]
+pub mod replica;
 pub mod runtime;
 pub mod sync;
 pub mod volume;
