@@ -18,11 +18,17 @@
 use std::process::{Command, Output};
 
 fn yy(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_yy"))
-        .args(args)
-        .env_clear()
-        .output()
-        .expect("run yy")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
+    command.args(args);
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("YINYANG_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command.output().expect("run yy")
 }
 
 fn stderr(output: &Output) -> String {
