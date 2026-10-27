@@ -20,7 +20,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -204,6 +204,11 @@ fn isolated_user_service_lifecycle() {
     units.start(&units.mount_instance("service"));
     units.wait_active(&units.mount_instance("service"));
     wait_mount(&mounts.join("service"), None);
+    write_and_sync(&mounts.join("service"), "service-before-restart", b"service mount bytes");
+    units.restart(&units.mount_instance("service"));
+    units.wait_active(&units.mount_instance("service"));
+    wait_mount(&mounts.join("service"), None);
+    assert_mount_bytes(&mounts.join("service"), "service-before-restart", b"service mount bytes");
     units.stop(&units.mount_instance("service"));
     assert!(state.join("service/staging.db").exists());
 
@@ -275,9 +280,11 @@ fn isolated_user_service_lifecycle() {
         &mount_root,
         &units.mount_instance("object"),
     );
+    write_and_sync(&mounts.join("object"), "object-before-restart", b"object mount bytes");
     units.restart(&units.mount_instance("object"));
     units.wait_active(&units.mount_instance("object"));
     wait_mount(&mounts.join("object"), None);
+    assert_mount_bytes(&mounts.join("object"), "object-before-restart", b"object mount bytes");
     units.stop(&units.mount_instance("object"));
     assert!(state.join("object/staging.db").exists());
 
@@ -397,11 +404,27 @@ fn cli_smoke_with(storage: Storage) {
         None,
     );
     doctor.success_or("doctor while the Managed Mount holds its lease");
+    write_and_sync(&mountpoint, "object-before-restart", b"object mount bytes");
     stop(&mut mount);
     assert!(
         state.join("object/staging.db").exists(),
         "mount stop discarded durable staging"
     );
+    let mut remounted = install.spawn(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            object_config.to_str().unwrap(),
+            "mount",
+            mountpoint.to_str().unwrap(),
+        ],
+        &object_root,
+        None,
+    );
+    wait_mount(&mountpoint, Some(&mut remounted));
+    assert_mount_bytes(&mountpoint, "object-before-restart", b"object mount bytes");
+    stop(&mut remounted);
 
     let sync_root = storage.root("sync");
     let sync_config = write_config(&configs, "sync", "sync", "library", "object", None);
@@ -504,7 +527,31 @@ fn cli_smoke_with(storage: Storage) {
         Some(SERVICE_TOKEN),
     );
     wait_mount(&service_mountpoint, Some(&mut service_mount));
+    write_and_sync(
+        &service_mountpoint,
+        "service-before-restart",
+        b"service mount bytes",
+    );
     stop(&mut service_mount);
+    let mut remounted = install.spawn(
+        &storage,
+        &work,
+        &[
+            "--volume",
+            service_config.to_str().unwrap(),
+            "mount",
+            service_mountpoint.to_str().unwrap(),
+        ],
+        &service_root,
+        Some(SERVICE_TOKEN),
+    );
+    wait_mount(&service_mountpoint, Some(&mut remounted));
+    assert_mount_bytes(
+        &service_mountpoint,
+        "service-before-restart",
+        b"service mount bytes",
+    );
+    stop(&mut remounted);
 
     let service_sync_config = write_config(
         &configs,
@@ -970,6 +1017,28 @@ fn wait_mount(mountpoint: &Path, mut child: Option<&mut Child>) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn write_and_sync(mountpoint: &Path, name: &str, bytes: &[u8]) {
+    let path = mountpoint.join(name);
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("create {name} through {}: {error}", mountpoint.display()));
+    file.write_all(bytes)
+        .unwrap_or_else(|error| panic!("write {name} through {}: {error}", mountpoint.display()));
+    file.sync_all()
+        .unwrap_or_else(|error| panic!("fsync {name} through {}: {error}", mountpoint.display()));
+    drop(file);
+    assert_mount_bytes(mountpoint, name, bytes);
+}
+
+fn assert_mount_bytes(mountpoint: &Path, name: &str, expected: &[u8]) {
+    let path = mountpoint.join(name);
+    let actual = fs::read(&path)
+        .unwrap_or_else(|error| panic!("read {name} through {}: {error}", mountpoint.display()));
+    assert_eq!(actual, expected, "{name} did not preserve installed-mount bytes");
 }
 
 struct UserUnits {
