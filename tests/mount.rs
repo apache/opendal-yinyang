@@ -629,3 +629,181 @@ async fn cancelled_first_open_broadcasts_retry_to_all_waiters() {
     assert_eq!(second_file.status().await.unwrap().id, shared);
     assert_eq!(mount.status().await.unwrap().handles.len(), 1);
 }
+
+#[tokio::test]
+async fn read_only_range_observations_pin_reads_without_staging() {
+    const BLOCK: usize = 64 * 1024;
+
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let setup = tempfile::tempdir().unwrap();
+    let writer = Runtime::open(authority.clone(), setup.path())
+        .await
+        .unwrap();
+    let (id, _) = writer
+        .create_file_with_node(authority.root(), "large", false)
+        .await
+        .unwrap();
+    let contents: Vec<u8> = (0..BLOCK * 8).map(|index| (index % 251) as u8).collect();
+    let mut file = writer.open_node(id, true).await.unwrap();
+    file.write(0, &contents).await.unwrap();
+    file.close().await.unwrap();
+    drop(writer);
+    backend.state.lock().unwrap().data_read_bytes = 0;
+
+    let mount_temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority.clone(), mount_temp.path(), true)
+        .await
+        .unwrap();
+    let first = mount.open_read_only_node(id).await.unwrap();
+    let second = mount.open_read_only_node(id).await.unwrap();
+    assert_eq!(first.version().revision(), second.version().revision());
+    let old_revision = first.version().revision();
+    assert!(mount.status().await.unwrap().handles.is_empty());
+
+    let offset = (BLOCK * 5 - 2048) as u64;
+    let expected = &contents[offset as usize..offset as usize + 4096];
+    assert_eq!(first.read(offset, 4096).await.unwrap(), expected);
+    assert_eq!(second.read(offset, 4096).await.unwrap(), expected);
+    let bytes_read = backend.state.lock().unwrap().data_read_bytes;
+    assert!(
+        bytes_read < contents.len() as u64,
+        "a 4 KiB range read fetched the whole {}-byte file",
+        contents.len()
+    );
+
+    let update_temp = tempfile::tempdir().unwrap();
+    let updater = Runtime::open(authority.clone(), update_temp.path())
+        .await
+        .unwrap();
+    let mut fresh = updater.open_node(id, true).await.unwrap();
+    fresh.write(0, b"new version").await.unwrap();
+    fresh.close().await.unwrap();
+
+    assert_eq!(
+        first.read(0, 11).await.unwrap(),
+        &contents[..11],
+        "an existing range handle was rebased onto a newer remote version"
+    );
+    drop(first);
+    drop(second);
+
+    let current = mount.open_read_only_node(id).await.unwrap();
+    assert_eq!(current.read(0, 11).await.unwrap(), b"new version");
+    assert_ne!(current.version().revision(), old_revision);
+}
+
+#[tokio::test]
+async fn writable_mount_rejects_unshared_range_observations() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(authority, temp.path(), false).await.unwrap();
+    assert_eq!(
+        mount
+            .open_read_only_node(yinyang::core::NodeId::generate())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+}
+
+async fn pausing_read_only_mount() -> (
+    Arc<PausingObserveAuthority>,
+    Mount,
+    yinyang::core::NodeId,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let setup_temp = tempfile::tempdir().unwrap();
+    let setup = Runtime::open(authority.clone(), setup_temp.path())
+        .await
+        .unwrap();
+    let (node, _) = setup
+        .create_file_with_node(authority.root(), "file", false)
+        .await
+        .unwrap();
+    drop(setup);
+
+    let pausing = Arc::new(PausingObserveAuthority::new(authority));
+    let mount_temp = tempfile::tempdir().unwrap();
+    let mount = Mount::open(pausing.clone(), mount_temp.path(), true)
+        .await
+        .unwrap();
+    (pausing, mount, node, setup_temp, mount_temp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_first_range_open_broadcasts_retry_to_all_waiters() {
+    let (pausing, mount, node, _setup_temp, _mount_temp) = pausing_read_only_mount().await;
+    pausing.pause_next_observe();
+    pausing.fail_next_observe();
+    let mut owner = Box::pin(mount.open_read_only_node(node));
+    assert_pending(&mut owner);
+    pausing.entered.acquire().await.unwrap().forget();
+    let mut first = Box::pin(mount.open_read_only_node(node));
+    let mut second = Box::pin(mount.open_read_only_node(node));
+    assert_pending(&mut first);
+    assert_pending(&mut second);
+    pausing.release.add_permits(1);
+
+    let error = tokio::time::timeout(Duration::from_secs(5), &mut owner)
+        .await
+        .expect("failed range owner did not finish")
+        .expect_err("failed range owner returned a file");
+    assert_eq!(error.kind(), ErrorKind::Storage);
+    let first = tokio::time::timeout(Duration::from_secs(5), &mut first)
+        .await
+        .expect("first range waiter did not retry")
+        .expect("first range waiter failed");
+    let second = tokio::time::timeout(Duration::from_secs(5), &mut second)
+        .await
+        .expect("second range waiter did not retry")
+        .expect("second range waiter failed");
+    assert_eq!(
+        first.version().revision(),
+        second.version().revision(),
+        "retried range opens did not share one observation"
+    );
+    assert!(mount.status().await.unwrap().handles.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_first_range_open_broadcasts_retry_to_all_waiters() {
+    let (pausing, mount, node, _setup_temp, _mount_temp) = pausing_read_only_mount().await;
+    pausing.pause_next_observe();
+    let mut owner = Box::pin(mount.open_read_only_node(node));
+    assert_pending(&mut owner);
+    pausing.entered.acquire().await.unwrap().forget();
+    let mut first = Box::pin(mount.open_read_only_node(node));
+    let mut second = Box::pin(mount.open_read_only_node(node));
+    assert_pending(&mut first);
+    assert_pending(&mut second);
+    drop(owner);
+
+    let first = tokio::time::timeout(Duration::from_secs(5), &mut first)
+        .await
+        .expect("first range waiter did not retry")
+        .expect("first range waiter failed");
+    let second = tokio::time::timeout(Duration::from_secs(5), &mut second)
+        .await
+        .expect("second range waiter did not retry")
+        .expect("second range waiter failed");
+    assert_eq!(first.version().revision(), second.version().revision());
+    assert!(mount.status().await.unwrap().handles.is_empty());
+}

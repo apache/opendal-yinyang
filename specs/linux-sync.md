@@ -14,6 +14,8 @@ its evidence.
 
 ```text
 yy --volume CONFIG sync init    --directory ROOT
+yy --volume CONFIG sync backup  --output BACKUP
+yy --volume CONFIG sync restore --backup BACKUP --directory ROOT
 yy --volume CONFIG sync run
 yy --volume CONFIG sync status  [--json]
 yy --volume CONFIG sync export  --artifact ARTIFACT_ID --output PATH
@@ -25,6 +27,15 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
 - `init` binds `ROOT` to the volume's remote root. It creates the local root and
   the state directory when missing, rejects a state directory that contains the
   root (or the reverse), and requires root and state on the same filesystem.
+- `backup` writes one experimental quiesced package containing the bound root,
+  `replica.db`, `sync.db`, content staging, retained artifacts, and a manifest
+  binding their filesystem identities and current content hashes. It requires
+  exclusive Sync/runtime leases and refuses incomplete local installs.
+- `restore` validates a backup package and the configured authority before
+  creating absent destination root/state paths. It copies the package, then
+  rebinds root/quarantine inode identities in one SQLite transaction. It
+  preserves accepted fingerprints, commit identities, Unknown work, and
+  historical artifact digests.
 - `run` performs one finite reconciliation pass: it retries any associated
   durable work, pulls remote changes, and publishes eligible local edits.
 - `status` reports the current binding, remote and local observations, and the
@@ -86,6 +97,31 @@ be reached; it never fabricates success. `export --artifact` and `export
 --conflict --side local` read durable local bytes and never contact the
 authority. `export --conflict --side remote` reads a retained revision and
 needs the authority.
+
+## Backup identity
+
+The root and state directory identities recorded in `replica.db` are not
+portable across an ordinary filesystem copy. The backup manifest therefore
+contains complete quiesced `LocalSnapshot` evidence for the root and each
+retained artifact, including original inode relationships and current content
+hashes, plus hashes of the consistent SQLite package files. Restore verifies
+the package, then maps original root/quarantine identities to the copied
+destinations. Baseline and work fingerprints and CommitIds are not rewritten.
+
+An unscanned local rename remains a rename because the old inode is mapped to
+the copied inode at its new path. Local edits not represented by baseline/work
+remain local differences. A retained artifact is validated against the bytes
+captured by the quiesced backup, not against the install's historical
+`expected_digest`; the existing conflict rules may therefore report the
+retained artifact as conflicted without discarding its bytes.
+
+Restore requires a same-version package, a matching filesystem, absent
+destination paths, and terminal install records. It rejects malformed
+checksums, unsafe/duplicate paths or artifact names, wrong profiles, incomplete
+installs, and ambiguous old-to-new identity collisions before creating or
+rebinding destinations. The package format is experimental and is not an
+online snapshot or migration contract. See
+[Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
 
 ## Status document
 

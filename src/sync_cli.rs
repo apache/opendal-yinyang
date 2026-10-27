@@ -41,6 +41,19 @@ pub enum SyncCommand {
         #[arg(long)]
         directory: PathBuf,
     },
+    /// Write a quiesced local Sync backup package.
+    Backup {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Complete an isolated restore of copied sync state and local directory.
+    Restore {
+        /// Backup package created by `sync backup`.
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        directory: PathBuf,
+    },
     /// Reconcile the bound local directory with the Managed remote root.
     Run,
     /// Report Managed Sync status without mutating any state.
@@ -370,6 +383,10 @@ pub async fn run(
     match command {
         SyncCommand::Status { json } => status(&config, operator, json).await,
         SyncCommand::Init { directory } => init(&config, operator, &directory).await,
+        SyncCommand::Backup { output } => backup(&config, operator, &output).await,
+        SyncCommand::Restore { backup, directory } => {
+            restore(&config, operator, &backup, &directory).await
+        }
         SyncCommand::Run => reconcile(&config, operator).await,
         SyncCommand::Export {
             artifact,
@@ -471,6 +488,38 @@ async fn init(
         .map_err(fatal)?;
     println!(
         "sync bound {} to state {}",
+        directory.display(),
+        config.staging.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn backup(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+    output: &Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let authority = connect(config, operator).await?;
+    let directory = DirectorySync::open(authority, &config.staging)
+        .await
+        .map_err(fatal)?;
+    directory.backup(output).await.map_err(fatal)?;
+    println!("sync backup written to {}", output.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn restore(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+    backup: &Path,
+    directory: &Path,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let authority = connect(config, operator).await?;
+    DirectorySync::restore(authority, backup, &config.staging, directory)
+        .await
+        .map_err(fatal)?;
+    println!(
+        "sync restored {} with state {}",
         directory.display(),
         config.staging.display()
     );

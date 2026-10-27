@@ -25,6 +25,12 @@ an identity already in the journal before reading the source. `publish` takes
 only a `CommitId`; it restores and retries the original frozen transaction and
 never accepts, scans or replans from a source path.
 
+For backup, stop the publishing process and use a consistent SQLite backup of
+`directory.db`; copy the complete immutable object prefix referenced by the
+journal. Restoring the journal plus that prefix preserves receipt lookup,
+source-free retry, export, and historical restore. See
+[Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
+
 The source is a complete replacement namespace. The planner scans all relevant
 remote nodes and directory memberships, so concurrent content changes and
 unseen additions within that scope cause Conflict. It does not silently erase
