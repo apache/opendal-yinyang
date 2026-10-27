@@ -8,9 +8,11 @@ only authority supported by those commands.
 
 The benchmark uses isolated Silo (S3-compatible) settings, a unique remote root,
 and a new staging directory. A loopback HTTP counting proxy sits between YinYang
-and Silo. It counts request methods, request bytes, and response bytes without
-instrumenting production code. Metadata-service traffic is direct; the byte
-counts cover storage traffic only.
+and Silo. It parses HTTP/1 request framing before counting request methods, and
+counts request and response bytes without instrumenting production code.
+Metadata-service traffic is direct; the byte counts cover storage traffic only.
+The extra loopback hop is visible in latency but not in byte or request counts;
+compare runs only with the same proxy.
 
 ## Run
 
@@ -63,24 +65,26 @@ Each JSONL record includes:
 - dataset file count, directory count, logical bytes, file size, and range size;
 - completion semantics for the frontend;
 - every latency sample and p50/p95/min/max;
-- process `rchar`, `wchar`, syscall counts, and block-layer read/write bytes from
-  `/proc/<pid>/io`;
+- sampled process `rchar`, `wchar`, syscall counts, and block-layer read/write
+  bytes from `/proc/<pid>/io`;
 - storage requests by HTTP method, total request bytes, and total response bytes;
 - local payload, Sync state, mount staging, metadata database, and persistent S3
   object bytes and object counts;
 - assertions that completed successfully and the failure count (zero for a
   completed scenario).
 
-`/proc/<pid>/io` character counts include socket I/O as well as file I/O. Block
-read/write bytes identify actual local block-layer work, while the dataset and
-persistent-space fields provide the storage-accounting context. Do not report
-one of these fields as local-only file I/O when the process also read or wrote
-the network.
+`/proc/<pid>/io` is polled while the process is alive, so terminal increments can
+be missed and every value is a lower bound. Character counts also include socket
+I/O. Block read/write bytes identify actual local block-layer work, while the
+dataset and persistent-space fields provide the storage-accounting context. Do
+not report one of these fields as exact local-only scan or hash work when the
+process also read or wrote the network.
 
 Sync completion is the successful return of one finite `yy sync run` followed by
-an independently observed `status --json` with `summary.in_sync=true`. FUSE
-sparse-update and concurrent-writer completion is the successful `fsync` of
-every descriptor; the benchmark verifies the resulting remote namespace. These
+an independently observed `status --json` with `summary.in_sync=true`; that
+status observation is outside the reported run latency. FUSE sparse-update and
+concurrent-writer completion is the successful `fsync` of every descriptor. The
+benchmark verifies the resulting remote bytes after the measured interval. These
 are not interchangeable with a File Provider local save, which is outside this
 Linux benchmark.
 

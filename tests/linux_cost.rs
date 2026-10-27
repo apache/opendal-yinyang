@@ -33,7 +33,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,7 @@ use fixture::{Fixture, Publication, SyncPaths};
 const RESULT_SCHEMA: &str = "yinyang.linux-cost.v1";
 const CHUNK: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
+const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io while alive; terminal increments can be missed, so values are lower bounds and character I/O includes sockets";
 
 #[derive(Clone, Copy)]
 enum Profile {
@@ -222,7 +223,7 @@ fn run_sync_matrix(
     populate_small_tree(&paths.directory, scale);
     fixture.sync_init(&paths);
     let dataset = tree_dataset(&paths.directory);
-    let completion = "yy sync run returned after one finite pass; status confirmed in_sync";
+    let completion = "latency is one finite yy sync run; in_sync status was read separately after the measured run";
 
     let initial = run_yy_operation(
         proxy,
@@ -421,6 +422,7 @@ fn run_fuse_matrix(
         vec!["range bytes verified".to_owned()],
     );
 
+    let mut expected_large = payload(size, 0x5a);
     let mut sparse = OperationBatch::default();
     let mut spaces = Vec::new();
     for index in 0..4_u64 {
@@ -429,6 +431,7 @@ fn run_fuse_matrix(
             RANGE_BYTES,
             0x80 + u8::try_from(index).expect("four updates"),
         );
+        expected_large[offset as usize..offset as usize + RANGE_BYTES].copy_from_slice(&value);
         let measured = measure_mount_operation(proxy, mounted.pid(), || {
             let file = OpenOptions::new()
                 .write(true)
@@ -441,6 +444,11 @@ fn run_fuse_matrix(
         sparse.push(measured);
         spaces.push(space_snapshot(&fixture, None, None, Some(&staging)));
     }
+    assert_eq!(
+        remote_file_bytes(&fixture, "large.bin"),
+        expected_large,
+        "remote content did not reflect every sparse update"
+    );
     sparse.record_with_spaces(
         recorder,
         context,
@@ -460,13 +468,18 @@ fn run_fuse_matrix(
     let mut restarted = FuseMount::start(&fixture, &config, &mountpoint);
     let restart = measure_mount_operation(proxy, restarted.pid(), || {
         let file = File::open(&large).expect("open after FUSE restart");
-        let mut value = vec![0_u8; RANGE_BYTES];
-        read_exact_at(&file, &mut value, (size / 2) as u64);
+        let verify_offset = (size as u64 - RANGE_BYTES as u64) / 2 - RANGE_BYTES as u64;
+        let mut value = vec![0_u8; 6 * RANGE_BYTES];
+        read_exact_at(&file, &mut value, verify_offset);
         drop(file);
-        value
+        (verify_offset, value)
     });
-    let restart_bytes = restart.value;
-    assert_eq!(restart_bytes, payload(RANGE_BYTES, 0x5a));
+    let (verify_offset, restart_bytes) = restart.value;
+    assert_eq!(
+        restart_bytes,
+        expected_large[verify_offset as usize..verify_offset as usize + 6 * RANGE_BYTES],
+        "restarted mount did not preserve sparse bytes and adjacent untouched bytes"
+    );
     recorder.record(
         context,
         "fuse_restart_cold_open_range_read",
@@ -510,17 +523,31 @@ fn run_concurrent_matrix(
         range_bytes: None,
         writers: Some(writers),
     };
-    let barrier = Arc::new(Barrier::new(writers + 1));
-    let mut threads = Vec::with_capacity(writers);
-    for index in 0..writers {
-        let barrier = barrier.clone();
-        let path = mountpoint.join(format!("concurrent/writer-{index:02}.bin"));
-        threads.push(thread::spawn(move || {
-            let value = payload(
+    let expected = (0..writers)
+        .map(|index| {
+            payload(
                 writer_bytes,
                 0x20 + u8::try_from(index).expect("small writer set"),
-            );
-            barrier.wait();
+            )
+        })
+        .collect::<Vec<_>>();
+    let start = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut threads = Vec::with_capacity(writers);
+    for index in 0..writers {
+        let start = start.clone();
+        let path = mountpoint.join(format!("concurrent/writer-{index:02}.bin"));
+        let value = expected[index].clone();
+        threads.push(thread::spawn(move || {
+            let (started, ready) = &*start;
+            let mut started = started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*started {
+                started = ready
+                    .wait(started)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            drop(started);
             let started = Instant::now();
             let mut file = File::create(path).expect("create concurrent FUSE file");
             file.write_all(&value).expect("write concurrent FUSE file");
@@ -529,10 +556,16 @@ fn run_concurrent_matrix(
             started.elapsed().as_secs_f64() * 1000.0
         }));
     }
-    barrier.wait();
     let net_before = proxy.snapshot();
     let io_before = read_proc_io(mounted.pid());
     let started = Instant::now();
+    {
+        let (release, ready) = &*start;
+        *release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        ready.notify_all();
+    }
     let mut samples = Vec::with_capacity(writers);
     for thread in threads {
         samples.push(thread.join().expect("concurrent FUSE writer panicked"));
@@ -540,13 +573,22 @@ fn run_concurrent_matrix(
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
     let network = proxy.snapshot().since(net_before);
     let io = read_proc_io(mounted.pid()).since(io_before);
+    let remote = fixture.remote_tree().expect("read concurrent remote tree");
+    for (index, expected) in expected.iter().enumerate() {
+        match remote.get(&format!("concurrent/writer-{index:02}.bin")) {
+            Some(fixture::RemoteEntry::File { bytes, .. }) => {
+                assert_eq!(bytes, expected, "concurrent writer {index} remote bytes")
+            }
+            value => panic!("concurrent writer {index} has unexpected remote state: {value:?}"),
+        }
+    }
     recorder.record(
         context,
         "fuse_concurrent_writers",
         publication,
         scale,
         dataset,
-        "all writer descriptors fsync-acknowledged remote publication before returning",
+        "all writer fsync calls returned; remote bytes were verified after the measured interval",
         samples,
         io,
         network,
@@ -554,17 +596,8 @@ fn run_concurrent_matrix(
         space_snapshot(&fixture, None, None, Some(&staging)),
         vec![
             format!("wall_ms={wall_ms:.3}"),
-            "all remote fsync calls returned success".to_owned(),
+            "all writer files matched their complete expected remote bytes".to_owned(),
         ],
-    );
-
-    let remote = fixture.remote_tree().expect("read concurrent remote tree");
-    assert_eq!(
-        remote
-            .keys()
-            .filter(|path| path.starts_with("concurrent/writer-"))
-            .count(),
-        writers
     );
     mounted.unmount();
 }
@@ -699,6 +732,18 @@ fn assert_sync_in_sync(fixture: &Fixture, paths: &SyncPaths, context: &str) {
         status.summary.in_sync,
         "{context}: Sync status was not in_sync: {status:#?}"
     );
+}
+
+fn remote_file_bytes(fixture: &Fixture, path: &str) -> Vec<u8> {
+    match fixture
+        .remote_tree()
+        .expect("read remote tree for content verification")
+        .remove(path)
+    {
+        Some(fixture::RemoteEntry::File { bytes, .. }) => bytes,
+        Some(fixture::RemoteEntry::Directory { .. }) => panic!("{path} is a remote directory"),
+        None => panic!("{path} is absent from the remote tree"),
+    }
 }
 
 fn mount_paths(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -1222,7 +1267,7 @@ impl Drop for CountingProxy {
     }
 }
 
-fn proxy_connection(mut client: TcpStream, upstream: SocketAddr, counters: Arc<ProxyCounters>) {
+fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<ProxyCounters>) {
     let Ok(server) = TcpStream::connect(upstream) else {
         return;
     };
@@ -1278,22 +1323,131 @@ fn pump(reader: &mut TcpStream, writer: &mut TcpStream, counters: &ProxyCounters
     let _ = writer.shutdown(Shutdown::Write);
 }
 
+#[derive(Clone, Copy, Default)]
+enum ScanState {
+    #[default]
+    RequestLine,
+    Headers,
+    Body(u64),
+    ChunkSize,
+    ChunkData(u64),
+    ChunkCrlf(u8),
+    Trailers,
+}
+
 #[derive(Default)]
 struct RequestScanner {
-    pending: Vec<u8>,
+    state: ScanState,
+    line: Vec<u8>,
+    content_length: Option<u64>,
+    chunked: bool,
 }
 
 impl RequestScanner {
     fn scan(&mut self, bytes: &[u8], counters: &ProxyCounters) {
-        self.pending.extend_from_slice(bytes);
-        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let line = self.pending.drain(..=end).collect::<Vec<_>>();
-            let line = line.strip_suffix(b"\n").unwrap_or(&line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            count_request_line(line, counters);
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match self.state {
+                ScanState::Body(remaining) | ScanState::ChunkData(remaining) => {
+                    let count = remaining.min((bytes.len() - offset) as u64) as usize;
+                    offset += count;
+                    if count as u64 == remaining {
+                        self.state = if matches!(self.state, ScanState::Body(_)) {
+                            ScanState::RequestLine
+                        } else {
+                            ScanState::ChunkCrlf(2)
+                        };
+                    } else {
+                        self.state = match self.state {
+                            ScanState::Body(_) => ScanState::Body(remaining - count as u64),
+                            ScanState::ChunkData(_) => {
+                                ScanState::ChunkData(remaining - count as u64)
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                ScanState::ChunkCrlf(remaining) => {
+                    let count = usize::from(remaining).min(bytes.len() - offset);
+                    offset += count;
+                    let remaining = remaining - count as u8;
+                    self.state = if remaining == 0 {
+                        ScanState::ChunkSize
+                    } else {
+                        ScanState::ChunkCrlf(remaining)
+                    };
+                }
+                ScanState::RequestLine
+                | ScanState::Headers
+                | ScanState::ChunkSize
+                | ScanState::Trailers => {
+                    let end = bytes[offset..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map(|position| offset + position);
+                    if let Some(end) = end {
+                        self.line.extend_from_slice(&bytes[offset..end]);
+                        let line = std::mem::take(&mut self.line);
+                        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                        self.process_line(line, counters);
+                        offset = end + 1;
+                    } else {
+                        self.line.extend_from_slice(&bytes[offset..]);
+                        offset = bytes.len();
+                        if self.line.len() > 16 * 1024 {
+                            self.line.clear();
+                            self.state = ScanState::RequestLine;
+                        }
+                    }
+                }
+            }
         }
-        if self.pending.len() > 16 * 1024 {
-            self.pending.clear();
+    }
+
+    fn process_line(&mut self, line: &[u8], counters: &ProxyCounters) {
+        match self.state {
+            ScanState::RequestLine => {
+                count_request_line(line, counters);
+                self.content_length = None;
+                self.chunked = false;
+                self.state = ScanState::Headers;
+            }
+            ScanState::Headers if line.is_empty() => {
+                self.state = if self.chunked {
+                    ScanState::ChunkSize
+                } else if let Some(length) = self.content_length.filter(|length| *length > 0) {
+                    ScanState::Body(length)
+                } else {
+                    ScanState::RequestLine
+                };
+            }
+            ScanState::Headers => {
+                let header = String::from_utf8_lossy(line).to_ascii_lowercase();
+                if let Some(value) = header.strip_prefix("content-length:") {
+                    self.content_length = value.trim().parse().ok();
+                } else if header.starts_with("transfer-encoding:") && header.contains("chunked") {
+                    self.chunked = true;
+                }
+            }
+            ScanState::ChunkSize => {
+                let size = std::str::from_utf8(line)
+                    .ok()
+                    .and_then(|line| line.split(';').next())
+                    .and_then(|size| u64::from_str_radix(size.trim(), 16).ok())
+                    .unwrap_or_else(|| panic!("invalid HTTP chunk size in benchmark request"));
+                self.state = if size == 0 {
+                    ScanState::Trailers
+                } else {
+                    ScanState::ChunkData(size)
+                };
+            }
+            ScanState::Trailers if line.is_empty() => {
+                self.state = ScanState::RequestLine;
+            }
+            ScanState::Trailers => {}
+            ScanState::Body(_) | ScanState::ChunkData(_) | ScanState::ChunkCrlf(_) => {
+                unreachable!("fixed-width HTTP states do not process lines")
+            }
         }
     }
 }
@@ -1349,13 +1503,11 @@ fn space_snapshot(
     let local_payload_bytes = local.map(tree_bytes).unwrap_or_default();
     let sync_state_bytes = sync_state.map(tree_bytes).unwrap_or_default();
     let mount_staging_bytes = mount_staging.map(tree_bytes).unwrap_or_default();
-    let metadata_database_bytes = fixture
-        .temp
-        .path()
-        .join("metadata.db")
-        .metadata()
+    let metadata_database_bytes = ["metadata.db", "metadata.db-wal", "metadata.db-shm"]
+        .into_iter()
+        .filter_map(|name| fixture.temp.path().join(name).metadata().ok())
         .map(|metadata| metadata.len())
-        .unwrap_or_default();
+        .fold(0_u64, u64::saturating_add);
     let (remote_stored_bytes, remote_objects) = remote_storage(fixture);
     SpaceSnapshot {
         local_payload_bytes,
@@ -1400,13 +1552,14 @@ fn remote_storage(fixture: &Fixture) -> (u64, u64) {
         .expect("build benchmark storage listing runtime");
     runtime.block_on(async move {
         let mut entries = operator
-            .lister("")
+            .lister_with("")
+            .recursive(true)
             .await
             .expect("list persistent benchmark storage");
         let mut bytes = 0_u64;
         let mut objects = 0_u64;
         while let Some(entry) = entries
-            .next()
+            .try_next()
             .await
             .expect("read persistent benchmark object")
         {
@@ -1479,6 +1632,7 @@ struct CostRecord {
     wall_ms: f64,
     latency: LatencyStats,
     local_process_io: IoSnapshot,
+    local_process_io_note: String,
     network: NetworkSnapshot,
     space_series: Vec<SpaceSnapshot>,
     space: SpaceSnapshot,
@@ -1561,6 +1715,7 @@ impl Recorder {
             wall_ms: latencies.iter().sum(),
             latency,
             local_process_io: io,
+            local_process_io_note: PROCESS_IO_NOTE.to_owned(),
             network,
             space_series,
             space,
@@ -1630,6 +1785,7 @@ impl Recorder {
                 max_ms: 0.0,
             },
             local_process_io: IoSnapshot::default(),
+            local_process_io_note: PROCESS_IO_NOTE.to_owned(),
             network: NetworkSnapshot::default(),
             space_series: Vec::new(),
             space: SpaceSnapshot::default(),
@@ -1683,7 +1839,7 @@ impl Recorder {
             ));
         }
         markdown.push_str(
-            "\nRequest and byte values cover storage HTTP traffic through the counting proxy. Process I/O and space series are preserved in the JSONL evidence. Completion semantics differ by frontend and are recorded per row.\n",
+            "\nRequest and byte values cover storage HTTP traffic through the counting proxy. Process I/O values are sampled lower bounds, not exact local scan or hash costs. Space series and completion semantics are preserved in the JSONL evidence.\n",
         );
         fs::write(&self.summary_path, markdown).expect("write benchmark Markdown summary");
         println!(
@@ -1742,4 +1898,36 @@ fn blake3_file(path: &Path) -> String {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("benchmark path is UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProxyCounters, RequestScanner};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn request_scanner_skips_content_length_and_chunked_bodies() {
+        let counters = ProxyCounters::default();
+        let body = b"PUT /not-a-request HTTP/1.1\r\n\r\n";
+        let mut wire = format!(
+            "PUT /object HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(body);
+        wire.extend_from_slice(
+            b"POST /chunked HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\
+              4\r\nGET \r\n0\r\n\r\n\
+              HEAD /next HTTP/1.1\r\n\r\n",
+        );
+        let mut scanner = RequestScanner::default();
+        for byte in wire {
+            scanner.scan(&[byte], &counters);
+        }
+        assert_eq!(counters.requests.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.put.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.post.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.head.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.get.load(Ordering::Relaxed), 0);
+    }
 }
