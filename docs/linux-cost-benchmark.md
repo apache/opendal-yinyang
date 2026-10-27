@@ -40,14 +40,30 @@ cargo x bench-linux-cost \
   --output target/linux-cost/service.jsonl
 ```
 
+Run the matched read-only range workload at 8 MiB and 32 MiB for both
+authorities:
+
+```shell
+cargo x bench-linux-cost \
+  --workload read-only-range \
+  --output target/linux-cost/read-only-range.jsonl
+```
+
+This selector always writes read-only volume configurations. A baseline from an
+older production commit must use the same collector, workload, file sizes,
+range offsets, proxy chain, and read-only policy. Results from the earlier
+writable FUSE fixtures are not an equivalent control because the writable path
+also exercises publication-capable staging.
+
 The `early` profile runs the small object-authority Sync, FUSE, concurrent-writer,
 and one-shot transfer scenarios. The `full` profile adds the service authority,
 the medium scale, and the explicit service-authority one-shot boundary. The
 `--publication` filter defaults to `all`; `object` and `service` select only
 that authority. The command writes JSONL evidence to `--output` and a Markdown
 summary to the same path with an `.md` extension. Every record and summary
-reports the publication filter and the measured/unsupported record counts so a
-filtered run cannot be mistaken for the complete matrix.
+reports the workload, volume mode, publication filter, and the
+measured/unsupported record counts so a filtered run cannot be mistaken for the
+complete matrix.
 
 The summary marks combinations that the product does not support as
 `unsupported` with dashes for measurement fields. This prevents a not-run
@@ -74,6 +90,16 @@ The matrix covers:
   descriptor, four sparse updates, a remount/restart, and concurrent writers;
 - one-shot object-authority `publish` and `restore`.
 
+The `read-only-range` workload covers both authorities at 8 MiB and 32 MiB:
+a cold open plus one 4 KiB read, five warm reads on the same descriptor, a
+restart, and a cold open plus one 8 KiB read spanning a 64 KiB verification-unit
+boundary. It records allocated mount staging while the read descriptor remains
+open, after the reads, and after restart. These samples expose local
+materialization even if a later release reclaims a clean staged file.
+Warm here means repeated reads through the same `FileVersion`; it does not imply
+local staging or a persistent content cache. The measured requests and bytes
+must determine whether those reads still fetch remote units or proofs.
+
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
@@ -94,6 +120,7 @@ Each JSONL record includes:
   CPU/memory identity, and Rust version;
 - dataset file count, directory count, logical bytes, file size, and range size;
 - completion semantics for the frontend;
+- workload and read-only/read-write volume mode;
 - every latency sample and p50/p95/min/max;
 - sampled process `rchar`, `wchar`, syscall counts, and block-layer read/write
   bytes from `/proc/<pid>/io`;

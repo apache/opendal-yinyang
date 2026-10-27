@@ -283,6 +283,12 @@ enum BenchPublication {
     Service,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchWorkload {
+    Full,
+    ReadOnlyRange,
+}
+
 #[derive(Parser)]
 #[clap(name = "bench-linux-cost")]
 struct CommandBenchLinuxCost {
@@ -295,6 +301,13 @@ struct CommandBenchLinuxCost {
         help = "Limit authority-specific workloads while preserving the selected profile's scales."
     )]
     publication: BenchPublication,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "full",
+        help = "Select the complete product matrix or the matched read-only range workload."
+    )]
+    workload: BenchWorkload,
     #[arg(
         long,
         help = "Write JSONL evidence here; a Markdown summary uses the same path with .md."
@@ -324,14 +337,21 @@ impl CommandBenchLinuxCost {
                 panic!("{name} is unset; the Linux cost benchmark fails hard instead of skipping");
             }
         }
-        let profile = match self.profile {
-            BenchProfile::Early => "early",
-            BenchProfile::Full => "full",
+        let profile = match self.workload {
+            BenchWorkload::ReadOnlyRange => "full",
+            BenchWorkload::Full => match self.profile {
+                BenchProfile::Early => "early",
+                BenchProfile::Full => "full",
+            },
         };
         let publication = match self.publication {
             BenchPublication::All => "all",
             BenchPublication::Object => "object",
             BenchPublication::Service => "service",
+        };
+        let workload = match self.workload {
+            BenchWorkload::Full => "full",
+            BenchWorkload::ReadOnlyRange => "read-only-range",
         };
         let mut cmd = find_command("cargo");
         cmd.args([
@@ -348,6 +368,7 @@ impl CommandBenchLinuxCost {
             "--test-threads=1",
         ]);
         cmd.env("YINYANG_COST_PROFILE", profile);
+        cmd.env("YINYANG_COST_WORKLOAD", workload);
         cmd.env("YINYANG_COST_PUBLICATION", publication);
         cmd.env("YINYANG_COST_OUTPUT", &self.output);
         cmd.env("YINYANG_COST_SUMMARY", self.output.with_extension("md"));
@@ -412,6 +433,12 @@ struct CommandTestLinuxFuse {
         help = "Run only the read-only acceptance stage for independent first-layer validation."
     )]
     read_only: bool,
+    #[arg(
+        long,
+        conflicts_with = "read_only",
+        help = "Run only the read-only range-hydration acceptance scenarios."
+    )]
+    read_only_range: bool,
 }
 
 impl CommandTestLinuxFuse {
@@ -442,7 +469,9 @@ impl CommandTestLinuxFuse {
         }
         let mut cmd = find_command("cargo");
         cmd.args(["test", "-p", "yinyang", "--test", "linux_fuse"]);
-        if self.read_only {
+        if self.read_only_range {
+            cmd.arg("fuse_read_only_range_");
+        } else if self.read_only {
             cmd.arg("fuse_read_only_");
         } else {
             cmd.arg("fuse_");
