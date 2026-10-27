@@ -524,7 +524,7 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
     assert_eq!(receipt.commit_id, id);
     assert_eq!(receipt.request_digest, prepared.intent.request_digest);
     let status = journal.status(id).await.unwrap().unwrap();
-    assert_eq!(status.state, DirectoryState::Committed(receipt));
+    assert_eq!(status.state, DirectoryState::Committed(receipt.clone()));
     assert!(status.failure.is_none());
     assert!(
         !status.can_retry(),
@@ -615,7 +615,7 @@ async fn separately_opened_journals_replay_one_exact_request_safely() {
     assert_eq!(left, right);
     assert_eq!(
         first.status(id).await.unwrap().unwrap().state,
-        DirectoryState::Committed(left)
+        DirectoryState::Committed(left.clone())
     );
     let output = temp.path().join("published");
     yinyang::restore_directory_revision(&fs, left.cursor.revision, &output)

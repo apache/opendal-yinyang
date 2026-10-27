@@ -138,6 +138,16 @@ pub struct DirectoryJournal {
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for DirectoryJournal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectoryJournal")
+            .field("filesystem", &self.filesystem())
+            .field("root", &self.root())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DirectoryJournal {
     /// Open or create a journal bound to one object publication authority.
     pub async fn open(fs: &Fs, directory: impl AsRef<Path>) -> Result<Self> {
@@ -550,6 +560,11 @@ impl DirectoryJournal {
             .await?
             .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown directory intent"))?;
         let status = row.status(commit_id)?;
+        if !status.can_export() {
+            return Err(Error::Retained(status.failure.ok_or_else(|| {
+                Error::local_kind(ErrorKind::Corrupt, "failed intent has no diagnostic")
+            })?));
+        }
         let (baseline, request_id, digest) = Transaction::inspect_identity(&row.request)?;
         if baseline != status.intent.baseline || request_id != commit_id || digest != row.digest() {
             return Err(Error::local_kind(
