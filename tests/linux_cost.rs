@@ -1551,18 +1551,14 @@ fn remote_storage(fixture: &Fixture) -> (u64, u64) {
         .build()
         .expect("build benchmark storage listing runtime");
     runtime.block_on(async move {
-        let mut entries = operator
-            .lister_with("")
+        let entries = operator
+            .list_with("")
             .recursive(true)
             .await
             .expect("list persistent benchmark storage");
         let mut bytes = 0_u64;
         let mut objects = 0_u64;
-        while let Some(entry) = entries
-            .try_next()
-            .await
-            .expect("read persistent benchmark object")
-        {
+        for entry in entries {
             let metadata = entry.metadata();
             if metadata.is_file() {
                 objects += 1;
