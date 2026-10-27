@@ -734,6 +734,7 @@ fn run_read_only_range_matrix(
         cold_bytes,
         expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
     );
+    let cold_after = space_snapshot(fixture, None, None, Some(&staging));
     recorder.record(
         context,
         "fuse_read_only_range_cold_4k",
@@ -744,10 +745,8 @@ fn run_read_only_range_matrix(
         vec![latency_ms],
         io,
         network,
-        vec![
-            cold_space,
-            space_snapshot(fixture, None, None, Some(&staging)),
-        ],
+        vec![cold_space, cold_after.clone()],
+        cold_after,
         vec!["middle 4 KiB range verified".to_owned()],
     );
 
@@ -825,6 +824,7 @@ fn run_read_only_range_matrix(
         range_bytes: Some(boundary_length as u64),
         ..dataset
     };
+    let boundary_after = space_snapshot(fixture, None, None, Some(&staging));
     recorder.record(
         context,
         "fuse_read_only_range_restart_boundary_crossing",
@@ -835,10 +835,8 @@ fn run_read_only_range_matrix(
         vec![latency_ms],
         io,
         network,
-        vec![
-            boundary_space,
-            space_snapshot(fixture, None, None, Some(&staging)),
-        ],
+        vec![boundary_space, boundary_after.clone()],
+        boundary_after,
         vec!["boundary-crossing range bytes verified".to_owned()],
     );
     restarted.unmount();
