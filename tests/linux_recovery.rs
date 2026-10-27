@@ -23,15 +23,17 @@
 mod fixture;
 
 use fixture::{
-    ArtifactKind, Captured, EntryState, Fixture, Publication, RemoteEntry, SyncStatus, runtime,
+    ArtifactKind, Captured, EntryState, Fixture, Publication, RemoteEntry, SyncStatus, local_tree,
+    runtime,
 };
 use nix::unistd::{Gid, Uid};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
-use std::net::SocketAddr;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
@@ -39,6 +41,8 @@ use yinyang::core::{Authority, CommitId, NodeId};
 use yinyang::runtime::{Runtime, RuntimeStatus};
 
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
+const MAX_HTTP_HEAD: usize = 64 * 1024;
+const MAX_HTTP_BODY: usize = 16 * 1024 * 1024;
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
@@ -830,6 +834,126 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     service.stop();
 }
 
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
+fn object_publication_journal_restore_preserves_history_and_unknown() {
+    let fixture = Fixture::new(Publication::Object);
+    let history = fixture.path("history-source");
+    fs::create_dir(&history).unwrap();
+    fs::write(history.join("version.txt"), b"history-v1").unwrap();
+    let first_tree = local_tree(&history).unwrap();
+    fixture.yy_ok(&["publish", text(&history)]);
+    let first_status = fixture.yy_ok(&["status"]);
+    let first_revision = String::from_utf8_lossy(&first_status.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("revision: ").map(str::to_owned))
+        .expect("first publish did not report a revision");
+    fs::write(history.join("version.txt"), b"history-v2").unwrap();
+    fixture.yy_ok(&["publish", text(&history), "--replace"]);
+
+    let source = fixture.path("journal-source");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("accepted.txt"), b"accepted-before-backup").unwrap();
+    fs::write(source.join("nested/payload"), b"nested").unwrap();
+    let accepted_tree = local_tree(&source).unwrap();
+    let journal = fixture.path("journal-source-state");
+    let commit = uuid::Uuid::new_v4().to_string();
+    let gate = S3DropGate::start();
+    let mut command = fixture.yy_command(&[
+        "publish",
+        text(&source),
+        "--state",
+        text(&journal),
+        "--commit-id",
+        &commit,
+    ]);
+    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let lost = run_command(command, Duration::from_secs(180));
+    assert_eq!(
+        lost.status.code(),
+        Some(3),
+        "lost commit response must remain Uncertain\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&lost.stdout),
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    gate.wait_intercepted();
+    drop(gate);
+    fs::write(source.join("accepted.txt"), b"newer-local-source").unwrap();
+
+    let restored_state = fixture.path("journal-restored-state");
+    fs::create_dir(&restored_state).unwrap();
+    sqlite_backup(
+        &journal.join("directory.db"),
+        &restored_state.join("directory.db"),
+    );
+    let destination_root = remote_root("journal-restore");
+    copy_prefix(fixture.operator(), operator_for_root(&destination_root));
+    let inspection = fixture.yy_ok(&[
+        "publication",
+        "inspect",
+        &commit,
+        "--state",
+        text(&restored_state),
+        "--json",
+    ]);
+    let inspection: serde_json::Value = serde_json::from_slice(&inspection.stdout).unwrap();
+    assert_eq!(inspection["intents"][0]["state"], "unknown");
+    assert_eq!(inspection["intents"][0]["commit_id"], commit);
+
+    let exported = fixture.path("journal-exported");
+    fixture
+        .yy_with_env(
+            &[
+                "publication",
+                "export",
+                &commit,
+                "--state",
+                text(&restored_state),
+                "--destination",
+                text(&exported),
+            ],
+            &[("YINYANG_S3_ROOT", &destination_root)],
+        )
+        .success_or("export accepted publication bytes after restore");
+    assert_eq!(local_tree(&exported).unwrap(), accepted_tree);
+
+    let retried = fixture.yy_with_env(
+        &[
+            "publication",
+            "retry",
+            &commit,
+            "--state",
+            text(&restored_state),
+        ],
+        &[("YINYANG_S3_ROOT", &destination_root)],
+    );
+    retried.success_or("retry restored publication journal");
+    assert!(
+        String::from_utf8_lossy(&retried.stdout).contains(&commit),
+        "restored retry must preserve the original commit: {}",
+        String::from_utf8_lossy(&retried.stdout)
+    );
+    fixture
+        .yy_with_env(
+            &["receipt", &commit],
+            &[("YINYANG_S3_ROOT", &destination_root)],
+        )
+        .success_or("query restored publication receipt");
+    let restored_history = fixture.path("journal-history");
+    fixture
+        .yy_with_env(
+            &[
+                "restore",
+                text(&restored_history),
+                "--revision",
+                &first_revision,
+            ],
+            &[("YINYANG_S3_ROOT", &destination_root)],
+        )
+        .success_or("restore historical revision from isolated object copy");
+    assert_eq!(local_tree(&restored_history).unwrap(), first_tree);
+}
+
 fn inspect(staging: &Path) -> RuntimeStatus {
     runtime()
         .block_on(Runtime::inspect(staging))
@@ -1020,6 +1144,319 @@ fn remote_root(label: &str) -> String {
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     )
+}
+
+struct S3DropGate {
+    address: SocketAddr,
+    intercepted: mpsc::Receiver<Result<(), String>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl S3DropGate {
+    fn start() -> Self {
+        let upstream = upstream_endpoint();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind S3 response-loss gate");
+        let address = listener
+            .local_addr()
+            .expect("S3 response-loss gate address");
+        let intercepted = Arc::new(AtomicBool::new(false));
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(client) = incoming else {
+                    break;
+                };
+                let intercepted = intercepted.clone();
+                let poisoned = poisoned.clone();
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    handle_dropped_s3_response(client, upstream, intercepted, poisoned, sender);
+                });
+            }
+        });
+        Self {
+            address,
+            intercepted: receiver,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn wait_intercepted(&self) {
+        self.intercepted
+            .recv_timeout(Duration::from_secs(90))
+            .expect("S3 gate did not intercept a commit")
+            .unwrap_or_else(|error| panic!("S3 gate commit failed: {error}"));
+    }
+}
+
+impl Drop for S3DropGate {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_dropped_s3_response(
+    mut client: TcpStream,
+    upstream: SocketAddr,
+    intercepted: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
+    sender: mpsc::Sender<Result<(), String>>,
+) {
+    if poisoned.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok((head, request_line, headers)) = read_http_head(&mut client) else {
+        return;
+    };
+    let is_commit = is_head_commit(&request_line) && !intercepted.swap(true, Ordering::SeqCst);
+    if has_expect_continue(&headers) {
+        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let Ok(body) = read_http_body(&mut client, &headers) else {
+        return;
+    };
+    let Ok(mut server) = TcpStream::connect(upstream) else {
+        return;
+    };
+    if server.write_all(&head).is_err() || server.write_all(&body).is_err() {
+        return;
+    }
+    let head_only = request_line
+        .split_whitespace()
+        .next()
+        .is_some_and(|method| method == "HEAD");
+    let Ok(response) = read_http_response(&mut server, head_only) else {
+        return;
+    };
+    if is_commit {
+        if response.status == 200 {
+            poisoned.store(true, Ordering::SeqCst);
+            let _ = sender.send(Ok(()));
+        } else {
+            let _ = sender.send(Err(format!(
+                "conditional head PUT returned HTTP {}, expected 200",
+                response.status
+            )));
+        }
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    }
+    let response = with_connection_close(&response.bytes);
+    let _ = client.write_all(&response);
+    let _ = client.shutdown(Shutdown::Both);
+}
+
+fn read_http_head(
+    stream: &mut TcpStream,
+) -> std::io::Result<(Vec<u8>, String, Vec<(String, String)>)> {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        if bytes.len() == MAX_HTTP_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request head exceeds 64 KiB",
+            ));
+        }
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 HTTP head"))?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default().to_owned();
+    let headers = lines
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    Ok((bytes, request_line, headers))
+}
+
+struct HttpResponse {
+    status: u16,
+    bytes: Vec<u8>,
+}
+
+fn read_http_response(stream: &mut TcpStream, head_only: bool) -> std::io::Result<HttpResponse> {
+    loop {
+        let (head, status_line, headers) = read_http_head(stream)?;
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing HTTP status")
+            })?;
+        let body = if head_only || matches!(status, 204 | 304) {
+            Vec::new()
+        } else {
+            read_http_body(stream, &headers)?
+        };
+        if !(100..200).contains(&status) {
+            let mut response = head;
+            response.extend(body);
+            return Ok(HttpResponse {
+                status,
+                bytes: response,
+            });
+        }
+    }
+}
+
+fn read_http_body(
+    stream: &mut TcpStream,
+    headers: &[(String, String)],
+) -> std::io::Result<Vec<u8>> {
+    if header(headers, "transfer-encoding").is_some_and(|value| value.contains("chunked")) {
+        return read_chunked(stream);
+    }
+    let length = header(headers, "content-length")
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid content length")
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if length > MAX_HTTP_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP body exceeds 16 MiB gate bound",
+        ));
+    }
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn read_chunked(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_line(stream)?;
+        let size = line
+            .split(';')
+            .next()
+            .and_then(|value| usize::from_str_radix(value, 16).ok())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk size")
+            })?;
+        body.extend_from_slice(line.as_bytes());
+        body.extend_from_slice(b"\r\n");
+        if size == 0 {
+            loop {
+                let trailer = read_line(stream)?;
+                body.extend_from_slice(trailer.as_bytes());
+                body.extend_from_slice(b"\r\n");
+                if trailer.is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+        if body.len().saturating_add(size) > MAX_HTTP_BODY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunked HTTP body exceeds 16 MiB gate bound",
+            ));
+        }
+        let mut chunk = vec![0; size + 2];
+        stream.read_exact(&mut chunk)?;
+        body.extend_from_slice(&chunk);
+    }
+}
+
+fn read_line(stream: &mut TcpStream) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte)?;
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return String::from_utf8(line).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 HTTP line")
+            });
+        }
+        if line.len() > MAX_HTTP_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP line exceeds 64 KiB",
+            ));
+        }
+    }
+}
+
+fn with_connection_close(response: &[u8]) -> Vec<u8> {
+    let Some(boundary) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return response.to_vec();
+    };
+    let Ok(head) = std::str::from_utf8(&response[..boundary]) else {
+        return response.to_vec();
+    };
+    let mut output = Vec::with_capacity(response.len() + 19);
+    for line in head.split("\r\n") {
+        if !line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            output.extend_from_slice(line.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    output.extend_from_slice(b"Connection: close\r\n\r\n");
+    output.extend_from_slice(&response[boundary + 4..]);
+    output
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn has_expect_continue(headers: &[(String, String)]) -> bool {
+    header(headers, "expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
+}
+
+fn is_head_commit(request_line: &str) -> bool {
+    let mut parts = request_line.split_whitespace();
+    parts.next() == Some("PUT")
+        && parts.next().is_some_and(|target| {
+            target
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/.yinyang/head"))
+        })
+}
+
+fn upstream_endpoint() -> SocketAddr {
+    let endpoint = std::env::var("YINYANG_S3_ENDPOINT")
+        .expect("YINYANG_S3_ENDPOINT is required by recovery acceptance");
+    endpoint
+        .strip_prefix("http://")
+        .expect("the S3 gate supports the isolated plain-HTTP fixture")
+        .split('/')
+        .next()
+        .expect("S3 endpoint authority")
+        .parse()
+        .expect("S3 endpoint must be an IP socket address")
 }
 
 fn commit_text(commit: CommitId) -> String {
