@@ -586,7 +586,7 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     assert_eq!(before_backup.summary.unknown, 1);
     assert_eq!(
         before_backup.conflict("conflict.txt").local_artifact,
-        Some(conflict_artifact)
+        Some(conflict_artifact.clone())
     );
 
     let backup = fixture.path("sync-backup");
@@ -695,7 +695,7 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
     );
     assert_eq!(
         restored.conflict("conflict.txt").local_artifact.as_deref(),
-        Some(artifact_id.as_str())
+        Some(conflict_artifact.as_str())
     );
     let artifact = restored
         .artifacts
