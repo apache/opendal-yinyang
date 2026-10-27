@@ -24,6 +24,7 @@
 
 mod resolution;
 
+use super::backup::BackupManifest;
 use crate::replica::state::{BaselineNode, BaselineRecord, ConflictRecord, WorkRecord};
 use crate::replica::{Artifact, Conflict, Identity, LocalKind, LocalNode, LocalSnapshot, Replica};
 use crate::sync::{EditId, FileMetadata, NamespaceState, RenameMode, Sync};
@@ -242,6 +243,33 @@ pub struct DirectorySync {
 }
 
 impl DirectorySync {
+    /// Write one quiesced local Sync backup package. The caller must not run a
+    /// second writer; this method holds the existing replica and runtime leases
+    /// while it captures the root and SQLite state.
+    pub async fn backup(&self, output: &Path) -> Result<()> {
+        Sync::validate_restore(self.replica.state(), self.sync.authority().filesystem())
+            .await
+            .map_err(Box::new)?;
+        BackupManifest::create(&self.replica, output).map_err(Box::new)
+    }
+
+    /// Complete an isolated restore after both the state directory and bound
+    /// local root have been copied from one backup package.
+    pub async fn restore(
+        authority: Arc<dyn Authority>,
+        backup: &Path,
+        state: &Path,
+        root: &Path,
+    ) -> Result<Self> {
+        let manifest = BackupManifest::load(backup).map_err(Box::new)?;
+        manifest.copy_to(backup, root, state).map_err(Box::new)?;
+        Sync::validate_restore(state, authority.filesystem()).await?;
+        let replica =
+            Replica::restore(state, root, authority.filesystem(), &manifest).map_err(Box::new)?;
+        let sync = Sync::open(authority, state).await?;
+        Ok(Self { sync, replica })
+    }
+
     pub async fn open(authority: Arc<dyn Authority>, state: &Path) -> Result<Self> {
         let replica = Replica::open(state, authority.filesystem())?;
         let sync = Sync::open(authority, state).await?;

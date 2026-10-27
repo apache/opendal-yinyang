@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::backup::BackupManifest;
 use super::state::{ArtifactRecord, ConflictRecord, InstallPhase, InstallRecord, Store};
 use super::{Error, Result};
 use rustix::fd::OwnedFd;
@@ -277,6 +278,79 @@ impl Replica {
             store,
         };
         replica.recover_incomplete()?;
+        Ok(replica)
+    }
+
+    /// Complete an isolated restore after the state and local root have been
+    /// copied. Journaled installs must be terminal; assigning new identities to
+    /// an interrupted exchange would invent recovery evidence.
+    pub(super) fn restore(
+        state: &Path,
+        root: &Path,
+        filesystem: NodeId,
+        manifest: &BackupManifest,
+    ) -> Result<Self> {
+        let root = std::fs::canonicalize(root).map_err(|e| Error::io("canonicalize", root, e))?;
+        let state =
+            std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;
+        if state.starts_with(&root) {
+            return Err(Error::invalid(format!(
+                "sync state {} must be outside the synchronized root {}",
+                state.display(),
+                root.display()
+            )));
+        }
+        let root_text = root
+            .to_str()
+            .ok_or_else(|| Error::unsupported("local root path is not UTF-8"))?
+            .to_owned();
+        let (root_fd, root_identity) = open_bound_directory(&root, "open restored local root")?;
+        let (state_fd, state_identity) = open_bound_directory(&state, "open restored sync state")?;
+        if root_identity.dev != state_identity.dev {
+            return Err(Error::unsupported(
+                "restored local root and sync state must be on the same filesystem",
+            ));
+        }
+        let lease = acquire_state_lease(&state_fd, &state)?;
+        let mut store = Store::open(&state.join("replica.db"))?;
+        let previous = store
+            .binding()?
+            .ok_or_else(|| Error::invalid("sync state is not initialized; run sync init"))?;
+        if previous.filesystem != filesystem {
+            return Err(Error::invalid(format!(
+                "replica is bound to filesystem {}, not {}",
+                hex(previous.filesystem.as_bytes()),
+                hex(filesystem.as_bytes())
+            )));
+        }
+        if !store.incomplete_installs()?.is_empty() {
+            return Err(Error::invalid(
+                "sync state contains an incomplete local install; finish recovery with the original root and state before taking or restoring the backup",
+            ));
+        }
+        let quarantine_fd = open_quarantine(&state_fd)?;
+        let binding = super::state::Binding {
+            filesystem,
+            root: root_text,
+            root_dev: root_identity.dev,
+            root_ino: root_identity.ino,
+            state_dev: state_identity.dev,
+            state_ino: state_identity.ino,
+        };
+        let mut replica = Self {
+            root,
+            state,
+            filesystem,
+            root_identity,
+            state_identity,
+            root_fd,
+            quarantine_fd,
+            _lease: Some(lease),
+            store,
+        };
+        replica.validate_restore_artifacts()?;
+        manifest.apply(&mut replica, &binding)?;
+        replica.verify_retained_artifacts()?;
         Ok(replica)
     }
 
@@ -1313,7 +1387,7 @@ impl Replica {
         Ok(())
     }
 
-    fn scan_artifact(&self, name: &str) -> Result<BTreeMap<String, LocalNode>> {
+    pub(super) fn scan_artifact(&self, name: &str) -> Result<BTreeMap<String, LocalNode>> {
         let stat = statat(&self.quarantine_fd, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| Error::errno("inspect retained artifact", &self.state, e))?;
         let mut nodes = BTreeMap::new();
