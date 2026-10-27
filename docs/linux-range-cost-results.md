@@ -62,7 +62,7 @@ Raw evidence:
 
 The superseded schema v2 files are
 [baseline](benchmarks/linux-cost-read-only-range-2026-10-27-b8a931b.jsonl),
-[pre-attribute-fix optimized](benchmarks/linux-cost-read-only-range-2026-10-27-a7abd0e.jsonl),
+[pre-attribute-fix optimized](benchmarks/linux-cost-read-only-range-2026-10-27-pre-attribute-fix.jsonl),
 and [attribute-fixed optimized](benchmarks/linux-cost-read-only-range-2026-10-27-af4b591.jsonl).
 
 ## Cold and warm reads
