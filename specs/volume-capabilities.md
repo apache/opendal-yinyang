@@ -1,11 +1,12 @@
 # Volume admission and capabilities
 
 **Status: experimental Managed volume, Mount durability policy, library and
-Linux FUSE frontends.**
-Direct, Sync reconciliation, macOS, and Windows frontends are recognized
-configuration choices but are rejected as unimplemented before startup. The
-Linux FUSE frontend is specified separately in
-[`linux-fuse.md`](linux-fuse.md).
+Linux FUSE frontends, and Linux ordinary-directory Managed Sync.**
+Direct volumes and the macOS and Windows frontends are recognized configuration
+choices but are rejected as unimplemented before startup; read-only Managed Sync
+is rejected as unsupported. The Linux FUSE frontend is specified separately in
+[`linux-fuse.md`](linux-fuse.md), and Managed Sync in
+[`linux-sync.md`](linux-sync.md).
 
 ## Configuration
 
@@ -45,6 +46,12 @@ installing a mount point. It does not claim an OS frontend or offline Sync.
 opens the shared Mount read-write; recovered pending/frozen/error state is
 served through the same handles and reported by flush/fsync rather than hidden.
 
+`access=sync` selects bidirectional ordinary-directory reconciliation and is
+admitted only with `frontend=library` and `read_only: false`. The
+[`sync` CLI](linux-sync.md) connects the authority through `Volume::connect`;
+the file-runtime opener `Volume::open` still rejects Sync volumes because it
+installs recoverable handles instead of reconciling a directory.
+
 ## Negotiation and enforcement
 
 The effective capability set is the intersection of:
@@ -61,8 +68,11 @@ implemented runtime set. A read-only Linux FUSE mount claims read, list,
 stable-identity, pinned-reads, and retained-unlink-read; a writable FUSE mount
 claims the full Managed set, including write, append, truncate, atomic rename,
 remote fsync, and recoverable staging.
-does not claim recoverable staging or any write-side operation. Every other
-frontend claims an empty set and is rejected by its own admission rule.
+A read-only Sync configuration is rejected before startup because
+reconciliation is bidirectional and the flag would otherwise be silently
+ignored while the volume still published writes. Direct volumes and
+macOS/Windows frontends claim an empty set and are rejected by their own
+admission rule.
 
 The storage layer reports whether its primitives can support the Managed
 contract. It does not require raw S3 to implement filesystem rename. Read,

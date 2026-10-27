@@ -3,8 +3,12 @@
 The `yinyang` crate provides one-shot directory transfer over the experimental
 object-storage `yinyang_core::Fs`. The runtime and CLI target native Linux,
 macOS, and Windows, not WebAssembly. License checks cover their native target
-graphs without enabling browser-only certificate bundles. There is no Mount,
-background synchronization, offline reconciliation, or bidirectional Sync.
+graphs without enabling browser-only certificate bundles. This specification
+covers only the finite, caller-driven publication and restoration API: it does
+not define the Managed mount frontend ([Linux FUSE frontend](linux-fuse.md)),
+the durable file-operation runtime ([File-operation runtime](file-runtime.md)),
+or baseline-bound reconciliation ([Sync runtime](sync-runtime.md)). Those
+frontends and runtimes own their own contracts.
 
 ## Publication
 

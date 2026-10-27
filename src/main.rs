@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use yinyang::core::{BackendProfile, CommitId, CommitOutcome, Fs, Revision};
 mod file_cli;
+#[cfg(target_os = "linux")]
+mod sync_cli;
 
 #[derive(Parser)]
 #[command(
@@ -37,12 +39,18 @@ struct Cli {
 enum Command {
     /// Inspect each capability layer and its effective intersection.
     Capabilities,
-    /// Mount a read-only Managed volume through the Linux FUSE frontend.
+    /// Mount a Managed volume through the Linux FUSE frontend.
     Mount { mountpoint: PathBuf },
     /// Operate recoverable file handles (requires --volume).
     File {
         #[command(subcommand)]
         command: file_cli::FileCommand,
+    },
+    /// Reconcile a bound ordinary directory with the Managed volume (requires --volume).
+    #[cfg(target_os = "linux")]
+    Sync {
+        #[command(subcommand)]
+        command: sync_cli::SyncCommand,
     },
     /// Run the authenticated loopback metadata authority with a local SQLite database.
     Serve {
@@ -73,25 +81,34 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("yy: {error}");
             ExitCode::FAILURE
         }
     }
 }
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     opendal::install_default();
     if let Some(path) = &cli.volume {
-        return file_cli::run(path, cli.command).await;
+        return match cli.command {
+            #[cfg(target_os = "linux")]
+            Command::Sync { command } => sync_cli::run(path, command).await,
+            command => {
+                file_cli::run(path, command).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+        };
     }
     match cli.command {
         Command::Mount { .. } => {
-            return Err(
-                "mount requires --volume CONFIG.json with frontend=fuse and read_only=true".into(),
-            );
+            return Err("mount requires --volume CONFIG.json with frontend=fuse".into());
         }
         Command::File { .. } | Command::Capabilities => {
+            return Err("this command requires --volume CONFIG.json".into());
+        }
+        #[cfg(target_os = "linux")]
+        Command::Sync { .. } => {
             return Err("this command requires --volume CONFIG.json".into());
         }
         _ => {}
@@ -120,7 +137,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(listen).await?;
         println!("metadata service listening on {}", listener.local_addr()?);
         yinyang::core::service::serve(listener, service, token).await?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if matches!(cli.command, Command::Create) {
         let fs = Fs::create(operator, profile).await?;
@@ -128,7 +145,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "filesystem ready at revision {}",
             revision(fs.observe_latest().await?.revision())
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     let fs = Fs::open(operator, profile).await?;
     let observed = fs.observe_latest().await?;
@@ -138,6 +155,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Command::File { .. }
         | Command::Capabilities
         | Command::Mount { .. } => unreachable!(),
+        #[cfg(target_os = "linux")]
+        Command::Sync { .. } => unreachable!(),
         Command::Publish {
             source,
             replace,
@@ -195,7 +214,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 fn revision(value: Revision) -> String {
     value

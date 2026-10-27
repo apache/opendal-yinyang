@@ -205,7 +205,7 @@ impl VolumeConfig {
         match self.access {
             Access::Mount if self.read_only => read_only(),
             Access::Mount => managed(),
-            Access::Sync => CapabilitySet::new(),
+            Access::Sync => managed(),
         }
     }
     fn frontend_capabilities(&self) -> CapabilitySet {
@@ -236,21 +236,37 @@ impl VolumeConfig {
         if self.model != Model::Managed {
             return Err(Error::Invalid("Direct volumes are not implemented"));
         }
-        if self.access != Access::Mount {
-            return Err(Error::Invalid("Sync reconciliation is not implemented"));
-        }
-        match self.frontend {
-            Frontend::Library => {}
-            Frontend::Fuse if !cfg!(target_os = "linux") => {
-                return Err(Error::Invalid(
-                    "the fuse frontend is implemented only on Linux",
-                ));
-            }
-            Frontend::Fuse => {}
-            Frontend::Macos | Frontend::Windows => {
-                return Err(Error::Invalid(
-                    "macOS and Windows frontends are not implemented; select library or fuse",
-                ));
+        match self.access {
+            Access::Mount => match self.frontend {
+                Frontend::Library => {}
+                Frontend::Fuse if !cfg!(target_os = "linux") => {
+                    return Err(Error::Invalid(
+                        "the fuse frontend is implemented only on Linux",
+                    ));
+                }
+                Frontend::Fuse => {}
+                Frontend::Macos | Frontend::Windows => {
+                    return Err(Error::Invalid(
+                        "macOS and Windows frontends are not implemented; select library or fuse",
+                    ));
+                }
+            },
+            Access::Sync => {
+                // Managed Sync installs an ordinary local directory itself; it
+                // never projects through an OS mount frontend.
+                if self.frontend != Frontend::Library {
+                    return Err(Error::Invalid(
+                        "managed sync uses the library frontend, not an OS mount frontend",
+                    ));
+                }
+                // The frontend implements bidirectional reconciliation. A
+                // read-only flag would be silently ignored while the volume
+                // still published writes, so refuse it explicitly.
+                if self.read_only {
+                    return Err(Error::Invalid(
+                        "managed sync is bidirectional; read_only must be false for access=sync",
+                    ));
+                }
             }
         }
         match (self.publication, self.service_address) {
@@ -285,6 +301,15 @@ impl Volume {
         operator: Operator,
         token: Option<String>,
     ) -> Result<Self> {
+        // The file runtime installs recoverable handles; it does not own the
+        // ordinary-directory reconciliation of a Sync volume. Admission accepts
+        // `access: sync` for `Volume::connect`, so reject it here before this
+        // opener creates any staging or reads storage.
+        if config.access == Access::Sync {
+            return Err(Error::Invalid(
+                "managed sync volumes are operated through the sync frontend, not the file runtime",
+            ));
+        }
         let capabilities = config.validate(&operator)?;
         let authority = Self::connect(&config, operator, token).await?;
         let runtime = if config.read_only {
