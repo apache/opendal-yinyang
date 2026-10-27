@@ -55,6 +55,60 @@ pub struct Sync {
     inner: Arc<Inner>,
 }
 impl Sync {
+    /// Validate copied Sync and content-staging databases without acquiring a
+    /// writer lease, migrating schemas, or recovering records.
+    pub async fn validate_restore(directory: impl AsRef<Path>, filesystem: NodeId) -> Result<()> {
+        let directory = directory.as_ref().to_owned();
+        Runtime::validate_staging(directory.join("content"), filesystem).await?;
+        let _ = Self::inspect(&directory).await?;
+        tokio::task::spawn_blocking(move || {
+            let path = directory.join("sync.db");
+            let connection = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(Error::local)?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(1))
+                .map_err(Error::local)?;
+            let (profile, bound): (String, Vec<u8>) = connection
+                .query_row("SELECT profile,filesystem FROM binding", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(Error::local)?;
+            if !matches!(profile.as_str(), "yinyang-sync-1" | "yinyang-sync-2") {
+                return Err(Error::Invalid(
+                    "sync journal belongs to another filesystem or profile",
+                ));
+            }
+            if bound != filesystem.as_bytes() {
+                return Err(Error::Invalid(
+                    "sync journal belongs to another filesystem or profile",
+                ));
+            }
+            let mut statement = connection
+                .prepare("SELECT handle FROM edits")
+                .map_err(Error::local)?;
+            let handles = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(Error::local)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::local)?;
+            if handles
+                .iter()
+                .any(|handle| uuid::Uuid::from_slice(handle).is_err())
+            {
+                return Err(Error::local_kind(
+                    ErrorKind::Corrupt,
+                    "sync journal contains an invalid staging handle",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(Error::local)?
+    }
+
     pub async fn open(authority: Arc<dyn Authority>, directory: impl AsRef<Path>) -> Result<Self> {
         let runtime = Runtime::open(authority.clone(), directory.as_ref().join("content")).await?;
         let path = directory.as_ref().join("sync.db");
