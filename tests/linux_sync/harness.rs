@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
@@ -1566,11 +1566,19 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Invalid, "Managed Sync acceptance", message)
 }
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build acceptance runtime")
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    // OpenDAL's reqwest transport is process-wide. Recreating a runtime between
+    // opening the authority and using it can leave pooled connections attached
+    // to a dead executor, which surfaces as intermittent reqwest::send errors
+    // when acceptance tests run concurrently.
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build acceptance runtime")
+    })
 }
 
 fn join(parent: &str, name: &str) -> String {

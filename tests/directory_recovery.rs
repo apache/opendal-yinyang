@@ -37,7 +37,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use support::{Fixture, Publication, Tree, local_tree};
+use support::{Fixture, Publication, Tree, local_tree, runtime};
 
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(90);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
@@ -658,11 +658,7 @@ fn independent_operator(fixture: &Fixture) -> opendal::Operator {
 
 fn delete_content_pack(fixture: &Fixture, marker: &[u8]) {
     let operator = independent_operator(fixture);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
+    runtime().block_on(async {
         let mut lister = operator
             .lister_with("/")
             .recursive(true)
