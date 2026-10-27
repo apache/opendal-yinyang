@@ -48,10 +48,9 @@ enum CommitAction {
     /// Read the complete request, signal interception, and wait before sending
     /// it upstream. This leaves the journal frozen before any commit response.
     HoldBeforeCommit,
-    /// Send the request and consume the successful response before holding it.
-    HoldResponse,
     /// Send the request and consume the successful response, then close the
-    /// client without forwarding that response.
+    /// client without forwarding that response. Subsequent connections fail so
+    /// the client cannot turn the lost response back into a definitive commit.
     DropResponse,
 }
 
@@ -72,10 +71,12 @@ impl S3Gate {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let intercepted = Arc::new(AtomicBool::new(false));
+        let poisoned = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let thread_release = release.clone();
         let thread_stop = stop.clone();
         let thread_intercepted = intercepted.clone();
+        let thread_poisoned = poisoned.clone();
         let thread = thread::spawn(move || {
             for incoming in listener.incoming() {
                 if thread_stop.load(Ordering::SeqCst) {
@@ -86,9 +87,18 @@ impl S3Gate {
                 };
                 let release = thread_release.clone();
                 let intercepted = thread_intercepted.clone();
+                let poisoned = thread_poisoned.clone();
                 let sender = sender.clone();
                 thread::spawn(move || {
-                    handle_connection(client, upstream, action, release, intercepted, sender);
+                    handle_connection(
+                        client,
+                        upstream,
+                        action,
+                        release,
+                        intercepted,
+                        poisoned,
+                        sender,
+                    );
                 });
             }
         });
@@ -137,8 +147,12 @@ fn handle_connection(
     action: CommitAction,
     release: Arc<(Mutex<bool>, Condvar)>,
     intercepted: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
     sender: mpsc::Sender<()>,
 ) {
+    if poisoned.load(Ordering::SeqCst) {
+        return;
+    }
     let Ok((head, request_line, headers)) = read_http_head(&mut client) else {
         return;
     };
@@ -152,10 +166,6 @@ fn handle_connection(
     let Ok(body) = read_http_body(&mut client, &headers) else {
         return;
     };
-    if !matches!(action, CommitAction::HoldBeforeCommit) {
-        // Continue transparently when the gate is configured to observe the
-        // response instead of holding the request.
-    }
     let mut request = head;
     request.extend_from_slice(&body);
     if matches!(action, CommitAction::HoldBeforeCommit) {
@@ -175,8 +185,10 @@ fn handle_connection(
         let _ = sender.send(());
     }
     match action {
-        CommitAction::HoldBeforeCommit | CommitAction::DropResponse => {}
-        CommitAction::HoldResponse => wait_release(&release),
+        CommitAction::HoldBeforeCommit => {}
+        CommitAction::DropResponse => {
+            poisoned.store(true, Ordering::SeqCst);
+        }
     }
     let _ = client.shutdown(Shutdown::Both);
 }
