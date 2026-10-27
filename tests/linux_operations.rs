@@ -1125,7 +1125,7 @@ impl Drop for UserUnits {
             let _ = fs::remove_file(overlay);
         }
         if self.created_config_root {
-            let _ = fs::remove_dir(&self.environment.parent().unwrap());
+            let _ = fs::remove_dir(self.environment.parent().unwrap());
         }
         if self.created_unit_directory {
             let _ = fs::remove_dir(&self.directory);

@@ -198,22 +198,23 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
         None::<String>,
     );
 
-    let environment = storage_environment(&config);
-    let environment_ready = environment.is_ok();
+    let (environment_status, environment_detail, environment_remediation) =
+        match storage_environment(&config) {
+            Ok(detail) => (Health::Pass, detail, None),
+            Err(detail) => (
+                Health::ActionRequired,
+                detail,
+                Some(
+                    "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain, and provide the service token when publication=service",
+                ),
+            ),
+        };
+    let environment_ready = environment_status == Health::Pass;
     report.push(
         "environment",
-        if environment.is_ok() {
-            Health::Pass
-        } else {
-            Health::ActionRequired
-        },
-        environment
-            .as_ref()
-            .map(|detail| detail.clone())
-            .unwrap_or_else(|error| error.clone()),
-        environment.err().map(|_| {
-            "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain, and provide the service token when publication=service"
-        }),
+        environment_status,
+        environment_detail,
+        environment_remediation,
     );
 
     check_fuse(&config, &mut report);
