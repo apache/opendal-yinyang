@@ -61,6 +61,13 @@ expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
 are current behavior boundaries, not benchmark assumptions.
 
+`fuse_mount_ready` measures from before spawning `yy mount` until
+`/proc/mounts` reports `fuse.yinyang`, including daemon process I/O and proxy
+traffic. `fuse_restart_mount_ready` measures the same interval for the
+replacement mount. `fuse_restart_cold_open_range_read` starts only after that
+replacement mount is ready, so remount startup is not hidden in the restart-read
+latency.
+
 ## Evidence
 
 Each JSONL record includes:

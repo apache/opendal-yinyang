@@ -418,9 +418,7 @@ fn run_fuse_matrix(
         &format!("fuse-{}-{}", publication.as_str(), scale.as_str()),
     );
     fs::create_dir(&mountpoint).expect("create benchmark mountpoint");
-    let mounted_at = Instant::now();
-    let mut mounted = FuseMount::start(&fixture, &config, &mountpoint);
-    let mount_ready_ms = mounted_at.elapsed().as_secs_f64() * 1000.0;
+    let (mut mounted, mount_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
     let dataset = Dataset {
         kind: "single_large_file".to_owned(),
         files: 1,
@@ -436,10 +434,10 @@ fn run_fuse_matrix(
         publication,
         scale,
         dataset.clone(),
-        "yy mount process reported the fuse.yinyang mount ready",
-        vec![mount_ready_ms],
-        IoSnapshot::default(),
-        NetworkSnapshot::default(),
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
         vec![],
         space_snapshot(&fixture, None, None, Some(&staging)),
         vec!["mount type=fuse.yinyang".to_owned()],
@@ -539,7 +537,21 @@ fn run_fuse_matrix(
     );
 
     mounted.unmount();
-    let mut restarted = FuseMount::start(&fixture, &config, &mountpoint);
+    let (mut restarted, restart_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_restart_mount_ready",
+        publication,
+        scale,
+        dataset.clone(),
+        "interval begins before the replacement yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["replacement mount type=fuse.yinyang".to_owned()],
+    );
     let restart = measure_mount_operation(&meter, restarted.pid(), || {
         let file = File::open(&large).expect("open after FUSE restart");
         let verify_offset = (size as u64 - RANGE_BYTES as u64) / 2 - RANGE_BYTES as u64;
@@ -560,7 +572,7 @@ fn run_fuse_matrix(
         publication,
         scale,
         dataset,
-        "new yy mount process, then cold open and 4 KiB range read",
+        "interval starts after the replacement mount is ready, then cold-opens and reads 4 KiB",
         vec![restart.latency_ms],
         restart.io,
         restart.network,
@@ -587,7 +599,7 @@ fn run_concurrent_matrix(
         &format!("concurrent-{}-{}", publication.as_str(), scale.as_str()),
     );
     fs::create_dir(&mountpoint).expect("create concurrent mountpoint");
-    let mut mounted = FuseMount::start(&fixture, &config, &mountpoint);
+    let (mut mounted, _) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
     let writers = scale.writers();
     let writer_bytes = 256 * 1024;
     let dataset = Dataset {
@@ -862,7 +874,14 @@ struct FuseMount {
 }
 
 impl FuseMount {
-    fn start(fixture: &Fixture, config: &Path, mountpoint: &Path) -> Self {
+    fn start(
+        fixture: &Fixture,
+        config: &Path,
+        mountpoint: &Path,
+        network: &NetworkMeter<'_>,
+    ) -> (Self, Measurement<()>) {
+        let network_before = network.snapshot();
+        let started = Instant::now();
         let mut command =
             fixture.yy_command(&["--volume", path_str(config), "mount", path_str(mountpoint)]);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -876,10 +895,21 @@ impl FuseMount {
             mountpoint: mountpoint.to_path_buf(),
             finished: false,
         };
+        let mut io = read_proc_io(mounted.pid());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if mount_type(mountpoint).as_deref() == Some("fuse.yinyang") {
-                return mounted;
+                let current = read_proc_io(mounted.pid());
+                if current != IoSnapshot::default() {
+                    io = current;
+                }
+                let measurement = Measurement {
+                    value: (),
+                    latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    io,
+                    network: network.snapshot().since(network_before),
+                };
+                return (mounted, measurement);
             }
             if let Some(status) = mounted.child.try_wait().expect("wait for yy mount") {
                 let stderr = mounted.join_stderr();
@@ -894,6 +924,10 @@ impl FuseMount {
                     "yy mount did not reach fuse.yinyang within 60s:\n{}",
                     String::from_utf8_lossy(&stderr)
                 );
+            }
+            let current = read_proc_io(mounted.pid());
+            if current != IoSnapshot::default() {
+                io = current;
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -1095,7 +1129,7 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
     bytes
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 struct IoSnapshot {
     rchar: u64,
     wchar: u64,
