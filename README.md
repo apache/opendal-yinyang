@@ -95,6 +95,10 @@ target/debug/yy publication retry UUID --state ./publication-state
 target/debug/yy publication export UUID --state ./publication-state --destination ./original
 ```
 
+`--state DIR` must be outside `SOURCE`; the journal directory cannot be the
+source or one of its descendants. Keep the journal database and WAL files
+together and outside mounted or synchronized source trees.
+
 `publication inspect` reads only local state and needs no storage credentials.
 `retry` and `export` never scan `SOURCE`; they use the original frozen request
 and prepared manifest. Retrying a known identity with `publish` is rejected
