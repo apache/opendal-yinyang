@@ -704,35 +704,62 @@ async fn journal_inspection_rejects_a_malformed_frozen_identity() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn journal_rejects_state_inside_a_symlinked_source_before_publication() {
+async fn journal_rejects_canonical_source_containing_state_before_publication() {
     use std::os::unix::fs::symlink;
 
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("source");
-    source(&input).await;
-    let alias = temp.path().join("source-alias");
-    symlink(&input, &alias).unwrap();
-    let state = input.join(".state");
-    let backend = TestBackend::default();
-    let fs = filesystem(&backend).await;
-    let observed = fs.observe_latest().await.unwrap();
-    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
-    let before = backend.state.lock().unwrap().objects.len();
-    let id = CommitId::generate();
-    assert_eq!(
-        journal
+    for (layout, equal) in [("inside", false), ("equal", true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("source");
+        source(&input).await;
+        let alias = temp.path().join("source-alias");
+        symlink(&input, &alias).unwrap();
+        let state = if equal {
+            input.clone()
+        } else {
+            input.join(".state")
+        };
+        let backend = TestBackend::default();
+        let fs = filesystem(&backend).await;
+        let observed = fs.observe_latest().await.unwrap();
+        let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+        for (source_kind, source_path) in [("direct", &input), ("alias", &alias)] {
+            let before = backend.state.lock().unwrap().objects.len();
+            let id = CommitId::generate();
+            let error = journal
+                .prepare(&observed, source_path, id)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                RuntimeErrorKind::Invalid,
+                "{layout} {source_kind}: {error}"
+            );
+            assert!(
+                error.to_string().contains("is inside source"),
+                "{layout} {source_kind} did not fail the containment check: {error}"
+            );
+            assert!(journal.status(id).await.unwrap().is_none());
+            assert_eq!(
+                backend.state.lock().unwrap().objects.len(),
+                before,
+                "{layout} {source_kind} uploaded or published directory content"
+            );
+        }
+
+        // Preserve the scanner's existing symlink-root rejection when the
+        // journal itself does not trigger the containment guard.
+        let outside = temp.path().join("outside-state");
+        let outside_journal = DirectoryJournal::open(&fs, &outside).await.unwrap();
+        let before = backend.state.lock().unwrap().objects.len();
+        let id = CommitId::generate();
+        let error = outside_journal
             .prepare(&observed, &alias, id)
             .await
-            .unwrap_err()
-            .kind(),
-        RuntimeErrorKind::Invalid
-    );
-    assert!(journal.status(id).await.unwrap().is_none());
-    assert_eq!(
-        backend.state.lock().unwrap().objects.len(),
-        before,
-        "the rejected layout must not upload or publish directory content"
-    );
+            .unwrap_err();
+        assert_eq!(error.kind(), RuntimeErrorKind::Unsupported);
+        assert!(outside_journal.status(id).await.unwrap().is_none());
+        assert_eq!(backend.state.lock().unwrap().objects.len(), before);
+    }
 }
 
 #[tokio::test]
