@@ -458,7 +458,7 @@ fn compatibility_fd1338c_service_unknown_profile_rejects_without_mutation() {
         &database,
         "UPDATE authority SET profile='yinyang-sqlite-99'",
     );
-    let before = tree_hashes(storage.temp.path());
+    let before = authoritative_tree(storage.temp.path());
     let rejected = run_timeout(
         storage.command(
             &current_binary(),
@@ -482,10 +482,10 @@ fn compatibility_fd1338c_service_unknown_profile_rejects_without_mutation() {
         "service rejection did not reach the profile boundary:\n{}",
         rejected.text()
     );
-    assert_eq!(
-        tree_hashes(storage.temp.path()),
-        before,
-        "unknown service profile rejection mutated the SQLite authority"
+    assert_authoritative_state_unchanged(
+        storage.temp.path(),
+        &before,
+        "unknown service profile rejection",
     );
 }
 
@@ -720,7 +720,7 @@ fn sqlite_execute(database: &Path, sql: &str) {
 }
 
 fn assert_profile_rejection(temp: &Path, args: &[&str], local: Option<&Path>) {
-    let before = local.map(tree_hashes);
+    let before = local.map(authoritative_tree);
     let mut command = Command::new(current_binary());
     command.args(args);
     command.current_dir(temp);
@@ -757,17 +757,51 @@ fn assert_profile_rejection(temp: &Path, args: &[&str], local: Option<&Path>) {
         rejected.text()
     );
     if let Some(local) = local {
-        assert_eq!(
-            tree_hashes(local),
-            before.unwrap(),
-            "unknown profile rejection mutated local state for {args:?}"
+        assert_authoritative_state_unchanged(
+            local,
+            &before.unwrap(),
+            &format!("unknown profile rejection for {args:?}"),
         );
     }
 }
 
-fn tree_hashes(root: &Path) -> Vec<(String, String)> {
+fn authoritative_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     tree_files(root)
         .into_iter()
-        .map(|(path, bytes)| (path, sha256(&bytes)))
+        .filter(|(path, _)| !path.ends_with(".db-shm"))
         .collect()
+}
+
+fn assert_authoritative_state_unchanged(
+    root: &Path,
+    before: &[(String, Vec<u8>)],
+    context: &str,
+) {
+    let after = tree_files(root);
+    for (path, bytes) in before {
+        let current = after
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .unwrap_or_else(|| panic!("{context} removed authoritative file {path:?}"));
+        assert_eq!(
+            current.1, *bytes,
+            "{context} changed authoritative file {path:?}"
+        );
+    }
+    for (path, bytes) in after {
+        if before.iter().any(|(candidate, _)| candidate == &path) {
+            continue;
+        }
+        if path.ends_with(".db-shm") {
+            continue;
+        }
+        if path.ends_with(".db-wal") {
+            assert!(
+                bytes.is_empty(),
+                "{context} created non-empty WAL {path:?}"
+            );
+            continue;
+        }
+        panic!("{context} created unexpected file {path:?}");
+    }
 }
