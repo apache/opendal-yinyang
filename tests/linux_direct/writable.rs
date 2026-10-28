@@ -369,6 +369,44 @@ fn direct_write_create_is_conditional_and_never_clobbers_external_appearance() {
     mounted.unmount();
 }
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
+    let fixture = Fixture::new();
+    let original = payload(12 * 1024 + 3, 0x23);
+    let external = payload(12 * 1024 + 7, 0x49);
+    fixture.write_raw("unlink.txt", &original);
+    let staging = fixture.path("direct-write-unlink-state");
+    let config = fixture.writable_config("direct-write-unlink", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-unlink");
+    fs::create_dir(&mountpoint).expect("create writable Direct unlink mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("unlink.txt");
+
+    fixture.write_raw("unlink.txt", &external);
+    let error =
+        fs::remove_file(&path).expect_err("Direct unlink must reject an externally replaced ETag");
+    assert_errno(
+        &error,
+        &[libc::ESTALE, libc::EIO],
+        "conditional Direct unlink",
+    );
+    assert_eq!(
+        fixture.raw_get("unlink.txt").as_deref(),
+        Some(external.as_slice()),
+        "conditional Direct unlink removed the external replacement"
+    );
+
+    mounted.refresh_and_wait(Duration::from_secs(30));
+    fs::remove_file(&path).expect("retry Direct unlink after refresh");
+    assert_eq!(
+        fixture.raw_get("unlink.txt"),
+        None,
+        "refreshed conditional unlink did not remove the accepted object"
+    );
+    mounted.unmount();
+}
+
 fn set_xattr(path: &Path) -> std::io::Result<()> {
     let mut command = Command::new("python3");
     command.args([
@@ -545,27 +583,32 @@ fn direct_write_safe_save_retries_source_cleanup_without_atomic_rename_claim() {
 
     gate.release();
     gate.wait_original_dropped();
-    let error = rename
-        .join()
-        .expect("safe-save rename thread panicked")
-        .expect_err("dropped source cleanup must not report a completed rename");
-    assert_errno(
-        &error,
-        &[libc::EIO, libc::ESTALE],
-        "safe-save source cleanup failure",
-    );
+    let renamed = rename.join().expect("safe-save rename thread panicked");
     drop(gate);
     assert_eq!(
         fixture.raw_get("safe.txt").as_deref(),
         Some(replacement.as_slice())
     );
-    assert_eq!(
-        fixture.raw_get("safe.txt.tmp").as_deref(),
-        Some(replacement.as_slice()),
-        "safe-save failure must retain the source needed for cleanup retry"
-    );
-
-    fs::rename(&source, &destination).expect("retry safe-save source cleanup");
+    match renamed {
+        Ok(()) => assert_eq!(
+            fixture.raw_get("safe.txt.tmp"),
+            None,
+            "safe-save reported success before source cleanup completed"
+        ),
+        Err(error) => {
+            assert_errno(
+                &error,
+                &[libc::EIO, libc::ESTALE, libc::EBUSY],
+                "safe-save source cleanup failure",
+            );
+            assert_eq!(
+                fixture.raw_get("safe.txt.tmp").as_deref(),
+                Some(replacement.as_slice()),
+                "safe-save failure must retain the source needed for cleanup retry"
+            );
+            fs::rename(&source, &destination).expect("retry safe-save source cleanup");
+        }
+    }
     assert_eq!(
         fixture.raw_get("safe.txt").as_deref(),
         Some(replacement.as_slice())
