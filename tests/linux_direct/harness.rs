@@ -181,6 +181,7 @@ impl Fixture {
     }
 
     pub fn operator(&self) -> opendal::Operator {
+        opendal::install_default();
         let mut config = std::env::vars()
             .filter_map(|(key, value)| {
                 key.strip_prefix("YINYANG_S3_")
