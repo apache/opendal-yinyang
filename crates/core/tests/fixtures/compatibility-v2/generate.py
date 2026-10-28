@@ -230,11 +230,7 @@ def transaction_fixture(descriptor: bytes, digest_value: bytes) -> tuple[bytes, 
 
 def object_fixtures() -> None:
     root_node = node_bytes(ROOT, 1)
-    author_id = bytes([0x88]) * 16
-    old_object = OBJECT
-    globals()["OBJECT"] = author_id
     nodes_page = index_page([(ROOT, root_node)])
-    globals()["OBJECT"] = old_object
 
     pack = bytearray()
     snapshot_offset = 0
@@ -277,7 +273,7 @@ def object_fixtures() -> None:
 
     write(
         "object-unknown-head.bin",
-        head(packed_ref(0, b""), magic=b"YYHEAD03"),
+        head(packed_ref(0, b"x"), magic=b"YYHEAD03"),
     )
 
 

@@ -522,6 +522,12 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             "metadata-service authority required",
         ));
     }
+    if bytes.starts_with(b"YYSERV") {
+        return Err(Error::unsupported(
+            "open filesystem",
+            "unknown service binding profile",
+        ));
+    }
     if bytes.starts_with(b"YYHEAD01") {
         return Err(Error::unsupported(
             "open filesystem",
