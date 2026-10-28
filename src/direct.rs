@@ -228,6 +228,7 @@ impl DirectNamespace {
         Ok(Self { operator })
     }
 
+    #[cfg(test)]
     fn unchecked(operator: Operator) -> Self {
         Self { operator }
     }

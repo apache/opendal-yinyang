@@ -184,8 +184,8 @@ staging database, metadata database, publication lease or remote object.
 - LIST pages are not an atomic cross-page snapshot.
 - Directory markers, invalid components and file-prefix collisions reject the
   complete view rather than being renamed by mutating storage.
-- Empty components are not remapped because no bounded Linux component can
-  represent them without changing path depth.
+- The current version rejects empty components; it does not define an
+  additional mapping that changes path depth.
 - Direct does not provide rename-stable identity, hard links, symlinks, xattrs,
   distributed locks, cross-client transactions, version browsing, garbage
   collection or write conflict resolution.
