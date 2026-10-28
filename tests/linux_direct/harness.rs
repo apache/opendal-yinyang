@@ -238,10 +238,10 @@ impl Fixture {
 
     pub fn spawn_writable_mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
         let command = self.mount_command(config, mountpoint);
-        Mounted::spawn_with_policy(command, mountpoint, false)
+        Mounted::spawn_writable(command, mountpoint)
     }
 
-    fn mount_command(&self, config: &Path, mountpoint: &Path) -> Command {
+    pub fn mount_command(&self, config: &Path, mountpoint: &Path) -> Command {
         self.yy_command(&[
             "--volume",
             config.to_str().expect("Direct config path is UTF-8"),
@@ -272,6 +272,10 @@ pub struct Mounted {
 impl Mounted {
     pub fn spawn(command: Command, mountpoint: &Path) -> Self {
         Self::spawn_with_policy(command, mountpoint, true)
+    }
+
+    pub fn spawn_writable(command: Command, mountpoint: &Path) -> Self {
+        Self::spawn_with_policy(command, mountpoint, false)
     }
 
     fn spawn_with_policy(mut command: Command, mountpoint: &Path, read_only: bool) -> Self {

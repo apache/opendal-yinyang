@@ -18,9 +18,10 @@
 //! Accepted writable Direct admission and native mutation scenarios.
 
 use crate::harness::{
-    Fixture, RequestCounter, assert_errno, effective_capabilities, local_paths, path_text, payload,
-    run_timeout,
+    Fixture, Mounted, RequestCounter, assert_errno, effective_capabilities, local_paths, path_text,
+    payload, run_timeout,
 };
+use crate::s3_gate::{CommitAction, S3Gate};
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::unistd::{chown, getgid, getuid};
 use std::collections::BTreeSet;
@@ -30,6 +31,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::thread;
 use std::time::Duration;
 
 const REQUIRED_WRITABLE_CAPABILITIES: [&str; 8] = [
@@ -429,4 +431,92 @@ fn direct_write_rejects_unsupported_posix_operations_without_storage_effect() {
         inventory,
         "unsupported Direct operations changed backend objects"
     );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_safe_save_retries_source_cleanup_without_atomic_rename_claim() {
+    let fixture = Fixture::new();
+    fixture.write_raw("safe.txt", b"old destination");
+    let replacement = payload(96 * 1024 + 13, 0x5a);
+    let staging = fixture.path("direct-write-safe-save-state");
+    let config = fixture.writable_config("direct-write-safe-save", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-safe-save");
+    fs::create_dir(&mountpoint).expect("create writable Direct safe-save mountpoint");
+
+    let suffix = format!("/{}/safe.txt.tmp", fixture.root());
+    let gate = S3Gate::start_for_path(CommitAction::DropBeforeCommit, "DELETE", suffix);
+    let mut command = fixture.mount_command(&config, &mountpoint);
+    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let mounted = Mounted::spawn_writable(command, &mountpoint);
+    let source = mounted.mountpoint().join("safe.txt.tmp");
+    let destination = mounted.mountpoint().join("safe.txt");
+    let mut temporary = File::create(&source).expect("create safe-save temporary file");
+    temporary
+        .write_all(&replacement)
+        .expect("write safe-save temporary bytes");
+    temporary
+        .sync_all()
+        .expect("publish safe-save temporary object");
+    drop(temporary);
+    assert_eq!(
+        fixture.raw_get("safe.txt.tmp").as_deref(),
+        Some(replacement.as_slice())
+    );
+
+    let source_for_thread = source.clone();
+    let destination_for_thread = destination.clone();
+    let rename = thread::spawn(move || fs::rename(source_for_thread, destination_for_thread));
+    let intercepted = gate.wait_intercepted();
+    assert_eq!(intercepted.method, "DELETE");
+    assert!(
+        intercepted.target.contains("/safe.txt.tmp"),
+        "safe-save cleanup did not target the temporary source: {}",
+        intercepted.target
+    );
+    assert!(
+        intercepted.header("if-match").is_some(),
+        "safe-save source cleanup omitted its conditional ETag: {:?}",
+        intercepted.headers
+    );
+    fixture.wait_raw_bytes("safe.txt", &replacement, Duration::from_secs(30));
+    assert_eq!(
+        fixture.raw_get("safe.txt.tmp").as_deref(),
+        Some(replacement.as_slice()),
+        "held source cleanup must leave the published temporary object available for retry"
+    );
+
+    gate.release();
+    gate.wait_original_dropped();
+    let error = rename
+        .join()
+        .expect("safe-save rename thread panicked")
+        .expect_err("dropped source cleanup must not report a completed rename");
+    assert_errno(
+        &error,
+        &[libc::EIO, libc::ESTALE],
+        "safe-save source cleanup failure",
+    );
+    drop(gate);
+    assert_eq!(
+        fixture.raw_get("safe.txt").as_deref(),
+        Some(replacement.as_slice())
+    );
+    assert_eq!(
+        fixture.raw_get("safe.txt.tmp").as_deref(),
+        Some(replacement.as_slice()),
+        "safe-save failure must retain the source needed for cleanup retry"
+    );
+
+    fs::rename(&source, &destination).expect("retry safe-save source cleanup");
+    assert_eq!(
+        fixture.raw_get("safe.txt").as_deref(),
+        Some(replacement.as_slice())
+    );
+    assert_eq!(
+        fixture.raw_get("safe.txt.tmp"),
+        None,
+        "safe-save retry did not remove the conditional source object"
+    );
+    mounted.unmount();
 }
