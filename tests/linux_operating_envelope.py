@@ -569,12 +569,15 @@ class Workload:
 
         deadline = time.monotonic() + self.fsync_retry_seconds
         interval = self.fsync_retry_interval
-        while not self.stop.is_set():
+        # Drain an already-dispatched fsync even if the phase ends normally.
+        # A normal phase stop must not turn a recoverable in-flight publication
+        # into an artificial deadline failure.
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            self.stop.wait(min(interval, remaining))
-            if self.stop.is_set():
+            time.sleep(min(interval, remaining))
+            if time.monotonic() >= deadline:
                 break
             with self.lock:
                 self.fsync_retry_attempts += 1

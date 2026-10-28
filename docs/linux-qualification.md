@@ -69,8 +69,10 @@ The separate real-Amazon-S3 entrypoint run used source
 `f629ed207cce81f196b55915bdd1154a3269a79a` and debug `yy` SHA-256
 `3dfe4c573b2d3311e07d4bf7c3be225a21d8541eec6fc7dc02262638ce06b9a0`.
 It passed the writable remount entrypoint and finite Direct Sync entrypoint
-through provider-default HTTPS. This is source-specific evidence; the final
-`f74fecfa837de4bd8f909f571f2c8860ceeb65f1` candidate was not rerun on AWS.
+through provider-default HTTPS. This is source-specific Direct entrypoint
+evidence; the final `f74fecfa837de4bd8f909f571f2c8860ceeb65f1` candidate was
+not rerun for these Direct entrypoints. The separate Managed operating-envelope
+run at `f74` is not this Direct entrypoint record.
 
 ## Matrix
 
@@ -80,10 +82,12 @@ The initial qualified combination is:
 - one local systemd user manager on a single host;
 - object publication or authenticated single-host loopback service publication;
 - Managed Mount and finite ordinary-directory Managed Sync;
-- isolated MinIO-compatible Silo for Managed, read-only and conditional-writable
-  Direct Mount, and finite Direct Sync;
-- read-only Direct and conditional mutation primitives on the explicitly
-  recorded Amazon S3 buckets;
+- isolated MinIO-compatible Silo for deterministic fixture coverage of Managed,
+  read-only and conditional-writable Direct Mount, and finite Direct Sync; this
+  is not qualified conditional-DELETE backend coverage because Silo ignores
+  `DELETE If-Match`;
+- Amazon S3 as the independently qualified backend for read-only Direct and
+  conditional mutation primitives on the explicitly recorded buckets;
 - installed, stopped binary replacement only for the exact producer and target
   source pair recorded by installed-prefix evidence; arbitrary upgrade and
   downgrade remain unsupported.
@@ -99,9 +103,10 @@ conditional-DELETE provider certification. The separate source-pinned Amazon
 S3 entrypoint evidence covers writable remount and finite Direct Sync at
 `f629ed2`, while the Amazon S3 primitive record covers read-only Direct and raw
 conditional requests. Neither record claims the final `f74` candidate was rerun
-on AWS. Other S3-compatible services remain outside the matrix unless they
-satisfy exact recursive LIST, conditional ETag mutation and the tested
-version/range behavior.
+for those Direct entrypoints; the separate Managed operating-envelope run at
+`f74` is not part of that claim. Other S3-compatible services remain outside the
+matrix unless they satisfy exact recursive LIST, conditional ETag mutation and
+the tested version/range behavior.
 
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed

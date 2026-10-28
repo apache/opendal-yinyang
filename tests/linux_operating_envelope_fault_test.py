@@ -24,6 +24,7 @@ import errno
 import importlib.util
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -61,8 +62,14 @@ class FsyncRetryFaultTest(unittest.TestCase):
         module, workload = self.make_workload(retry_seconds=0.1)
         fsync_attempts = 0
         retry_completed = threading.Event()
+        pwrite_calls = 0
+        pwrite_descriptor = None
+        fsync_descriptors = []
 
         def fake_pwrite(descriptor: int, data: bytes, offset: int) -> int:
+            nonlocal pwrite_calls, pwrite_descriptor
+            pwrite_calls += 1
+            pwrite_descriptor = descriptor
             self.assertGreater(descriptor, 2)
             self.assertEqual(offset, 0)
             return len(data)
@@ -70,10 +77,11 @@ class FsyncRetryFaultTest(unittest.TestCase):
         def fake_fsync(descriptor: int) -> None:
             nonlocal fsync_attempts
             fsync_attempts += 1
+            fsync_descriptors.append(descriptor)
             if fsync_attempts == 1:
+                workload.stop.set()
                 raise OSError(errno.EIO, "injected publication retry")
             retry_completed.set()
-            workload.stop.set()
 
         with (
             patch.object(module.os, "pwrite", side_effect=fake_pwrite),
@@ -84,6 +92,9 @@ class FsyncRetryFaultTest(unittest.TestCase):
             summary = workload.finish()
 
         self.assertEqual(fsync_attempts, 2)
+        self.assertEqual(pwrite_calls, 1)
+        self.assertIsNotNone(pwrite_descriptor)
+        self.assertTrue(all(fd == pwrite_descriptor for fd in fsync_descriptors))
         self.assertEqual(summary["fatal"], [])
         self.assertEqual(summary["writers"]["fsync_errors"], 1)
         self.assertEqual(summary["writers"]["fsync_retry_attempts"], 1)
@@ -95,18 +106,22 @@ class FsyncRetryFaultTest(unittest.TestCase):
     def test_permanent_fsync_failure_is_fatal(self) -> None:
         module, workload = self.make_workload(retry_seconds=0.02)
         first_fsync = threading.Event()
-        retry_attempted = threading.Event()
         fsync_attempts = 0
+        pwrite_calls = 0
+        pwrite_descriptor = None
+        fsync_descriptors = []
 
         def fake_pwrite(descriptor: int, data: bytes, offset: int) -> int:
+            nonlocal pwrite_calls, pwrite_descriptor
+            pwrite_calls += 1
+            pwrite_descriptor = descriptor
             return len(data)
 
         def fake_fsync(descriptor: int) -> None:
             nonlocal fsync_attempts
             fsync_attempts += 1
+            fsync_descriptors.append(descriptor)
             first_fsync.set()
-            if fsync_attempts >= 2:
-                retry_attempted.set()
             raise OSError(errno.EIO, "injected permanent publication failure")
 
         with (
@@ -115,11 +130,15 @@ class FsyncRetryFaultTest(unittest.TestCase):
         ):
             workload.start()
             self.assertTrue(first_fsync.wait(1), "fsync fault was not reached")
-            self.assertTrue(
-                retry_attempted.wait(1), "fsync retry was not attempted"
-            )
+            deadline = time.monotonic() + 1
+            while not workload.fatal and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertNotEqual(workload.fatal, [], "writer did not reach its fatal deadline")
             summary = workload.finish()
 
+        self.assertEqual(pwrite_calls, 1)
+        self.assertIsNotNone(pwrite_descriptor)
+        self.assertTrue(all(fd == pwrite_descriptor for fd in fsync_descriptors))
         self.assertNotEqual(summary["fatal"], [])
         self.assertGreater(summary["writers"]["fsync_errors"], 0)
         self.assertGreater(summary["writers"]["fsync_retry_attempts"], 0)
