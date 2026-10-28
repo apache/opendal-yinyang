@@ -105,7 +105,18 @@ Cold and bounded-capacity behavior remains visible:
 
 The fill batches include units already read by earlier phases. The optimized
 full-file random batch exceeds the 16 MiB payload bound and still issues 2.76
-requests per read; this is not an all-file cache claim.
+requests per read; this is not an all-file cache claim. Its complete observed
+distribution was:
+
+| 32 MiB over-capacity metric | Baseline | Bounded reuse |
+| --- | ---: | ---: |
+| p50 | 278.089 ms | 73.914 ms |
+| p95 | 323.073 ms | 186.319 ms |
+| max | 421.438 ms | 737.078 ms |
+
+The observed p95 improved by 42.3%, while the worst single sample regressed from
+421.438 ms to 737.078 ms. The 288-sample batch exposes a tail tradeoff but does
+not establish systematic tail worsening.
 
 The boundary "cold" row also reuses proof nodes from the earlier same-version
 reads. Its optimized request count therefore fell from 15/17 to 10/12 for the
@@ -135,7 +146,8 @@ claim that exactly 16 MiB was resident in cache.
 
 Cold open/read and restart latencies were effectively unchanged. Fresh
 descriptor reads correctly missed and showed one-sample p50 noise in both
-directions. Over-capacity random access retained partial benefit but remained
+directions. Over-capacity random access retained partial benefit and lower p95,
+but its observed maximum increased to 737.078 ms from 421.438 ms while remaining
 remote-bound. First reads after eviction remained full storage reads.
 
 Previously verified cached bytes can outlive source-descriptor release until
