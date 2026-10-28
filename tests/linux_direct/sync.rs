@@ -526,7 +526,7 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
     );
     fs::write(local.join("uncertain.txt"), &first).expect("write first Direct Sync local edit");
 
-    let mut command = {
+    let command = {
         let mut command = fixture.yy_command(&["--volume", path_text(&config), "sync", "run"]);
         command.env("YINYANG_S3_ENDPOINT", &endpoint);
         command
