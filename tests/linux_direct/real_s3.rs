@@ -1102,9 +1102,10 @@ fn direct_amazon_s3_conditional_primitives_unversioned() {
     eprintln!("conditional create collision: {duplicate_error}");
     assert_eq!(fixture.aws.get(&key, None, None).0, initial);
 
+    let noncurrent_etag = "\"00000000000000000000000000000000\"";
     let stale = fixture
         .aws
-        .put(&key, b"stale replacement", Some(initial_etag), None);
+        .put(&key, b"stale replacement", Some(noncurrent_etag), None);
     let stale_error = assert_conditional_failure(&stale, "stale If-Match replacement");
     eprintln!("stale conditional PUT: {stale_error}");
     assert_eq!(
