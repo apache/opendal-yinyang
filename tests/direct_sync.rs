@@ -499,7 +499,8 @@ async fn wrong_storage_binding_rejects_before_recovery_or_effects() {
         "scheme=s3;profile=minio;bucket=other;root=/objects/;endpoint=loopback".to_owned();
     let error = DirectSync::open(wrong.clone(), &fixture.state)
         .await
-        .unwrap_err();
+        .err()
+        .expect("wrong binding must fail");
     assert!(error.to_string().contains("bound to namespace"));
     assert_eq!(fixture.handle.read("file"), before);
 
@@ -517,7 +518,8 @@ async fn empty_local_and_remote_directories_fail_before_state_or_effects() {
         &local_empty.root,
     )
     .await
-    .unwrap_err();
+    .err()
+    .expect("empty local directory must fail");
     assert!(error.to_string().contains("empty directory markers"));
     assert!(!local_empty.state.join("direct-sync.db").exists());
 
@@ -529,7 +531,8 @@ async fn empty_local_and_remote_directories_fail_before_state_or_effects() {
         &remote_empty.root,
     )
     .await
-    .unwrap_err();
+    .err()
+    .expect("empty remote directory must fail");
     assert!(error.to_string().contains("empty directory markers"));
     assert!(!remote_empty.state.join("direct-sync.db").exists());
 }

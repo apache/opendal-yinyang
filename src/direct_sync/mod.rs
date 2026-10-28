@@ -260,11 +260,22 @@ impl<R: DirectRemote> DirectSync<R> {
     /// Bind a new state directory. An unbound namespace admits at most one
     /// non-empty file side; two non-empty sides require explicit resolution.
     pub async fn init(remote: R, state: &Path, root: &Path) -> Result<Self> {
-        if state.join("direct-sync.db").exists() {
-            return Err(Error::invalid(format!(
-                "Direct Sync state is already initialized at {}",
-                state.display()
-            )));
+        let database = state.join("direct-sync.db");
+        match std::fs::symlink_metadata(&database) {
+            Ok(_) => {
+                return Err(Error::invalid(format!(
+                    "Direct Sync state is already initialized at {}",
+                    state.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::io(
+                    "inspect Direct Sync state before initialization",
+                    &database,
+                    error,
+                ));
+            }
         }
         let local = LocalTree::create(root, state)?;
         let namespace = remote.namespace_id();
@@ -1316,13 +1327,16 @@ impl<R: DirectRemote> DirectSync<R> {
         let remote_artifact = match remote_artifact {
             Some(id) => Some(id),
             None => match remote.filter(|entry| entry.is_file()) {
-                Some(entry) => match self.capture_remote_artifact(entry).await {
-                    Ok(artifact) => {
-                        self.store.insert_artifact(&artifact)?;
-                        Some(artifact.id)
+                Some(entry) => {
+                    match Self::capture_remote_artifact_with(&self.local, &self.remote, entry).await
+                    {
+                        Ok(artifact) => {
+                            self.store.insert_artifact(&artifact)?;
+                            Some(artifact.id)
+                        }
+                        Err(_) => None,
                     }
-                    Err(_) => None,
-                },
+                }
                 None => None,
             },
         };
@@ -1337,11 +1351,15 @@ impl<R: DirectRemote> DirectSync<R> {
         })
     }
 
-    async fn capture_remote_artifact(&self, entry: &RemoteEntry) -> Result<ArtifactRecord> {
-        let (temporary, path, file) = self.local.create_install_file("conflict")?;
+    async fn capture_remote_artifact_with(
+        local: &LocalTree,
+        remote: &R,
+        entry: &RemoteEntry,
+    ) -> Result<ArtifactRecord> {
+        let (temporary, path, file) = local.create_install_file("conflict")?;
         drop(file);
-        match self.remote.read_to_path(entry, &path).await {
-            Ok(()) => self.local.retain_install_temporary(
+        match remote.read_to_path(entry, &path).await {
+            Ok(()) => local.retain_install_temporary(
                 &temporary,
                 &entry.path,
                 ArtifactKind::RemoteConflict,

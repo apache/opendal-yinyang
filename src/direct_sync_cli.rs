@@ -21,6 +21,7 @@ use crate::sync_cli::{SyncCommand, SyncSide};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::ExitCode;
+use yinyang::direct::DirectStorageBinding;
 use yinyang::direct_sync::{
     ArtifactPhase, BindingState, ConflictPresence, DirectRemoteAdapter, DirectSync, EntryState,
     EvidenceKind, Inspection, InstallState, LocalScanState, RemoteAvailability, RemoteOperation,
@@ -110,38 +111,31 @@ fn admit(config: &VolumeConfig) -> Result<DirectRemoteAdapter, Box<dyn std::erro
     }
     let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
     config.validate(&operator)?;
-    let binding = storage_binding(config, &operator);
+    let binding = storage_binding(config, &operator)?;
     let namespace = yinyang::volume::direct_namespace(config, operator)?;
-    Ok(DirectRemoteAdapter::open(namespace, binding)?)
+    Ok(DirectRemoteAdapter::open(
+        namespace,
+        hex(binding.namespace_id()),
+    )?)
 }
 
-fn storage_binding(config: &VolumeConfig, operator: &opendal::Operator) -> String {
+fn storage_binding(
+    config: &VolumeConfig,
+    operator: &opendal::Operator,
+) -> Result<DirectStorageBinding, Box<dyn std::error::Error>> {
     let profile = match config.storage_profile {
         StorageProfile::AmazonS3 => "amazon-s3",
         StorageProfile::Minio => "minio",
     };
-    let endpoint = std::env::var("YINYANG_S3_ENDPOINT")
-        .ok()
-        .map(|endpoint| canonical_endpoint(&endpoint))
-        .unwrap_or_else(|| "provider-default".to_owned());
-    format!(
-        "scheme={};profile={profile};bucket={};root={};endpoint={endpoint}",
+    let endpoint =
+        std::env::var("YINYANG_S3_ENDPOINT").unwrap_or_else(|_| "provider-default".to_owned());
+    Ok(DirectStorageBinding::new(
         operator.info().scheme(),
+        profile,
         operator.info().name(),
         operator.info().root(),
-    )
-}
-
-fn canonical_endpoint(endpoint: &str) -> String {
-    let endpoint = endpoint.trim().trim_end_matches('/');
-    let authority = endpoint
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(endpoint);
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    authority.to_ascii_lowercase()
+        endpoint,
+    )?)
 }
 
 async fn init(
