@@ -569,6 +569,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     assert_sqlite_integrity(&service_database);
     let restarted_service =
         ServiceProcess::start(&current_yy, &storage, &service_root, &service_database);
+    rewrite_service_address(&service_config, &restarted_service.address.to_string());
     let service_read_handle = open_handle(
         &current_yy,
         &storage,
@@ -989,6 +990,18 @@ fn write_config(
         serde_json::to_vec_pretty(&document).expect("serialize volume"),
     )
     .expect("write installed-upgrade volume");
+}
+
+fn rewrite_service_address(config: &Path, address: &str) {
+    let mut document: Value =
+        serde_json::from_slice(&fs::read(config).expect("read service volume"))
+            .expect("parse service volume");
+    document["service_address"] = Value::String(address.to_owned());
+    fs::write(
+        config,
+        serde_json::to_vec_pretty(&document).expect("serialize service volume"),
+    )
+    .expect("rewrite service volume address");
 }
 
 fn open_handle(
