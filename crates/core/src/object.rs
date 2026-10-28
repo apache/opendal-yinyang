@@ -317,6 +317,10 @@ impl ObjectFs {
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
         match self.commit_batch_inner(requests).await {
             Err(error) if error.kind() == ErrorKind::Storage => {
+                eprintln!(
+                    "yinyang-diagnostic: retryable-source=storage operation={}",
+                    error.operation()
+                );
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
             }
             result => result,
@@ -446,6 +450,12 @@ impl ObjectFs {
                 }
                 None => outcomes.push(Outcome::Retryable),
             }
+        }
+        if outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Retryable))
+        {
+            eprintln!("yinyang-diagnostic: retryable-source=cas-exhausted");
         }
         Ok(outcomes)
     }
