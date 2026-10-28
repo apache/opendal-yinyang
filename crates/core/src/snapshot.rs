@@ -220,8 +220,6 @@ impl FileVersion {
     /// Authenticate intersecting units before delivering their bytes. The range
     /// must lie within the file. A later error can leave a verified prefix in
     /// the destination, but never an unverified unit or bytes from another version.
-    /// Previously authenticated extents for this exact version may be reused from
-    /// the bounded process-local cache.
     pub async fn read_range(
         &self,
         range: Range<u64>,
