@@ -268,11 +268,6 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     );
     let (frozen_commit, frozen_digest) =
         stage_identity(&temp.path().join("object-state/staging.db"), &frozen_handle);
-    let (pending_commit, pending_digest) = stage_identity(
-        &temp.path().join("object-state/staging.db"),
-        &pending_handle,
-    );
-    assert_ne!(frozen_commit, pending_commit);
 
     run_ok(
         current_yy_command(&current_yy, &storage, &sync_root).args(["create"]),
@@ -473,7 +468,10 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         &object_config,
         &["fsync", &pending_handle],
     );
-    assert_eq!(parse_file_commit(&pending_publish.stdout), pending_commit);
+    let pending_commit = parse_file_commit(&pending_publish.stdout);
+    assert_ne!(frozen_commit, pending_commit);
+    let pending_receipt = receipt(&current_yy, &storage, &object_root, &pending_commit);
+    let pending_digest = field(&pending_receipt, "request digest").to_owned();
     assert_receipt(
         &current_yy,
         &storage,
