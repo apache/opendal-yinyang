@@ -233,10 +233,6 @@ impl DirectNamespace {
         Self { operator }
     }
 
-    pub fn operator(&self) -> &Operator {
-        &self.operator
-    }
-
     /// Observe every visible object and synthesize the complete path tree.
     ///
     /// Recursive listing is read-only. The resulting snapshot never writes
