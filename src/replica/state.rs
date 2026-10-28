@@ -1806,16 +1806,16 @@ fn validate_profile(connection: &Connection) -> Result<Shape> {
         .iter()
         .any(|table| !TABLE_NAMES.contains(&table.as_str()))
     {
-        return Err(Error::corrupt(format!(
-            "replica state contains an unsupported table"
-        )));
+        return Err(Error::corrupt(
+            "replica state contains an unsupported table",
+        ));
     }
     if !schema::columns_match(connection, REQUIRED_SCHEMA)
         .map_err(|error| Error::corrupt(format!("read replica schema: {error}")))?
     {
-        return Err(Error::corrupt(format!(
-            "replica state has an unsupported required-table schema"
-        )));
+        return Err(Error::corrupt(
+            "replica state has an unsupported required-table schema",
+        ));
     }
 
     let baseline = schema::column_names(connection, "baseline")
@@ -1830,9 +1830,9 @@ fn validate_profile(connection: &Connection) -> Result<Shape> {
         && !schema::columns_match(connection, &[CONFLICTS_SCHEMA])
             .map_err(|error| Error::corrupt(format!("read conflict schema: {error}")))?
     {
-        return Err(Error::corrupt(format!(
-            "replica state has an unsupported conflicts schema"
-        )));
+        return Err(Error::corrupt(
+            "replica state has an unsupported conflicts schema",
+        ));
     }
 
     let has_work = tables.contains("work");
