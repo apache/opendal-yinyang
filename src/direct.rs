@@ -250,6 +250,7 @@ impl DirectNamespace {
             .map_err(Error::storage)?;
         let mut records = entries
             .into_iter()
+            .filter(|entry| !(entry.path().is_empty() && entry.metadata().mode() == EntryMode::DIR))
             .map(|entry| {
                 let metadata = entry.metadata();
                 ObjectRecord {
@@ -470,7 +471,6 @@ impl DirectSnapshot {
     }
 
     pub fn resolve(&self, path: &str) -> Option<&DirectNode> {
-        let path = path.trim_matches('/');
         self.paths
             .get(path)
             .and_then(|id| self.nodes.get(id))
@@ -1034,6 +1034,15 @@ mod tests {
         assert_eq!(names.len(), 4);
         assert!(names.contains("a"));
         assert!(names.contains("A"));
+    }
+
+    #[test]
+    fn resolve_requires_the_canonical_mapped_path() {
+        let snapshot = DirectSnapshot::build(namespace(), vec![record("dir/file", false)]).unwrap();
+        assert!(snapshot.resolve("dir/file").is_some());
+        assert!(snapshot.resolve("/dir/file").is_none());
+        assert!(snapshot.resolve("dir/file/").is_none());
+        assert!(snapshot.resolve("dir//file").is_none());
     }
 
     #[test]
