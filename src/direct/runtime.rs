@@ -2884,11 +2884,25 @@ fn sync_parent(path: &Path) -> Result<()> {
             "Direct runtime path has no parent directory",
         )
     })?;
-    let directory =
-        File::open(parent).map_err(|error| local_io("open Direct runtime directory", error))?;
-    directory
-        .sync_all()
-        .map_err(|error| local_io("sync Direct runtime directory", error))
+    sync_directory(parent)
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory =
+            File::open(path).map_err(|error| local_io("open Direct runtime directory", error))?;
+        directory
+            .sync_all()
+            .map_err(|error| local_io("sync Direct runtime directory", error))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows cannot portably open and flush a directory. File contents are
+        // already synced, but directory-entry durability is not claimed there.
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn local_io(context: &str, error: std::io::Error) -> Error {
