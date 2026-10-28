@@ -2758,6 +2758,7 @@ mod tests {
         .await
         .unwrap();
         let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.truncate(0).await.unwrap();
         file.write(0, b"local").await.unwrap();
         backend.fail_next_write_before_effect();
         let mutation = match file.flush().await.unwrap() {
