@@ -413,10 +413,10 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
     fixture.delete_raw("replace.bin");
     mounted.refresh();
     mounted.wait_for_log("refresh", Duration::from_secs(30));
-    assert!(
-        fs::metadata(&path).is_err(),
-        "a fresh lookup after external delete must not serve the removed raw key"
+    let error = File::open(&path).expect_err(
+        "a fresh Direct open after external delete must not reopen the removed raw key",
     );
+    assert_errno(&error, &[2, 116], "fresh Direct open after external delete");
     let deleted_attr = old_fd
         .metadata()
         .expect("fstat retained Direct fd after external delete");
@@ -682,8 +682,8 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
             "directory marker",
         ),
         (
-            "name-max",
-            vec![("x".repeat(256), b"too-long".as_slice())],
+            "encoded-name-max",
+            vec![("\u{7f}".repeat(128), b"too-long".as_slice())],
             "NAME_MAX",
         ),
     ];
