@@ -956,7 +956,11 @@ fn staging_unknown_identity(database: &Path) -> (String, String) {
             let (_, commit, digest) =
                 yinyang_core::Transaction::inspect_identity(&plan).expect("inspect frozen content");
             frozen.push((
-                uuid::Uuid::from_bytes(*commit.as_bytes()).to_string(),
+                commit
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
                 digest.iter().map(|byte| format!("{byte:02x}")).collect(),
             ));
         }
