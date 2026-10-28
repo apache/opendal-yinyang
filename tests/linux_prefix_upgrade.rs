@@ -393,12 +393,13 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     );
     service.kill_without_cleanup();
     let wal = service_database.with_extension("db-wal");
-    assert!(
-        wal.metadata().is_ok_and(|metadata| metadata.len() > 0),
-        "fd1338c service did not leave the expected non-empty WAL"
+    assert_eq!(
+        sqlite_journal_mode(&service_database),
+        "wal",
+        "fd1338c service authority did not use WAL mode"
     );
     assert_sqlite_integrity(&service_database);
-    let wal_bytes = wal.metadata().expect("service WAL metadata").len();
+    let wal_bytes = wal.metadata().map(|metadata| metadata.len()).unwrap_or(0);
 
     assert_no_installed_writer(&prefix, temp.path());
     let previous_target =
@@ -1156,6 +1157,15 @@ fn assert_sqlite_integrity(database: &Path) {
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("run service SQLite integrity_check");
     assert_eq!(result, "ok", "service database integrity failure");
+}
+
+fn sqlite_journal_mode(database: &Path) -> String {
+    let connection =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open service database read-only");
+    connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read service SQLite journal mode")
 }
 
 fn assert_no_installed_writer(prefix: &Path, work: &Path) {
