@@ -410,9 +410,6 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
         ),
         Err(error) => assert_errno(&error, &[5, 116], "old Direct fd after replacement"),
     }
-    drop(fresh);
-    drop(old_fd);
-
     fixture.delete_raw("replace.bin");
     mounted.refresh();
     mounted.wait_for_log("refresh", Duration::from_secs(30));
@@ -420,6 +417,21 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
         fs::metadata(&path).is_err(),
         "a fresh lookup after external delete must not serve the removed raw key"
     );
+    let deleted_attr = old_fd
+        .metadata()
+        .expect("fstat retained Direct fd after external delete");
+    assert!(deleted_attr.is_file());
+    assert_eq!(
+        deleted_attr.len(),
+        old.len() as u64,
+        "external delete must not rebase a live old descriptor"
+    );
+    match read_fully_at(&old_fd, tail_offset, 4096) {
+        Ok(bytes) => assert_eq!(bytes, old[old.len() - 4096..]),
+        Err(error) => assert_errno(&error, &[5, 116], "old Direct fd after delete"),
+    }
+    drop(fresh);
+    drop(old_fd);
     mounted.unmount();
 }
 
@@ -614,6 +626,13 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
             inventory,
             "unrepresentable Direct namespace {label} mutated storage"
         );
+        for (key, bytes) in &objects {
+            assert_eq!(
+                fixture.raw_get(key).as_deref(),
+                Some(*bytes),
+                "unrepresentable Direct namespace {label} changed exact key {key:?}"
+            );
+        }
         assert!(
             inventory.keys().all(|key| !key.starts_with(".yinyang/")),
             "Direct rejection {label} created authoritative metadata"
