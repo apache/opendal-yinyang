@@ -119,13 +119,18 @@ impl FromStr for RevisionArg {
 }
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    #[cfg(feature = "benchmark-telemetry")]
+    let telemetry = yinyang::benchmark::Telemetry::install();
+    let result = match run(Cli::parse()).await {
         Ok(code) => code,
         Err(error) => {
             eprintln!("yy: {error}");
             ExitCode::FAILURE
         }
-    }
+    };
+    #[cfg(feature = "benchmark-telemetry")]
+    drop(telemetry);
+    result
 }
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     opendal::install_default();
@@ -182,6 +187,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         })
         .collect::<Vec<_>>();
     let operator = opendal::Operator::via_iter("s3", config)?;
+    #[cfg(feature = "benchmark-telemetry")]
+    let operator = yinyang::benchmark::instrument(operator);
     if let Command::Serve { database, listen } = &cli.command {
         let token = std::env::var("YINYANG_SERVICE_TOKEN").map_err(
             |_| "set YINYANG_SERVICE_TOKEN to a random authentication token of at least 32 bytes",
