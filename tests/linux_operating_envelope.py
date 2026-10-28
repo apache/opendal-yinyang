@@ -285,7 +285,6 @@ class MountProcess:
         self.process: subprocess.Popen[bytes] | None = None
         self.stdout: threading.Thread | None = None
         self.stderr: threading.Thread | None = None
-        self.output: list[bytes] = []
 
     def start(self, redact: Any) -> None:
         if mount_type(self.mountpoint) is not None:
@@ -594,6 +593,8 @@ class Harness:
         self.samples: list[dict[str, Any]] = []
         self.history_samples: list[dict[str, Any]] = []
         self.io_totals: dict[str, int] = {}
+        self.last_io_pid: int | None = None
+        self.last_io: dict[str, int | None] | None = None
         self.report["samples"] = self.samples
         self.report["history_samples"] = self.history_samples
         self.report["workdir"] = str(self.work)
@@ -762,14 +763,7 @@ class Harness:
             "read_only": False,
             "require": [],
         }
-        descriptor = os.open(
-            self.config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        try:
-            os.write(descriptor, json.dumps(document, indent=2).encode() + b"\n")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        write_private(self.config, json.dumps(document, indent=2).encode() + b"\n")
 
     def prepare_authority(self) -> None:
         self.write_config()
@@ -808,7 +802,16 @@ class Harness:
     def sample(self, elapsed: float, phase: str) -> dict[str, Any]:
         pid = self.mount.pid()
         io = read_proc_io(pid)
-        io_add(self.io_totals, io)
+        if pid is not None:
+            if self.last_io_pid == pid and self.last_io is not None:
+                io_add(self.io_totals, io_since(self.last_io, io))
+            else:
+                io_add(self.io_totals, io)
+            self.last_io_pid = pid
+            self.last_io = io
+        else:
+            self.last_io_pid = None
+            self.last_io = None
         statistics_ = os.statvfs(self.state)
         sample = {
             "timestamp": utc_now(),
