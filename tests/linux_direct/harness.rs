@@ -19,6 +19,7 @@
 
 pub use crate::process::{Captured, run_timeout};
 pub use crate::raw_s3::{RawInventory as Inventory, RawS3};
+use crate::real_s3::AwsS3;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
@@ -38,6 +39,22 @@ const STORAGE_ENV: [&str; 5] = [
     "YINYANG_S3_ACCESS_KEY_ID",
     "YINYANG_S3_SECRET_ACCESS_KEY",
 ];
+const STORAGE_ENV_WITH_SESSION: [&str; 6] = [
+    "YINYANG_S3_BUCKET",
+    "YINYANG_S3_ENDPOINT",
+    "YINYANG_S3_REGION",
+    "YINYANG_S3_ACCESS_KEY_ID",
+    "YINYANG_S3_SECRET_ACCESS_KEY",
+    "YINYANG_S3_SESSION_TOKEN",
+];
+
+pub fn direct_test_storage_profile() -> &'static str {
+    match std::env::var("YINYANG_DIRECT_TEST_STORAGE_PROFILE").as_deref() {
+        Ok("amazon-s3") => "amazon-s3",
+        Ok("minio") | Err(_) => "minio",
+        Ok(profile) => panic!("unsupported Direct acceptance storage profile {profile:?}"),
+    }
+}
 
 pub fn require_direct_environment() {
     if !Path::new("/dev/fuse").exists() {
@@ -48,18 +65,31 @@ pub fn require_direct_environment() {
             panic!("{tool} is unavailable; Direct acceptance must fail rather than skip");
         }
     }
-    for name in STORAGE_ENV {
-        if std::env::var_os(name).is_none() {
+    let amazon_s3 = direct_test_storage_profile() == "amazon-s3";
+    for name in STORAGE_ENV_WITH_SESSION {
+        if amazon_s3 && name == "YINYANG_S3_ENDPOINT" {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "{name} must be unset for the Amazon S3 default endpoint"
+            );
+        } else if !amazon_s3 && name == "YINYANG_S3_SESSION_TOKEN" {
+            continue;
+        } else if std::env::var_os(name).is_none() {
             panic!("{name} is unset; Direct acceptance must fail rather than skip");
         }
     }
+}
+
+enum FixtureRaw {
+    Http(RawS3),
+    Amazon(AwsS3),
 }
 
 pub struct Fixture {
     pub temp: tempfile::TempDir,
     pub root: String,
     bucket: String,
-    raw: RawS3,
+    raw: FixtureRaw,
 }
 
 pub struct RunningCommand {
@@ -165,8 +195,12 @@ impl Fixture {
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         );
-        let raw_base = RawS3::from_env();
-        let raw = raw_base.with_bucket(bucket.clone());
+        let raw = if direct_test_storage_profile() == "amazon-s3" {
+            FixtureRaw::Amazon(AwsS3::new(bucket.clone()))
+        } else {
+            let raw_base = RawS3::from_env();
+            FixtureRaw::Http(raw_base.with_bucket(bucket.clone()))
+        };
         Self {
             temp,
             root,
@@ -189,20 +223,27 @@ impl Fixture {
 
     pub fn write_raw(&self, key: &str, bytes: &[u8]) {
         let key = self.full_key(key);
-        self.raw.put(&key, bytes);
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.put(&key, bytes),
+            FixtureRaw::Amazon(raw) => raw.raw_put(&key, bytes),
+        }
         assert_eq!(
-            self.raw.get(&key).as_deref(),
+            self.raw_get_storage_key(&key).as_deref(),
             Some(bytes),
             "raw S3 did not preserve the requested key {key:?}"
         );
     }
 
     pub fn delete_raw(&self, key: &str) {
-        self.raw.delete(&self.full_key(key));
+        let key = self.full_key(key);
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.delete(&key),
+            FixtureRaw::Amazon(raw) => raw.raw_delete(&key),
+        }
     }
 
     pub fn raw_get(&self, key: &str) -> Option<Vec<u8>> {
-        self.raw.get(&self.full_key(key))
+        self.raw_get_storage_key(&self.full_key(key))
     }
 
     pub fn wait_raw_bytes(&self, key: &str, expected: &[u8], timeout: Duration) -> Option<Vec<u8>> {
@@ -216,8 +257,11 @@ impl Fixture {
 
     pub fn inventory(&self) -> Inventory {
         let prefix = format!("{}/", self.root);
-        self.raw
-            .inventory(&prefix)
+        let inventory = match &self.raw {
+            FixtureRaw::Http(raw) => raw.inventory(&prefix),
+            FixtureRaw::Amazon(raw) => raw.raw_inventory(&prefix),
+        };
+        inventory
             .into_iter()
             .map(|(key, object)| {
                 let key = key
@@ -242,7 +286,7 @@ impl Fixture {
             "access": "mount",
             "frontend": frontend,
             "publication": "object",
-            "storage_profile": "minio",
+            "storage_profile": direct_test_storage_profile(),
         });
         if let Some(read_only) = read_only {
             config["read_only"] = Value::Bool(read_only);
@@ -267,7 +311,7 @@ impl Fixture {
                 "access": "mount",
                 "frontend": frontend,
                 "publication": "object",
-                "storage_profile": "minio",
+                "storage_profile": direct_test_storage_profile(),
                 "read_only": false,
                 "staging": staging,
             }),
@@ -287,9 +331,15 @@ impl Fixture {
     pub fn yy_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
         command.args(args);
-        for name in STORAGE_ENV {
+        let amazon_s3 = direct_test_storage_profile() == "amazon-s3";
+        for name in STORAGE_ENV_WITH_SESSION {
             let value = if name == "YINYANG_S3_BUCKET" {
                 self.bucket.clone()
+            } else if amazon_s3 && name == "YINYANG_S3_ENDPOINT" {
+                command.env_remove(name);
+                continue;
+            } else if !amazon_s3 && name == "YINYANG_S3_SESSION_TOKEN" {
+                continue;
             } else {
                 std::env::var(name)
                     .unwrap_or_else(|_| panic!("{name} is required for Direct acceptance"))
@@ -297,7 +347,7 @@ impl Fixture {
             command.env(name, value);
         }
         command.env("YINYANG_S3_ROOT", &self.root);
-        command.env("YINYANG_STORAGE_PROFILE", "minio");
+        command.env("YINYANG_STORAGE_PROFILE", direct_test_storage_profile());
         command
     }
 
@@ -334,11 +384,29 @@ impl Fixture {
 
     pub fn raw_object(&self, key: &str) -> Option<crate::raw_s3::RawObject> {
         let full_key = self.full_key(key);
-        self.raw.inventory(&full_key).remove(&full_key)
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.inventory(&full_key).remove(&full_key),
+            FixtureRaw::Amazon(raw) => raw.raw_object(&full_key),
+        }
     }
 
     pub fn full_key(&self, key: &str) -> String {
         format!("{}/{key}", self.root)
+    }
+
+    fn raw_get_storage_key(&self, key: &str) -> Option<Vec<u8>> {
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.get(key),
+            FixtureRaw::Amazon(raw) => raw.raw_get(key),
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let FixtureRaw::Amazon(raw) = &self.raw {
+            raw.raw_cleanup(&self.root);
+        }
     }
 }
 

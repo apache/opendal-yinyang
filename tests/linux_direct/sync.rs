@@ -17,7 +17,9 @@
 
 //! Real storage and CLI acceptance for finite Direct Sync.
 
-use crate::harness::{Fixture, RunningCommand, path_text, payload, run_timeout};
+use crate::harness::{
+    Fixture, RunningCommand, direct_test_storage_profile, path_text, payload, run_timeout,
+};
 use crate::s3_gate::{CommitAction, S3Gate};
 use serde_json::{Value, json};
 use std::fs;
@@ -33,7 +35,7 @@ fn sync_config(fixture: &Fixture, name: &str, staging: &Path) -> PathBuf {
             "access": "sync",
             "frontend": "library",
             "publication": "object",
-            "storage_profile": "minio",
+            "storage_profile": direct_test_storage_profile(),
             "read_only": false,
             "staging": staging,
         }),
