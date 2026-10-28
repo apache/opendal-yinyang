@@ -17,11 +17,12 @@
 
 //! Real storage and CLI acceptance for finite Direct Sync.
 
-use crate::harness::{Fixture, RunningCommand, path_text, payload};
+use crate::harness::{Fixture, RunningCommand, path_text, payload, run_timeout};
 use crate::s3_gate::{CommitAction, S3Gate};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn sync_config(fixture: &Fixture, name: &str, staging: &Path) -> PathBuf {
     fixture.config_document(
@@ -40,16 +41,42 @@ fn sync_config(fixture: &Fixture, name: &str, staging: &Path) -> PathBuf {
 }
 
 fn sync_run(fixture: &Fixture, config: &Path) {
-    fixture
-        .yy_ok(&["--volume", path_text(config), "sync", "run"])
-        .success_or("Direct Sync run");
+    sync_run_at(fixture, config, None).success_or("Direct Sync run");
 }
 
 fn sync_status(fixture: &Fixture, config: &Path) -> Value {
-    let output = fixture.yy_ok(&["--volume", path_text(config), "sync", "status", "--json"]);
+    sync_status_at(fixture, config, None)
+}
+
+fn sync_run_at(
+    fixture: &Fixture,
+    config: &Path,
+    endpoint: Option<&str>,
+) -> crate::harness::Captured {
+    run_sync_command(fixture, config, endpoint, &["run"])
+}
+
+fn sync_status_at(fixture: &Fixture, config: &Path, endpoint: Option<&str>) -> Value {
+    let output = run_sync_command(fixture, config, endpoint, &["status", "--json"]);
+    output.success_or("Direct Sync status");
     let status: Value = serde_json::from_slice(&output.stdout).expect("Direct Sync status JSON");
     assert_eq!(status["schema"], "yinyang.direct-sync.status.v1");
     status
+}
+
+fn run_sync_command(
+    fixture: &Fixture,
+    config: &Path,
+    endpoint: Option<&str>,
+    command: &[&str],
+) -> crate::harness::Captured {
+    let mut args = vec!["--volume", path_text(config), "sync"];
+    args.extend_from_slice(command);
+    let mut process = fixture.yy_command(&args);
+    if let Some(endpoint) = endpoint {
+        process.env("YINYANG_S3_ENDPOINT", endpoint);
+    }
+    run_timeout(process, Duration::from_secs(120))
 }
 
 fn entry<'a>(status: &'a Value, path: &str) -> &'a Value {
@@ -471,21 +498,6 @@ fn direct_sync_empty_directories_and_kind_changes_are_never_silently_ignored() {
     );
 }
 
-fn baseline_sync(fixture: &Fixture, config: &Path, local: &Path, original: &[u8]) {
-    fixture
-        .yy_ok(&[
-            "--volume",
-            path_text(config),
-            "sync",
-            "init",
-            "--directory",
-            path_text(local),
-        ])
-        .success_or("Direct Sync uncertainty init");
-    sync_run(fixture, config);
-    assert_eq!(fixture.raw_get("uncertain.txt").as_deref(), Some(original));
-}
-
 fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
     let fixture = Fixture::new();
     let state = fixture.path("direct-sync-uncertain-state");
@@ -495,15 +507,30 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
     let original = payload(24 * 1024 + 1, 0x17);
     let first = payload(24 * 1024 + 5, 0x39);
     let newer = payload(24 * 1024 + 3, 0x5b);
-    fs::write(local.join("uncertain.txt"), &original)
-        .expect("write Direct Sync uncertainty baseline");
-    baseline_sync(&fixture, &config, &local, &original);
-    fs::write(local.join("uncertain.txt"), &first).expect("write first Direct Sync local edit");
+    fixture.write_raw("uncertain.txt", &original);
 
     let suffix = format!("/{}/uncertain.txt", fixture.root());
     let gate = S3Gate::start_for_path(action, "PUT", suffix);
-    let mut command = fixture.yy_command(&["--volume", path_text(&config), "sync", "run"]);
-    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let endpoint = gate.endpoint();
+    run_sync_command(
+        &fixture,
+        &config,
+        Some(&endpoint),
+        &["init", "--directory", path_text(&local)],
+    )
+    .success_or("Direct Sync uncertainty init");
+    sync_run_at(&fixture, &config, Some(&endpoint)).success_or("Direct Sync uncertainty baseline");
+    assert_eq!(
+        fs::read(local.join("uncertain.txt")).expect("read Direct Sync uncertainty baseline"),
+        original
+    );
+    fs::write(local.join("uncertain.txt"), &first).expect("write first Direct Sync local edit");
+
+    let mut command = {
+        let mut command = fixture.yy_command(&["--volume", path_text(&config), "sync", "run"]);
+        command.env("YINYANG_S3_ENDPOINT", &endpoint);
+        command
+    };
     let mut running = RunningCommand::spawn(command);
     let intercepted = gate.wait_intercepted();
     assert_eq!(intercepted.method, "PUT");
@@ -534,10 +561,10 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
             output.text()
         );
     }
-    drop(gate);
+    gate.resume();
 
     fs::write(local.join("uncertain.txt"), &newer).expect("write newer Direct Sync local edit");
-    let status = sync_status(&fixture, &config);
+    let status = sync_status_at(&fixture, &config, Some(&endpoint));
     assert_eq!(status["summary"]["unknown"], 1, "{status:#}");
     let unknown = entry(&status, "uncertain.txt");
     assert_eq!(unknown["state"], "unknown", "{status:#}");
@@ -594,32 +621,29 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
         "Direct Sync did not retain the original uncertain upload bytes"
     );
 
-    let _retry = fixture.yy(&["--volume", path_text(&config), "sync", "run"]);
+    let _retry = sync_run_at(&fixture, &config, Some(&endpoint));
     assert_eq!(
         fixture.raw_get("uncertain.txt").as_deref(),
         Some(backend_before_retry),
         "a later run automatically overwrote from an older uncertain request"
     );
-    let status = sync_status(&fixture, &config);
+    let status = sync_status_at(&fixture, &config, Some(&endpoint));
     assert_eq!(status["summary"]["unknown"], 1, "{status:#}");
 
-    fixture
-        .yy_ok(&[
-            "--volume",
-            path_text(&config),
-            "sync",
-            "resolve",
-            work,
-            "--keep",
-            "local",
-        ])
-        .success_or("resolve Direct Sync Unknown work to current local state");
+    run_sync_command(
+        &fixture,
+        &config,
+        Some(&endpoint),
+        &["resolve", work, "--keep", "local"],
+    )
+    .success_or("resolve Direct Sync Unknown work to current local state");
     assert_eq!(
         fixture.raw_get("uncertain.txt").as_deref(),
         Some(newer.as_slice()),
         "explicit local resolution did not publish the observed desired state"
     );
-    assert_in_sync(&sync_status(&fixture, &config));
+    assert_in_sync(&sync_status_at(&fixture, &config, Some(&endpoint)));
+    drop(gate);
 }
 
 #[test]
