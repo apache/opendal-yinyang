@@ -646,26 +646,23 @@ fn direct_write_safe_save_retries_source_cleanup_without_atomic_rename_claim() {
         fixture.raw_get("safe.txt").as_deref(),
         Some(replacement.as_slice())
     );
-    match renamed {
-        Ok(()) => assert_eq!(
-            fixture.raw_get("safe.txt.tmp"),
-            None,
-            "safe-save reported success before source cleanup completed"
-        ),
-        Err(error) => {
-            assert_errno(
-                &error,
-                &[libc::EIO, libc::ESTALE, libc::EBUSY],
-                "safe-save source cleanup failure",
-            );
-            assert_eq!(
-                fixture.raw_get("safe.txt.tmp").as_deref(),
-                Some(replacement.as_slice()),
-                "safe-save failure must retain the source needed for cleanup retry"
-            );
-            fs::rename(&source, &destination).expect("retry safe-save source cleanup");
-        }
-    }
+    let error = renamed.expect_err("safe-save must report pending source cleanup");
+    assert_errno(
+        &error,
+        &[libc::EIO, libc::ESTALE, libc::EBUSY],
+        "safe-save source cleanup failure",
+    );
+    assert_eq!(
+        fixture.raw_get("safe.txt.tmp").as_deref(),
+        Some(replacement.as_slice()),
+        "safe-save failure must retain the source needed for cleanup retry"
+    );
+    fs::rename(&source, &destination).unwrap_or_else(|error| {
+        panic!(
+            "retry safe-save source cleanup: {error}\nmount logs:\n{}",
+            mounted.logs()
+        )
+    });
     assert_eq!(
         fixture.raw_get("safe.txt").as_deref(),
         Some(replacement.as_slice())
