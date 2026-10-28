@@ -565,7 +565,7 @@ impl Fixture {
     }
 
     fn storage_env(&self) -> Vec<(&'static str, String)> {
-        let mut env = Vec::with_capacity(STORAGE_VARIABLES.len() + 3);
+        let mut env = Vec::with_capacity(STORAGE_VARIABLES.len() + 4);
         let profile =
             std::env::var("YINYANG_STORAGE_PROFILE").unwrap_or_else(|_| "minio".to_owned());
         for name in STORAGE_VARIABLES {
@@ -591,6 +591,9 @@ impl Fixture {
         env.push(("YINYANG_STORAGE_PROFILE", profile));
         env.push(("YINYANG_S3_ROOT", self.root.clone()));
         env.push(("YINYANG_SERVICE_TOKEN", self.token.clone()));
+        if let Ok(token) = std::env::var("YINYANG_S3_SESSION_TOKEN") {
+            env.push(("YINYANG_S3_SESSION_TOKEN", token));
+        }
         env
     }
 
