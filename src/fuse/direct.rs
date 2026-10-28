@@ -970,7 +970,13 @@ impl DirectInner {
             .await
         {
             Ok(status) => status,
-            Err(error) => return reply.error(direct_errno(&error)),
+            Err(error) => {
+                eprintln!(
+                    "yy: fuse rename: Direct rename of {:?} to {:?} failed: {error}",
+                    name, new_name
+                );
+                return reply.error(direct_errno(&error));
+            }
         };
         match mutation_errno(&status) {
             None => {
