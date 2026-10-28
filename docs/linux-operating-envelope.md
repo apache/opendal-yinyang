@@ -51,6 +51,14 @@ The raw JSON evidence contains:
 - unmount exit, remount readiness, `doctor` result, SQLite integrity and final
   latest-state bytes compared with the expected in-memory dataset.
 
+The expected-byte oracle advances after every successful `pwrite` segment, not
+only after the following `fsync`. Partial writes therefore remain represented
+in the local and remote byte assertions. `pwrite` failures and `fsync` failures
+are counted separately; a file remains durability-unknown until a later
+successful fsync covers its dirty bytes. Three consecutive write or fsync
+failures abort the phase; otherwise any unresolved uncertainty makes the run
+fail after the byte assertions are evaluated and recorded.
+
 File counts, dimensions, concurrency, sampling period and duration are bounded
 inputs, not extrapolated capacity. A run that exceeds the bounded interval or
 dataset is separate evidence.
@@ -124,7 +132,62 @@ correct.
 
 ## Current evidence
 
-No final accepted implementation target has passed this operating-envelope
-workload yet. Existing bounded loopback cost results, native restart/recovery
-acceptance and the historical Amazon S3 operations smoke remain separate
-evidence with narrower configurations.
+The operating-envelope harness has passed a 90-second real Amazon S3 smoke at
+source `79506c0684c47b37bc93364eaa7192d65a770ede` with binary SHA-256
+`b4985f099f1aff9447a2990f2ec3bdc8945237732eb8985a576f7666147cd979`.
+It used the dedicated `yinyang-direct-q-35b90fdf-versioned` bucket in
+`us-east-2` and the 24-file/256 KiB default dataset. The two workload phases
+ran for 48.156 and 48.552 seconds; final version-list verification added time,
+so this is not presented as a 90-second wall-clock result.
+
+The smoke reached the following bounded observations:
+
+- peak sampled Mount RSS and high-water RSS: 27,070,464 bytes;
+- peak Mount staging allocation: 10,608,640 bytes;
+- peak observed open descriptors: 21;
+- two clean unmounts and one successful remount;
+- final latest-state restore: 24 files, 6,291,456 bytes;
+- final S3 history: 3,558 object versions, 0 delete markers, 41,388,760 stored
+  bytes across 4 version-list pages;
+- 48 successful fsync-write operations in each phase, with no writer/reader
+  errors;
+- `doctor` passed and the retained SQLite `staging.db` integrity check reported
+  `ok`.
+
+An earlier 90-second run at source `7fd4d87602f3aa98b53dca31eeca9bf6d8ce2f3e`
+reported a same-length mismatch for `file-0015.bin` during the first-phase
+restore. The original JSON did not retain per-operation error counters, so that
+historical event is not proven. Source review identified an oracle defect:
+the expected bytes were updated only after `fsync`, although a successful
+`pwrite` had already acknowledged bytes and a failed fsync could later be
+published by close/flush. A local tmp-file fault injection reproduced the
+result: the old oracle rejected the actual successful pwrite bytes, while the
+updated oracle matched them and reported `fsync_errors=1` and
+`uncertain_files=[0]`.
+
+The harness now advances expected bytes per successful pwrite segment, records
+pwrite and fsync failures separately, and fails a run after byte assertions if
+durability remains uncertain. The earlier 795 repeat passed with the enhanced
+verification, but the historical mismatch is not counted as a proven product
+defect. The final integrated soak must still retain the full byte assertions
+and resolve any observed durability uncertainty.
+
+Request count is unavailable for this smoke because no compatible
+process-scoped counter was supplied; the report keeps that field explicit
+rather than inferring it from local I/O. The raw JSON is retained outside the
+repository at
+`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/O-envelope-smoke-79506c0.json`.
+
+A separate installed-prefix run at the same source upgraded the
+`fd1338c` producer to the target release binary, preserved a 74,192-byte
+service WAL before target startup, and passed target file, Sync, service,
+receipt and `doctor` checks. Its digest is recorded in
+`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/O-upgrade-79506c0.json`.
+That run is preparatory evidence for the operations harness; it does not
+qualify the final integrated implementation.
+
+The local Ubuntu 24.04 archive built from the same source has SHA-256
+`4368831f2bd3b9729caaaed511312749e9f98100a3d22a733a339222a9da159c`; the
+archive's binary hash matches the smoke target. No final 45-minute
+operating-envelope run has been made against the integrated
+P/W/M/S candidate yet.

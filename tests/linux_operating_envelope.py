@@ -83,6 +83,10 @@ def binary_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def bytes_sha256(bytes_: bytes | bytearray) -> str:
+    return hashlib.sha256(bytes_).hexdigest()
+
+
 def tree_usage(root: Path) -> dict[str, int]:
     files = 0
     logical = 0
@@ -417,7 +421,9 @@ class Workload:
         self.lock = threading.Lock()
         self.write_latencies: list[float] = []
         self.read_latencies: list[float] = []
-        self.write_errors = 0
+        self.pwrite_errors = 0
+        self.fsync_errors = 0
+        self.uncertain_files: set[int] = set()
         self.read_errors = 0
         self.fatal: list[str] = []
 
@@ -464,22 +470,40 @@ class Workload:
                         count = os.pwrite(descriptors[index], view, offset + written)
                         if count <= 0:
                             raise OSError("short pwrite through FUSE")
+                        segment = page[written : written + count]
+                        self.expected[index][
+                            offset + written : offset + written + count
+                        ] = segment
                         written += count
                         view = view[count:]
-                    os.fsync(descriptors[index])
-                    self.expected[index][offset : offset + PAGE_BYTES] = page
-                    with self.lock:
-                        self.write_latencies.append(
-                            (time.monotonic() - started) * 1000
-                        )
-                    failures = 0
                 except OSError as error:
                     with self.lock:
-                        self.write_errors += 1
+                        self.pwrite_errors += 1
+                        self.uncertain_files.add(index)
                     failures += 1
                     if failures >= 3:
-                        self.fatal.append(f"three consecutive fsync writes failed: {error}")
+                        self.fatal.append(f"three consecutive writes failed: {error}")
                         self.stop.set()
+                else:
+                    try:
+                        os.fsync(descriptors[index])
+                    except OSError as error:
+                        with self.lock:
+                            self.fsync_errors += 1
+                            self.uncertain_files.add(index)
+                        failures += 1
+                        if failures >= 3:
+                            self.fatal.append(
+                                f"three consecutive fsync writes failed: {error}"
+                            )
+                            self.stop.set()
+                    else:
+                        with self.lock:
+                            self.write_latencies.append(
+                                (time.monotonic() - started) * 1000
+                            )
+                            self.uncertain_files.discard(index)
+                        failures = 0
                 elapsed = time.monotonic() - started
                 self.stop.wait(max(0.0, self.write_interval - elapsed))
         except OSError as error:
@@ -532,14 +556,19 @@ class Workload:
             raise EnvelopeError("workload thread did not stop within its bounded timeout")
         if self.fatal:
             raise EnvelopeError("; ".join(self.fatal))
+        write_errors = self.pwrite_errors + self.fsync_errors
+        writers = {
+            **latency_summary(self.write_latencies, write_errors),
+            "interval_seconds": self.write_interval,
+            "threads": self.writers,
+            "bytes_per_write": PAGE_BYTES,
+            "fsync_each_write": True,
+            "pwrite_errors": self.pwrite_errors,
+            "fsync_errors": self.fsync_errors,
+            "uncertain_files": sorted(self.uncertain_files),
+        }
         return {
-            "writers": {
-                **latency_summary(self.write_latencies, self.write_errors),
-                "interval_seconds": self.write_interval,
-                "threads": self.writers,
-                "bytes_per_write": PAGE_BYTES,
-                "fsync_each_write": True,
-            },
+            "writers": writers,
             "readers": {
                 **latency_summary(self.read_latencies, self.read_errors),
                 "interval_seconds": self.read_interval,
@@ -936,7 +965,8 @@ class Harness:
             if actual != expected_bytes:
                 raise EnvelopeError(
                     f"{label} restore byte mismatch for {path.name}: "
-                    f"expected {len(expected_bytes)} bytes, got {len(actual)}"
+                    f"expected {len(expected_bytes)} bytes sha256={bytes_sha256(expected_bytes)}, "
+                    f"got {len(actual)} bytes sha256={bytes_sha256(actual)}"
                 )
             total += len(actual)
             sha256.update(path.name.encode())
@@ -948,7 +978,9 @@ class Harness:
             actual = (self.mountpoint / f"file-{index:04d}.bin").read_bytes()
             if actual != expected_bytes:
                 raise EnvelopeError(
-                    f"mounted bytes changed across restart for file-{index:04d}.bin"
+                    f"mounted bytes mismatch for file-{index:04d}.bin: "
+                    f"expected {len(expected_bytes)} bytes sha256={bytes_sha256(expected_bytes)}, "
+                    f"got {len(actual)} bytes sha256={bytes_sha256(actual)}"
                 )
 
     def sqlite_integrity(self) -> list[dict[str, Any]]:
@@ -1045,6 +1077,7 @@ class Harness:
         second_duration = self.args.duration_seconds - first_duration
         self.report["phase"] = "steady-state-one"
         first = self.run_phase("steady-state-one", first_duration, expected)
+        self.verify_mount_bytes(expected)
         self.report["phase"] = "restart"
         stopped_one = self.mount.stop(self.redact)
         first_verify = self.verify_bytes("first-phase", expected)
@@ -1058,6 +1091,7 @@ class Harness:
         }
         self.report["phase"] = "steady-state-two"
         second = self.run_phase("steady-state-two", second_duration, expected)
+        self.verify_mount_bytes(expected)
         self.report["phase"] = "final-stop"
         stopped_two = self.mount.stop(self.redact)
         final_verify = self.verify_bytes("final", expected)
@@ -1078,6 +1112,28 @@ class Harness:
             "doctor": doctor,
         }
         self.report["request_accounting"] = self.request_accounting
+        uncertain_files = sorted(
+            set(first["writers"]["uncertain_files"])
+            | set(second["writers"]["uncertain_files"])
+        )
+        self.report["durability"] = {
+            "status": "unknown" if uncertain_files else "known",
+            "uncertain_files": uncertain_files,
+            "pwrite_errors": (
+                first["writers"]["pwrite_errors"]
+                + second["writers"]["pwrite_errors"]
+            ),
+            "fsync_errors": (
+                first["writers"]["fsync_errors"]
+                + second["writers"]["fsync_errors"]
+            ),
+        }
+        if uncertain_files:
+            self.report["status"] = "fail"
+            raise EnvelopeError(
+                "pwrite/fsync failures left uncertain durability for files "
+                f"{uncertain_files}; byte assertions completed but the run is not accepted"
+            )
         self.report["status"] = "pass"
         self.report["phase"] = "complete"
         self.report["ended_at"] = utc_now()
