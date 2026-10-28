@@ -712,7 +712,7 @@ def create_sync_fixture(binary, output, s3, temp):
 
 
 def sqlite_value(database, query):
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    connection = sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True)
     try:
         row = connection.execute(query).fetchone()
         if row is None:
@@ -725,6 +725,8 @@ def sqlite_value(database, query):
 def manifest(output, producer, binary):
     files = []
     for path in sorted(output.rglob("*")):
+        if path.name.endswith(("-wal", "-shm")):
+            fail(f"quiesced fixture unexpectedly contains SQLite sidecar {path}")
         if not path.is_file() or path.name == "manifest.json":
             continue
         files.append(
