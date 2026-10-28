@@ -251,7 +251,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{VolumeConfig, reject_unpublished_staging};
+    use super::{VolumeConfig, reject_unpublished_staging, run};
     use crate::core::{BackendProfile, Fs};
     use crate::mount::Mount;
     use crate::runtime::Runtime;
