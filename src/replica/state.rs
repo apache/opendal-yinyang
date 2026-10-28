@@ -158,8 +158,8 @@ const WORK_UPGRADE_ORDER: &[&str] = &[
     "commit_id",
 ];
 const WORK_COLUMNS: &[&str] = &[
-    "id",
     "seq",
+    "id",
     "path",
     "original_path",
     "desired_path",
