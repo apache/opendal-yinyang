@@ -24,7 +24,7 @@ use crate::direct::{
     DirectNode, DirectObjectPin, DirectObjectState, DirectObjectStatus, DirectRuntime,
     DirectSnapshot, Error as DirectError, ErrorKind as DirectErrorKind,
 };
-use crate::volume::{StorageProfile, VolumeConfig};
+use crate::volume::VolumeConfig;
 use fuser::{
     AccessFlags, BsdFileFlags, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, Notifier, OpenAccMode,
@@ -153,6 +153,7 @@ struct FileView {
     modified: Option<std::time::SystemTime>,
 }
 
+#[derive(Clone)]
 enum OpenSource {
     Remote(DirectFile),
     Staged(DirectFileHandle),
@@ -289,10 +290,12 @@ impl DirectInner {
             .entry(key.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(FileView { size, modified })))
             .clone();
-        let mut current = guard(&view);
-        current.size = size;
-        if modified.is_some() {
-            current.modified = modified;
+        {
+            let mut current = guard(&view);
+            current.size = size;
+            if modified.is_some() {
+                current.modified = modified;
+            }
         }
         view
     }
@@ -1800,19 +1803,22 @@ mod tests {
 
     #[test]
     fn rename_flags_name_supported_replace_semantics() {
-        assert_eq!(rename_replace(RenameFlags::empty()), Ok(true));
-        assert_eq!(rename_replace(RenameFlags::RENAME_NOREPLACE), Ok(false));
-        assert_eq!(
+        assert!(matches!(rename_replace(RenameFlags::empty()), Ok(true)));
+        assert!(matches!(
+            rename_replace(RenameFlags::RENAME_NOREPLACE),
+            Ok(false)
+        ));
+        assert!(matches!(
             rename_replace(RenameFlags::RENAME_EXCHANGE),
-            Err(fuser::Errno::EOPNOTSUPP)
-        );
-        assert_eq!(
+            Err(errno) if format!("{errno:?}") == "EOPNOTSUPP"
+        ));
+        assert!(matches!(
             rename_replace(RenameFlags::RENAME_WHITEOUT),
-            Err(fuser::Errno::EOPNOTSUPP)
-        );
-        assert_eq!(
+            Err(errno) if format!("{errno:?}") == "EOPNOTSUPP"
+        ));
+        assert!(matches!(
             rename_replace(RenameFlags::from_bits_retain(1 << 20)),
-            Err(fuser::Errno::EINVAL)
-        );
+            Err(errno) if format!("{errno:?}") == "EINVAL"
+        ));
     }
 }
