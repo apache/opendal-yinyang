@@ -181,24 +181,6 @@ const WORK_COLUMNS: &[&str] = &[
     "state",
     "error",
 ];
-const WORK_SCHEMA: schema::TableColumns<'static> = ("work", WORK_COLUMNS);
-const BASELINE_COLUMNS: &[&str] = &[
-    "path",
-    "node",
-    "directory",
-    "executable",
-    "remote_digest",
-    "remote_length",
-    "local_present",
-    "local_digest",
-    "local_length",
-    "local_executable",
-    "local_dev",
-    "local_ino",
-    "local_parent_dev",
-    "local_parent_ino",
-    "remote_revision",
-];
 const CREATE_CONFLICTS_TABLE: &str = "
     CREATE TABLE conflicts(
       id TEXT PRIMARY KEY,
