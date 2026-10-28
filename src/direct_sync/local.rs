@@ -344,6 +344,21 @@ impl LocalTree {
         Ok(std::fs::File::from(fd))
     }
 
+    pub fn verify_artifact(&self, artifact: &ArtifactRecord) -> Result<()> {
+        let (length, digest, _) = hash_at(
+            &self.artifact_fd,
+            &artifact.name,
+            &self.state.join("artifacts").join(&artifact.name),
+        )?;
+        if length != artifact.length || digest.as_bytes() != &artifact.digest {
+            return Err(Error::corrupt(format!(
+                "retained Direct Sync artifact {} no longer matches its recorded bytes",
+                artifact.id
+            )));
+        }
+        Ok(())
+    }
+
     pub fn open_live_file(&self, path: &str) -> Result<std::fs::File> {
         validate_path(path)?;
         let (parent, name) = split_path(path)?;
