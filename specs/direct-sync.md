@@ -129,8 +129,13 @@ remote rename: a pass can end with both names present or with one side
 partially applied, and the retained work makes the next retry boundary
 explicit.
 
-No watcher, daemon or automatic garbage collection is implied. Empty parent
-directories left by a local file deletion are not recursively removed.
+No watcher, daemon or automatic garbage collection is implied. When removing a
+file also empties an ancestor directory that is required by the durable
+baseline, Direct Sync removes that now-empty parent with fd-relative
+`AT_REMOVEDIR` calls and stops at the first non-empty directory. This keeps a
+pulled `dir/file` delete convergent and a later run is a no-op. An unrelated
+empty directory that is not an ancestor of accepted or pending file state
+remains an explicit unsupported namespace entry.
 
 ## Remote publication
 
