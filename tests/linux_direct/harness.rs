@@ -18,7 +18,7 @@
 //! Real raw-S3 and Linux FUSE harness for read-only Direct acceptance.
 
 pub use crate::process::{Captured, run_timeout};
-pub use crate::raw_s3::{RawInventory as Inventory, RawObject as StoredObject, RawS3};
+pub use crate::raw_s3::{RawInventory as Inventory, RawS3};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
@@ -208,7 +208,7 @@ impl Fixture {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let stdout = spawn_log_reader(stdout, logs.clone());
         let stderr = spawn_log_reader(stderr, logs.clone());
-        let mounted = Mounted {
+        let mut mounted = Mounted {
             child: Some(child),
             mountpoint: mountpoint.to_owned(),
             logs,
@@ -243,7 +243,7 @@ impl Mounted {
         String::from_utf8_lossy(&self.logs.lock().expect("mount log lock")).into_owned()
     }
 
-    fn wait_visible(&self, timeout: Duration) {
+    fn wait_visible(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some((filesystem, options)) = mount_info(&self.mountpoint) {

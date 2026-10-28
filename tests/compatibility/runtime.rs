@@ -199,7 +199,7 @@ pub fn assert_tree_matches(root: &Path, expected: &Value) {
                 let bytes = fs::read(&actual).unwrap();
                 assert_eq!(
                     Sha256::digest(&bytes)
-                        .as_ref()
+                        .as_slice()
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect::<String>(),

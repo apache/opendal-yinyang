@@ -299,7 +299,7 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
     let mounted = fixture.spawn_mount(&config, &mountpoint, "fuse");
     let path = mounted.mountpoint().join("replace.bin");
 
-    let mut old_fd = File::open(&path).expect("open old Direct version");
+    let old_fd = File::open(&path).expect("open old Direct version");
     assert!(
         old_fd
             .metadata()
@@ -392,7 +392,7 @@ fn direct_true_versioning_replacement_keeps_old_fd_bytes_and_attributes() {
     fs::create_dir(&mountpoint).expect("create versioned Direct mountpoint");
     let mounted = fixture.spawn_mount(&config, &mountpoint, "fuse");
     let path = mounted.mountpoint().join("versioned.bin");
-    let mut old_fd = File::open(&path).expect("open versioned old Direct fd");
+    let old_fd = File::open(&path).expect("open versioned old Direct fd");
     let old_metadata = old_fd.metadata().expect("fstat versioned old Direct fd");
     assert!(old_metadata.is_file());
     assert_eq!(old_metadata.len(), old.len() as u64);
@@ -471,7 +471,7 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
         b"dotdot"
     );
     assert_eq!(
-        fs::read(root.join(find_encoded(root, ".").join("dot")).unwrap()),
+        fs::read(root.join(find_encoded(root, ".").join("dot"))),
         b"dot"
     );
     assert_eq!(

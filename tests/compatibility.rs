@@ -92,7 +92,7 @@ fn compatibility_fixture_manifest_is_immutable() {
         );
         assert_eq!(
             Sha256::digest(&bytes)
-                .as_ref()
+                .as_slice()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),

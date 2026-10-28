@@ -31,7 +31,7 @@ use std::time::Duration;
 
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
-        .as_ref()
+        .as_slice()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
