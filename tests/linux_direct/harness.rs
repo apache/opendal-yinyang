@@ -166,6 +166,26 @@ impl Fixture {
                     .to_owned(),
             );
         }
+        self.config_document(name, config)
+    }
+
+    pub fn writable_config(&self, name: &str, frontend: &str, staging: &Path) -> PathBuf {
+        self.config_document(
+            name,
+            json!({
+                "name": name,
+                "model": "direct",
+                "access": "mount",
+                "frontend": frontend,
+                "publication": "object",
+                "storage_profile": "minio",
+                "read_only": false,
+                "staging": staging,
+            }),
+        )
+    }
+
+    pub fn config_document(&self, name: &str, config: Value) -> PathBuf {
         let path = self.path(&format!("{name}.json"));
         fs::write(
             &path,
@@ -203,14 +223,49 @@ impl Fixture {
     }
 
     pub fn spawn_mount(&self, config: &Path, mountpoint: &Path, _frontend: &str) -> Mounted {
-        let mut command = self.yy_command(&[
+        let command = self.mount_command(config, mountpoint);
+        Mounted::spawn(command, mountpoint)
+    }
+
+    pub fn spawn_writable_mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
+        let command = self.mount_command(config, mountpoint);
+        Mounted::spawn_with_policy(command, mountpoint, false)
+    }
+
+    fn mount_command(&self, config: &Path, mountpoint: &Path) -> Command {
+        self.yy_command(&[
             "--volume",
             config.to_str().expect("Direct config path is UTF-8"),
             "mount",
             mountpoint
                 .to_str()
                 .expect("Direct mountpoint path is UTF-8"),
-        ]);
+        ])
+    }
+
+    pub fn raw_object(&self, key: &str) -> Option<crate::raw_s3::RawObject> {
+        let full_key = self.full_key(key);
+        self.raw.inventory(&full_key).remove(&full_key)
+    }
+
+    pub fn full_key(&self, key: &str) -> String {
+        format!("{}/{key}", self.root)
+    }
+}
+
+pub struct Mounted {
+    child: Option<Child>,
+    mountpoint: PathBuf,
+    logs: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl Mounted {
+    pub fn spawn(command: Command, mountpoint: &Path) -> Self {
+        Self::spawn_with_policy(command, mountpoint, true)
+    }
+
+    fn spawn_with_policy(mut command: Command, mountpoint: &Path, read_only: bool) -> Self {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
             .spawn()
@@ -226,23 +281,9 @@ impl Fixture {
             logs,
             readers: vec![stdout, stderr],
         };
-        mounted.wait_visible(Duration::from_secs(30));
+        mounted.wait_visible(Duration::from_secs(30), read_only);
         mounted
     }
-
-    fn full_key(&self, key: &str) -> String {
-        format!("{}/{key}", self.root)
-    }
-}
-
-pub struct Mounted {
-    child: Option<Child>,
-    mountpoint: PathBuf,
-    logs: Arc<Mutex<Vec<u8>>>,
-    readers: Vec<JoinHandle<()>>,
-}
-
-impl Mounted {
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
@@ -255,7 +296,7 @@ impl Mounted {
         String::from_utf8_lossy(&self.logs.lock().expect("mount log lock")).into_owned()
     }
 
-    fn wait_visible(&mut self, timeout: Duration) {
+    fn wait_visible(&mut self, timeout: Duration, read_only: bool) {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some((filesystem, options)) = mount_info(&self.mountpoint) {
@@ -263,9 +304,10 @@ impl Mounted {
                     filesystem, "fuse.yinyang",
                     "Direct mount must expose the YinYang FUSE filesystem type"
                 );
-                assert!(
-                    options.split(',').any(|option| option == "ro"),
-                    "default Direct mount must include the kernel ro option: {options}"
+                let kernel_ro = options.split(',').any(|option| option == "ro");
+                assert_eq!(
+                    kernel_ro, read_only,
+                    "Direct mount policy does not match the kernel mount options: {options}"
                 );
                 return;
             }
@@ -294,6 +336,27 @@ impl Mounted {
 
     pub fn refresh(&self) {
         kill(self.pid(), Signal::SIGHUP).expect("send SIGHUP to Direct mount");
+    }
+
+    pub fn refresh_and_wait(&self, timeout: Duration) -> String {
+        const COMPLETION: &str = "yy: fuse refresh: done (";
+        let before = self.logs().matches(COMPLETION).count();
+        self.refresh();
+        wait_until(timeout, "a completed Direct SIGHUP completion line", || {
+            self.logs().matches(COMPLETION).count() > before
+        });
+        let logs = self.logs();
+        let completion = logs
+            .lines()
+            .filter(|line| line.contains(COMPLETION))
+            .nth(before)
+            .unwrap_or_else(|| panic!("missing Direct refresh completion line:\n{logs}"))
+            .to_owned();
+        assert!(
+            completion.contains("errors=0"),
+            "Direct refresh did not invalidate every known entry: {completion}"
+        );
+        completion
     }
 
     pub fn wait_for_log(&self, needle: &str, timeout: Duration) {
