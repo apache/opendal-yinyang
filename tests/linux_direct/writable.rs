@@ -641,7 +641,6 @@ fn direct_write_safe_save_retries_source_cleanup_without_atomic_rename_claim() {
     gate.release();
     gate.wait_original_dropped();
     let renamed = rename.join().expect("safe-save rename thread panicked");
-    drop(gate);
     assert_eq!(
         fixture.raw_get("safe.txt").as_deref(),
         Some(replacement.as_slice())
@@ -986,7 +985,6 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     if !delivered {
         gate.wait_original_dropped();
     }
-    drop(gate);
 
     let (file, error) = publication
         .join()
