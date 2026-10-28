@@ -43,7 +43,7 @@ pub fn require_direct_environment() {
     if !Path::new("/dev/fuse").exists() {
         panic!("/dev/fuse is unavailable; Direct acceptance must fail rather than skip");
     }
-    for tool in ["fusermount3", "timeout"] {
+    for tool in ["fusermount3", "timeout", "python3"] {
         if Command::new(tool).arg("--version").output().is_err() {
             panic!("{tool} is unavailable; Direct acceptance must fail rather than skip");
         }
@@ -60,6 +60,86 @@ pub struct Fixture {
     pub root: String,
     bucket: String,
     raw: RawS3,
+}
+
+pub struct RunningCommand {
+    child: Option<Child>,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+    description: String,
+}
+
+impl RunningCommand {
+    pub fn spawn(mut command: Command) -> Self {
+        let description = describe_command(&command);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn command ({description}): {error}"));
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        Self {
+            child: Some(child),
+            stdout: Some(thread::spawn(move || read_captured(stdout))),
+            stderr: Some(thread::spawn(move || read_captured(stderr))),
+            description,
+        }
+    }
+
+    pub fn kill(&mut self) {
+        self.child
+            .as_mut()
+            .expect("running command is live")
+            .kill()
+            .expect("kill running command");
+    }
+
+    pub fn wait(mut self, timeout: Duration) -> Captured {
+        let child = self.child.as_mut().expect("running command is live");
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait().expect("wait for running command") {
+                Some(status) => break status,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                None => {
+                    let _ = child.kill();
+                    let status = child.wait().expect("wait after killing timed-out command");
+                    let stdout = self.stdout.take().unwrap().join().unwrap_or_default();
+                    let stderr = self.stderr.take().unwrap().join().unwrap_or_default();
+                    panic!(
+                        "command timed out after {timeout:?} with {status} ({}):\nstdout:\n{}\nstderr:\n{}",
+                        self.description,
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            }
+        };
+        self.child.take();
+        Captured {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap_or_default(),
+            stderr: self.stderr.take().unwrap().join().unwrap_or_default(),
+        }
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Fixture {
@@ -125,6 +205,15 @@ impl Fixture {
         self.raw.get(&self.full_key(key))
     }
 
+    pub fn wait_raw_bytes(&self, key: &str, expected: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        let mut observed = None;
+        wait_until(timeout, &format!("raw Direct bytes for {key:?}"), || {
+            observed = self.raw_get(key);
+            observed.as_deref() == Some(expected)
+        });
+        observed
+    }
+
     pub fn inventory(&self) -> Inventory {
         let prefix = format!("{}/", self.root);
         self.raw
@@ -166,6 +255,26 @@ impl Fixture {
                     .to_owned(),
             );
         }
+        self.config_document(name, config)
+    }
+
+    pub fn writable_config(&self, name: &str, frontend: &str, staging: &Path) -> PathBuf {
+        self.config_document(
+            name,
+            json!({
+                "name": name,
+                "model": "direct",
+                "access": "mount",
+                "frontend": frontend,
+                "publication": "object",
+                "storage_profile": "minio",
+                "read_only": false,
+                "staging": staging,
+            }),
+        )
+    }
+
+    pub fn config_document(&self, name: &str, config: Value) -> PathBuf {
         let path = self.path(&format!("{name}.json"));
         fs::write(
             &path,
@@ -203,14 +312,53 @@ impl Fixture {
     }
 
     pub fn spawn_mount(&self, config: &Path, mountpoint: &Path, _frontend: &str) -> Mounted {
-        let mut command = self.yy_command(&[
+        let command = self.mount_command(config, mountpoint);
+        Mounted::spawn(command, mountpoint)
+    }
+
+    pub fn spawn_writable_mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
+        let command = self.mount_command(config, mountpoint);
+        Mounted::spawn_writable(command, mountpoint)
+    }
+
+    pub fn mount_command(&self, config: &Path, mountpoint: &Path) -> Command {
+        self.yy_command(&[
             "--volume",
             config.to_str().expect("Direct config path is UTF-8"),
             "mount",
             mountpoint
                 .to_str()
                 .expect("Direct mountpoint path is UTF-8"),
-        ]);
+        ])
+    }
+
+    pub fn raw_object(&self, key: &str) -> Option<crate::raw_s3::RawObject> {
+        let full_key = self.full_key(key);
+        self.raw.inventory(&full_key).remove(&full_key)
+    }
+
+    pub fn full_key(&self, key: &str) -> String {
+        format!("{}/{key}", self.root)
+    }
+}
+
+pub struct Mounted {
+    child: Option<Child>,
+    mountpoint: PathBuf,
+    logs: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl Mounted {
+    pub fn spawn(command: Command, mountpoint: &Path) -> Self {
+        Self::spawn_with_policy(command, mountpoint, true)
+    }
+
+    pub fn spawn_writable(command: Command, mountpoint: &Path) -> Self {
+        Self::spawn_with_policy(command, mountpoint, false)
+    }
+
+    fn spawn_with_policy(mut command: Command, mountpoint: &Path, read_only: bool) -> Self {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
             .spawn()
@@ -226,23 +374,9 @@ impl Fixture {
             logs,
             readers: vec![stdout, stderr],
         };
-        mounted.wait_visible(Duration::from_secs(30));
+        mounted.wait_visible(Duration::from_secs(30), read_only);
         mounted
     }
-
-    fn full_key(&self, key: &str) -> String {
-        format!("{}/{key}", self.root)
-    }
-}
-
-pub struct Mounted {
-    child: Option<Child>,
-    mountpoint: PathBuf,
-    logs: Arc<Mutex<Vec<u8>>>,
-    readers: Vec<JoinHandle<()>>,
-}
-
-impl Mounted {
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
@@ -255,7 +389,7 @@ impl Mounted {
         String::from_utf8_lossy(&self.logs.lock().expect("mount log lock")).into_owned()
     }
 
-    fn wait_visible(&mut self, timeout: Duration) {
+    fn wait_visible(&mut self, timeout: Duration, read_only: bool) {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some((filesystem, options)) = mount_info(&self.mountpoint) {
@@ -263,9 +397,10 @@ impl Mounted {
                     filesystem, "fuse.yinyang",
                     "Direct mount must expose the YinYang FUSE filesystem type"
                 );
-                assert!(
-                    options.split(',').any(|option| option == "ro"),
-                    "default Direct mount must include the kernel ro option: {options}"
+                let kernel_ro = options.split(',').any(|option| option == "ro");
+                assert_eq!(
+                    kernel_ro, read_only,
+                    "Direct mount policy does not match the kernel mount options: {options}"
                 );
                 return;
             }
@@ -296,6 +431,27 @@ impl Mounted {
         kill(self.pid(), Signal::SIGHUP).expect("send SIGHUP to Direct mount");
     }
 
+    pub fn refresh_and_wait(&self, timeout: Duration) -> String {
+        const COMPLETION: &str = "yy: fuse refresh: done (";
+        let before = self.logs().matches(COMPLETION).count();
+        self.refresh();
+        wait_until(timeout, "a completed Direct SIGHUP completion line", || {
+            self.logs().matches(COMPLETION).count() > before
+        });
+        let logs = self.logs();
+        let completion = logs
+            .lines()
+            .filter(|line| line.contains(COMPLETION))
+            .nth(before)
+            .unwrap_or_else(|| panic!("missing Direct refresh completion line:\n{logs}"))
+            .to_owned();
+        assert!(
+            completion.contains("errors=0"),
+            "Direct refresh did not invalidate every known entry: {completion}"
+        );
+        completion
+    }
+
     pub fn wait_for_log(&self, needle: &str, timeout: Duration) {
         wait_until(timeout, &format!("mount log containing {needle:?}"), || {
             self.logs().contains(needle)
@@ -317,6 +473,18 @@ impl Mounted {
     pub fn terminate(mut self) {
         kill(self.pid(), Signal::SIGTERM).expect("send SIGTERM to Direct mount");
         self.wait(Duration::from_secs(30));
+        self.join_readers();
+    }
+
+    pub fn crash(mut self) {
+        kill(self.pid(), Signal::SIGKILL).expect("send SIGKILL to Direct mount");
+        let child = self.child.as_mut().expect("mount process is live");
+        let status = child.wait().expect("wait for crashed Direct mount");
+        self.child.take();
+        assert!(
+            !status.success(),
+            "SIGKILLed Direct mount unexpectedly exited successfully"
+        );
         self.join_readers();
     }
 
@@ -497,6 +665,20 @@ fn read_request_line(stream: &mut std::net::TcpStream) -> String {
         .into_owned()
 }
 
+fn describe_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn read_captured(mut reader: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    bytes
+}
+
 impl Drop for RequestCounter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -514,6 +696,69 @@ pub fn wait_until(timeout: Duration, context: &str, mut condition: impl FnMut() 
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+pub fn local_paths(root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path)
+            .unwrap_or_else(|error| panic!("read test directory {}: {error}", path.display()))
+        {
+            let entry = entry.expect("read test directory entry");
+            let path = entry.path();
+            paths.push(
+                path.strip_prefix(root)
+                    .expect("test path is below root")
+                    .display()
+                    .to_string(),
+            );
+            if entry.file_type().expect("test path type").is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+pub fn effective_capabilities(document: &[u8]) -> std::collections::BTreeSet<String> {
+    let value: Value = serde_json::from_slice(document).expect("capabilities JSON");
+    value["effective"]
+        .as_array()
+        .expect("effective capability array")
+        .iter()
+        .map(|value| value.as_str().expect("capability name").to_owned())
+        .collect()
+}
+
+pub fn payload(length: usize, seed: u8) -> Vec<u8> {
+    let mut value = Vec::with_capacity(length);
+    let mut state = u64::from(seed) | 1;
+    while value.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        value.extend_from_slice(&state.to_le_bytes());
+    }
+    value.truncate(length);
+    value
+}
+
+pub fn read_fully_at(file: &fs::File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let mut output = vec![0_u8; length];
+    let mut read = 0;
+    while read < output.len() {
+        let count = file.read_at(&mut output[read..], offset + read as u64)?;
+        if count == 0 {
+            output.truncate(read);
+            break;
+        }
+        read += count;
+    }
+    Ok(output)
 }
 
 pub fn path_text(path: &Path) -> &str {

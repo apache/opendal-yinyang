@@ -50,13 +50,14 @@ impl Captured {
 }
 
 pub fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
+    let command_description = describe_command(&command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .unwrap_or_else(|error| panic!("spawn command (format: {command:?}): {error}"));
+        .unwrap_or_else(|error| panic!("spawn command ({command_description}): {error}"));
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let stdout = thread::spawn(move || read_all(stdout));
@@ -74,7 +75,7 @@ pub fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
                 let stdout = stdout.join().unwrap_or_default();
                 let stderr = stderr.join().unwrap_or_default();
                 panic!(
-                    "command timed out after {timeout:?} with {status} (format: {command:?}):\n\
+                    "command timed out after {timeout:?} with {status} ({command_description}):\n\
                      stdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&stdout),
                     String::from_utf8_lossy(&stderr)
@@ -83,7 +84,7 @@ pub fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("wait for command (format: {command:?}): {error}");
+                panic!("wait for command ({command_description}): {error}");
             }
         }
     };
@@ -92,6 +93,14 @@ pub fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
     }
+}
+
+fn describe_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn read_all(mut reader: impl Read) -> Vec<u8> {

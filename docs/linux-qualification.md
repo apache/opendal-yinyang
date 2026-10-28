@@ -11,6 +11,7 @@ qualification.
 | --- | --- | --- |
 | `cargo x test` | host-independent test runners | Rust unit and integration tests; ignored native tests are compiled but not executed |
 | `cargo x test-linux-fuse` | Ubuntu, `/dev/fuse`, isolated Silo | Real `fuse.yinyang` mount, read-only range hydration, writable recovery, corruption, refresh, restart and lifecycle |
+| `cargo x test-linux-direct` | Ubuntu, `/dev/fuse`, Python 3, isolated Silo | Read-only and conditional-writable Direct Mount, Direct Sync, raw inventory/bytes, uncertainty and restart boundaries |
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object Mount and finite Sync, loopback service Mount |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
 
@@ -56,12 +57,20 @@ The initial qualified combination is:
 - one local systemd user manager on a single host;
 - object publication or authenticated single-host loopback service publication;
 - Managed Mount and finite ordinary-directory Managed Sync;
+- read-only and conditional-writable Direct Mount plus finite Direct Sync;
 - isolated MinIO-compatible Silo continuously, with Amazon S3 only when its
   explicit run is recorded.
 
 The metadata service remains one authenticated loopback authority. This matrix
 does not claim TLS, HA, network-safe service exposure, multi-host locking,
 automatic Sync watching, or automatic garbage collection.
+
+Deterministic Direct coverage uses isolated loopback Silo. Real Amazon S3
+Direct qualification is a separate credentials-gated run and does not become a
+matrix entry until its source, bucket, versioning, request and binary evidence
+is recorded. Other S3-compatible services remain outside the matrix unless they
+satisfy exact recursive LIST, conditional ETag mutation and the tested
+version/range behavior.
 
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed
