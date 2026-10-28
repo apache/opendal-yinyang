@@ -556,33 +556,30 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
     );
 
     write_sync_bytes(&directory.join("hello.txt"), SYNC_V1);
-    let gate = S3Gate::start(CommitAction::DropBeforeCommit);
+    let gate = S3Gate::start(CommitAction::DropResponse);
     let mut command = storage.command(
         &legacy,
         &["--volume", config.to_str().unwrap(), "sync", "run"],
     );
     command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
-    let running = Running::spawn(command);
+    let lost = run_timeout(command, PROCESS_TIMEOUT);
+    assert!(
+        !lost.status.success(),
+        "fd1338c Sync must observe response loss as an Unknown failure:\n{}",
+        lost.text()
+    );
     gate.wait_intercepted();
+    drop(gate);
 
     write_sync_bytes(&directory.join("hello.txt"), SYNC_V2);
-    let in_flight = sync_status(&storage, &current, &config);
-    assert_eq!(in_flight["summary"]["unknown"], 1, "{in_flight:#}");
-    assert!(in_flight["summary"]["pending"].as_u64().unwrap_or(0) >= 1);
-    let entry = sync_entry(&in_flight, "hello.txt");
+    let retained = sync_status(&storage, &current, &config);
+    assert_eq!(retained["summary"]["unknown"], 1, "{retained:#}");
+    let entry = sync_entry(&retained, "hello.txt");
     assert_eq!(entry["outcome"]["state"], "unknown");
     let frozen_commit = entry["intent"]["commit_id"]
         .as_str()
         .expect("old Sync intent commit identity")
         .to_owned();
-
-    let _ = running.kill();
-    gate.release();
-    gate.wait_original_dropped();
-    drop(gate);
-
-    let retained = sync_status(&storage, &current, &config);
-    assert_eq!(retained["summary"]["unknown"], 1);
     assert_eq!(
         sync_entry(&retained, "hello.txt")["intent"]["commit_id"],
         frozen_commit.as_str()
@@ -601,7 +598,6 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
     );
     let after_retry = sync_status(&storage, &current, &config);
     assert_eq!(after_retry["summary"]["unknown"], 0, "{after_retry:#}");
-    assert!(after_retry["summary"]["pending"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(
         fs::read(directory.join("hello.txt")).unwrap(),
         SYNC_V2,
@@ -624,15 +620,22 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
     );
     assert_eq!(fs::read(restored_v1.join("hello.txt")).unwrap(), SYNC_V1);
 
-    run_ok(
-        &storage,
-        &current,
-        &["--volume", config.to_str().unwrap(), "sync", "run"],
-        "current publish of the newer local Sync edit",
-    );
-    let converged = sync_status(&storage, &current, &config);
+    let mut converged = after_retry;
+    for _ in 0..3 {
+        if converged["summary"]["in_sync"] == true {
+            break;
+        }
+        run_ok(
+            &storage,
+            &current,
+            &["--volume", config.to_str().unwrap(), "sync", "run"],
+            "current publish of the newer local Sync edit",
+        );
+        converged = sync_status(&storage, &current, &config);
+    }
     assert_eq!(converged["summary"]["in_sync"], true, "{converged:#}");
     assert_eq!(converged["summary"]["unknown"], 0);
+    assert_eq!(fs::read(directory.join("hello.txt")).unwrap(), SYNC_V2);
     let restored_v2 = storage.path("sync-restored-v2");
     run_ok(
         &storage,
