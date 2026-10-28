@@ -210,8 +210,8 @@ async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions
     committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
 
     let snapshot = fs.observe_latest().await.unwrap();
-    let first = snapshot.open_file(id).await.unwrap().reusable_reader();
-    let second = snapshot.open_file(id).await.unwrap().reusable_reader();
+    let first = snapshot.open_file(id).await.unwrap();
+    let second = snapshot.open_file(id).await.unwrap();
     let range = 65_525..65_539;
     backend.state.lock().unwrap().data_reads = 0;
     let mut output = Vec::new();
@@ -241,7 +241,7 @@ async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions
     committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
 
     let fresh = fs.observe_latest().await.unwrap();
-    let file = fresh.open_file(id).await.unwrap().reusable_reader();
+    let file = fresh.open_file(id).await.unwrap();
     backend.state.lock().unwrap().data_reads = 0;
     output.clear();
     file.read_range(range.clone(), &mut output).await.unwrap();

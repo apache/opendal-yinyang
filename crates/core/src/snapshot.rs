@@ -207,17 +207,6 @@ impl FileVersion {
             NodeKind::Directory { .. } => unreachable!("FileVersion requires a file node"),
         }
     }
-    /// Create a reusable reader for this exact immutable version.
-    ///
-    /// The reader shares its content binding's bounded process-local cache.
-    /// Unlike `FileVersion::read_range`, later reads may reuse previously
-    /// authenticated extents without fetching them again.
-    pub fn reusable_reader(&self) -> FileVersionReader {
-        FileVersionReader {
-            data: self.data.clone(),
-            descriptor: self.descriptor().clone(),
-        }
-    }
     /// Return up to EOF. Memory is proportional to returned bytes; use
     /// read_range with a streaming destination for large transfers.
     pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
@@ -231,6 +220,8 @@ impl FileVersion {
     /// Authenticate intersecting units before delivering their bytes. The range
     /// must lie within the file. A later error can leave a verified prefix in
     /// the destination, but never an unverified unit or bytes from another version.
+    /// Previously authenticated extents for this exact version may be reused from
+    /// the bounded process-local cache.
     pub async fn read_range(
         &self,
         range: Range<u64>,
@@ -238,42 +229,6 @@ impl FileVersion {
     ) -> Result<()> {
         self.data
             .read_range_cached(self.descriptor(), range, destination)
-            .await
-    }
-}
-
-/// A read-only handle that may reuse verified ranges for one immutable version.
-///
-/// Exact descriptor and physical extent identity prevent reuse across logical
-/// versions. Reuse is process-local and bounded by the content binding.
-#[derive(Clone, Debug)]
-pub struct FileVersionReader {
-    data: DataStore,
-    descriptor: ContentDescriptor,
-}
-
-impl FileVersionReader {
-    /// Return up to EOF, reusing previously verified ranges when possible.
-    pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
-        let size = self.descriptor.content_id().length();
-        let start = offset.min(size);
-        let end = offset.saturating_add(length as u64).min(size);
-        let mut bytes = Vec::new();
-        self.read_range(start..end, &mut bytes).await?;
-        Ok(bytes)
-    }
-
-    /// Authenticate and return an exact in-bounds range.
-    ///
-    /// Cache hits are revalidated against the pinned logical tree. Errors and
-    /// unverified extents are never inserted.
-    pub async fn read_range(
-        &self,
-        range: Range<u64>,
-        destination: &mut (impl AsyncWrite + Unpin),
-    ) -> Result<()> {
-        self.data
-            .read_range_cached(&self.descriptor, range, destination)
             .await
     }
 }

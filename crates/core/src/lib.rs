@@ -37,7 +37,7 @@ pub use namespace::{DirectoryEntry, Link, Node, NodeKind};
 pub use object::{
     BackendProfile, Cursor, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot,
 };
-pub use snapshot::{DirectoryPage, FileVersion, FileVersionReader, ScanToken};
+pub use snapshot::{DirectoryPage, FileVersion, ScanToken};
 pub use transaction::{Planner, Transaction};
 
 #[cfg(test)]

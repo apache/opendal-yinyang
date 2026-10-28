@@ -93,15 +93,14 @@ For a read-only whole-volume mount, `Mount::open_read_only_node` observes latest
 and pins the authenticated `Snapshot::open_file` result without creating a
 staging record or reading the complete payload. Concurrent opens of one NodeId
 share that immutable `FileVersion`; a later remote revision does not rebase an
-existing descriptor. `read` asks the reusable reader created from that exact
-`FileVersion` for only the intersecting authenticated content units. `getattr`
-with the handle, and path attributes while that observation is active, use its
-node metadata, executable bit, length and revision. `release` drops the reference
-and reclaims a zero-reference observation, so the next open pins the current
-remote revision. Repeated reads may reuse previously verified proof nodes and
-units from the content binding's bounded process-local cache; cache keys are
-bound to the exact immutable version and `PackedRef`, and a fresh version cannot
-consume them.
+existing descriptor. `read` asks the `FileVersion` range reader for only the
+intersecting authenticated content units. `getattr` with the handle, and path
+attributes while that observation is active, use its node metadata, executable
+bit, length and revision. `release` drops the reference and reclaims a
+zero-reference observation, so the next open pins the current remote revision.
+Repeated reads may reuse previously verified proof nodes and units from the
+content binding's bounded process-local cache; cache keys are bound to the exact
+immutable version and `PackedRef`, and a fresh version cannot consume them.
 Before replying to a read-only open, the frontend sends
 `inval_inode(ino, -1, 0)` so a cached pre-transition attribute cannot survive
 while READ uses the newly pinned version. The open reply becomes visible only

@@ -21,11 +21,11 @@ leave a verified prefix. A Vec-returning read exposes no partial result on error
 The version carries its observed node metadata, content descriptor and revision;
 clones read that same content even after remote writes, rename or unlink. It has
 no write methods, publication, staging lease or implicit rebasing. It needs
-access to the retained remote content, not a full local copy. Its direct range
-reads remain uncached and verify each remote extent. `reusable_reader()` returns
-a handle for process-local bounded reuse of ranges already verified for this
-exact version; read-only whole-volume Mount uses it. Retain the NodeId and
-revision and reopen through the same authority to recover this observation.
+access to the retained remote content, not a full local copy. Ranges already
+verified for this exact immutable version may be served from the binding's
+bounded process-local cache; a cold miss still reads and authenticates remote
+bytes. Retain the NodeId and revision and reopen through the same authority to
+recover this observation.
 
 The recoverable `FileHandle` API below deliberately retains full materialization
 for both read-only and writable handles, including its offline staged reads.

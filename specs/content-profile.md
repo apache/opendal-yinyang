@@ -101,12 +101,12 @@ and metadata stay pinned across concurrent namespace and file changes; a fresh
 snapshot is required to observe a newer version. This is an immutable reader,
 not a writable file handle or a persistent offline cache.
 
-`FileVersion::reusable_reader()` creates a read-only handle that may reuse
-verified proof nodes and data units from a process-local cache owned by its
-existing `DataStore` binding. The plain `FileVersion::read_range` path remains
-uncached and re-reads every intersecting extent, so a previously successful read
-does not mask later storage corruption. Read-only whole-volume FUSE mounts use
-the reusable reader.
+`FileVersion` range reads may reuse verified proof nodes and data units from a
+process-local cache owned by their existing `DataStore` binding. A hit returns
+the previously authenticated original bytes for the exact immutable descriptor;
+it never returns bytes from a different version and never turns cached presence
+into preparation authority. A later cache scope or cold miss still detects
+remote corruption before delivering that new range.
 
 Each cache key contains the exact content descriptor and `PackedRef`, so
 different logical versions or descriptors cannot share an entry. Bytes enter the
