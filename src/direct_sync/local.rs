@@ -365,6 +365,49 @@ impl LocalTree {
                 InstallState::Prepared => {}
                 InstallState::Dispatched => {
                     if let Some(fingerprint) = self.infer_dispatched(&install)? {
+                        if install.operation == InstallOperation::DeleteFile
+                            && let Some(stat) = optional_stat(
+                                &self.install_fd,
+                                &install.temporary,
+                                &self.install_path(&install.temporary),
+                            )?
+                        {
+                            let expected = install.expected_local.ok_or_else(|| {
+                                Error::corrupt("local delete recovery has no expected file")
+                            })?;
+                            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                                || stat.st_dev != expected.dev
+                                || stat.st_ino != expected.ino
+                            {
+                                install.state = InstallState::Conflict;
+                                install.error = Some(
+                                    "a different local inode was quarantined during delete recovery"
+                                        .to_owned(),
+                                );
+                                store.update_install(&install)?;
+                                continue;
+                            }
+                            unlinkat(
+                                &self.install_fd,
+                                install.temporary.as_str(),
+                                AtFlags::empty(),
+                            )
+                            .map_err(|error| {
+                                Error::errno(
+                                    "remove quarantined Direct Sync delete",
+                                    &self.install_path(&install.temporary),
+                                    error,
+                                )
+                            })?;
+                            fsync(&self.install_fd).map_err(|error| {
+                                Error::errno(
+                                    "persist Direct Sync delete quarantine",
+                                    &self.state,
+                                    error,
+                                )
+                            })?;
+                        }
+                        self.settle_displaced_artifact(store, &install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
                         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
                     } else if self.local_matches_expected(&install)? {
@@ -382,6 +425,7 @@ impl LocalTree {
                 InstallState::Applied => {
                     let fingerprint = self.local_fingerprint(&install.path)?;
                     if desired_matches(install.desired_local, Some(fingerprint)) {
+                        self.settle_displaced_artifact(store, &install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
                         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
                     } else {
@@ -668,19 +712,69 @@ impl LocalTree {
         }
         install.state = InstallState::Dispatched;
         store.update_install(install)?;
-        unlinkat(&parent_fd, name, AtFlags::empty()).map_err(|error| {
-            Error::errno(
-                "remove Direct Sync local file",
+        if let Err(error) = renameat_with(
+            &parent_fd,
+            name,
+            &self.install_fd,
+            install.temporary.as_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::EXIST) {
+                return self.install_conflict(
+                    store,
+                    install,
+                    "local delete target changed before quarantine",
+                );
+            }
+            return Err(Error::errno(
+                "quarantine Direct Sync local file",
                 &self.root.join(&install.path),
                 error,
-            )
-        })?;
+            ));
+        }
         fsync(&parent_fd).map_err(|error| {
             Error::errno(
                 "persist Direct Sync local removal",
                 &self.root.join(parent),
                 error,
             )
+        })?;
+        let quarantined = hash_at(
+            &self.install_fd,
+            &install.temporary,
+            &self.install_path(&install.temporary),
+        )?;
+        if quarantined.2 != expected.identity()
+            || quarantined.0 != expected.length
+            || quarantined.1.as_bytes() != &expected.digest
+        {
+            let _ = renameat_with(
+                &self.install_fd,
+                install.temporary.as_str(),
+                &parent_fd,
+                name,
+                RenameFlags::NOREPLACE,
+            );
+            return self.install_conflict(
+                store,
+                install,
+                "local delete target changed during quarantine",
+            );
+        }
+        unlinkat(
+            &self.install_fd,
+            install.temporary.as_str(),
+            AtFlags::empty(),
+        )
+        .map_err(|error| {
+            Error::errno(
+                "remove quarantined Direct Sync local file",
+                &self.install_path(&install.temporary),
+                error,
+            )
+        })?;
+        fsync(&self.install_fd).map_err(|error| {
+            Error::errno("persist Direct Sync delete quarantine", &self.state, error)
         })?;
         store.complete_install(&install.id, None, &install.path)?;
         Ok(())
@@ -696,6 +790,56 @@ impl LocalTree {
         install.error = Some(reason.to_owned());
         store.update_install(install)?;
         Err(Error::conflict(reason))
+    }
+
+    fn settle_displaced_artifact(&self, store: &mut Store, install: &InstallRecord) -> Result<()> {
+        if install.operation != InstallOperation::ReplaceFile {
+            return Ok(());
+        }
+        let Some(id) = install.artifact.as_deref() else {
+            return Ok(());
+        };
+        let artifact = store
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == id)
+            .ok_or_else(|| Error::corrupt("displaced local artifact record disappeared"))?;
+        let artifact_exists = optional_stat(
+            &self.artifact_fd,
+            &artifact.name,
+            &self.state.join("artifacts"),
+        )?
+        .is_some();
+        let temporary_exists = optional_stat(
+            &self.install_fd,
+            &install.temporary,
+            &self.install_path(&install.temporary),
+        )?
+        .is_some();
+        if temporary_exists && !artifact_exists {
+            renameat_with(
+                &self.install_fd,
+                install.temporary.as_str(),
+                &self.artifact_fd,
+                artifact.name.as_str(),
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|error| {
+                Error::errno(
+                    "recover displaced Direct Sync local file",
+                    &self.install_path(&install.temporary),
+                    error,
+                )
+            })?;
+            fsync(&self.install_fd).map_err(|error| {
+                Error::errno("persist Direct Sync install directory", &self.state, error)
+            })?;
+            fsync(&self.artifact_fd).map_err(|error| {
+                Error::errno("persist Direct Sync artifact directory", &self.state, error)
+            })?;
+            store.update_artifact(id, ArtifactPhase::Retained, None)?;
+        }
+        Ok(())
     }
 
     fn infer_dispatched(&self, install: &InstallRecord) -> Result<Option<LocalFingerprint>> {
@@ -729,18 +873,27 @@ impl LocalTree {
                 }
             }
             InstallOperation::DeleteFile => {
-                if self.optional_local_fingerprint(&install.path)?.is_none() {
-                    Ok(Some(LocalFingerprint {
-                        length: 0,
-                        digest: [0; 32],
-                        dev: 0,
-                        ino: 0,
-                        parent_dev: 0,
-                        parent_ino: 0,
-                    }))
-                } else {
-                    Ok(None)
+                if self.optional_local_fingerprint(&install.path)?.is_some() {
+                    return Ok(None);
                 }
+                if let Some(quarantined) = self.optional_install_fingerprint(&install.temporary)? {
+                    if let Some(expected) = install.expected_local
+                        && (quarantined.dev != expected.dev
+                            || quarantined.ino != expected.ino
+                            || quarantined.length != expected.length
+                            || quarantined.digest != expected.digest)
+                    {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(LocalFingerprint {
+                    length: 0,
+                    digest: [0; 32],
+                    dev: 0,
+                    ino: 0,
+                    parent_dev: 0,
+                    parent_ino: 0,
+                }))
             }
         }
     }

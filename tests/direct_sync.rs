@@ -17,7 +17,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,7 @@ use yinyang::direct_sync::{
 struct MemoryRemote {
     namespace: String,
     objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    directories: Arc<Mutex<BTreeSet<String>>>,
     generation: Arc<AtomicU64>,
     unknown_next_publish: Arc<AtomicBool>,
     pause_next_publish: Arc<AtomicBool>,
@@ -51,6 +52,7 @@ impl MemoryRemote {
             namespace: "scheme=s3;profile=minio;bucket=test;root=/objects/;endpoint=loopback"
                 .to_owned(),
             objects: Arc::new(Mutex::new(BTreeMap::new())),
+            directories: Arc::new(Mutex::new(BTreeSet::new())),
             generation: Arc::new(AtomicU64::new(1)),
             unknown_next_publish: Arc::new(AtomicBool::new(false)),
             pause_next_publish: Arc::new(AtomicBool::new(false)),
@@ -72,6 +74,14 @@ impl RemoteHandle {
 
     fn delete(&self, path: &str) {
         self.remote.objects.lock().unwrap().remove(path);
+    }
+
+    fn mkdir(&self, path: &str) {
+        self.remote
+            .directories
+            .lock()
+            .unwrap()
+            .insert(path.to_owned());
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -104,8 +114,10 @@ impl DirectRemote for MemoryRemote {
 
     fn observe(&self) -> impl Future<Output = yinyang::replica::Result<RemoteSnapshot>> + Send {
         let objects = self.objects.clone();
+        let directories = self.directories.clone();
         async move {
             let objects = objects.lock().unwrap();
+            let directories = directories.lock().unwrap();
             let mut entries = BTreeMap::new();
             for (path, bytes) in objects.iter() {
                 entries.insert(
@@ -116,6 +128,18 @@ impl DirectRemote for MemoryRemote {
                         size: bytes.len() as u64,
                         pin: Some(pin(path, bytes)),
                         observation: observation(path, bytes),
+                    },
+                );
+            }
+            for path in directories.iter() {
+                entries.insert(
+                    path.clone(),
+                    RemoteEntry {
+                        path: path.clone(),
+                        kind: RemoteKind::Directory,
+                        size: 0,
+                        pin: None,
+                        observation: observation(path, &[]),
                     },
                 );
             }
@@ -481,4 +505,53 @@ async fn wrong_storage_binding_rejects_before_recovery_or_effects() {
 
     let inspection = DirectSync::<MemoryRemote>::inspect(Some(&wrong), &fixture.state, None).await;
     assert_eq!(inspection.binding.state, BindingState::Error);
+}
+
+#[tokio::test]
+async fn empty_local_and_remote_directories_fail_before_state_or_effects() {
+    let local_empty = Fixture::new();
+    std::fs::create_dir(local_empty.root.join("empty")).unwrap();
+    let error = DirectSync::init(
+        local_empty.remote.clone(),
+        &local_empty.state,
+        &local_empty.root,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("empty directory markers"));
+    assert!(!local_empty.state.join("direct-sync.db").exists());
+
+    let remote_empty = Fixture::new();
+    remote_empty.handle.mkdir("empty");
+    let error = DirectSync::init(
+        remote_empty.remote.clone(),
+        &remote_empty.state,
+        &remote_empty.root,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("empty directory markers"));
+    assert!(!remote_empty.state.join("direct-sync.db").exists());
+}
+
+#[tokio::test]
+async fn file_to_directory_transition_is_an_explicit_conflict() {
+    let fixture = Fixture::new();
+    fixture.write("node", b"file");
+    let mut sync = fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.handle.delete("node");
+    fixture.handle.mkdir("node");
+    fixture.handle.put("node/child", b"child");
+    let mut sync = fixture.open().await;
+    let outcome = sync.run().await.unwrap();
+    assert_eq!(outcome.conflicts, 1);
+    assert!(!outcome.in_sync);
+    assert_eq!(fixture.read("node"), b"file");
+    assert_eq!(
+        fixture.handle.read("node/child").as_deref(),
+        Some(b"child".as_slice())
+    );
 }

@@ -270,7 +270,7 @@ impl<R: DirectRemote> DirectSync<R> {
         let namespace = remote.namespace_id();
         let local_scan = local.scan()?;
         let remote_snapshot = remote.observe().await?;
-        reject_unsupported_directories(&local_scan, &remote_snapshot)?;
+        reject_unsupported_directories(&local_scan, &remote_snapshot, &BTreeSet::new())?;
         let local_files = local_files(&local_scan);
         let remote_files = remote_files(&remote_snapshot);
         if !local_files.is_empty() && !remote_files.is_empty() {
@@ -347,16 +347,24 @@ impl<R: DirectRemote> DirectSync<R> {
 
         let observed_remote = self.remote.observe().await?;
         let observed_local = self.local.scan()?;
-        reject_unsupported_directories(&observed_local, &observed_remote)?;
+        let pending_paths = self
+            .store
+            .work()?
+            .into_iter()
+            .map(|record| record.path)
+            .chain(self.store.installs()?.into_iter().map(|record| record.path))
+            .collect::<BTreeSet<_>>();
+        reject_unsupported_directories(&observed_local, &observed_remote, &pending_paths)?;
 
         for work in self.store.work()? {
             if matches!(work.state, WorkState::Prepared | WorkState::Unknown) {
-                self.dispatch_existing_work(work).await?;
+                let _ = self.dispatch_existing_work(work).await?;
             }
         }
 
         let remote_snapshot = self.remote.observe().await?;
         let local_snapshot = self.local.scan()?;
+        reject_unsupported_directories(&local_snapshot, &remote_snapshot, &pending_paths)?;
         let baseline = self.store.baseline()?;
         let blocked = self.blocked_paths()?;
         let actions = plan_actions(&baseline, &local_snapshot, &remote_snapshot, &blocked)?;
@@ -369,12 +377,14 @@ impl<R: DirectRemote> DirectSync<R> {
                     local,
                     baseline,
                 } => match self.publish_local(&path, &local, baseline).await {
-                    Ok(()) => outcome.published_local += 1,
+                    Ok(true) => outcome.published_local += 1,
+                    Ok(false) => {}
                     Err(error) if error.kind() == ErrorKind::Conflict => {}
                     Err(error) => return Err(error),
                 },
                 Action::DeleteRemote { baseline } => match self.delete_remote(baseline).await {
-                    Ok(()) => outcome.deleted_remote += 1,
+                    Ok(true) => outcome.deleted_remote += 1,
+                    Ok(false) => {}
                     Err(error) if error.kind() == ErrorKind::Conflict => {}
                     Err(error) => return Err(error),
                 },
@@ -660,6 +670,11 @@ impl<R: DirectRemote> DirectSync<R> {
 
         let local_map = local_snapshot.as_ref().map(all_local_entries);
         let remote_map = remote_snapshot.as_ref().map(all_remote_entries);
+        let pending_paths = work
+            .iter()
+            .map(|record| record.path.clone())
+            .chain(installs.iter().map(|record| record.path.clone()))
+            .collect::<BTreeSet<_>>();
         let mut unsupported_paths = BTreeSet::new();
         if let Some(local) = &local_snapshot {
             let files = local_files(local);
@@ -671,6 +686,7 @@ impl<R: DirectRemote> DirectSync<R> {
                         node.is_directory()
                             && !node.path.is_empty()
                             && !has_descendant_file(&files, &node.path)
+                            && !is_pending_parent(&node.path, &pending_paths)
                     })
                     .map(|node| node.path.clone()),
             );
@@ -685,6 +701,7 @@ impl<R: DirectRemote> DirectSync<R> {
                         !entry.is_file()
                             && !entry.path.is_empty()
                             && !has_descendant_file(&files, &entry.path)
+                            && !is_pending_parent(&entry.path, &pending_paths)
                     })
                     .map(|entry| entry.path.clone()),
             );
@@ -994,7 +1011,7 @@ impl<R: DirectRemote> DirectSync<R> {
         Ok(blocked)
     }
 
-    async fn dispatch_existing_work(&mut self, work: WorkRecord) -> Result<()> {
+    async fn dispatch_existing_work(&mut self, work: WorkRecord) -> Result<bool> {
         let was_unknown = work.state == WorkState::Unknown;
         self.store
             .update_work_state(work.id, WorkState::Unknown, work.error.as_deref())?;
@@ -1045,7 +1062,8 @@ impl<R: DirectRemote> DirectSync<R> {
         work: WorkRecord,
         was_unknown: bool,
         outcome: MutationOutcome,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut applied = false;
         match outcome {
             MutationOutcome::Applied { accepted } => match work.operation {
                 RemoteOperation::Publish => {
@@ -1065,9 +1083,11 @@ impl<R: DirectRemote> DirectSync<R> {
                             local,
                         }),
                     )?;
+                    applied = true;
                 }
                 RemoteOperation::Delete => {
                     self.store.complete_work(work.id, None)?;
+                    applied = true;
                 }
             },
             MutationOutcome::Conflict => {
@@ -1107,7 +1127,7 @@ impl<R: DirectRemote> DirectSync<R> {
                     .update_work_state(work.id, WorkState::Failed, Some(&message))?;
             }
         }
-        Ok(())
+        Ok(applied)
     }
 
     async fn publish_local(
@@ -1115,7 +1135,7 @@ impl<R: DirectRemote> DirectSync<R> {
         path: &str,
         node: &LocalNode,
         baseline_remote: Option<RemotePin>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let artifact = self.local.capture_local(node, ArtifactKind::Upload)?;
         self.store.insert_artifact(&artifact)?;
         let local = LocalFingerprint::from_node(node)?;
@@ -1147,7 +1167,7 @@ impl<R: DirectRemote> DirectSync<R> {
         self.dispatch_existing_work(work).await
     }
 
-    async fn delete_remote(&mut self, baseline: BaselineEntry) -> Result<()> {
+    async fn delete_remote(&mut self, baseline: BaselineEntry) -> Result<bool> {
         let id = work_identity(
             RemoteOperation::Delete,
             &baseline.path,
@@ -1244,7 +1264,7 @@ impl<R: DirectRemote> DirectSync<R> {
             expected_local: Some(baseline.local),
             desired_local: None,
             desired_remote: Some(pin),
-            temporary: String::new(),
+            temporary: format!("delete-{}", uuid::Uuid::new_v4().simple()),
             artifact: None,
             error: None,
         };
@@ -1374,7 +1394,7 @@ impl<R: DirectRemote> DirectSync<R> {
                             expected_local: Some(local),
                             desired_local: None,
                             desired_remote: None,
-                            temporary: String::new(),
+                            temporary: format!("delete-{}", uuid::Uuid::new_v4().simple()),
                             artifact: None,
                             error: None,
                         };
@@ -1396,6 +1416,11 @@ impl<R: DirectRemote> DirectSync<R> {
                 let baseline_remote = remote.as_ref().and_then(|entry| entry.pin.clone());
                 let mut work = match local_node {
                     Some(node) => {
+                        if remote.as_ref().is_some_and(|entry| !entry.is_file()) {
+                            return Err(Error::conflict(
+                                "remote path is a directory; keep-local cannot replace it with a file",
+                            ));
+                        }
                         let artifact = self.local.capture_local(&node, ArtifactKind::Resolution)?;
                         self.store.insert_artifact(&artifact)?;
                         let local = LocalFingerprint::from_node(&node)?;
@@ -1416,7 +1441,7 @@ impl<R: DirectRemote> DirectSync<R> {
                             error: None,
                         }
                     }
-                    None => WorkRecord {
+                    None if remote.as_ref().is_some_and(RemoteEntry::is_file) => WorkRecord {
                         id: work_identity(
                             RemoteOperation::Delete,
                             &conflict.path,
@@ -1432,6 +1457,16 @@ impl<R: DirectRemote> DirectSync<R> {
                         desired_artifact: None,
                         error: None,
                     },
+                    None if remote.is_some() => {
+                        return Err(Error::conflict(
+                            "remote path is a directory; keep-local cannot delete it",
+                        ));
+                    }
+                    None => {
+                        self.store.remove_baseline(&conflict.path)?;
+                        self.store.remove_conflict(&conflict.id)?;
+                        return Ok(());
+                    }
                 };
                 if work.operation == RemoteOperation::Publish && work.desired_artifact.is_none() {
                     return Err(Error::conflict(
@@ -1442,7 +1477,7 @@ impl<R: DirectRemote> DirectSync<R> {
                 self.store
                     .update_work_state(work.id, WorkState::Unknown, None)?;
                 work.state = WorkState::Unknown;
-                self.dispatch_existing_work(work).await?;
+                let _ = self.dispatch_existing_work(work).await?;
                 if !self
                     .store
                     .work()?
@@ -1528,7 +1563,7 @@ impl<R: DirectRemote> DirectSync<R> {
                 self.store.insert_work(&replacement)?;
                 self.store
                     .update_work_state(replacement.id, WorkState::Unknown, None)?;
-                self.dispatch_existing_work(replacement).await?;
+                let _ = self.dispatch_existing_work(replacement).await?;
             }
             Resolution::KeepRemote => {
                 let remote = snapshot.entries.get(&work.path).cloned();
@@ -1559,7 +1594,7 @@ impl<R: DirectRemote> DirectSync<R> {
                             expected_local: Some(local),
                             desired_local: None,
                             desired_remote: None,
-                            temporary: String::new(),
+                            temporary: format!("delete-{}", uuid::Uuid::new_v4().simple()),
                             artifact: None,
                             error: None,
                         };
@@ -1792,7 +1827,11 @@ fn local_files(snapshot: &LocalSnapshot) -> BTreeMap<String, LocalNode> {
         .collect()
 }
 
-fn reject_unsupported_directories(local: &LocalSnapshot, remote: &RemoteSnapshot) -> Result<()> {
+fn reject_unsupported_directories(
+    local: &LocalSnapshot,
+    remote: &RemoteSnapshot,
+    pending_paths: &BTreeSet<String>,
+) -> Result<()> {
     let local_files = local_files(local);
     let remote_files = remote_files(remote);
     let mut unsupported = Vec::new();
@@ -1800,6 +1839,7 @@ fn reject_unsupported_directories(local: &LocalSnapshot, remote: &RemoteSnapshot
         if node.is_directory()
             && !node.path.is_empty()
             && !has_descendant_file(&local_files, &node.path)
+            && !is_pending_parent(&node.path, pending_paths)
         {
             unsupported.push(format!("local directory {:?}", node.path));
         }
@@ -1808,6 +1848,7 @@ fn reject_unsupported_directories(local: &LocalSnapshot, remote: &RemoteSnapshot
         if !entry.is_file()
             && !entry.path.is_empty()
             && !has_descendant_file(&remote_files, &entry.path)
+            && !is_pending_parent(&entry.path, pending_paths)
         {
             unsupported.push(format!("remote directory {:?}", entry.path));
         }
@@ -1825,6 +1866,11 @@ fn reject_unsupported_directories(local: &LocalSnapshot, remote: &RemoteSnapshot
 fn has_descendant_file<T>(files: &BTreeMap<String, T>, directory: &str) -> bool {
     let prefix = format!("{directory}/");
     files.keys().any(|path| path.starts_with(&prefix))
+}
+
+fn is_pending_parent(directory: &str, pending_paths: &BTreeSet<String>) -> bool {
+    let prefix = format!("{directory}/");
+    pending_paths.iter().any(|path| path.starts_with(&prefix))
 }
 
 fn remote_files(snapshot: &RemoteSnapshot) -> BTreeMap<String, RemoteEntry> {

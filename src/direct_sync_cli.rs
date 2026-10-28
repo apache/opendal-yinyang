@@ -19,7 +19,7 @@
 
 use crate::sync_cli::{SyncCommand, SyncSide};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use yinyang::direct_sync::{
     ArtifactPhase, BindingState, ConflictPresence, DirectRemoteAdapter, DirectSync, EntryState,
