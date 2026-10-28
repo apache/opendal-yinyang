@@ -701,6 +701,57 @@ async fn upload_failure_and_unknown_publication_keep_frozen_identity() {
     assert_eq!(reopened.read(0, 20).await.unwrap(), b"recover me");
     reopened.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn retryable_publication_replays_the_same_frozen_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    runtime.create_file(authority.root(), "file").await.unwrap();
+    let mut file = runtime.open_file("file", true).await.unwrap();
+    file.write(0, b"retry exact").await.unwrap();
+
+    backend.state.lock().unwrap().delay_next_head = true;
+    let Err(Error::Unknown(commit)) = file.fsync().await else {
+        panic!("expected unknown publication");
+    };
+    assert_eq!(file.status().await.unwrap().frozen_commit_id, Some(commit));
+
+    // Allow replay's observe, then fail the commit's observe as a storage error.
+    backend.state.lock().unwrap().fail_head_read_after = Some(1);
+    assert!(matches!(file.fsync().await, Err(Error::Retryable)));
+    let retryable = file.status().await.unwrap();
+    assert!(retryable.pending && retryable.frozen);
+    assert_eq!(
+        retryable.error.as_ref().unwrap().kind(),
+        ErrorKind::Retryable
+    );
+    assert_eq!(retryable.frozen_commit_id, Some(commit));
+    assert!(file.write(0, b"different").await.is_err());
+
+    let receipt = file.fsync().await.unwrap().unwrap();
+    assert_eq!(receipt.commit_id, commit);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(file.status().await.unwrap().node)
+            .await
+            .unwrap()
+            .read(0, 20)
+            .await
+            .unwrap(),
+        b"retry exact"
+    );
+    file.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn clean_handle_reports_unacknowledged_errors_on_close() {
     let temp = tempfile::tempdir().unwrap();
