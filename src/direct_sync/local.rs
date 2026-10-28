@@ -1150,7 +1150,7 @@ fn desired_matches(desired: Option<DesiredFile>, fingerprint: Option<LocalFinger
 }
 
 fn prepare_directory(path: &Path, operation: &str) -> Result<()> {
-    match std::fs::create_dir(path) {
+    match std::fs::create_dir_all(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(Error::io(operation, path, error)),
@@ -1170,7 +1170,7 @@ fn prepare_private_directory(path: &Path, operation: &str) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
+    builder.recursive(true).mode(0o700);
     match builder.create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

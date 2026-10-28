@@ -1167,9 +1167,20 @@ impl<R: DirectRemote> DirectSync<R> {
                             "conditional write returned no accepted version or ETag; Direct Sync cannot baseline it",
                         )
                     })?;
+                    if accepted.version.is_none() && accepted.etag.is_none() {
+                        return Err(Error::unsupported(
+                            "conditional write response exposes neither a version nor an ETag; Direct Sync cannot baseline it",
+                        ));
+                    }
                     let local = work.desired_local.ok_or_else(|| {
                         Error::corrupt("Direct Sync publish work has no accepted local fingerprint")
                     })?;
+                    if accepted.size != local.length {
+                        return Err(Error::unsupported(format!(
+                            "conditional write accepted {} bytes, but the retained input is {} bytes",
+                            accepted.size, local.length
+                        )));
+                    }
                     self.store.complete_work(
                         work.id,
                         Some(&BaselineEntry {
@@ -1612,10 +1623,13 @@ impl<R: DirectRemote> DirectSync<R> {
                     ));
                 }
                 let current_local = local_file(&current, &work.path).cloned();
-                let remote = snapshot
-                    .entries
-                    .get(&work.path)
-                    .and_then(|entry| entry.pin.clone());
+                let remote_entry = snapshot.entries.get(&work.path);
+                if remote_entry.is_some_and(|entry| !entry.is_file()) {
+                    return Err(Error::conflict(
+                        "remote path is a directory; keep-local cannot publish it as a file",
+                    ));
+                }
+                let remote = remote_entry.and_then(|entry| entry.pin.clone());
                 let mut replacement = match current_local {
                     Some(node) => {
                         let artifact = self.local.capture_local(&node, ArtifactKind::Resolution)?;
@@ -1983,7 +1997,10 @@ fn reject_unsupported_directories(
 
 fn has_descendant_file<T>(files: &BTreeMap<String, T>, directory: &str) -> bool {
     let prefix = format!("{directory}/");
-    files.keys().any(|path| path.starts_with(&prefix))
+    files
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|(path, _)| path.starts_with(&prefix))
 }
 
 fn is_pending_parent(directory: &str, pending_paths: &BTreeSet<String>) -> bool {

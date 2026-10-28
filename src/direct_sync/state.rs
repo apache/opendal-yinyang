@@ -153,6 +153,7 @@ const CREATE_SCHEMA: &str = "
 ";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemotePin {
     pub version: Option<String>,
     pub etag: Option<String>,
@@ -189,6 +190,7 @@ impl RemotePin {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalFingerprint {
     pub length: u64,
     pub digest: [u8; 32],
@@ -199,6 +201,7 @@ pub struct LocalFingerprint {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredFile {
     pub length: u64,
     pub digest: [u8; 32],
@@ -476,6 +479,7 @@ pub enum EvidenceKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictSide {
     pub presence: ConflictPresence,
     pub kind: Option<EvidenceKind>,
@@ -1145,6 +1149,18 @@ fn validate_schema(connection: &Connection) -> Result<()> {
     if actual_tables != expected_tables {
         return Err(Error::corrupt(format!(
             "Direct Sync tables are {actual_tables:?}, expected {expected_tables:?}"
+        )));
+    }
+    let profile = connection
+        .query_row("SELECT profile FROM binding WHERE singleton=1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|error| Error::corrupt(format!("inspect Direct Sync profile: {error}")))?
+        .ok_or_else(|| Error::corrupt("Direct Sync binding profile is missing"))?;
+    if profile != PROFILE {
+        return Err(Error::corrupt(format!(
+            "unsupported Direct Sync profile {profile:?}"
         )));
     }
     for (table, expected) in TABLES {

@@ -554,6 +554,35 @@ async fn unknown_survives_restart_and_explicit_keep_local_observes_current_state
 }
 
 #[tokio::test]
+async fn unknown_does_not_become_a_conflict_or_overwrite_an_external_successor() {
+    let fixture = Fixture::new();
+    fixture.write("file", b"v1");
+    let mut sync = fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.write("file", b"v2");
+    fixture.handle.lose_next_publish_response();
+    let mut sync = fixture.open().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.handle.put("file", b"external");
+    let mut sync = fixture.open().await;
+    let outcome = sync.run().await.unwrap();
+    assert_eq!(outcome.unknown, 1);
+    assert_eq!(outcome.conflicts, 0);
+    assert_eq!(
+        fixture.handle.read("file").as_deref(),
+        Some(b"external".as_slice())
+    );
+    let status =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    assert_eq!(status.entries[0].state, EntryState::Unknown);
+    assert_eq!(status.summary.conflicts, 0);
+}
+
+#[tokio::test]
 async fn accepted_older_input_does_not_acknowledge_a_newer_local_edit() {
     let fixture = Fixture::new();
     fixture.write("file", b"v1");
