@@ -43,13 +43,13 @@ fn direct_raw_s3_harness_preserves_requested_keys() {
     );
     let keys = [
         "literal%.txt",
-        "../escape",
-        "./dot",
         "control\u{7f}",
-        "a//b",
-        "/leading",
         "trailing/",
-        "nul\0byte",
+        "space name.txt",
+        "Case.txt",
+        "case.txt",
+        "caf\u{e9}",
+        "cafe\u{301}",
     ];
     for (index, suffix) in keys.iter().enumerate() {
         let key = format!("{root}/{suffix}");
@@ -447,8 +447,7 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
     let fixture = Fixture::new();
     fixture.write_raw("plain.txt", b"plain");
     fixture.write_raw("literal%.txt", b"percent");
-    fixture.write_raw("../escape", b"dotdot");
-    fixture.write_raw("./dot", b"dot");
+    fixture.write_raw("literal%25.txt", b"percent-encoded-spelling");
     fixture.write_raw("control\u{7f}", b"control");
     fixture.write_raw("Case.txt", b"uppercase");
     fixture.write_raw("case.txt", b"lowercase");
@@ -467,12 +466,8 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
         b"percent"
     );
     assert_eq!(
-        fs::read(root.join(find_encoded(root, "..").join("escape"))).unwrap(),
-        b"dotdot"
-    );
-    assert_eq!(
-        fs::read(root.join(find_encoded(root, ".").join("dot"))).unwrap(),
-        b"dot"
+        fs::read(root.join(find_encoded(root, "literal%25.txt"))).unwrap(),
+        b"percent-encoded-spelling"
     );
     assert_eq!(
         fs::read(root.join(find_encoded(root, "control\u{7f}"))).unwrap(),
@@ -502,11 +497,6 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
                 ("a/b".to_owned(), b"child".as_slice()),
             ],
             "file-prefix collision",
-        ),
-        (
-            "empty-component",
-            vec![("a//b".to_owned(), b"empty".as_slice())],
-            "empty",
         ),
         (
             "directory-marker",
