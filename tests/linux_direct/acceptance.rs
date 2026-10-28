@@ -171,6 +171,24 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
         initial_inventory,
         "Direct capabilities and doctor must not mutate raw storage"
     );
+    let status = fixture.yy_ok(&["--volume", path_text(&config), "status"]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout)
+            .to_ascii_lowercase()
+            .contains("direct"),
+        "Direct status did not identify the Direct namespace:\n{}",
+        status.text()
+    );
+    assert_eq!(
+        local_paths(fixture.temp.path()),
+        local_before,
+        "Direct status must not create staging or authority state"
+    );
+    assert_eq!(
+        fixture.inventory(),
+        initial_inventory,
+        "Direct status must not mutate raw storage"
+    );
 
     let mountpoint = fixture.path("mnt");
     fs::create_dir(&mountpoint).expect("create Direct mountpoint");
@@ -256,6 +274,44 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
         fixture.inventory(),
         initial_inventory,
         "rejected Direct writable admission must not mutate raw storage"
+    );
+
+    let staging = fixture.path("direct-staging-must-not-exist");
+    let with_staging = fixture.config(
+        "direct-staging",
+        "fuse",
+        Some(true),
+        Some(staging.as_path()),
+    );
+    let requests = RequestCounter::start();
+    let rejected_mountpoint = fixture.path("mnt-staging");
+    fs::create_dir(&rejected_mountpoint).expect("create staging rejection mountpoint");
+    let mut rejected_command = fixture.yy_command(&[
+        "--volume",
+        path_text(&with_staging),
+        "mount",
+        path_text(&rejected_mountpoint),
+    ]);
+    rejected_command.env("YINYANG_S3_ENDPOINT", requests.endpoint());
+    let rejected = run_timeout(rejected_command, Duration::from_secs(30));
+    assert!(
+        !rejected.status.success(),
+        "Direct staging configuration was accepted"
+    );
+    assert!(
+        rejected.text().to_ascii_lowercase().contains("staging"),
+        "Direct staging rejection did not identify the field:\n{}",
+        rejected.text()
+    );
+    requests.assert_no_requests("Direct staging rejection");
+    assert!(
+        !staging.exists(),
+        "Direct staging rejection created the configured path"
+    );
+    assert_eq!(
+        fixture.inventory(),
+        initial_inventory,
+        "Direct staging rejection mutated raw storage"
     );
 }
 
