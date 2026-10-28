@@ -70,12 +70,13 @@ impl Captured {
 }
 
 pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
+    let command_description = describe_command(&cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
-        .unwrap_or_else(|error| panic!("failed to spawn command (format: {cmd:?}): {error}"));
+        .unwrap_or_else(|error| panic!("failed to spawn command ({command_description}): {error}"));
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let stdout_thread = thread::spawn(move || read_all(stdout));
@@ -91,7 +92,7 @@ pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
                     let stdout = stdout_thread.join().unwrap_or_default();
                     let stderr = stderr_thread.join().unwrap_or_default();
                     panic!(
-                        "command timed out after {timeout:?} with {status} (format: {cmd:?}):\nstdout:\n{}\nstderr:\n{}",
+                        "command timed out after {timeout:?} with {status} ({command_description}):\nstdout:\n{}\nstderr:\n{}",
                         String::from_utf8_lossy(&stdout),
                         String::from_utf8_lossy(&stderr)
                     );
@@ -101,7 +102,7 @@ pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("failed to wait for command (format: {cmd:?}): {error}");
+                panic!("failed to wait for command ({command_description}): {error}");
             }
         }
     };
@@ -112,6 +113,14 @@ pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
         stdout,
         stderr,
     }
+}
+
+fn describe_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn run_external(program: &str, args: &[&str], timeout: Duration) -> Captured {

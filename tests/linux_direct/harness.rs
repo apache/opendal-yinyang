@@ -66,23 +66,26 @@ pub struct RunningCommand {
     child: Option<Child>,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
+    description: String,
 }
 
 impl RunningCommand {
     pub fn spawn(mut command: Command) -> Self {
+        let description = describe_command(&command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
-            .unwrap_or_else(|error| panic!("spawn command (format: {command:?}): {error}"));
+            .unwrap_or_else(|error| panic!("spawn command ({description}): {error}"));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
         Self {
             child: Some(child),
             stdout: Some(thread::spawn(move || read_captured(stdout))),
             stderr: Some(thread::spawn(move || read_captured(stderr))),
+            description,
         }
     }
 
@@ -107,7 +110,8 @@ impl RunningCommand {
                     let stdout = self.stdout.take().unwrap().join().unwrap_or_default();
                     let stderr = self.stderr.take().unwrap().join().unwrap_or_default();
                     panic!(
-                        "command timed out after {timeout:?} with {status}:\nstdout:\n{}\nstderr:\n{}",
+                        "command timed out after {timeout:?} with {status} ({}):\nstdout:\n{}\nstderr:\n{}",
+                        self.description,
                         String::from_utf8_lossy(&stdout),
                         String::from_utf8_lossy(&stderr)
                     );
@@ -659,6 +663,14 @@ fn read_request_line(stream: &mut std::net::TcpStream) -> String {
         .map(String::from_utf8_lossy)
         .unwrap_or_default()
         .into_owned()
+}
+
+fn describe_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn read_captured(mut reader: impl Read) -> Vec<u8> {
