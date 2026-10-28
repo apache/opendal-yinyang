@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
+use yinyang::direct::DirectNamespace;
 use yinyang::runtime::Runtime;
-use yinyang::volume::{Access, Frontend, Publication, Volume, VolumeConfig};
+use yinyang::volume::{Access, Frontend, Model, Publication, Volume, VolumeConfig};
 
 const SCHEMA: &str = "yinyang.operational-health.v1";
 
@@ -88,6 +89,7 @@ impl DoctorReport {
         }
         for value in [
             &mut self.volume.name,
+            &mut self.volume.model,
             &mut self.volume.access,
             &mut self.volume.frontend,
             &mut self.volume.authority,
@@ -112,6 +114,7 @@ impl DoctorReport {
 #[derive(Debug, Default, Serialize)]
 struct VolumeReport {
     name: Option<String>,
+    model: Option<String>,
     access: Option<String>,
     frontend: Option<String>,
     authority: Option<String>,
@@ -170,14 +173,22 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             return finish(report, &secrets, json);
         }
     };
-    if config.staging.is_relative() {
+    if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
         config.staging = path
             .parent()
             .unwrap_or(Path::new("."))
             .join(&config.staging);
     }
+    if config.model == Model::Direct {
+        report.scope = DiagnosticScope {
+            state_probe: "not performed; Direct has no local state path",
+            catalog_and_publication_state: "recursive object listing is read-only; no object, YinYang metadata, SQLite state, recovery, publication or lease is created",
+            authority: "observe one Direct namespace; no mutation is issued",
+        };
+    }
     report.volume = VolumeReport {
         name: Some(config.name.clone()),
+        model: Some(format!("{:?}", config.model).to_ascii_lowercase()),
         access: Some(format!("{:?}", config.access).to_ascii_lowercase()),
         frontend: Some(format!("{:?}", config.frontend).to_ascii_lowercase()),
         authority: Some(
@@ -192,8 +203,8 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
         "configuration",
         Health::Pass,
         format!(
-            "volume {} uses {:?} access with {:?} publication",
-            config.name, config.access, config.publication
+            "volume {} uses {:?} model with {:?} access and {:?} publication",
+            config.name, config.model, config.access, config.publication
         ),
         None::<String>,
     );
@@ -204,9 +215,11 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             Err(detail) => (
                 Health::ActionRequired,
                 detail,
-                Some(
-                    "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain, and provide the service token when publication=service",
-                ),
+                Some(if config.model == Model::Direct {
+                    "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain with stat, read and list permission"
+                } else {
+                    "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain, and provide the service token when publication=service"
+                }),
             ),
         };
     let environment_ready = environment_status == Health::Pass;
@@ -222,7 +235,11 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
 
     if !environment_ready {
         report.push(
-            "authority",
+            if config.model == Model::Direct {
+                "namespace"
+            } else {
+                "authority"
+            },
             Health::ActionRequired,
             "not checked because the storage or service environment is invalid",
             Some("fix the environment check first, then rerun `yy doctor`"),
@@ -283,10 +300,17 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             ),
         }
         if admitted {
-            check_authority(&config, operator, &mut report).await;
+            match config.model {
+                Model::Direct => check_direct_namespace(&config, operator, &mut report).await,
+                Model::Managed => check_authority(&config, operator, &mut report).await,
+            }
         } else {
             report.push(
-                "authority",
+                if config.model == Model::Direct {
+                    "namespace"
+                } else {
+                    "authority"
+                },
                 Health::ActionRequired,
                 "not checked because volume admission failed",
                 Some("fix admission first, then rerun `yy doctor`"),
@@ -294,7 +318,11 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
         }
     } else {
         report.push(
-            "authority",
+            if config.model == Model::Direct {
+                "namespace"
+            } else {
+                "authority"
+            },
             Health::ActionRequired,
             "not checked because the storage operator is invalid",
             Some("fix the environment check first, then rerun `yy doctor`"),
@@ -495,6 +523,15 @@ fn open_fuse_device() -> Result<(), String> {
 }
 
 async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
+    if config.model == Model::Direct {
+        report.push(
+            "local-state",
+            Health::Info,
+            "Direct uses no staging path and creates no local namespace or publication state",
+            None::<String>,
+        );
+        return;
+    }
     match probe_directory(&config.staging) {
         Ok(path) => report.push(
             "local-state",
@@ -551,6 +588,49 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
             Some(
                 "stop the mount, preserve its staging directory, and inspect the SQLite/WAL state before retrying",
             ),
+        ),
+    }
+}
+
+async fn check_direct_namespace(
+    _config: &VolumeConfig,
+    operator: opendal::Operator,
+    report: &mut DoctorReport,
+) {
+    let namespace = match DirectNamespace::new(operator) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            report.push(
+                "namespace",
+                Health::ActionRequired,
+                error.to_string(),
+                Some(
+                    "select an S3 storage profile with stat, read, recursive list, version reads and conditional ETag reads",
+                ),
+            );
+            return;
+        }
+    };
+    match namespace.observe().await {
+        Ok(snapshot) => {
+            let root = snapshot.read_dir(snapshot.root()).unwrap_or_default();
+            let directories = root.iter().filter(|node| node.is_directory()).count();
+            report.push(
+                "namespace",
+                Health::Pass,
+                format!(
+                    "Direct namespace is readable at observation {} with {} root entries and {directories} root directories",
+                    snapshot.revision().to_hex(),
+                    root.len()
+                ),
+                None::<String>,
+            );
+        }
+        Err(error) => report.push(
+            "namespace",
+            Health::ActionRequired,
+            error.to_string(),
+            Some(direct_remediation(&error.to_string())),
         ),
     }
 }
@@ -620,7 +700,11 @@ fn authority_remediation(config: &VolumeConfig, detail: &str) -> &'static str {
         return "verify the storage credentials and bucket permissions; a 403 does not distinguish a bad key from a policy denial";
     }
     if detail.contains("bucket") {
-        return "verify YINYANG_S3_BUCKET and YINYANG_S3_ROOT and grant the principal read/write access";
+        return if config.model == Model::Direct {
+            "verify YINYANG_S3_BUCKET and YINYANG_S3_ROOT and grant the principal stat, read and list access"
+        } else {
+            "verify YINYANG_S3_BUCKET and YINYANG_S3_ROOT and grant the principal read/write access"
+        };
     }
     if detail.contains("connect")
         || detail.contains("dns")
@@ -630,6 +714,32 @@ fn authority_remediation(config: &VolumeConfig, detail: &str) -> &'static str {
         return "verify YINYANG_S3_ENDPOINT, region, DNS, TLS trust and outbound network access";
     }
     "inspect the authority error, bucket policy and local SQLite state; preserve state if the outcome is uncertain"
+}
+
+fn direct_remediation(detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("invalidname")
+        || detail.contains("object key")
+        || detail.contains("collision")
+        || detail.contains("marker")
+    {
+        return "rename or remove the named object key; Direct rejects unrepresentable names and collisions instead of hiding objects";
+    }
+    if detail.contains("credential")
+        || detail.contains("403")
+        || detail.contains("forbidden")
+        || detail.contains("signature")
+    {
+        return "verify that the configured principal can stat, read and list the bucket or prefix";
+    }
+    if detail.contains("connect")
+        || detail.contains("dns")
+        || detail.contains("refused")
+        || detail.contains("timeout")
+    {
+        return "verify YINYANG_S3_ENDPOINT, region, DNS, TLS trust and outbound network access";
+    }
+    "inspect the S3 namespace and its read/list permissions; Direct never creates or repairs object metadata"
 }
 
 fn operator() -> Result<opendal::Operator, opendal::Error> {
