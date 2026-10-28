@@ -120,6 +120,7 @@ pub(super) struct ObjectRecord {
     pub precondition: PreconditionRecord,
     pub state: u8,
     pub generation: u64,
+    pub durable_generation: u64,
     pub length: u64,
     pub digest: Option<[u8; 32]>,
     pub accepted: Option<PinRecord>,
@@ -157,6 +158,28 @@ pub(super) struct Store {
 
 impl Store {
     pub fn open(root: &Path, binding: &DirectStorageBinding) -> Result<Self> {
+        let database = root.join("runtime.db");
+        let exists = database.exists();
+        let nonempty = if exists {
+            std::fs::metadata(&database)
+                .map_err(|error| local("inspect Direct runtime database", error))?
+                .len()
+                > 0
+        } else {
+            false
+        };
+        if nonempty {
+            let check = Connection::open_with_flags(
+                &database,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|error| sqlite("preflight Direct runtime database", error))?;
+            check
+                .busy_timeout(Duration::from_secs(1))
+                .map_err(|error| sqlite("configure Direct runtime preflight", error))?;
+            validate_schema(&check, binding)?;
+        }
+
         create_private_dir(root)?;
         for child in ["objects", "inputs"] {
             create_private_dir(&root.join(child))?;
@@ -181,11 +204,9 @@ impl Store {
             }
         }
 
-        let database = root.join("runtime.db");
-        let exists = database.exists();
         let mut connection = Connection::open_with_flags(
             &database,
-            if exists {
+            if nonempty {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
             } else {
                 OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -198,14 +219,7 @@ impl Store {
             .busy_timeout(Duration::from_secs(1))
             .map_err(|error| sqlite("configure Direct runtime database", error))?;
 
-        let initialized = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='authority')",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|error| sqlite("inspect Direct runtime database", error))?;
-        if initialized {
+        if nonempty {
             validate_schema(&connection, binding)?;
         } else {
             let transaction = connection
@@ -218,7 +232,11 @@ impl Store {
                 .execute(
                     "INSERT INTO authority(singleton,profile,binding,binding_diagnostic)
                      VALUES(1,?1,?2,?3)",
-                    params![PROFILE, binding.digest().as_slice(), binding.diagnostic()],
+                    params![
+                        PROFILE,
+                        binding.namespace_id().as_slice(),
+                        binding.description()
+                    ],
                 )
                 .map_err(|error| sqlite("bind Direct runtime profile", error))?;
             transaction
@@ -431,12 +449,12 @@ fn validate_schema(connection: &Connection, binding: &DirectStorageBinding) -> R
             format!("unsupported Direct runtime profile {profile:?}"),
         ));
     }
-    if bound.as_slice() != binding.digest() {
+    if bound.as_slice() != binding.namespace_id() {
         return Err(Error::new(
             ErrorKind::Invalid,
             format!(
                 "Direct runtime state is bound to {diagnostic:?}, not the selected storage namespace {:?}",
-                binding.diagnostic()
+                binding.description()
             ),
         ));
     }
