@@ -25,3 +25,5 @@ mod harness;
 mod process;
 #[path = "support/raw_s3.rs"]
 mod raw_s3;
+#[path = "linux_direct/writable.rs"]
+mod writable;

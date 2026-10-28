@@ -17,12 +17,14 @@
 
 //! Real S3/FUSE acceptance for read-only Direct volumes.
 
-use crate::harness::{Fixture, RequestCounter, assert_errno, path_text, run_timeout};
+use crate::harness::{
+    Fixture, RequestCounter, assert_errno, effective_capabilities, local_paths, path_text, payload,
+    read_fully_at, run_timeout,
+};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -86,16 +88,6 @@ fn direct_raw_s3_harness_preserves_requested_keys() {
     );
 }
 
-fn effective_capabilities(document: &[u8]) -> BTreeSet<String> {
-    let value: Value = serde_json::from_slice(document).expect("capabilities JSON");
-    value["effective"]
-        .as_array()
-        .expect("effective capability array")
-        .iter()
-        .map(|value| value.as_str().expect("capability name").to_owned())
-        .collect()
-}
-
 fn assert_direct_read_only_capabilities(capabilities: &BTreeSet<String>) {
     for required in ["read", "list"] {
         assert!(
@@ -116,30 +108,6 @@ fn assert_direct_read_only_capabilities(capabilities: &BTreeSet<String>) {
             "Direct read-only capabilities unexpectedly claimed {forbidden:?}: {capabilities:?}"
         );
     }
-}
-
-fn local_paths(root: &Path) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut pending = vec![root.to_owned()];
-    while let Some(path) = pending.pop() {
-        for entry in fs::read_dir(&path)
-            .unwrap_or_else(|error| panic!("read test directory {}: {error}", path.display()))
-        {
-            let entry = entry.expect("read test directory entry");
-            let path = entry.path();
-            paths.push(
-                path.strip_prefix(root)
-                    .expect("test path is below root")
-                    .display()
-                    .to_string(),
-            );
-            if entry.file_type().expect("test path type").is_dir() {
-                pending.push(path);
-            }
-        }
-    }
-    paths.sort();
-    paths
 }
 
 #[test]
@@ -313,33 +281,6 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
         initial_inventory,
         "Direct staging rejection mutated raw storage"
     );
-}
-
-fn payload(length: usize, seed: u8) -> Vec<u8> {
-    let mut value = Vec::with_capacity(length);
-    let mut state = u64::from(seed) | 1;
-    while value.len() < length {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        value.extend_from_slice(&state.to_le_bytes());
-    }
-    value.truncate(length);
-    value
-}
-
-fn read_fully_at(file: &File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
-    let mut output = vec![0_u8; length];
-    let mut read = 0;
-    while read < output.len() {
-        let count = file.read_at(&mut output[read..], offset + read as u64)?;
-        if count == 0 {
-            output.truncate(read);
-            break;
-        }
-        read += count;
-    }
-    Ok(output)
 }
 
 #[test]

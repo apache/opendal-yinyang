@@ -579,6 +579,69 @@ pub fn wait_until(timeout: Duration, context: &str, mut condition: impl FnMut() 
     }
 }
 
+pub fn local_paths(root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path)
+            .unwrap_or_else(|error| panic!("read test directory {}: {error}", path.display()))
+        {
+            let entry = entry.expect("read test directory entry");
+            let path = entry.path();
+            paths.push(
+                path.strip_prefix(root)
+                    .expect("test path is below root")
+                    .display()
+                    .to_string(),
+            );
+            if entry.file_type().expect("test path type").is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+pub fn effective_capabilities(document: &[u8]) -> std::collections::BTreeSet<String> {
+    let value: Value = serde_json::from_slice(document).expect("capabilities JSON");
+    value["effective"]
+        .as_array()
+        .expect("effective capability array")
+        .iter()
+        .map(|value| value.as_str().expect("capability name").to_owned())
+        .collect()
+}
+
+pub fn payload(length: usize, seed: u8) -> Vec<u8> {
+    let mut value = Vec::with_capacity(length);
+    let mut state = u64::from(seed) | 1;
+    while value.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        value.extend_from_slice(&state.to_le_bytes());
+    }
+    value.truncate(length);
+    value
+}
+
+pub fn read_fully_at(file: &fs::File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let mut output = vec![0_u8; length];
+    let mut read = 0;
+    while read < output.len() {
+        let count = file.read_at(&mut output[read..], offset + read as u64)?;
+        if count == 0 {
+            output.truncate(read);
+            break;
+        }
+        read += count;
+    }
+    Ok(output)
+}
+
 pub fn path_text(path: &Path) -> &str {
     path.to_str().expect("test path is UTF-8")
 }
