@@ -146,6 +146,15 @@ The smoke reached the following bounded observations:
 - `doctor` passed and the retained SQLite `staging.db` integrity check reported
   `ok`.
 
+An earlier 90-second run at source `7fd4d87602f3aa98b53dca31eeca9bf6d8ce2f3e`
+reported a same-length mismatch for `file-0015.bin` during the first-phase
+restore. The harness was strengthened to compare the mounted view before
+unmount and to record both byte hashes; the repeat at `79506c0` passed. The
+cause of the original mismatch is not established, so neither run is treated
+as a stable capacity result. The final integrated soak must detect,
+reproduce or explain this residual risk before claiming a settled operating
+envelope.
+
 Request count is unavailable for this smoke because no compatible
 process-scoped counter was supplied; the report keeps that field explicit
 rather than inferring it from local I/O. The raw JSON is retained outside the
