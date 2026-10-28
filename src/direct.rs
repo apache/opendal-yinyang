@@ -47,10 +47,10 @@ pub use mutation::{
     DirectObservation, DirectPrecondition,
 };
 pub use runtime::{
-    DirectFileHandle, DirectFlushOutcome, DirectMutationCounts, DirectMutationEndpoint,
-    DirectMutationId, DirectMutationKind, DirectMutationState, DirectMutationStatus,
-    DirectObjectCounts, DirectObjectState, DirectObjectStatus, DirectRuntime,
-    DirectRuntimeInspection, DirectRuntimeInspectionState,
+    DirectConflictResolution, DirectFileHandle, DirectFlushOutcome, DirectMutationCounts,
+    DirectMutationEndpoint, DirectMutationId, DirectMutationKind, DirectMutationState,
+    DirectMutationStatus, DirectObjectCounts, DirectObjectId, DirectObjectState,
+    DirectObjectStatus, DirectRuntime, DirectRuntimeInspection, DirectRuntimeInspectionState,
 };
 
 const NAME_MAX: usize = 255;
