@@ -225,10 +225,10 @@ mod tests {
         );
         recorder.register_histogram(&key, &metadata).record(0.1);
         recorder
-            .register_histogram(&Key::new(REQUEST_BYTES), &metadata)
+            .register_histogram(&Key::from_name(REQUEST_BYTES), &metadata)
             .record(12.0);
         recorder
-            .register_histogram(&Key::new(RESPONSE_BYTES), &metadata)
+            .register_histogram(&Key::from_name(RESPONSE_BYTES), &metadata)
             .record(34.0);
 
         assert_eq!(state.requests.load(Ordering::Relaxed), 1);
