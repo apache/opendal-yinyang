@@ -180,10 +180,18 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             .join(&config.staging);
     }
     if config.model == Model::Direct {
-        report.scope = DiagnosticScope {
-            state_probe: "not performed; Direct has no local state path",
-            catalog_and_publication_state: "recursive object listing is read-only; no object, YinYang metadata, SQLite state, recovery, publication or lease is created",
-            authority: "observe one Direct namespace; no mutation is issued",
+        report.scope = if config.read_only {
+            DiagnosticScope {
+                state_probe: "not performed; read-only Direct has no local state path",
+                catalog_and_publication_state: "recursive object listing is read-only; no object, YinYang metadata, SQLite state, recovery, publication or lease is created",
+                authority: "observe one Direct namespace; no mutation is issued",
+            }
+        } else {
+            DiagnosticScope {
+                state_probe: "probe the configured Direct staging path with one temporary owner-only file, sync it, and remove it",
+                catalog_and_publication_state: "inspect retained Direct runtime state read-only; no object, recovery, publication or runtime lease is created",
+                authority: "observe one Direct namespace; no mutation is issued",
+            }
         };
     }
     report.volume = VolumeReport {
@@ -216,7 +224,11 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
                 Health::ActionRequired,
                 detail,
                 Some(if config.model == Model::Direct {
-                    "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain with stat, read and list permission"
+                    if config.read_only {
+                        "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain with stat, read and list permission"
+                    } else {
+                        "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain with stat, read, list, conditional write and conditional delete permission as required"
+                    }
                 } else {
                     "set YINYANG_S3_BUCKET; use a complete access-key pair or the ambient AWS credential chain, and provide the service token when publication=service"
                 }),
@@ -523,11 +535,11 @@ fn open_fuse_device() -> Result<(), String> {
 }
 
 async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
-    if config.model == Model::Direct {
+    if config.model == Model::Direct && config.read_only {
         report.push(
             "local-state",
             Health::Info,
-            "Direct uses no staging path and creates no local namespace or publication state",
+            "read-only Direct uses no staging path and creates no local namespace or publication state",
             None::<String>,
         );
         return;
@@ -550,6 +562,19 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
                 "make the state path writable outside synchronized or mounted source trees and ensure free space",
             ),
         ),
+    }
+    if config.model == Model::Direct {
+        if config.staging.join("runtime.db").exists() {
+            report.push(
+                "mount-state",
+                Health::Info,
+                "Direct runtime state exists; doctor did not acquire its lease, run recovery, or mutate it",
+                Some(
+                    "inspect `yy --volume CONFIG status` and preserve staging while pending, conflict or Unknown objects remain",
+                ),
+            );
+        }
+        return;
     }
     if config.access != Access::Mount || !config.staging.join("staging.db").exists() {
         return;
@@ -593,7 +618,7 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
 }
 
 async fn check_direct_namespace(
-    _config: &VolumeConfig,
+    config: &VolumeConfig,
     operator: opendal::Operator,
     report: &mut DoctorReport,
 ) {
@@ -604,9 +629,7 @@ async fn check_direct_namespace(
                 "namespace",
                 Health::ActionRequired,
                 error.to_string(),
-                Some(
-                    "select an S3 storage profile with stat, read, recursive list, version reads and conditional ETag reads",
-                ),
+                Some(direct_config_remediation(config)),
             );
             return;
         }
@@ -633,6 +656,16 @@ async fn check_direct_namespace(
             Some(direct_remediation(&error.to_string())),
         ),
     }
+}
+
+fn direct_config_remediation(config: &VolumeConfig) -> &'static str {
+    if config.read_only {
+        return "select an S3 storage profile with stat, read, recursive list, version reads and conditional ETag reads";
+    }
+    if config.access == Access::Sync {
+        return "select an S3 storage profile with Direct reads, conditional create/replace and conditional delete, then correct unrepresentable keys or collisions";
+    }
+    "select an S3 storage profile with Direct reads and conditional create/replace, then correct unrepresentable keys or collisions"
 }
 
 async fn check_authority(
@@ -700,8 +733,10 @@ fn authority_remediation(config: &VolumeConfig, detail: &str) -> &'static str {
         return "verify the storage credentials and bucket permissions; a 403 does not distinguish a bad key from a policy denial";
     }
     if detail.contains("bucket") {
-        return if config.model == Model::Direct {
+        return if config.model == Model::Direct && config.read_only {
             "verify YINYANG_S3_BUCKET and YINYANG_S3_ROOT and grant the principal stat, read and list access"
+        } else if config.model == Model::Direct {
+            "verify YINYANG_S3_BUCKET and YINYANG_S3_ROOT and grant the principal Direct read plus conditional write, and conditional delete when required"
         } else {
             "verify YINYANG_S3_BUCKET and YINYANG_S3_ROOT and grant the principal read/write access"
         };

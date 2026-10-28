@@ -48,7 +48,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Mount a Managed or read-only Direct volume through the Linux FUSE frontend.
+    /// Mount a Managed or Direct volume through the Linux FUSE frontend.
     Mount { mountpoint: PathBuf },
     /// Operate recoverable file handles (requires --volume).
     File {
