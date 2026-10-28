@@ -724,13 +724,12 @@ mod tests {
             files
         );
         assert!(temp.path().join("staging.db-shm").exists());
-        assert_eq!(
-            std::fs::metadata(temp.path().join("staging.db-wal"))
-                .map(|metadata| metadata.len())
-                .unwrap_or(0),
-            0,
-            "new WAL sidecar must remain empty"
+        let wal = temp.path().join("staging.db-wal");
+        assert!(
+            wal.exists(),
+            "SQLite did not create the observed WAL sidecar"
         );
+        assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
         assert!(!temp.path().join("staging.db-journal").exists());
     }
 
