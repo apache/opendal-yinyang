@@ -766,7 +766,8 @@ async fn file_to_directory_transition_is_an_explicit_conflict() {
     let outcome = sync.run().await.unwrap();
     assert_eq!(outcome.conflicts, 1);
     assert!(!outcome.in_sync);
-    assert_eq!(fixture.read("node"), b"file");
+    assert!(fixture.root.join("node").is_dir());
+    assert_eq!(fixture.read("node/local-child"), b"local-child");
     assert_eq!(
         fixture.handle.read("node/child").as_deref(),
         Some(b"child".as_slice())
