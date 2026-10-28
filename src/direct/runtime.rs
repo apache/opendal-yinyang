@@ -1660,6 +1660,11 @@ impl DirectRuntime {
     async fn flush_entry(&self, entry: &Arc<ObjectEntry>) -> Result<DirectFlushOutcome> {
         let store = self.store.as_ref().expect("writable runtime has a store");
         let mut inner = entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Ok(DirectFlushOutcome::Unsupported {
+                message: "Direct local name was discarded".to_owned(),
+            });
+        }
         if inner.state == DirectObjectState::Clean && inner.generation == inner.durable_generation {
             return Ok(DirectFlushOutcome::Unchanged);
         }
@@ -1893,6 +1898,12 @@ impl DirectFileHandle {
             return Ok(());
         }
         let mut inner = self.entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local name was discarded",
+            ));
+        }
         {
             let file = inner.file.as_mut().ok_or_else(|| {
                 Error::new(
@@ -1919,6 +1930,12 @@ impl DirectFileHandle {
             return Ok(self.len().await?);
         }
         let mut inner = self.entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local name was discarded",
+            ));
+        }
         let offset = inner.length;
         {
             let file = inner.file.as_mut().ok_or_else(|| {
@@ -1943,6 +1960,12 @@ impl DirectFileHandle {
     pub async fn truncate(&self, length: u64) -> Result<()> {
         self.require_writable()?;
         let mut inner = self.entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local name was discarded",
+            ));
+        }
         if inner.length != length {
             let file = inner.file.as_mut().ok_or_else(|| {
                 Error::new(
@@ -2629,6 +2652,7 @@ mod tests {
         .await
         .unwrap();
         let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.truncate(0).await.unwrap();
         file.write(0, b"local").await.unwrap();
         operator.write("file", b"external".to_vec()).await.unwrap();
         let outcome = file.flush().await.unwrap();

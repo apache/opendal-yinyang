@@ -109,6 +109,7 @@ pub struct S3Gate {
     events: mpsc::Receiver<GateEvent>,
     release: Arc<(Mutex<bool>, Condvar)>,
     stop: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
     intercepted_request: Arc<Mutex<Option<GateRequest>>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -183,6 +184,7 @@ impl S3Gate {
             events: receiver,
             release,
             stop,
+            poisoned,
             intercepted_request,
             thread: Some(thread),
         }
@@ -253,6 +255,12 @@ impl S3Gate {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
         condvar.notify_all();
+    }
+
+    /// Resume forwarding after the intentionally dropped response has been
+    /// observed. The first matching request remains intercepted for life.
+    pub fn resume(&self) {
+        self.poisoned.store(false, Ordering::SeqCst);
     }
 }
 
