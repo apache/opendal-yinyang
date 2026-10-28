@@ -23,8 +23,8 @@
   "files": [
     {
       "path": "object/expected.json",
-      "length": 12504,
-      "sha256": "660b1bce9aa1352bf389a785ce6c8751ac9e8c354a8185504d26c917dc6d3d77"
+      "length": 12505,
+      "sha256": "036ac8ccd607a9de2b1b7936746e9d2b1d0b33da2632c45a0e3523156ffc4e57"
     },
     {
       "path": "object/journal/directory.db",

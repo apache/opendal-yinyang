@@ -135,12 +135,13 @@ def head_identity(path):
     if data[:8] == b"YYHEAD02":
         if len(data) < 65:
             fail(f"{path} is a truncated YYHEAD02 fixture")
+        sequence = int.from_bytes(data[41:49], "little")
         return {
             "profile": "YYHEAD02",
             "mode": data[8],
             "filesystem": data[9:25].hex(),
             "root": data[25:41].hex(),
-            "revision": data[41:65].hex(),
+            "revision": f"{sequence:016x}{data[49:65].hex()}",
         }
     if data[:8] == b"YYSERV01":
         if len(data) != 40:
