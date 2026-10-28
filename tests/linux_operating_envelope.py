@@ -736,7 +736,6 @@ class Harness:
         if not self.yy.is_file():
             raise EnvelopeError(f"yy binary is unavailable: {self.yy}")
         self.request_accounting = self.load_request_accounting()
-        self.run([str(self.yy), "--version"], self.env)
         versioning = self.aws(
             [
                 "get-bucket-versioning",
@@ -1096,13 +1095,6 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     source_sha = args.source_sha.strip()
     if len(source_sha) != 40 or any(character not in "0123456789abcdef" for character in source_sha):
         raise EnvelopeError("--source-sha must be a 40-character lowercase Git SHA")
-    yy_version = subprocess.run(
-        [str(yy), "--version"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
     return {
         "schema": SCHEMA,
         "status": "fail",
@@ -1111,7 +1103,6 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "binary": {
             "path": str(yy),
             "sha256": binary_sha256(yy),
-            "version_output": yy_version.stdout.strip() or yy_version.stderr.strip(),
         },
         "backend": {
             "label": args.backend_label,
