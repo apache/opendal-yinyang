@@ -18,6 +18,7 @@
 //! Durable single-authority metadata, independent of object-store head CAS.
 //! SQLite files must reside on a local filesystem that honors sync and locking.
 
+use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
 use crate::namespace::{Node, NodeKind, decode, encode};
 use crate::snapshot::{
     ChangeRecord, Cursor, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
@@ -37,8 +38,24 @@ use tokio::io::AsyncRead;
 mod transport;
 pub use transport::{ServiceClient, serve};
 
-const PROFILE: &str = "yinyang-sqlite-1";
 type Db = Arc<Mutex<Connection>>;
+const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
+const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
+    ("singleton", "INTEGER"),
+    ("profile", "TEXT"),
+    ("filesystem", "BLOB"),
+    ("root", "BLOB"),
+    ("latest", "BLOB"),
+];
+const PREPARED_COLUMNS: [(&str, &str); 1] = [("descriptor", "BLOB")];
+const RECORDS_COLUMNS: [(&str, &str); 5] = [
+    ("family", "INTEGER"),
+    ("key", "BLOB"),
+    ("start", "INTEGER"),
+    ("end", "INTEGER"),
+    ("value", "BLOB"),
+];
+const REVISIONS_COLUMNS: [(&str, &str); 2] = [("token", "BLOB"), ("sequence", "INTEGER")];
 
 /// One durable filesystem authority. Clones and independent processes coordinate
 /// through SQLite; no process-local cache determines the latest revision.
@@ -52,6 +69,102 @@ pub struct MetadataService {
 
 fn sql(error: rusqlite::Error) -> Error {
     Error::new(ErrorKind::Storage, "metadata database", error.to_string())
+}
+fn corrupt_schema(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::Corrupt, "metadata database", message)
+}
+fn check_columns(conn: &Connection, table: &str, expected: &[(&str, &str)]) -> Result<()> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| {
+            corrupt_schema(format!("cannot inspect table {table} columns: {error}"))
+        })?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
+        .map_err(|error| {
+            corrupt_schema(format!("cannot inspect table {table} columns: {error}"))
+        })?;
+    if columns.len() != expected.len()
+        || columns
+            .iter()
+            .zip(expected)
+            .any(|((name, kind), (expected_name, expected_kind))| {
+                name.as_str() != *expected_name || !kind.eq_ignore_ascii_case(expected_kind)
+            })
+    {
+        return Err(corrupt_schema(format!(
+            "schema profile has an incompatible {table} table"
+        )));
+    }
+    Ok(())
+}
+fn inspect_schema(conn: &Connection) -> Result<bool> {
+    let tables = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type='table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .map_err(|error| corrupt_schema(format!("cannot inspect SQLite schema: {error}")))?;
+    if tables.is_empty() {
+        return Ok(false);
+    }
+    if !tables.iter().any(|table| table == "authority") {
+        return Err(Error::unsupported(
+            "open metadata authority",
+            "database is not a YinYang authority",
+        ));
+    }
+    let profile: Option<String> = conn
+        .query_row(
+            "SELECT profile FROM authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| corrupt_schema(format!("cannot read authority profile: {error}")))?;
+    match profile.as_deref() {
+        Some(SQLITE_SCHEMA_PROFILE) => {}
+        Some(_) => {
+            return Err(Error::unsupported(
+                "open metadata authority",
+                "unknown schema profile",
+            ));
+        }
+        None => return Err(corrupt_schema("authority profile row is missing")),
+    }
+    for required in REQUIRED_TABLES {
+        if !tables.iter().any(|table| table.as_str() == required) {
+            return Err(corrupt_schema(format!(
+                "schema profile is missing table {required}"
+            )));
+        }
+    }
+    check_columns(conn, "authority", &AUTHORITY_COLUMNS)?;
+    check_columns(conn, "prepared", &PREPARED_COLUMNS)?;
+    check_columns(conn, "records", &RECORDS_COLUMNS)?;
+    check_columns(conn, "revisions", &REVISIONS_COLUMNS)?;
+    let (_, _, revision) = manifest(conn)?;
+    let sequence: Option<i64> = conn
+        .query_row(
+            "SELECT sequence FROM revisions WHERE token=?1",
+            params![revision.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| corrupt_schema(format!("cannot validate retained revision: {error}")))?;
+    if sequence != Some(revision.sequence as i64) {
+        return Err(corrupt_schema("latest manifest is not a retained revision"));
+    }
+    Ok(true)
 }
 async fn db_call<T: Send + 'static>(
     db: &Db,
@@ -86,6 +199,14 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
         }
         let conn = Connection::open_with_flags(path, flags).map_err(sql)?;
         conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
+        let existing = inspect_schema(&conn)?;
+        if !existing && !create {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "open metadata authority",
+                "database is missing or uninitialized",
+            ));
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )
@@ -102,17 +223,21 @@ fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
-        .map_err(sql)?;
-    if profile != PROFILE {
+        .map_err(|error| corrupt_schema(format!("cannot read authority manifest: {error}")))?;
+    if profile != SQLITE_SCHEMA_PROFILE {
         return Err(Error::unsupported(
             "open metadata authority",
             "unknown schema profile",
         ));
     }
+    let revision = Revision::from_bytes(fixed(revision)?);
+    if revision.sequence > i64::MAX as u64 {
+        return Err(corrupt_schema("latest revision exceeds the SQLite domain"));
+    }
     Ok((
         NodeId::from_bytes(fixed(fs)?),
         NodeId::from_bytes(fixed(root)?),
-        Revision::from_bytes(fixed(revision)?),
+        revision,
     ))
 }
 fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
@@ -123,6 +248,20 @@ fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
             "invalid identity length",
         )
     })
+}
+fn parse_service_binding(bytes: &[u8]) -> Result<(NodeId, NodeId)> {
+    if bytes.len() < SERVICE_BINDING_MAGIC.len() {
+        return Err(corrupt_schema("service binding is truncated"));
+    }
+    if bytes[..SERVICE_BINDING_MAGIC.len()] != SERVICE_BINDING_MAGIC {
+        return Err(Error::unsupported(
+            "open metadata authority",
+            "unknown service binding profile",
+        ));
+    }
+    let (magic, filesystem, root): ([u8; 8], [u8; 16], [u8; 16]) = decode(bytes)?;
+    debug_assert_eq!(magic, SERVICE_BINDING_MAGIC);
+    Ok((NodeId::from_bytes(filesystem), NodeId::from_bytes(root)))
 }
 impl MetadataService {
     /// Initialize a new local database or reopen its exact existing authority.
@@ -140,7 +279,7 @@ impl MetadataService {
                 let fs = NodeId::generate();
                 let root = NodeId::generate();
                 let revision = Revision::new(0);
-                tx.execute("INSERT INTO authority VALUES(1,?1,?2,?3,?4)",params![PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
+                tx.execute("INSERT INTO authority VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
                 tx.execute("INSERT INTO revisions VALUES(?1,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
                 let node = Node {id:root, generation:1, executable:false, link:None, kind:NodeKind::Directory{membership:1}};
                 tx.execute("INSERT INTO records VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
@@ -184,7 +323,7 @@ impl MetadataService {
     }
     fn marker(&self) -> Result<Vec<u8>> {
         encode(&(
-            *b"YYSERV01",
+            SERVICE_BINDING_MAGIC,
             *self.filesystem.as_bytes(),
             *self.root.as_bytes(),
         ))
@@ -194,7 +333,8 @@ impl MetadataService {
             .read(".yinyang/head")
             .await
             .map_err(|e| Error::from_storage("read authority binding", e))?;
-        if marker.to_vec() != self.marker()? {
+        let (filesystem, root) = parse_service_binding(&marker.to_vec())?;
+        if filesystem != self.filesystem || root != self.root {
             return Err(Error::invalid(
                 "open metadata authority",
                 "storage belongs to another filesystem or publication mode",
@@ -492,5 +632,42 @@ impl RecordReader for SqlRecords {
                 rows.collect::<std::result::Result<Rows,_>>().map_err(sql)
             }).await
         })
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn unknown_rpc_version_is_rejected_before_command_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let before = service.observe_latest().await.unwrap().revision();
+        let token = "metadata-rpc-compatibility-test-token";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, service.clone(), token.into()));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = borsh::to_vec(&(2_u8, token.to_owned(), 3_u8, vec![0_u8])).unwrap();
+        stream.write_u32(request.len() as u32).await.unwrap();
+        stream.write_all(&request).await.unwrap();
+        let length = stream.read_u32().await.unwrap() as usize;
+        let mut response = vec![0; length];
+        stream.read_exact(&mut response).await.unwrap();
+        let (variant, kind, message): (u8, u8, String) = borsh::from_slice(&response).unwrap();
+        assert_eq!(variant, 5, "expected an RPC error response");
+        assert_eq!(kind, 4, "expected Unsupported");
+        assert!(message.contains("unknown protocol version"), "{message}");
+        assert_eq!(service.observe_latest().await.unwrap().revision(), before);
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+        server.abort();
     }
 }
