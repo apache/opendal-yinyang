@@ -650,11 +650,20 @@ mod tests {
         fs
     }
 
+    fn names(path: &std::path::Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[tokio::test]
     async fn unsupported_profile_is_rejected_without_creating_a_lease_or_changing_sqlite() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let fs = raw_database(&path, "yinyang-stage-99", true);
+        let _ = raw_database(&path, "yinyang-stage-99", true);
         assert_eq!(
             Stage::inspect(path.clone()).await.unwrap_err().kind(),
             ErrorKind::Unsupported
@@ -685,6 +694,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(profile, "yinyang-stage-99");
+    }
+
+    #[tokio::test]
+    async fn unsupported_profile_read_only_rejection_preserves_authoritative_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        let fs = raw_database(&path, "yinyang-stage-99", true);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL")
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert_eq!(
+            Stage::inspect(path.clone()).await.unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!temp.path().join("runtime.lock").exists());
+        assert!(
+            names(temp.path()).iter().all(|name| matches!(
+                name.as_str(),
+                "staging.db" | "staging.db-wal" | "staging.db-shm" | "staging.db-journal"
+            )),
+            "read-only profile admission created a non-SQLite file: {:?}",
+            names(temp.path())
+        );
     }
 
     #[tokio::test]

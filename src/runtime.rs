@@ -28,6 +28,8 @@ use yinyang_core::{
 mod staging;
 use staging::{CHUNK, Record, Stage};
 pub(crate) mod schema;
+#[cfg(test)]
+mod sqlite_tests;
 
 mod error;
 pub use error::{Error, ErrorKind, Failure, Result};
