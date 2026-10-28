@@ -155,7 +155,8 @@ jobs:
           cargo test --workspace --all-targets s3_ -- \
             --ignored --nocapture \
             --skip isolated_s3_cli_smoke \
-            --skip real_amazon_s3_cli_smoke
+            --skip real_amazon_s3_cli_smoke \
+            --skip direct_amazon_s3_
 
       - name: Run fd1338c cross-version acceptance
         run: cargo x test-compatibility
