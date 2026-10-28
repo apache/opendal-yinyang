@@ -687,6 +687,8 @@ async fn file_to_directory_transition_is_an_explicit_conflict() {
     fixture.handle.delete("node");
     fixture.handle.mkdir("node");
     fixture.handle.put("node/child", b"child");
+    std::fs::remove_file(fixture.root.join("node")).unwrap();
+    std::fs::create_dir(fixture.root.join("node")).unwrap();
     fixture.write("node/local-child", b"local-child");
     let mut sync = fixture.open().await;
     let outcome = sync.run().await.unwrap();
