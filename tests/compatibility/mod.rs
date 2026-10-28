@@ -17,4 +17,5 @@
 
 pub mod cases;
 pub mod fixtures;
+pub mod recovery;
 pub mod runtime;
