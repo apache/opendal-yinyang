@@ -122,7 +122,7 @@ async fn independent_content_vectors_read_and_reject_before_output() {
         .read_range(&descriptor, 65_535..65_537, &mut output)
         .await
         .unwrap();
-    assert_eq!(output, b"7x");
+    assert_eq!(output, [7, b'x']);
     output.clear();
     store
         .read_range(&descriptor, 65_536..65_537, &mut output)
@@ -385,7 +385,9 @@ async fn service_binding_fixtures_distinguish_unknown_malformed_and_mismatch() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
     insert_object(&backend, ".yinyang/head", SERVICE_BINDING_CURRENT);
-    let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+    let path = temp.path().join("metadata.db");
+    std::fs::write(&path, SERVICE_CURRENT).unwrap();
+    let service = MetadataService::open(&path, backend.operator())
         .await
         .unwrap();
     let token = "metadata-rpc-compatibility-test-token";

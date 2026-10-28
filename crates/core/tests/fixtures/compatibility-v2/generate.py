@@ -204,7 +204,7 @@ def transaction_fixture(descriptor: bytes, digest_value: bytes) -> tuple[bytes, 
         b"YYREQ002"
         + FILESYSTEM
         + borsh_vec([])
-        + borsh_vec([mutation_logical])
+        + borsh_vec([borsh_bytes(mutation_logical)])
     )
     request_digest = blake3.blake3(request, derive_key_context=REQUEST_CONTEXT).digest()
     base = struct.pack(">Q", 7) + NONCE
@@ -213,7 +213,7 @@ def transaction_fixture(descriptor: bytes, digest_value: bytes) -> tuple[bytes, 
         + FILE_NODE
         + ROOT
         + borsh_string("file")
-        + borsh_option(borsh_vec([descriptor]))
+        + borsh_option(borsh_bytes(descriptor))
         + b"\x01"
     )
     plan = (
@@ -223,7 +223,7 @@ def transaction_fixture(descriptor: bytes, digest_value: bytes) -> tuple[bytes, 
         + base
         + request_digest
         + borsh_vec([])
-        + borsh_vec([mutation_plan])
+        + borsh_vec([borsh_bytes(mutation_plan)])
     )
     return plan, request_digest
 
