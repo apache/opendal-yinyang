@@ -202,6 +202,14 @@ with stable ObjectId, raw key, mapped path, parent, name, length, remote-existed
 flag, precondition, accepted/observed evidence and pending mutation. Clean
 observations from an old pin are not reused for a new snapshot.
 
+After a successful own write, a clean retained entry may be promoted when the
+new snapshot's HEAD pin exactly matches its accepted response pin. Promotion
+updates the entry ObjectId to the new DirectId instead of creating a second
+clean entry for the same key. Existing writers and readers keep sharing the same
+local bytes; only FUSE-owned descriptor attributes remain pinned separately. An
+unrelated external successor does not match the accepted pin and does not reuse
+the old clean bytes.
+
 ## Unlink
 
 `unlink_file` requires the observed ETag and issues conditional delete. It has no
