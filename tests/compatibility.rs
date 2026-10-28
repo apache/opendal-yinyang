@@ -91,7 +91,11 @@ fn compatibility_fixture_manifest_is_immutable() {
             "fixture length changed for {relative}"
         );
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            Sha256::digest(&bytes)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             expected_hash,
             "fixture bytes changed for {relative}"
         );

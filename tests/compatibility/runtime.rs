@@ -198,7 +198,11 @@ pub fn assert_tree_matches(root: &Path, expected: &Value) {
                 );
                 let bytes = fs::read(&actual).unwrap();
                 assert_eq!(
-                    format!("{:x}", Sha256::digest(&bytes)),
+                    Sha256::digest(&bytes)
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
                     entry["sha256"].as_str().expect("file hash"),
                     "restored bytes for {path}"
                 );

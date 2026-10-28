@@ -17,7 +17,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "linux_direct/acceptance.rs"]
 mod acceptance;
+#[path = "linux_direct/harness.rs"]
 mod harness;
 #[path = "support/process.rs"]
 mod process;

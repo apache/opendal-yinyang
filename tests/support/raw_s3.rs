@@ -17,7 +17,7 @@
 
 //! Minimal path-style S3 client used to preserve raw key bytes in acceptance.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -124,7 +124,7 @@ impl RawS3 {
 
     pub fn inventory(&self, prefix: &str) -> RawInventory {
         let mut keys = Vec::new();
-        let mut token = None;
+        let mut token: Option<String> = None;
         loop {
             let mut query = vec![
                 ("encoding-type".to_owned(), "url".to_owned()),

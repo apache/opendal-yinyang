@@ -30,7 +30,11 @@ use std::process::Command;
 use std::time::Duration;
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn parse_handle(output: &[u8]) -> String {
@@ -303,20 +307,18 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
         "service",
         Some(service.address),
     );
-    let handle = parse_handle(
-        &storage
-            .run(
-                &current,
-                &[
-                    "--volume",
-                    config.to_str().unwrap(),
-                    "file",
-                    "open",
-                    "service.txt",
-                ],
-            )
-            .success_or("current service open"),
+    let opened = storage.run(
+        &current,
+        &[
+            "--volume",
+            config.to_str().unwrap(),
+            "file",
+            "open",
+            "service.txt",
+        ],
     );
+    opened.success_or("current service open");
+    let handle = parse_handle(&opened.stdout);
     let bytes = storage.run(
         &current,
         &[
@@ -345,21 +347,19 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
             ],
         )
         .success_or("current service create");
-    let write_handle = parse_handle(
-        &storage
-            .run(
-                &current,
-                &[
-                    "--volume",
-                    config.to_str().unwrap(),
-                    "file",
-                    "open",
-                    "current-service.txt",
-                    "--write",
-                ],
-            )
-            .success_or("current service writable open"),
+    let opened = storage.run(
+        &current,
+        &[
+            "--volume",
+            config.to_str().unwrap(),
+            "file",
+            "open",
+            "current-service.txt",
+            "--write",
+        ],
     );
+    opened.success_or("current service writable open");
+    let write_handle = parse_handle(&opened.stdout);
     let payload = storage.path("current-service-input");
     fs::write(&payload, b"current service writer").unwrap();
     storage
@@ -417,20 +417,18 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
         ("service.txt", fixture_service_hash),
         ("current-service.txt", current_service_hash.as_str()),
     ] {
-        let handle = parse_handle(
-            &storage
-                .run(
-                    &legacy,
-                    &[
-                        "--volume",
-                        legacy_config.to_str().unwrap(),
-                        "file",
-                        "open",
-                        path,
-                    ],
-                )
-                .success_or("fd1338c service open"),
+        let opened = storage.run(
+            &legacy,
+            &[
+                "--volume",
+                legacy_config.to_str().unwrap(),
+                "file",
+                "open",
+                path,
+            ],
         );
+        opened.success_or("fd1338c service open");
+        let handle = parse_handle(&opened.stdout);
         let bytes = storage.run(
             &legacy,
             &[
