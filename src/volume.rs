@@ -22,7 +22,7 @@ use opendal::Operator;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use yinyang_core::service::ServiceClient;
 use yinyang_core::{Authority, BackendProfile, Fs};
@@ -488,6 +488,6 @@ pub fn direct_namespace(config: &VolumeConfig, operator: Operator) -> Result<Dir
         .map_err(|error| Error::local_kind(ErrorKind::Invalid, error.to_string()))
 }
 
-fn path_is_empty(path: &PathBuf) -> bool {
+fn path_is_empty(path: &Path) -> bool {
     path.as_os_str().is_empty()
 }
