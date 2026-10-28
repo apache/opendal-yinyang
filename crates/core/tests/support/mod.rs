@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use opendal::raw::*;
-use opendal::{Buffer, BytesRange, EntryMode, Metadata, OperationContext, Operator};
+use opendal::{Buffer, BytesRange, Metadata, MetadataBuilder, OperationContext, Operator};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -113,6 +113,7 @@ impl Service for TestService {
     type Lister = ();
     type Deleter = ();
     type Copier = ();
+    type Composer = ();
 
     fn info(&self) -> ServiceInfo {
         ServiceInfo::with_scheme("s3")
@@ -197,7 +198,6 @@ impl Service for TestService {
         _: &str,
         _: &str,
         _: OpCopy,
-        _: OpCopier,
     ) -> opendal::Result<Self::Copier> {
         Err(unsupported())
     }
@@ -368,9 +368,9 @@ impl oio::Write for TestWriter {
 }
 
 fn metadata(object: &StoredObject) -> Metadata {
-    Metadata::new(EntryMode::FILE)
-        .with_content_length(object.bytes.len() as u64)
-        .with_etag(object.etag.clone())
+    let mut builder = MetadataBuilder::file(object.bytes.len() as u64);
+    builder.etag(object.etag.clone());
+    builder.build()
 }
 
 fn not_found() -> opendal::Error {
