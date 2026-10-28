@@ -33,6 +33,8 @@ pub struct TestState {
     pub next_revision: u64,
     pub fail_after_head_write: bool,
     pub fail_next_write_response: bool,
+    pub fail_next_write_before_effect: bool,
+    pub fail_next_delete_before_effect: bool,
     pub stat_calls: u64,
     pub head_stat_calls: u64,
     pub fail_data_close: bool,
@@ -86,6 +88,14 @@ impl TestBackend {
 
     pub fn lose_next_write_response(&self) {
         self.state.lock().unwrap().fail_next_write_response = true;
+    }
+
+    pub fn fail_next_write_before_effect(&self) {
+        self.state.lock().unwrap().fail_next_write_before_effect = true;
+    }
+
+    pub fn fail_next_delete_before_effect(&self) {
+        self.state.lock().unwrap().fail_next_delete_before_effect = true;
     }
 
     pub fn stat_calls(&self) -> u64 {
@@ -162,13 +172,24 @@ impl Service for TestService {
         Ok(RpStat::new(metadata(object)))
     }
 
-    fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> opendal::Result<Self::Reader> {
+    fn read(
+        &self,
+        _: &OperationContext,
+        path: &str,
+        args: OpRead,
+    ) -> opendal::Result<Self::Reader> {
         let mut state = self.state.lock().unwrap();
         if state.offline {
             return Err(unavailable());
         }
         state.read_paths.push(path.to_owned());
         let object = state.objects.get(path).cloned().ok_or_else(not_found)?;
+        if args.if_match().is_some_and(|etag| object.etag != etag) {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::ConditionNotMatch,
+                "ETag does not match",
+            ));
+        }
         Ok(TestReader {
             object,
             state: self.state.clone(),
@@ -330,6 +351,13 @@ impl oio::Write for TestWriter {
                 "ETag does not match",
             ));
         }
+        if state.fail_next_write_before_effect {
+            state.fail_next_write_before_effect = false;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "write failed before effect",
+            ));
+        }
 
         state.next_revision += 1;
         state.written_bytes += self.bytes.len() as u64;
@@ -393,6 +421,13 @@ impl oio::OneShotDelete for TestDeleter {
         let mut state = self.state.lock().unwrap();
         if state.offline {
             return Err(unavailable());
+        }
+        if state.fail_next_delete_before_effect {
+            state.fail_next_delete_before_effect = false;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "delete failed before effect",
+            ));
         }
         if let Some(etag) = args.if_match()
             && state
