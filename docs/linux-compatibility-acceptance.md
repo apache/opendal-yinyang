@@ -24,6 +24,10 @@ them:
 - current processes reopen and restore `fd1338c` object history, pending
   staging bytes, service SQLite authority, Sync state, backup packages and
   committed publication journals;
+- actual `fd1338c` processes are held at the object `.yinyang/head` commit
+  boundary to create frozen directory, Mount and Sync requests; current
+  processes reopen and retry the original CommitId/digest/bytes while newer
+  local work remains a separate pending edit;
 - `fd1338c` processes read state written by the current binary;
 - unknown or malformed persistent profiles are rejected at their format
   boundary, and copied local or remote state is byte-identical after rejection.
