@@ -422,7 +422,7 @@ impl DirectInner {
         guard(&self.dentries).insert((parent.0, name.to_owned()));
     }
 
-    async fn refresh_once(&self) {
+    async fn refresh_remote_only(&self) {
         match self.namespace.observe().await {
             Ok(snapshot) => {
                 let revision = snapshot.revision().to_hex();
@@ -442,7 +442,6 @@ impl DirectInner {
                 eprintln!(
                     "yy: fuse refresh: Direct observation {revision} with {root_entries} root entries and {pending} pending objects"
                 );
-                self.invalidate_known().await;
             }
             Err(error) => {
                 let message = error.to_string();
@@ -451,6 +450,13 @@ impl DirectInner {
                 );
                 *guard(&self.refresh_error) = Some(message);
             }
+        }
+    }
+
+    async fn refresh_once(&self) {
+        self.refresh_remote_only().await;
+        if guard(&self.refresh_error).is_none() {
+            self.invalidate_known().await;
         }
     }
 
@@ -731,21 +737,21 @@ impl DirectInner {
             };
             match flush {
                 DirectFlushOutcome::Unchanged | DirectFlushOutcome::Applied { .. } => {
-                    self.refresh_once().await;
+                    self.refresh_remote_only().await;
                 }
                 DirectFlushOutcome::Conflict { .. } => {
                     let _ = self.refresh_pending().await;
-                    self.refresh_once().await;
+                    self.refresh_remote_only().await;
                     return reply.error(fuser::Errno::ESTALE);
                 }
                 DirectFlushOutcome::Unknown { .. } => {
                     let _ = self.refresh_pending().await;
-                    self.refresh_once().await;
+                    self.refresh_remote_only().await;
                     return reply.error(fuser::Errno::EIO);
                 }
                 DirectFlushOutcome::Unsupported { message } => {
                     let _ = self.refresh_pending().await;
-                    self.refresh_once().await;
+                    self.refresh_remote_only().await;
                     eprintln!("yy: fuse create: Direct publication is unsupported: {message}");
                     return reply.error(fuser::Errno::EOPNOTSUPP);
                 }
@@ -875,14 +881,14 @@ impl DirectInner {
         };
         match mutation_errno(&status) {
             None => {
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 reply.ok();
             }
             Some(errno) => {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
                 }
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 eprintln!(
                     "yy: fuse unlink: Direct mutation {} retained in {:?}: {}",
                     status.id.to_hex(),
@@ -960,14 +966,14 @@ impl DirectInner {
         };
         match mutation_errno(&status) {
             None => {
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 reply.ok();
             }
             Some(errno) => {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse rename: cannot retain mutation state: {pending:?}");
                 }
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 eprintln!(
                     "yy: fuse rename: Direct mutation {} retained in {:?}: {}",
                     status.id.to_hex(),
@@ -1238,21 +1244,21 @@ impl DirectInner {
                 if let Ok(status) = file.status().await {
                     self.store_pending(status);
                 }
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 Ok(())
             }
             DirectFlushOutcome::Conflict { .. } => {
                 if let Err(errno) = self.refresh_pending().await {
                     eprintln!("yy: fuse flush: cannot retain Direct conflict state: {errno:?}");
                 }
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 Err(fuser::Errno::ESTALE)
             }
             DirectFlushOutcome::Unknown { .. } => {
                 if let Err(errno) = self.refresh_pending().await {
                     eprintln!("yy: fuse flush: cannot retain Direct unknown state: {errno:?}");
                 }
-                self.refresh_once().await;
+                self.refresh_remote_only().await;
                 Err(fuser::Errno::EIO)
             }
             DirectFlushOutcome::Unsupported { message } => {

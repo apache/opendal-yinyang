@@ -1,8 +1,8 @@
 # Volume admission and capabilities
 
 **Status: experimental Managed volume, Mount durability policy, library and
-Linux FUSE frontends, conditional-write S3 Direct, and Linux ordinary-directory
-Managed Sync.**
+Linux FUSE frontends, conditional-write S3 Direct, Direct Sync, and Linux
+ordinary-directory Managed Sync.**
 Writable Direct is opt-in and requires local staging. Direct Sync is a separate
 library workflow for the combinations admitted below. macOS and Windows
 frontends are recognized configuration choices but rejected as unimplemented
