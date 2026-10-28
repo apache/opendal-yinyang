@@ -19,5 +19,7 @@
 
 mod acceptance;
 mod harness;
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/raw_s3.rs"]
 mod raw_s3;

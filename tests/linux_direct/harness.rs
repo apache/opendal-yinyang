@@ -17,6 +17,7 @@
 
 //! Real raw-S3 and Linux FUSE harness for read-only Direct acceptance.
 
+pub use crate::process::{Captured, run_timeout};
 pub use crate::raw_s3::{RawInventory as Inventory, RawObject as StoredObject, RawS3};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -24,7 +25,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -51,78 +52,6 @@ pub fn require_direct_environment() {
         if std::env::var_os(name).is_none() {
             panic!("{name} is unset; Direct acceptance must fail rather than skip");
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct Captured {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-impl Captured {
-    pub fn success_or(&self, context: &str) {
-        assert!(
-            self.status.success(),
-            "{context} failed with {}:\nstdout:\n{}\nstderr:\n{}",
-            self.status,
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        );
-    }
-
-    pub fn text(&self) -> String {
-        format!(
-            "stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        )
-    }
-}
-
-pub fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|error| panic!("spawn command (format: {command:?}): {error}"));
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout = thread::spawn(move || read_all(stdout));
-    let stderr = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let status = child.wait().expect("wait after killing timed-out command");
-                let stdout = stdout.join().unwrap_or_default();
-                let stderr = stderr.join().unwrap_or_default();
-                panic!(
-                    "command timed out after {timeout:?} with {status} (format: {command:?}):\n\
-                     stdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("wait for command (format: {command:?}): {error}");
-            }
-        }
-    };
-    Captured {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
     }
 }
 
@@ -566,10 +495,4 @@ fn spawn_log_reader(
             }
         }
     })
-}
-
-fn read_all(mut reader: impl Read) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
-    bytes
 }

@@ -17,6 +17,10 @@
 
 #[path = "compatibility/mod.rs"]
 mod compatibility;
+#[path = "support/process.rs"]
+mod process;
+#[path = "support/raw_s3.rs"]
+mod raw_s3;
 
 use compatibility::fixtures::{EXPECTED_PRODUCER, fixture_root};
 use serde_json::Value;
