@@ -99,6 +99,14 @@ impl Fixture {
         self.temp.path().join(name)
     }
 
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
     pub fn write_raw(&self, key: &str, bytes: &[u8]) {
         let key = self.full_key(key);
         self.raw.put(&key, bytes);
@@ -375,12 +383,21 @@ pub fn assert_errno(error: &std::io::Error, expected: &[i32], context: &str) {
 pub struct RequestCounter {
     address: std::net::SocketAddr,
     requests: Arc<AtomicUsize>,
+    request_lines: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl RequestCounter {
     pub fn start() -> Self {
+        Self::start_inner(None)
+    }
+
+    pub fn start_with_response(response: Vec<u8>) -> Self {
+        Self::start_inner(Some(response))
+    }
+
+    fn start_inner(response: Option<Vec<u8>>) -> Self {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind Direct request counter");
         listener
@@ -390,19 +407,27 @@ impl RequestCounter {
             .local_addr()
             .expect("Direct request counter address");
         let requests = Arc::new(AtomicUsize::new(0));
+        let request_lines = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_requests = requests.clone();
+        let thread_request_lines = request_lines.clone();
         let thread_stop = stop.clone();
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         thread_requests.fetch_add(1, Ordering::Relaxed);
-                        let _ = stream.write_all(
+                        let request_line = read_request_line(&mut stream);
+                        thread_request_lines
+                            .lock()
+                            .expect("Direct request line lock")
+                            .push(request_line);
+                        let response = response.as_deref().unwrap_or(
                             b"HTTP/1.1 500 Internal Server Error\r\n\
                               Content-Length: 0\r\n\
                               Connection: close\r\n\r\n",
                         );
+                        let _ = stream.write_all(response);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -414,6 +439,7 @@ impl RequestCounter {
         Self {
             address,
             requests,
+            request_lines,
             stop,
             thread: Some(thread),
         }
@@ -427,6 +453,13 @@ impl RequestCounter {
         self.requests.load(Ordering::Relaxed)
     }
 
+    pub fn request_lines(&self) -> Vec<String> {
+        self.request_lines
+            .lock()
+            .expect("Direct request line lock")
+            .clone()
+    }
+
     pub fn assert_no_requests(&self, context: &str) {
         thread::sleep(Duration::from_millis(250));
         assert_eq!(
@@ -435,6 +468,33 @@ impl RequestCounter {
             "{context} reached the S3 endpoint before admission rejected it"
         );
     }
+}
+
+fn read_request_line(stream: &mut std::net::TcpStream) -> String {
+    const MAX_HEADER: usize = 64 * 1024;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set Direct request counter read timeout");
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while request.len() < MAX_HEADER {
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    request
+        .split(|byte| *byte == b'\r' || *byte == b'\n')
+        .next()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default()
+        .into_owned()
 }
 
 impl Drop for RequestCounter {

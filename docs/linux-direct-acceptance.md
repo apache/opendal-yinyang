@@ -2,8 +2,8 @@
 
 `cargo x test-linux-direct` exercises an existing raw S3 namespace through the
 real `yy --volume CONFIG mount` FUSE entry point. It does not first call
-`yy create`, and every test compares a raw S3 inventory before and after the
-operation.
+`yy create`. Native backend tests compare the visible raw S3 inventory and
+every seeded key before and after the operation.
 
 The command requires:
 
@@ -29,8 +29,11 @@ Acceptance covers:
   `false` is rejected by the actual mount entry point before any S3 connection;
 - `capabilities` and `doctor` without Managed write primitives, staging state
   or authoritative YinYang metadata;
-- complete-observation rejection for file-prefix conflicts, non-empty
-  directory markers and overlong names that the selected backend can store;
+- complete-observation rejection for non-empty directory markers and overlong
+  names that the selected backend lists;
+- a controlled complete `ListObjectsV2` response containing both `a` and
+  `a/b`, routed through the actual CLI and OpenDAL request path, which must
+  reject the file-prefix collision after that single GET and before mounting;
 - the reversible percent mapping while preserving case and Unicode
   normalization distinctions;
 - raw external replacement and deletion, retained descriptor attributes,
@@ -39,6 +42,16 @@ Acceptance covers:
   version and an unversioned ETag path that fails `ESTALE` rather than falling
   back to an unconditional range read;
 - SIGTERM teardown and a fresh mount without storage mutation.
+
+The recursive LIST must return every current object key exactly; it is a
+backend contract prerequisite for Direct. Pagination is not an atomic snapshot,
+because external writers can make different pages describe different moments.
+The selected Silo test endpoint supports exact GET for both `a` and `a/b`, but
+its `ListObjectsV2` response exposes only `a`. Direct cannot discover the
+hidden key without guessing names or probing arbitrary paths, so this scenario
+is outside the validated Direct support boundary. The controlled complete-list
+fixture proves collision rejection without claiming that Silo qualifies; the
+remaining backend qualification stays open.
 
 The shared `YINYANG_S3_BUCKET` is never versioned by the suite. The separate
 versioned bucket is a test resource and remains isolated from Managed suites.

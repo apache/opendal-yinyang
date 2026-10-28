@@ -554,18 +554,128 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
     );
 }
 
+fn complete_list_response(bucket: &str, root: &str) -> Vec<u8> {
+    let parent = format!("{root}/a");
+    let child = format!("{root}/a/b");
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult>\
+         <Name>{bucket}</Name>\
+         <Prefix>{root}/</Prefix>\
+         <KeyCount>2</KeyCount>\
+         <MaxKeys>1000</MaxKeys>\
+         <EncodingType>url</EncodingType>\
+         <IsTruncated>false</IsTruncated>\
+         <Contents>\
+         <Key>{parent}</Key>\
+         <LastModified>2026-10-28T00:00:00.000Z</LastModified>\
+         <ETag>\"parent-etag\"</ETag>\
+         <Size>4</Size>\
+         <StorageClass>STANDARD</StorageClass>\
+         </Contents>\
+         <Contents>\
+         <Key>{child}</Key>\
+         <LastModified>2026-10-28T00:00:01.000Z</LastModified>\
+         <ETag>\"child-etag\"</ETag>\
+         <Size>5</Size>\
+         <StorageClass>STANDARD</StorageClass>\
+         </Contents>\
+         </ListBucketResult>"
+    );
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/xml\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_complete_list_file_prefix_collision_rejects_before_mount() {
+    let fixture = Fixture::new();
+    fixture.write_raw("a", b"file");
+    fixture.write_raw("a/b", b"child");
+    let inventory = fixture.inventory();
+
+    let requests = RequestCounter::start_with_response(complete_list_response(
+        fixture.bucket(),
+        fixture.root(),
+    ));
+    let config = fixture.config("direct-complete-list-collision", "fuse", None, None);
+    let mountpoint = fixture.path("mnt-complete-list-collision");
+    fs::create_dir(&mountpoint).expect("create complete-list collision mountpoint");
+    let local_before = local_paths(fixture.temp.path());
+    let mut rejected_command = fixture.yy_command(&[
+        "--volume",
+        path_text(&config),
+        "mount",
+        path_text(&mountpoint),
+    ]);
+    rejected_command.env("YINYANG_S3_ENDPOINT", requests.endpoint());
+    let rejected = run_timeout(rejected_command, Duration::from_secs(30));
+
+    assert!(
+        !rejected.status.success(),
+        "a complete LIST that exposes a file-prefix collision was accepted"
+    );
+    let diagnostic = rejected.text();
+    assert!(
+        diagnostic
+            .to_ascii_lowercase()
+            .contains("file-prefix collision"),
+        "Direct collision rejection did not identify the invariant:\n{diagnostic}"
+    );
+    for key in ["a", "a/b"] {
+        assert!(
+            diagnostic.contains(key),
+            "Direct collision rejection omitted original key {key:?}:\n{diagnostic}"
+        );
+    }
+    assert_eq!(
+        requests.count(),
+        1,
+        "Direct collision rejection must stop after the complete LIST"
+    );
+    let requests = requests.request_lines();
+    assert_eq!(requests.len(), 1, "one complete-list request was expected");
+    assert!(
+        requests[0].starts_with("GET /") && requests[0].contains("list-type=2"),
+        "collision fixture did not receive the expected recursive ListObjectsV2 request: {:?}",
+        requests[0]
+    );
+    assert_eq!(
+        local_paths(fixture.temp.path()),
+        local_before,
+        "Direct collision rejection created local staging or authority state"
+    );
+    assert_eq!(
+        fixture.inventory(),
+        inventory,
+        "Direct collision rejection changed the backend's visible object inventory"
+    );
+    for (key, bytes) in [("a", b"file".as_slice()), ("a/b", b"child".as_slice())] {
+        assert_eq!(
+            fixture.raw_get(key).as_deref(),
+            Some(bytes),
+            "Direct collision rejection changed exact key {key:?}"
+        );
+    }
+    if inventory.len() == 1 {
+        eprintln!(
+            "Silo boundary evidence: exact GET retained both keys while ListObjectsV2 exposed only one; \
+             the controlled complete-list fixture above covers collision rejection"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
 fn direct_unrepresentable_names_reject_the_complete_observation_without_writes() {
     let cases: Vec<(&str, Vec<(String, &[u8])>, &str)> = vec![
-        (
-            "file-prefix",
-            vec![
-                ("a".to_owned(), b"file".as_slice()),
-                ("a/b".to_owned(), b"child".as_slice()),
-            ],
-            "file-prefix collision",
-        ),
         (
             "directory-marker",
             vec![("dir/".to_owned(), b"not-a-directory".as_slice())],
