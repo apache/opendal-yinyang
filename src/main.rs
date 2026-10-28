@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use yinyang::core::{BackendProfile, CommitId, Fs, Revision};
+#[cfg(target_os = "linux")]
+mod direct_sync_cli;
 mod directory_cli;
 mod file_cli;
 mod operations_cli;
@@ -150,7 +152,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 return Ok(operations_cli::run(path, json).await);
             }
             #[cfg(target_os = "linux")]
-            Command::Sync { command } => sync_cli::run(path, command).await,
+            Command::Sync { command } => direct_sync_cli::run(path, command).await,
             command => file_cli::run(path, command).await,
         };
     }

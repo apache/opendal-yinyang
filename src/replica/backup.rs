@@ -18,7 +18,7 @@
 //! Experimental quiesced backup package for Linux Managed Sync.
 
 use super::linux::{
-    Identity, LocalKind, LocalNode, LocalSnapshot, Replica, observe_path, validate_path,
+    Identity, LocalKind, LocalNode, LocalSnapshot, Replica, scan_path, validate_path,
 };
 use super::state::{Binding, IdentityMap, Store};
 use super::{Error, Result};
@@ -626,7 +626,7 @@ impl BackupManifest {
 }
 
 fn snapshot(root: &Path) -> Result<LocalSnapshot> {
-    observe_path(root)
+    scan_path(root)
 }
 
 fn canonical_target(path: &Path) -> Result<PathBuf> {

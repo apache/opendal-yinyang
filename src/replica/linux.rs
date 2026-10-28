@@ -2111,7 +2111,10 @@ impl From<ConflictRecord> for Conflict {
     }
 }
 
-pub(super) fn observe_path(path: &Path) -> Result<LocalSnapshot> {
+/// Scan one existing path without following symlinks or crossing a filesystem
+/// boundary. The returned paths are relative to `path`, whose snapshot key is
+/// the empty string.
+pub fn scan_path(path: &Path) -> Result<LocalSnapshot> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
