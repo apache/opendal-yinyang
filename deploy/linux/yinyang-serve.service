@@ -1,0 +1,17 @@
+[Unit]
+Description=Apache OpenDAL YinYang authenticated loopback metadata service
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=%h/.config/yinyang/environment
+EnvironmentFile=-%h/.config/yinyang/environment-service
+ExecStart=/usr/bin/env ${YINYANG_BIN} serve --database ${YINYANG_METADATA_DB} --listen ${YINYANG_SERVICE_LISTEN}
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
