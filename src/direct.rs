@@ -29,6 +29,7 @@ use opendal::{EntryMode, ErrorKind as OpenDalErrorKind, Operator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 const NAME_MAX: usize = 255;
 const PATH_MAX: usize = 4095;
@@ -143,6 +144,7 @@ pub struct DirectNode {
     kind: DirectKind,
     size: u64,
     pin: Option<ObjectPin>,
+    modified: Option<SystemTime>,
 }
 
 impl DirectNode {
@@ -182,10 +184,14 @@ impl DirectNode {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.modified
+    }
 }
 
 /// An operator-bound Direct namespace.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DirectNamespace {
     operator: Operator,
 }
@@ -225,6 +231,7 @@ impl DirectNamespace {
                     size: metadata.content_length(),
                     etag: pin_value(metadata.etag()).map(str::to_owned),
                     version: pin_value(metadata.version()).map(str::to_owned),
+                    modified: metadata.last_modified().map(SystemTime::from),
                     directory: metadata.mode() == EntryMode::DIR || entry.path().ends_with('/'),
                 }
             })
@@ -280,7 +287,7 @@ pub fn validate_operator(operator: &Operator) -> Result<()> {
 }
 
 /// One complete storage-native namespace observation.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DirectSnapshot {
     namespace: DirectNamespace,
     revision: DirectRevision,
@@ -307,6 +314,7 @@ impl DirectSnapshot {
                 kind: DirectKind::Directory,
                 size: 0,
                 pin: None,
+                modified: None,
             }),
         );
         children.insert(root, BTreeMap::new());
@@ -389,6 +397,7 @@ impl DirectSnapshot {
                 kind,
                 size: if record.directory { 0 } else { record.size },
                 pin,
+                modified: record.modified,
             });
             nodes.insert(id, node);
             children
@@ -518,6 +527,8 @@ impl DirectSnapshot {
         let observed = ObjectPin {
             version: pin_value(metadata.version()).map(str::to_owned),
             etag: pin_value(metadata.etag()).map(str::to_owned),
+            size: metadata.content_length(),
+            modified: metadata.last_modified().map(SystemTime::from),
         };
         if observed.version.is_none() && observed.etag.is_none() {
             return Err(Error::new(
@@ -543,6 +554,7 @@ impl DirectSnapshot {
             length: metadata.content_length(),
             version: observed.version,
             etag: observed.etag,
+            modified: metadata.last_modified().map(SystemTime::from),
         })
     }
 }
@@ -556,6 +568,7 @@ pub struct DirectFile {
     length: u64,
     version: Option<String>,
     etag: Option<String>,
+    modified: Option<SystemTime>,
 }
 
 impl DirectFile {
@@ -577,6 +590,10 @@ impl DirectFile {
 
     pub fn etag(&self) -> Option<&str> {
         self.etag.as_deref()
+    }
+
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.modified
     }
 
     /// Read exactly one contiguous range from the pinned object version.
@@ -622,12 +639,15 @@ struct ObjectRecord {
     etag: Option<String>,
     version: Option<String>,
     directory: bool,
+    modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ObjectPin {
     version: Option<String>,
     etag: Option<String>,
+    size: u64,
+    modified: Option<SystemTime>,
 }
 
 impl ObjectPin {
@@ -635,6 +655,8 @@ impl ObjectPin {
         let pin = Self {
             version: pin_value(record.version.as_deref()).map(str::to_owned),
             etag: pin_value(record.etag.as_deref()).map(str::to_owned),
+            size: record.size,
+            modified: record.modified,
         };
         (pin.version.is_some() || pin.etag.is_some()).then_some(pin)
     }
@@ -642,10 +664,20 @@ impl ObjectPin {
     fn matches(&self, observed: &Self) -> bool {
         match &self.version {
             Some(version) => observed.version.as_deref() == Some(version),
-            None => match &self.etag {
-                Some(etag) => observed.version.is_none() && observed.etag.as_deref() == Some(etag),
-                None => false,
-            },
+            None => {
+                let etag_matches = match &self.etag {
+                    Some(etag) => {
+                        observed.version.is_none() && observed.etag.as_deref() == Some(etag)
+                    }
+                    None => false,
+                };
+                etag_matches
+                    && self.size == observed.size
+                    && match (self.modified, observed.modified) {
+                        (Some(expected), Some(observed)) => expected == observed,
+                        _ => true,
+                    }
+            }
         }
     }
 }
@@ -665,6 +697,26 @@ fn hash_record(hasher: &mut blake3::Hasher, record: &ObjectRecord) {
             None => {
                 hasher.update(&[0]);
             }
+        }
+    }
+    hash_time(hasher, record.modified);
+}
+
+fn hash_time(hasher: &mut blake3::Hasher, value: Option<SystemTime>) {
+    match value.map(|time| time.duration_since(SystemTime::UNIX_EPOCH)) {
+        Some(Ok(duration)) => {
+            hasher.update(&[1]);
+            hasher.update(&duration.as_secs().to_be_bytes());
+            hasher.update(&duration.subsec_nanos().to_be_bytes());
+        }
+        Some(Err(error)) => {
+            let duration = error.duration();
+            hasher.update(&[2]);
+            hasher.update(&duration.as_secs().to_be_bytes());
+            hasher.update(&duration.subsec_nanos().to_be_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
         }
     }
 }
@@ -842,6 +894,7 @@ fn ensure_directory(
                 kind: DirectKind::Directory,
                 size: 0,
                 pin: None,
+                modified: None,
             }),
         );
         children
@@ -876,6 +929,8 @@ fn derive_id(path: &str, kind: DirectKind, pin: Option<&ObjectPin>) -> DirectId 
                 }
             }
         }
+        hasher.update(&pin.size.to_be_bytes());
+        hash_time(&mut hasher, pin.modified);
     }
     let mut id = [0_u8; 16];
     id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
@@ -888,7 +943,7 @@ mod tests {
     use opendal::services::Memory;
 
     fn namespace() -> DirectNamespace {
-        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let operator = Operator::new(Memory::default()).unwrap();
         DirectNamespace::unchecked(operator)
     }
 
@@ -899,6 +954,7 @@ mod tests {
             etag: Some("\"etag\"".to_owned()),
             version: None,
             directory,
+            modified: None,
         }
     }
 
@@ -996,6 +1052,28 @@ mod tests {
             ObjectPin::from_record(&record).is_none(),
             "the synthetic null version is not an immutable pin"
         );
+    }
+
+    #[test]
+    fn etag_pin_covers_size_and_available_modified_time() {
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let mut record = record("file", false);
+        record.size = 9;
+        record.modified = Some(modified);
+        let pin = ObjectPin::from_record(&record).unwrap();
+        assert!(pin.matches(&pin));
+
+        let longer = ObjectPin {
+            size: 10,
+            ..pin.clone()
+        };
+        assert!(!pin.matches(&longer));
+
+        let newer = ObjectPin {
+            modified: Some(modified + std::time::Duration::from_secs(1)),
+            ..pin.clone()
+        };
+        assert!(!pin.matches(&newer));
     }
 
     #[test]

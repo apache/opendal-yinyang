@@ -20,7 +20,7 @@
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE};
 use super::{Outcome, TEARDOWN_GRACE, blocking_error, shutdown_signal};
 use crate::direct::{
-    DirectFile, DirectId, DirectKind, DirectNamespace, DirectNode, DirectRevision, DirectSnapshot,
+    DirectFile, DirectId, DirectKind, DirectNamespace, DirectNode, DirectSnapshot,
     Error as DirectError, ErrorKind as DirectErrorKind,
 };
 use crate::volume::VolumeConfig;
@@ -40,7 +40,7 @@ use tokio::runtime::Handle;
 
 const ROOT_INODE: u64 = 1;
 const INODE_DOMAIN: &[u8] = b"yinyang direct fuse inode v1";
-const STAMP_EPOCH: u64 = 1_600_000_000;
+const FALLBACK_STAMP_SECONDS: u64 = 1_600_000_000;
 
 struct DirectInodeTable {
     by_inode: BTreeMap<u64, DirectId>,
@@ -289,7 +289,7 @@ impl DirectInner {
         self.remember_lookup(ino);
         reply.entry(
             &ATTR_TTL,
-            &attribute(ino, node, snapshot.revision()),
+            &attribute(ino, node, node.modified()),
             Generation(0),
         );
     }
@@ -310,7 +310,7 @@ impl DirectInner {
         let Some(node) = snapshot.node(id) else {
             return reply.error(fuser::Errno::ENOENT);
         };
-        reply.attr(&ATTR_TTL, &attribute(ino, node, snapshot.revision()));
+        reply.attr(&ATTR_TTL, &attribute(ino, node, node.modified()));
     }
 
     async fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -339,7 +339,7 @@ impl DirectInner {
         if let Err(errno) = self.invalidate_before_open(ino).await {
             return reply.error(errno);
         }
-        let attr = attribute(ino, node, snapshot.revision());
+        let attr = attribute_with_size(ino, true, file.length(), file.modified());
         let fh = self.next_handle();
         guard(&self.files).insert(fh, Arc::new(OpenFile { _file: file, attr }));
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
@@ -474,20 +474,21 @@ impl DirectInner {
     }
 }
 
-fn attribute(ino: INodeNo, node: &DirectNode, revision: DirectRevision) -> FileAttr {
+fn attribute(ino: INodeNo, node: &DirectNode, modified: Option<std::time::SystemTime>) -> FileAttr {
+    attribute_with_size(ino, node.is_directory(), node.size(), modified)
+}
+
+fn attribute_with_size(
+    ino: INodeNo,
+    directory: bool,
+    node_size: u64,
+    modified: Option<std::time::SystemTime>,
+) -> FileAttr {
     use nix::unistd::{getegid, geteuid};
-    let revision = revision.to_bytes();
-    let stamp = std::time::SystemTime::UNIX_EPOCH
-        + std::time::Duration::from_secs(
-            STAMP_EPOCH
-                + u64::from_be_bytes(revision[..8].try_into().expect("revision stamp prefix")),
-        );
-    let directory = node.is_directory();
-    let size = if directory {
-        DIRECTORY_SIZE
-    } else {
-        node.size()
-    };
+    let stamp = modified.unwrap_or_else(|| {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(FALLBACK_STAMP_SECONDS)
+    });
+    let size = if directory { DIRECTORY_SIZE } else { node_size };
     FileAttr {
         ino,
         size,
@@ -946,5 +947,28 @@ impl Filesystem for DirectFuseFrontend {
         reply: fuser::ReplyLseek,
     ) {
         reply.error(fuser::Errno::ENOSYS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attributes_use_storage_time_and_safe_fallback() {
+        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let file = attribute_with_size(INodeNo(42), false, 7, Some(modified));
+        assert_eq!(file.ino, INodeNo(42));
+        assert_eq!(file.size, 7);
+        assert_eq!(file.mtime, modified);
+        assert_eq!(file.ctime, modified);
+
+        let directory = attribute_with_size(INodeNo(43), true, 0, None);
+        assert_eq!(directory.size, DIRECTORY_SIZE);
+        assert_eq!(
+            directory.mtime,
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(FALLBACK_STAMP_SECONDS)
+        );
     }
 }

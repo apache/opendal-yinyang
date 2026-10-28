@@ -17,7 +17,7 @@
 
 //! Volume configuration and effective capability admission, before runtime exposure.
 use crate::direct::{self, DirectNamespace};
-use crate::runtime::{Error, Result, Runtime};
+use crate::runtime::{Error, ErrorKind, Result, Runtime};
 use opendal::Operator;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
@@ -141,7 +141,7 @@ pub struct VolumeConfig {
     pub frontend: Frontend,
     pub publication: Publication,
     pub storage_profile: StorageProfile,
-    #[serde(skip_serializing_if = "PathBuf::is_empty")]
+    #[serde(skip_serializing_if = "path_is_empty")]
     pub staging: PathBuf,
     #[serde(default)]
     pub read_only: bool,
@@ -346,7 +346,8 @@ impl VolumeConfig {
                     ));
                 }
             }
-            direct::validate_operator(operator)?;
+            direct::validate_operator(operator)
+                .map_err(|error| Error::local_kind(ErrorKind::Invalid, error.to_string()))?;
             let caps = self.capabilities(operator);
             if !self.require.is_subset(&caps.effective) {
                 return Err(Error::Invalid(
@@ -485,5 +486,10 @@ pub fn direct_namespace(config: &VolumeConfig, operator: Operator) -> Result<Dir
     if config.model != Model::Direct {
         return Err(Error::Invalid("volume model is not direct"));
     }
-    DirectNamespace::new(operator).map_err(|error| Error::Invalid(error.to_string()))
+    DirectNamespace::new(operator)
+        .map_err(|error| Error::local_kind(ErrorKind::Invalid, error.to_string()))
+}
+
+fn path_is_empty(path: &PathBuf) -> bool {
+    path.as_os_str().is_empty()
 }
