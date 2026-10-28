@@ -22,16 +22,16 @@ use super::journal::{
     MUTATION_DISPATCHING, MUTATION_FAILED, MUTATION_KIND_COPY, MUTATION_KIND_CREATE,
     MUTATION_KIND_DELETE, MUTATION_KIND_PUBLISH, MUTATION_KIND_RENAME,
     MUTATION_PENDING_SOURCE_CLEANUP, MUTATION_SOURCE_DISPATCHING, MUTATION_STAGED,
-    MUTATION_UNKNOWN, MutationRecord, OBJECT_CONFLICT, OBJECT_FAILED, OBJECT_PENDING,
-    OBJECT_STAGED, OBJECT_UNKNOWN, ObjectRecord, ObservationRecord, PinRecord, PreconditionRecord,
-    Store,
+    MUTATION_UNKNOWN, MutationRecord, OBJECT_CONFLICT, OBJECT_DISCARDED, OBJECT_FAILED,
+    OBJECT_PENDING, OBJECT_STAGED, OBJECT_UNKNOWN, ObjectRecord, ObservationRecord, PinRecord,
+    PreconditionRecord, Store,
 };
 use super::mutation::{
     DirectMutation, DirectMutationOutcome, DirectObjectPin, DirectObservation, DirectPrecondition,
 };
 use super::{
     DirectFile, DirectId, DirectKey, DirectNamespace, DirectNode, DirectSnapshot, Error, ErrorKind,
-    Result, derive_id,
+    Result, derive_id, pin_value,
 };
 use opendal::EntryMode;
 use std::collections::BTreeMap;
@@ -80,6 +80,7 @@ pub enum DirectObjectState {
     Conflict,
     Unknown,
     Failed,
+    Discarded,
 }
 
 /// The operation represented by a durable Direct mutation.
@@ -128,7 +129,8 @@ pub struct DirectMutationStatus {
     pub input_length: u64,
     pub input_digest: Option<[u8; 32]>,
     pub accepted: Option<DirectObjectPin>,
-    pub observed: DirectObservation,
+    pub source_observed: DirectObservation,
+    pub destination_observed: DirectObservation,
     pub error: Option<String>,
 }
 
@@ -284,7 +286,9 @@ impl DirectRuntime {
             .collect::<Vec<_>>();
         for entry in entries {
             let status = status_from_entry(&entry).await;
-            if status.state != DirectObjectState::Clean || !status.existed_remote {
+            if status.state != DirectObjectState::Discarded
+                && (status.state != DirectObjectState::Clean || !status.existed_remote)
+            {
                 statuses.insert(status.id, status);
             }
         }
@@ -429,7 +433,8 @@ impl DirectRuntime {
         };
         let key = DirectKey::from_path(&path)?;
         let store = self.store.as_ref().expect("writable runtime has a store");
-        if guard(store).object(key.as_str())?.is_some()
+        let retained = { guard(store).object(key.as_str())?.is_some() };
+        if retained
             || self
                 .objects
                 .lock()
@@ -503,6 +508,944 @@ impl DirectRuntime {
         })
     }
 
+    /// Discard one never-flushed local-only file.
+    ///
+    /// This removes the local overlay without issuing a storage request. It is
+    /// intentionally unavailable once a mutation may have reached storage.
+    pub async fn discard_local(&self, id: DirectId) -> Result<()> {
+        if self.read_only {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct runtime is read-only",
+            ));
+        }
+        let entry = if let Some(entry) = self.objects.lock().await.get(&id).cloned() {
+            entry
+        } else {
+            let store = self.store.as_ref().expect("writable runtime has a store");
+            let record = guard(store).object_by_id(*id.as_bytes())?.ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, "Direct local object is not retained")
+            })?;
+            entry_from_record(store, record)?
+        };
+        let mut inner = entry.inner.lock().await;
+        if entry.identity.existed_remote.load(Ordering::SeqCst) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct object existed remotely; use conditional unlink",
+            ));
+        }
+        if inner.state == DirectObjectState::Discarded {
+            return Ok(());
+        }
+        if inner.pending_mutation.is_some()
+            || !matches!(
+                inner.state,
+                DirectObjectState::Staged | DirectObjectState::Failed
+            )
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local object has a dispatched or unresolved mutation",
+            ));
+        }
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        guard(store).remove_object(*id.as_bytes())?;
+        inner.state = DirectObjectState::Discarded;
+        inner.pending_mutation = None;
+        inner.accepted = None;
+        inner.observed = DirectObservation::Missing;
+        inner.error = Some("Direct local name was discarded".to_owned());
+        if let Some(path) = inner.data_path.take() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(local_io("remove discarded Direct object", error));
+                }
+            }
+        }
+        self.objects.lock().await.remove(&id);
+        Ok(())
+    }
+
+    /// Conditionally delete one observed file.
+    ///
+    /// If a dirty local handle exists, its bytes remain readable while the name
+    /// is deleted. A later flush of that handle reports Conflict rather than
+    /// recreating the removed name.
+    pub async fn unlink_file(
+        &self,
+        snapshot: &DirectSnapshot,
+        id: DirectId,
+    ) -> Result<DirectMutationStatus> {
+        if self.read_only {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct runtime is read-only",
+            ));
+        }
+        let node = snapshot
+            .node(id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "file is not in this snapshot"))?;
+        if !node.is_file() {
+            return Err(Error::new(
+                ErrorKind::IsDirectory,
+                format!("{:?} is a directory", node.path()),
+            ));
+        }
+        let key = DirectKey::from_storage_key(node.key().expect("file node has key"))?;
+        let existing = self
+            .objects
+            .lock()
+            .await
+            .values()
+            .find(|entry| entry.identity.key == key)
+            .cloned();
+        let (source, generation, dirty) = if let Some(entry) = &existing {
+            let inner = entry.inner.lock().await;
+            if !entry.identity.existed_remote.load(Ordering::SeqCst) {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!(
+                        "Direct path {:?} is a local-only create; use discard_local",
+                        entry.identity.path
+                    ),
+                ));
+            }
+            if inner.pending_mutation.is_some()
+                || matches!(
+                    inner.state,
+                    DirectObjectState::Pending
+                        | DirectObjectState::Conflict
+                        | DirectObjectState::Unknown
+                )
+            {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "Direct object has an unresolved mutation",
+                ));
+            }
+            let precondition = inner.precondition.clone().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "Direct object exposes no ETag for conditional delete",
+                )
+            })?;
+            (
+                endpoint_from_identity(&entry.identity, precondition),
+                inner.generation,
+                inner.generation != inner.durable_generation,
+            )
+        } else {
+            let etag = node.etag().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "Direct object exposes no ETag for conditional delete",
+                )
+            })?;
+            let identity = ObjectIdentity {
+                id: node.id(),
+                key: key.clone(),
+                path: node.path().to_owned(),
+                parent: node.parent().ok_or_else(|| {
+                    Error::new(ErrorKind::Invalid, "file node does not have a parent")
+                })?,
+                name: node.name().to_owned(),
+                existed_remote: AtomicBool::new(true),
+            };
+            (
+                endpoint_from_identity(&identity, DirectPrecondition::Etag(etag.to_owned())),
+                0,
+                false,
+            )
+        };
+        let mutation = MutationRecord {
+            id: *DirectMutationId::new().as_bytes(),
+            kind: MUTATION_KIND_DELETE,
+            state: MUTATION_DISPATCHING,
+            generation,
+            source: Some(source),
+            destination: None,
+            input_length: 0,
+            input_digest: None,
+            accepted: None,
+            source_observed: ObservationRecord::Unavailable("not observed".to_owned()),
+            destination_observed: ObservationRecord::Unavailable("not observed".to_owned()),
+            error: None,
+        };
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        guard(store).put_mutation(&mutation)?;
+        let outcome = self
+            .mutation
+            .delete(
+                &key,
+                precondition_from_record(&mutation.source.as_ref().unwrap().precondition),
+            )
+            .await;
+        let mut mutation = mutation;
+        match outcome {
+            Ok(DirectMutationOutcome::Applied { .. }) => {
+                mutation.state = MUTATION_APPLIED;
+                mutation.source_observed = ObservationRecord::Missing;
+            }
+            Ok(DirectMutationOutcome::Conflict { observed }) => {
+                mutation.state = MUTATION_CONFLICT;
+                mutation.source_observed = observation_to_record(&observed);
+                mutation.error = Some(
+                    "storage precondition changed; the remote name was not deleted".to_owned(),
+                );
+            }
+            Ok(DirectMutationOutcome::Unknown { observed, message }) => {
+                mutation.state = MUTATION_UNKNOWN;
+                mutation.source_observed = observation_to_record(&observed);
+                mutation.error = Some(message);
+            }
+            Ok(DirectMutationOutcome::Unsupported { message }) => {
+                mutation.state = MUTATION_FAILED;
+                mutation.error = Some(message);
+            }
+            Err(error) => {
+                mutation.state = MUTATION_UNKNOWN;
+                mutation.error = Some(error.to_string());
+            }
+        }
+        let mut object = None;
+        if let Some(entry) = &existing {
+            let mut inner = entry.inner.lock().await;
+            match mutation.state {
+                MUTATION_APPLIED if !dirty => {
+                    guard(store).remove_object(*entry.identity.id.as_bytes())?;
+                    if let Some(path) = inner.data_path.take() {
+                        remove_if_exists(&path)?;
+                    }
+                    self.objects.lock().await.remove(&entry.identity.id);
+                }
+                MUTATION_APPLIED => {
+                    inner.state = DirectObjectState::Conflict;
+                    inner.observed = DirectObservation::Missing;
+                    inner.pending_mutation = Some(DirectMutationId::from_bytes(mutation.id));
+                    inner.error =
+                        Some("Direct name was unlinked while local bytes remain".to_owned());
+                    object = Some(record_from_entry(entry, &inner));
+                }
+                MUTATION_CONFLICT => {
+                    inner.state = DirectObjectState::Conflict;
+                    inner.observed = observation_from_record(mutation.source_observed.clone());
+                    inner.error = mutation.error.clone();
+                    object = Some(record_from_entry(entry, &inner));
+                }
+                MUTATION_UNKNOWN => {
+                    inner.state = DirectObjectState::Unknown;
+                    inner.observed = observation_from_record(mutation.source_observed.clone());
+                    inner.error = mutation.error.clone();
+                    object = Some(record_from_entry(entry, &inner));
+                }
+                _ => {}
+            }
+        }
+        match object {
+            Some(object) => guard(store).put_records(&[object], &[mutation.clone()])?,
+            None => guard(store).put_mutation(&mutation)?,
+        }
+        status_from_mutation(&mutation)
+    }
+
+    /// Publish destination bytes from one pinned source file without deleting
+    /// the source.
+    pub async fn copy_file(
+        &self,
+        snapshot: &DirectSnapshot,
+        source: DirectId,
+        destination_parent: DirectId,
+        destination_name: &str,
+        replace: bool,
+    ) -> Result<DirectMutationStatus> {
+        let (mutation, input) = self
+            .prepare_namespace_mutation(
+                snapshot,
+                source,
+                destination_parent,
+                destination_name,
+                replace,
+                MUTATION_KIND_COPY,
+            )
+            .await?;
+        self.persist_staged_mutation(&mutation)?;
+        let mutation = self.dispatch_destination(mutation, &input).await?;
+        Ok(status_from_mutation(&mutation)?)
+    }
+
+    /// Safe-save a file: conditionally publish the destination from pinned
+    /// source bytes, then conditionally delete the source.
+    ///
+    /// This is not a POSIX atomic rename. A destination-applied/source-pending
+    /// mutation is retained for explicit recovery.
+    pub async fn rename_file(
+        &self,
+        snapshot: &DirectSnapshot,
+        source: DirectId,
+        destination_parent: DirectId,
+        destination_name: &str,
+        replace: bool,
+    ) -> Result<DirectMutationStatus> {
+        let (mutation, input) = self
+            .prepare_namespace_mutation(
+                snapshot,
+                source,
+                destination_parent,
+                destination_name,
+                replace,
+                MUTATION_KIND_RENAME,
+            )
+            .await?;
+        self.persist_staged_mutation(&mutation)?;
+        let mutation = self.dispatch_destination(mutation, &input).await?;
+        let mutation = if mutation.state == MUTATION_DESTINATION_APPLIED {
+            self.cleanup_rename_source(mutation).await?
+        } else {
+            mutation
+        };
+        Ok(status_from_mutation(&mutation)?)
+    }
+
+    /// Observe the current endpoints of one retained mutation without dispatch.
+    pub async fn observe_mutation(&self, id: DirectMutationId) -> Result<DirectMutationStatus> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        let mut mutation = guard(store).mutation(id.0)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("unknown Direct mutation {}", id.to_hex()),
+            )
+        })?;
+        if let Some(source) = &mutation.source {
+            let key = DirectKey::from_storage_key(&source.key)?;
+            mutation.source_observed = observation_to_record(&self.observe_key(&key).await);
+        }
+        if let Some(destination) = &mutation.destination {
+            let key = DirectKey::from_storage_key(&destination.key)?;
+            mutation.destination_observed = observation_to_record(&self.observe_key(&key).await);
+        }
+        guard(store).put_mutation(&mutation)?;
+        status_from_mutation(&mutation)
+    }
+
+    /// Retry one mutation only when retained evidence proves it is safe.
+    ///
+    /// Content equality is never used as commit proof. A write/copy retry runs
+    /// only while the original destination precondition still holds. A rename
+    /// source cleanup runs only after the accepted destination pin is observed
+    /// unchanged.
+    pub async fn retry_mutation(&self, id: DirectMutationId) -> Result<DirectMutationStatus> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        let mutation = guard(store).mutation(id.0)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("unknown Direct mutation {}", id.to_hex()),
+            )
+        })?;
+        let mutation = match (mutation.kind, mutation_state(mutation.state)?) {
+            (MUTATION_KIND_DELETE, DirectMutationState::Staged) => {
+                self.dispatch_delete(mutation).await?
+            }
+            (MUTATION_KIND_DELETE, DirectMutationState::Unknown) => {
+                self.retry_delete(mutation).await?
+            }
+            (
+                MUTATION_KIND_PUBLISH | MUTATION_KIND_CREATE | MUTATION_KIND_COPY,
+                DirectMutationState::Staged,
+            ) => {
+                self.verify_mutation_input(&mutation)?;
+                let input = guard(store).input_path(mutation.id);
+                self.dispatch_destination(mutation, &input).await?
+            }
+            (
+                MUTATION_KIND_PUBLISH | MUTATION_KIND_CREATE | MUTATION_KIND_COPY,
+                DirectMutationState::Unknown,
+            ) => self.retry_destination(mutation).await?,
+            (MUTATION_KIND_RENAME, state)
+                if matches!(
+                    state,
+                    DirectMutationState::DestinationApplied
+                        | DirectMutationState::PendingSourceCleanup
+                ) =>
+            {
+                self.cleanup_rename_source(mutation).await?
+            }
+            (MUTATION_KIND_RENAME, DirectMutationState::Staged) => {
+                self.verify_mutation_input(&mutation)?;
+                let input = guard(store).input_path(mutation.id);
+                let mutation = self.dispatch_destination(mutation, &input).await?;
+                if mutation.state == MUTATION_DESTINATION_APPLIED {
+                    self.cleanup_rename_source(mutation).await?
+                } else {
+                    mutation
+                }
+            }
+            (MUTATION_KIND_RENAME, DirectMutationState::Unknown) => {
+                let mutation = self.retry_destination(mutation).await?;
+                if mutation.state == MUTATION_DESTINATION_APPLIED {
+                    self.cleanup_rename_source(mutation).await?
+                } else {
+                    mutation
+                }
+            }
+            (_, state) => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!("Direct mutation in state {state:?} cannot be retried"),
+                ));
+            }
+        };
+        self.apply_mutation_to_object(&mutation).await?;
+        status_from_mutation(&mutation)
+    }
+
+    async fn retry_destination(&self, mut mutation: MutationRecord) -> Result<MutationRecord> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        let destination = mutation
+            .destination
+            .as_ref()
+            .expect("write mutation has a destination");
+        let destination_key = DirectKey::from_storage_key(&destination.key)?;
+        let observation = self.observe_key(&destination_key).await;
+        mutation.destination_observed = observation_to_record(&observation);
+        let precondition = precondition_from_record(&destination.precondition);
+        if !observation_matches_precondition(&observation, &precondition) {
+            guard(store).put_mutation(&mutation)?;
+            return Ok(mutation);
+        }
+        self.verify_mutation_input(&mutation)?;
+        let input = guard(store).input_path(mutation.id);
+        self.dispatch_destination(mutation, &input).await
+    }
+
+    async fn retry_delete(&self, mut mutation: MutationRecord) -> Result<MutationRecord> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        let source = mutation
+            .source
+            .as_ref()
+            .expect("delete mutation has a source");
+        let source_key = DirectKey::from_storage_key(&source.key)?;
+        let observation = self.observe_key(&source_key).await;
+        mutation.source_observed = observation_to_record(&observation);
+        if observation.is_missing() {
+            mutation.state = MUTATION_APPLIED;
+            mutation.error = None;
+            guard(store).put_mutation(&mutation)?;
+            return Ok(mutation);
+        }
+        let precondition = precondition_from_record(&source.precondition);
+        if !observation_matches_precondition(&observation, &precondition) {
+            mutation.state = MUTATION_CONFLICT;
+            mutation.error = Some("Direct delete source changed; no delete was issued".to_owned());
+            guard(store).put_mutation(&mutation)?;
+            return Ok(mutation);
+        }
+        self.dispatch_delete(mutation).await
+    }
+
+    async fn dispatch_delete(&self, mut mutation: MutationRecord) -> Result<MutationRecord> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        mutation.state = MUTATION_DISPATCHING;
+        mutation.error = None;
+        guard(store).put_mutation(&mutation)?;
+        let source = mutation
+            .source
+            .as_ref()
+            .expect("delete mutation has a source");
+        let source_key = DirectKey::from_storage_key(&source.key)?;
+        let outcome = self
+            .mutation
+            .delete(&source_key, precondition_from_record(&source.precondition))
+            .await;
+        match outcome {
+            Ok(DirectMutationOutcome::Applied { .. }) => {
+                mutation.state = MUTATION_APPLIED;
+                mutation.source_observed = ObservationRecord::Missing;
+            }
+            Ok(DirectMutationOutcome::Conflict { observed }) => {
+                mutation.state = MUTATION_CONFLICT;
+                mutation.source_observed = observation_to_record(&observed);
+                mutation.error = Some("Direct delete precondition changed".to_owned());
+            }
+            Ok(DirectMutationOutcome::Unknown { observed, message }) => {
+                mutation.state = MUTATION_UNKNOWN;
+                mutation.source_observed = observation_to_record(&observed);
+                mutation.error = Some(message);
+            }
+            Ok(DirectMutationOutcome::Unsupported { message }) => {
+                mutation.state = MUTATION_FAILED;
+                mutation.error = Some(message);
+            }
+            Err(error) => {
+                mutation.state = MUTATION_UNKNOWN;
+                mutation.error = Some(error.to_string());
+            }
+        }
+        guard(store).put_mutation(&mutation)?;
+        Ok(mutation)
+    }
+
+    fn verify_mutation_input(&self, mutation: &MutationRecord) -> Result<()> {
+        let Some(expected_digest) = mutation.input_digest else {
+            return Ok(());
+        };
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        let path = guard(store).input_path(mutation.id);
+        let mut file = File::open(&path)
+            .map_err(|error| local_io("open retained Direct mutation input", error))?;
+        let length = file
+            .metadata()
+            .map_err(|error| local_io("inspect retained Direct mutation input", error))?
+            .len();
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0_u8; IO_CHUNK];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| local_io("read retained Direct mutation input", error))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if length != mutation.input_length || *hasher.finalize().as_bytes() != expected_digest {
+            return Err(Error::new(
+                ErrorKind::Storage,
+                format!(
+                    "retained Direct mutation input {} is missing or corrupt",
+                    mutation
+                        .id
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn apply_mutation_to_object(&self, mutation: &MutationRecord) -> Result<()> {
+        let endpoint = match mutation.kind {
+            MUTATION_KIND_PUBLISH | MUTATION_KIND_CREATE | MUTATION_KIND_COPY => {
+                mutation.destination.as_ref()
+            }
+            MUTATION_KIND_DELETE => mutation.source.as_ref(),
+            MUTATION_KIND_RENAME if mutation.state == MUTATION_APPLIED => mutation.source.as_ref(),
+            _ => None,
+        };
+        let Some(endpoint) = endpoint else {
+            return Ok(());
+        };
+        let entry = self
+            .objects
+            .lock()
+            .await
+            .values()
+            .find(|entry| entry.identity.key.as_str() == endpoint.key)
+            .cloned();
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let mut inner = entry.inner.lock().await;
+        let mutation_id = DirectMutationId::from_bytes(mutation.id);
+        if inner.pending_mutation != Some(mutation_id) {
+            return Ok(());
+        }
+        match mutation_state(mutation.state)? {
+            DirectMutationState::Applied => {
+                if mutation.kind == MUTATION_KIND_DELETE {
+                    inner.state = DirectObjectState::Conflict;
+                    inner.observed = observation_from_record(mutation.source_observed.clone());
+                    inner.error =
+                        Some("Direct name was unlinked while local bytes remain".to_owned());
+                } else {
+                    inner.accepted = mutation.accepted.clone().map(pin_from_record);
+                    inner.observed = observation_from_record(mutation.destination_observed.clone());
+                    inner.durable_generation = mutation.generation;
+                    if let Some(etag) = inner
+                        .accepted
+                        .as_ref()
+                        .and_then(DirectObjectPin::etag)
+                        .map(str::to_owned)
+                    {
+                        inner.precondition = Some(DirectPrecondition::Etag(etag));
+                        inner.state = DirectObjectState::Clean;
+                        inner.error = None;
+                    }
+                }
+            }
+            DirectMutationState::Conflict => {
+                inner.state = DirectObjectState::Conflict;
+                inner.observed =
+                    observation_from_record(if mutation.kind == MUTATION_KIND_DELETE {
+                        mutation.source_observed.clone()
+                    } else {
+                        mutation.destination_observed.clone()
+                    });
+                inner.error = mutation.error.clone();
+            }
+            DirectMutationState::Unknown => {
+                inner.state = DirectObjectState::Unknown;
+                inner.observed =
+                    observation_from_record(if mutation.kind == MUTATION_KIND_DELETE {
+                        mutation.source_observed.clone()
+                    } else {
+                        mutation.destination_observed.clone()
+                    });
+                inner.error = mutation.error.clone();
+            }
+            _ => {}
+        }
+        let object = record_from_entry(&entry, &inner);
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        guard(store).put_object(&object)
+    }
+
+    async fn prepare_namespace_mutation(
+        &self,
+        snapshot: &DirectSnapshot,
+        source: DirectId,
+        destination_parent: DirectId,
+        destination_name: &str,
+        replace: bool,
+        kind: u8,
+    ) -> Result<(MutationRecord, PathBuf)> {
+        if self.read_only {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct runtime is read-only",
+            ));
+        }
+        let source_node = snapshot
+            .node(source)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "source is not in this snapshot"))?;
+        if !source_node.is_file() {
+            return Err(Error::new(
+                ErrorKind::IsDirectory,
+                format!("{:?} is a directory", source_node.path()),
+            ));
+        }
+        let destination_parent_node = snapshot.node(destination_parent).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                "destination parent is not in this snapshot",
+            )
+        })?;
+        if !destination_parent_node.is_directory() {
+            return Err(Error::new(
+                ErrorKind::NotDirectory,
+                format!("{:?} is not a directory", destination_parent_node.path()),
+            ));
+        }
+        let destination_path = if destination_parent_node.path().is_empty() {
+            destination_name.to_owned()
+        } else {
+            format!("{}/{destination_name}", destination_parent_node.path())
+        };
+        if destination_path == source_node.path() {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                "Direct source and destination are the same path",
+            ));
+        }
+        let destination_key = DirectKey::from_path(&destination_path)?;
+        let source_key =
+            DirectKey::from_storage_key(source_node.key().expect("file node has key"))?;
+        let existing_destination = snapshot.lookup(destination_parent, destination_name)?;
+        if existing_destination.is_some_and(DirectNode::is_directory) {
+            return Err(Error::new(
+                ErrorKind::IsDirectory,
+                "Direct file rename/copy destination is a directory",
+            ));
+        }
+        if existing_destination.is_some() && !replace {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                format!("Direct destination {destination_path:?} already exists"),
+            ));
+        }
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        if let Some(record) = { guard(store).object(source_key.as_str())? } {
+            if record.state != 0 || record.generation != record.durable_generation {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "Direct source has local edits; flush or discard them before rename/copy",
+                ));
+            }
+        }
+        if { guard(store).object(destination_key.as_str())? }.is_some() {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct destination has retained local state",
+            ));
+        }
+
+        let source_file = snapshot.open_file(source).await?;
+        let source_etag = source_file.etag().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "Direct source exposes no ETag for conditional read/delete",
+            )
+        })?;
+        let destination_precondition = if let Some(node) = existing_destination {
+            let destination_file = snapshot.open_file(node.id()).await?;
+            DirectPrecondition::Etag(
+                destination_file
+                    .etag()
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unsupported,
+                            "Direct replacement destination exposes no ETag",
+                        )
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            DirectPrecondition::Absent
+        };
+        let destination_id = existing_destination
+            .map(DirectNode::id)
+            .unwrap_or_else(|| derive_id(&destination_path, super::DirectKind::File, None));
+        let mutation_id = DirectMutationId::new();
+        let input_path = guard(store).input_path(mutation_id.0);
+        let temporary = guard(store).temporary_path("inputs", mutation_id.0);
+        remove_if_exists(&temporary)?;
+        let (input_length, input_digest) =
+            freeze_remote_file(&source_file, &temporary, &input_path).await?;
+        if input_length != source_node.size() {
+            return Err(Error::new(
+                ErrorKind::Stale,
+                format!(
+                    "Direct source read {input_length} bytes, expected {}",
+                    source_node.size()
+                ),
+            ));
+        }
+        let source_endpoint = EndpointRecord {
+            id: *source_node.id().as_bytes(),
+            key: source_key.as_str().to_owned(),
+            path: source_node.path().to_owned(),
+            parent: *source_node.parent().expect("file has a parent").as_bytes(),
+            name: source_node.name().to_owned(),
+            precondition: PreconditionRecord::Etag(source_etag.to_owned()),
+        };
+        let destination_endpoint = EndpointRecord {
+            id: *destination_id.as_bytes(),
+            key: destination_key.as_str().to_owned(),
+            path: destination_path,
+            parent: *destination_parent.as_bytes(),
+            name: destination_name.to_owned(),
+            precondition: precondition_to_record(&destination_precondition),
+        };
+        Ok((
+            MutationRecord {
+                id: mutation_id.0,
+                kind,
+                state: MUTATION_STAGED,
+                generation: 0,
+                source: Some(source_endpoint),
+                destination: Some(destination_endpoint),
+                input_length,
+                input_digest: Some(input_digest),
+                accepted: None,
+                source_observed: ObservationRecord::Unavailable("not observed".to_owned()),
+                destination_observed: ObservationRecord::Unavailable("not observed".to_owned()),
+                error: None,
+            },
+            input_path,
+        ))
+    }
+
+    fn persist_staged_mutation(&self, mutation: &MutationRecord) -> Result<()> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        guard(store).put_mutation(mutation)
+    }
+
+    async fn dispatch_destination(
+        &self,
+        mut mutation: MutationRecord,
+        input: &Path,
+    ) -> Result<MutationRecord> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        mutation.state = MUTATION_DISPATCHING;
+        mutation.error = None;
+        guard(store).put_mutation(&mutation)?;
+        let destination = mutation
+            .destination
+            .as_ref()
+            .expect("destination mutation has a destination");
+        let destination_key = DirectKey::from_storage_key(&destination.key)?;
+        let precondition = precondition_from_record(&destination.precondition);
+        let outcome = self
+            .mutation
+            .publish_file(&destination_key, input, precondition)
+            .await;
+        match outcome {
+            Ok(DirectMutationOutcome::Applied { accepted }) => {
+                mutation.accepted = accepted.as_ref().map(pin_to_record);
+                mutation.destination_observed = accepted
+                    .as_ref()
+                    .map(|pin| ObservationRecord::Present(pin_to_record(pin)))
+                    .unwrap_or_else(|| {
+                        ObservationRecord::Unavailable(
+                            "successful response omitted metadata".to_owned(),
+                        )
+                    });
+                mutation.state = if mutation.kind == MUTATION_KIND_RENAME {
+                    MUTATION_DESTINATION_APPLIED
+                } else {
+                    MUTATION_APPLIED
+                };
+                if accepted.is_none()
+                    || (accepted
+                        .as_ref()
+                        .is_some_and(|pin| pin.etag().is_none() && pin.version().is_none()))
+                {
+                    mutation.state = if mutation.kind == MUTATION_KIND_RENAME {
+                        MUTATION_DESTINATION_APPLIED
+                    } else {
+                        MUTATION_FAILED
+                    };
+                    mutation.error = Some(
+                        "successful Direct write response omitted a usable identity".to_owned(),
+                    );
+                }
+            }
+            Ok(DirectMutationOutcome::Conflict { observed }) => {
+                mutation.state = MUTATION_CONFLICT;
+                mutation.destination_observed = observation_to_record(&observed);
+                mutation.error = Some(
+                    "storage destination precondition changed; source bytes are retained"
+                        .to_owned(),
+                );
+            }
+            Ok(DirectMutationOutcome::Unknown { observed, message }) => {
+                mutation.state = MUTATION_UNKNOWN;
+                mutation.destination_observed = observation_to_record(&observed);
+                mutation.error = Some(message);
+            }
+            Ok(DirectMutationOutcome::Unsupported { message }) => {
+                mutation.state = MUTATION_FAILED;
+                mutation.error = Some(message);
+            }
+            Err(error) => {
+                mutation.state = MUTATION_UNKNOWN;
+                mutation.error = Some(error.to_string());
+            }
+        }
+        guard(store).put_mutation(&mutation)?;
+        Ok(mutation)
+    }
+
+    async fn cleanup_rename_source(&self, mut mutation: MutationRecord) -> Result<MutationRecord> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
+        let accepted = mutation
+            .accepted
+            .clone()
+            .map(pin_from_record)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "Direct rename destination has no verifiable accepted pin",
+                )
+            })?;
+        let destination = mutation
+            .destination
+            .as_ref()
+            .expect("rename has a destination");
+        let destination_key = DirectKey::from_storage_key(&destination.key)?;
+        let destination_observation = self.observe_key(&destination_key).await;
+        mutation.destination_observed = observation_to_record(&destination_observation);
+        if !observation_matches_pin(&destination_observation, &accepted) {
+            mutation.state = MUTATION_CONFLICT;
+            mutation.error = Some(
+                "Direct rename destination changed after publication; source was not deleted"
+                    .to_owned(),
+            );
+            guard(store).put_mutation(&mutation)?;
+            return Ok(mutation);
+        }
+
+        let source = mutation.source.as_ref().expect("rename has a source");
+        let source_key = DirectKey::from_storage_key(&source.key)?;
+        let source_observation = self.observe_key(&source_key).await;
+        mutation.source_observed = observation_to_record(&source_observation);
+        if source_observation.is_missing() {
+            mutation.state = MUTATION_APPLIED;
+            mutation.error = None;
+            guard(store).put_mutation(&mutation)?;
+            return Ok(mutation);
+        }
+        let source_precondition = precondition_from_record(&source.precondition);
+        if !observation_matches_precondition(&source_observation, &source_precondition) {
+            mutation.state = MUTATION_CONFLICT;
+            mutation.error =
+                Some("Direct rename source changed after destination publication".to_owned());
+            guard(store).put_mutation(&mutation)?;
+            return Ok(mutation);
+        }
+
+        mutation.state = MUTATION_SOURCE_DISPATCHING;
+        guard(store).put_mutation(&mutation)?;
+        let outcome = self.mutation.delete(&source_key, source_precondition).await;
+        match outcome {
+            Ok(DirectMutationOutcome::Applied { .. }) => {
+                mutation.state = MUTATION_APPLIED;
+                mutation.source_observed = ObservationRecord::Missing;
+                mutation.error = None;
+            }
+            Ok(DirectMutationOutcome::Conflict { observed }) => {
+                mutation.state = MUTATION_CONFLICT;
+                mutation.source_observed = observation_to_record(&observed);
+                mutation.error = Some(
+                    "Direct rename source precondition changed; destination remains applied"
+                        .to_owned(),
+                );
+            }
+            Ok(DirectMutationOutcome::Unknown { observed, message }) => {
+                mutation.state = MUTATION_PENDING_SOURCE_CLEANUP;
+                mutation.source_observed = observation_to_record(&observed);
+                mutation.error = Some(message);
+            }
+            Ok(DirectMutationOutcome::Unsupported { message }) => {
+                mutation.state = MUTATION_FAILED;
+                mutation.error = Some(message);
+            }
+            Err(error) => {
+                mutation.state = MUTATION_PENDING_SOURCE_CLEANUP;
+                mutation.error = Some(error.to_string());
+            }
+        }
+        guard(store).put_mutation(&mutation)?;
+        Ok(mutation)
+    }
+
+    async fn observe_key(&self, key: &DirectKey) -> DirectObservation {
+        match self.namespace.operator.stat(key.as_str()).await {
+            Ok(metadata) if metadata.mode() != EntryMode::DIR => {
+                DirectObservation::Present(DirectObjectPin::from_parts(
+                    pin_value(metadata.version()).map(str::to_owned),
+                    pin_value(metadata.etag()).map(str::to_owned),
+                    metadata.content_length(),
+                    metadata
+                        .last_modified()
+                        .map(|time| super::normalize_time(SystemTime::from(time))),
+                ))
+            }
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
+                DirectObservation::Missing
+            }
+            Ok(_) => DirectObservation::Unavailable {
+                message: "Direct key is a directory".to_owned(),
+            },
+            Err(error) => DirectObservation::Unavailable {
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn entry_for_node(
         &self,
         snapshot: &DirectSnapshot,
@@ -544,7 +1487,8 @@ impl DirectRuntime {
             }
         }
         if let Some(store) = &self.store {
-            if let Some(record) = guard(store).object(key.as_str())? {
+            let record = { guard(store).object(key.as_str())? };
+            if let Some(record) = record {
                 if record.state != 0 {
                     let entry = entry_from_record(store, record)?;
                     return Ok(self
@@ -777,7 +1721,8 @@ impl DirectRuntime {
             input_length,
             input_digest: Some(input_digest),
             accepted: None,
-            observed: ObservationRecord::Unavailable("not observed".to_owned()),
+            source_observed: ObservationRecord::Unavailable("not observed".to_owned()),
+            destination_observed: ObservationRecord::Unavailable("not observed".to_owned()),
             error: None,
         };
         inner.state = DirectObjectState::Staged;
@@ -828,7 +1773,7 @@ impl DirectRuntime {
             }
             Ok(DirectMutationOutcome::Conflict { observed }) => {
                 mutation.state = MUTATION_CONFLICT;
-                mutation.observed = observation_to_record(&observed);
+                mutation.destination_observed = observation_to_record(&observed);
                 mutation.error =
                     Some("storage precondition changed; local bytes are retained".to_owned());
                 inner.state = DirectObjectState::Conflict;
@@ -840,7 +1785,7 @@ impl DirectRuntime {
             }
             Ok(DirectMutationOutcome::Unknown { observed, message }) => {
                 mutation.state = MUTATION_UNKNOWN;
-                mutation.observed = observation_to_record(&observed);
+                mutation.destination_observed = observation_to_record(&observed);
                 mutation.error = Some(message.clone());
                 inner.state = DirectObjectState::Unknown;
                 inner.observed = observed;
@@ -1216,7 +2161,8 @@ fn status_from_mutation(record: &MutationRecord) -> Result<DirectMutationStatus>
         input_length: record.input_length,
         input_digest: record.input_digest,
         accepted: record.accepted.clone().map(pin_from_record),
-        observed: observation_from_record(record.observed.clone()),
+        source_observed: observation_from_record(record.source_observed.clone()),
+        destination_observed: observation_from_record(record.destination_observed.clone()),
         error: record.error.clone(),
     })
 }
@@ -1283,6 +2229,9 @@ fn flush_outcome_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> DirectF
             observed: inner.observed.clone(),
             message: "Direct mutation did not reach a terminal outcome".to_owned(),
         },
+        DirectObjectState::Discarded => DirectFlushOutcome::Unsupported {
+            message: "Direct local name was discarded".to_owned(),
+        },
     }
 }
 
@@ -1294,6 +2243,7 @@ fn object_state(value: u8) -> Result<DirectObjectState> {
         OBJECT_CONFLICT => Ok(DirectObjectState::Conflict),
         OBJECT_UNKNOWN => Ok(DirectObjectState::Unknown),
         OBJECT_FAILED => Ok(DirectObjectState::Failed),
+        OBJECT_DISCARDED => Ok(DirectObjectState::Discarded),
         _ => Err(Error::new(
             ErrorKind::Storage,
             format!("unknown Direct object state {value}"),
@@ -1309,6 +2259,7 @@ fn object_state_code(value: DirectObjectState) -> u8 {
         DirectObjectState::Conflict => OBJECT_CONFLICT,
         DirectObjectState::Unknown => OBJECT_UNKNOWN,
         DirectObjectState::Failed => OBJECT_FAILED,
+        DirectObjectState::Discarded => OBJECT_DISCARDED,
     }
 }
 
@@ -1397,6 +2348,73 @@ fn atomic_bool(value: bool) -> AtomicBool {
     AtomicBool::new(value)
 }
 
+async fn freeze_remote_file(
+    source: &DirectFile,
+    temporary: &Path,
+    target: &Path,
+) -> Result<(u64, [u8; 32])> {
+    let mut output = create_private_file(temporary)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0_u64;
+    while offset < source.length() {
+        let bytes = source
+            .read(offset, IO_CHUNK.min((source.length() - offset) as usize))
+            .await?;
+        if bytes.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Stale,
+                "pinned Direct source ended during mutation preparation",
+            ));
+        }
+        output
+            .write_all(&bytes)
+            .map_err(|error| local_io("freeze Direct mutation input", error))?;
+        hasher.update(&bytes);
+        offset += bytes.len() as u64;
+    }
+    output
+        .sync_all()
+        .map_err(|error| local_io("sync Direct mutation input", error))?;
+    std::fs::rename(temporary, target)
+        .map_err(|error| local_io("publish Direct mutation input", error))?;
+    sync_parent(target)?;
+    Ok((offset, *hasher.finalize().as_bytes()))
+}
+
+fn observation_matches_precondition(
+    observation: &DirectObservation,
+    precondition: &DirectPrecondition,
+) -> bool {
+    match (observation, precondition) {
+        (DirectObservation::Missing, DirectPrecondition::Absent) => true,
+        (DirectObservation::Present(observed), DirectPrecondition::Etag(expected)) => {
+            observed.etag() == Some(expected.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn observation_matches_pin(observation: &DirectObservation, accepted: &DirectObjectPin) -> bool {
+    let DirectObservation::Present(observed) = observation else {
+        return false;
+    };
+    if let Some(version) = accepted.version() {
+        return observed.version() == Some(version)
+            && accepted
+                .etag()
+                .is_none_or(|etag| observed.etag() == Some(etag))
+            && accepted.size() == observed.size();
+    }
+    accepted
+        .etag()
+        .is_some_and(|etag| observed.etag() == Some(etag))
+        && accepted.size() == observed.size()
+        && match (accepted.modified(), observed.modified()) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
 fn freeze_object(file: &mut File, temporary: &Path, target: &Path) -> Result<(u64, [u8; 32])> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| local_io("seek Direct mutation input", error))?;
@@ -1471,4 +2489,485 @@ fn local_io(context: &str, error: std::io::Error) -> Error {
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::TestBackend;
+
+    fn binding(bucket: &str) -> super::super::DirectStorageBinding {
+        super::super::DirectStorageBinding::new(
+            "s3",
+            "minio",
+            bucket,
+            "/direct",
+            "http://127.0.0.1:9000",
+        )
+        .unwrap()
+    }
+
+    fn namespace(operator: &opendal::Operator) -> DirectNamespace {
+        DirectNamespace::unchecked(operator.clone())
+    }
+
+    fn snapshot(operator: &opendal::Operator, backend: &TestBackend) -> DirectSnapshot {
+        let records = backend
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .iter()
+            .map(|(key, object)| super::super::ObjectRecord {
+                key: key.clone(),
+                size: object.bytes.len() as u64,
+                etag: Some(object.etag.clone()),
+                version: None,
+                directory: false,
+                modified: None,
+            })
+            .collect();
+        DirectSnapshot::build(namespace(operator), records).unwrap()
+    }
+
+    fn empty_snapshot(operator: &opendal::Operator) -> DirectSnapshot {
+        DirectSnapshot::build(namespace(operator), Vec::new()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn staged_write_survives_restart_without_publication() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let first = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = first
+            .create_file(&snapshot, snapshot.root(), "local")
+            .await
+            .unwrap();
+        file.write(0, b"local").await.unwrap();
+        let id = file.id();
+        drop(file);
+        drop(first);
+
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let pending = reopened.pending_objects().await.unwrap();
+        let status = pending
+            .iter()
+            .find(|status| status.id == id)
+            .expect("local generation was not retained");
+        assert_eq!(status.length, 5);
+        assert_eq!(status.state, DirectObjectState::Staged);
+        assert!(!status.existed_remote);
+        let file = reopened.open_pending(id, false).await.unwrap();
+        assert_eq!(file.read(0, 5).await.unwrap(), b"local");
+        assert!(operator.stat("local").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_flush_uses_absent_condition_and_returns_response_pin() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "created")
+            .await
+            .unwrap();
+        file.write(0, b"bytes").await.unwrap();
+        let DirectFlushOutcome::Applied {
+            accepted: Some(accepted),
+            ..
+        } = file.flush().await.unwrap()
+        else {
+            panic!("conditional create did not apply");
+        };
+        assert!(accepted.etag().is_some());
+        assert_eq!(operator.read("created").await.unwrap().to_vec(), b"bytes");
+        let status = file.status().await.unwrap();
+        assert_eq!(status.state, DirectObjectState::Clean);
+        assert!(status.existed_remote);
+        assert!(status.pending_mutation.is_some());
+    }
+
+    #[tokio::test]
+    async fn flush_conflict_retains_local_bytes_after_restart() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let file_id = snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.write(0, b"local").await.unwrap();
+        operator.write("file", b"external".to_vec()).await.unwrap();
+        let outcome = file.flush().await.unwrap();
+        assert!(matches!(
+            outcome,
+            DirectFlushOutcome::Conflict {
+                observed: DirectObservation::Present(_),
+                ..
+            }
+        ));
+        let id = file.id();
+        drop(file);
+        drop(runtime);
+
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let pending = reopened.pending_objects().await.unwrap();
+        let status = pending
+            .iter()
+            .find(|status| status.id == id)
+            .expect("conflicted generation was not retained");
+        assert_eq!(status.state, DirectObjectState::Conflict);
+        assert_eq!(
+            reopened
+                .open_pending(id, false)
+                .await
+                .unwrap()
+                .read(0, 5)
+                .await
+                .unwrap(),
+            b"local"
+        );
+        assert_eq!(operator.read("file").await.unwrap().to_vec(), b"external");
+    }
+
+    #[tokio::test]
+    async fn lost_response_is_unknown_across_restart() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let file_id = snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.write(0, b"local").await.unwrap();
+        backend.lose_next_write_response();
+        let mutation = match file.flush().await.unwrap() {
+            DirectFlushOutcome::Unknown { mutation, .. } => mutation,
+            outcome => panic!("lost response was not Unknown: {outcome:?}"),
+        };
+        drop(file);
+        drop(runtime);
+
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.mutation_status(mutation).unwrap().state,
+            DirectMutationState::Unknown
+        );
+        let pending = reopened.pending_objects().await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|status| status.state == DirectObjectState::Unknown),
+            "restart did not preserve the Unknown local generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_retry_dispatches_only_after_precondition_is_reobserved() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let file_id = snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.write(0, b"local").await.unwrap();
+        backend.fail_next_write_before_effect();
+        let mutation = match file.flush().await.unwrap() {
+            DirectFlushOutcome::Unknown { mutation, .. } => mutation,
+            outcome => panic!("failed request was not Unknown: {outcome:?}"),
+        };
+        let status = runtime.retry_mutation(mutation).await.unwrap();
+        assert_eq!(status.state, DirectMutationState::Applied);
+        assert_eq!(operator.read("file").await.unwrap().to_vec(), b"local");
+    }
+
+    #[tokio::test]
+    async fn fresh_snapshot_does_not_reuse_clean_old_pin() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"v1".to_vec()).await.unwrap();
+        let first_snapshot = snapshot(&operator, &backend);
+        let first_id = first_snapshot.resolve("file").unwrap().id();
+        let runtime = DirectRuntime::open(namespace(&operator), None, true, binding("bucket"))
+            .await
+            .unwrap();
+        let old = runtime
+            .open_file(&first_snapshot, first_id, false)
+            .await
+            .unwrap();
+        operator.write("file", b"v2".to_vec()).await.unwrap();
+        let second_snapshot = snapshot(&operator, &backend);
+        let second_id = second_snapshot.resolve("file").unwrap().id();
+        assert_ne!(first_id, second_id);
+        let new = runtime
+            .open_file(&second_snapshot, second_id, false)
+            .await
+            .unwrap();
+        assert_eq!(new.read(0, 2).await.unwrap(), b"v2");
+        assert_eq!(old.read(0, 2).await.unwrap_err().kind(), ErrorKind::Stale);
+    }
+
+    #[tokio::test]
+    async fn storage_binding_mismatch_fails_before_runtime_state_creation() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        drop(runtime);
+        for wrong in [
+            binding("other-bucket"),
+            super::super::DirectStorageBinding::new(
+                "s3",
+                "amazon-s3",
+                "bucket",
+                "/direct",
+                "http://127.0.0.1:9000",
+            )
+            .unwrap(),
+            super::super::DirectStorageBinding::new(
+                "s3",
+                "minio",
+                "bucket",
+                "/other",
+                "http://127.0.0.1:9000",
+            )
+            .unwrap(),
+            super::super::DirectStorageBinding::new(
+                "s3",
+                "minio",
+                "bucket",
+                "/direct",
+                "http://127.0.0.1:9001",
+            )
+            .unwrap(),
+        ] {
+            let error = match DirectRuntime::open(
+                namespace(&operator),
+                Some(state.path().to_owned()),
+                false,
+                wrong,
+            )
+            .await
+            {
+                Ok(_) => panic!("wrong Direct storage binding was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::Invalid);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_existing_database_is_rejected_without_runtime_files() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let database = state.path().join("runtime.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE foreign_state(value INTEGER);")
+            .unwrap();
+        drop(connection);
+
+        let error = match DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        {
+            Ok(_) => panic!("partial Direct runtime database was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(!state.path().join("runtime.lock").exists());
+        assert!(!state.path().join("objects").exists());
+        assert!(!state.path().join("inputs").exists());
+    }
+
+    #[tokio::test]
+    async fn safe_save_rename_never_deletes_source_after_destination_changes() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("source", b"source".to_vec()).await.unwrap();
+        let first_snapshot = snapshot(&operator, &backend);
+        let source_id = first_snapshot.resolve("source").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        backend.fail_next_delete_before_effect();
+        let status = runtime
+            .rename_file(
+                &first_snapshot,
+                source_id,
+                first_snapshot.root(),
+                "destination",
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.state, DirectMutationState::PendingSourceCleanup);
+        assert_eq!(operator.read("source").await.unwrap().to_vec(), b"source");
+        assert_eq!(
+            operator.read("destination").await.unwrap().to_vec(),
+            b"source"
+        );
+
+        operator
+            .write("destination", b"external".to_vec())
+            .await
+            .unwrap();
+        let status = runtime.retry_mutation(status.id).await.unwrap();
+        assert_eq!(status.state, DirectMutationState::Conflict);
+        assert_eq!(
+            operator.read("destination").await.unwrap().to_vec(),
+            b"external"
+        );
+        assert_eq!(operator.read("source").await.unwrap().to_vec(), b"source");
+    }
+
+    #[tokio::test]
+    async fn unlink_with_dirty_handle_retains_bytes_and_prevents_resurrection() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let file_id = snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.write(0, b"local").await.unwrap();
+        let status = runtime.unlink_file(&snapshot, file_id).await.unwrap();
+        assert_eq!(status.state, DirectMutationState::Applied);
+        assert!(operator.stat("file").await.is_err());
+        assert!(matches!(
+            file.flush().await.unwrap(),
+            DirectFlushOutcome::Conflict {
+                observed: DirectObservation::Missing,
+                ..
+            }
+        ));
+        assert!(operator.stat("file").await.is_err());
+        assert_eq!(file.read(0, 5).await.unwrap(), b"local");
+    }
+
+    #[tokio::test]
+    async fn local_only_create_has_explicit_discard() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "local")
+            .await
+            .unwrap();
+        let id = file.id();
+        file.write(0, b"bytes").await.unwrap();
+        runtime.discard_local(id).await.unwrap();
+        assert!(!operator.stat("local").await.is_ok());
+        assert!(matches!(
+            file.flush().await.unwrap(),
+            DirectFlushOutcome::Unsupported { .. }
+        ));
+        assert!(
+            runtime
+                .pending_objects()
+                .await
+                .unwrap()
+                .iter()
+                .all(|status| status.id != id)
+        );
+    }
 }
