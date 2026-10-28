@@ -1,0 +1,15 @@
+{
+  "storage_keys": [
+    ".yinyang/head",
+    ".yinyang/v2/0d665c4838ef4c8ba2f44987e98fb15e/packs/f5ac29f01c254f0b9737fd722d50ab51"
+  ],
+  "handle": "2988b9c9-8335-4515-9f0a-323bf7dc6117",
+  "bytes_sha256": "6e0033416cd37c35958d40b25e3e553429564189ee929259239b8142fa1462bf",
+  "fsync_stdout": "committed: de1cd46c-3271-4996-bd67-50b674a16a0a revision: 000000000000000226fd65200c2343ed9639f4411df34266\n",
+  "status": "volume: compat-service access: Mount frontend: Library read-only: false\nlocal handles: 0\nremote latest: 000000000000000226fd65200c2343ed9639f4411df34266\n",
+  "head": {
+    "profile": "YYSERV01",
+    "filesystem": "0d665c4838ef4c8ba2f44987e98fb15e",
+    "root": "706f50598f7d456f8c5e6a79373dfb82"
+  }
+}

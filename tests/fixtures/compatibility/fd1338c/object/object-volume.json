@@ -1,0 +1,11 @@
+{
+  "name": "compat-object-stage",
+  "model": "managed",
+  "access": "mount",
+  "frontend": "library",
+  "publication": "object",
+  "storage_profile": "minio",
+  "read_only": false,
+  "require": [],
+  "staging": "tests/fixtures/compatibility/fd1338c/object/stage-pending"
+}

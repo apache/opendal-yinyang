@@ -1,0 +1,292 @@
+{
+  "storage_keys": [
+    ".yinyang/head",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/0c856129800443dfbe367e6fde0ef5fa",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/101a4bb8e12545b1ae0dc736be02375f",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/13ef6f76754d409db7daae450b00ecbf",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/1f19efdcc1d747118d82859747f903c0",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/23a02cbfefd6483983332db0ac4abfd8",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/24318a895f30478298847a3745b3c604",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/269e250d32a34d368ad62abbf1a79ffe",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/2c8f9f3d38794a84aec47bc06512dafe",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/2d7fe19e96124f50b86dd11a52e35acf",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/2dd053f2208943a3a369572537298810",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/309693d5a45c404ca2b19a3643665058",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/3351ebf940d44bf4bb1ae873d5d5c2da",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/3715089d3b6e42139990bf722f02c569",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/43908004495340798f94fc49c6c005e3",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/4d095ac5977a42899d895b6464d7adc7",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/4fbfd70a010c40ea97e51220cb33c149",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/508c27e82629464792be5d8ceff1f70b",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/559a74316aed4dcd89d5bc2cf8cb46a4",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/5707592768f34becaab69bd89f295407",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/58b7d0b06d734413b6ab0f05fda239c4",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/63f9cfe886654b769a04e14a516a9c9e",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/6df697de703f478b87afe61a0527a97f",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/6f6a0285e2c947a2af14458d92329436",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/707a26300c204bcfa170573b7ffb71ce",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/71e5eda96a9f46b69c0f9adb1f83681e",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/770cc7250b214bc886fe535e3e2aac78",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/799994e746f9489dbad3ec72c257b7ec",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/7ab6553b3a7e4a6a8841145eabe58137",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/8351ce4abf9541dda1609c6b1e79ab79",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/83c0f8f8a2064a31a8af9e407fbbee89",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/88488cdeaf6946f5b7ad44000df79e73",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/8ba8c9d3027d429ca6f5c025cf0a5dde",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/8e516090423f42ecaa278452fc1f2e7b",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/8e6993703d814ca49b3418ab57b732fd",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/8fb1280628384aaea50a4933c89135b1",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/904f08785cf5412c8c66c987b9cbbb69",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/957f431c9bcb469c9636e94a386c7bc3",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/9aedafdf9afa40c7bd843da39958a30a",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/9be7dadc8f394c099dace05a984f13f5",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/9bebcb20412347f9a501411f50edaece",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/9c09d871c65149888bc01907754cc938",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/9d387c17f40d4b77b89a5fe2918608fd",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/9f037d8de80943218ad33aabeff66750",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/a35ab973421d49d7978f0b4305fd924d",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/aefecaff458a41788ceb18ffed2771c0",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/b37aa2e4ab394d33967a8fcfdad881a3",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/c1045cefa59b40c6ab793feda1148c9e",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/c48468d0f5a24e37a2ff4e18cd8fe465",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/c4def65941ca49b9b3c36aa3b28108c9",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/ca3a751bf4b948b8ba6ee4de64c76617",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/da00693c2b7f45859cc3b7ae50f0ab89",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/dac72f77acb142a9b08b2aeb4ca0462b",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/e28a557eb1a14bd69e610837abe0051e",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/e502d219a990404caf443f93aeb7c78d",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/e622770a728140a3949250959db8f773",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/eaf14ebb1967483a9f1805cdcdd2c68e",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/ede6fafd36d444e2a6a7a43d66323c6b",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/f3f0573877d449d2aeabe0e54434972f",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/f416b9681a894973986de7d03bb891e7",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/f4deded7ff924c22a991cb5207edbaf3",
+    ".yinyang/v2/ac0f74cc63614f828d9ddaab1396d422/packs/f90f5ab2f6eb4170b7beb16a5d4c1ace"
+  ],
+  "source_v1": [
+    {
+      "path": "hello.txt",
+      "kind": "file",
+      "length": 19,
+      "sha256": "d80b528da93185b36099e6b8621ef15f5449fec3f86dbd1b50be3a5d6f5497cc",
+      "executable": false
+    },
+    {
+      "path": "literal%.txt",
+      "kind": "file",
+      "length": 15,
+      "sha256": "fecbbe388280588e8456beb0d84108a143c8ded4aa316b7103bb6d9c12524260",
+      "executable": false
+    },
+    {
+      "path": "nested",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/empty",
+      "kind": "file",
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "executable": false
+    },
+    {
+      "path": "nested/empty-dir",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/name-\u03bb.txt",
+      "kind": "file",
+      "length": 15,
+      "sha256": "89067937a06492c163adca4b09ea3bcf434507cfb0b73ad85e38b8bd6b67c6e4",
+      "executable": false
+    },
+    {
+      "path": "run.sh",
+      "kind": "file",
+      "length": 29,
+      "sha256": "e908a82f2dbf0159cd96cb83a543d1fbf5c93a435eb18000be3312844883f01a",
+      "executable": true
+    }
+  ],
+  "source_v2": [
+    {
+      "path": "hello.txt",
+      "kind": "file",
+      "length": 22,
+      "sha256": "f6a136bc7d566d1d8e934fa75817d95be8999ad289984ba874b23471644736d1",
+      "executable": false
+    },
+    {
+      "path": "literal%.txt",
+      "kind": "file",
+      "length": 15,
+      "sha256": "fecbbe388280588e8456beb0d84108a143c8ded4aa316b7103bb6d9c12524260",
+      "executable": false
+    },
+    {
+      "path": "nested",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/empty",
+      "kind": "file",
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "executable": false
+    },
+    {
+      "path": "nested/empty-dir",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/name-\u03bb.txt",
+      "kind": "file",
+      "length": 18,
+      "sha256": "74d3f2615eb238e54831d81a657d1318ff979a519cd20e90a135421faaac9fd4",
+      "executable": false
+    },
+    {
+      "path": "run.sh",
+      "kind": "file",
+      "length": 29,
+      "sha256": "e908a82f2dbf0159cd96cb83a543d1fbf5c93a435eb18000be3312844883f01a",
+      "executable": true
+    },
+    {
+      "path": "second.txt",
+      "kind": "file",
+      "length": 21,
+      "sha256": "1c44b4207248f5b068852404c426f752c770aef6564ee4780ae5ccf1a6b8019f",
+      "executable": false
+    }
+  ],
+  "journal_source": [
+    {
+      "path": "hello.txt",
+      "kind": "file",
+      "length": 19,
+      "sha256": "d80b528da93185b36099e6b8621ef15f5449fec3f86dbd1b50be3a5d6f5497cc",
+      "executable": false
+    },
+    {
+      "path": "journal-only.txt",
+      "kind": "file",
+      "length": 25,
+      "sha256": "e4d31747ed4576528a37a94bdf2e88028ac1514ab657c54a805508764de2215b",
+      "executable": false
+    },
+    {
+      "path": "literal%.txt",
+      "kind": "file",
+      "length": 15,
+      "sha256": "fecbbe388280588e8456beb0d84108a143c8ded4aa316b7103bb6d9c12524260",
+      "executable": false
+    },
+    {
+      "path": "nested",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/empty",
+      "kind": "file",
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "executable": false
+    },
+    {
+      "path": "nested/empty-dir",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/name-\u03bb.txt",
+      "kind": "file",
+      "length": 15,
+      "sha256": "89067937a06492c163adca4b09ea3bcf434507cfb0b73ad85e38b8bd6b67c6e4",
+      "executable": false
+    },
+    {
+      "path": "run.sh",
+      "kind": "file",
+      "length": 29,
+      "sha256": "e908a82f2dbf0159cd96cb83a543d1fbf5c93a435eb18000be3312844883f01a",
+      "executable": true
+    }
+  ],
+  "object": {
+    "head": {
+      "profile": "YYHEAD02",
+      "mode": 0,
+      "filesystem": "ac0f74cc63614f828d9ddaab1396d422",
+      "root": "1b118996746443999e25442feb4a7d39",
+      "revision": "04000000000000007bcda829126b492ebdeaa565c6976241"
+    },
+    "revision_v1": "00000000000000016687470f559a46bd88da5174180b5b43",
+    "revision_v2": "00000000000000028bd244355ae647a1a9ed201aa4279202",
+    "commit_v1": "00000000-0000-4000-8000-000000000101",
+    "commit_v2": "00000000-0000-4000-8000-000000000102",
+    "publish_v1_stdout": "published revision 00000000000000016687470f559a46bd88da5174180b5b43 (commit 00000000-0000-4000-8000-000000000101)\n",
+    "publish_v2_stdout": "published revision 00000000000000028bd244355ae647a1a9ed201aa4279202 (commit 00000000-0000-4000-8000-000000000102)\n"
+  },
+  "journal": {
+    "commit": "00000000-0000-4000-8000-000000000103",
+    "revision": "000000000000000379a76a2c4dd4444aae158434d924218d",
+    "publish_stdout": "commit: 00000000-0000-4000-8000-000000000103\nrevision: 000000000000000379a76a2c4dd4444aae158434d924218d\nordinal: 0\nrequest digest: bc9de8cfa08218a0fd9b6df554f177967430ff3563bbf97c01d2726bf419d396\n",
+    "source": [
+      {
+        "path": "hello.txt",
+        "kind": "file",
+        "length": 19,
+        "sha256": "d80b528da93185b36099e6b8621ef15f5449fec3f86dbd1b50be3a5d6f5497cc",
+        "executable": false
+      },
+      {
+        "path": "journal-only.txt",
+        "kind": "file",
+        "length": 25,
+        "sha256": "e4d31747ed4576528a37a94bdf2e88028ac1514ab657c54a805508764de2215b",
+        "executable": false
+      },
+      {
+        "path": "literal%.txt",
+        "kind": "file",
+        "length": 15,
+        "sha256": "fecbbe388280588e8456beb0d84108a143c8ded4aa316b7103bb6d9c12524260",
+        "executable": false
+      },
+      {
+        "path": "nested",
+        "kind": "directory"
+      },
+      {
+        "path": "nested/empty",
+        "kind": "file",
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "executable": false
+      },
+      {
+        "path": "nested/empty-dir",
+        "kind": "directory"
+      },
+      {
+        "path": "nested/name-\u03bb.txt",
+        "kind": "file",
+        "length": 15,
+        "sha256": "89067937a06492c163adca4b09ea3bcf434507cfb0b73ad85e38b8bd6b67c6e4",
+        "executable": false
+      },
+      {
+        "path": "run.sh",
+        "kind": "file",
+        "length": 29,
+        "sha256": "e908a82f2dbf0159cd96cb83a543d1fbf5c93a435eb18000be3312844883f01a",
+        "executable": true
+      }
+    ]
+  },
+  "stage_pending": {
+    "handle": "9302848e-dad6-413f-9559-ef2f81e373be",
+    "bytes_sha256": "a0ebc569dd3de3a042598afdf79ff376b22dd79cf5932b489c528b7dc69d4793",
+    "status": "volume: compat-object-stage access: Mount frontend: Library read-only: false\nlocal handles: 1\nhandle: 9302848e-dad6-413f-9559-ef2f81e373be local: 1 remote: 0 revision: 00000000000000047bcda829126b492ebdeaa565c6976241 pending: true frozen: false conflict: false\nremote latest: 00000000000000047bcda829126b492ebdeaa565c6976241\n"
+  }
+}

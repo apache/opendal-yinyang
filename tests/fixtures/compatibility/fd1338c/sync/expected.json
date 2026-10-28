@@ -1,0 +1,385 @@
+{
+  "storage_keys": [
+    ".yinyang/head",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/1f26dad9325444feb68c8b2269852bfd",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/2dc3403910e843afb711d5b4bc615276",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/44056cf1f8f74cfcaa608d5f0175afba",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/466e0a9ee3694de38b7f50ba30ef1394",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/4b6386b1198c4358a9fb1c6cd2214c16",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/4d20594a51e448d7968a96da17a79642",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/5870b66feb3043a6a74d002c799ee6d8",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/5b89549ab8f440b597428a011bf62333",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/6fabc1b1abda42ce883dc71616b15220",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/7f477fbecf4b4adb910243a7799187d9",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/809bf6c64de04daa911360089837996a",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/819ac3a77927455680ed2bfe008f968a",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/91455f5608af49e9979a2b5a7266df1b",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/9dd60dd5d32240319274c1cf9baf10a3",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/a3cb08aa4e1b42dc8e01568bbdebbd27",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/a8274ce0068148a49bbfd6828e1d80f3",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/af5ef7adf2b940938cfc558636b7ac10",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/b75eefd009944d8b94cb433983e3dbac",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/cb739c0b1e8f4538ac20aafa56b41024",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/cd17d46eaaa345dc8258de503857ea61",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/d2b8506aa9654c00b19e81ba9b7ad33d",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/d6c39b2c3dce4b41917f3a48a146fa18",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/de134deaf23a4b728499726a32659963",
+    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/e991bd2c67044d60a523341febef5fae"
+  ],
+  "local": [
+    {
+      "path": "nested",
+      "kind": "directory"
+    },
+    {
+      "path": "nested/empty",
+      "kind": "file",
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "executable": false
+    },
+    {
+      "path": "sync.txt",
+      "kind": "file",
+      "length": 33,
+      "sha256": "1821321dd281767e6675c348aa7de13635a3d5ba9ffc88890bc3f630de19d476",
+      "executable": false
+    }
+  ],
+  "in_sync_status": {
+    "schema": "yinyang.sync.status.v1",
+    "binding": {
+      "state": "bound",
+      "state_directory": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state",
+      "root": "/tmp/yinyang-compatibility-180gp6kv/sync-work/local",
+      "filesystem": "1f05871e29ab4933b778791cddb4bf9e",
+      "same_filesystem": true
+    },
+    "remote": {
+      "availability": "available",
+      "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285",
+      "error": null
+    },
+    "local": {
+      "scan": "clean",
+      "error": null
+    },
+    "summary": {
+      "in_sync": true,
+      "pending": 0,
+      "unknown": 0,
+      "conflicts": 0,
+      "failed": 0,
+      "retained_artifacts": 2
+    },
+    "entries": [
+      {
+        "path": "nested",
+        "original_path": null,
+        "desired_path": null,
+        "state": "in_sync",
+        "local": {
+          "kind": "directory",
+          "length": null,
+          "digest": null,
+          "executable": false,
+          "presence": "present"
+        },
+        "remote": {
+          "kind": "directory",
+          "length": null,
+          "digest": null,
+          "executable": false,
+          "presence": "present",
+          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "baseline": {
+          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "intent": {
+          "id": "3ba6984400ba8f5669a50e0f38c1b049a403b8bbbcf2619d2a31098b7dc16188",
+          "operation": "create_directory",
+          "state": "committed",
+          "commit_id": "a84fae8c7e8eaa8be76f21b8fd8f0bd9",
+          "receipt_revision": "000000000000000146fdfab5d0ef443eb436c71784e85dff"
+        },
+        "outcome": {
+          "state": "remote_completed",
+          "error": null
+        },
+        "conflict": null
+      },
+      {
+        "path": "nested/empty",
+        "original_path": null,
+        "desired_path": null,
+        "state": "in_sync",
+        "local": {
+          "kind": "file",
+          "length": 0,
+          "digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "executable": false,
+          "presence": "present"
+        },
+        "remote": {
+          "kind": "file",
+          "length": 0,
+          "digest": "8b6e8e7afc13ad19dbda880a74217bc132f02679c34b4338cd318b6c264c7714",
+          "executable": false,
+          "presence": "present",
+          "node": "c290a53ad83821844069bb200840f8ab",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "baseline": {
+          "node": "c290a53ad83821844069bb200840f8ab",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "intent": {
+          "id": "eeb183e10dd45976a2221035488c0a2c8fa0ab1d584d67298e17f7a70c0e053d",
+          "operation": "create_file",
+          "state": "committed",
+          "commit_id": "cf1d4151a88b89fe0c39051c42129f3d",
+          "receipt_revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "outcome": {
+          "state": "remote_completed",
+          "error": null
+        },
+        "conflict": null
+      },
+      {
+        "path": "sync.txt",
+        "original_path": null,
+        "desired_path": null,
+        "state": "in_sync",
+        "local": {
+          "kind": "file",
+          "length": 30,
+          "digest": "040d002f0c44a0e323a9668f1665b41462c051eb20f1f235cc4162a0329c7883",
+          "executable": false,
+          "presence": "present"
+        },
+        "remote": {
+          "kind": "file",
+          "length": 30,
+          "digest": "6625c65ddda30f757434c13bbe4ad406276b625f04c7d0cec0667f56332f7a1d",
+          "executable": false,
+          "presence": "present",
+          "node": "af4d8daddaaeca4de357cb2920f89476",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "baseline": {
+          "node": "af4d8daddaaeca4de357cb2920f89476",
+          "revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+        },
+        "intent": {
+          "id": "8bfc36f993505d12c7656c3a90f67406ec30e406a0718aae7e485ff2e7b8b575",
+          "operation": "create_file",
+          "state": "committed",
+          "commit_id": "f6c2f9e8cfb70fb5eb23538fff9b98f6",
+          "receipt_revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+        },
+        "outcome": {
+          "state": "remote_completed",
+          "error": null
+        },
+        "conflict": null
+      }
+    ],
+    "conflicts": [],
+    "artifacts": [
+      {
+        "id": "010341eb-ba81-4b82-b413-bcb12aac120f",
+        "origin": "sync.txt",
+        "kind": "upload_retained",
+        "phase": "retained",
+        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-010341eb-ba81-4b82-b413-bcb12aac120f",
+        "exportable": true,
+        "error": null
+      },
+      {
+        "id": "2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "origin": "nested/empty",
+        "kind": "upload_retained",
+        "phase": "retained",
+        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "exportable": true,
+        "error": null
+      }
+    ]
+  },
+  "pending_status": {
+    "schema": "yinyang.sync.status.v1",
+    "binding": {
+      "state": "bound",
+      "state_directory": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state",
+      "root": "/tmp/yinyang-compatibility-180gp6kv/sync-work/local",
+      "filesystem": "1f05871e29ab4933b778791cddb4bf9e",
+      "same_filesystem": true
+    },
+    "remote": {
+      "availability": "available",
+      "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285",
+      "error": null
+    },
+    "local": {
+      "scan": "changed",
+      "error": null
+    },
+    "summary": {
+      "in_sync": false,
+      "pending": 1,
+      "unknown": 0,
+      "conflicts": 0,
+      "failed": 0,
+      "retained_artifacts": 2
+    },
+    "entries": [
+      {
+        "path": "nested",
+        "original_path": null,
+        "desired_path": null,
+        "state": "in_sync",
+        "local": {
+          "kind": "directory",
+          "length": null,
+          "digest": null,
+          "executable": false,
+          "presence": "present"
+        },
+        "remote": {
+          "kind": "directory",
+          "length": null,
+          "digest": null,
+          "executable": false,
+          "presence": "present",
+          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "baseline": {
+          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "intent": {
+          "id": "3ba6984400ba8f5669a50e0f38c1b049a403b8bbbcf2619d2a31098b7dc16188",
+          "operation": "create_directory",
+          "state": "committed",
+          "commit_id": "a84fae8c7e8eaa8be76f21b8fd8f0bd9",
+          "receipt_revision": "000000000000000146fdfab5d0ef443eb436c71784e85dff"
+        },
+        "outcome": {
+          "state": "remote_completed",
+          "error": null
+        },
+        "conflict": null
+      },
+      {
+        "path": "nested/empty",
+        "original_path": null,
+        "desired_path": null,
+        "state": "in_sync",
+        "local": {
+          "kind": "file",
+          "length": 0,
+          "digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "executable": false,
+          "presence": "present"
+        },
+        "remote": {
+          "kind": "file",
+          "length": 0,
+          "digest": "8b6e8e7afc13ad19dbda880a74217bc132f02679c34b4338cd318b6c264c7714",
+          "executable": false,
+          "presence": "present",
+          "node": "c290a53ad83821844069bb200840f8ab",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "baseline": {
+          "node": "c290a53ad83821844069bb200840f8ab",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "intent": {
+          "id": "eeb183e10dd45976a2221035488c0a2c8fa0ab1d584d67298e17f7a70c0e053d",
+          "operation": "create_file",
+          "state": "committed",
+          "commit_id": "cf1d4151a88b89fe0c39051c42129f3d",
+          "receipt_revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "outcome": {
+          "state": "remote_completed",
+          "error": null
+        },
+        "conflict": null
+      },
+      {
+        "path": "sync.txt",
+        "original_path": null,
+        "desired_path": null,
+        "state": "local_pending",
+        "local": {
+          "kind": "file",
+          "length": 33,
+          "digest": "5e64196524b61c1a83f5e5637684f6f76ab53cc30f9a21cc29102f9daa552b36",
+          "executable": false,
+          "presence": "present"
+        },
+        "remote": {
+          "kind": "file",
+          "length": 30,
+          "digest": "6625c65ddda30f757434c13bbe4ad406276b625f04c7d0cec0667f56332f7a1d",
+          "executable": false,
+          "presence": "present",
+          "node": "af4d8daddaaeca4de357cb2920f89476",
+          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+        },
+        "baseline": {
+          "node": "af4d8daddaaeca4de357cb2920f89476",
+          "revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+        },
+        "intent": {
+          "id": "8bfc36f993505d12c7656c3a90f67406ec30e406a0718aae7e485ff2e7b8b575",
+          "operation": "create_file",
+          "state": "committed",
+          "commit_id": "f6c2f9e8cfb70fb5eb23538fff9b98f6",
+          "receipt_revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+        },
+        "outcome": {
+          "state": "remote_completed",
+          "error": null
+        },
+        "conflict": null
+      }
+    ],
+    "conflicts": [],
+    "artifacts": [
+      {
+        "id": "010341eb-ba81-4b82-b413-bcb12aac120f",
+        "origin": "sync.txt",
+        "kind": "upload_retained",
+        "phase": "retained",
+        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-010341eb-ba81-4b82-b413-bcb12aac120f",
+        "exportable": true,
+        "error": null
+      },
+      {
+        "id": "2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "origin": "nested/empty",
+        "kind": "upload_retained",
+        "phase": "retained",
+        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "exportable": true,
+        "error": null
+      }
+    ]
+  },
+  "head": {
+    "profile": "YYHEAD02",
+    "mode": 0,
+    "filesystem": "1f05871e29ab4933b778791cddb4bf9e",
+    "root": "f9757a6972e2422da720299a7e4e9cd2",
+    "revision": "0300000000000000c503cf7676ec4e2ea8a62625435fa285"
+  },
+  "filesystem": "1F05871E29AB4933B778791CDDB4BF9E"
+}
