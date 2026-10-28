@@ -30,7 +30,11 @@ them:
   local work remains a separate pending edit;
 - `fd1338c` processes read state written by the current binary;
 - unknown or malformed persistent profiles are rejected at their format
-  boundary, and copied local or remote state is byte-identical after rejection.
+  boundary while the authoritative main databases, any existing WAL or
+  journal bytes, logical rows, retained content and recovery state remain
+  unchanged. SQLite may create or update derived `-shm` coordination files and
+  may create a new empty WAL; it cannot add or change a non-empty WAL or hide a
+  durable state change.
 
 The frozen fixture includes only SQLite backup images, never live `-wal`,
 `-shm` or process lease files. The checked-in profile images are those emitted
