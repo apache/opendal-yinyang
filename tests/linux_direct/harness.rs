@@ -180,6 +180,17 @@ impl Fixture {
         command
     }
 
+    pub fn operator(&self) -> opendal::Operator {
+        let mut config = std::env::vars()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("YINYANG_S3_")
+                    .map(|key| (key.to_ascii_lowercase(), value))
+            })
+            .collect::<Vec<_>>();
+        config.push(("root".to_owned(), self.root.clone()));
+        opendal::Operator::via_iter("s3", config).expect("construct Direct test operator")
+    }
+
     pub fn yy(&self, args: &[&str]) -> Captured {
         run_timeout(self.yy_command(args), Duration::from_secs(120))
     }

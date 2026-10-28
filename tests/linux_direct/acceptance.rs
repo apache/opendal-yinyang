@@ -488,6 +488,36 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_list_preserves_file_prefix_aliases_without_folding() {
+    let fixture = Fixture::new();
+    fixture.write_raw("a", b"file");
+    fixture.write_raw("a/b", b"child");
+    let runtime = tokio::runtime::Runtime::new().expect("Direct test runtime");
+    let paths = runtime
+        .block_on(fixture.operator().list_with("").recursive(true))
+        .expect("list raw Direct namespace")
+        .into_iter()
+        .map(|entry| entry.path().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        paths,
+        ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
+        "OpenDAL recursive list must expose both the file key and descendant key"
+    );
+
+    let namespace =
+        yinyang::direct::DirectNamespace::new(fixture.operator()).expect("admit Direct operator");
+    let error = runtime
+        .block_on(namespace.observe())
+        .expect_err("file-prefix alias must reject the complete Direct observation");
+    assert!(
+        error.to_string().contains("file-prefix collision"),
+        "unexpected Direct observation error: {error}"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
 fn direct_unrepresentable_names_reject_the_complete_observation_without_writes() {
     let cases: Vec<(&str, Vec<(String, &[u8])>, &str)> = vec![
         (
