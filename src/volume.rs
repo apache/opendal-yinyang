@@ -16,7 +16,7 @@
 // under the License.
 
 //! Volume configuration and effective capability admission, before runtime exposure.
-use crate::direct::{self, DirectNamespace};
+use crate::direct::{self, DirectNamespace, DirectStorageBinding};
 use crate::runtime::{Error, Result, Runtime};
 use opendal::Operator;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -543,6 +543,38 @@ pub fn direct_namespace(config: &VolumeConfig, operator: Operator) -> Result<Dir
         return Err(Error::Invalid("volume model is not direct"));
     }
     DirectNamespace::new(operator).map_err(direct_admission_error)
+}
+
+/// Build the one non-secret storage binding shared by writable Direct Mount
+/// and Direct Sync. The endpoint comes from the existing operator construction
+/// environment rather than a second configuration field.
+pub fn direct_storage_binding(
+    config: &VolumeConfig,
+    operator: &Operator,
+) -> Result<DirectStorageBinding> {
+    if config.model != Model::Direct {
+        return Err(Error::Invalid(
+            "a Direct storage binding requires a direct volume",
+        ));
+    }
+    let endpoint = match std::env::var_os("YINYANG_S3_ENDPOINT") {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| Error::Invalid("YINYANG_S3_ENDPOINT is not valid UTF-8"))?,
+        None => "provider-default".to_owned(),
+    };
+    let profile = match config.storage_profile {
+        StorageProfile::AmazonS3 => "amazon-s3",
+        StorageProfile::Minio => "minio",
+    };
+    DirectStorageBinding::new(
+        operator.info().scheme(),
+        profile,
+        operator.info().name(),
+        operator.info().root(),
+        endpoint,
+    )
+    .map_err(direct_admission_error)
 }
 
 fn path_is_empty(path: &Path) -> bool {
