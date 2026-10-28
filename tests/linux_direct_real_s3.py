@@ -33,6 +33,9 @@ environment:
     YINYANG_QUALIFICATION_REGION (optional, defaults to us-east-2)
     AWS_CLI_BIN (optional, defaults to aws)
 
+argument:
+    optional test-name filter beginning with direct_amazon_s3_
+
 The helper removes every inherited YINYANG_* and AWS endpoint setting before
 starting the tests. It never prints, writes or places credentials in command
 arguments.
@@ -68,6 +71,11 @@ def credentials_from_stdin() -> dict[str, str]:
 
 def main() -> int:
     credentials = credentials_from_stdin()
+    if len(sys.argv) > 2:
+        raise SystemExit("at most one Direct test-name filter is accepted")
+    test_filter = sys.argv[1] if len(sys.argv) == 2 else "direct_amazon_s3_"
+    if not test_filter.startswith("direct_amazon_s3_"):
+        raise SystemExit("Direct test-name filter must begin with direct_amazon_s3_")
     unversioned = os.environ.get("YINYANG_DIRECT_UNVERSIONED_BUCKET")
     versioned = os.environ.get("YINYANG_DIRECT_VERSIONED_BUCKET")
     if not unversioned:
@@ -138,7 +146,7 @@ def main() -> int:
             "yinyang",
             "--test",
             "linux_direct",
-            "direct_amazon_s3_",
+            test_filter,
             "--",
             "--ignored",
             "--nocapture",

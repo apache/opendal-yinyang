@@ -78,6 +78,10 @@ cargo test --locked -p yinyang --test linux_direct direct_amazon_s3_
   -- --ignored --nocapture --test-threads=1
 ```
 
+An optional argument beginning with `direct_amazon_s3_` restricts a targeted
+rerun to one qualified scenario while preserving the same credential and
+endpoint checks.
+
 Do not put credentials in environment assignments visible in a command line,
 files or logs. A qualification invocation through the shared Linux runner
 looks like:

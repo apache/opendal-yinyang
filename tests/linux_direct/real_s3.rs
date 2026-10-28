@@ -722,6 +722,121 @@ fn hex(value: u8) -> u8 {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BucketKind {
+    Unversioned,
+    Versioned,
+}
+
+fn marker_fixture(kind: BucketKind) -> Fixture {
+    match kind {
+        BucketKind::Unversioned => Fixture::unversioned(),
+        BucketKind::Versioned => Fixture::versioned(),
+    }
+}
+
+fn cleanup_marker_fixture(fixture: &Fixture, kind: BucketKind) {
+    match kind {
+        BucketKind::Unversioned => fixture.cleanup(),
+        BucketKind::Versioned => fixture.cleanup_versions(),
+    }
+}
+
+#[test]
+#[ignore = "requires two real Amazon S3 buckets; run with tests/linux_direct_real_s3.py"]
+fn direct_amazon_s3_directory_marker_probe_is_lossless() {
+    for kind in [BucketKind::Unversioned, BucketKind::Versioned] {
+        let fixture = marker_fixture(kind);
+        match kind {
+            BucketKind::Unversioned => assert_eq!(fixture.aws.versioning(), json!({})),
+            BucketKind::Versioned => {
+                assert_eq!(fixture.aws.versioning(), json!({"Status": "Enabled"}))
+            }
+        }
+        fixture
+            .aws
+            .put_ok(&fixture.full_key("empty/"), b"", None, None);
+        fixture
+            .aws
+            .put_ok(&fixture.full_key("empty/child.txt"), b"child", None, None);
+        let initial = fixture.inventory();
+        assert_eq!(initial["empty/"].size, 0);
+        assert_eq!(initial["empty/child.txt"].size, 5);
+
+        let config = fixture.config("amazon-s3-empty-marker");
+        let mountpoint = fixture.temp.path().join("mnt-empty-marker");
+        fs::create_dir(&mountpoint).expect("create empty marker mountpoint");
+        let mounted = fixture.spawn_mount(&config, &mountpoint);
+        assert!(
+            fs::metadata(mounted.mountpoint().join("empty"))
+                .expect("stat empty marker")
+                .is_dir(),
+            "a zero-length trailing-slash object must remain a visible directory"
+        );
+        assert_eq!(
+            fs::read(mounted.mountpoint().join("empty/child.txt"))
+                .expect("read empty marker child"),
+            b"child"
+        );
+        mounted.unmount();
+        assert_eq!(
+            fixture.inventory(),
+            initial,
+            "the empty marker observation changed raw storage"
+        );
+        cleanup_marker_fixture(&fixture, kind);
+
+        let fixture = marker_fixture(kind);
+        let marker = b"must-not-be-hidden";
+        let marker_key = fixture.full_key("nonempty/");
+        fixture.aws.put_ok(&marker_key, marker, None, None);
+        let initial = fixture.inventory();
+        assert_eq!(initial["nonempty/"].size, marker.len() as u64);
+        assert_eq!(
+            fixture.aws.get(&marker_key, None, None).0,
+            marker,
+            "raw exact GET changed non-empty marker bytes"
+        );
+
+        let config = fixture.config("amazon-s3-nonempty-marker");
+        let mountpoint = fixture.temp.path().join("mnt-nonempty-marker");
+        fs::create_dir(&mountpoint).expect("create non-empty marker mountpoint");
+        let rejected = run_timeout(
+            fixture.yy_command(&[
+                "--volume",
+                path_text(&config),
+                "mount",
+                path_text(&mountpoint),
+            ]),
+            Duration::from_secs(60),
+        );
+        assert!(
+            !rejected.status.success(),
+            "a data-bearing trailing-slash object was accepted as a directory"
+        );
+        let diagnostic = rejected.text();
+        assert!(
+            diagnostic.to_ascii_lowercase().contains("directory marker"),
+            "marker rejection omitted its invariant:\n{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("contains data"),
+            "marker rejection omitted the data-bearing cause:\n{diagnostic}"
+        );
+        assert_eq!(
+            fixture.inventory(),
+            initial,
+            "marker rejection changed raw inventory"
+        );
+        assert_eq!(
+            fixture.aws.get(&marker_key, None, None).0,
+            marker,
+            "marker rejection changed or hid raw object bytes"
+        );
+        cleanup_marker_fixture(&fixture, kind);
+    }
+}
+
 #[test]
 #[ignore = "requires two real Amazon S3 buckets; run with tests/linux_direct_real_s3.py"]
 fn direct_amazon_s3_complete_pagination_reaches_real_fuse() {
