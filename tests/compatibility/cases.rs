@@ -263,6 +263,8 @@ fn compatibility_fd1338c_object_stage_and_journal_cross_both_binaries() {
         .raw_get(".yinyang/head")
         .expect("fixture object head");
     head[..8].copy_from_slice(b"YYHEAD99");
+    let checksum = blake3::hash(&head[..head.len() - 32]);
+    head[head.len() - 32..].copy_from_slice(checksum.as_bytes());
     broken.raw_put(".yinyang/head", &head);
     let before = broken.inventory();
     let rejected = broken.run(&current, &["status"]);
