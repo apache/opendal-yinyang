@@ -20,6 +20,13 @@ start and exclusive end sequence. Revision tokens are retained separately and
 validated before reads. History is application data, not an expiring database
 MVCC window. There is no history deletion or garbage collection.
 
+Before changing the SQLite journal mode or creating tables, opening checks the
+schema profile, the retained `authority` manifest, the required tables, and the
+column order used by writes. An unknown profile returns `Unsupported`; a
+supported identifier with an incompatible schema or manifest returns `Corrupt`.
+Neither path modifies the database. This admission is a format check, not a scan
+of all historical records.
+
 Writers serialize at the database boundary, but revalidate original logical
 predicates through the same transaction evaluator as object publication.
 Disjoint name slots and file states can both succeed from one observation;
@@ -59,6 +66,10 @@ all mandatory predicates, and digest. A caller cannot remove a condition to
 bypass concurrency checks. An untrusted serialized request is not preparation
 evidence. Object-mode restoration verifies referenced content through import.
 
+`YYPLAN01` is the supported frozen-request profile. Analysis of an unknown plan
+identifier returns `Unsupported` before observing the authority, importing
+content, or attempting publication.
+
 ## Protocol and security boundary
 
 `yy serve --database PATH --listen 127.0.0.1:7447` opens or creates the authority.
@@ -80,6 +91,12 @@ requests. Responses carry observations, records, readiness, typed outcomes, or
 typed errors. Maximum batch size is 4096; scans request at most 4097 records.
 The server handles at most 32 active connections, each with a 60-second timeout.
 This wire profile is experimental and is not a stable interoperability promise.
+
+Protocol version 1 is the only supported request version. The server checks the
+token first, then returns `Unsupported` for a validly authenticated unknown
+version before dispatching or decoding a command against storage. Clients and
+servers that implement different versions fail explicitly rather than
+negotiating down or sharing an authority.
 
 Error responses retain the existing tag order: Invalid=0, Corrupt=1,
 NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional
@@ -122,3 +139,16 @@ depends on retained versions and query ranges; this profile does not promise
 the object B+ tree's page bounds. SQLite's single writer is a throughput limit.
 There is no benchmark-based production capacity claim or stable storage
 migration support.
+
+## Compatibility
+
+The supported service profiles are `yinyang-sqlite-1`, `YYSERV01`, `YYPLAN01`,
+the shared `YYFILE02`/`YYHASH02` content profile, and loopback RPC version 1.
+There is no automatic schema upgrade or downgrade, no object-authority fallback,
+and no cross-profile read of local preparation evidence. A same-profile process
+restart retains published history, receipts, frozen requests, and readiness.
+
+The independent SQLite and object vectors under
+[`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) are consumed
+directly by the tests. See [Compatibility](compatibility.md) for the complete
+reader/writer matrix and unsupported-transition behavior.

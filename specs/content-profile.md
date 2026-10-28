@@ -1,9 +1,10 @@
-# Experimental authenticated content profile
+# Authenticated content profile
 
-Status: implemented by `yinyang_core::data`. This profile supplies the content
-and preparation boundary for the transactional filesystem. It is not a claim
-that either publication authority is implemented by this module, or that the
-profile has been frozen for an interoperable release.
+Status: `YYFILE02` / `YYHASH02` is the supported content profile for the current
+experimental implementation. It supplies the content and preparation boundary
+for both publication authorities. The profile identifier, hash context,
+verification unit, field order, and proof encoding are fixed. Release support
+for a frontend or platform remains separate from this format compatibility.
 
 ## Canonical identity
 
@@ -29,6 +30,13 @@ and block boundaries unchanged and only rebuilds affected leaves and hash paths.
 `ContentId::calculate` applies the same canonical profile to a local byte stream
 without writing storage. It uses one verification-unit buffer and a logarithmic
 hash frontier. Directory transfer uses this to reuse unchanged published content.
+
+The profile is `YYFILE02` with content hash context
+`Apache OpenDAL YinYang content profile 2`. Readers and writers that advertise
+it use the same logical identities. Changing the unit size, context string,
+domain tags, integer widths, tree split, or descriptor/index fields requires a
+different profile identifier; existing identities are never reinterpreted
+through new tuning.
 
 Conformance vectors (lowercase hexadecimal):
 
@@ -69,6 +77,11 @@ Each unit's physical and logical hashes are checked before releasing its
 requested bytes. A failure in a later unit may leave a verified prefix. Unread
 units are not scrubbed as a side effect of a range read.
 
+Unknown descriptor or hash-node identifiers return `Unsupported` before payload
+bytes are read or released. A malformed record carrying `YYFILE02` or
+`YYHASH02` returns `Corrupt`. There is no `YYFILE01` reader, automatic upgrade,
+or downgrade. The current writer emits only `YYFILE02` and `YYHASH02`.
+
 `Snapshot::open_file(NodeId)` binds a `FileVersion` to published node metadata
 and its revision without fetching payload. Its range reads reuse this profile's
 verification and do not prepare content or materialize local staging. Content
@@ -99,3 +112,11 @@ visibility. External mutation/deletion is outside the contract. This in-process
 evidence is not an authentication protocol for an untrusted remote caller.
 Compression, encryption, retention expiry, and garbage collection are not
 implemented by this profile.
+
+## Conformance
+
+[`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) contains
+independently encoded descriptors, proof nodes, ranges, and malformed/unknown
+records consumed directly by the core tests. The fixed hash vectors above and
+these stored vectors must both continue to pass. The complete reader/writer
+matrix and transition limits are defined by [Compatibility](compatibility.md).
