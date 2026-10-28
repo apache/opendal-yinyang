@@ -666,7 +666,8 @@ mod tests {
         assert_eq!(
             Stage::open(temp.path().to_owned(), fs)
                 .await
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .kind(),
             ErrorKind::Unsupported
         );
@@ -698,7 +699,8 @@ mod tests {
         assert_eq!(
             Stage::open(temp.path().to_owned(), fs)
                 .await
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .kind(),
             ErrorKind::Corrupt
         );
