@@ -13,6 +13,7 @@ qualification.
 | `cargo x test-linux-fuse` | Ubuntu, `/dev/fuse`, isolated Silo | Real `fuse.yinyang` mount, read-only range hydration, writable recovery, corruption, refresh, restart and lifecycle |
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object Mount and finite Sync, loopback service Mount |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
+| `cargo test --test linux_prefix_upgrade` | Ubuntu, isolated Silo, `YY_LEGACY_BIN`, `YY_UPGRADE_BIN`, `sqlite3` | Stopped installed-prefix transition from the `fd1338c` producer to a selected target with retained file, Sync and service state |
 
 GitHub Actions runs the FUSE and installed-CLI checks in the `linux-fuse` job
 after starting isolated Silo. It runs backup and recovery acceptance in the
@@ -37,6 +38,8 @@ These checks require infrastructure that hosted CI does not provide:
 | `cargo x test-linux-operations --systemd` | running systemd user manager, `/dev/fuse`, isolated Silo | install/start/restart/stop/uninstall templates for service, Mount and finite Sync |
 | `cargo x test-linux-operations --amazon-s3` | real Amazon S3 credentials and bucket, `/dev/fuse` | installed CLI lifecycle against the named S3 backend |
 | `cargo x bench-linux-cost --workload read-only-range` | matched source identities, release binary, isolated S3, `/dev/fuse` | bounded FUSE range latency, requests, payload and staging |
+| `cargo test --test linux_prefix_upgrade` | isolated Silo, exact `fd1338c` and final-target binaries, `sqlite3` | stopped versioned-prefix replacement with pending/Unknown state, receipts and service WAL recovery |
+| `tests/linux_operating_envelope.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `aws`, `sqlite3` | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
 
 The systemd lifecycle remains an explicit qualified-host command. Hosted CI
 does not enable linger, create a boot service, or change FUSE configuration to
@@ -58,6 +61,9 @@ The initial qualified combination is:
 - Managed Mount and finite ordinary-directory Managed Sync;
 - isolated MinIO-compatible Silo continuously, with Amazon S3 only when its
   explicit run is recorded.
+- installed, stopped binary replacement only for the exact producer and target
+  source pair recorded by installed-prefix evidence; arbitrary upgrade and
+  downgrade remain unsupported.
 
 The metadata service remains one authenticated loopback authority. This matrix
 does not claim TLS, HA, network-safe service exposure, multi-host locking,
@@ -66,4 +72,6 @@ automatic Sync watching, or automatic garbage collection.
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed
 in [`linux-fuse.md`](../specs/linux-fuse.md). Matched range cost evidence is in
-[`linux-range-cost-results.md`](linux-range-cost-results.md).
+[`linux-range-cost-results.md`](linux-range-cost-results.md). Bounded sustained
+operation, sampled resource growth and current limitations are recorded in
+[`linux-operating-envelope.md`](linux-operating-envelope.md).
