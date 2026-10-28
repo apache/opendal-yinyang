@@ -110,6 +110,11 @@ impl DirectId {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    #[cfg(test)]
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// A digest of one complete Direct namespace observation.
@@ -572,6 +577,28 @@ pub struct DirectFile {
 }
 
 impl DirectFile {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        operator: Operator,
+        id: DirectId,
+        key: String,
+        length: u64,
+        version: Option<String>,
+        etag: Option<String>,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            operator,
+            id,
+            key,
+            length,
+            version,
+            etag,
+            modified,
+        }
+    }
+
     pub fn id(&self) -> DirectId {
         self.id
     }
@@ -666,9 +693,7 @@ impl ObjectPin {
             Some(version) => observed.version.as_deref() == Some(version),
             None => {
                 let etag_matches = match &self.etag {
-                    Some(etag) => {
-                        observed.version.is_none() && observed.etag.as_deref() == Some(etag)
-                    }
+                    Some(etag) => observed.etag.as_deref() == Some(etag),
                     None => false,
                 };
                 etag_matches
@@ -1074,6 +1099,26 @@ mod tests {
             ..pin.clone()
         };
         assert!(!pin.matches(&newer));
+    }
+
+    #[test]
+    fn list_etag_pin_accepts_head_version_and_strengthens_reads() {
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let mut record = record("file", false);
+        record.version = None;
+        record.size = 9;
+        record.modified = Some(modified);
+        let list_pin = ObjectPin::from_record(&record).unwrap();
+        let head_pin = ObjectPin {
+            version: Some("real-version-id".to_owned()),
+            etag: list_pin.etag.clone(),
+            size: list_pin.size,
+            modified: list_pin.modified,
+        };
+        assert!(
+            list_pin.matches(&head_pin),
+            "ListObjectsV2 may omit version IDs while HEAD returns one"
+        );
     }
 
     #[test]
