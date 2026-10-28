@@ -65,6 +65,7 @@ SECRET_NAMES = (
 )
 PAGE_BYTES = 4096
 POLL_SECONDS = 0.05
+MAX_FIRST_ERRORS = 16
 
 
 class EnvelopeError(RuntimeError):
@@ -426,8 +427,11 @@ class Workload:
         self.uncertain_files: set[int] = set()
         self.read_errors = 0
         self.fatal: list[str] = []
+        self.first_errors: list[dict[str, Any]] = []
+        self.started_at: float | None = None
 
     def start(self) -> None:
+        self.started_at = time.monotonic()
         for worker in range(self.writers):
             thread = threading.Thread(
                 target=self.writer,
@@ -477,6 +481,7 @@ class Workload:
                         written += count
                         view = view[count:]
                 except OSError as error:
+                    self.record_first_error("pwrite", index, error)
                     with self.lock:
                         self.pwrite_errors += 1
                         self.uncertain_files.add(index)
@@ -488,6 +493,7 @@ class Workload:
                     try:
                         os.fsync(descriptors[index])
                     except OSError as error:
+                        self.record_first_error("fsync", index, error)
                         with self.lock:
                             self.fsync_errors += 1
                             self.uncertain_files.add(index)
@@ -507,6 +513,7 @@ class Workload:
                 elapsed = time.monotonic() - started
                 self.stop.wait(max(0.0, self.write_interval - elapsed))
         except OSError as error:
+            self.record_first_error("open", None, error)
             self.fatal.append(f"writer {worker} failed outside an operation: {error}")
             self.stop.set()
         finally:
@@ -539,6 +546,7 @@ class Workload:
                     self.read_latencies.append((time.monotonic() - started) * 1000)
                 failures = 0
             except OSError as error:
+                self.record_first_error("read", index, error)
                 with self.lock:
                     self.read_errors += 1
                 failures += 1
@@ -548,14 +556,32 @@ class Workload:
             elapsed = time.monotonic() - started
             self.stop.wait(max(0.0, self.read_interval - elapsed))
 
+    def record_first_error(
+        self, operation: str, index: int | None, error: OSError
+    ) -> None:
+        with self.lock:
+            if len(self.first_errors) >= MAX_FIRST_ERRORS:
+                return
+            self.first_errors.append(
+                {
+                    "operation": operation,
+                    "file": None if index is None else f"file-{index:04d}.bin",
+                    "errno": error.errno,
+                    "message": str(error),
+                    "elapsed_seconds": (
+                        None
+                        if self.started_at is None
+                        else round(time.monotonic() - self.started_at, 3)
+                    ),
+                }
+            )
+
     def finish(self) -> dict[str, Any]:
         self.stop.set()
         for thread in self.threads:
             thread.join(timeout=self.write_interval + self.read_interval + 30)
         if any(thread.is_alive() for thread in self.threads):
             raise EnvelopeError("workload thread did not stop within its bounded timeout")
-        if self.fatal:
-            raise EnvelopeError("; ".join(self.fatal))
         write_errors = self.pwrite_errors + self.fsync_errors
         writers = {
             **latency_summary(self.write_latencies, write_errors),
@@ -568,6 +594,8 @@ class Workload:
             "uncertain_files": sorted(self.uncertain_files),
         }
         return {
+            "fatal": list(self.fatal),
+            "first_errors": self.first_errors,
             "writers": writers,
             "readers": {
                 **latency_summary(self.read_latencies, self.read_errors),
@@ -941,9 +969,15 @@ class Harness:
                 )
         finally:
             summary = workload.finish()
+            summary["planned_seconds"] = duration
+            summary["actual_seconds"] = round(time.monotonic() - phase_started, 3)
+            summary["phase_started_report_elapsed_seconds"] = round(
+                phase_started - self.report_started, 3
+            )
+            self.report.setdefault("phases", {})[name] = summary
             self.sample(time.monotonic() - self.report_started, f"{name}-final")
-        summary["planned_seconds"] = duration
-        summary["actual_seconds"] = round(time.monotonic() - phase_started, 3)
+        if summary["fatal"]:
+            raise EnvelopeError("; ".join(summary["fatal"]))
         return summary
 
     def verify_bytes(self, label: str, expected: list[bytearray]) -> dict[str, Any]:
