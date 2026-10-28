@@ -164,10 +164,11 @@ yy --volume volume.json file fsync HANDLE
 yy --volume volume.json file close HANDLE
 ```
 
-Direct uses `mount`, `capabilities`, `doctor`, and `status`; `file`, Managed
-`receipt`, and `sync` commands reject it. Direct `status` reports the accepted
-recursive observation summary without creating local staging. A Direct
-`capabilities` or `doctor` call never creates storage metadata.
+Direct Mount uses `mount`, `capabilities`, `doctor`, and `status`; `file` and
+Managed `receipt` reject it. Direct Sync uses `sync` with
+`frontend=library`, while its `status` command reports the binding and
+convergence state. A Direct `capabilities` or `doctor` call never creates
+storage metadata.
 
 `file read HANDLE` emits bytes to stdout; `--offset` and `--length` select
 a range. Reads stream in bounded chunks. `file write` streams its source in
@@ -193,19 +194,24 @@ strict volume document, reports whether the current host is the tested
 operational combination, checks FUSE device/helper access, and validates
 admission. Managed performs one owner-only temporary state-path write probe,
 removes it, inspects persisted Mount records read-only, and observes the selected
-authority. Read-only Direct performs no state probe. Writable Direct probes the
-configured staging directory with one temporary owner-only file, then validates
-the retained Direct runtime profile, storage binding and object/mutation state
-read-only. Both Direct policies report a recursive namespace observation.
-Doctor does not create staging, initialize `staging.db`, `sync.db` or
-`runtime.db`, run recovery, acquire a runtime or publication lease, or publish.
+authority. Read-only Direct performs no state probe. Writable Direct Mount
+probes the configured staging directory with one temporary owner-only file,
+then validates the retained Direct runtime profile, storage binding and
+object/mutation state read-only. Direct Sync probes its state directory and
+inspects the Direct Sync SQLite profile, binding, pending, Unknown, conflict
+and retained artifact state read-only. Direct policies report a recursive
+namespace observation. Doctor does not create staging, initialize `staging.db`,
+`sync.db`, `direct-sync.db` or `runtime.db`, run recovery, acquire a runtime or
+publication lease, or publish.
 Its JSON form and exit codes are specified in
 [`linux-operations.md`](linux-operations.md).
 
 `doctor` reports readiness, not reconciliation convergence. In particular, a
 successful finite `sync run` and a successful `doctor` check do not establish
 that local and remote state match; only `sync status --json` with
-`summary.in_sync=true` and an available remote does.
+`summary.in_sync=true` and an available remote does. The Direct Sync doctor
+check exposes persisted pending, Unknown and conflict counts without acquiring
+the writer lease.
 
 ## Status and limits
 

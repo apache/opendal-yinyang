@@ -251,6 +251,12 @@ clean against the baseline, the remote was observed, and no pending, Unknown,
 failed or conflicting path remains. A successful `run` does not by itself
 prove convergence; `status` is the completion evidence.
 
+`yy --volume CONFIG doctor --json` inspects the Direct Sync SQLite profile,
+binding, pending, Unknown, conflict and retained artifact state read-only and
+reports it as `sync-state`. Doctor does not acquire the writer lease, initialize
+state, run recovery, or establish `summary.in_sync`; use `sync status --json`
+for convergence.
+
 `status` and artifact export do not require remote connectivity. They do not
 acquire the writer lease or change authoritative state. SQLite read-only open
 may create an empty WAL or update derived shared-memory state, but existing

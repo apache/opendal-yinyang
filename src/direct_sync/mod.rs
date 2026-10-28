@@ -490,6 +490,21 @@ impl<R: DirectRemote> DirectSync<R> {
             artifacts: Vec::new(),
         };
         if !database.exists() {
+            if state.exists()
+                && let Err(error) = local::validate_private_state(state)
+            {
+                return Inspection {
+                    binding: BindingEvidence {
+                        state: BindingState::Error,
+                        state_directory,
+                        root: None,
+                        namespace: None,
+                        same_filesystem: None,
+                        error: Some(error.to_string()),
+                    },
+                    ..unbound
+                };
+            }
             return unbound;
         }
         if let Err(error) = local::validate_private_state(state) {
@@ -537,6 +552,40 @@ impl<R: DirectRemote> DirectSync<R> {
                 };
             }
         };
+        let current = match LocalTree::inspect_binding(&binding.root, state) {
+            Ok(current) => current,
+            Err(error) => {
+                return Inspection {
+                    binding: BindingEvidence {
+                        state: BindingState::Error,
+                        state_directory,
+                        root: Some(binding.root),
+                        namespace: Some(binding.namespace),
+                        same_filesystem: None,
+                        error: Some(error.to_string()),
+                    },
+                    ..unbound
+                };
+            }
+        };
+        if current.root_identity != binding.root_identity
+            || current.state_identity != binding.state_identity
+        {
+            return Inspection {
+                binding: BindingEvidence {
+                    state: BindingState::Error,
+                    state_directory,
+                    root: Some(binding.root),
+                    namespace: Some(binding.namespace),
+                    same_filesystem: Some(current.root_identity.dev == current.state_identity.dev),
+                    error: Some(
+                        "Direct Sync root or state identity changed since initialization"
+                            .to_owned(),
+                    ),
+                },
+                ..unbound
+            };
+        }
         if let Some(remote) = remote
             && remote.namespace_id() != binding.namespace
         {
@@ -556,7 +605,7 @@ impl<R: DirectRemote> DirectSync<R> {
                 ..unbound
             };
         }
-        let local_scan = LocalTree::scan_read_only(&binding.root);
+        let local_scan = LocalTree::scan_read_only(&current.root);
         let remote_observation = match remote {
             Some(remote) => Some(remote.observe().await),
             None => None,
@@ -2024,7 +2073,6 @@ fn reject_unsupported_directories(
     pending_paths: &BTreeSet<String>,
 ) -> Result<()> {
     let local_files = local_files(local);
-    let remote_files = remote_files(remote);
     let mut unsupported = Vec::new();
     for node in local.nodes().values() {
         if node.is_directory()
@@ -2035,6 +2083,24 @@ fn reject_unsupported_directories(
             unsupported.push(format!("local directory {:?}", node.path));
         }
     }
+    unsupported.extend(unsupported_remote_directories(remote, pending_paths));
+    reject_directories(unsupported)
+}
+
+/// Validate a remote namespace against Direct Sync's no-empty-directory rule.
+///
+/// This is read-only and is used by doctor before an unbound namespace has a
+/// persisted local binding.
+pub fn validate_remote_namespace(remote: &RemoteSnapshot) -> Result<()> {
+    reject_directories(unsupported_remote_directories(remote, &BTreeSet::new()))
+}
+
+fn unsupported_remote_directories(
+    remote: &RemoteSnapshot,
+    pending_paths: &BTreeSet<String>,
+) -> Vec<String> {
+    let remote_files = remote_files(remote);
+    let mut unsupported = Vec::new();
     for entry in remote.entries.values() {
         if !entry.is_file()
             && !entry.path.is_empty()
@@ -2044,6 +2110,10 @@ fn reject_unsupported_directories(
             unsupported.push(format!("remote directory {:?}", entry.path));
         }
     }
+    unsupported
+}
+
+fn reject_directories(unsupported: Vec<String>) -> Result<()> {
     if unsupported.is_empty() {
         Ok(())
     } else {
