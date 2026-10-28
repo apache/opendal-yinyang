@@ -656,11 +656,10 @@ impl DirectRuntime {
             };
             (
                 endpoint_from_identity(&identity, DirectPrecondition::Etag(etag.to_owned())),
-                node.id(),
+                0,
                 false,
             )
         };
-        let _ = dirty;
         let mutation = MutationRecord {
             id: *DirectMutationId::new().as_bytes(),
             kind: MUTATION_KIND_DELETE,
@@ -1661,6 +1660,11 @@ impl DirectRuntime {
     async fn flush_entry(&self, entry: &Arc<ObjectEntry>) -> Result<DirectFlushOutcome> {
         let store = self.store.as_ref().expect("writable runtime has a store");
         let mut inner = entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Ok(DirectFlushOutcome::Unsupported {
+                message: "Direct local name was discarded".to_owned(),
+            });
+        }
         if inner.state == DirectObjectState::Clean && inner.generation == inner.durable_generation {
             return Ok(DirectFlushOutcome::Unchanged);
         }
@@ -1894,6 +1898,12 @@ impl DirectFileHandle {
             return Ok(());
         }
         let mut inner = self.entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local name was discarded",
+            ));
+        }
         {
             let file = inner.file.as_mut().ok_or_else(|| {
                 Error::new(
@@ -1920,6 +1930,12 @@ impl DirectFileHandle {
             return Ok(self.len().await?);
         }
         let mut inner = self.entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local name was discarded",
+            ));
+        }
         let offset = inner.length;
         {
             let file = inner.file.as_mut().ok_or_else(|| {
@@ -1944,6 +1960,12 @@ impl DirectFileHandle {
     pub async fn truncate(&self, length: u64) -> Result<()> {
         self.require_writable()?;
         let mut inner = self.entry.inner.lock().await;
+        if inner.state == DirectObjectState::Discarded {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct local name was discarded",
+            ));
+        }
         if inner.length != length {
             let file = inner.file.as_mut().ok_or_else(|| {
                 Error::new(
@@ -2495,7 +2517,6 @@ fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::direct::{DirectObjectPin, DirectPrecondition};
     use crate::support::TestBackend;
 
     fn binding(bucket: &str) -> super::super::DirectStorageBinding {
@@ -2631,6 +2652,7 @@ mod tests {
         .await
         .unwrap();
         let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.truncate(0).await.unwrap();
         file.write(0, b"local").await.unwrap();
         operator.write("file", b"external".to_vec()).await.unwrap();
         let outcome = file.flush().await.unwrap();
@@ -2814,14 +2836,17 @@ mod tests {
             )
             .unwrap(),
         ] {
-            let error = DirectRuntime::open(
+            let error = match DirectRuntime::open(
                 namespace(&operator),
                 Some(state.path().to_owned()),
                 false,
                 wrong,
             )
             .await
-            .unwrap_err();
+            {
+                Ok(_) => panic!("wrong Direct storage binding was accepted"),
+                Err(error) => error,
+            };
             assert_eq!(error.kind(), ErrorKind::Invalid);
         }
     }
@@ -2838,14 +2863,17 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let error = DirectRuntime::open(
+        let error = match DirectRuntime::open(
             namespace(&operator),
             Some(state.path().to_owned()),
             false,
             binding("bucket"),
         )
         .await
-        .unwrap_err();
+        {
+            Ok(_) => panic!("partial Direct runtime database was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), ErrorKind::Storage);
         assert!(!state.path().join("runtime.lock").exists());
         assert!(!state.path().join("objects").exists());
