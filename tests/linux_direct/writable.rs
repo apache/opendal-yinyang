@@ -432,16 +432,53 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
     let original = payload(12 * 1024 + 3, 0x23);
     let external = payload(12 * 1024 + 7, 0x49);
     fixture.write_raw("unlink.txt", &original);
+    let original_etag = fixture
+        .raw_object("unlink.txt")
+        .expect("raw original unlink object")
+        .etag
+        .expect("raw original unlink ETag");
     let staging = fixture.path("direct-write-unlink-state");
     let config = fixture.writable_config("direct-write-unlink", "fuse", &staging);
     let mountpoint = fixture.path("mnt-direct-write-unlink");
     fs::create_dir(&mountpoint).expect("create writable Direct unlink mountpoint");
-    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let suffix = format!("/{}/unlink.txt", fixture.root());
+    let gate = S3Gate::start_for_path(CommitAction::HoldBeforeCommit, "DELETE", suffix);
+    let mut command = fixture.mount_command(&config, &mountpoint);
+    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let mounted = Mounted::spawn_writable(command, &mountpoint);
     let path = mounted.mountpoint().join("unlink.txt");
 
     fixture.write_raw("unlink.txt", &external);
-    let error =
-        fs::remove_file(&path).expect_err("Direct unlink must reject an externally replaced ETag");
+    let external_etag = fixture
+        .raw_object("unlink.txt")
+        .expect("raw external unlink object")
+        .etag
+        .expect("raw external unlink ETag");
+    assert_ne!(
+        original_etag, external_etag,
+        "external unlink replacement did not change the raw ETag"
+    );
+    let unlink_path = path.clone();
+    let unlink = thread::spawn(move || fs::remove_file(unlink_path));
+    let intercepted = gate.wait_intercepted_for(Duration::from_secs(30));
+    assert_eq!(intercepted.method, "DELETE");
+    assert!(
+        intercepted.target.contains("/unlink.txt"),
+        "conditional unlink targeted the wrong object: {}",
+        intercepted.target
+    );
+    assert_eq!(
+        intercepted
+            .header("if-match")
+            .expect("conditional unlink omitted If-Match")
+            .trim_matches('"'),
+        original_etag.trim_matches('"'),
+    );
+    gate.release();
+    let error = unlink
+        .join()
+        .expect("conditional unlink thread panicked")
+        .expect_err("Direct unlink must reject an externally replaced ETag");
     assert_errno(
         &error,
         &[libc::ESTALE, libc::EIO],
@@ -733,15 +770,15 @@ fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart(
     let doctor_value: serde_json::Value =
         serde_json::from_slice(&doctor.stdout).expect("writable Direct conflict doctor JSON");
     assert_ne!(doctor_value["status"], "pass", "{doctor_value:#}");
-    let local_state = doctor_value["checks"]
+    let mount_state = doctor_value["checks"]
         .as_array()
         .expect("doctor checks")
         .iter()
-        .find(|check| check["name"] == "local-state")
-        .expect("doctor local-state check");
-    assert_ne!(local_state["status"], "pass", "{doctor_value:#}");
+        .find(|check| check["name"] == "mount-state")
+        .expect("doctor mount-state check");
+    assert_ne!(mount_state["status"], "pass", "{doctor_value:#}");
     assert!(
-        local_state["detail"]
+        mount_state["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("conflict") || detail.contains("failed")),
         "doctor did not report retained Direct conflict state: {doctor_value:#}"
@@ -761,7 +798,7 @@ fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart(
             .as_array()
             .expect("doctor checks")
             .iter()
-            .filter(|check| check["name"] == "local-state")
+            .filter(|check| check["name"] == "mount-state")
             .any(|check| {
                 check["detail"]
                     .as_str()
@@ -996,6 +1033,7 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
         "uncertain Direct publication",
     );
     drop(file);
+    gate.resume();
 
     let mut remount = fixture.mount_command(&config, &mountpoint);
     remount.env("YINYANG_S3_ENDPOINT", &endpoint);

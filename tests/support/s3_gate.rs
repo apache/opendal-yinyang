@@ -374,6 +374,9 @@ fn handle_connection(
                 response.status
             );
             let _ = sender.send(GateEvent::CommitFailed(message));
+            let response = with_connection_close(&response.bytes);
+            let _ = client.write_all(&response);
+            let _ = client.shutdown(Shutdown::Both);
             return;
         }
         match action {
