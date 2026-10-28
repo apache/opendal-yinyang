@@ -627,10 +627,10 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
         "resolving v1 must not acknowledge the newer local v2"
     );
 
-    let receipt = receipt(&storage, &current, &frozen_uuid);
-    assert_eq!(field(&receipt, "commit"), frozen_uuid);
-    assert_eq!(field(&receipt, "request digest"), frozen_digest);
-    let revision = field(&receipt, "revision").to_owned();
+    let v1_receipt = receipt(&storage, &current, &frozen_uuid);
+    assert_eq!(field(&v1_receipt, "commit"), frozen_uuid);
+    assert_eq!(field(&v1_receipt, "request digest"), frozen_digest);
+    let revision = field(&v1_receipt, "revision").to_owned();
     let restored_v1 = storage.path("sync-restored-v1");
     run_ok(
         &storage,
