@@ -571,6 +571,13 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
             fixture.write_raw(key, bytes);
         }
         let inventory = fixture.inventory();
+        for (key, _) in &objects {
+            assert!(
+                inventory.contains_key(key),
+                "raw S3 inventory for {label} omitted requested key {key:?}: {:?}",
+                inventory.keys().collect::<Vec<_>>()
+            );
+        }
         let config = fixture.config(&format!("direct-{label}"), "fuse", None, None);
         let mountpoint = fixture.path(&format!("mnt-{label}"));
         fs::create_dir(&mountpoint).expect("create rejection mountpoint");
