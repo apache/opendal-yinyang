@@ -343,8 +343,7 @@ class MountProcess:
             unmount = subprocess.run(
                 ["fusermount3", "-u", str(self.mountpoint)],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
@@ -596,6 +595,7 @@ class Harness:
         self.io_totals: dict[str, int] = {}
         self.report["samples"] = self.samples
         self.report["history_samples"] = self.history_samples
+        self.report["workdir"] = str(self.work)
 
     def redact(self, text: str) -> str:
         output = text
@@ -664,8 +664,7 @@ class Harness:
             command,
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
@@ -707,6 +706,7 @@ class Harness:
             raise EnvelopeError("/dev/fuse is unavailable")
         if not self.yy.is_file():
             raise EnvelopeError(f"yy binary is unavailable: {self.yy}")
+        self.request_accounting = self.load_request_accounting()
         self.run([str(self.yy), "--version"], self.env)
         versioning = self.aws(
             [
@@ -1021,7 +1021,7 @@ class Harness:
             "sqlite": integrity,
             "doctor": doctor,
         }
-        self.report["request_accounting"] = self.load_request_accounting()
+        self.report["request_accounting"] = self.request_accounting
         self.report["status"] = "pass"
         self.report["phase"] = "complete"
         self.report["ended_at"] = utc_now()
@@ -1048,8 +1048,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     yy_version = subprocess.run(
         [str(yy), "--version"],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         check=False,
     )
@@ -1152,6 +1151,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--readers cannot be negative")
     if args.write_interval <= 0 or args.read_interval <= 0:
         parser.error("write and read intervals must be positive")
+    if Path(args.output).exists():
+        parser.error("--output already exists; preserve prior evidence and choose a new path")
     return args
 
 
@@ -1168,16 +1169,17 @@ def main() -> int:
         exit_code = 0
     except KeyboardInterrupt:
         report["error"] = "interrupted"
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - every failed precondition must reach evidence.
         report["error"] = (
             harness.redact(str(error)) if harness is not None else str(error)
         )
     finally:
         if harness is not None and exit_code != 0:
             harness.cleanup_failure()
-        report["ended_at"] = utc_now()
         output = Path(args.output).resolve()
-        atomic_json(output, report)
+        if report:
+            report["ended_at"] = utc_now()
+            atomic_json(output, report)
         print(
             json.dumps(
                 {

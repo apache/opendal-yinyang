@@ -129,7 +129,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     let current_yy = prefix.join("current/bin/yy");
 
     run_ok(
-        current_yy_command(&current_yy, &storage, &object_root),
+        &mut current_yy_command(&current_yy, &storage, &object_root),
         "fd1338c create installed object authority",
     );
     let object_config = temp.path().join("object.json");
@@ -269,7 +269,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     assert_ne!(frozen_commit, pending_commit);
 
     run_ok(
-        current_yy_command(&current_yy, &storage, &sync_root),
+        &mut current_yy_command(&current_yy, &storage, &sync_root),
         "fd1338c create installed Sync authority",
     );
     let sync_state = temp.path().join("sync-state");
@@ -336,7 +336,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     );
 
     run_ok(
-        current_yy_command(&current_yy, &storage, &service_root),
+        &mut current_yy_command(&current_yy, &storage, &service_root),
         "fd1338c create installed service authority",
     );
     let service_database = temp.path().join("metadata/metadata.db");
@@ -874,7 +874,7 @@ fn run_file_ok(yy: &Path, storage: &Storage, root: &str, config: &Path, args: &[
     )
 }
 
-fn run_ok(mut command: Command, context: &str) -> Output {
+fn run_ok(command: &mut Command, context: &str) -> Output {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -950,7 +950,7 @@ fn open_handle(
     if write {
         command.arg("--write");
     }
-    let output = run_ok(command, &format!("open installed file {path}"));
+    let output = run_ok(&mut command, &format!("open installed file {path}"));
     parse_handle(&output.stdout)
 }
 
@@ -1026,7 +1026,10 @@ fn staging_unknown_identity(database: &Path) -> (String, String) {
         .query_map([], |row| row.get::<_, Vec<u8>>(0))
         .expect("query Sync handles");
     let mut plans = Vec::new();
-    for bytes in rows.expect("read Sync handles") {
+    let rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read Sync handles");
+    for bytes in rows {
         let record: StageRecord = borsh::from_slice(&bytes).expect("decode Sync stage record");
         if let Some(plan) = record.plan {
             plans.push(transaction_identity(&plan));
