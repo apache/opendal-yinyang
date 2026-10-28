@@ -63,9 +63,35 @@ fn managed() -> CapabilitySet {
 }
 /// Read-only storage-native Direct namespace. There is no retained-unlink-read
 /// claim: an unversioned ETag-pinned descriptor becomes Stale after a delete.
-fn direct() -> CapabilitySet {
+fn direct_read_only() -> CapabilitySet {
     use Capability::*;
     [Read, List, PinnedReads].into_iter().collect()
+}
+/// Whole-object staging over storage-native conditional replacements. Direct
+/// does not claim Managed stable identity, retained unlink reads, or atomic
+/// rename. `RemoteFsync` means the configured object write and its condition
+/// completed, not that a Managed receipt exists.
+fn direct_writable() -> CapabilitySet {
+    use Capability::*;
+    [
+        Read,
+        List,
+        Write,
+        Append,
+        Truncate,
+        PinnedReads,
+        RemoteFsync,
+        RecoverableStaging,
+    ]
+    .into_iter()
+    .collect()
+}
+fn direct_capabilities(read_only: bool) -> CapabilitySet {
+    if read_only {
+        direct_read_only()
+    } else {
+        direct_writable()
+    }
 }
 fn read_only() -> CapabilitySet {
     use Capability::*;
@@ -242,15 +268,23 @@ impl VolumeConfig {
                 }
             }
             Model::Direct => {
-                let storage = operator.info().scheme() == "s3"
+                let reads = operator.info().scheme() == "s3"
                     && cap.stat
                     && cap.read
                     && cap.list
                     && cap.list_with_recursive
                     && cap.read_with_version
                     && cap.read_with_if_match;
-                if storage {
-                    direct()
+                let writes = self.read_only
+                    || (cap.write
+                        && cap.write_can_multi
+                        && cap.write_can_empty
+                        && cap.write_with_if_match
+                        && cap.write_with_if_not_exists);
+                let deletion =
+                    self.access != Access::Sync || (cap.delete && cap.delete_with_if_match);
+                if reads && writes && deletion {
+                    self.volume_capabilities()
                 } else {
                     CapabilitySet::new()
                 }
@@ -263,21 +297,27 @@ impl VolumeConfig {
     fn volume_capabilities(&self) -> CapabilitySet {
         match self.model {
             Model::Managed => managed(),
-            Model::Direct => direct(),
+            Model::Direct => direct_capabilities(self.read_only),
         }
     }
     fn access_capabilities(&self) -> CapabilitySet {
         match (self.model, self.access) {
-            (Model::Direct, Access::Mount) if self.read_only => direct(),
-            (Model::Direct, _) => CapabilitySet::new(),
+            (Model::Direct, Access::Mount) if self.read_only => direct_read_only(),
+            (Model::Direct, Access::Mount) => direct_writable(),
+            (Model::Direct, Access::Sync) => direct_writable(),
             (Model::Managed, Access::Mount) if self.read_only => read_only(),
             (Model::Managed, Access::Mount | Access::Sync) => managed(),
         }
     }
     fn frontend_capabilities(&self) -> CapabilitySet {
         match (self.model, self.frontend) {
-            (Model::Direct, Frontend::Library) => direct(),
-            (Model::Direct, Frontend::Fuse) if self.read_only => direct(),
+            (Model::Direct, Frontend::Library) if self.read_only || self.access == Access::Sync => {
+                self.volume_capabilities()
+            }
+            (Model::Direct, Frontend::Library) => CapabilitySet::new(),
+            (Model::Direct, Frontend::Fuse) if self.access == Access::Mount => {
+                self.volume_capabilities()
+            }
             (Model::Direct, Frontend::Fuse | Frontend::Macos | Frontend::Windows) => {
                 CapabilitySet::new()
             }
@@ -310,45 +350,64 @@ impl VolumeConfig {
             ));
         }
         if self.model == Model::Direct {
-            if !self.staging.as_os_str().is_empty() {
+            if self.read_only && !self.staging.as_os_str().is_empty() {
                 return Err(Error::Invalid(
-                    "Direct volumes do not use staging; omit the staging field",
+                    "read-only Direct volumes do not use staging; omit the staging field",
                 ));
             }
-            if !self.read_only {
+            if !self.read_only && self.staging.as_os_str().is_empty() {
                 return Err(Error::Invalid(
-                    "Direct volumes are read-only; read_only must be true or omitted",
-                ));
-            }
-            if self.access != Access::Mount {
-                return Err(Error::Invalid(
-                    "Direct supports access=mount only; writable Direct Sync is not implemented",
+                    "writable Direct volumes require a staging path",
                 ));
             }
             if self.publication != Publication::Object || self.service_address.is_some() {
                 return Err(Error::Invalid(
-                    "Direct reads the configured object namespace directly and does not use a publication service",
+                    "Direct reads and mutates the configured object namespace directly and does not use a publication service",
                 ));
             }
-            match self.frontend {
-                Frontend::Library => {}
-                Frontend::Fuse if !cfg!(target_os = "linux") => {
-                    return Err(Error::Invalid(
-                        "the fuse frontend is implemented only on Linux",
-                    ));
-                }
-                Frontend::Fuse => {}
-                Frontend::Macos | Frontend::Windows => {
-                    return Err(Error::Invalid(
-                        "macOS and Windows frontends are not implemented; select library or fuse",
-                    ));
+            match self.access {
+                Access::Mount => match self.frontend {
+                    Frontend::Library if self.read_only => {}
+                    Frontend::Library => {
+                        return Err(Error::Invalid(
+                            "writable Direct mount uses the fuse frontend; the library frontend remains read-only",
+                        ));
+                    }
+                    Frontend::Fuse if !cfg!(target_os = "linux") => {
+                        return Err(Error::Invalid(
+                            "the fuse frontend is implemented only on Linux",
+                        ));
+                    }
+                    Frontend::Fuse => {}
+                    Frontend::Macos | Frontend::Windows => {
+                        return Err(Error::Invalid(
+                            "macOS and Windows frontends are not implemented; select library or fuse",
+                        ));
+                    }
+                },
+                Access::Sync => {
+                    if !cfg!(target_os = "linux") {
+                        return Err(Error::Invalid("Direct Sync is implemented only on Linux"));
+                    }
+                    if self.read_only {
+                        return Err(Error::Invalid(
+                            "Direct Sync is bidirectional; read_only must be false",
+                        ));
+                    }
+                    if self.frontend != Frontend::Library {
+                        return Err(Error::Invalid(
+                            "Direct Sync uses the library frontend, not an OS mount frontend",
+                        ));
+                    }
                 }
             }
             direct::validate_operator(operator).map_err(direct_admission_error)?;
             let caps = self.capabilities(operator);
-            if !self.require.is_subset(&caps.effective) {
+            if !self.baseline().is_subset(&caps.effective)
+                || !self.require.is_subset(&caps.effective)
+            {
                 return Err(Error::Invalid(
-                    "effective Direct capability intersection is missing a required operation",
+                    "effective Direct capability intersection is missing baseline or required operations",
                 ));
             }
             return Ok(caps);
@@ -420,7 +479,7 @@ impl Volume {
     ) -> Result<Self> {
         if config.model == Model::Direct {
             return Err(Error::Invalid(
-                "Direct volumes expose a read-only namespace through the library or FUSE frontend; they do not install Managed file handles",
+                "Direct volumes use Direct Mount or Sync entry points; they do not install Managed file handles",
             ));
         }
         // The file runtime installs recoverable handles; it does not own the
