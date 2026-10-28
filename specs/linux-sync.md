@@ -39,8 +39,10 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
 - `run` performs one finite reconciliation pass: it retries any associated
   durable work, pulls remote changes, and publishes eligible local edits.
 - `status` reports the current binding, remote and local observations, and the
-  derived per-path state. It never mutates state or acquires the publication
-  lease, so it stays usable while `run` holds the lease.
+  derived per-path state. It never changes authoritative database/WAL bytes,
+  logical state, or acquires the publication lease, so it stays usable while
+  `run` holds the lease. SQLite may create an empty `-wal` and may create or
+  update derived `-shm`; existing WAL/journal bytes remain protected.
 - `export` writes retained bytes. `--artifact` selects a retained artifact from
   `status`; `--conflict` with `--side` selects one side of a conflict. The output
   path must not exist.

@@ -650,6 +650,15 @@ mod tests {
         fs
     }
 
+    fn names(path: &std::path::Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[tokio::test]
     async fn unsupported_profile_is_rejected_without_creating_a_lease_or_changing_sqlite() {
         let temp = tempfile::tempdir().unwrap();
@@ -685,6 +694,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(profile, "yinyang-stage-99");
+    }
+
+    #[tokio::test]
+    async fn unsupported_profile_read_only_rejection_preserves_authoritative_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        let _ = raw_database(&path, "yinyang-stage-99", true);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL")
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert_eq!(
+            Stage::inspect(path.clone()).await.unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!temp.path().join("runtime.lock").exists());
+        let files = names(temp.path());
+        eprintln!("unknown-profile read-only rejection files: {:?}", files);
+        assert!(
+            files.iter().all(|name| matches!(
+                name.as_str(),
+                "staging.db" | "staging.db-wal" | "staging.db-shm"
+            )),
+            "read-only profile admission created a non-SQLite file: {:?}",
+            files
+        );
+        assert!(temp.path().join("staging.db-shm").exists());
+        assert_eq!(
+            std::fs::metadata(temp.path().join("staging.db-wal"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            0,
+            "new WAL sidecar must remain empty"
+        );
+        assert!(!temp.path().join("staging.db-journal").exists());
+    }
+
+    #[tokio::test]
+    async fn unsupported_profile_only_in_existing_wal_is_read_without_changing_wal() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let _ = raw_database(&source, PROFILE_V2, true);
+        let writer = Connection::open(&source).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 UPDATE authority SET profile='yinyang-stage-99' WHERE singleton=1;",
+            )
+            .unwrap();
+        assert!(
+            std::fs::metadata(source.with_file_name("source.db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let staging = state.join("staging.db");
+        std::fs::copy(&source, &staging).unwrap();
+        let source_wal = source.with_file_name("source.db-wal");
+        let staging_wal = state.join("staging.db-wal");
+        std::fs::copy(&source_wal, &staging_wal).unwrap();
+        drop(writer);
+
+        let main_before = std::fs::read(&staging).unwrap();
+        let wal_before = std::fs::read(&staging_wal).unwrap();
+        assert_eq!(
+            Stage::inspect(staging.clone()).await.unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(std::fs::read(&staging).unwrap(), main_before);
+        assert_eq!(std::fs::read(&staging_wal).unwrap(), wal_before);
+        assert!(state.join("staging.db-shm").exists());
+        assert!(!state.join("staging.db-journal").exists());
     }
 
     #[tokio::test]

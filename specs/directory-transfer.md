@@ -70,12 +70,15 @@ no stable released migration promise.
 
 The supported schema signature is the exact table set `binding` and
 `publications` with their ordered columns; positional inserts make that order
-part of the local contract. A writer validates an existing database before WAL
-configuration or DDL. A missing or zero-table database may be initialized after
-the journal's SQLite write transaction starts; an existing known profile with a
-missing, extra, or reordered maintained column is corruption, not a migration
-input. Read-only inspect performs the same profile and schema validation without
-creating tables or changing journal mode.
+part of the local contract. A writer validates an existing database before
+PRAGMA journal-mode configuration or DDL. A missing or zero-table database may
+be initialized after the journal's SQLite write transaction starts; an existing
+known profile with a missing, extra, or reordered maintained column is
+corruption, not a migration input. Read-only inspect performs the same profile
+and schema validation without creating tables, changing authoritative
+database/WAL bytes, or changing journal mode. SQLite may create an empty `-wal`
+and may create or update derived `-shm`; existing WAL/journal bytes remain
+protected.
 
 The canonical journal directory must be outside the canonical source tree. A
 preparation that would publish the journal's own `directory.db` or WAL files is
