@@ -33,6 +33,34 @@ const CONFLICT: u8 = 3;
 const RETRYABLE: u8 = 4;
 const FAILED: u8 = 5;
 
+pub(super) const TABLE: &str = "namespaces";
+pub(super) const COLUMNS: &[&str] = &[
+    "id",
+    "intent_key",
+    "baseline",
+    "commit_id",
+    "request_digest",
+    "operation",
+    "request",
+    "state",
+    "receipt_revision",
+    "receipt_ordinal",
+    "failure",
+];
+pub(super) const CREATE_TABLE: &str = "CREATE TABLE namespaces(
+    id BLOB PRIMARY KEY,
+    intent_key BLOB NOT NULL,
+    baseline BLOB NOT NULL,
+    commit_id BLOB NOT NULL UNIQUE,
+    request_digest BLOB NOT NULL,
+    operation BLOB NOT NULL,
+    request BLOB NOT NULL,
+    state INTEGER NOT NULL,
+    receipt_revision BLOB,
+    receipt_ordinal INTEGER,
+    failure BLOB
+);";
+
 /// Creation metadata represented by the current namespace contract.
 ///
 /// The core persists only the executable bit. Adapters must reject ownership,
@@ -283,23 +311,7 @@ impl OperationWire {
 }
 
 pub(super) fn initialize(connection: &Connection) -> Result<()> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS namespaces(
-                id BLOB PRIMARY KEY,
-                intent_key BLOB NOT NULL,
-                baseline BLOB NOT NULL,
-                commit_id BLOB NOT NULL UNIQUE,
-                request_digest BLOB NOT NULL,
-                operation BLOB NOT NULL,
-                request BLOB NOT NULL,
-                state INTEGER NOT NULL,
-                receipt_revision BLOB,
-                receipt_ordinal INTEGER,
-                failure BLOB
-            );",
-        )
-        .map_err(Error::local)
+    connection.execute_batch(CREATE_TABLE).map_err(Error::local)
 }
 
 #[derive(Clone)]

@@ -153,6 +153,9 @@ fn table(tag: u8) -> Result<Table> {
         _ => return Err(protocol()),
     })
 }
+fn token_matches(candidate: &str, expected: &str) -> bool {
+    blake3::hash(candidate.as_bytes()) == blake3::hash(expected.as_bytes())
+}
 
 /// Serve authenticated local clients. No object checkpoint can accept writes
 /// while this authority is unavailable. Stop the listener to stop accepting;
@@ -174,12 +177,15 @@ pub async fn serve(listener: TcpListener, service: MetadataService, token: Strin
             // A timeout drops the connection, never claims to roll back a commit.
             let _ = tokio::time::timeout(TIMEOUT, async {
                 let response = match read_frame::<Request>(&mut stream).await {
-                    Ok(request)
-                        if request.version == 1
-                            && blake3::hash(request.token.as_bytes())
-                                == blake3::hash(token.as_bytes()) =>
-                    {
-                        dispatch(&service, request.command).await
+                    Ok(request) if token_matches(&request.token, &token) => {
+                        if request.version == crate::compatibility::RPC_PROTOCOL_VERSION {
+                            dispatch(&service, request.command).await
+                        } else {
+                            Err(Error::unsupported(
+                                "metadata RPC",
+                                "unknown protocol version",
+                            ))
+                        }
                     }
                     _ => Err(Error::invalid(
                         "metadata RPC",
@@ -298,7 +304,7 @@ async fn rpc(addr: SocketAddr, token: &str, command: Command) -> Result<Response
         write_frame(
             &mut stream,
             &Request {
-                version: 1,
+                version: crate::compatibility::RPC_PROTOCOL_VERSION,
                 token: token.to_owned(),
                 command,
             },
@@ -325,7 +331,8 @@ impl ServiceClient {
             .read(".yinyang/head")
             .await
             .map_err(|e| Error::from_storage("verify service data binding", e))?;
-        if marker.to_vec() != encode(&(*b"YYSERV01", fs, root))? {
+        let (bound_filesystem, bound_root) = super::parse_service_binding(&marker.to_vec())?;
+        if bound_filesystem != NodeId::from_bytes(fs) || bound_root != NodeId::from_bytes(root) {
             return Err(Error::invalid(
                 "connect service",
                 "data binding disagrees with service",

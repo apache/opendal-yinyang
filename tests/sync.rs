@@ -924,3 +924,203 @@ async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
     backend.state.lock().unwrap().offline = false;
     sync.publish(edit).await.unwrap();
 }
+
+#[tokio::test]
+async fn sync_one_upgrades_after_exact_legacy_schema_validation() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    drop(Sync::open(authority.clone(), &state).await.unwrap());
+    {
+        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE namespaces;
+                 UPDATE binding SET profile='yinyang-sync-1';",
+            )
+            .unwrap();
+    }
+
+    drop(Sync::open(authority, &state).await.unwrap());
+    let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+    let profile: String = connection
+        .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(profile, "yinyang-sync-2");
+    let namespaces: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='namespaces'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(namespaces);
+}
+
+#[tokio::test]
+async fn unsupported_and_partial_sync_schemas_are_not_repaired() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    drop(Sync::open(authority.clone(), &state).await.unwrap());
+    {
+        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE namespaces;
+                 UPDATE binding SET profile='yinyang-sync-99';",
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        Sync::open(authority.clone(), &state)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    {
+        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        let profile: String = connection
+            .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(profile, "yinyang-sync-99");
+        let namespaces: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='namespaces'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!namespaces);
+        connection
+            .execute("UPDATE binding SET profile='yinyang-sync-2'", [])
+            .unwrap();
+    }
+    assert_eq!(
+        Sync::open(authority.clone(), &state)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+    assert_eq!(
+        Sync::inspect(&state).await.unwrap_err().kind(),
+        ErrorKind::Corrupt
+    );
+}
+
+#[tokio::test]
+async fn legacy_staging_and_sync_upgrade_preserves_unknown_identity_and_newer_edits() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let editor = Runtime::open(authority.clone(), temp.path().join("editor"))
+        .await
+        .unwrap();
+    editor.create_file(authority.root(), "file").await.unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let node = baseline.resolve("file").await.unwrap().unwrap().id();
+    let state = temp.path().join("sync");
+    let sync = Sync::open(authority.clone(), &state).await.unwrap();
+    let original = b"original unknown";
+    let edit = sync
+        .stage(node, baseline.revision(), &mut &original[..])
+        .await
+        .unwrap();
+    backend.state.lock().unwrap().delay_next_head = true;
+    let error = sync.publish(edit).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    let commit = error.commit_id().unwrap();
+    drop(sync);
+
+    {
+        let staging = rusqlite::Connection::open(state.join("content/staging.db")).unwrap();
+        staging
+            .execute_batch(
+                "ALTER TABLE handles DROP COLUMN failure;
+                 ALTER TABLE errors DROP COLUMN failure;
+                 UPDATE authority SET profile='yinyang-stage-1' WHERE singleton=1;",
+            )
+            .unwrap();
+        let journal = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        journal
+            .execute_batch(
+                "DROP TABLE namespaces;
+                 UPDATE binding SET profile='yinyang-sync-1';",
+            )
+            .unwrap();
+    }
+
+    let sync = Sync::open(authority.clone(), &state).await.unwrap();
+    let status = sync.status(edit).await.unwrap();
+    assert!(status.pending);
+    assert!(status.frozen);
+    assert_eq!(status.frozen_commit_id, Some(commit));
+    assert_eq!(sync.read(edit, 0, original.len()).await.unwrap(), original);
+    let revision = sync.publish(edit).await.unwrap();
+    let receipt = authority
+        .observe_latest()
+        .await
+        .unwrap()
+        .receipt(commit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.cursor.revision, revision);
+    assert_eq!(
+        authority
+            .observe_revision(baseline.revision())
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 16)
+            .await
+            .unwrap(),
+        b""
+    );
+
+    let current = authority.observe_revision(revision).await.unwrap();
+    let newer = sync
+        .stage(node, current.revision(), &mut &b"newer local edit"[..])
+        .await
+        .unwrap();
+    sync.publish(newer).await.unwrap();
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 32)
+            .await
+            .unwrap(),
+        b"newer local edit"
+    );
+}

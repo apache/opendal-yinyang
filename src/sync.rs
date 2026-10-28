@@ -16,6 +16,7 @@
 // under the License.
 
 //! Durable conditional uploads for OS-managed or ordinary local replicas.
+use crate::runtime::schema;
 use crate::runtime::{Error, ErrorKind, HandleStatus, Result, Runtime};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::BTreeSet;
@@ -29,6 +30,127 @@ mod namespace;
 pub use namespace::{
     FileMetadata, NamespaceIntent, NamespaceOperation, NamespaceState, NamespaceStatus, RenameMode,
 };
+
+const PROFILE_V1: &str = "yinyang-sync-1";
+const PROFILE_V2: &str = "yinyang-sync-2";
+const SCHEMA_V1: &[schema::TableColumns<'static>] = &[
+    ("binding", &["singleton", "profile", "filesystem"]),
+    ("edits", &["id", "handle"]),
+];
+const SCHEMA_V2: &[schema::TableColumns<'static>] = &[
+    ("binding", &["singleton", "profile", "filesystem"]),
+    ("edits", &["id", "handle"]),
+    (namespace::TABLE, namespace::COLUMNS),
+];
+const CREATE_SCHEMA_V2: &str = "
+    CREATE TABLE binding(
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      profile TEXT NOT NULL,
+      filesystem BLOB NOT NULL
+    );
+    CREATE TABLE edits(id BLOB PRIMARY KEY, handle BLOB NOT NULL UNIQUE);
+    CREATE TABLE namespaces(
+      id BLOB PRIMARY KEY,
+      intent_key BLOB NOT NULL,
+      baseline BLOB NOT NULL,
+      commit_id BLOB NOT NULL UNIQUE,
+      request_digest BLOB NOT NULL,
+      operation BLOB NOT NULL,
+      request BLOB NOT NULL,
+      state INTEGER NOT NULL,
+      receipt_revision BLOB,
+      receipt_ordinal INTEGER,
+      failure BLOB
+    );";
+
+fn validate_schema(connection: &Connection, profile: &str) -> Result<()> {
+    let expected = match profile {
+        PROFILE_V1 => SCHEMA_V1,
+        PROFILE_V2 => SCHEMA_V2,
+        _ => {
+            return Err(Error::State(
+                ErrorKind::Unsupported,
+                "sync journal uses an unsupported profile",
+            ));
+        }
+    };
+    if !schema::matches(connection, expected).map_err(Error::local)? {
+        return Err(Error::local_kind(
+            ErrorKind::Corrupt,
+            format!("sync profile {profile} has an unsupported schema"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile(connection: &Connection, filesystem: NodeId) -> Result<String> {
+    let (profile, bound): (String, Vec<u8>) = connection
+        .query_row("SELECT profile,filesystem FROM binding", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|error| {
+            Error::local_kind(ErrorKind::Corrupt, format!("read sync profile: {error}"))
+        })?;
+    validate_schema(connection, &profile)?;
+    if bound != filesystem.as_bytes() {
+        return Err(Error::Invalid(
+            "sync journal belongs to a different filesystem",
+        ));
+    }
+    Ok(profile)
+}
+
+async fn validate_database(
+    path: std::path::PathBuf,
+    filesystem: NodeId,
+    allow_empty: bool,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(Error::local)?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .map_err(Error::local)?;
+        if allow_empty && schema::matches(&connection, &[]).map_err(Error::local)? {
+            return Ok(());
+        }
+        validate_profile(&connection, filesystem)?;
+        Ok(())
+    })
+    .await
+    .map_err(Error::local)?
+}
+
+pub(crate) async fn preflight_open(
+    directory: &Path,
+    filesystem: NodeId,
+    require_journal: bool,
+) -> Result<()> {
+    let journal = directory.join("sync.db");
+    let staging = directory.join("content/staging.db");
+    let journal_exists = journal.try_exists().map_err(Error::local)?;
+    if journal_exists {
+        validate_database(journal, filesystem, !require_journal).await?;
+    } else if require_journal {
+        return Err(Error::local_kind(
+            ErrorKind::Invalid,
+            "sync journal is missing",
+        ));
+    }
+    let staging_exists = staging.try_exists().map_err(Error::local)?;
+    if staging_exists {
+        Runtime::validate_staging(directory.join("content"), filesystem).await?;
+    } else if require_journal {
+        return Err(Error::local_kind(
+            ErrorKind::Invalid,
+            "sync content staging is missing",
+        ));
+    }
+    Ok(())
+}
 
 /// Content-addressed local intent, distinct from the frozen remote commit ID.
 /// It binds the filesystem, node, observed revision and exact replacement bytes.
@@ -59,7 +181,7 @@ impl Sync {
     /// writer lease, migrating schemas, or recovering records.
     pub async fn validate_restore(directory: impl AsRef<Path>, filesystem: NodeId) -> Result<()> {
         let directory = directory.as_ref().to_owned();
-        Runtime::validate_staging(directory.join("content"), filesystem).await?;
+        preflight_open(&directory, filesystem, true).await?;
         let _ = Self::inspect(&directory).await?;
         tokio::task::spawn_blocking(move || {
             let path = directory.join("sync.db");
@@ -71,21 +193,7 @@ impl Sync {
             connection
                 .busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(Error::local)?;
-            let (profile, bound): (String, Vec<u8>) = connection
-                .query_row("SELECT profile,filesystem FROM binding", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .map_err(Error::local)?;
-            if !matches!(profile.as_str(), "yinyang-sync-1" | "yinyang-sync-2") {
-                return Err(Error::Invalid(
-                    "sync journal belongs to another filesystem or profile",
-                ));
-            }
-            if bound != filesystem.as_bytes() {
-                return Err(Error::Invalid(
-                    "sync journal belongs to another filesystem or profile",
-                ));
-            }
+            validate_profile(&connection, filesystem)?;
             let mut statement = connection
                 .prepare("SELECT handle FROM edits")
                 .map_err(Error::local)?;
@@ -110,50 +218,63 @@ impl Sync {
     }
 
     pub async fn open(authority: Arc<dyn Authority>, directory: impl AsRef<Path>) -> Result<Self> {
-        let runtime = Runtime::open(authority.clone(), directory.as_ref().join("content")).await?;
-        let path = directory.as_ref().join("sync.db");
         let filesystem = *authority.filesystem().as_bytes();
+        let filesystem = NodeId::from_bytes(filesystem);
+        let directory = directory.as_ref().to_owned();
+        // Reject every unsupported existing component before Runtime::open can
+        // migrate staging or remove incomplete handles.
+        preflight_open(&directory, filesystem, false).await?;
+        let runtime = Runtime::open(authority.clone(), directory.join("content")).await?;
+        let path = directory.join("sync.db");
+        let exists = path.try_exists().map_err(Error::local)?;
         let journal = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut c = Connection::open(path).map_err(Error::local)?;
-            c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-                CREATE TABLE IF NOT EXISTS binding(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS edits(id BLOB PRIMARY KEY, handle BLOB NOT NULL UNIQUE);").map_err(Error::local)?;
-            namespace::initialize(&c)?;
-            let tx = c.transaction().map_err(Error::local)?;
-            let binding: Option<(String, Vec<u8>)> = tx
-                .query_row("SELECT profile,filesystem FROM binding", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
-                .optional()
+            let mut c = Connection::open_with_flags(
+                &path,
+                if exists {
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                } else {
+                    OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | OpenFlags::SQLITE_OPEN_CREATE
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                },
+            )
+            .map_err(Error::local)?;
+            c.busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(Error::local)?;
-            match binding {
+            let profile = if exists && !schema::matches(&c, &[]).map_err(Error::local)? {
+                Some(validate_profile(&c, filesystem)?)
+            } else {
+                None
+            };
+            let tx = c.transaction().map_err(Error::local)?;
+            match profile.as_deref() {
                 None => {
+                    tx.execute_batch(CREATE_SCHEMA_V2).map_err(Error::local)?;
                     tx.execute(
-                        "INSERT INTO binding VALUES(1,'yinyang-sync-2',?1)",
-                        params![filesystem.as_slice()],
+                        "INSERT INTO binding VALUES(1,?1,?2)",
+                        params![PROFILE_V2, filesystem.as_bytes().as_slice()],
                     )
                     .map_err(Error::local)?;
                 }
-                Some((_profile, bound)) if bound != filesystem => {
-                    return Err(Error::Invalid(
-                        "sync journal belongs to another filesystem or profile",
-                    ));
+                Some(PROFILE_V1) => {
+                    namespace::initialize(&tx)?;
+                    tx.execute(
+                        "UPDATE binding SET profile=?1 WHERE singleton=1",
+                        [PROFILE_V2],
+                    )
+                    .map_err(Error::local)?;
                 }
-                Some((profile, _)) if profile == "yinyang-sync-1" => {
-                    tx.execute("UPDATE binding SET profile='yinyang-sync-2'", [])
-                        .map_err(Error::local)?;
-                }
-                Some((profile, _)) => {
-                    if profile != "yinyang-sync-2" {
-                        return Err(Error::Invalid(
-                            "sync journal belongs to another filesystem or profile",
-                        ));
-                    }
-                }
+                Some(PROFILE_V2) => {}
+                Some(_) => unreachable!("profile validation rejected unsupported state"),
             }
+            validate_profile(&tx, filesystem)?;
             tx.commit().map_err(Error::local)?;
+            c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+                .map_err(Error::local)?;
             Ok(c)
-        }).await.map_err(Error::local)??;
+        })
+        .await
+        .map_err(Error::local)??;
         let sync = Self {
             inner: Arc::new(Inner {
                 runtime,
@@ -304,18 +425,16 @@ impl Sync {
             connection
                 .busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(Error::local)?;
-            let profile: Option<String> = connection
+            let profile: String = connection
                 .query_row("SELECT profile FROM binding", [], |row| row.get(0))
-                .optional()
-                .map_err(Error::local)?;
-            let namespaces = match profile.as_deref() {
-                Some("yinyang-sync-1") => Vec::new(),
-                Some("yinyang-sync-2") => namespace::inspect(&connection)?,
-                _ => {
-                    return Err(Error::Invalid(
-                        "sync journal belongs to another filesystem or profile",
-                    ));
-                }
+                .map_err(|error| {
+                    Error::local_kind(ErrorKind::Corrupt, format!("read sync profile: {error}"))
+                })?;
+            validate_schema(&connection, &profile)?;
+            let namespaces = match profile.as_str() {
+                PROFILE_V1 => Vec::new(),
+                PROFILE_V2 => namespace::inspect(&connection)?,
+                _ => unreachable!("profile validation rejected unsupported state"),
             };
             let mut statement = connection
                 .prepare("SELECT id,handle FROM edits ORDER BY id")

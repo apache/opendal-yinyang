@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compatibility::{OBJECT_HEAD_MAGIC, OBJECT_SNAPSHOT_MAGIC, SERVICE_BINDING_MAGIC};
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::index::{Index, IndexCache};
 use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
@@ -93,7 +94,7 @@ impl ObjectState {
         self.reference = self
             .data
             .put_metadata(&encode(&(
-                *b"YYSNAP02",
+                OBJECT_SNAPSHOT_MAGIC,
                 *self.filesystem.as_bytes(),
                 *self.root.as_bytes(),
                 self.revision.wire(),
@@ -250,8 +251,17 @@ impl ObjectFs {
         etag: Option<String>,
     ) -> Result<ObjectState> {
         let bytes = self.data.read_extent(&reference, 4096).await?;
+        if bytes.len() < OBJECT_SNAPSHOT_MAGIC.len() {
+            return Err(corrupt("truncated snapshot descriptor"));
+        }
+        if bytes[..OBJECT_SNAPSHOT_MAGIC.len()] != OBJECT_SNAPSHOT_MAGIC {
+            return Err(Error::unsupported(
+                "open snapshot",
+                "unknown snapshot profile",
+            ));
+        }
         let (magic, fs, root, rev, roots): SnapshotWire = decode(&bytes)?;
-        if magic != *b"YYSNAP02"
+        if magic != OBJECT_SNAPSHOT_MAGIC
             || fs != *self.filesystem.as_bytes()
             || root != *self.root.as_bytes()
             || Revision::from_wire(rev) != revision
@@ -459,7 +469,7 @@ fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()>
 }
 fn head_bytes(snapshot: &ObjectState) -> Result<Vec<u8>> {
     let mut bytes = encode(&(
-        *b"YYHEAD02",
+        OBJECT_HEAD_MAGIC,
         0_u8,
         *snapshot.filesystem.as_bytes(),
         *snapshot.root.as_bytes(),
@@ -506,10 +516,16 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             bytes.extend_from_slice(&chunk);
         }
     }
-    if bytes.starts_with(b"YYSERV01") {
+    if bytes.starts_with(&SERVICE_BINDING_MAGIC) {
         return Err(Error::unsupported(
             "open filesystem",
             "metadata-service authority required",
+        ));
+    }
+    if bytes.starts_with(b"YYSERV") {
+        return Err(Error::unsupported(
+            "open filesystem",
+            "unknown service binding profile",
         ));
     }
     if bytes.starts_with(b"YYHEAD01") {
@@ -525,7 +541,7 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
     }
     let (magic, mode, fs, root, revision, reference): HeadWire =
         decode(&bytes[..bytes.len() - 32])?;
-    if magic != *b"YYHEAD02" || mode != 0 {
+    if magic != OBJECT_HEAD_MAGIC || mode != 0 {
         return Err(Error::unsupported(
             "open filesystem",
             "unknown profile or publication mode",
