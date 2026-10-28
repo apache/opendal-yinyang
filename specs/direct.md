@@ -8,7 +8,8 @@ and reads existing objects without creating YinYang metadata, Managed NodeIds,
 content proofs, transactions or Managed identities. This specification defines
 the read-only observation and FUSE contract. The separate
 [Direct mutation runtime](direct-mutations.md) defines conditional publication,
-retained local generations and safe-save namespace mutation.
+retained local generations and safe-save namespace mutation. Writable FUSE
+admission is defined by the Linux FUSE frontend.
 
 ## Configuration and admission
 
