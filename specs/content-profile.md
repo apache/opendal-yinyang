@@ -102,12 +102,18 @@ snapshot is required to observe a newer version. This is an immutable reader,
 not a writable file handle or a persistent offline cache.
 
 `FileVersion` range reads may reuse verified proof nodes and data units from a
-process-local cache owned by their existing `DataStore` binding. Each cache key
-contains the exact content descriptor and `PackedRef`, so different logical
-versions or descriptors cannot share an entry. Bytes enter the cache only after
-the physical extent digest and logical proof checks succeed. A hit is decoded
-and authenticated again against the pinned tree; an invalid entry is removed
-and returned as corruption. Errors and unverified bytes are never cached.
+process-local cache owned by their existing `DataStore` binding. A hit returns
+the previously authenticated original bytes for the exact immutable descriptor;
+it never returns bytes from a different version and never turns cached presence
+into preparation authority. A later cache scope or cold miss still detects
+remote corruption before delivering that new range.
+
+Each cache key contains the exact content descriptor and `PackedRef`, so
+different logical versions or descriptors cannot share an entry. Bytes enter the
+cache only after the physical extent digest and logical proof checks succeed. A
+hit is decoded and authenticated again against the pinned tree; an invalid entry
+is removed and returned as corruption. Errors and unverified bytes are never
+cached.
 
 The payload bound is 16 MiB across at most 4096 entries per `DataStore`, with
 least-recently-used eviction. Map and allocation overhead are additional.
