@@ -17,7 +17,7 @@
 
 //! Durable Direct Sync binding, baseline, work and conflict state.
 
-use crate::replica::{ContentHash, Error, Identity, LocalNode, Result};
+use crate::replica::{Error, Identity, LocalNode, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -227,10 +227,6 @@ impl LocalFingerprint {
             dev: self.dev,
             ino: self.ino,
         }
-    }
-
-    pub fn digest(&self) -> ContentHash {
-        ContentHash::from_bytes(self.digest)
     }
 
     pub fn same_content(&self, length: u64, digest: [u8; 32]) -> bool {

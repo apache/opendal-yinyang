@@ -212,59 +212,6 @@ impl LocalTree {
         })
     }
 
-    pub fn retain_file_path(
-        &self,
-        source: &Path,
-        origin: &str,
-        kind: ArtifactKind,
-    ) -> Result<ArtifactRecord> {
-        let source_path = source;
-        let mut source = std::fs::File::open(source_path)
-            .map_err(|error| Error::io("open explicit resolution input", source, error))?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let name = format!("artifact-{id}");
-        let fd = openat(
-            &self.artifact_fd,
-            name.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|error| Error::errno("create Direct Sync artifact", &self.state, error))?;
-        let mut output = std::fs::File::from(fd);
-        let mut bucket = Hasher::default();
-        let mut buffer = vec![0_u8; 64 * 1024];
-        loop {
-            let count = source
-                .read(&mut buffer)
-                .map_err(|error| Error::io("read resolution input", source_path, error))?;
-            if count == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..count])
-                .map_err(|error| Error::io("write Direct Sync artifact", &self.state, error))?;
-            bucket.update(&buffer[..count]);
-        }
-        output
-            .sync_all()
-            .map_err(|error| Error::io("persist Direct Sync artifact", &self.state, error))?;
-        let (length, digest) = bucket.finish();
-        drop(output);
-        fsync(&self.artifact_fd).map_err(|error| {
-            Error::errno("persist Direct Sync artifact directory", &self.state, error)
-        })?;
-        Ok(ArtifactRecord {
-            id,
-            origin: origin.to_owned(),
-            kind,
-            digest: *digest.as_bytes(),
-            length,
-            phase: ArtifactPhase::Retained,
-            name,
-            error: None,
-        })
-    }
-
     pub fn capture_local(&self, node: &LocalNode, kind: ArtifactKind) -> Result<ArtifactRecord> {
         validate_path(&node.path)?;
         let LocalFingerprint {
