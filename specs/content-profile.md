@@ -99,7 +99,27 @@ and its revision without fetching payload. Its range reads reuse this profile's
 verification and do not prepare content or materialize local staging. Content
 and metadata stay pinned across concurrent namespace and file changes; a fresh
 snapshot is required to observe a newer version. This is an immutable reader,
-not a writable file handle or an offline content cache.
+not a writable file handle or a persistent offline cache.
+
+`FileVersion` range reads may reuse verified proof nodes and data units from a
+process-local cache owned by their existing `DataStore` binding. Each cache key
+contains the exact content descriptor and `PackedRef`, so different logical
+versions or descriptors cannot share an entry. Bytes enter the cache only after
+the physical extent digest and logical proof checks succeed. A hit is decoded
+and authenticated again against the pinned tree; an invalid entry is removed
+and returned as corruption. Errors and unverified bytes are never cached.
+
+The payload bound is 16 MiB across at most 4096 entries per `DataStore`, with
+least-recently-used eviction. Map and allocation overhead are additional.
+Clones and concurrent `FileVersion` readers of the same binding share this
+budget. The cache ends with the process and is never persisted. Eviction,
+restart, or a fresh logical version requires storage reads again.
+`DataStore::import`, content preparation, and fixed-offset updates intentionally
+remain uncached: cached read-serving evidence cannot promote untrusted
+descriptors to preparation authority or replace their independent storage
+verification. The backend immutable-write contract still applies; externally
+deleted or corrupted ranges may remain readable only when their previously
+verified bytes are still cached.
 
 ## Preparation authority
 
