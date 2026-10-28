@@ -493,13 +493,39 @@ fn compatibility_fd1338c_sync_replica_and_backup_cross_both_binaries() {
     let state = storage.path("state");
     let local = storage.path("local");
     let backup = storage.path("backup");
-    storage.copy_fixture("sync", "state", &state);
-    storage.copy_fixture("sync", "local", &local);
     storage.copy_fixture("sync", "backup", &backup);
     let config = storage.path("sync.json");
     write_config(&config, "compat-sync", "sync", &state, "object", None);
     let current = current_binary();
     let legacy = legacy_binary();
+    storage
+        .run(
+            &legacy,
+            &[
+                "--volume",
+                config.to_str().unwrap(),
+                "sync",
+                "restore",
+                "--backup",
+                backup.to_str().unwrap(),
+                "--directory",
+                local.to_str().unwrap(),
+            ],
+        )
+        .success_or("fd1338c restore of its own Sync backup");
+    assert_eq!(
+        tree_files(&local),
+        tree_files(&backup.join("root")),
+        "fd1338c restore produced different initial bytes"
+    );
+    fs::copy(
+        super::fixtures::fixture_root()
+            .join("sync")
+            .join("local")
+            .join("sync.txt"),
+        local.join("sync.txt"),
+    )
+    .expect("apply fd1338c pending local edit after isolated restore");
 
     let before = storage.run(
         &current,
