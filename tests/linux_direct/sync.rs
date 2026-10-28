@@ -196,16 +196,8 @@ fn direct_sync_conflicts_export_and_explicit_resolution() {
     let id = conflict["id"].as_str().expect("Direct Sync conflict id");
     assert_eq!(conflict["path"], "shared.txt");
     assert_eq!(entry(&status, "shared.txt")["state"], "conflict");
-    assert_eq!(
-        conflict["local_artifact"].as_str().is_some(),
-        true,
-        "{status:#}"
-    );
-    assert_eq!(
-        conflict["remote_artifact"].as_str().is_some(),
-        true,
-        "{status:#}"
-    );
+    assert!(conflict["local_artifact"].as_str().is_some(), "{status:#}");
+    assert!(conflict["remote_artifact"].as_str().is_some(), "{status:#}");
 
     let local_export = fixture.path("direct-sync-local-conflict.bin");
     fixture
