@@ -514,6 +514,7 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
     eprintln!(
         "direct alias evidence: both GETs returned exact bytes; raw LIST contains {parent_key:?} and omits {child_key:?}"
     );
+    eprintln!("direct alias raw LIST XML:\n{list_xml}");
 
     let runtime = tokio::runtime::Runtime::new().expect("Direct test runtime");
     let operator = fixture.operator();
