@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Linux FUSE mount frontend for Managed and read-only Direct volumes.
+//! Linux FUSE mount frontend for Managed and Direct volumes.
 //!
 //! The CLI form is `yy --volume CONFIG mount MOUNTPOINT`; the process stays in
 //! the foreground until unmounted. The volume must declare `frontend = "fuse"`;
-//! read-only and writable Managed mounts plus read-only Direct mounts are
-//! supported. The shared admission rules in [`crate::volume`] reject every
+//! read-only and writable Managed mounts plus read-only and writable Direct
+//! mounts are supported. The shared admission rules in [`crate::volume`] reject every
 //! other combination before an authority connection or staging lease is
 //! created.
 //!
@@ -30,8 +30,9 @@
 //! must never surface those locally staged bytes as if they were remote. A
 //! writable mount serves recovered pending/error state through the shared Mount,
 //! where flush or fsync reports the real outcome. Clean observations are
-//! disposable and are reclaimed by the existing Mount recovery. Direct creates
-//! no staging state and observes the storage namespace directly.
+//! disposable and are reclaimed by the existing Mount recovery. Read-only
+//! Direct creates no local state; writable Direct opens a storage-bound local
+//! runtime and exposes retained staged objects as an overlay.
 //!
 //! The session mounts as `fuse.yinyang` and runs in the foreground. SIGINT and
 //! SIGTERM detach the mount and wait briefly for the session. Lazy unmounting
@@ -40,7 +41,7 @@
 //! bounded wait expires. The CLI handles that outcome by exiting non-zero,
 //! which closes `/dev/fuse` and makes the kernel abort every pending request.
 //!
-//! See `specs/linux-fuse.md` for the full read-only contract.
+//! See `specs/linux-fuse.md` for the full contract.
 
 mod attrs;
 mod direct;

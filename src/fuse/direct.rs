@@ -78,15 +78,30 @@ fn representable_mode(mode: u32, umask: u32, read_only: bool, directory: bool) -
     effective == expected
 }
 
-fn rename_replace(flags: RenameFlags) -> Result<bool, fuser::Errno> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameRejection {
+    Invalid,
+    Unsupported,
+}
+
+impl RenameRejection {
+    fn errno(self) -> fuser::Errno {
+        match self {
+            Self::Invalid => fuser::Errno::EINVAL,
+            Self::Unsupported => fuser::Errno::EOPNOTSUPP,
+        }
+    }
+}
+
+fn rename_replace(flags: RenameFlags) -> Result<bool, RenameRejection> {
     let known =
         RenameFlags::RENAME_NOREPLACE | RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT;
     if flags.bits() & !known.bits() != 0 {
-        return Err(fuser::Errno::EINVAL);
+        return Err(RenameRejection::Invalid);
     }
     if flags.contains(RenameFlags::RENAME_EXCHANGE) || flags.contains(RenameFlags::RENAME_WHITEOUT)
     {
-        return Err(fuser::Errno::EOPNOTSUPP);
+        return Err(RenameRejection::Unsupported);
     }
     Ok(!flags.contains(RenameFlags::RENAME_NOREPLACE))
 }
@@ -706,14 +721,17 @@ impl DirectInner {
                 }
                 DirectFlushOutcome::Conflict { .. } => {
                     let _ = self.refresh_pending().await;
+                    self.refresh_once().await;
                     return reply.error(fuser::Errno::ESTALE);
                 }
                 DirectFlushOutcome::Unknown { .. } => {
                     let _ = self.refresh_pending().await;
+                    self.refresh_once().await;
                     return reply.error(fuser::Errno::EIO);
                 }
                 DirectFlushOutcome::Unsupported { message } => {
                     let _ = self.refresh_pending().await;
+                    self.refresh_once().await;
                     eprintln!("yy: fuse create: Direct publication is unsupported: {message}");
                     return reply.error(fuser::Errno::EOPNOTSUPP);
                 }
@@ -850,6 +868,7 @@ impl DirectInner {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
                 }
+                self.refresh_once().await;
                 eprintln!(
                     "yy: fuse unlink: Direct mutation {} retained in {:?}: {}",
                     status.id.to_hex(),
@@ -875,7 +894,7 @@ impl DirectInner {
         }
         let replace = match rename_replace(flags) {
             Ok(replace) => replace,
-            Err(errno) => return reply.error(errno),
+            Err(rejection) => return reply.error(rejection.errno()),
         };
         if parent == new_parent && name == new_name {
             return reply.ok();
@@ -918,27 +937,13 @@ impl DirectInner {
         let Some(source) = source else {
             return reply.error(fuser::Errno::ESTALE);
         };
-        let mut status = match direct
+        let status = match direct
             .rename_file(&snapshot, source, new_parent_id, &new_name, replace)
             .await
         {
             Ok(status) => status,
             Err(error) => return reply.error(direct_errno(&error)),
         };
-        if matches!(
-            status.state,
-            DirectMutationState::DestinationApplied | DirectMutationState::PendingSourceCleanup
-        ) {
-            match direct.retry_mutation(status.id).await {
-                Ok(retried) => status = retried,
-                Err(error) => {
-                    eprintln!(
-                        "yy: fuse rename: retry Direct mutation {}: {error}",
-                        status.id.to_hex()
-                    );
-                }
-            }
-        }
         match mutation_errno(&status) {
             None => {
                 self.refresh_once().await;
@@ -948,6 +953,7 @@ impl DirectInner {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse rename: cannot retain mutation state: {pending:?}");
                 }
+                self.refresh_once().await;
                 eprintln!(
                     "yy: fuse rename: Direct mutation {} retained in {:?}: {}",
                     status.id.to_hex(),
@@ -1217,12 +1223,14 @@ impl DirectInner {
                 if let Err(errno) = self.refresh_pending().await {
                     eprintln!("yy: fuse flush: cannot retain Direct conflict state: {errno:?}");
                 }
+                self.refresh_once().await;
                 Err(fuser::Errno::ESTALE)
             }
             DirectFlushOutcome::Unknown { .. } => {
                 if let Err(errno) = self.refresh_pending().await {
                     eprintln!("yy: fuse flush: cannot retain Direct unknown state: {errno:?}");
                 }
+                self.refresh_once().await;
                 Err(fuser::Errno::EIO)
             }
             DirectFlushOutcome::Unsupported { message } => {
@@ -1421,7 +1429,7 @@ fn mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
         DirectMutationState::Applied => None,
         DirectMutationState::Conflict => Some(fuser::Errno::ESTALE),
         DirectMutationState::DestinationApplied | DirectMutationState::PendingSourceCleanup => {
-            Some(fuser::Errno::EBUSY)
+            Some(fuser::Errno::EIO)
         }
         DirectMutationState::Failed => Some(fuser::Errno::EOPNOTSUPP),
         DirectMutationState::Staged
@@ -2003,15 +2011,15 @@ mod tests {
         ));
         assert!(matches!(
             rename_replace(RenameFlags::RENAME_EXCHANGE),
-            Err(errno) if format!("{errno:?}") == "EOPNOTSUPP"
+            Err(RenameRejection::Unsupported)
         ));
         assert!(matches!(
             rename_replace(RenameFlags::RENAME_WHITEOUT),
-            Err(errno) if format!("{errno:?}") == "EOPNOTSUPP"
+            Err(RenameRejection::Unsupported)
         ));
         assert!(matches!(
             rename_replace(RenameFlags::from_bits_retain(1 << 20)),
-            Err(errno) if format!("{errno:?}") == "EINVAL"
+            Err(RenameRejection::Invalid)
         ));
     }
 }
