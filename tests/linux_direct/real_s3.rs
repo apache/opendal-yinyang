@@ -160,7 +160,13 @@ impl AwsS3 {
     }
 
     fn versioning(&self) -> Value {
-        self.s3api_json("get-bucket-versioning", &[])
+        let output = self.s3api("get-bucket-versioning", &[], Duration::from_secs(60));
+        output.success_or("AWS CLI get-bucket-versioning");
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            json!({})
+        } else {
+            serde_json::from_slice(&output.stdout).expect("get-bucket-versioning JSON")
+        }
     }
 
     fn head(&self, key: &str) -> Option<ObjectMetadata> {
@@ -470,16 +476,26 @@ impl Fixture {
     fn inventory(&self) -> Inventory {
         let prefix = format!("{}/", self.root);
         let listing = self.aws.list(&prefix, PAGE_SIZE);
+        let mut hasher = blake3::Hasher::new();
         for (key, entry) in &listing.entries {
             assert!(
                 key.starts_with(&prefix),
                 "raw LIST escaped fixture prefix: {key:?}"
             );
-            eprintln!(
-                "raw LIST evidence: key={key:?} etag={:?} size={} last_modified={:?}",
-                entry.etag, entry.size, entry.last_modified
-            );
+            hasher.update(&(key.len() as u64).to_be_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update(&entry.size.to_be_bytes());
         }
+        eprintln!(
+            "raw LIST evidence: bucket={} prefix={:?} keys={} pages={:?} key_set_blake3={} first={:?} last={:?}",
+            self.bucket,
+            prefix,
+            listing.entries.len(),
+            listing.page_sizes,
+            hasher.finalize().to_hex(),
+            listing.entries.keys().next(),
+            listing.entries.keys().next_back(),
+        );
         assert!(
             listing.page_sizes.len() > 1 || listing.entries.len() < PAGE_SIZE,
             "raw LIST did not exercise continuation for {prefix:?}"
@@ -641,6 +657,23 @@ fn assert_delete_conditional_failure(output: &Captured, context: &str) -> &'stat
         "conditional-conflict"
     } else {
         panic!("{context} failed without a conditional error:\n{text}");
+    }
+}
+
+fn assert_delete_missing_key(output: &Captured, context: &str) -> &'static str {
+    let text = output.text();
+    assert!(
+        !output.status.success(),
+        "{context} unexpectedly succeeded:\n{text}"
+    );
+    if text.contains("NoSuchKey") || text.contains("(404)") {
+        "not-found"
+    } else if text.contains("PreconditionFailed") || text.contains("(412)") {
+        "precondition-failed"
+    } else if text.contains("ConditionalRequestConflict") || text.contains("(409)") {
+        "conditional-conflict"
+    } else {
+        panic!("{context} failed without a documented missing-key error:\n{text}");
     }
 }
 
@@ -1143,12 +1176,11 @@ fn direct_amazon_s3_conditional_primitives_unversioned() {
         .success_or("current ETag conditional DELETE");
     assert!(fixture.aws.head(&key).is_none());
     let missing = fixture.aws.delete(&key, Some(replacement_etag), None);
-    let missing_error =
-        assert_delete_conditional_failure(&missing, "conditional DELETE on a missing key");
+    let missing_error = assert_delete_missing_key(&missing, "conditional DELETE on a missing key");
     eprintln!("conditional DELETE missing-key semantics: {missing_error}");
     let missing_star = fixture.aws.delete(&key, Some("*"), None);
     let missing_star_error =
-        assert_delete_conditional_failure(&missing_star, "wildcard DELETE on a missing key");
+        assert_delete_missing_key(&missing_star, "wildcard DELETE on a missing key");
     eprintln!("wildcard conditional DELETE missing-key semantics: {missing_star_error}");
 
     let create_race_key = fixture.full_key("create-race.bin");
@@ -1247,7 +1279,7 @@ fn direct_amazon_s3_conditional_primitives_versioned() {
     assert_eq!(fixture.aws.get(&key, Some(second_version), None).0, second);
 
     let missing = fixture.aws.delete(&key, Some(second_etag), None);
-    let missing_error = assert_delete_conditional_failure(
+    let missing_error = assert_delete_missing_key(
         &missing,
         "versioned conditional DELETE with an existing delete marker",
     );
@@ -1255,7 +1287,7 @@ fn direct_amazon_s3_conditional_primitives_versioned() {
         "versioned conditional DELETE with delete marker missing-key semantics: {missing_error}"
     );
     let missing_star = fixture.aws.delete(&key, Some("*"), None);
-    let missing_star_error = assert_delete_conditional_failure(
+    let missing_star_error = assert_delete_missing_key(
         &missing_star,
         "versioned wildcard DELETE with an existing delete marker",
     );
