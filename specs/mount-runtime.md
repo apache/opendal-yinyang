@@ -67,3 +67,8 @@ Shared contract tests cover both publication authorities, reference-local write
 permissions, cross-reference visibility, atomic append, close-one/keep-writing,
 explicit refresh, retained conflicts, and original Unknown request recovery.
 These tests are not native Linux, Windows or macOS mount acceptance.
+
+A quiesced backup copies Mount's `staging.db` with a consistent SQLite backup,
+not only its main database file. Pending/frozen handles remain recoverable from
+that copy when it is restored to an empty staging directory. See
+[Linux backup and isolated recovery](../docs/linux-backup-recovery.md).

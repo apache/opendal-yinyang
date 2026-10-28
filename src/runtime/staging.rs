@@ -221,6 +221,31 @@ fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
     .collect()
 }
 impl Stage {
+    pub async fn validate(path: PathBuf, fs: NodeId) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(local)?;
+            let (profile, filesystem): (String, Vec<u8>) = c
+                .query_row(
+                    "SELECT profile,filesystem FROM authority WHERE singleton=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(local)?;
+            if !matches!(profile.as_str(), "yinyang-stage-1" | "yinyang-stage-2") {
+                return Err(Error::Invalid("unknown staging profile"));
+            }
+            if filesystem != fs.as_bytes() {
+                return Err(Error::Invalid("staging belongs to a different filesystem"));
+            }
+            let _ = records(&c)?;
+            let _ = errors(&c)?;
+            Ok(())
+        })
+        .await
+        .map_err(local)?
+    }
+
     pub async fn inspect(path: PathBuf) -> Result<RuntimeStatus> {
         tokio::task::spawn_blocking(move || {
             let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

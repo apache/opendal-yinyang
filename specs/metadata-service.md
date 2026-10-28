@@ -103,6 +103,12 @@ readiness, changes, and historical revisions. No automatic failover or
 checkpoint writer exists. Listener shutdown stops accepting new work; already
 accepted requests may finish.
 
+For a supported quiesced backup, freeze service clients and create a consistent
+SQLite backup with the SQLite backup API (for example
+`sqlite3 DB ".backup DEST"`), then copy the complete content prefix. The
+service database and content marker must be restored together. See
+[Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
+
 ## Verification and operating limits
 
 Shared integration tests run the same predicate and snapshot suite against
