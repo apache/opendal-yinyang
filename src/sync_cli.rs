@@ -417,7 +417,10 @@ fn operator() -> Result<opendal::Operator, opendal::Error> {
                 .map(|key| (key.to_ascii_lowercase(), value))
         })
         .collect::<Vec<_>>();
-    opendal::Operator::via_iter("s3", config)
+    let operator = opendal::Operator::via_iter("s3", config)?;
+    #[cfg(feature = "benchmark-telemetry")]
+    let operator = yinyang::benchmark::instrument(operator);
+    Ok(operator)
 }
 
 /// Applies the same four-layer admission as every other volume command, then

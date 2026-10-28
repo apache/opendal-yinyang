@@ -17,8 +17,9 @@
 
 //! Canonical, range-verifiable content and process-local preparation evidence.
 
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
@@ -32,6 +33,8 @@ use crate::{Error, NodeId, Result};
 /// Fixed logical verification unit of the YYFILE02 content profile.
 pub const BLOCK_BYTES: usize = CONTENT_UNIT_BYTES;
 const MAX_NODE_BYTES: u32 = 512;
+const RANGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const RANGE_CACHE_ENTRIES: usize = 4096;
 
 pub(crate) type RefWire = ([u8; 16], u64, u32, [u8; 32]);
 type ChildWire = ([u8; 32], RefWire);
@@ -94,7 +97,7 @@ impl ContentId {
 }
 
 /// Untrusted serializable reference, not evidence that its bytes are ready.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ContentDescriptor {
     filesystem: NodeId,
     length: u64,
@@ -181,6 +184,7 @@ pub struct DataStore {
     operator: Operator,
     filesystem: NodeId,
     issuer: Arc<()>,
+    range_cache: RangeCache,
 }
 
 impl DataStore {
@@ -200,6 +204,7 @@ impl DataStore {
             operator,
             filesystem,
             issuer: Arc::new(()),
+            range_cache: RangeCache::default(),
         })
     }
 
@@ -298,6 +303,27 @@ impl DataStore {
         range: Range<u64>,
         destination: &mut (impl AsyncWrite + Unpin),
     ) -> Result<()> {
+        self.read_range_inner(descriptor, range, destination, None)
+            .await
+    }
+
+    pub(crate) async fn read_range_cached(
+        &self,
+        descriptor: &ContentDescriptor,
+        range: Range<u64>,
+        destination: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<()> {
+        self.read_range_inner(descriptor, range, destination, Some(&self.range_cache))
+            .await
+    }
+
+    async fn read_range_inner(
+        &self,
+        descriptor: &ContentDescriptor,
+        range: Range<u64>,
+        destination: &mut (impl AsyncWrite + Unpin),
+        cache: Option<&RangeCache>,
+    ) -> Result<()> {
         self.check(descriptor)?;
         if range.start > range.end || range.end > descriptor.length {
             return Err(Error::invalid(
@@ -319,6 +345,8 @@ impl DataStore {
             descriptor.length,
             &range,
             destination,
+            descriptor,
+            cache,
         )
         .await
     }
@@ -331,10 +359,15 @@ impl DataStore {
         length: u64,
         range: &Range<u64>,
         destination: &mut (impl AsyncWrite + Unpin),
+        descriptor: &ContentDescriptor,
+        cache: Option<&RangeCache>,
     ) -> Result<()> {
-        match self.node(child, start, count).await? {
+        let scope = cache.map(|cache| (cache, descriptor));
+        match self.node(child, start, count, scope).await? {
             HashNode::Leaf(reference) => {
-                let bytes = self.unit(&reference, child.hash, start, length).await?;
+                let bytes = self
+                    .unit(&reference, child.hash, start, length, scope)
+                    .await?;
                 let offset = start * BLOCK_BYTES as u64;
                 let begin = range.start.saturating_sub(offset) as usize;
                 let end = (range.end - offset).min(bytes.len() as u64) as usize;
@@ -354,6 +387,8 @@ impl DataStore {
                         length,
                         range,
                         destination,
+                        descriptor,
+                        cache,
                     ))
                     .await?;
                 }
@@ -365,6 +400,8 @@ impl DataStore {
                         length,
                         range,
                         destination,
+                        descriptor,
+                        cache,
                     ))
                     .await?;
                 }
@@ -439,9 +476,12 @@ impl DataStore {
         if range.end <= offset || range.start >= subtree_end {
             return Ok(child.clone());
         }
-        match self.node(child, start, count).await? {
+        match self.node(child, start, count, None).await? {
             HashNode::Leaf(reference) => {
-                let mut bytes = self.unit(&reference, child.hash, start, length).await?;
+                let mut bytes = self
+                    .unit(&reference, child.hash, start, length, None)
+                    .await?
+                    .to_vec();
                 let begin = range.start.max(offset);
                 let end = range.end.min(subtree_end);
                 bytes[(begin - offset) as usize..(end - offset) as usize].copy_from_slice(
@@ -476,14 +516,48 @@ impl DataStore {
         }
     }
 
-    async fn node(&self, child: &Child, start: u64, count: u64) -> Result<HashNode> {
-        let bytes = self.read_extent(&child.reference, MAX_NODE_BYTES).await?;
-        let node = HashNode::decode(&bytes)?;
+    async fn node(
+        &self,
+        child: &Child,
+        start: u64,
+        count: u64,
+        cache: Option<(&RangeCache, &ContentDescriptor)>,
+    ) -> Result<HashNode> {
+        let key = cache.map(|(cache, descriptor)| {
+            (
+                cache,
+                RangeCacheKey {
+                    descriptor: descriptor.clone(),
+                    reference: child.reference.clone(),
+                },
+            )
+        });
+        let bytes = match key.as_ref().and_then(|(cache, key)| cache.get(key)) {
+            Some(bytes) => bytes,
+            None => Arc::from(self.read_extent(&child.reference, MAX_NODE_BYTES).await?),
+        };
+        let node = match HashNode::decode(&bytes) {
+            Ok(node) => node,
+            Err(error) => {
+                if let Some((cache, key)) = &key {
+                    cache.remove(key);
+                }
+                return Err(error);
+            }
+        };
         match &node {
             HashNode::Leaf(_) if count == 1 => {}
             HashNode::Branch(left, right)
                 if count > 1 && branch_hash(start, count, left.hash, right.hash) == child.hash => {}
-            _ => return Err(corrupt("invalid hash tree shape or proof")),
+            _ => {
+                if let Some((cache, key)) = &key {
+                    cache.remove(key);
+                }
+                return Err(corrupt("invalid hash tree shape or proof"));
+            }
+        }
+        if let Some((cache, key)) = key {
+            cache.insert(key, bytes);
         }
         Ok(node)
     }
@@ -494,13 +568,32 @@ impl DataStore {
         hash: [u8; 32],
         start: u64,
         length: u64,
-    ) -> Result<Vec<u8>> {
-        let bytes = self.read_extent(reference, BLOCK_BYTES as u32).await?;
+        cache: Option<(&RangeCache, &ContentDescriptor)>,
+    ) -> Result<Arc<[u8]>> {
+        let key = cache.map(|(cache, descriptor)| {
+            (
+                cache,
+                RangeCacheKey {
+                    descriptor: descriptor.clone(),
+                    reference: reference.clone(),
+                },
+            )
+        });
+        let bytes = match key.as_ref().and_then(|(cache, key)| cache.get(key)) {
+            Some(bytes) => bytes,
+            None => Arc::from(self.read_extent(reference, BLOCK_BYTES as u32).await?),
+        };
         let expected = (length - start * BLOCK_BYTES as u64).min(BLOCK_BYTES as u64);
         if bytes.len() as u64 != expected || leaf_hash(start, &bytes) != hash {
+            if let Some((cache, key)) = &key {
+                cache.remove(key);
+            }
             return Err(corrupt(
                 "verification unit does not match the pinned logical root",
             ));
+        }
+        if let Some((cache, key)) = key {
+            cache.insert(key, bytes.clone());
         }
         Ok(bytes)
     }
@@ -595,7 +688,136 @@ impl PackedRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RangeCacheKey {
+    descriptor: ContentDescriptor,
+    reference: PackedRef,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RangeCache {
+    state: Arc<Mutex<RangeCacheState>>,
+    limits: RangeCacheLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RangeCacheLimits {
+    bytes: usize,
+    entries: usize,
+}
+
+impl Default for RangeCacheLimits {
+    fn default() -> Self {
+        Self {
+            bytes: RANGE_CACHE_BYTES,
+            entries: RANGE_CACHE_ENTRIES,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RangeCacheState {
+    entries: HashMap<RangeCacheKey, RangeCacheEntry>,
+    order: BTreeMap<u64, RangeCacheKey>,
+    bytes: usize,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct RangeCacheEntry {
+    sequence: u64,
+    bytes: Arc<[u8]>,
+}
+
+impl RangeCache {
+    fn get(&self, key: &RangeCacheKey) -> Option<Arc<[u8]>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = state.entries.get(key)?;
+        let bytes = entry.bytes.clone();
+        let previous = entry.sequence;
+        let sequence = state.next_sequence();
+        state.order.remove(&previous);
+        state.order.insert(sequence, key.clone());
+        state
+            .entries
+            .get_mut(key)
+            .expect("cache entry remains after lookup")
+            .sequence = sequence;
+        Some(bytes)
+    }
+
+    fn insert(&self, key: RangeCacheKey, bytes: Arc<[u8]>) {
+        if bytes.len() > self.limits.bytes {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.entries.contains_key(&key) {
+            return;
+        }
+        while state.entries.len() >= self.limits.entries
+            || state.bytes.saturating_add(bytes.len()) > self.limits.bytes
+        {
+            let Some((_, oldest)) = state.order.pop_first() else {
+                break;
+            };
+            if let Some(entry) = state.entries.remove(&oldest) {
+                state.bytes = state.bytes.saturating_sub(entry.bytes.len());
+            }
+        }
+        let sequence = state.next_sequence();
+        state.bytes = state.bytes.saturating_add(bytes.len());
+        state.order.insert(sequence, key.clone());
+        state
+            .entries
+            .insert(key, RangeCacheEntry { sequence, bytes });
+    }
+
+    fn remove(&self, key: &RangeCacheKey) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = state.entries.remove(key) {
+            state.order.remove(&entry.sequence);
+            state.bytes = state.bytes.saturating_sub(entry.bytes.len());
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(bytes: usize, entries: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RangeCacheState::default())),
+            limits: RangeCacheLimits { bytes, entries },
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .len()
+    }
+}
+
+impl RangeCacheState {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .expect("range cache recency sequence exhausted");
+        self.sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Child {
     hash: [u8; 32],
     reference: PackedRef,
@@ -821,6 +1043,7 @@ fn storage_error(error: opendal::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::support::TestBackend;
 
     #[test]
     fn content_vectors() {
@@ -854,5 +1077,128 @@ mod tests {
             .as_str(),
             "4a9449de9b3ed735f25145e7ec1dbf209b8b698092e29a7f476215dcd1c8ced3"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_range_reuse_is_version_scoped_and_import_stays_uncached() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let bytes = (0..BLOCK_BYTES * 3 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+        let range = BLOCK_BYTES as u64 - 11..BLOCK_BYTES as u64 + 13;
+
+        let mut output = Vec::new();
+        store
+            .read_range_cached(file.descriptor(), range.clone(), &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+
+        backend.state.lock().unwrap().data_reads = 0;
+        output.clear();
+        store
+            .read_range_cached(file.descriptor(), range.clone(), &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            0,
+            "a repeated read of one immutable version must reuse verified ranges"
+        );
+
+        let other_bytes = vec![0x55; BLOCK_BYTES * 2];
+        let other = store.prepare(&mut other_bytes.as_slice()).await.unwrap();
+        backend.state.lock().unwrap().data_reads = 0;
+        output.clear();
+        store
+            .read_range_cached(other.descriptor(), 1..2, &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, [0x55]);
+        assert!(
+            backend.state.lock().unwrap().data_reads > 0,
+            "a different logical version must miss the cache"
+        );
+
+        backend.state.lock().unwrap().data_reads = 0;
+        output.clear();
+        store
+            .read_range(file.descriptor(), range, &mut output)
+            .await
+            .unwrap();
+        assert!(
+            backend.state.lock().unwrap().data_reads > 0,
+            "the trust-promotion read path must remain uncached"
+        );
+
+        let key = store.key(
+            file.descriptor()
+                .root
+                .as_ref()
+                .expect("nonempty cached content")
+                .reference
+                .object,
+        );
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .get_mut(&key)
+            .unwrap()
+            .bytes[0] ^= 1;
+        assert_eq!(
+            store.import(file.descriptor()).await.unwrap_err().kind(),
+            crate::ErrorKind::Corrupt,
+            "import must independently verify storage rather than promote cached reads"
+        );
+    }
+
+    #[test]
+    fn range_cache_evicts_the_least_recently_used_verified_extent() {
+        let cache = RangeCache::with_limits(8, 4);
+        let descriptor = ContentDescriptor {
+            filesystem: NodeId::from_bytes([1; 16]),
+            length: 0,
+            root: None,
+        };
+        let first = RangeCacheKey {
+            descriptor: descriptor.clone(),
+            reference: PackedRef {
+                object: [1; 16],
+                offset: 0,
+                length: 4,
+                digest: [1; 32],
+            },
+        };
+        let second = RangeCacheKey {
+            descriptor: descriptor.clone(),
+            reference: PackedRef {
+                object: [2; 16],
+                offset: 0,
+                length: 4,
+                digest: [2; 32],
+            },
+        };
+        let third = RangeCacheKey {
+            descriptor,
+            reference: PackedRef {
+                object: [3; 16],
+                offset: 0,
+                length: 4,
+                digest: [3; 32],
+            },
+        };
+        cache.insert(first.clone(), Arc::from([1; 4]));
+        cache.insert(second.clone(), Arc::from([2; 4]));
+        assert!(cache.get(&first).is_some());
+        cache.insert(third.clone(), Arc::from([3; 4]));
+        assert!(cache.get(&second).is_none());
+        assert!(cache.get(&first).is_some());
+        assert!(cache.get(&third).is_some());
+        assert_eq!(cache.len(), 2);
     }
 }

@@ -495,8 +495,9 @@ async fn version_reads(runtime: &Runtime, backend: &TestBackend) {
         .await
         .unwrap();
     assert_eq!(retained.read(0, 10).await.unwrap(), bytes[..10]);
-    // Corrupt the exact packed bytes read by this version; verified data must
-    // not escape merely because a previous read of the same version succeeded.
+    // Corrupt the exact packed bytes read by this version. A warm authenticated
+    // hit may return the original bytes, but an uncached read must reject the
+    // mutated storage without releasing anything.
     {
         let mut state = backend.state.lock().unwrap();
         let object = state
@@ -506,11 +507,20 @@ async fn version_reads(runtime: &Runtime, backend: &TestBackend) {
             .unwrap();
         object.bytes[0] ^= 1;
     }
-    let mut destination = Vec::new();
-    let err = file.read_range(0..10, &mut destination).await.unwrap_err();
+    let mut warm = Vec::new();
+    file.read_range(0..10, &mut warm).await.unwrap();
+    assert_eq!(warm, bytes[..10]);
+    assert_eq!(file.read(0, 10).await.unwrap(), bytes[..10]);
+
+    let mut cold = Vec::new();
+    let err = runtime
+        .authority()
+        .data()
+        .read_range(file.descriptor(), 0..10, &mut cold)
+        .await
+        .unwrap_err();
     assert_eq!(err.kind(), yinyang::core::ErrorKind::Corrupt);
-    assert!(destination.is_empty());
-    assert!(file.read(0, 10).await.is_err());
+    assert!(cold.is_empty());
 }
 
 async fn identity_access(runtime: &Runtime) {

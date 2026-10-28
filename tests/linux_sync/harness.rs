@@ -141,7 +141,11 @@ impl Drop for RunningSync {
 }
 
 pub fn require_acceptance() {
+    let amazon_s3 = std::env::var("YINYANG_STORAGE_PROFILE").as_deref() == Ok("amazon-s3");
     for name in STORAGE_VARIABLES {
+        if amazon_s3 && name == "YINYANG_S3_ENDPOINT" {
+            continue;
+        }
         if std::env::var_os(name).is_none() {
             panic!("{name} is unset; Managed Sync acceptance fails instead of skipping");
         }
@@ -525,11 +529,17 @@ impl Fixture {
     ) -> Self {
         require_acceptance();
         let temp = tempfile::tempdir().expect("create isolated acceptance directory");
-        let root = format!(
+        let isolated = format!(
             "managed-sync-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         );
+        let root = match std::env::var("YINYANG_S3_ROOT") {
+            Ok(prefix) if !prefix.trim_matches('/').is_empty() => {
+                format!("{}/{}", prefix.trim_matches('/'), isolated)
+            }
+            _ => isolated,
+        };
         let mut fixture = Self {
             temp,
             publication,
@@ -555,8 +565,17 @@ impl Fixture {
     }
 
     fn storage_env(&self) -> Vec<(&'static str, String)> {
-        let mut env = Vec::with_capacity(STORAGE_VARIABLES.len() + 3);
+        let mut env = Vec::with_capacity(STORAGE_VARIABLES.len() + 4);
+        let profile =
+            std::env::var("YINYANG_STORAGE_PROFILE").unwrap_or_else(|_| "minio".to_owned());
         for name in STORAGE_VARIABLES {
+            if profile == "amazon-s3"
+                && name == "YINYANG_S3_ENDPOINT"
+                && self.storage_endpoint.is_none()
+                && std::env::var_os(name).is_none()
+            {
+                continue;
+            }
             let value = if name == "YINYANG_S3_ENDPOINT" {
                 self.storage_endpoint
                     .clone()
@@ -569,9 +588,12 @@ impl Fixture {
             });
             env.push((name, value));
         }
-        env.push(("YINYANG_STORAGE_PROFILE", "minio".to_owned()));
+        env.push(("YINYANG_STORAGE_PROFILE", profile));
         env.push(("YINYANG_S3_ROOT", self.root.clone()));
         env.push(("YINYANG_SERVICE_TOKEN", self.token.clone()));
+        if let Ok(token) = std::env::var("YINYANG_S3_SESSION_TOKEN") {
+            env.push(("YINYANG_S3_SESSION_TOKEN", token));
+        }
         env
     }
 
