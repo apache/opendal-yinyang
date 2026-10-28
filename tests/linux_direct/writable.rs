@@ -18,12 +18,18 @@
 //! Accepted writable Direct admission and native mutation scenarios.
 
 use crate::harness::{
-    Fixture, RequestCounter, effective_capabilities, local_paths, path_text, payload, run_timeout,
+    Fixture, RequestCounter, assert_errno, effective_capabilities, local_paths, path_text, payload,
+    run_timeout,
 };
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::unistd::{chown, getgid, getuid};
 use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Duration;
 
 const REQUIRED_WRITABLE_CAPABILITIES: [&str; 8] = [
@@ -303,4 +309,124 @@ fn direct_write_append_flags_and_shared_fd_visibility() {
         Some(b"AB23456789CD".as_slice())
     );
     mounted.unmount();
+}
+
+fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes()).expect("test path has no NUL");
+    let name = CString::new(name).expect("xattr name has no NUL");
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn renameat2(source: &Path, destination: &Path, flags: u32) -> std::io::Result<()> {
+    let source = CString::new(source.as_os_str().as_bytes()).expect("test source has no NUL");
+    let destination =
+        CString::new(destination.as_os_str().as_bytes()).expect("test destination has no NUL");
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            flags,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_rejects_unsupported_posix_operations_without_storage_effect() {
+    let fixture = Fixture::new();
+    fixture.write_raw("base.txt", b"base");
+    fixture.write_raw("other.txt", b"other");
+    fixture.write_raw("directory/child.txt", b"child");
+    let inventory = fixture.inventory();
+    let staging = fixture.path("direct-write-reject-state");
+    let config = fixture.writable_config("direct-write-reject", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-reject");
+    fs::create_dir(&mountpoint).expect("create writable Direct rejection mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let root = mounted.mountpoint();
+    let base = root.join("base.txt");
+
+    let error = fs::set_permissions(&base, fs::Permissions::from_mode(0o600))
+        .expect_err("Direct must reject POSIX mode changes");
+    assert_errno(
+        &error,
+        &[libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS],
+        "Direct chmod",
+    );
+
+    let error = chown(&base, Some(getuid()), Some(getgid()))
+        .expect_err("Direct must reject ownership changes");
+    assert!(
+        [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS].contains(&error as i32),
+        "Direct chown returned unexpected errno {error}"
+    );
+
+    let error = set_xattr(&base, "user.yinyang", b"unsupported")
+        .expect_err("Direct must reject extended attributes");
+    assert_errno(&error, &[libc::EOPNOTSUPP, libc::ENOSYS], "Direct xattr");
+
+    let error = std::os::unix::fs::symlink("base.txt", root.join("symlink"))
+        .expect_err("Direct must reject symlinks");
+    assert_errno(
+        &error,
+        &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EPERM],
+        "Direct symlink",
+    );
+    let error =
+        fs::hard_link(&base, root.join("hardlink")).expect_err("Direct must reject hard links");
+    assert_errno(
+        &error,
+        &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EPERM],
+        "Direct hard link",
+    );
+
+    let error = fs::rename(root.join("directory"), root.join("renamed-directory"))
+        .expect_err("Direct must reject directory rename");
+    assert_errno(
+        &error,
+        &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
+        "Direct directory rename",
+    );
+    let error = renameat2(&base, &root.join("other.txt"), libc::RENAME_EXCHANGE)
+        .expect_err("Direct must reject RENAME_EXCHANGE");
+    assert_errno(
+        &error,
+        &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
+        "Direct RENAME_EXCHANGE",
+    );
+    let error = renameat2(&base, &root.join("whiteout"), libc::RENAME_WHITEOUT)
+        .expect_err("Direct must reject RENAME_WHITEOUT");
+    assert_errno(
+        &error,
+        &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
+        "Direct RENAME_WHITEOUT",
+    );
+
+    mounted.unmount();
+    assert_eq!(
+        fixture.inventory(),
+        inventory,
+        "unsupported Direct operations changed backend objects"
+    );
 }
