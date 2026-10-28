@@ -109,14 +109,25 @@ def sqlite_backup(source, destination):
 
 def head_identity(path):
     data = path.read_bytes()
-    if len(data) < 65 or data[:8] != b"YYHEAD02":
-        fail(f"{path} is not a YYHEAD02 fixture")
-    return {
-        "mode": data[8],
-        "filesystem": data[9:25].hex(),
-        "root": data[25:41].hex(),
-        "revision": data[41:65].hex(),
-    }
+    if data[:8] == b"YYHEAD02":
+        if len(data) < 65:
+            fail(f"{path} is a truncated YYHEAD02 fixture")
+        return {
+            "profile": "YYHEAD02",
+            "mode": data[8],
+            "filesystem": data[9:25].hex(),
+            "root": data[25:41].hex(),
+            "revision": data[41:65].hex(),
+        }
+    if data[:8] == b"YYSERV01":
+        if len(data) != 40:
+            fail(f"{path} is a malformed YYSERV01 fixture")
+        return {
+            "profile": "YYSERV01",
+            "filesystem": data[8:24].hex(),
+            "root": data[24:40].hex(),
+        }
+    fail(f"{path} does not contain a supported fd1338c authority marker")
 
 
 class S3:
