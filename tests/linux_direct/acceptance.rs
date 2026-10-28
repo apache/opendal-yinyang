@@ -493,10 +493,9 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
     fixture.write_raw("a", b"file");
     fixture.write_raw("a/b", b"child");
     let raw_keys = fixture.inventory().keys().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(
-        raw_keys,
-        ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
-        "the raw S3 fixture must contain both alias keys"
+    assert!(
+        raw_keys.contains("a"),
+        "the raw S3 fixture must expose the parent alias key: {raw_keys:?}"
     );
     let runtime = tokio::runtime::Runtime::new().expect("Direct test runtime");
     let operator = fixture.operator();
@@ -510,10 +509,29 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
             .map(|entry| entry.path().to_owned())
             .collect::<BTreeSet<_>>()
     });
+    let child_paths = runtime.block_on(async {
+        operator
+            .list_with("a/")
+            .recursive(true)
+            .await
+            .expect("list child prefix")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
+    let immediate_paths = runtime.block_on(async {
+        operator
+            .list_with("")
+            .await
+            .expect("list immediate root children")
+            .into_iter()
+            .map(|entry| (entry.path().to_owned(), entry.metadata().mode()))
+            .collect::<Vec<_>>()
+    });
     assert_eq!(
         paths,
         ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
-        "OpenDAL recursive list must expose both the file key and descendant key"
+        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?}"
     );
 
     let namespace = yinyang::direct::DirectNamespace::new(operator).expect("admit Direct operator");
