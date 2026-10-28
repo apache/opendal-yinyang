@@ -475,9 +475,11 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
     gate.release();
     let result = unlink.join().expect("conditional unlink thread panicked");
     let response = gate.last_commit_response().unwrap_or_default();
+    let retained = fixture.raw_object("unlink.txt");
     eprintln!(
-        "conditional Direct unlink: if-match={if_match} upstream={} result={result:?}",
-        String::from_utf8_lossy(&response)
+        "conditional Direct unlink: if-match={if_match} upstream={} result={result:?} retained_etag={:?}",
+        String::from_utf8_lossy(&response),
+        retained.as_ref().and_then(|object| object.etag.as_deref()),
     );
     let error = result.expect_err("Direct unlink must reject an externally replaced ETag");
     assert_errno(
