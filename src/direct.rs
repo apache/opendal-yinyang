@@ -25,7 +25,8 @@
 //! or, when versioning is unavailable, use conditional ETag reads for every
 //! range so bytes from different object versions are never combined.
 
-use opendal::{EntryMode, ErrorKind as OpenDalErrorKind, Operator};
+use opendal::raw::{OpRead, OpReader, ReadDyn, ServiceDyn};
+use opendal::{EntryMode, ErrorKind as OpenDalErrorKind, Operator, options};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -287,7 +288,19 @@ async fn verify_empty_directory_marker(
             format!("directory marker {path:?} has no ETag; Direct cannot verify that it is empty"),
         )
     })?;
-    let bytes = match operator.read_with(path).if_match(etag).range(0..1).await {
+    // Operator::read rejects trailing-slash paths before dispatch. The S3 list
+    // marks the same key as a directory but no longer exposes its object size.
+    let (range, args, _): (opendal::raw::BytesRange, OpRead, OpReader) = options::ReadOptions {
+        range: (0..1).into(),
+        if_match: Some(etag.to_owned()),
+        ..Default::default()
+    }
+    .into();
+    let reader = operator
+        .base_service()
+        .read_dyn(operator.base_context(), path, args)
+        .map_err(Error::storage)?;
+    let bytes = match reader.read_dyn(range).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == OpenDalErrorKind::RangeNotSatisfied => return Ok(()),
         Err(error) => return Err(Error::storage(error)),
