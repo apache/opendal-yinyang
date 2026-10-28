@@ -180,6 +180,10 @@ fn direct_defaults_to_read_only_and_does_not_require_staging() {
     let backend = TestBackend::default();
     let error = with_staging.validate(&backend.operator()).unwrap_err();
     assert!(error.to_string().contains("do not use staging"));
+
+    let error = direct.validate(&backend.operator()).unwrap_err();
+    assert!(error.to_string().contains("direct admission"));
+    assert!(!error.to_string().contains("local staging"));
 }
 #[tokio::test]
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {

@@ -17,7 +17,7 @@
 
 //! Volume configuration and effective capability admission, before runtime exposure.
 use crate::direct::{self, DirectNamespace};
-use crate::runtime::{Error, ErrorKind, Result, Runtime};
+use crate::runtime::{Error, Result, Runtime};
 use opendal::Operator;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use yinyang_core::service::ServiceClient;
-use yinyang_core::{Authority, BackendProfile, Fs};
+use yinyang_core::{Authority, BackendProfile, ErrorKind as CoreErrorKind, Fs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -344,8 +344,7 @@ impl VolumeConfig {
                     ));
                 }
             }
-            direct::validate_operator(operator)
-                .map_err(|error| Error::local_kind(ErrorKind::Invalid, error.to_string()))?;
+            direct::validate_operator(operator).map_err(direct_admission_error)?;
             let caps = self.capabilities(operator);
             if !self.require.is_subset(&caps.effective) {
                 return Err(Error::Invalid(
@@ -484,10 +483,21 @@ pub fn direct_namespace(config: &VolumeConfig, operator: Operator) -> Result<Dir
     if config.model != Model::Direct {
         return Err(Error::Invalid("volume model is not direct"));
     }
-    DirectNamespace::new(operator)
-        .map_err(|error| Error::local_kind(ErrorKind::Invalid, error.to_string()))
+    DirectNamespace::new(operator).map_err(direct_admission_error)
 }
 
 fn path_is_empty(path: &Path) -> bool {
     path.as_os_str().is_empty()
+}
+
+fn direct_admission_error(error: direct::Error) -> Error {
+    let kind = match error.kind() {
+        direct::ErrorKind::Unsupported => CoreErrorKind::Unsupported,
+        _ => CoreErrorKind::Invalid,
+    };
+    Error::Core(yinyang_core::Error::new(
+        kind,
+        "direct admission",
+        error.to_string(),
+    ))
 }

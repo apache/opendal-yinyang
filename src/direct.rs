@@ -98,11 +98,11 @@ impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A stable path identity within a Direct namespace.
+/// An identity for one accepted Direct node version.
 ///
-/// The identity is derived from the reversible path and node kind. Object
-/// replacement at the same path retains the identity; the file descriptor
-/// separately pins the object version or ETag.
+/// The identity is derived from the reversible path, node kind and the accepted
+/// storage pin, size and second-precision mtime. A replacement at the same path
+/// receives a new file identity so an old descriptor cannot be rebound.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DirectId([u8; 16]);
 
