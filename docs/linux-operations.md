@@ -55,8 +55,10 @@ authenticated single-host loopback authority, not TLS, HA or a network-safe
 service. There is no automatic Sync watcher or timer.
 
 Read-only Direct Mount is implemented as a separate experimental frontend. It
-does not use staging, the metadata service or Managed recovery state, and the
-Managed qualification results below do not qualify Direct.
+does not use staging, the metadata service or Managed recovery state. Writable
+Direct, when enabled by its own accepted integration, requires a private
+staging directory and uses Direct runtime state for pending, conflict and
+Unknown work. Managed qualification below does not qualify either Direct mode.
 
 ## Prerequisites
 
@@ -397,8 +399,12 @@ x86_64 qualification combination; an untested Linux host is reported as
 information, not as a CLI runtime restriction. For Managed, the `scope` object
 states that the state probe writes and removes one namespaced temporary file,
 does not initialize the catalog or acquire a runtime lease, and the authority
-check only observes the latest revision. For Direct, no state probe occurs;
-doctor performs one recursive read-only namespace observation.
+check only observes the latest revision. Read-only Direct performs no state
+probe and reports one recursive read-only namespace observation. Writable
+Direct probes its configured staging path with one temporary owner-only file
+and inspects `DirectRuntime` read-only for profile/schema/binding and retained
+pending, conflict or Unknown state; it does not create `runtime.db`, run
+recovery or take the runtime lease.
 
 Stop services without deleting state:
 

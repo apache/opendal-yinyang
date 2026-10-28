@@ -72,8 +72,8 @@ Checks are ordered from local policy to remote observation:
   because it is untested. A non-Linux host reports the operational restriction
   instead of implying native Linux frontend support.
 - `configuration`: parses the strict volume document and resolves a non-empty
-  relative staging path against the document directory. Direct has no staging
-  path to resolve.
+  relative staging path against the document directory. Read-only Direct has no
+  staging path; writable Direct requires one.
 - `environment`: requires a bucket, a complete explicit access-key pair when
   either key is set, and, for service publication, a 32..=1024 byte service
   token. The volume document's `storage_profile` is authoritative for a
@@ -85,14 +85,18 @@ Checks are ordered from local policy to remote observation:
   is not treated as readiness.
 - `local-state`: Managed writes one namespaced owner-only temporary file under
   the nearest existing state-directory ancestor, syncs and removes it, or probes
-  the existing state directory. Direct reports this check as informational and
-  performs no filesystem write. Doctor does not create the configured staging
-  directory, initialize `staging.db` or `sync.db`, run recovery, acquire the
-  runtime or publication lease, or inspect a live Mount as unhealthy merely
-  because that Mount holds its lease.
+  the existing state directory. Writable Direct performs the same owner-only
+  temporary-file probe and then inspects retained Direct runtime state
+  read-only; read-only Direct reports this check as informational. Doctor does
+  not create the configured staging directory, initialize `staging.db`,
+  `sync.db` or Direct `runtime.db`, run recovery, acquire the runtime or
+  publication lease, or inspect a live Mount as unhealthy merely because that
+  Mount holds its lease.
 - `mount-state`: when existing Mount staging is present, inspect persisted
-  handles without taking the lease. Pending, frozen, conflict and failed
-  records require action; read-only inspection itself is not a failure.
+  handles without taking the lease. For writable Direct staging, inspect the
+  retained runtime profile, schema, binding and pending/conflict/Unknown state
+  without creating or recovering it. Pending, frozen, conflict, Unknown and
+  failed records require action; read-only inspection itself is not a failure.
 - `admission`: construct the S3 operator and validate the effective
   four-layer capability intersection.
 - `authority`: Managed connects and observes the latest revision. Object mode checks the
