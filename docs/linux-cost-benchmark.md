@@ -104,6 +104,16 @@ must determine whether those reads still fetch remote units or proofs.
 The bounded 2026-10-27 matched result is recorded in
 [`linux-range-cost-results.md`](linux-range-cost-results.md).
 
+The `repeated-random` workload measures one Managed object authority through a
+read-only FUSE mount against a direct Amazon S3 HTTPS endpoint. It adds
+same-offset repetition, an 8 MiB hot working set, over-capacity random access,
+restart, forced eviction, and replacement with an old descriptor. The optional
+`benchmark-telemetry` feature installs the released OpenDAL MetricsLayer in the
+measured `yy` process, so request counts and HTTP body bytes are collected
+without a proxy or TLS termination. Its exact source/binary identities,
+per-batch accounting, memory tradeoff, negative cases, and raw evidence are in
+[`linux-verified-range-reuse.md`](linux-verified-range-reuse.md).
+
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
