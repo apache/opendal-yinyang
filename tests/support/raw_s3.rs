@@ -70,6 +70,7 @@ impl RawS3 {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_bucket(&self, bucket: impl Into<String>) -> Self {
         Self {
             bucket: bucket.into(),
@@ -109,6 +110,7 @@ impl RawS3 {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_version(&self, key: &str, version: &str) -> Option<Vec<u8>> {
         let query = format!("versionId={}", query_encode(version));
         let response = self.request("GET", Some(key), &query, &[]);

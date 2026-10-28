@@ -29,7 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::fixtures::fixture_root;
 
@@ -320,18 +320,6 @@ impl Drop for Service {
         if let Some(stderr) = self.stderr.take() {
             let _ = stderr.join();
         }
-    }
-}
-
-pub fn wait_for(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(25));
     }
 }
 

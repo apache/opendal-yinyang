@@ -471,7 +471,7 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
         b"dotdot"
     );
     assert_eq!(
-        fs::read(root.join(find_encoded(root, ".").join("dot"))),
+        fs::read(root.join(find_encoded(root, ".").join("dot"))).unwrap(),
         b"dot"
     );
     assert_eq!(

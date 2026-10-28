@@ -259,7 +259,7 @@ impl Mounted {
             }
             if let Some(status) = self
                 .child
-                .as_ref()
+                .as_mut()
                 .expect("mount process is live")
                 .try_wait()
                 .expect("poll Direct mount")
