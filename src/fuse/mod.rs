@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Linux FUSE mount frontend for Managed volumes.
+//! Linux FUSE mount frontend for Managed and read-only Direct volumes.
 //!
 //! The CLI form is `yy --volume CONFIG mount MOUNTPOINT`; the process stays in
 //! the foreground until unmounted. The volume must declare `frontend = "fuse"`;
-//! read-only and writable Managed mounts are supported. The shared admission rules in
-//! [`crate::volume`] reject every other combination before an authority
-//! connection or staging lease is created.
+//! read-only and writable Managed mounts plus read-only Direct mounts are
+//! supported. The shared admission rules in [`crate::volume`] reject every
+//! other combination before an authority connection or staging lease is
+//! created.
 //!
 //! Startup takes the staging lease through [`crate::mount::Mount`]. A read-only
 //! mount refuses to serve a staging database that still holds unpublished,
@@ -41,11 +42,12 @@
 //! See `specs/linux-fuse.md` for the full read-only contract.
 
 mod attrs;
+mod direct;
 mod frontend;
 mod inode;
 
 use crate::mount::Mount;
-use crate::volume::{Volume, VolumeConfig};
+use crate::volume::{Model, Volume, VolumeConfig};
 use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +77,9 @@ pub async fn run(
     token: Option<String>,
     mountpoint: PathBuf,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
+    if config.model == Model::Direct {
+        return direct::run(config, operator, mountpoint).await;
+    }
     let read_only = config.read_only;
     let authority = Volume::connect(&config, operator, token).await?;
     let mount = Mount::open(authority, &config.staging, read_only).await?;

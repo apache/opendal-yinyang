@@ -19,6 +19,7 @@
 //!
 //! One-shot publication and restoration of local directories on a Managed filesystem.
 
+pub mod direct;
 mod directory;
 #[cfg(target_os = "linux")]
 pub mod fuse;

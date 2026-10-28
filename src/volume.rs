@@ -16,9 +16,10 @@
 // under the License.
 
 //! Volume configuration and effective capability admission, before runtime exposure.
+use crate::direct::{self, DirectNamespace};
 use crate::runtime::{Error, Result, Runtime};
 use opendal::Operator;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -59,6 +60,14 @@ fn managed() -> CapabilitySet {
     ]
     .into_iter()
     .collect()
+}
+/// Read-only storage-native Direct namespace. There is no retained-unlink-read
+/// claim: an unversioned ETag-pinned descriptor becomes Stale after a delete.
+fn direct() -> CapabilitySet {
+    use Capability::*;
+    [Read, List, StableIdentity, PinnedReads]
+        .into_iter()
+        .collect()
 }
 fn read_only() -> CapabilitySet {
     use Capability::*;
@@ -124,8 +133,7 @@ impl StorageProfile {
 }
 /// Strict configuration: unknown fields are errors, not ignored security policy.
 /// Storage credentials and RPC token are supplied separately, never serialized.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct VolumeConfig {
     pub name: String,
     pub model: Model,
@@ -133,12 +141,53 @@ pub struct VolumeConfig {
     pub frontend: Frontend,
     pub publication: Publication,
     pub storage_profile: StorageProfile,
+    #[serde(skip_serializing_if = "PathBuf::is_empty")]
     pub staging: PathBuf,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
     pub require: CapabilitySet,
     pub service_address: Option<SocketAddr>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVolumeConfig {
+    name: String,
+    model: Model,
+    access: Access,
+    frontend: Frontend,
+    publication: Publication,
+    storage_profile: StorageProfile,
+    #[serde(default)]
+    staging: PathBuf,
+    #[serde(default)]
+    read_only: Option<bool>,
+    #[serde(default)]
+    require: CapabilitySet,
+    #[serde(default)]
+    service_address: Option<SocketAddr>,
+}
+
+impl<'de> Deserialize<'de> for VolumeConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawVolumeConfig::deserialize(deserializer)?;
+        Ok(Self {
+            name: raw.name,
+            model: raw.model,
+            access: raw.access,
+            frontend: raw.frontend,
+            publication: raw.publication,
+            storage_profile: raw.storage_profile,
+            staging: raw.staging,
+            read_only: raw.read_only.unwrap_or(raw.model == Model::Direct),
+            require: raw.require,
+            service_address: raw.service_address,
+        })
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Capabilities {
@@ -179,41 +228,65 @@ impl VolumeConfig {
     pub fn capabilities(&self, operator: &Operator) -> Capabilities {
         let volume = self.volume_capabilities();
         let cap = operator.info().capability();
-        let content = operator.info().scheme() == "s3"
-            && cap.read
-            && cap.write
-            && cap.write_can_multi
-            && cap.write_with_if_not_exists;
-        let publication = self.publication == Publication::Service || cap.write_with_if_match;
-        let storage = if content && publication {
-            managed()
-        } else {
-            CapabilitySet::new()
+        let storage = match self.model {
+            Model::Managed => {
+                let content = operator.info().scheme() == "s3"
+                    && cap.read
+                    && cap.write
+                    && cap.write_can_multi
+                    && cap.write_with_if_not_exists;
+                let publication =
+                    self.publication == Publication::Service || cap.write_with_if_match;
+                if content && publication {
+                    managed()
+                } else {
+                    CapabilitySet::new()
+                }
+            }
+            Model::Direct => {
+                let pinned = cap.read_with_version || cap.read_with_if_match;
+                let storage = operator.info().scheme() == "s3"
+                    && cap.stat
+                    && cap.read
+                    && cap.list
+                    && cap.list_with_recursive
+                    && pinned;
+                if storage {
+                    direct()
+                } else {
+                    CapabilitySet::new()
+                }
+            }
         };
         let access = self.access_capabilities();
         let frontend = self.frontend_capabilities();
         Capabilities::intersect(volume, storage, access, frontend)
     }
     fn volume_capabilities(&self) -> CapabilitySet {
-        if self.model == Model::Managed {
-            managed()
-        } else {
-            CapabilitySet::new()
+        match self.model {
+            Model::Managed => managed(),
+            Model::Direct => direct(),
         }
     }
     fn access_capabilities(&self) -> CapabilitySet {
-        match self.access {
-            Access::Mount if self.read_only => read_only(),
-            Access::Mount => managed(),
-            Access::Sync => managed(),
+        match (self.model, self.access) {
+            (Model::Direct, Access::Mount) if self.read_only => direct(),
+            (Model::Direct, _) => CapabilitySet::new(),
+            (Model::Managed, Access::Mount) if self.read_only => read_only(),
+            (Model::Managed, Access::Mount | Access::Sync) => managed(),
         }
     }
     fn frontend_capabilities(&self) -> CapabilitySet {
-        match self.frontend {
-            Frontend::Library => managed(),
-            Frontend::Fuse if self.read_only => fuse(),
-            Frontend::Fuse => managed(),
-            Frontend::Macos | Frontend::Windows => CapabilitySet::new(),
+        match (self.model, self.frontend) {
+            (Model::Direct, Frontend::Library) => direct(),
+            (Model::Direct, Frontend::Fuse) if self.read_only => direct(),
+            (Model::Direct, Frontend::Fuse | Frontend::Macos | Frontend::Windows) => {
+                CapabilitySet::new()
+            }
+            (Model::Managed, Frontend::Library) => managed(),
+            (Model::Managed, Frontend::Fuse) if self.read_only => fuse(),
+            (Model::Managed, Frontend::Fuse) => managed(),
+            (Model::Managed, Frontend::Macos | Frontend::Windows) => CapabilitySet::new(),
         }
     }
     /// Capabilities the selected combination promises independent of storage
@@ -230,11 +303,57 @@ impl VolumeConfig {
             .collect()
     }
     pub fn validate(&self, operator: &Operator) -> Result<Capabilities> {
-        if self.name.trim().is_empty() || self.staging.as_os_str().is_empty() {
-            return Err(Error::Invalid("volume name and staging path are required"));
+        if self.name.trim().is_empty() {
+            return Err(Error::Invalid("volume name is required"));
         }
-        if self.model != Model::Managed {
-            return Err(Error::Invalid("Direct volumes are not implemented"));
+        if self.model == Model::Managed && self.staging.as_os_str().is_empty() {
+            return Err(Error::Invalid(
+                "the staging path is required for a Managed volume",
+            ));
+        }
+        if self.model == Model::Direct {
+            if !self.staging.as_os_str().is_empty() {
+                return Err(Error::Invalid(
+                    "Direct volumes do not use staging; omit the staging field",
+                ));
+            }
+            if !self.read_only {
+                return Err(Error::Invalid(
+                    "Direct volumes are read-only; read_only must be true or omitted",
+                ));
+            }
+            if self.access != Access::Mount {
+                return Err(Error::Invalid(
+                    "Direct supports access=mount only; writable Direct Sync is not implemented",
+                ));
+            }
+            if self.publication != Publication::Object || self.service_address.is_some() {
+                return Err(Error::Invalid(
+                    "Direct reads the configured object namespace directly and does not use a publication service",
+                ));
+            }
+            match self.frontend {
+                Frontend::Library => {}
+                Frontend::Fuse if !cfg!(target_os = "linux") => {
+                    return Err(Error::Invalid(
+                        "the fuse frontend is implemented only on Linux",
+                    ));
+                }
+                Frontend::Fuse => {}
+                Frontend::Macos | Frontend::Windows => {
+                    return Err(Error::Invalid(
+                        "macOS and Windows frontends are not implemented; select library or fuse",
+                    ));
+                }
+            }
+            direct::validate_operator(operator)?;
+            let caps = self.capabilities(operator);
+            if !self.require.is_subset(&caps.effective) {
+                return Err(Error::Invalid(
+                    "effective Direct capability intersection is missing a required operation",
+                ));
+            }
+            return Ok(caps);
         }
         match self.access {
             Access::Mount => match self.frontend {
@@ -301,6 +420,11 @@ impl Volume {
         operator: Operator,
         token: Option<String>,
     ) -> Result<Self> {
+        if config.model == Model::Direct {
+            return Err(Error::Invalid(
+                "Direct volumes expose a read-only namespace through the library or FUSE frontend; they do not install Managed file handles",
+            ));
+        }
         // The file runtime installs recoverable handles; it does not own the
         // ordinary-directory reconciliation of a Sync volume. Admission accepts
         // `access: sync` for `Volume::connect`, so reject it here before this
@@ -330,6 +454,11 @@ impl Volume {
         token: Option<String>,
     ) -> Result<Arc<dyn Authority>> {
         config.validate(&operator)?;
+        if config.model == Model::Direct {
+            return Err(Error::Invalid(
+                "Direct volumes do not connect to a Managed authority",
+            ));
+        }
         let authority: Arc<dyn Authority> = match config.publication {
             Publication::Object => {
                 Arc::new(Fs::open(operator, config.storage_profile.backend()).await?)
@@ -348,4 +477,13 @@ impl Volume {
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
+}
+
+/// Construct the storage-native namespace for an admitted Direct volume.
+pub fn direct_namespace(config: &VolumeConfig, operator: Operator) -> Result<DirectNamespace> {
+    config.validate(&operator)?;
+    if config.model != Model::Direct {
+        return Err(Error::Invalid("volume model is not direct"));
+    }
+    DirectNamespace::new(operator).map_err(|error| Error::Invalid(error.to_string()))
 }
