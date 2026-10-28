@@ -158,6 +158,82 @@ pub(super) struct Store {
     _lock: File,
 }
 
+pub(super) struct StoreInspection {
+    pub profile: String,
+    pub binding_id: [u8; 32],
+    pub binding_description: String,
+    pub objects: [u64; 7],
+    pub mutations: [u64; 9],
+}
+
+pub(super) fn inspect(
+    database: &Path,
+    binding: Option<&DirectStorageBinding>,
+) -> Result<StoreInspection> {
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| sqlite("inspect Direct runtime database", error))?;
+    connection
+        .busy_timeout(Duration::from_secs(1))
+        .map_err(|error| sqlite("configure Direct runtime inspection", error))?;
+    let (binding_bytes, binding_description) = validate_schema(&connection, binding)?;
+    let binding_id: [u8; 32] = binding_bytes.try_into().map_err(|_| {
+        Error::new(
+            ErrorKind::Storage,
+            "Direct runtime binding digest has an invalid length",
+        )
+    })?;
+    let mut objects = [0_u64; 7];
+    let mut statement = connection
+        .prepare("SELECT record FROM objects")
+        .map_err(|error| sqlite("prepare Direct object inspection", error))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|error| sqlite("inspect Direct object records", error))?;
+    for row in rows {
+        let record: ObjectRecord = decode(
+            "Direct object state",
+            &row.map_err(|error| sqlite("inspect Direct object records", error))?,
+        )?;
+        let slot = objects.get_mut(record.state as usize).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Storage,
+                format!("unknown Direct object state {}", record.state),
+            )
+        })?;
+        *slot = slot.saturating_add(1);
+    }
+    let mut mutations = [0_u64; 9];
+    let mut statement = connection
+        .prepare("SELECT record FROM mutations")
+        .map_err(|error| sqlite("prepare Direct mutation inspection", error))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|error| sqlite("inspect Direct mutation records", error))?;
+    for row in rows {
+        let record: MutationRecord = decode(
+            "Direct mutation state",
+            &row.map_err(|error| sqlite("inspect Direct mutation records", error))?,
+        )?;
+        let slot = mutations.get_mut(record.state as usize).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Storage,
+                format!("unknown Direct mutation state {}", record.state),
+            )
+        })?;
+        *slot = slot.saturating_add(1);
+    }
+    Ok(StoreInspection {
+        profile: PROFILE.to_owned(),
+        binding_id,
+        binding_description,
+        objects,
+        mutations,
+    })
+}
+
 impl Store {
     pub fn open(root: &Path, binding: &DirectStorageBinding) -> Result<Self> {
         let database = root.join("runtime.db");
@@ -179,7 +255,7 @@ impl Store {
             check
                 .busy_timeout(Duration::from_secs(1))
                 .map_err(|error| sqlite("configure Direct runtime preflight", error))?;
-            validate_schema(&check, binding)?;
+            let _ = validate_schema(&check, Some(binding))?;
         }
 
         create_private_dir(root)?;
@@ -222,7 +298,7 @@ impl Store {
             .map_err(|error| sqlite("configure Direct runtime database", error))?;
 
         if nonempty {
-            validate_schema(&connection, binding)?;
+            let _ = validate_schema(&connection, Some(binding))?;
         } else {
             let transaction = connection
                 .transaction()
@@ -431,7 +507,10 @@ impl Store {
     }
 }
 
-fn validate_schema(connection: &Connection, binding: &DirectStorageBinding) -> Result<()> {
+fn validate_schema(
+    connection: &Connection,
+    binding: Option<&DirectStorageBinding>,
+) -> Result<(Vec<u8>, String)> {
     let (profile, bound, diagnostic) = connection
         .query_row(
             "SELECT profile,binding,binding_diagnostic FROM authority WHERE singleton=1",
@@ -451,14 +530,16 @@ fn validate_schema(connection: &Connection, binding: &DirectStorageBinding) -> R
             format!("unsupported Direct runtime profile {profile:?}"),
         ));
     }
-    if bound.as_slice() != binding.namespace_id() {
-        return Err(Error::new(
-            ErrorKind::Invalid,
-            format!(
-                "Direct runtime state is bound to {diagnostic:?}, not the selected storage namespace {:?}",
-                binding.description()
-            ),
-        ));
+    if let Some(binding) = binding {
+        if bound.as_slice() != binding.namespace_id() {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                format!(
+                    "Direct runtime state is bound to {diagnostic:?}, not the selected storage namespace {:?}",
+                    binding.description()
+                ),
+            ));
+        }
     }
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
@@ -499,7 +580,7 @@ fn validate_schema(connection: &Connection, binding: &DirectStorageBinding) -> R
             ));
         }
     }
-    Ok(())
+    Ok((bound, diagnostic))
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {

@@ -52,15 +52,18 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   isolated macOS 27 / Xcode 27 prototypes. They share the native bridge and
   runtimes, but ordinary volume CLI admission does not select them. See the
   [macOS frontend contract](specs/macos-frontends.md).
-- **Read-only Direct:** The library and Linux FUSE frontend can browse and read
-  an existing S3-compatible object namespace without importing it into Managed
+- **Direct:** The library and Linux FUSE frontend can browse and read an
+  existing S3-compatible object namespace without importing it into Managed
   metadata. Keys use a reversible Linux-name mapping, recursive listing is an
   explicit SIGHUP-refreshed observation, and each descriptor pins a real object
-  version or uses conditional ETag ranges. See the
-  [Direct contract](specs/direct.md). Writable Direct and Direct Sync remain
-  unimplemented. The current MinIO-compatible Silo qualification does not
-  cover a namespace whose LIST hides a descendant behind an existing
-  file-prefix alias; the selected service must enumerate every current key.
+  version or uses conditional ETag ranges. The library also has an experimental
+  conditional whole-object mutation runtime with retained local generations and
+  safe-save copy/rename outcomes. See the [Direct contract](specs/direct.md) and
+  [mutation runtime](specs/direct-mutations.md). Writable FUSE admission and
+  Direct Sync remain separate integration work. The current MinIO-compatible
+  Silo qualification does not cover a namespace whose LIST hides a descendant
+  behind an existing file-prefix alias; the selected service must enumerate
+  every current key.
 
 The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
 tracks the remaining integration and platform work.

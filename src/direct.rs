@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only namespace over the objects already present in storage.
+//! Storage-native Direct namespaces and conditional object mutations.
 //!
 //! Direct snapshots do not create Managed metadata, NodeIds, proofs, staging
-//! state or transactions. An object key is split into UTF-8 path components
+//! state or transactions. A read-only observation maps object keys to bounded
+//! Linux paths. The separate mutation runtime stages whole-object generations
+//! and records exact backend conditions without Managed transactions.
+//! An object key is split into UTF-8 path components
 //! and each component receives a bounded reversible representation. Names that
 //! cannot be represented by the Linux frontend fail the whole observation
 //! instead of being filtered out. File opens pin the observed S3 version ID,
@@ -42,9 +45,10 @@ pub use mutation::{
     DirectObservation, DirectPrecondition,
 };
 pub use runtime::{
-    DirectFileHandle, DirectFlushOutcome, DirectMutationEndpoint, DirectMutationId,
-    DirectMutationKind, DirectMutationState, DirectMutationStatus, DirectObjectState,
-    DirectObjectStatus, DirectRuntime,
+    DirectFileHandle, DirectFlushOutcome, DirectMutationCounts, DirectMutationEndpoint,
+    DirectMutationId, DirectMutationKind, DirectMutationState, DirectMutationStatus,
+    DirectObjectCounts, DirectObjectState, DirectObjectStatus, DirectRuntime,
+    DirectRuntimeInspection, DirectRuntimeInspectionState,
 };
 
 const NAME_MAX: usize = 255;
