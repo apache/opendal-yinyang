@@ -415,6 +415,10 @@ async fn nested_last_child_deletes_prune_only_sync_created_empty_parents() {
     assert!(local_fixture.handle.read("nested/local.txt").is_none());
     assert!(!local_fixture.root.join("nested").exists());
     assert!(outcome.in_sync);
+    let second = sync.run().await.unwrap();
+    assert!(second.in_sync);
+    assert_eq!(second.deleted_remote, 0);
+    drop(sync);
 
     let both_fixture = Fixture::new();
     both_fixture.write("both/file.txt", b"both");
@@ -547,6 +551,35 @@ async fn unknown_survives_restart_and_explicit_keep_local_observes_current_state
     let inspection =
         DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
     assert!(inspection.summary.in_sync, "{inspection:?}");
+}
+
+#[tokio::test]
+async fn unknown_does_not_become_a_conflict_or_overwrite_an_external_successor() {
+    let fixture = Fixture::new();
+    fixture.write("file", b"v1");
+    let mut sync = fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.write("file", b"v2");
+    fixture.handle.lose_next_publish_response();
+    let mut sync = fixture.open().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.handle.put("file", b"external");
+    let mut sync = fixture.open().await;
+    let outcome = sync.run().await.unwrap();
+    assert_eq!(outcome.unknown, 1);
+    assert_eq!(outcome.conflicts, 0);
+    assert_eq!(
+        fixture.handle.read("file").as_deref(),
+        Some(b"external".as_slice())
+    );
+    let status =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    assert_eq!(status.entries[0].state, EntryState::Unknown);
+    assert_eq!(status.summary.conflicts, 0);
 }
 
 #[tokio::test]
@@ -683,6 +716,8 @@ async fn file_to_directory_transition_is_an_explicit_conflict() {
     fixture.handle.delete("node");
     fixture.handle.mkdir("node");
     fixture.handle.put("node/child", b"child");
+    std::fs::remove_file(fixture.root.join("node")).unwrap();
+    std::fs::create_dir(fixture.root.join("node")).unwrap();
     fixture.write("node/local-child", b"local-child");
     let mut sync = fixture.open().await;
     let outcome = sync.run().await.unwrap();

@@ -1062,7 +1062,9 @@ impl LocalTree {
         for depth in (1..=components.len()).rev() {
             let directory = components[..depth].join("/");
             let parent_path = components[..depth - 1].join("/");
-            let parent_fd = self.open_relative_dir(&parent_path)?;
+            let Some(parent_fd) = self.open_relative_dir_optional(&parent_path)? else {
+                break;
+            };
             match unlinkat(&parent_fd, components[depth - 1], AtFlags::REMOVEDIR) {
                 Ok(()) => {
                     fsync(&parent_fd).map_err(|error| {
@@ -1073,7 +1075,11 @@ impl LocalTree {
                         )
                     })?;
                 }
-                Err(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::NOENT) => break,
+                Err(
+                    rustix::io::Errno::NOTEMPTY
+                    | rustix::io::Errno::NOENT
+                    | rustix::io::Errno::NOTDIR,
+                ) => break,
                 Err(error) => {
                     return Err(Error::errno(
                         "remove empty Direct Sync directory",
@@ -1144,7 +1150,7 @@ fn desired_matches(desired: Option<DesiredFile>, fingerprint: Option<LocalFinger
 }
 
 fn prepare_directory(path: &Path, operation: &str) -> Result<()> {
-    match std::fs::create_dir(path) {
+    match std::fs::create_dir_all(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(Error::io(operation, path, error)),
@@ -1164,7 +1170,7 @@ fn prepare_private_directory(path: &Path, operation: &str) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
+    builder.recursive(true).mode(0o700);
     match builder.create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

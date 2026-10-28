@@ -34,7 +34,8 @@ The existing `staging` field is the Direct Sync state directory. It is not
 object payload staging for a Managed runtime. It must be non-empty, outside the
 local root, on the same filesystem as the local root, and writable only as
 required by the installing account. The state directory must not grant group or
-other permissions.
+other permissions. It is dedicated to one Direct Sync binding and must not be
+shared with a writable Direct Mount runtime or another Sync root.
 
 Admission runs before state creation or storage effects. In addition to the
 read prerequisites in [`direct.md`](direct.md), Direct Sync requires:
