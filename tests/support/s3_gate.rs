@@ -244,6 +244,7 @@ impl S3Gate {
         }
     }
 
+    #[allow(dead_code)]
     pub fn wait_commit_succeeded(&self) {
         match self
             .events
