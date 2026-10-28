@@ -1491,7 +1491,7 @@ fn should_rebase_namespace_after_failure(errno: fuser::Errno) -> bool {
     // VFS can retry UNLINK or RENAME after ESTALE. Keep the failed pin until
     // explicit SIGHUP so a retry cannot use a refreshed destination or source
     // precondition and silently replace an external namespace change.
-    errno != fuser::Errno::ESTALE
+    errno.code() != fuser::Errno::ESTALE.code()
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
