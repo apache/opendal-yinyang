@@ -106,6 +106,51 @@ pub enum DirectMutationState {
     Failed,
 }
 
+/// Whether durable Direct state exists without changing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectRuntimeInspectionState {
+    Missing,
+    Uninitialized,
+    Ready,
+}
+
+/// Read-only object-generation counts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectObjectCounts {
+    pub clean: u64,
+    pub staged: u64,
+    pub pending: u64,
+    pub conflict: u64,
+    pub unknown: u64,
+    pub failed: u64,
+    pub discarded: u64,
+}
+
+/// Read-only mutation-intent counts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectMutationCounts {
+    pub staged: u64,
+    pub dispatching: u64,
+    pub applied: u64,
+    pub conflict: u64,
+    pub unknown: u64,
+    pub destination_applied: u64,
+    pub pending_source_cleanup: u64,
+    pub failed: u64,
+    pub source_dispatching: u64,
+}
+
+/// Non-mutating inspection result for writable Direct doctor admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectRuntimeInspection {
+    pub state: DirectRuntimeInspectionState,
+    pub profile: Option<String>,
+    pub binding_id: Option<[u8; 32]>,
+    pub binding_description: Option<String>,
+    pub objects: DirectObjectCounts,
+    pub mutations: DirectMutationCounts,
+}
+
 /// One object endpoint of a durable namespace mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectMutationEndpoint {
@@ -225,6 +270,67 @@ pub struct DirectRuntime {
 }
 
 impl DirectRuntime {
+    /// Inspect durable state without creating directories, acquiring the writer
+    /// lease, changing journal mode, running recovery, or contacting storage.
+    pub fn inspect(
+        path: &Path,
+        binding: Option<&super::DirectStorageBinding>,
+    ) -> Result<DirectRuntimeInspection> {
+        if !path.exists() {
+            return Ok(DirectRuntimeInspection {
+                state: DirectRuntimeInspectionState::Missing,
+                profile: None,
+                binding_id: None,
+                binding_description: None,
+                objects: DirectObjectCounts::default(),
+                mutations: DirectMutationCounts::default(),
+            });
+        }
+        let database = path.join("runtime.db");
+        if !database.exists()
+            || std::fs::metadata(&database)
+                .map_err(|error| local_io("inspect Direct runtime database", error))?
+                .len()
+                == 0
+        {
+            return Ok(DirectRuntimeInspection {
+                state: DirectRuntimeInspectionState::Uninitialized,
+                profile: None,
+                binding_id: None,
+                binding_description: None,
+                objects: DirectObjectCounts::default(),
+                mutations: DirectMutationCounts::default(),
+            });
+        }
+        let inspected = super::journal::inspect(&database, binding)?;
+        Ok(DirectRuntimeInspection {
+            state: DirectRuntimeInspectionState::Ready,
+            profile: Some(inspected.profile),
+            binding_id: Some(inspected.binding_id),
+            binding_description: Some(inspected.binding_description),
+            objects: DirectObjectCounts {
+                clean: inspected.objects[0],
+                staged: inspected.objects[1],
+                pending: inspected.objects[2],
+                conflict: inspected.objects[3],
+                unknown: inspected.objects[4],
+                failed: inspected.objects[5],
+                discarded: inspected.objects[6],
+            },
+            mutations: DirectMutationCounts {
+                staged: inspected.mutations[0],
+                dispatching: inspected.mutations[1],
+                applied: inspected.mutations[2],
+                conflict: inspected.mutations[3],
+                unknown: inspected.mutations[4],
+                destination_applied: inspected.mutations[5],
+                pending_source_cleanup: inspected.mutations[6],
+                failed: inspected.mutations[7],
+                source_dispatching: inspected.mutations[8],
+            },
+        })
+    }
+
     /// Open a runtime.
     ///
     /// Read-only runtimes do not inspect or create the optional staging path.
@@ -2994,5 +3100,55 @@ mod tests {
                 .iter()
                 .all(|status| status.id != id)
         );
+    }
+
+    #[tokio::test]
+    async fn inspection_is_read_only_and_checks_binding() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let inspection = DirectRuntime::inspect(&missing, None).unwrap();
+        assert_eq!(inspection.state, DirectRuntimeInspectionState::Missing);
+        assert!(!missing.exists());
+
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let inspection = DirectRuntime::inspect(&empty, None).unwrap();
+        assert_eq!(
+            inspection.state,
+            DirectRuntimeInspectionState::Uninitialized
+        );
+        assert!(!empty.join("runtime.lock").exists());
+        assert!(!empty.join("runtime.db").exists());
+
+        let state = root.path().join("state");
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.clone()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "local")
+            .await
+            .unwrap();
+        file.write(0, b"x").await.unwrap();
+        drop(file);
+        drop(runtime);
+
+        let inspection = DirectRuntime::inspect(&state, Some(&binding("bucket"))).unwrap();
+        assert_eq!(inspection.state, DirectRuntimeInspectionState::Ready);
+        assert_eq!(inspection.objects.staged, 1);
+        assert_eq!(inspection.mutations.staged, 0);
+        assert_eq!(
+            inspection.profile.as_deref(),
+            Some("yinyang-direct-runtime-1")
+        );
+        let error = DirectRuntime::inspect(&state, Some(&binding("other"))).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
     }
 }
