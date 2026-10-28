@@ -225,7 +225,25 @@ impl S3Gate {
         }
     }
 
+    /// Wait one bounded interval without consuming a non-intercept event.
     #[allow(dead_code)]
+    pub fn wait_intercepted_timeout(&self, timeout: Duration) -> bool {
+        match self.events.recv_timeout(timeout) {
+            Ok(GateEvent::Intercepted) => true,
+            Ok(GateEvent::CommitSucceeded) => {
+                panic!("S3 gate observed a commit without reporting request interception")
+            }
+            Ok(GateEvent::OriginalDropped) => {
+                panic!("S3 gate dropped a request without reporting request interception")
+            }
+            Ok(GateEvent::CommitFailed(error)) => panic!("S3 gate commit failed: {error}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("S3 gate event channel disconnected before request interception")
+            }
+        }
+    }
+
     pub fn wait_commit_succeeded(&self) {
         match self
             .events
