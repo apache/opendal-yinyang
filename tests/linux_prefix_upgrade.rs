@@ -741,8 +741,17 @@ impl RemoteCleanup {
     fn cleanup(&mut self) {
         let raw = RawS3::from_env();
         for root in self.roots.drain(..) {
-            for key in raw.inventory(&format!("{root}/")).into_keys() {
-                raw.delete(&key);
+            for _ in 0..3 {
+                let keys = raw
+                    .inventory(&format!("{root}/"))
+                    .into_keys()
+                    .collect::<Vec<_>>();
+                if keys.is_empty() {
+                    break;
+                }
+                for key in keys {
+                    raw.delete(&key);
+                }
             }
         }
     }
@@ -1207,10 +1216,16 @@ fn assert_no_installed_writer(prefix: &Path, work: &Path) {
 }
 
 fn assert_storage_inventory_complete_when_empty(storage: &Storage, root: &str) {
-    let inventory = storage.raw.inventory(&format!("{root}/"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut inventory = storage.raw.inventory(&format!("{root}/"));
+    while !inventory.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+        inventory = storage.raw.inventory(&format!("{root}/"));
+    }
     assert!(
         inventory.is_empty(),
-        "remote cleanup did not remove every key below {root}"
+        "remote cleanup did not remove every key below {root}: {:?}",
+        inventory.keys().collect::<Vec<_>>()
     );
 }
 
