@@ -125,6 +125,15 @@ impl Fixture {
         self.raw.get(&self.full_key(key))
     }
 
+    pub fn wait_raw_bytes(&self, key: &str, expected: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        let mut observed = None;
+        wait_until(timeout, &format!("raw Direct bytes for {key:?}"), || {
+            observed = self.raw_get(key);
+            observed.as_deref() == Some(expected)
+        });
+        observed
+    }
+
     pub fn inventory(&self) -> Inventory {
         let prefix = format!("{}/", self.root);
         self.raw
@@ -380,6 +389,18 @@ impl Mounted {
     pub fn terminate(mut self) {
         kill(self.pid(), Signal::SIGTERM).expect("send SIGTERM to Direct mount");
         self.wait(Duration::from_secs(30));
+        self.join_readers();
+    }
+
+    pub fn crash(mut self) {
+        kill(self.pid(), Signal::SIGKILL).expect("send SIGKILL to Direct mount");
+        let child = self.child.as_mut().expect("mount process is live");
+        let status = child.wait().expect("wait for crashed Direct mount");
+        self.child.take();
+        assert!(
+            !status.success(),
+            "SIGKILLed Direct mount unexpectedly exited successfully"
+        );
         self.join_readers();
     }
 

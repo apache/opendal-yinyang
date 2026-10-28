@@ -18,9 +18,12 @@
 //! Accepted writable Direct admission and native mutation scenarios.
 
 use crate::harness::{
-    Fixture, RequestCounter, effective_capabilities, local_paths, path_text, run_timeout,
+    Fixture, RequestCounter, effective_capabilities, local_paths, path_text, payload, run_timeout,
 };
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Duration;
 
 const REQUIRED_WRITABLE_CAPABILITIES: [&str; 8] = [
@@ -113,4 +116,191 @@ fn direct_write_admission_requires_staging_and_publishes_limited_capabilities() 
         initial_inventory,
         "missing-staging admission mutated raw storage"
     );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_mount_publishes_whole_objects_and_persists_remount() {
+    let fixture = Fixture::new();
+    let original = payload(16 * 1024, 0x31);
+    fixture.write_raw("basic.bin", &original);
+    let staging = fixture.path("direct-write-basic-state");
+    let config = fixture.writable_config("direct-write-basic", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-basic");
+    fs::create_dir(&mountpoint).expect("create writable Direct mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("basic.bin");
+
+    let patch = payload(1024, 0x47);
+    let tail = payload(17, 0x63);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open writable Direct file");
+    file.seek(SeekFrom::Start(4096))
+        .expect("seek writable Direct file");
+    file.write_all(&patch).expect("write Direct file range");
+    file.set_len(8192 + tail.len() as u64)
+        .expect("extend Direct file");
+    file.seek(SeekFrom::Start(8192))
+        .expect("seek extended Direct file");
+    file.write_all(&tail).expect("write Direct file tail");
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind writable Direct file");
+    let mut staged = Vec::new();
+    file.read_to_end(&mut staged)
+        .expect("read staged Direct file");
+    assert_eq!(
+        staged,
+        {
+            let mut expected = original.clone();
+            expected[4096..4096 + patch.len()].copy_from_slice(&patch);
+            expected.resize(8192 + tail.len(), 0);
+            expected[8192..].copy_from_slice(&tail);
+            expected
+        },
+        "read must observe the complete staged object"
+    );
+    file.sync_all()
+        .expect("publish writable Direct whole object");
+    drop(file);
+
+    assert_eq!(
+        fixture.raw_get("basic.bin").as_deref(),
+        Some(staged.as_slice()),
+        "successful Direct fsync must publish the exact staged bytes"
+    );
+    assert_eq!(
+        fixture.raw_object("basic.bin").map(|object| object.bytes),
+        Some(staged.clone())
+    );
+    assert_eq!(
+        fixture.raw_get("basic.bin").unwrap().len(),
+        8192 + tail.len()
+    );
+    mounted.unmount();
+
+    let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    assert_eq!(
+        fs::read(remounted.mountpoint().join("basic.bin"))
+            .expect("read remounted writable Direct file"),
+        staged,
+        "remount must recover the accepted whole-object bytes"
+    );
+    remounted.unmount();
+    assert!(
+        fixture
+            .inventory()
+            .keys()
+            .all(|key| !key.starts_with(".yinyang/")),
+        "writable Direct created Managed metadata"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_read_only_flush_does_not_publish_shared_dirty_bytes() {
+    let fixture = Fixture::new();
+    let original = payload(8192, 0x19);
+    let dirty = payload(8192, 0x71);
+    fixture.write_raw("flush.txt", &original);
+    let staging = fixture.path("direct-write-flush-state");
+    let config = fixture.writable_config("direct-write-flush", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-flush");
+    fs::create_dir(&mountpoint).expect("create writable Direct flush mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("flush.txt");
+
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open writable Direct writer");
+    writer
+        .seek(SeekFrom::Start(0))
+        .expect("rewind dirty writer");
+    writer.write_all(&dirty).expect("stage Direct dirty bytes");
+    let mut reader = File::open(&path).expect("open read-only Direct descriptor");
+    let mut staged = Vec::new();
+    reader
+        .read_to_end(&mut staged)
+        .expect("read shared staged Direct bytes");
+    assert_eq!(staged, dirty);
+    drop(reader);
+
+    assert_eq!(
+        fixture.raw_get("flush.txt").as_deref(),
+        Some(original.as_slice()),
+        "closing a read-only descriptor published another writer's dirty bytes"
+    );
+    writer
+        .sync_all()
+        .expect("publish dirty bytes through writable descriptor");
+    drop(writer);
+    assert_eq!(
+        fixture.raw_get("flush.txt").as_deref(),
+        Some(dirty.as_slice())
+    );
+    mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_append_flags_and_shared_fd_visibility() {
+    let fixture = Fixture::new();
+    fixture.write_raw("append.txt", b"0123456789");
+    let staging = fixture.path("direct-write-append-state");
+    let config = fixture.writable_config("direct-write-append", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-append");
+    fs::create_dir(&mountpoint).expect("create writable Direct append mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("append.txt");
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(&path)
+        .expect("open Direct file with O_APPEND");
+    let flags = fcntl(&file, FcntlArg::F_GETFL).expect("read Direct open flags");
+    let flags = OFlag::from_bits_truncate(flags);
+    assert!(flags.contains(OFlag::O_APPEND));
+    fcntl(&file, FcntlArg::F_SETFL(flags.difference(OFlag::O_APPEND)))
+        .expect("clear Direct O_APPEND");
+    file.seek(SeekFrom::Start(0))
+        .expect("seek after clearing Direct O_APPEND");
+    file.write_all(b"AB").expect("write Direct file offset");
+    file.sync_all()
+        .expect("publish Direct overwrite without O_APPEND");
+    assert_eq!(
+        fixture.raw_get("append.txt").as_deref(),
+        Some(b"AB23456789".as_slice())
+    );
+
+    let mut reader = File::open(&path).expect("open shared Direct reader");
+    fcntl(&file, FcntlArg::F_SETFL(flags)).expect("restore Direct O_APPEND");
+    file.seek(SeekFrom::Start(0))
+        .expect("O_APPEND must ignore this seek");
+    file.write_all(b"CD").expect("append Direct bytes");
+    reader
+        .seek(SeekFrom::Start(0))
+        .expect("rewind shared Direct reader");
+    let mut shared = String::new();
+    reader
+        .read_to_string(&mut shared)
+        .expect("read shared dirty bytes");
+    assert_eq!(shared, "AB23456789CD");
+    drop(reader);
+    assert_eq!(
+        fixture.raw_get("append.txt").as_deref(),
+        Some(b"AB23456789".as_slice()),
+        "shared reader close published appended bytes before the writable fsync"
+    );
+    file.sync_all().expect("publish Direct appended bytes");
+    drop(file);
+    assert_eq!(
+        fixture.raw_get("append.txt").as_deref(),
+        Some(b"AB23456789CD".as_slice())
+    );
+    mounted.unmount();
 }
