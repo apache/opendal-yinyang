@@ -66,6 +66,9 @@ SECRET_NAMES = (
 PAGE_BYTES = 4096
 POLL_SECONDS = 0.05
 MAX_FIRST_ERRORS = 16
+FSYNC_RETRY_SECONDS = 30.0
+FSYNC_RETRY_INTERVAL = 0.5
+FSYNC_RETRY_MAX_INTERVAL = 5.0
 
 
 class EnvelopeError(RuntimeError):
@@ -409,6 +412,8 @@ class Workload:
         write_interval: float,
         read_interval: float,
         seed: int,
+        fsync_retry_seconds: float = FSYNC_RETRY_SECONDS,
+        fsync_retry_interval: float = FSYNC_RETRY_INTERVAL,
     ) -> None:
         self.mountpoint = mountpoint
         self.expected = expected
@@ -417,6 +422,8 @@ class Workload:
         self.write_interval = write_interval
         self.read_interval = read_interval
         self.seed = seed
+        self.fsync_retry_seconds = fsync_retry_seconds
+        self.fsync_retry_interval = fsync_retry_interval
         self.stop = threading.Event()
         self.threads: list[threading.Thread] = []
         self.lock = threading.Lock()
@@ -429,6 +436,8 @@ class Workload:
         self.fatal: list[str] = []
         self.first_errors: list[dict[str, Any]] = []
         self.started_at: float | None = None
+        self.fsync_retry_attempts = 0
+        self.fsync_retry_successes = 0
 
     def start(self) -> None:
         self.started_at = time.monotonic()
@@ -490,19 +499,11 @@ class Workload:
                         self.fatal.append(f"three consecutive writes failed: {error}")
                         self.stop.set()
                 else:
-                    try:
-                        os.fsync(descriptors[index])
-                    except OSError as error:
-                        self.record_first_error("fsync", index, error)
-                        with self.lock:
-                            self.fsync_errors += 1
-                            self.uncertain_files.add(index)
-                        failures += 1
-                        if failures >= 3:
-                            self.fatal.append(
-                                f"three consecutive fsync writes failed: {error}"
-                            )
-                            self.stop.set()
+                    if not self.fsync_with_retry(descriptors[index], index):
+                        self.fatal.append(
+                            f"fsync retry deadline expired for file-{index:04d}.bin"
+                        )
+                        self.stop.set()
                     else:
                         with self.lock:
                             self.write_latencies.append(
@@ -556,6 +557,42 @@ class Workload:
             elapsed = time.monotonic() - started
             self.stop.wait(max(0.0, self.read_interval - elapsed))
 
+    def fsync_with_retry(self, descriptor: int, index: int) -> bool:
+        try:
+            os.fsync(descriptor)
+            return True
+        except OSError as error:
+            self.record_first_error("fsync", index, error)
+            with self.lock:
+                self.fsync_errors += 1
+                self.uncertain_files.add(index)
+
+        deadline = time.monotonic() + self.fsync_retry_seconds
+        interval = self.fsync_retry_interval
+        while not self.stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.stop.wait(min(interval, remaining))
+            if self.stop.is_set():
+                break
+            with self.lock:
+                self.fsync_retry_attempts += 1
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                self.record_first_error("fsync-retry", index, error)
+                with self.lock:
+                    self.fsync_errors += 1
+                    self.uncertain_files.add(index)
+                interval = min(interval * 2, FSYNC_RETRY_MAX_INTERVAL)
+                continue
+            with self.lock:
+                self.fsync_retry_successes += 1
+                self.uncertain_files.discard(index)
+            return True
+        return False
+
     def record_first_error(
         self, operation: str, index: int | None, error: OSError
     ) -> None:
@@ -591,6 +628,10 @@ class Workload:
             "fsync_each_write": True,
             "pwrite_errors": self.pwrite_errors,
             "fsync_errors": self.fsync_errors,
+            "fsync_retry_attempts": self.fsync_retry_attempts,
+            "fsync_retry_successes": self.fsync_retry_successes,
+            "fsync_retry_seconds": self.fsync_retry_seconds,
+            "fsync_retry_interval": self.fsync_retry_interval,
             "uncertain_files": sorted(self.uncertain_files),
         }
         return {
@@ -943,6 +984,8 @@ class Harness:
             write_interval=self.args.write_interval,
             read_interval=self.args.read_interval,
             seed=self.args.seed,
+            fsync_retry_seconds=self.args.fsync_retry_seconds,
+            fsync_retry_interval=self.args.fsync_retry_interval,
         )
         phase_started = time.monotonic()
         phase_deadline = phase_started + duration
@@ -1216,6 +1259,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "readers": args.readers,
             "write_interval_seconds": args.write_interval,
             "read_interval_seconds": args.read_interval,
+            "fsync_retry_seconds": args.fsync_retry_seconds,
+            "fsync_retry_interval": args.fsync_retry_interval,
             "restart_at_fraction": 0.5,
         },
         "limits": [
@@ -1268,6 +1313,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--readers", type=int, default=2)
     parser.add_argument("--write-interval", type=float, default=2.0)
     parser.add_argument("--read-interval", type=float, default=0.5)
+    parser.add_argument("--fsync-retry-seconds", type=float, default=30.0)
+    parser.add_argument("--fsync-retry-interval", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=20261028)
     parser.add_argument(
         "--request-accounting",
@@ -1289,6 +1336,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--readers cannot be negative")
     if args.write_interval <= 0 or args.read_interval <= 0:
         parser.error("write and read intervals must be positive")
+    if args.fsync_retry_seconds <= 0 or args.fsync_retry_interval <= 0:
+        parser.error("fsync retry window and interval must be positive")
+    if args.fsync_retry_interval > FSYNC_RETRY_MAX_INTERVAL:
+        parser.error("--fsync-retry-interval exceeds the bounded maximum")
     if Path(args.output).exists():
         parser.error("--output already exists; preserve prior evidence and choose a new path")
     return args
