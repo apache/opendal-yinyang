@@ -382,7 +382,7 @@ fn linux_cost_benchmark() {
 
     if workload == Workload::RepeatedRandom {
         assert!(
-            cfg!(feature = "benchmark-telemetry"),
+            benchmark_telemetry_enabled(),
             "repeated-random measurement requires --features benchmark-telemetry"
         );
         let publications = &[Publication::Object];
@@ -471,6 +471,10 @@ fn linux_cost_benchmark() {
         }
     }
     recorder.finish();
+}
+
+fn benchmark_telemetry_enabled() -> bool {
+    cfg!(feature = "benchmark-telemetry")
 }
 
 fn require_benchmark_environment() {
