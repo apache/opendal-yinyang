@@ -116,6 +116,9 @@ intersecting authenticated content units. `getattr` with the handle, and path
 attributes while that observation is active, use its node metadata, executable
 bit, length and revision. `release` drops the reference and reclaims a
 zero-reference observation, so the next open pins the current remote revision.
+Repeated reads may reuse previously verified proof nodes and units from the
+content binding's bounded process-local cache; cache keys are bound to the exact
+immutable version and `PackedRef`, and a fresh version cannot consume them.
 Before replying to a read-only open, the frontend sends
 `inval_inode(ino, -1, 0)` so a cached pre-transition attribute cannot survive
 while READ uses the newly pinned version. The open reply becomes visible only
@@ -277,6 +280,14 @@ may finish inside that window. A `NotFound` notification result is expected
 (the kernel already dropped the entry or inode) and is counted separately, so
 only explicit connection-ended errors (`ENODEV`, `ENOTCONN`, `EPIPE`,
 `ECONNRESET`, `ESHUTDOWN`) stop the batch before it would otherwise finish.
+
+Namespace callbacks do not issue synchronous `inval_entry` notifications before
+replying. The kernel already updates the dentry involved in CREATE, UNLINK or
+RENAME; a reverse entry invalidation from inside that request can deadlock while
+the kernel holds the related parent lock. Callback-side refresh updates only the
+adapter snapshot and pending overlay. Metadata-only inode invalidation and
+dentry invalidation remain confined to the explicit SIGHUP path, outside a
+related mutation request.
 
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at

@@ -4,6 +4,11 @@ This records one matched read-only FUSE range workload for issue #78. It is not
 a production capacity claim or a comparison with the earlier writable FUSE
 fixtures.
 
+These results describe their recorded source identities. A later
+[real Amazon S3 repeat/random study](linux-verified-range-reuse.md) adds bounded
+process-local reuse for already verified immutable-version ranges; it does not
+change these historical measurements or the 64 KiB verification unit.
+
 ## Tested identities
 
 Both runs used the same schema v3 collector, 8 MiB and 32 MiB files, 4 KiB and

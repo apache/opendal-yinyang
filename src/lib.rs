@@ -19,6 +19,9 @@
 //!
 //! One-shot publication and restoration of local directories on a Managed filesystem.
 
+#[cfg(feature = "benchmark-telemetry")]
+#[doc(hidden)]
+pub mod benchmark;
 pub mod direct;
 #[cfg(target_os = "linux")]
 pub mod direct_sync;

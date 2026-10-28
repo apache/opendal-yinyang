@@ -97,9 +97,6 @@ produces storage observations, not Managed commit receipts.
 The shared `YINYANG_S3_BUCKET` is not versioned by the suite. The separate
 versioned bucket remains isolated from Managed suites.
 
-The shared `YINYANG_S3_BUCKET` is never versioned by the suite. The separate
-versioned bucket is a test resource and remains isolated from Managed suites.
-
 ## Amazon S3 backend qualification
 
 The default `cargo x test-linux-direct` command uses isolated Silo so it can

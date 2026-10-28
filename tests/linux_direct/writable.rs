@@ -392,8 +392,12 @@ fn direct_write_create_is_conditional_and_never_clobbers_external_appearance() {
 
     let local = payload(20 * 1024 + 17, 0x51);
     let external = payload(20 * 1024 + 3, 0x73);
-    let mut raced =
-        File::create(mounted.mountpoint().join("raced.txt")).expect("create raced Direct file");
+    let mut raced = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(mounted.mountpoint().join("raced.txt"))
+        .expect("create raced Direct file");
     raced
         .write_all(&local)
         .expect("write raced Direct local bytes");
@@ -729,6 +733,52 @@ fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart(
     drop(file);
     mounted.unmount();
 
+    let doctor = fixture.yy(&["--volume", path_text(&config), "doctor", "--json"]);
+    let doctor_value: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("writable Direct conflict doctor JSON");
+    assert_ne!(doctor_value["status"], "pass", "{doctor_value:#}");
+    let local_state = doctor_value["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "local-state")
+        .expect("doctor local-state check");
+    assert_ne!(local_state["status"], "pass", "{doctor_value:#}");
+    assert!(
+        local_state["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("conflict") || detail.contains("failed")),
+        "doctor did not report retained Direct conflict state: {doctor_value:#}"
+    );
+    let mut wrong_binding =
+        fixture.yy_command(&["--volume", path_text(&config), "doctor", "--json"]);
+    wrong_binding.env(
+        "YINYANG_S3_ROOT",
+        format!("{}-wrong-binding", fixture.root()),
+    );
+    let wrong_binding = run_timeout(wrong_binding, Duration::from_secs(120));
+    let wrong_value: serde_json::Value = serde_json::from_slice(&wrong_binding.stdout)
+        .expect("wrong-binding writable Direct doctor JSON");
+    assert_ne!(wrong_value["status"], "pass", "{wrong_value:#}");
+    assert!(
+        wrong_value["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .filter(|check| check["name"] == "local-state")
+            .any(|check| {
+                check["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("bound"))
+            }),
+        "doctor did not identify the Direct state binding mismatch: {wrong_value:#}"
+    );
+    assert_eq!(
+        fixture.raw_get("conflict.txt").as_deref(),
+        Some(external.as_slice()),
+        "read-only Direct doctor changed the external conflict object"
+    );
+
     let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
     assert_eq!(
         fs::read(remounted.mountpoint().join("conflict.txt"))
@@ -893,8 +943,9 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
 
     let suffix = format!("/{}/uncertain.txt", fixture.root());
     let gate = S3Gate::start_for_path(action, "PUT", suffix);
+    let endpoint = gate.endpoint();
     let mut command = fixture.mount_command(&config, &mountpoint);
-    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    command.env("YINYANG_S3_ENDPOINT", &endpoint);
     let mounted = Mounted::spawn_writable(command, &mountpoint);
     let path = mounted.mountpoint().join("uncertain.txt");
     let mut file = OpenOptions::new()
@@ -951,7 +1002,9 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     );
     drop(file);
 
-    let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let mut remount = fixture.mount_command(&config, &mountpoint);
+    remount.env("YINYANG_S3_ENDPOINT", &endpoint);
+    let remounted = Mounted::spawn_writable(remount, &mountpoint);
     assert_eq!(
         fs::read(remounted.mountpoint().join("uncertain.txt"))
             .expect("read retained uncertain Direct bytes"),
@@ -983,7 +1036,9 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     remounted.crash();
     drop(writer);
 
-    let final_mount = fixture.spawn_writable_mount(&config, &mountpoint);
+    let mut final_remount = fixture.mount_command(&config, &mountpoint);
+    final_remount.env("YINYANG_S3_ENDPOINT", &endpoint);
+    let final_mount = Mounted::spawn_writable(final_remount, &mountpoint);
     assert_eq!(
         fs::read(final_mount.mountpoint().join("uncertain.txt"))
             .expect("read newer local Direct bytes after restart"),
