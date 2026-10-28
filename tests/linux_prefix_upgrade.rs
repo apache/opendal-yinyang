@@ -345,6 +345,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     fs::create_dir_all(service_database.parent().expect("metadata parent"))
         .expect("create metadata directory");
     let service = ServiceProcess::start(&current_yy, &storage, &service_root, &service_database);
+    let service_address = service.address;
     let (service_wal_reader, service_journal_mode) = sqlite_wal_reader(&service_database);
     let service_config = temp.path().join("service.json");
     write_config(
@@ -570,9 +571,13 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         SYNC_V2
     );
 
-    let restarted_service =
-        ServiceProcess::start(&current_yy, &storage, &service_root, &service_database);
-    rewrite_service_address(&service_config, &restarted_service.address.to_string());
+    let restarted_service = ServiceProcess::start_at(
+        &current_yy,
+        &storage,
+        &service_root,
+        &service_database,
+        service_address,
+    );
     let service_read_handle = open_handle(
         &current_yy,
         &storage,
@@ -808,6 +813,16 @@ impl ServiceProcess {
             std::net::TcpListener::bind("127.0.0.1:0").expect("reserve service test port");
         let address = listener.local_addr().expect("reserve service address");
         drop(listener);
+        Self::start_at(yy, storage, root, database, address)
+    }
+
+    fn start_at(
+        yy: &Path,
+        storage: &Storage,
+        root: &str,
+        database: &Path,
+        address: std::net::SocketAddr,
+    ) -> Self {
         let mut command = current_yy_command(yy, storage, root);
         command
             .args([
@@ -1024,18 +1039,6 @@ fn write_config(
         serde_json::to_vec_pretty(&document).expect("serialize volume"),
     )
     .expect("write installed-upgrade volume");
-}
-
-fn rewrite_service_address(config: &Path, address: &str) {
-    let mut document: Value =
-        serde_json::from_slice(&fs::read(config).expect("read service volume"))
-            .expect("parse service volume");
-    document["service_address"] = Value::String(address.to_owned());
-    fs::write(
-        config,
-        serde_json::to_vec_pretty(&document).expect("serialize service volume"),
-    )
-    .expect("rewrite service volume address");
 }
 
 fn open_handle(
