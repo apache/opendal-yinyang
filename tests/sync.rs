@@ -988,7 +988,8 @@ async fn unsupported_and_partial_sync_schemas_are_not_repaired() {
     assert_eq!(
         Sync::open(authority.clone(), &state)
             .await
-            .unwrap_err()
+            .err()
+            .unwrap()
             .kind(),
         ErrorKind::Unsupported
     );
@@ -1016,7 +1017,8 @@ async fn unsupported_and_partial_sync_schemas_are_not_repaired() {
     assert_eq!(
         Sync::open(authority.clone(), &state)
             .await
-            .unwrap_err()
+            .err()
+            .unwrap()
             .kind(),
         ErrorKind::Corrupt
     );
