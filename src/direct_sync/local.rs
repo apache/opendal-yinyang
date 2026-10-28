@@ -381,7 +381,7 @@ impl LocalTree {
         for mut install in store.installs()? {
             match install.state {
                 InstallState::Prepared => {
-                    if install.operation != InstallOperation::DeleteFile
+                    if install.operation != InstallOperation::Delete
                         && install.desired_local.is_none()
                     {
                         if optional_stat(
@@ -414,7 +414,7 @@ impl LocalTree {
                         store.remove_install(&install.id)?;
                         continue;
                     }
-                    if install.operation != InstallOperation::DeleteFile {
+                    if install.operation != InstallOperation::Delete {
                         let desired = install.desired_local.ok_or_else(|| {
                             Error::corrupt("prepared file install has no desired content")
                         })?;
@@ -439,15 +439,15 @@ impl LocalTree {
                             continue;
                         }
                     }
-                    if let Err(error) = self.apply_install(store, &mut install) {
-                        if error.kind() != ErrorKind::Conflict {
-                            return Err(error);
-                        }
+                    if let Err(error) = self.apply_install(store, &mut install)
+                        && error.kind() != ErrorKind::Conflict
+                    {
+                        return Err(error);
                     }
                 }
                 InstallState::Dispatched => {
                     if let Some(fingerprint) = self.infer_dispatched(&install)? {
-                        if install.operation == InstallOperation::DeleteFile
+                        if install.operation == InstallOperation::Delete
                             && let Some(stat) = optional_stat(
                                 &self.install_fd,
                                 &install.temporary,
@@ -527,10 +527,10 @@ impl LocalTree {
 
     pub fn apply_install(&self, store: &mut Store, install: &mut InstallRecord) -> Result<()> {
         match install.operation {
-            InstallOperation::CreateFile | InstallOperation::ReplaceFile => {
+            InstallOperation::Create | InstallOperation::Replace => {
                 self.install_file(store, install)
             }
-            InstallOperation::DeleteFile => self.delete_file(store, install),
+            InstallOperation::Delete => self.delete_file(store, install),
         }
     }
 
@@ -579,8 +579,8 @@ impl LocalTree {
         )?;
         let current = optional_stat(&parent_fd, name, &self.root.join(&install.path))?;
         match (install.operation, install.expected_local, current) {
-            (InstallOperation::CreateFile, None, None) => {}
-            (InstallOperation::ReplaceFile, Some(expected), Some(stat)) => {
+            (InstallOperation::Create, None, None) => {}
+            (InstallOperation::Replace, Some(expected), Some(stat)) => {
                 if parent_identity.dev != expected.parent_dev
                     || parent_identity.ino != expected.parent_ino
                     || stat.st_dev != expected.dev
@@ -606,10 +606,10 @@ impl LocalTree {
                     );
                 }
             }
-            (InstallOperation::CreateFile, None, Some(_)) => {
+            (InstallOperation::Create, None, Some(_)) => {
                 return self.install_conflict(store, install, "local create target already exists");
             }
-            (InstallOperation::ReplaceFile, Some(_), None) => {
+            (InstallOperation::Replace, Some(_), None) => {
                 return self.install_conflict(
                     store,
                     install,
@@ -623,7 +623,7 @@ impl LocalTree {
             }
         }
 
-        if install.operation == InstallOperation::ReplaceFile && install.artifact.is_none() {
+        if install.operation == InstallOperation::Replace && install.artifact.is_none() {
             let expected = install
                 .expected_local
                 .ok_or_else(|| Error::corrupt("replacement has no expected local file"))?;
@@ -643,7 +643,7 @@ impl LocalTree {
 
         install.state = InstallState::Dispatched;
         store.update_install(install)?;
-        let exchange = install.operation == InstallOperation::ReplaceFile;
+        let exchange = install.operation == InstallOperation::Replace;
         let flags = if exchange {
             RenameFlags::EXCHANGE
         } else {
@@ -880,7 +880,7 @@ impl LocalTree {
     }
 
     fn settle_displaced_artifact(&self, store: &mut Store, install: &InstallRecord) -> Result<()> {
-        if install.operation != InstallOperation::ReplaceFile {
+        if install.operation != InstallOperation::Replace {
             return Ok(());
         }
         let Some(id) = install.artifact.as_deref() else {
@@ -931,7 +931,7 @@ impl LocalTree {
 
     fn infer_dispatched(&self, install: &InstallRecord) -> Result<Option<LocalFingerprint>> {
         match install.operation {
-            InstallOperation::CreateFile => {
+            InstallOperation::Create => {
                 let current = self.optional_local_fingerprint(&install.path)?;
                 let temp = self.install_temporary_exists(&install.temporary);
                 match (current, temp) {
@@ -943,7 +943,7 @@ impl LocalTree {
                     _ => Ok(None),
                 }
             }
-            InstallOperation::ReplaceFile => {
+            InstallOperation::Replace => {
                 let current = self.optional_local_fingerprint(&install.path)?;
                 let temp = self.optional_install_fingerprint(&install.temporary)?;
                 match (current, temp, install.expected_local) {
@@ -959,19 +959,18 @@ impl LocalTree {
                     _ => Ok(None),
                 }
             }
-            InstallOperation::DeleteFile => {
+            InstallOperation::Delete => {
                 if self.optional_local_fingerprint(&install.path)?.is_some() {
                     return Ok(None);
                 }
-                if let Some(quarantined) = self.optional_install_fingerprint(&install.temporary)? {
-                    if let Some(expected) = install.expected_local
-                        && (quarantined.dev != expected.dev
-                            || quarantined.ino != expected.ino
-                            || quarantined.length != expected.length
-                            || quarantined.digest != expected.digest)
-                    {
-                        return Ok(None);
-                    }
+                if let Some(quarantined) = self.optional_install_fingerprint(&install.temporary)?
+                    && let Some(expected) = install.expected_local
+                    && (quarantined.dev != expected.dev
+                        || quarantined.ino != expected.ino
+                        || quarantined.length != expected.length
+                        || quarantined.digest != expected.digest)
+                {
+                    return Ok(None);
                 }
                 Ok(Some(LocalFingerprint {
                     length: 0,
@@ -987,7 +986,7 @@ impl LocalTree {
 
     fn local_matches_expected(&self, install: &InstallRecord) -> Result<bool> {
         match (install.operation, install.expected_local) {
-            (InstallOperation::DeleteFile, _) | (InstallOperation::CreateFile, None) => Ok(true),
+            (InstallOperation::Delete, _) | (InstallOperation::Create, None) => Ok(true),
             (_, Some(expected)) => {
                 Ok(self.optional_local_fingerprint(&install.path)? == Some(expected))
             }
@@ -1204,11 +1203,11 @@ fn build_baseline(
     local: LocalFingerprint,
 ) -> Result<Option<super::state::BaselineEntry>> {
     let remote = match install.operation {
-        InstallOperation::CreateFile | InstallOperation::ReplaceFile => install
+        InstallOperation::Create | InstallOperation::Replace => install
             .desired_remote
             .clone()
             .ok_or_else(|| Error::corrupt("file install has no remote pin"))?,
-        InstallOperation::DeleteFile => return Ok(None),
+        InstallOperation::Delete => return Ok(None),
     };
     Ok(Some(super::state::BaselineEntry {
         path: install.path.clone(),
