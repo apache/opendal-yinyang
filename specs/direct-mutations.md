@@ -72,7 +72,9 @@ does not replace that accepted pin. Unknown is never converted to success
 because current bytes equal the intended bytes. Unknown is resolved only by
 evidence such as the unchanged original precondition, an exact accepted
 version/ETag observation, or an explicit observed-desired decision; equality
-alone is not commit proof.
+alone is not commit proof. Safe automatic re-dispatch after Unknown relies on
+the selected backend preserving linearizable conditional mutation semantics;
+the backend qualification must establish that property.
 
 ## Storage binding
 
@@ -175,6 +177,14 @@ All handles for one raw key share local bytes. A writable open first materialize
 the pinned whole object. A read-only handle is either a pinned remote descriptor
 or a view of the same local generation when one exists.
 
+Every process-local `ObjectEntry` receives a random `DirectObjectId` once. All
+handles sharing that entry return the same `object_id()` even when the entry is
+rebound to a newer DirectId; independently retained old/new pin entries return
+different ObjectIds. The value is coordination metadata, not durable state.
+`DirectFileHandle::id()` may therefore change on a clean-pin rebind; callers
+that cache process-local views by shared entry must use `object_id()`, not the
+snapshot DirectId.
+
 Every successful local write, append or truncate:
 
 1. changes the local data file;
@@ -196,6 +206,13 @@ The writable open/create creates an empty local generation. No remote object
 exists before its first flush. `discard_local` removes only a never-dispatched
 local-only name; an unresolved or possibly dispatched create is rejected before
 effects.
+
+`resolve_object(id, KeepLocal)` explicitly rebases retained local bytes onto
+the currently observed ETag or absence and stages a new conditional generation.
+`resolve_object(id, KeepRemote)` returns Unsupported without an exact
+observation, and otherwise drops only the local overlay without a storage
+request. Both decisions are limited to `Conflict`, `Unknown` or `Failed`
+generations; neither claims that an earlier ambiguous request committed.
 
 `pending_objects` reports local-only, staged, conflicted and Unknown objects
 with stable ObjectId, raw key, mapped path, parent, name, length, remote-existed
