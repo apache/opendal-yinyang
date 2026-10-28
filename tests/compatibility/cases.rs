@@ -768,6 +768,12 @@ fn assert_profile_rejection(temp: &Path, args: &[&str], local: Option<&Path>) {
 fn tree_hashes(root: &Path) -> Vec<(String, String)> {
     tree_files(root)
         .into_iter()
+        // Read-only SQLite WAL inspection may materialize an empty WAL and a
+        // shared-memory file. Neither carries durable state; a non-empty WAL
+        // and every database remain in the snapshot below.
+        .filter(|(path, bytes)| {
+            !path.ends_with("-shm") && !(path.ends_with("-wal") && bytes.is_empty())
+        })
         .map(|(path, bytes)| (path, sha256(&bytes)))
         .collect()
 }
