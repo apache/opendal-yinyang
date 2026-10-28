@@ -943,8 +943,9 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
 
     let suffix = format!("/{}/uncertain.txt", fixture.root());
     let gate = S3Gate::start_for_path(action, "PUT", suffix);
+    let endpoint = gate.endpoint();
     let mut command = fixture.mount_command(&config, &mountpoint);
-    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    command.env("YINYANG_S3_ENDPOINT", &endpoint);
     let mounted = Mounted::spawn_writable(command, &mountpoint);
     let path = mounted.mountpoint().join("uncertain.txt");
     let mut file = OpenOptions::new()
