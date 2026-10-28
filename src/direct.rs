@@ -153,6 +153,26 @@ pub struct DirectNode {
 }
 
 impl DirectNode {
+    #[cfg(test)]
+    pub(crate) fn for_test_file(
+        id: DirectId,
+        path: &str,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            id,
+            parent: None,
+            name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            path: path.to_owned(),
+            key: Some(path.to_owned()),
+            kind: DirectKind::File,
+            size,
+            pin: None,
+            modified,
+        }
+    }
+
     pub fn id(&self) -> DirectId {
         self.id
     }
@@ -236,7 +256,9 @@ impl DirectNamespace {
                     size: metadata.content_length(),
                     etag: pin_value(metadata.etag()).map(str::to_owned),
                     version: pin_value(metadata.version()).map(str::to_owned),
-                    modified: metadata.last_modified().map(SystemTime::from),
+                    modified: metadata
+                        .last_modified()
+                        .map(|time| normalize_time(SystemTime::from(time))),
                     directory: metadata.mode() == EntryMode::DIR || entry.path().ends_with('/'),
                 }
             })
@@ -402,7 +424,7 @@ impl DirectSnapshot {
                 kind,
                 size: if record.directory { 0 } else { record.size },
                 pin,
-                modified: record.modified,
+                modified: record.modified.map(normalize_time),
             });
             nodes.insert(id, node);
             children
@@ -533,7 +555,9 @@ impl DirectSnapshot {
             version: pin_value(metadata.version()).map(str::to_owned),
             etag: pin_value(metadata.etag()).map(str::to_owned),
             size: metadata.content_length(),
-            modified: metadata.last_modified().map(SystemTime::from),
+            modified: metadata
+                .last_modified()
+                .map(|time| normalize_time(SystemTime::from(time))),
         };
         if observed.version.is_none() && observed.etag.is_none() {
             return Err(Error::new(
@@ -559,7 +583,9 @@ impl DirectSnapshot {
             length: metadata.content_length(),
             version: observed.version,
             etag: observed.etag,
-            modified: metadata.last_modified().map(SystemTime::from),
+            modified: metadata
+                .last_modified()
+                .map(|time| normalize_time(SystemTime::from(time))),
         })
     }
 }
@@ -577,28 +603,6 @@ pub struct DirectFile {
 }
 
 impl DirectFile {
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn for_test(
-        operator: Operator,
-        id: DirectId,
-        key: String,
-        length: u64,
-        version: Option<String>,
-        etag: Option<String>,
-        modified: Option<SystemTime>,
-    ) -> Self {
-        Self {
-            operator,
-            id,
-            key,
-            length,
-            version,
-            etag,
-            modified,
-        }
-    }
-
     pub fn id(&self) -> DirectId {
         self.id
     }
@@ -683,7 +687,7 @@ impl ObjectPin {
             version: pin_value(record.version.as_deref()).map(str::to_owned),
             etag: pin_value(record.etag.as_deref()).map(str::to_owned),
             size: record.size,
-            modified: record.modified,
+            modified: record.modified.map(normalize_time),
         };
         (pin.version.is_some() || pin.etag.is_some()).then_some(pin)
     }
@@ -699,7 +703,7 @@ impl ObjectPin {
                 etag_matches
                     && self.size == observed.size
                     && match (self.modified, observed.modified) {
-                        (Some(expected), Some(observed)) => expected == observed,
+                        (Some(expected), Some(observed)) => same_second(expected, observed),
                         _ => true,
                     }
             }
@@ -728,22 +732,23 @@ fn hash_record(hasher: &mut blake3::Hasher, record: &ObjectRecord) {
 }
 
 fn hash_time(hasher: &mut blake3::Hasher, value: Option<SystemTime>) {
-    match value.map(|time| time.duration_since(SystemTime::UNIX_EPOCH)) {
-        Some(Ok(duration)) => {
-            hasher.update(&[1]);
-            hasher.update(&duration.as_secs().to_be_bytes());
-            hasher.update(&duration.subsec_nanos().to_be_bytes());
-        }
-        Some(Err(error)) => {
-            let duration = error.duration();
-            hasher.update(&[2]);
-            hasher.update(&duration.as_secs().to_be_bytes());
-            hasher.update(&duration.subsec_nanos().to_be_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
+    let seconds = value.map_or(0, time_seconds);
+    hasher.update(&[u8::from(value.is_some())]);
+    hasher.update(&seconds.to_be_bytes());
+}
+
+fn normalize_time(time: SystemTime) -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(time_seconds(time))
+}
+
+fn time_seconds(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn same_second(left: SystemTime, right: SystemTime) -> bool {
+    time_seconds(left) == time_seconds(right)
 }
 
 fn pin_value(value: Option<&str>) -> Option<&str> {
@@ -1103,17 +1108,18 @@ mod tests {
 
     #[test]
     fn list_etag_pin_accepts_head_version_and_strengthens_reads() {
-        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let list_modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(123_900);
+        let head_modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
         let mut record = record("file", false);
         record.version = None;
         record.size = 9;
-        record.modified = Some(modified);
+        record.modified = Some(list_modified);
         let list_pin = ObjectPin::from_record(&record).unwrap();
         let head_pin = ObjectPin {
             version: Some("real-version-id".to_owned()),
             etag: list_pin.etag.clone(),
             size: list_pin.size,
-            modified: list_pin.modified,
+            modified: Some(head_modified),
         };
         assert!(
             list_pin.matches(&head_pin),

@@ -339,7 +339,7 @@ impl DirectInner {
         if let Err(errno) = self.invalidate_before_open(ino).await {
             return reply.error(errno);
         }
-        let attr = file_attribute(ino, &file);
+        let attr = open_attr(ino, node);
         let fh = self.next_handle();
         guard(&self.files).insert(fh, Arc::new(OpenFile { _file: file, attr }));
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
@@ -478,8 +478,9 @@ fn attribute(ino: INodeNo, node: &DirectNode, modified: Option<std::time::System
     attribute_with_size(ino, node.is_directory(), node.size(), modified)
 }
 
-fn file_attribute(ino: INodeNo, file: &DirectFile) -> FileAttr {
-    attribute_with_size(ino, false, file.length(), file.modified())
+fn open_attr(ino: INodeNo, node: &DirectNode) -> FileAttr {
+    debug_assert!(node.is_file());
+    attribute(ino, node, node.modified())
 }
 
 fn attribute_with_size(
@@ -978,17 +979,13 @@ mod tests {
 
     #[test]
     fn open_file_attributes_are_files_with_object_length() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
-        let file = DirectFile::for_test(
-            operator,
+        let node = DirectNode::for_test_file(
             DirectId::from_bytes([7; 16]),
-            "object".to_owned(),
+            "object",
             19,
-            Some("\"version-id\"".to_owned()),
-            Some("\"etag\"".to_owned()),
             Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123)),
         );
-        let attr = file_attribute(INodeNo(88), &file);
+        let attr = open_attr(INodeNo(88), &node);
         assert_eq!(attr.kind, FileType::RegularFile);
         assert_eq!(attr.size, 19);
         assert_eq!(attr.perm, 0o444);
