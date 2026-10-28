@@ -120,12 +120,13 @@ The authoritative local details are in
 transfer](directory-transfer.md), [Linux Sync](linux-sync.md), and
 [directory reconciliation](directory-sync.md). A writer preflights every
 existing component before changing any of them. Unknown profiles and partial
-known schemas fail before DDL, runtime cleanup, replica recovery, or restore
-destination creation. A standard SQLite read-only WAL open can create or update
-the derived `-wal` and `-shm` coordination files. This is not authority-state
-mutation: the main database, existing WAL/journal bytes, configured journal
-mode, logical rows, and recovery state must remain unchanged. `immutable=1`
-cannot replace this path because it skips WAL and concurrent change detection.
+known schemas fail before PRAGMA journal-mode configuration, DDL, runtime
+cleanup, replica recovery, or restore destination creation. A standard SQLite
+read-only WAL open can create an empty `-wal` and can create or update the
+derived `-shm`. This is not authority-state mutation: the main database, any
+existing WAL/journal bytes, configured journal mode, logical rows, and recovery
+state must remain unchanged. `immutable=1` cannot replace this path because it
+skips WAL and concurrent change detection.
 
 The local regression fixtures downgrade current databases to known older shapes
 with explicit SQL. They prove the current reader/writer transitions and

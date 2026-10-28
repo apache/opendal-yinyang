@@ -109,12 +109,12 @@ before changing either component. A valid sync-1 journal is then upgraded in one
 SQLite transaction by creating `namespaces` and advancing the profile to
 sync-2; content mappings, staged bytes, frozen requests, and receipts are not
 rewritten. A sync-2 journal is validated without DDL. Unknown profiles or
-missing/extra/reordered maintained columns fail before DDL, staging migration,
-or incomplete-content cleanup. A read-only WAL open may create or update
-SQLite's derived `-wal`/`-shm` coordination files; the main database, existing
-WAL/journal bytes, configured journal mode, logical rows, and recovery state
-remain unchanged. A missing filesystem binding or mismatched filesystem remains
-an error.
+missing/extra/reordered maintained columns fail before PRAGMA journal-mode
+configuration, DDL, staging migration, or incomplete-content cleanup. A
+read-only WAL open may create an empty `-wal` and may create or update derived
+`-shm`; the main database, any existing WAL/journal bytes, configured journal
+mode, logical rows, and recovery state remain unchanged. A missing filesystem
+binding or mismatched filesystem remains an error.
 
 Opening through `DirectorySync` preflights existing replica, Sync, and content
 staging state as a group before replica upgrade or recovery starts. Inspect and
@@ -150,11 +150,11 @@ staging database read-only, returns each content EditId with its
 `HandleStatus`, and returns every namespace intent. This supports progress and
 failure inspection while another process or task holds the publication lease.
 It performs no recovery, logical mutation, or remote request. SQLite may create
-or update derived `-wal`/`-shm` coordination files for read-only WAL access.
-Inspection reads the journal mappings before the staging database, relying on
-the existing invariant that a mapping is committed only after its staging
-record is durable; this ordering avoids a false missing-handle result during
-concurrent staging.
+an empty `-wal` and may create or update derived `-shm`; existing WAL/journal
+bytes remain protected. Inspection reads the journal mappings before the
+staging database, relying on the existing invariant that a mapping is committed
+only after its staging record is durable; this ordering avoids a false
+missing-handle result during concurrent staging.
 
 Before dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a durable
 SQLite transaction. A crash or lost response therefore cannot turn a possibly
