@@ -194,10 +194,14 @@ The package version and release directory identity are separate.
 - authenticated loopback service start, stop and restart against retained
   SQLite authority;
 - removal of the installed binary prefix while state and configuration remain;
-- stopped installed-prefix transition from the exact `fd1338c` producer to the
-  selected target binary while pending, frozen and Unknown work is retained;
 - when run with isolated MinIO and a systemd user manager, actual start,
   restart and stop of the three user units through `systemctl --user`.
+
+`tests/linux_prefix_upgrade.rs` separately exercises a stopped installed-prefix
+transition from the exact `fd1338c` producer to the selected target binary,
+including retained pending, frozen and Unknown work, receipts and a non-empty
+service WAL. It uses the same versioned `current` prefix as the user units while
+keeping process lifetime independent of a particular systemd user session.
 
 The real Amazon S3 smoke inherits `YINYANG_S3_SESSION_TOKEN` when temporary
 credentials are used. It must not inherit a MinIO endpoint and does not use a
