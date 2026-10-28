@@ -242,13 +242,13 @@ impl VolumeConfig {
                 }
             }
             Model::Direct => {
-                let pinned = cap.read_with_version || cap.read_with_if_match;
                 let storage = operator.info().scheme() == "s3"
                     && cap.stat
                     && cap.read
                     && cap.list
                     && cap.list_with_recursive
-                    && pinned;
+                    && cap.read_with_version
+                    && cap.read_with_if_match;
                 if storage {
                     direct()
                 } else {

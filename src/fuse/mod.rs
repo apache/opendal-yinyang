@@ -24,13 +24,14 @@
 //! other combination before an authority connection or staging lease is
 //! created.
 //!
-//! Startup takes the staging lease through [`crate::mount::Mount`]. A read-only
-//! mount refuses to serve a staging database that still holds unpublished,
-//! frozen, conflicted or failed handles: a read-only snapshot view must never
-//! surface those locally staged bytes as if they were remote. A writable mount
-//! serves recovered pending/error state through the shared Mount, where flush
-//! or fsync reports the real outcome. Clean observations are disposable and are
-//! reclaimed by the existing Mount recovery.
+//! Managed startup takes the staging lease through [`crate::mount::Mount`]. A
+//! read-only Managed mount refuses to serve a staging database that still holds
+//! unpublished, frozen, conflicted or failed handles: a read-only snapshot view
+//! must never surface those locally staged bytes as if they were remote. A
+//! writable mount serves recovered pending/error state through the shared Mount,
+//! where flush or fsync reports the real outcome. Clean observations are
+//! disposable and are reclaimed by the existing Mount recovery. Direct creates
+//! no staging state and observes the storage namespace directly.
 //!
 //! The session mounts as `fuse.yinyang` and runs in the foreground. SIGINT and
 //! SIGTERM detach the mount and wait briefly for the session. Lazy unmounting
@@ -70,7 +71,7 @@ pub enum Outcome {
 
 /// Mount a validated read-only or writable FUSE volume in the foreground.
 ///
-/// `staging` must already be resolved to an absolute path by the CLI.
+/// Managed `staging` must already be resolved to an absolute path by the CLI.
 pub async fn run(
     config: VolumeConfig,
     operator: opendal::Operator,

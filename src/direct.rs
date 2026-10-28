@@ -295,8 +295,11 @@ pub fn validate_operator(operator: &Operator) -> Result<()> {
     if !capability.list_with_recursive {
         missing.push("recursive-list");
     }
-    if !capability.read_with_version && !capability.read_with_if_match {
-        missing.push("version-or-if-match-read");
+    if !capability.read_with_version {
+        missing.push("version-read");
+    }
+    if !capability.read_with_if_match {
+        missing.push("if-match-read");
     }
     if missing.is_empty() {
         Ok(())
@@ -381,6 +384,9 @@ impl DirectSnapshot {
             };
             if let Some(existing) = paths.get(&path).copied() {
                 let node = nodes.get(&existing).expect("a path always has a node");
+                if record.directory && node.is_directory() {
+                    continue;
+                }
                 return Err(Error::new(
                     ErrorKind::Invalid,
                     format!(
@@ -1051,6 +1057,23 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Invalid);
         assert!(error.to_string().contains("file-prefix collision"));
         assert!(error.to_string().contains("\"file\""));
+    }
+
+    #[test]
+    fn zero_length_marker_can_confirm_a_synthesized_directory() {
+        let snapshot = DirectSnapshot::build(
+            namespace(),
+            vec![record("dir/child", false), record("dir/", true)],
+        )
+        .unwrap();
+        assert!(snapshot.resolve("dir").unwrap().is_directory());
+        assert_eq!(
+            snapshot
+                .read_dir(snapshot.resolve("dir").unwrap().id())
+                .unwrap()[0]
+                .name(),
+            "child"
+        );
     }
 
     #[test]

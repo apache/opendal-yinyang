@@ -34,8 +34,9 @@ Direct admission accepts only:
 - `publication=object` with no service address;
 - `frontend=library`, or `frontend=fuse` on Linux;
 - the `amazon-s3` and `minio` profiles;
-- an S3 operator that reports `stat`, `read`, recursive `list`, and either
-  version reads or conditional ETag reads.
+- an S3 operator that reports `stat`, `read`, recursive `list`, version reads,
+  and conditional ETag reads. Both read pin modes are required because bucket
+  versioning state does not prove that every object has an immutable version.
 
 The mount entry point also requires `frontend=fuse`. Unsupported access,
 publication, frontend, write policy or required capabilities fail before the

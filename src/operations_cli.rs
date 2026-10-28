@@ -605,7 +605,7 @@ async fn check_direct_namespace(
                 Health::ActionRequired,
                 error.to_string(),
                 Some(
-                    "select an S3 storage profile with stat, read, recursive list and version or ETag reads",
+                    "select an S3 storage profile with stat, read, recursive list, version reads and conditional ETag reads",
                 ),
             );
             return;

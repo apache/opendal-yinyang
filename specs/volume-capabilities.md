@@ -102,7 +102,7 @@ contract. It does not require raw S3 to implement filesystem rename. Read,
 immutable streaming writes, and conditional creation are required for content;
 object publication additionally requires conditional replacement. Service
 publication relies on the service transaction authority for metadata atomicity.
-Direct instead requires stat, read, recursive list, and either version reads or
+Direct instead requires stat, read, recursive list, version reads, and
 conditional ETag reads. It never negotiates write or Managed transaction
 primitives.
 
