@@ -476,8 +476,13 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
     let result = unlink.join().expect("conditional unlink thread panicked");
     let response = gate.last_commit_response().unwrap_or_default();
     let retained = fixture.raw_object("unlink.txt");
+    let if_matches = gate
+        .matched_requests()
+        .into_iter()
+        .filter_map(|request| request.header("if-match").map(str::to_owned))
+        .collect::<Vec<_>>();
     eprintln!(
-        "conditional Direct unlink: if-match={if_match} upstream={} result={result:?} retained_etag={:?}",
+        "conditional Direct unlink: if-match={if_match} attempts={if_matches:?} upstream={} result={result:?} retained_etag={:?}",
         String::from_utf8_lossy(&response),
         retained.as_ref().and_then(|object| object.etag.as_deref()),
     );
