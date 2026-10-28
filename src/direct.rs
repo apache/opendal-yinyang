@@ -111,7 +111,7 @@ impl DirectId {
         &self.0
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -153,7 +153,7 @@ pub struct DirectNode {
 }
 
 impl DirectNode {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn for_test_file(
         id: DirectId,
         path: &str,

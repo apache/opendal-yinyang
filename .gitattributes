@@ -1,0 +1,3 @@
+# Cross-version fixtures are byte-for-byte evidence. Keep their original bytes
+# on every checkout platform because manifest.json records SHA-256 per file.
+tests/fixtures/compatibility/** -text
