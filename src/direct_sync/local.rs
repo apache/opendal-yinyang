@@ -29,9 +29,6 @@ use rustix::fs::{
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct LocalTree {
     root: PathBuf,
@@ -154,8 +151,7 @@ impl LocalTree {
     }
 
     pub fn create_install_file(&self, prefix: &str) -> Result<(String, PathBuf, std::fs::File)> {
-        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{prefix}-{}-{sequence}", std::process::id());
+        let name = format!("{prefix}-{}", uuid::Uuid::new_v4().simple());
         let fd = openat(
             &self.install_fd,
             name.as_str(),
@@ -382,7 +378,71 @@ impl LocalTree {
     pub fn recover_installs(&self, store: &mut Store) -> Result<()> {
         for mut install in store.installs()? {
             match install.state {
-                InstallState::Prepared => {}
+                InstallState::Prepared => {
+                    if install.operation != InstallOperation::DeleteFile
+                        && install.desired_local.is_none()
+                    {
+                        if optional_stat(
+                            &self.install_fd,
+                            &install.temporary,
+                            &self.install_path(&install.temporary),
+                        )?
+                        .is_some()
+                        {
+                            unlinkat(
+                                &self.install_fd,
+                                install.temporary.as_str(),
+                                AtFlags::empty(),
+                            )
+                            .map_err(|error| {
+                                Error::errno(
+                                    "remove incomplete Direct Sync download",
+                                    &self.install_path(&install.temporary),
+                                    error,
+                                )
+                            })?;
+                            fsync(&self.install_fd).map_err(|error| {
+                                Error::errno(
+                                    "persist Direct Sync download cleanup",
+                                    &self.state,
+                                    error,
+                                )
+                            })?;
+                        }
+                        store.remove_install(&install.id)?;
+                        continue;
+                    }
+                    if install.operation != InstallOperation::DeleteFile {
+                        let desired = install.desired_local.ok_or_else(|| {
+                            Error::corrupt("prepared file install has no desired content")
+                        })?;
+                        let current = match self.install_desired_file(&install.temporary) {
+                            Ok(current) => current,
+                            Err(error) => {
+                                install.state = InstallState::Failed;
+                                install.error = Some(format!(
+                                    "prepared Direct Sync download is unavailable: {error}"
+                                ));
+                                store.update_install(&install)?;
+                                continue;
+                            }
+                        };
+                        if current.length != desired.length || current.digest != desired.digest {
+                            install.state = InstallState::Failed;
+                            install.error = Some(
+                                "prepared Direct Sync download no longer matches its accepted bytes"
+                                    .to_owned(),
+                            );
+                            store.update_install(&install)?;
+                            continue;
+                        }
+                    }
+                    if let Err(error) = self.apply_install(store, &mut install) {
+                        if error.kind() != ErrorKind::Conflict {
+                            return Err(error);
+                        }
+                    }
+                }
                 InstallState::Dispatched => {
                     if let Some(fingerprint) = self.infer_dispatched(&install)? {
                         if install.operation == InstallOperation::DeleteFile

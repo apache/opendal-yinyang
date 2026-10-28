@@ -974,6 +974,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn remove_install(&mut self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM installs WHERE id=?1", params![id])
+            .map_err(|error| Error::corrupt(format!("remove Direct Sync install: {error}")))?;
+        Ok(())
+    }
+
     pub fn artifacts(&self) -> Result<Vec<ArtifactRecord>> {
         let mut statement = self
             .connection
