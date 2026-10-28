@@ -118,6 +118,19 @@ jobs:
       YINYANG_STORAGE_PROFILE: minio
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build fd1338c legacy binary
+        run: |
+          legacy="$RUNNER_TEMP/opendal-yinyang-fd1338c"
+          git worktree add --detach "$legacy" fd1338c2f924a90e9da752b9158e748d1d3acaf4
+          test "$(git -C "$legacy" rev-parse HEAD)" = "fd1338c2f924a90e9da752b9158e748d1d3acaf4"
+          cargo build --release --locked --bin yy \
+            --manifest-path "$legacy/Cargo.toml" \
+            --target-dir "$legacy/target"
+          sha256sum "$legacy/target/release/yy"
+          echo "YY_LEGACY_BIN=$legacy/target/release/yy" >> "$GITHUB_ENV"
 
       - name: Install recovery tools
         run: |
@@ -143,6 +156,9 @@ jobs:
             --ignored --nocapture \
             --skip isolated_s3_cli_smoke \
             --skip real_amazon_s3_cli_smoke
+
+      - name: Run fd1338c cross-version acceptance
+        run: cargo x test-compatibility
 
       - name: Run isolated recovery acceptance
         run: cargo x test-linux-recovery
@@ -202,6 +218,7 @@ jobs:
       YINYANG_S3_ACCESS_KEY_ID: yinyang-test
       YINYANG_S3_SECRET_ACCESS_KEY: yinyang-test-only
       YINYANG_STORAGE_PROFILE: minio
+      YINYANG_DIRECT_VERSIONED_BUCKET: yinyang-direct-versioned
     steps:
       - uses: actions/checkout@v7
 
@@ -223,9 +240,14 @@ jobs:
           curl --fail http://127.0.0.1:9000/minio/health/ready
           docker exec yinyang-linux-fuse-silo mcli alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
           docker exec yinyang-linux-fuse-silo mcli mb local/yinyang-test
+          docker exec yinyang-linux-fuse-silo mcli mb local/yinyang-direct-versioned
+          docker exec yinyang-linux-fuse-silo mcli version enable local/yinyang-direct-versioned
 
       - name: Run real Linux FUSE acceptance
         run: cargo x test-linux-fuse
+
+      - name: Run read-only Direct acceptance
+        run: cargo x test-linux-direct
 
       - name: Run installed CLI operations acceptance
         run: cargo x test-linux-operations
