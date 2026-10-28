@@ -19,7 +19,7 @@
 
 use super::state::{
     ArtifactKind, ArtifactPhase, ArtifactRecord, DesiredFile, InstallOperation, InstallRecord,
-    InstallState, LocalFingerprint, RemotePin, Store,
+    InstallState, LocalFingerprint, Store,
 };
 use crate::replica::{ContentHash, Error, Identity, LocalNode, LocalSnapshot, Result, scan_path};
 use rustix::fd::OwnedFd;
@@ -140,7 +140,8 @@ impl LocalTree {
     }
 
     pub fn install_desired_file(&self, temporary: &str) -> Result<DesiredFile> {
-        let (length, digest) = hash_at(&self.install_fd, temporary, &self.install_path(temporary))?;
+        let (length, digest, _) =
+            hash_at(&self.install_fd, temporary, &self.install_path(temporary))?;
         Ok(DesiredFile {
             length,
             digest: *digest.as_bytes(),
@@ -175,7 +176,8 @@ impl LocalTree {
         origin: &str,
         kind: ArtifactKind,
     ) -> Result<ArtifactRecord> {
-        let (length, digest) = hash_at(&self.install_fd, temporary, &self.install_path(temporary))?;
+        let (length, digest, _) =
+            hash_at(&self.install_fd, temporary, &self.install_path(temporary))?;
         let id = uuid::Uuid::new_v4().to_string();
         let name = format!("artifact-{id}");
         renameat_with(
@@ -233,7 +235,7 @@ impl LocalTree {
         loop {
             let count = source
                 .read(&mut buffer)
-                .map_err(|error| Error::io("read resolution input", source, error))?;
+                .map_err(|error| Error::io("read resolution input", &source, error))?;
             if count == 0 {
                 break;
             }
@@ -417,7 +419,7 @@ impl LocalTree {
                     if let Some(fingerprint) = self.infer_dispatched(&install)? {
                         let baseline = build_baseline(&install, fingerprint)?;
                         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
-                    } else if local_matches_expected(self, &install)? {
+                    } else if self.local_matches_expected(&install)? {
                         install.state = InstallState::Prepared;
                         store.update_install(&install)?;
                     } else {
@@ -431,7 +433,7 @@ impl LocalTree {
                 }
                 InstallState::Applied => {
                     let fingerprint = self.local_fingerprint(&install.path)?;
-                    if desired_matches(install.desired_local, fingerprint) {
+                    if desired_matches(install.desired_local, Some(fingerprint)) {
                         let baseline = build_baseline(&install, fingerprint)?;
                         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
                     } else {
@@ -481,7 +483,7 @@ impl LocalTree {
         let desired = install
             .desired_local
             .ok_or_else(|| Error::corrupt("file install has no desired content"))?;
-        let (temporary_length, temporary_digest) = hash_at(
+        let (temporary_length, temporary_digest, _) = hash_at(
             &self.install_fd,
             &install.temporary,
             &self.install_path(&install.temporary),

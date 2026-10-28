@@ -162,7 +162,7 @@ impl DirectRemote for MemoryRemote {
                 .map_err(|error| yinyang::replica::Error::io("read upload", source, error))?;
             {
                 let objects = self.objects.lock().unwrap();
-                if !condition_matches(objects.get(path), precondition) {
+                if !condition_matches(path, objects.get(path), precondition) {
                     return Ok(MutationOutcome::Conflict);
                 }
             }
@@ -193,7 +193,7 @@ impl DirectRemote for MemoryRemote {
     ) -> impl Future<Output = yinyang::replica::Result<MutationOutcome>> + Send + 'a {
         async move {
             let mut objects = self.objects.lock().unwrap();
-            if !condition_matches(objects.get(path), precondition) {
+            if !condition_matches(path, objects.get(path), precondition) {
                 return Ok(MutationOutcome::Conflict);
             }
             objects.remove(path);
@@ -202,12 +202,16 @@ impl DirectRemote for MemoryRemote {
     }
 }
 
-fn condition_matches(current: Option<&Vec<u8>>, precondition: &RemotePrecondition) -> bool {
+fn condition_matches(
+    path: &str,
+    current: Option<&Vec<u8>>,
+    precondition: &RemotePrecondition,
+) -> bool {
     match (current, precondition) {
         (None, RemotePrecondition::Absent) => true,
         (Some(_), RemotePrecondition::Absent) => false,
         (Some(bytes), RemotePrecondition::Etag(expected)) => {
-            pin("", bytes).etag.as_deref() == Some(expected.as_str())
+            pin(path, bytes).etag.as_deref() == Some(expected.as_str())
         }
         (None, RemotePrecondition::Etag(_)) => false,
     }

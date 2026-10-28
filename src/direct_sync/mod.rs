@@ -260,10 +260,17 @@ impl<R: DirectRemote> DirectSync<R> {
     /// Bind a new state directory. An unbound namespace admits at most one
     /// non-empty file side; two non-empty sides require explicit resolution.
     pub async fn init(remote: R, state: &Path, root: &Path) -> Result<Self> {
+        if state.join("direct-sync.db").exists() {
+            return Err(Error::invalid(format!(
+                "Direct Sync state is already initialized at {}",
+                state.display()
+            )));
+        }
         let local = LocalTree::create(root, state)?;
         let namespace = remote.namespace_id();
         let local_scan = local.scan()?;
         let remote_snapshot = remote.observe().await?;
+        reject_unsupported_directories(&local_scan, &remote_snapshot)?;
         let local_files = local_files(&local_scan);
         let remote_files = remote_files(&remote_snapshot);
         if !local_files.is_empty() && !remote_files.is_empty() {
@@ -337,6 +344,10 @@ impl<R: DirectRemote> DirectSync<R> {
     /// indefinitely.
     pub async fn run(&mut self) -> Result<RunOutcome> {
         self.local.recover_installs(&mut self.store)?;
+
+        let observed_remote = self.remote.observe().await?;
+        let observed_local = self.local.scan()?;
+        reject_unsupported_directories(&observed_local, &observed_remote)?;
 
         for work in self.store.work()? {
             if matches!(work.state, WorkState::Prepared | WorkState::Unknown) {
@@ -649,6 +660,35 @@ impl<R: DirectRemote> DirectSync<R> {
 
         let local_map = local_snapshot.as_ref().map(all_local_entries);
         let remote_map = remote_snapshot.as_ref().map(all_remote_entries);
+        let mut unsupported_paths = BTreeSet::new();
+        if let Some(local) = &local_snapshot {
+            let files = local_files(local);
+            unsupported_paths.extend(
+                local
+                    .nodes()
+                    .values()
+                    .filter(|node| {
+                        node.is_directory()
+                            && !node.path.is_empty()
+                            && !has_descendant_file(&files, &node.path)
+                    })
+                    .map(|node| node.path.clone()),
+            );
+        }
+        if let Some(remote) = &remote_snapshot {
+            let files = remote_files(remote);
+            unsupported_paths.extend(
+                remote
+                    .entries
+                    .values()
+                    .filter(|entry| {
+                        !entry.is_file()
+                            && !entry.path.is_empty()
+                            && !has_descendant_file(&files, &entry.path)
+                    })
+                    .map(|entry| entry.path.clone()),
+            );
+        }
         let mut paths = BTreeSet::new();
         paths.extend(baseline.keys().cloned());
         paths.extend(work.iter().map(|record| record.path.clone()));
@@ -668,6 +708,7 @@ impl<R: DirectRemote> DirectSync<R> {
                     .map(|entry| entry.path.clone()),
             );
         }
+        paths.extend(unsupported_paths.iter().cloned());
         paths.remove("");
 
         let conflict_by_path: BTreeMap<&str, &ConflictRecord> = conflicts
@@ -696,7 +737,10 @@ impl<R: DirectRemote> DirectSync<R> {
             let conflict = conflict_by_path.get(path.as_str()).copied();
             let work = work_by_path.get(path.as_str()).copied();
             let install = install_by_path.get(path.as_str()).copied();
-            let state = if conflict.is_some() {
+            let unsupported = unsupported_paths.contains(&path);
+            let state = if unsupported {
+                EntryState::Failed
+            } else if conflict.is_some() {
                 EntryState::Conflict
             } else if work.is_some_and(|record| record.state == WorkState::Unknown) {
                 EntryState::Unknown
@@ -738,9 +782,15 @@ impl<R: DirectRemote> DirectSync<R> {
                     operation: work.map(|record| record.operation),
                     state: work.map(|record| record.state),
                     install_state: install.map(|record| record.state),
-                    error: work
-                        .and_then(|record| record.error.clone())
-                        .or_else(|| install.and_then(|record| record.error.clone())),
+                    error: if unsupported {
+                        Some(
+                            "empty directories are not representable in the Direct file namespace"
+                                .to_owned(),
+                        )
+                    } else {
+                        work.and_then(|record| record.error.clone())
+                            .or_else(|| install.and_then(|record| record.error.clone()))
+                    },
                 },
                 conflict: conflict.map(|record| record.id.clone()),
             });
@@ -758,6 +808,7 @@ impl<R: DirectRemote> DirectSync<R> {
                 .iter()
                 .filter(|record| record.state == InstallState::Failed)
                 .count() as u64;
+        let failed = failed + unsupported_paths.len() as u64;
         let in_sync = remote_status.availability == RemoteAvailability::Available
             && local_status.scan == LocalScanState::Clean
             && pending == 0
@@ -908,7 +959,7 @@ impl<R: DirectRemote> DirectSync<R> {
 
     async fn inspect_current_outcome(&self, remote_snapshot: RemoteSnapshot) -> Result<RunOutcome> {
         let local = self.local.scan()?;
-        let inspection = self.inspect_with_store_read(
+        let inspection = Self::inspect_with_store_read(
             &self.store,
             state::Binding {
                 root: self.local.root().to_owned(),
@@ -1739,6 +1790,41 @@ fn local_files(snapshot: &LocalSnapshot) -> BTreeMap<String, LocalNode> {
         .filter(|(_, node)| matches!(node.kind, LocalKind::File { .. }))
         .map(|(path, node)| (path.clone(), node.clone()))
         .collect()
+}
+
+fn reject_unsupported_directories(local: &LocalSnapshot, remote: &RemoteSnapshot) -> Result<()> {
+    let local_files = local_files(local);
+    let remote_files = remote_files(remote);
+    let mut unsupported = Vec::new();
+    for node in local.nodes().values() {
+        if node.is_directory()
+            && !node.path.is_empty()
+            && !has_descendant_file(&local_files, &node.path)
+        {
+            unsupported.push(format!("local directory {:?}", node.path));
+        }
+    }
+    for entry in remote.entries.values() {
+        if !entry.is_file()
+            && !entry.path.is_empty()
+            && !has_descendant_file(&remote_files, &entry.path)
+        {
+            unsupported.push(format!("remote directory {:?}", entry.path));
+        }
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::unsupported(format!(
+            "Direct Sync does not represent empty directory markers; remove or populate: {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
+fn has_descendant_file<T>(files: &BTreeMap<String, T>, directory: &str) -> bool {
+    let prefix = format!("{directory}/");
+    files.keys().any(|path| path.starts_with(&prefix))
 }
 
 fn remote_files(snapshot: &RemoteSnapshot) -> BTreeMap<String, RemoteEntry> {

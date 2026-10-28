@@ -87,6 +87,7 @@ impl DirectRemote for DirectRemoteAdapter {
     }
 
     async fn read_to_path(&self, entry: &RemoteEntry, output: &Path) -> Result<()> {
+        let output_path = output;
         let snapshot = self
             .snapshot
             .lock()
@@ -108,8 +109,8 @@ impl DirectRemote for DirectRemoteAdapter {
                 ))
             })?;
         let file = snapshot.open_file(node.id()).await.map_err(direct_error)?;
-        let mut output = std::fs::File::create(output)
-            .map_err(|error| Error::io("create Direct Sync download", output, error))?;
+        let mut output = std::fs::File::create(output_path)
+            .map_err(|error| Error::io("create Direct Sync download", output_path, error))?;
         let mut offset = 0_u64;
         while offset < file.length() {
             let end = offset.saturating_add(64 * 1024).min(file.length());
@@ -119,12 +120,12 @@ impl DirectRemote for DirectRemoteAdapter {
                 .map_err(direct_error)?;
             output
                 .write_all(&bytes)
-                .map_err(|error| Error::io("write Direct Sync download", output, error))?;
+                .map_err(|error| Error::io("write Direct Sync download", output_path, error))?;
             offset = end;
         }
         output
             .sync_all()
-            .map_err(|error| Error::io("persist Direct Sync download", output, error))
+            .map_err(|error| Error::io("persist Direct Sync download", output_path, error))
     }
 
     async fn publish_file(
