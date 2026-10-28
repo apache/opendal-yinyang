@@ -896,11 +896,7 @@ impl DirectInner {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
                 }
-                // ESTALE can make VFS retry UNLINK. Do not replace the failed
-                // pin before replying, or the retry could delete the external
-                // replacement with its new ETag. SIGHUP performs the explicit
-                // rebase.
-                if status.state != DirectMutationState::Conflict {
+                if should_rebase_namespace_after_failure(errno) {
                     self.refresh_remote_only().await;
                 }
                 eprintln!(
@@ -993,7 +989,9 @@ impl DirectInner {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse rename: cannot retain mutation state: {pending:?}");
                 }
-                self.refresh_remote_only().await;
+                if should_rebase_namespace_after_failure(errno) {
+                    self.refresh_remote_only().await;
+                }
                 eprintln!(
                     "yy: fuse rename: Direct mutation {} retained in {:?}: {}",
                     status.id.to_hex(),
@@ -1487,6 +1485,13 @@ fn mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
         | DirectMutationState::Dispatching
         | DirectMutationState::Unknown => Some(fuser::Errno::EIO),
     }
+}
+
+fn should_rebase_namespace_after_failure(errno: fuser::Errno) -> bool {
+    // VFS can retry UNLINK or RENAME after ESTALE. Keep the failed pin until
+    // explicit SIGHUP so a retry cannot use a refreshed destination or source
+    // precondition and silently replace an external namespace change.
+    errno != fuser::Errno::ESTALE
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -2002,6 +2007,15 @@ impl Filesystem for DirectFuseFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_conflicts_retain_the_failed_pin_for_vfs_retry() {
+        assert!(!should_rebase_namespace_after_failure(fuser::Errno::ESTALE));
+        assert!(should_rebase_namespace_after_failure(fuser::Errno::EIO));
+        assert!(should_rebase_namespace_after_failure(
+            fuser::Errno::EOPNOTSUPP
+        ));
+    }
 
     #[test]
     fn view_pruning_keeps_live_versions_and_reclaims_released_ones() {
