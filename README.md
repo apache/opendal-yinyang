@@ -58,7 +58,9 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   explicit SIGHUP-refreshed observation, and each descriptor pins a real object
   version or uses conditional ETag ranges. See the
   [Direct contract](specs/direct.md). Writable Direct and Direct Sync remain
-  unimplemented.
+  unimplemented. The current MinIO-compatible Silo qualification does not
+  cover a namespace whose LIST hides a descendant behind an existing
+  file-prefix alias; the selected service must enumerate every current key.
 
 The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
 tracks the remaining integration and platform work.

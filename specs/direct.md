@@ -48,6 +48,13 @@ The mount entry point also requires `frontend=fuse`. Unsupported access,
 publication, frontend, write policy or required capabilities fail before the
 first storage observation and before a FUSE session is created.
 
+The current qualification does not cover a MinIO-compatible service whose LIST
+omits a descendant key such as `a/b` when file key `a` exists. The isolated
+Silo endpoint used by the native suite can GET both keys but has demonstrated
+that omission. A namespace with a returned file-prefix collision still rejects;
+the unqualified case is the backend that never returns the hidden key name to
+the mount layer.
+
 Direct publishes the `read`, `list`, and `pinned-reads` capabilities only. It
 does not claim Managed `stable-identity`: replacement changes the file inode.
 It does not claim `retained-unlink-read`; retained reads after deletion depend
@@ -193,6 +200,10 @@ staging database, metadata database, publication lease or remote object.
 - The selected service must return exact keys. A lossy LIST that omits hidden
   descendants cannot be made complete by guessing key names or by per-object
   probes, and such a service is outside the Direct support boundary.
+- The current Silo/MinIO compatibility evidence does not qualify the
+  file-prefix-alias namespace combination. Other ordinary namespaces remain
+  testable on that endpoint, but its result must not be presented as a general
+  lossless-namespace claim.
 - Directory markers, invalid components and file-prefix collisions reject the
   complete view rather than being renamed by mutating storage.
 - The current version rejects empty components; it does not define an
