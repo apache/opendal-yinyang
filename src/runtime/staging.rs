@@ -663,7 +663,7 @@ mod tests {
     async fn unsupported_profile_is_rejected_without_creating_a_lease_or_changing_sqlite() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let _ = raw_database(&path, "yinyang-stage-99", true);
+        let fs = raw_database(&path, "yinyang-stage-99", true);
         assert_eq!(
             Stage::inspect(path.clone()).await.unwrap_err().kind(),
             ErrorKind::Unsupported
@@ -700,7 +700,7 @@ mod tests {
     async fn unsupported_profile_read_only_rejection_preserves_authoritative_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let fs = raw_database(&path, "yinyang-stage-99", true);
+        let _ = raw_database(&path, "yinyang-stage-99", true);
         Connection::open(&path)
             .unwrap()
             .execute_batch("PRAGMA journal_mode=WAL")
