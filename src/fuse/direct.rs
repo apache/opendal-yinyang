@@ -887,17 +887,16 @@ impl DirectInner {
             Ok(status) => status,
             Err(error) => return reply.error(direct_errno(&error)),
         };
-        match mutation_errno(&status) {
+        match namespace_mutation_errno(&status) {
             None => {
                 self.refresh_remote_only().await;
                 reply.ok();
             }
             Some(errno) => {
-                let errno = namespace_conflict_errno(errno);
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
                 }
-                if should_rebase_namespace_after_failure(errno) {
+                if should_rebase_namespace_after_failure(status.state) {
                     self.refresh_remote_only().await;
                 }
                 eprintln!(
@@ -981,17 +980,16 @@ impl DirectInner {
                 return reply.error(direct_errno(&error));
             }
         };
-        match mutation_errno(&status) {
+        match namespace_mutation_errno(&status) {
             None => {
                 self.refresh_remote_only().await;
                 reply.ok();
             }
             Some(errno) => {
-                let errno = namespace_conflict_errno(errno);
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse rename: cannot retain mutation state: {pending:?}");
                 }
-                if should_rebase_namespace_after_failure(errno) {
+                if should_rebase_namespace_after_failure(status.state) {
                     self.refresh_remote_only().await;
                 }
                 eprintln!(
@@ -1475,10 +1473,13 @@ fn direct_errno(error: &DirectError) -> fuser::Errno {
     }
 }
 
-fn mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
+fn namespace_mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
     match status.state {
         DirectMutationState::Applied => None,
-        DirectMutationState::Conflict => Some(fuser::Errno::ESTALE),
+        // Linux namei retries ESTALE once inside the same syscall. A global
+        // refresh can advance pins before that retry, so report EAGAIN and
+        // leave any retry to a later caller-owned operation.
+        DirectMutationState::Conflict => Some(fuser::Errno::EAGAIN),
         DirectMutationState::DestinationApplied | DirectMutationState::PendingSourceCleanup => {
             Some(fuser::Errno::EIO)
         }
@@ -1489,21 +1490,10 @@ fn mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
     }
 }
 
-fn namespace_conflict_errno(errno: fuser::Errno) -> fuser::Errno {
-    // Linux namei retries ESTALE once inside the same syscall. Report a
-    // precondition conflict as EAGAIN instead, so no automatic retry can use a
-    // globally refreshed source or destination pin as a new intent.
-    if errno.code() == fuser::Errno::ESTALE.code() {
-        fuser::Errno::EAGAIN
-    } else {
-        errno
-    }
-}
-
-fn should_rebase_namespace_after_failure(errno: fuser::Errno) -> bool {
+fn should_rebase_namespace_after_failure(state: DirectMutationState) -> bool {
     // A conflict callback must not rebase its failed pin. Other namespace
     // failures return EIO/EOPNOTSUPP and may install the successful refresh.
-    errno.code() != fuser::Errno::EAGAIN.code()
+    state != DirectMutationState::Conflict
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -2019,23 +2009,6 @@ impl Filesystem for DirectFuseFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn namespace_conflicts_use_non_retrying_errno_and_retain_pin() {
-        assert_eq!(
-            namespace_conflict_errno(fuser::Errno::ESTALE).code(),
-            fuser::Errno::EAGAIN.code()
-        );
-        assert_eq!(
-            namespace_conflict_errno(fuser::Errno::EIO).code(),
-            fuser::Errno::EIO.code()
-        );
-        assert!(!should_rebase_namespace_after_failure(fuser::Errno::EAGAIN));
-        assert!(should_rebase_namespace_after_failure(fuser::Errno::EIO));
-        assert!(should_rebase_namespace_after_failure(
-            fuser::Errno::EOPNOTSUPP
-        ));
-    }
 
     #[test]
     fn view_pruning_keeps_live_versions_and_reclaims_released_ones() {
