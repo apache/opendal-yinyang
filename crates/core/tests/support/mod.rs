@@ -300,6 +300,9 @@ impl oio::Write for TestWriter {
     }
 
     async fn close(&mut self) -> opendal::Result<Metadata> {
+        if self.state.lock().unwrap().offline {
+            return Err(unavailable());
+        }
         if self.path == ".yinyang/head" && self.if_match.is_some() {
             let barrier = {
                 let mut state = self.state.lock().unwrap();
