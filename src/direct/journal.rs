@@ -237,7 +237,9 @@ pub(super) fn inspect(
 impl Store {
     pub fn open(root: &Path, binding: &DirectStorageBinding) -> Result<Self> {
         let database = root.join("runtime.db");
-        let exists = database.exists();
+        let exists = database
+            .try_exists()
+            .map_err(|error| local("inspect Direct runtime database", error))?;
         let nonempty = if exists {
             std::fs::metadata(&database)
                 .map_err(|error| local("inspect Direct runtime database", error))?
@@ -247,15 +249,7 @@ impl Store {
             false
         };
         if nonempty {
-            let check = Connection::open_with_flags(
-                &database,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|error| sqlite("preflight Direct runtime database", error))?;
-            check
-                .busy_timeout(Duration::from_secs(1))
-                .map_err(|error| sqlite("configure Direct runtime preflight", error))?;
-            let _ = validate_schema(&check, Some(binding))?;
+            let _ = inspect(&database, Some(binding))?;
         }
 
         create_private_dir(root)?;
@@ -530,18 +524,18 @@ fn validate_schema(
             format!("unsupported Direct runtime profile {profile:?}"),
         ));
     }
-    if let Some(binding) = binding {
-        if bound.as_slice() != binding.namespace_id() {
-            return Err(Error::new(
-                ErrorKind::Invalid,
-                format!(
-                    "Direct runtime state is bound to {diagnostic:?}, not the selected storage namespace {:?}",
-                    binding.description()
-                ),
-            ));
-        }
+    if let Some(binding) = binding
+        && bound.as_slice() != binding.namespace_id()
+    {
+        return Err(Error::new(
+            ErrorKind::Invalid,
+            format!(
+                "Direct runtime state is bound to {diagnostic:?}, not the selected storage namespace {:?}",
+                binding.description()
+            ),
+        ));
     }
-    let tables = connection
+    let mut tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         .and_then(|mut statement| {
             statement
@@ -549,7 +543,6 @@ fn validate_schema(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|error| sqlite("inspect Direct runtime schema", error))?;
-    let mut tables = tables;
     tables.sort();
     if tables != ["authority", "mutations", "objects"] {
         return Err(Error::new(
