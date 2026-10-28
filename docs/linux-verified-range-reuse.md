@@ -19,11 +19,13 @@ The optimized tree adds the cache and post-batch reuse assertions; timed
 workload bodies use the same FUSE operations, dataset generator, read offsets,
 sample counts, telemetry, and settlement rules.
 
-Later delivery commits after `50f44d0` are limited to benchmark-test guards,
-the runtime corruption contract test, specifications and reports. The final
-production source trees for `src/`, `crates/core/src/`, `Cargo.toml` and
-`Cargo.lock` are byte-identical to `50f44d0`, so the recorded release `yy`
-binary identity remains the measured identity.
+Later delivery commits after `50f44d0` add benchmark-test guards, the runtime
+corruption contract test, specifications, reports, and the independently
+accepted Q Direct backend qualification. The Managed data, `FileVersion`,
+Mount and benchmark-operator source paths remain byte-identical to `50f44d0`.
+The final `yy` binary therefore differs because it also contains unrelated
+Direct code; the recorded release binary belongs to the measured source pair
+and the Managed workload was not rerun for that Direct-only integration.
 
 The host was `lance-fuse-demo`: four vCPUs, 15 GiB RAM, Ubuntu 24.04, kernel
 `7.0.0-1014-aws`, and Rust `1.99.1`. Storage was an encrypted, public-access-
