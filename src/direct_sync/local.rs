@@ -1062,7 +1062,9 @@ impl LocalTree {
         for depth in (1..=components.len()).rev() {
             let directory = components[..depth].join("/");
             let parent_path = components[..depth - 1].join("/");
-            let parent_fd = self.open_relative_dir(&parent_path)?;
+            let Some(parent_fd) = self.open_relative_dir_optional(&parent_path)? else {
+                break;
+            };
             match unlinkat(&parent_fd, components[depth - 1], AtFlags::REMOVEDIR) {
                 Ok(()) => {
                     fsync(&parent_fd).map_err(|error| {
@@ -1073,7 +1075,11 @@ impl LocalTree {
                         )
                     })?;
                 }
-                Err(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::NOENT) => break,
+                Err(
+                    rustix::io::Errno::NOTEMPTY
+                    | rustix::io::Errno::NOENT
+                    | rustix::io::Errno::NOTDIR,
+                ) => break,
                 Err(error) => {
                     return Err(Error::errno(
                         "remove empty Direct Sync directory",

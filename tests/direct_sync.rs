@@ -415,6 +415,10 @@ async fn nested_last_child_deletes_prune_only_sync_created_empty_parents() {
     assert!(local_fixture.handle.read("nested/local.txt").is_none());
     assert!(!local_fixture.root.join("nested").exists());
     assert!(outcome.in_sync);
+    let second = sync.run().await.unwrap();
+    assert!(second.in_sync);
+    assert_eq!(second.deleted_remote, 0);
+    drop(sync);
 
     let both_fixture = Fixture::new();
     both_fixture.write("both/file.txt", b"both");

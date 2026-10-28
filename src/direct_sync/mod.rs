@@ -438,8 +438,8 @@ impl<R: DirectRemote> DirectSync<R> {
                     .await?;
                 }
                 Action::RemoveBaseline { path } => {
-                    self.store.remove_baseline(&path)?;
                     self.local.prune_parents_of(&path)?;
+                    self.store.remove_baseline(&path)?;
                 }
             }
         }
@@ -1181,6 +1181,7 @@ impl<R: DirectRemote> DirectSync<R> {
                     applied = true;
                 }
                 RemoteOperation::Delete => {
+                    self.local.prune_parents_of(&work.path)?;
                     self.store.complete_work(work.id, None)?;
                     applied = true;
                 }
