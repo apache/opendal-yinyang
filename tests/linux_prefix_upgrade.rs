@@ -797,11 +797,22 @@ impl ServiceProcess {
             .recv_timeout(Duration::from_secs(60))
             .expect("metadata service readiness timeout");
         read.expect("read metadata service readiness");
-        let address = line
+        let address = match line
             .trim()
             .strip_prefix("metadata service listening on ")
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| panic!("unexpected metadata service readiness: {line:?}"));
+        {
+            Some(address) => address,
+            None => {
+                let _ = child.kill();
+                let status = child.wait().expect("wait for failed metadata service");
+                let stderr = stderr.join().unwrap_or_default();
+                panic!(
+                    "unexpected metadata service readiness {line:?} with {status}:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        };
         Self {
             child: Some(child),
             stderr: Some(stderr),
