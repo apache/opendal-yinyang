@@ -609,10 +609,10 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     assert_eq!(doctor["schema"], "yinyang.operational-health.v1");
     assert_eq!(doctor["status"], "pass", "{doctor:#}");
 
+    cleanup.cleanup();
     for root in [&object_root, &sync_root, &service_root] {
         assert_storage_inventory_complete_when_empty(&storage, root);
     }
-    cleanup.cleanup();
 
     let evidence = json!({
         "schema": "yinyang.linux-prefix-upgrade.v1",
