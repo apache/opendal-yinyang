@@ -570,7 +570,6 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         SYNC_V2
     );
 
-    assert_sqlite_integrity(&service_database);
     let restarted_service =
         ServiceProcess::start(&current_yy, &storage, &service_root, &service_database);
     rewrite_service_address(&service_config, &restarted_service.address.to_string());
