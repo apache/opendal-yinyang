@@ -185,14 +185,21 @@ impl Fixture {
     }
 
     pub fn operator_with(&self, extra: &[(&str, &str)]) -> opendal::Operator {
+        self.operator_at_root(&self.root, extra)
+    }
+
+    pub fn operator_at_root(&self, root: &str, extra: &[(&str, &str)]) -> opendal::Operator {
         opendal::install_default();
         let mut config = std::env::vars()
             .filter_map(|(key, value)| {
                 key.strip_prefix("YINYANG_S3_")
                     .map(|key| (key.to_ascii_lowercase(), value))
             })
+            .filter(|(key, _)| key != "root")
             .collect::<Vec<_>>();
-        config.push(("root".to_owned(), self.root.clone()));
+        if !root.is_empty() {
+            config.push(("root".to_owned(), root.to_owned()));
+        }
         config.extend(
             extra
                 .iter()

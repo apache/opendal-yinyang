@@ -568,10 +568,21 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
             .map(|metadata| format!("{:?}", metadata.mode()))
             .unwrap_or_else(|error| format!("{error}"))
     });
+    let unscoped_operator = fixture.operator_at_root("", &[]);
+    let unscoped_paths = runtime.block_on(async {
+        unscoped_operator
+            .list_with(&format!("{}/", fixture.root))
+            .recursive(true)
+            .await
+            .expect("list the Direct prefix without an Operator root")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
     assert_eq!(
         paths,
         ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
-        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?} after={after_paths:?} versions={version_paths:?} v1={v1_paths:?} stat={directory_stat:?}"
+        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?} after={after_paths:?} versions={version_paths:?} v1={v1_paths:?} stat={directory_stat:?} unscoped={unscoped_paths:?}"
     );
 
     let namespace = yinyang::direct::DirectNamespace::new(operator).expect("admit Direct operator");
