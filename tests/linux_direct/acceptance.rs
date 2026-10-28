@@ -48,7 +48,7 @@ fn direct_raw_s3_harness_preserves_requested_keys() {
         "space name.txt",
         "Case.txt",
         "case.txt",
-        "caf\u{e9}",
+        "café",
         "cafe\u{301}",
     ];
     for (index, suffix) in keys.iter().enumerate() {
@@ -507,7 +507,7 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
     fixture.write_raw("control\u{7f}", b"control");
     fixture.write_raw("Case.txt", b"uppercase");
     fixture.write_raw("case.txt", b"lowercase");
-    fixture.write_raw("caf\u{e9}", b"nfc");
+    fixture.write_raw("café", b"nfc");
     fixture.write_raw("cafe\u{301}", b"nfd");
     let inventory = fixture.inventory();
     let config = fixture.config("direct-mapping", "fuse", None, None);
@@ -531,7 +531,7 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
     );
     assert_eq!(fs::read(root.join("Case.txt")).unwrap(), b"uppercase");
     assert_eq!(fs::read(root.join("case.txt")).unwrap(), b"lowercase");
-    assert_eq!(fs::read(root.join("caf\u{e9}")).unwrap(), b"nfc");
+    assert_eq!(fs::read(root.join("café")).unwrap(), b"nfc");
     assert_eq!(fs::read(root.join("cafe\u{301}")).unwrap(), b"nfd");
 
     mounted.unmount();
