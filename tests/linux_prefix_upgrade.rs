@@ -131,7 +131,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     let current_yy = prefix.join("current/bin/yy");
 
     run_ok(
-        &mut current_yy_command(&current_yy, &storage, &object_root),
+        current_yy_command(&current_yy, &storage, &object_root).args(["create"]),
         "fd1338c create installed object authority",
     );
     let object_config = temp.path().join("object.json");
@@ -271,7 +271,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     assert_ne!(frozen_commit, pending_commit);
 
     run_ok(
-        &mut current_yy_command(&current_yy, &storage, &sync_root),
+        current_yy_command(&current_yy, &storage, &sync_root).args(["create"]),
         "fd1338c create installed Sync authority",
     );
     let sync_state = temp.path().join("sync-state");
@@ -338,7 +338,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     );
 
     run_ok(
-        &mut current_yy_command(&current_yy, &storage, &service_root),
+        current_yy_command(&current_yy, &storage, &service_root).args(["create"]),
         "fd1338c create installed service authority",
     );
     let service_database = temp.path().join("metadata/metadata.db");
