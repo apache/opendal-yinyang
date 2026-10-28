@@ -826,24 +826,46 @@ class Harness:
 
     def remote_history(self, elapsed: float) -> dict[str, Any]:
         bucket = self.source_environment["YINYANG_S3_BUCKET"]
-        response = self.aws(
-            [
+        versions = 0
+        delete_markers = 0
+        stored_bytes = 0
+        pages = 0
+        key_marker: str | None = None
+        version_marker: str | None = None
+        while True:
+            arguments = [
                 "list-object-versions",
                 "--bucket",
                 bucket,
                 "--prefix",
                 f"{self.root}/",
-            ],
-            timeout=300,
-        )
-        versions = response.get("Versions", [])
-        markers = response.get("DeleteMarkers", [])
+                "--no-paginate",
+            ]
+            if key_marker is not None:
+                arguments.extend(["--key-marker", key_marker])
+            if version_marker is not None:
+                arguments.extend(["--version-id-marker", version_marker])
+            response = self.aws(arguments, timeout=300)
+            pages += 1
+            page_versions = response.get("Versions", [])
+            versions += len(page_versions)
+            delete_markers += len(response.get("DeleteMarkers", []))
+            stored_bytes += sum(int(item.get("Size", 0)) for item in page_versions)
+            if not response.get("IsTruncated", False):
+                break
+            key_marker = response.get("NextKeyMarker")
+            version_marker = response.get("NextVersionIdMarker")
+            if not key_marker or not version_marker:
+                raise EnvelopeError(
+                    "ListObjectVersions omitted continuation markers for a truncated page"
+                )
         sample = {
             "timestamp": utc_now(),
             "elapsed_seconds": round(elapsed, 3),
-            "object_versions": len(versions),
-            "delete_markers": len(markers),
-            "stored_bytes": sum(int(item.get("Size", 0)) for item in versions),
+            "object_versions": versions,
+            "delete_markers": delete_markers,
+            "stored_bytes": stored_bytes,
+            "pages": pages,
             "method": "paginated ListObjectVersions over the isolated prefix",
         }
         self.history_samples.append(sample)

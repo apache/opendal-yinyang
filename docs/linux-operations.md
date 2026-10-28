@@ -64,7 +64,7 @@ On the tested host:
 
 ```shell
 sudo apt-get update
-sudo apt-get install --yes ca-certificates fuse3
+sudo apt-get install --yes ca-certificates fuse3 jq python3
 rustc --version
 cargo --version
 ```
