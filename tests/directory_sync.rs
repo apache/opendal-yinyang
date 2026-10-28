@@ -1082,7 +1082,12 @@ async fn composite_preflight_rejects_unknown_sync_before_replica_upgrade() {
     assert_eq!(
         error
             .downcast_ref::<yinyang::runtime::Error>()
-            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "unexpected preflight error type {}: {error}",
+                    std::any::type_name_of_val(error.as_ref())
+                )
+            })
             .kind(),
         RuntimeErrorKind::Unsupported
     );
@@ -1120,7 +1125,12 @@ async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
     assert_eq!(
         error
             .downcast_ref::<yinyang::runtime::Error>()
-            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "unexpected preflight error type {}: {error}",
+                    std::any::type_name_of_val(error.as_ref())
+                )
+            })
             .kind(),
         RuntimeErrorKind::Unsupported
     );
