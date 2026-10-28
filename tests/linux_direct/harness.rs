@@ -62,6 +62,83 @@ pub struct Fixture {
     raw: RawS3,
 }
 
+pub struct RunningCommand {
+    child: Option<Child>,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl RunningCommand {
+    pub fn spawn(mut command: Command) -> Self {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn command (format: {command:?}): {error}"));
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        Self {
+            child: Some(child),
+            stdout: Some(thread::spawn(move || read_captured(stdout))),
+            stderr: Some(thread::spawn(move || read_captured(stderr))),
+        }
+    }
+
+    pub fn kill(&mut self) {
+        self.child
+            .as_mut()
+            .expect("running command is live")
+            .kill()
+            .expect("kill running command");
+    }
+
+    pub fn wait(mut self, timeout: Duration) -> Captured {
+        let child = self.child.as_mut().expect("running command is live");
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait().expect("wait for running command") {
+                Some(status) => break status,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                None => {
+                    let _ = child.kill();
+                    let status = child.wait().expect("wait after killing timed-out command");
+                    let stdout = self.stdout.take().unwrap().join().unwrap_or_default();
+                    let stderr = self.stderr.take().unwrap().join().unwrap_or_default();
+                    panic!(
+                        "command timed out after {timeout:?} with {status}:\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+                None => unreachable!(),
+            }
+        };
+        self.child.take();
+        Captured {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap_or_default(),
+            stderr: self.stderr.take().unwrap().join().unwrap_or_default(),
+        }
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl Fixture {
     pub fn new() -> Self {
         require_direct_environment();
@@ -583,6 +660,12 @@ fn read_request_line(stream: &mut std::net::TcpStream) -> String {
         .map(String::from_utf8_lossy)
         .unwrap_or_default()
         .into_owned()
+}
+
+fn read_captured(mut reader: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    bytes
 }
 
 impl Drop for RequestCounter {
