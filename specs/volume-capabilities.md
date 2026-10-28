@@ -107,6 +107,9 @@ conditional ETag reads. It never negotiates write or Managed transaction
 primitives. The selected service must also enumerate current keys exactly:
 capability flags cannot repair a lossy LIST that hides `a/b` when file key `a`
 exists, because the mount layer cannot read a key name it never receives.
+The current Silo/MinIO qualification does not cover that file-prefix-alias
+namespace combination; observed collisions still reject, and ordinary
+namespaces that LIST completely remain supported.
 
 Writable baseline capabilities are read, list, write, append, truncate,
 atomic-rename, stable-identity, pinned-reads, retained-unlink-read, remote-fsync,
