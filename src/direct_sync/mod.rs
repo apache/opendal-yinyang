@@ -305,6 +305,7 @@ impl<R: DirectRemote> DirectSync<R> {
     }
 
     pub async fn open(remote: R, state: &Path) -> Result<Self> {
+        local::validate_private_state(state)?;
         let database = state.join("direct-sync.db");
         if !database.exists() {
             return Err(Error::invalid(format!(
