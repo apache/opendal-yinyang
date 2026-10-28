@@ -166,8 +166,6 @@ struct OpenFile {
     key: String,
     source: OpenSource,
     writable: bool,
-    parent: Option<INodeNo>,
-    name: String,
     view: Arc<Mutex<FileView>>,
 }
 
@@ -565,7 +563,7 @@ impl DirectInner {
         let Some(direct) = &self.direct else {
             return reply.error(fuser::Errno::EIO);
         };
-        let (file, key, modified, parent) = if let Some(status) = self.pending_status(id) {
+        let (file, key, modified) = if let Some(status) = self.pending_status(id) {
             if status.observed.is_missing() {
                 return reply.error(fuser::Errno::ENOENT);
             }
@@ -579,15 +577,11 @@ impl DirectInner {
                         .present()
                         .and_then(DirectObjectPin::modified)
                 });
-            let parent = match self.inode_for(status.parent) {
-                Ok(parent) => Some(parent),
-                Err(errno) => return reply.error(errno),
-            };
             let file = match direct.open_pending(id, writable).await {
                 Ok(file) => file,
                 Err(error) => return reply.error(direct_errno(&error)),
             };
-            (file, status.key.as_str().to_owned(), modified, parent)
+            (file, status.key.as_str().to_owned(), modified)
         } else {
             let snapshot = match self.current() {
                 Ok(snapshot) => snapshot,
@@ -599,13 +593,6 @@ impl DirectInner {
             if node.is_directory() {
                 return reply.error(fuser::Errno::EISDIR);
             }
-            let parent = match node.parent() {
-                Some(parent) => match self.inode_for(parent) {
-                    Ok(parent) => Some(parent),
-                    Err(errno) => return reply.error(errno),
-                },
-                None => None,
-            };
             let file = match direct.open_file(&snapshot, id, writable).await {
                 Ok(file) => file,
                 Err(error) => return reply.error(direct_errno(&error)),
@@ -614,7 +601,6 @@ impl DirectInner {
                 file,
                 node.key().unwrap_or(node.path()).to_owned(),
                 node.modified(),
-                parent,
             )
         };
         if let Err(errno) = self.invalidate_before_open(ino).await {
@@ -628,8 +614,6 @@ impl DirectInner {
             Err(error) => return reply.error(direct_errno(&error)),
         };
         let view = self.view_for(&key, length, modified);
-        let parent = parent;
-        let name = file.name().to_owned();
         if let Err(error) = file.status().await {
             return reply.error(direct_errno(&error));
         }
@@ -641,8 +625,6 @@ impl DirectInner {
                 key,
                 source: OpenSource::Staged(file),
                 writable,
-                parent,
-                name,
                 view,
             }),
         );
@@ -669,13 +651,6 @@ impl DirectInner {
         }
         let key = node.key().unwrap_or(node.path()).to_owned();
         let view = self.view_for(&key, node.size(), node.modified());
-        let parent = match node.parent() {
-            Some(parent) => match self.inode_for(parent) {
-                Ok(parent) => Some(parent),
-                Err(errno) => return reply.error(errno),
-            },
-            None => None,
-        };
         let fh = self.next_handle();
         guard(&self.files).insert(
             fh,
@@ -684,8 +659,6 @@ impl DirectInner {
                 key,
                 source: OpenSource::Remote(file),
                 writable: false,
-                parent,
-                name: node.name().to_owned(),
                 view,
             }),
         );
@@ -785,8 +758,6 @@ impl DirectInner {
             key: status.key.as_str().to_owned(),
             source: OpenSource::Staged(file),
             writable,
-            parent: Some(parent),
-            name: name.clone(),
             view,
         };
         self.record_dentry(parent, &name);
@@ -1390,11 +1361,6 @@ fn attribute(
     read_only: bool,
 ) -> FileAttr {
     attribute_with_size(ino, node.is_directory(), node.size(), modified, read_only)
-}
-
-fn open_attr(ino: INodeNo, node: &DirectNode, read_only: bool) -> FileAttr {
-    debug_assert!(node.is_file());
-    attribute(ino, node, node.modified(), read_only)
 }
 
 fn attribute_with_size(
@@ -2004,7 +1970,7 @@ mod tests {
             19,
             Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123)),
         );
-        let attr = open_attr(INodeNo(88), &node, true);
+        let attr = attribute(INodeNo(88), &node, node.modified(), true);
         assert_eq!(attr.kind, FileType::RegularFile);
         assert_eq!(attr.size, 19);
         assert_eq!(attr.perm, 0o444);
