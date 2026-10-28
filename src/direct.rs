@@ -289,8 +289,9 @@ async fn verify_empty_directory_marker(
             format!("directory marker {path:?} has no ETag; Direct cannot verify that it is empty"),
         )
     })?;
-    // Operator::read rejects trailing-slash paths before dispatch. The S3 list
-    // marks the same key as a directory but no longer exposes its object size.
+    // Operator::read rejects trailing-slash paths before dispatch. Dispatch the
+    // same path through the composed service to retain the configured policy
+    // layers while bypassing that high-level entry validation.
     let (range, args, _): (opendal::BytesRange, OpRead, OpReader) = options::ReadOptions {
         range: (0..1).into(),
         if_match: Some(etag.to_owned()),
@@ -298,8 +299,8 @@ async fn verify_empty_directory_marker(
     }
     .into();
     let reader = operator
-        .base_service()
-        .read_dyn(operator.base_context(), path, args)
+        .service()
+        .read_dyn(operator.context(), path, args)
         .map_err(Error::storage)?;
     let bytes = match reader.read_dyn(range).await {
         Ok((_, bytes)) => bytes,
