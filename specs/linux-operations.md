@@ -97,6 +97,14 @@ Checks are ordered from local policy to remote observation:
   retained runtime profile, schema, binding and pending/conflict/Unknown state
   without creating or recovering it. Pending, frozen, conflict, Unknown and
   failed records require action; read-only inspection itself is not a failure.
+  Ledger errors are independent of handle records: they survive successful
+  retries and handle reclamation, and doctor remains `action_required` until
+  they are explicitly acknowledged. Stop the mount and resolve remaining
+  requests first; inspect retained sequences with
+  `yy --volume CONFIG status`, then acknowledge only reviewed sequences with
+  `yy --volume CONFIG file acknowledge-errors THROUGH`. Doctor `mount-state`
+  health converges only after unresolved handles are resolved and reviewed
+  ledger errors are acknowledged.
 - `admission`: construct the S3 operator and validate the effective
   four-layer capability intersection.
 - `authority`: Managed connects and observes the latest revision. Object mode checks the

@@ -629,7 +629,7 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
                     status.errors.len()
                 ),
                 (!healthy).then_some(
-                    "inspect `yy --volume CONFIG status`; preserve staging until every uncertain request is resolved",
+                    "stop the mount and recover unresolved requests first; review the retained ledger with `yy --volume CONFIG status`, then explicitly acknowledge reviewed sequences with `yy --volume CONFIG file acknowledge-errors THROUGH`; doctor health converges only after every unresolved request is resolved and reviewed errors are acknowledged",
                 ),
             );
         }
