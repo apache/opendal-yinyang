@@ -245,9 +245,11 @@ pub struct DirectorySync {
 impl DirectorySync {
     async fn preflight(authority: &dyn Authority, state: &Path) -> Result<()> {
         Replica::validate_existing(state, authority.filesystem()).map_err(Box::new)?;
-        crate::sync::preflight_open(state, authority.filesystem(), false)
-            .await
-            .map_err(Box::new)
+        Ok(
+            crate::sync::preflight_open(state, authority.filesystem(), false)
+                .await
+                .map_err(Box::new)?,
+        )
     }
 
     /// Write one quiesced local Sync backup package. The caller must not run a

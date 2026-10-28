@@ -1868,8 +1868,8 @@ fn validate_profile(connection: &Connection) -> Result<Shape> {
         validate_columns("work", &work_set, WORK_BASE, WORK_OPTIONAL)?;
         work_missing = WORK_UPGRADE_ORDER
             .iter()
-            .filter(|column| !work_columns.contains(*column))
             .copied()
+            .filter(|column| !work_columns.contains(*column))
             .collect();
     }
 
