@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::compatibility::SERVICE_BINDING_MAGIC;
 use crate::data::{ContentDescriptor, DataStore};
-use crate::namespace::{encode, name_key};
+use crate::namespace::name_key;
 use crate::object::{BackendProfile, ObjectFs};
-use crate::service::MetadataService;
+use crate::service::{MetadataService, ServiceClient, serve};
 use crate::support::{StoredObject, TestBackend};
 use crate::{CommitId, ErrorKind, NodeId, Transaction};
 
@@ -69,6 +68,14 @@ const SERVICE_CURRENT: &[u8] =
     include_bytes!("../tests/fixtures/compatibility-v2/service-current.db");
 const SERVICE_UNKNOWN: &[u8] =
     include_bytes!("../tests/fixtures/compatibility-v2/service-unknown.db");
+const SERVICE_BINDING_CURRENT: &[u8] =
+    include_bytes!("../tests/fixtures/compatibility-v2/service-binding-current.bin");
+const SERVICE_BINDING_UNKNOWN: &[u8] =
+    include_bytes!("../tests/fixtures/compatibility-v2/service-binding-unknown.bin");
+const SERVICE_BINDING_MALFORMED: &[u8] =
+    include_bytes!("../tests/fixtures/compatibility-v2/service-binding-malformed.bin");
+const SERVICE_BINDING_OTHER: &[u8] =
+    include_bytes!("../tests/fixtures/compatibility-v2/service-binding-other.bin");
 
 fn pack_key() -> String {
     format!(
@@ -264,7 +271,7 @@ async fn independent_object_fixtures_admit_current_and_reject_unknown_profiles()
 }
 
 fn service_binding() -> Vec<u8> {
-    encode(&(SERVICE_BINDING_MAGIC, FILESYSTEM, ROOT)).unwrap()
+    SERVICE_BINDING_CURRENT.to_vec()
 }
 
 #[tokio::test]
@@ -371,4 +378,51 @@ async fn known_profile_schema_shape_is_rejected_before_wal_or_ddl() {
             .unwrap();
         assert_eq!(mode, "delete");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_binding_fixtures_distinguish_unknown_malformed_and_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    insert_object(&backend, ".yinyang/head", SERVICE_BINDING_CURRENT);
+    let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    let token = "metadata-rpc-compatibility-test-token";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, service, token.into()));
+
+    for (marker, kind, message) in [
+        (SERVICE_BINDING_CURRENT, None, ""),
+        (
+            SERVICE_BINDING_UNKNOWN,
+            Some(ErrorKind::Unsupported),
+            "unknown service binding profile",
+        ),
+        (
+            SERVICE_BINDING_MALFORMED,
+            Some(ErrorKind::Corrupt),
+            "read namespace",
+        ),
+        (
+            SERVICE_BINDING_OTHER,
+            Some(ErrorKind::Invalid),
+            "data binding disagrees",
+        ),
+    ] {
+        insert_object(&backend, ".yinyang/head", marker);
+        let result = ServiceClient::connect(addr, token.into(), backend.operator()).await;
+        match kind {
+            Some(kind) => {
+                let error = result.err().expect("binding must be rejected");
+                assert_eq!(error.kind(), kind);
+                assert!(error.message().contains(message), "{error}");
+            }
+            None => {
+                result.expect("current binding must connect");
+            }
+        }
+    }
+    server.abort();
 }

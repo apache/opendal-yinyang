@@ -118,7 +118,7 @@ impl ContentDescriptor {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         encode(&(
-            FILE_MAGIC,
+            CONTENT_DESCRIPTOR_MAGIC,
             *self.filesystem.as_bytes(),
             self.length,
             self.root.as_ref().map(Child::wire),

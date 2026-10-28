@@ -309,6 +309,19 @@ def service_fixtures() -> None:
     revision = struct.pack("<Q", 0) + bytes(16)
     root_node = node_bytes(ROOT, 1)
     receipt = COMMIT + RECEIPT_DIGEST + revision + struct.pack("<I", 2)
+    write("service-binding-current.bin", b"YYSERV01" + FILESYSTEM + ROOT)
+    write(
+        "service-binding-unknown.bin",
+        b"YYSERV02" + FILESYSTEM + ROOT,
+    )
+    write(
+        "service-binding-malformed.bin",
+        b"YYSERV01" + FILESYSTEM + ROOT[:-1],
+    )
+    write(
+        "service-binding-other.bin",
+        b"YYSERV01" + bytes([0x12]) * 16 + bytes([0x56]) * 16,
+    )
 
     current = HERE / "service-current.db"
     if current.exists():

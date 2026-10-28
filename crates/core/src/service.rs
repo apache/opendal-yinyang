@@ -18,7 +18,7 @@
 //! Durable single-authority metadata, independent of object-store head CAS.
 //! SQLite files must reside on a local filesystem that honors sync and locking.
 
-use crate::compatibility::SQLITE_SCHEMA_PROFILE;
+use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
 use crate::namespace::{Node, NodeKind, decode, encode};
 use crate::snapshot::{
     ChangeRecord, Cursor, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
@@ -249,6 +249,20 @@ fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
         )
     })
 }
+fn parse_service_binding(bytes: &[u8]) -> Result<(NodeId, NodeId)> {
+    if bytes.len() < SERVICE_BINDING_MAGIC.len() {
+        return Err(corrupt_schema("service binding is truncated"));
+    }
+    if bytes[..SERVICE_BINDING_MAGIC.len()] != SERVICE_BINDING_MAGIC {
+        return Err(Error::unsupported(
+            "open metadata authority",
+            "unknown service binding profile",
+        ));
+    }
+    let (magic, filesystem, root): ([u8; 8], [u8; 16], [u8; 16]) = decode(bytes)?;
+    debug_assert_eq!(magic, SERVICE_BINDING_MAGIC);
+    Ok((NodeId::from_bytes(filesystem), NodeId::from_bytes(root)))
+}
 impl MetadataService {
     /// Initialize a new local database or reopen its exact existing authority.
     pub async fn create(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
@@ -309,7 +323,7 @@ impl MetadataService {
     }
     fn marker(&self) -> Result<Vec<u8>> {
         encode(&(
-            crate::compatibility::SERVICE_BINDING_MAGIC,
+            SERVICE_BINDING_MAGIC,
             *self.filesystem.as_bytes(),
             *self.root.as_bytes(),
         ))
@@ -319,7 +333,8 @@ impl MetadataService {
             .read(".yinyang/head")
             .await
             .map_err(|e| Error::from_storage("read authority binding", e))?;
-        if marker.to_vec() != self.marker()? {
+        let (filesystem, root) = parse_service_binding(&marker)?;
+        if filesystem != self.filesystem || root != self.root {
             return Err(Error::invalid(
                 "open metadata authority",
                 "storage belongs to another filesystem or publication mode",

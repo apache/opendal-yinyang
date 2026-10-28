@@ -41,6 +41,8 @@ Creation conditionally installs it; opening validates it. Object-mode readers
 reject this marker. Service commits neither replace it nor consult it as a
 latest checkpoint. A service outage cannot authorize object-mode writes.
 The database is the sole authority and is required for history and receipts.
+An unknown marker profile is `Unsupported`; malformed `YYSERV01` bytes are
+`Corrupt`; a valid marker naming another filesystem or root is `Invalid`.
 
 ## Shared API and content readiness
 

@@ -60,6 +60,7 @@ can mutate durable state:
 | Object head | Exact head bytes and profile/mode | `Unsupported` before head creation or replacement | `Corrupt` |
 | Object snapshot and index | Identifier before interpreting fields or child records | `Unsupported` before publication | `Corrupt` |
 | Frozen plan | Identifier before authority observation or content import | `Unsupported` | `Corrupt` or `Invalid` |
+| Service binding | Exact `YYSERV01` envelope before client acceptance | `Unsupported` | `Corrupt`; a different valid binding is `Invalid` |
 | SQLite authority | Schema profile, manifest, required tables, and column order before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
 | Loopback RPC | Frame decode and token authentication, then protocol version | `Unsupported` before command dispatch | `Invalid` |
 
@@ -86,11 +87,15 @@ state. Automatic profile upgrades, downgrade after a newer writer has opened the
 state, and live authority-mode changes are unsupported unless another
 specification explicitly adds them.
 
-Packing targets, page-cache sizes, batch limits, retry counts, and measured
-range-read choices are policy or resource bounds. Changing them does not create
-a new logical profile when the authenticated bytes and identities remain
-unchanged. The fixed values that do enter persisted verification are part of
-the profile and must not be tuned independently.
+The 64 KiB content verification unit enters logical identity and remains fixed
+unless a new content profile is introduced. The merged
+[Linux read-only range results](../docs/linux-range-cost-results.md) observed
+bounded payloads for 4 KiB reads and a two-unit boundary crossing, together
+with 9-11 storage requests and 7.4-9.2 ms p50 for repeated warm reads over one
+immutable version. The study did not compare other unit sizes and does not make
+64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry
+counts, and other requested-range policy are tunable without changing logical
+identity when the authenticated bytes and identities remain unchanged.
 
 ## Local state
 
