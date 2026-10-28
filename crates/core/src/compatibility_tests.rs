@@ -256,6 +256,7 @@ async fn assert_object_profile_open(head: &[u8], pack: &[u8], expected: Option<E
 async fn independent_object_fixtures_admit_current_and_reject_unknown_profiles() {
     assert_object_profile_open(OBJECT_CURRENT_HEAD, OBJECT_CURRENT_PACK, None).await;
     assert_object_profile_open(OBJECT_UNKNOWN_HEAD, b"", Some(ErrorKind::Unsupported)).await;
+    assert_object_profile_open(SERVICE_BINDING_UNKNOWN, b"", Some(ErrorKind::Unsupported)).await;
     assert_object_profile_open(
         OBJECT_UNKNOWN_SNAPSHOT_HEAD,
         OBJECT_UNKNOWN_SNAPSHOT_PACK,
