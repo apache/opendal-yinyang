@@ -28,6 +28,8 @@ and CI. Run `cargo x --help` to list its commands.
 - `cargo x test` runs all workspace tests.
 - `cargo x test-linux-fuse` runs real Linux FUSE acceptance through `yy` and
   `/dev/fuse`.
+- `cargo x test-linux-operations` runs installed Linux CLI and lifecycle checks.
+- `cargo x test-linux-recovery` runs isolated backup and recovery acceptance.
 - `cargo x lint` checks Rust formatting, Clippy, documentation, TOML formatting,
   and spelling.
 - `cargo x licenses` checks source headers and dependency licenses.

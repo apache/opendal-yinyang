@@ -60,6 +60,8 @@ impl Command {
             SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
+            SubCommand::TestLinuxOperations(cmd) => cmd.run(),
+            SubCommand::TestLinuxRecovery(cmd) => cmd.run(),
         }
     }
 }
@@ -86,6 +88,14 @@ enum SubCommand {
         about = "Run real Linux FUSE acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
     TestLinuxFuse(CommandTestLinuxFuse),
+    #[clap(
+        about = "Run installed Linux CLI operations through yy and /dev/fuse (requires isolated storage)."
+    )]
+    TestLinuxOperations(CommandTestLinuxOperations),
+    #[clap(
+        about = "Run isolated Linux backup, restore, pending-state, and disk-exhaustion recovery."
+    )]
+    TestLinuxRecovery(CommandTestLinuxRecovery),
     #[clap(about = "Build the macOS native prototypes (requires Xcode 27 and XcodeGen).")]
     Macos(CommandMacos),
 }
@@ -283,6 +293,12 @@ enum BenchPublication {
     Service,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchWorkload {
+    Full,
+    ReadOnlyRange,
+}
+
 #[derive(Parser)]
 #[clap(name = "bench-linux-cost")]
 struct CommandBenchLinuxCost {
@@ -295,6 +311,13 @@ struct CommandBenchLinuxCost {
         help = "Limit authority-specific workloads while preserving the selected profile's scales."
     )]
     publication: BenchPublication,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "full",
+        help = "Select the complete product matrix or the matched read-only range workload."
+    )]
+    workload: BenchWorkload,
     #[arg(
         long,
         help = "Write JSONL evidence here; a Markdown summary uses the same path with .md."
@@ -324,14 +347,21 @@ impl CommandBenchLinuxCost {
                 panic!("{name} is unset; the Linux cost benchmark fails hard instead of skipping");
             }
         }
-        let profile = match self.profile {
-            BenchProfile::Early => "early",
-            BenchProfile::Full => "full",
+        let profile = match self.workload {
+            BenchWorkload::ReadOnlyRange => "full",
+            BenchWorkload::Full => match self.profile {
+                BenchProfile::Early => "early",
+                BenchProfile::Full => "full",
+            },
         };
         let publication = match self.publication {
             BenchPublication::All => "all",
             BenchPublication::Object => "object",
             BenchPublication::Service => "service",
+        };
+        let workload = match self.workload {
+            BenchWorkload::Full => "full",
+            BenchWorkload::ReadOnlyRange => "read-only-range",
         };
         let mut cmd = find_command("cargo");
         cmd.args([
@@ -348,6 +378,7 @@ impl CommandBenchLinuxCost {
             "--test-threads=1",
         ]);
         cmd.env("YINYANG_COST_PROFILE", profile);
+        cmd.env("YINYANG_COST_WORKLOAD", workload);
         cmd.env("YINYANG_COST_PUBLICATION", publication);
         cmd.env("YINYANG_COST_OUTPUT", &self.output);
         cmd.env("YINYANG_COST_SUMMARY", self.output.with_extension("md"));
@@ -412,6 +443,12 @@ struct CommandTestLinuxFuse {
         help = "Run only the read-only acceptance stage for independent first-layer validation."
     )]
     read_only: bool,
+    #[arg(
+        long,
+        conflicts_with = "read_only",
+        help = "Run only the read-only range-hydration acceptance scenarios."
+    )]
+    read_only_range: bool,
 }
 
 impl CommandTestLinuxFuse {
@@ -442,7 +479,9 @@ impl CommandTestLinuxFuse {
         }
         let mut cmd = find_command("cargo");
         cmd.args(["test", "-p", "yinyang", "--test", "linux_fuse"]);
-        if self.read_only {
+        if self.read_only_range {
+            cmd.arg("fuse_read_only_range_");
+        } else if self.read_only {
             cmd.arg("fuse_read_only_");
         } else {
             cmd.arg("fuse_");
@@ -450,6 +489,117 @@ impl CommandTestLinuxFuse {
         cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
         run_command(cmd);
     }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-operations")]
+struct CommandTestLinuxOperations {
+    #[arg(
+        long,
+        conflicts_with = "systemd",
+        help = "Use real Amazon S3 and run the installed CLI smoke."
+    )]
+    amazon_s3: bool,
+    #[arg(
+        long,
+        conflicts_with = "amazon_s3",
+        help = "Run the explicit qualified-host user-systemd lifecycle instead of the CLI smoke."
+    )]
+    systemd: bool,
+}
+
+impl CommandTestLinuxOperations {
+    fn run(self) {
+        require_linux("Linux operations acceptance");
+        require_fuse("Linux operations acceptance");
+        if self.amazon_s3 {
+            for name in [
+                "YINYANG_S3_BUCKET",
+                "YINYANG_S3_REGION",
+                "YINYANG_S3_ACCESS_KEY_ID",
+                "YINYANG_S3_SECRET_ACCESS_KEY",
+            ] {
+                if std::env::var_os(name).is_none() {
+                    panic!("{name} is unset; Amazon S3 operations fail hard instead of skipping");
+                }
+            }
+        } else {
+            require_isolated_storage("Linux operations acceptance");
+        }
+        let filter = if self.amazon_s3 {
+            "real_amazon_s3_cli_smoke"
+        } else if self.systemd {
+            "isolated_user_service_lifecycle"
+        } else {
+            "isolated_s3_cli_smoke"
+        };
+        run_ignored_test("linux_operations", Some(filter));
+    }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-recovery")]
+struct CommandTestLinuxRecovery {}
+
+impl CommandTestLinuxRecovery {
+    fn run(self) {
+        require_linux("Linux recovery acceptance");
+        require_isolated_storage("Linux recovery acceptance");
+        if which::which("sqlite3").is_err() {
+            panic!(
+                "sqlite3 is unavailable; Linux recovery acceptance requires consistent SQLite backup"
+            );
+        }
+        if !find_command("sudo")
+            .args(["-n", "true"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            panic!(
+                "passwordless sudo is unavailable; Linux recovery acceptance needs a bounded tmpfs"
+            );
+        }
+        run_ignored_test("linux_recovery", None);
+    }
+}
+
+fn require_linux(context: &str) {
+    if !cfg!(target_os = "linux") {
+        panic!("{context} requires Linux");
+    }
+}
+
+fn require_fuse(context: &str) {
+    if !std::path::Path::new("/dev/fuse").exists() {
+        panic!("{context} requires /dev/fuse");
+    }
+    if which::which("fusermount3").is_err() {
+        panic!("{context} requires fusermount3");
+    }
+}
+
+fn require_isolated_storage(context: &str) {
+    for name in [
+        "YINYANG_S3_BUCKET",
+        "YINYANG_S3_ENDPOINT",
+        "YINYANG_S3_REGION",
+        "YINYANG_S3_ACCESS_KEY_ID",
+        "YINYANG_S3_SECRET_ACCESS_KEY",
+    ] {
+        if std::env::var_os(name).is_none() {
+            panic!("{name} is unset; {context} fails hard instead of skipping");
+        }
+    }
+}
+
+fn run_ignored_test(target: &str, filter: Option<&str>) {
+    let mut cmd = find_command("cargo");
+    cmd.args(["test", "-p", "yinyang", "--test", target]);
+    if let Some(filter) = filter {
+        cmd.arg(filter);
+    }
+    cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
+    run_command(cmd);
 }
 
 fn find_command(cmd: &str) -> StdCommand {

@@ -38,10 +38,29 @@ Run only the read-only stage for a first-layer adapter PR:
 cargo x test-linux-fuse --read-only
 ```
 
+Run only the read-only range-hydration scenarios:
+
+```shell
+cargo x test-linux-fuse --read-only-range
+```
+
 ## Scenarios
 
 - Read-only basic: mounted reads, and explicit rejection (`EROFS`/`EACCES`) of
   writable open, create, mkdir and rename.
+- Read-only range hydration: an 8 MiB file with a partial final verification
+  unit must return correct 4 KiB, cross-unit, and final-unit pread results while
+  allocated mount staging stays bounded instead of growing to the full file.
+- Retained replacement descriptor: an open descriptor keeps its original bytes,
+  length and inode after an independent remote replacement. SIGHUP exposes the
+  replacement and a newly added file, while a fresh open observes the new node
+  and the old descriptor remains pinned until it is closed.
+- Corrupt content: independently flipping the content-index proof and a data
+  extent must return `EIO` without releasing the requested bytes.
+- Read-only staging admission: an interrupted writable mount with dirty bytes
+  leaves unpublished staging for both authorities, and a later read-only mount
+  must fail with a diagnostic naming that handle. A frozen service publication
+  must likewise be rejected rather than exposed as a read-only snapshot.
 - Read-only directories: nested `read_dir` enumeration and stable inode numbers
   across repeated stat calls, cached `readdir` after a file lookup/read, and a
   520-entry bulk directory that crosses the adapter's 512-entry readdir page.

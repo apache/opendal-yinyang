@@ -968,90 +968,102 @@ fn external_changes(fixture: &Fixture) {
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
 fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
-        let fixture = Fixture::new(publication);
-        let suffix = fixture.publication().as_str();
-        let library =
-            fixture.volume_config(&format!("lib-sighup-{suffix}"), Frontend::Library, false);
-        fixture.library_seed(&library, "a.txt", b"old-content");
-        let config =
-            fixture.volume_config(&format!("stage-sighup-{suffix}"), Frontend::Fuse, false);
-        let mountpoint = fixture.temp.path().join(format!("mnt-sighup-{suffix}"));
-        fs::create_dir(&mountpoint).expect("create mountpoint");
-        let mut mounted = fixture.mount(&config, &mountpoint);
-        let root = mounted.mountpoint().to_path_buf();
-
-        let old_path = root.join("a.txt");
-        let mut old = File::open(&old_path).expect("open old descriptor before refresh");
-        let old_ino = inode(&old_path);
-        let old_len = fs::metadata(&old_path).expect("warm old dentry").len();
-        let mut old_bytes = Vec::new();
-        old.read_to_end(&mut old_bytes).expect("read old bytes");
-        assert_eq!(old_bytes, b"old-content");
-
-        let new_payload = b"new-content-longer";
-        fixture.remote_rename(&library, "a.txt", "b.txt");
-        fixture.remote_write(&library, "b.txt", new_payload);
-        fixture.remote_create(&library, "new.txt");
-        fixture.remote_write(&library, "new.txt", b"added");
-
-        mounted.refresh_sighup();
-        let refresh_log =
-            mounted.wait_for_output_line("yy: fuse refresh: done (", Duration::from_secs(30));
-        let completion = refresh_log
-            .lines()
-            .find(|line| line.contains("yy: fuse refresh: done ("))
-            .expect("refresh completion line");
-        let (inode_count, entry_count, error_count) = refresh_counts(completion);
-        assert!(
-            inode_count > 0 && entry_count > 0 && error_count == 0,
-            "refresh must acknowledge native notifications (inode={inode_count} \
-             entries={entry_count} errors={error_count}):\n{refresh_log}"
-        );
-
-        assert_errno(
-            fs::metadata(&old_path).expect_err("renamed source must disappear after SIGHUP"),
-            &[ENOENT],
-            "stat renamed source after SIGHUP",
-        );
-        let shared = fs::metadata(root.join("b.txt")).expect("stat renamed target after SIGHUP");
-        assert_eq!(shared.ino(), old_ino);
-        assert_eq!(shared.len(), old_len);
-        assert_eq!(
-            fs::read(root.join("b.txt")).expect("read renamed target after SIGHUP"),
-            b"old-content",
-            "the live mount keeps the shared pinned view while the old descriptor is active"
-        );
-        assert_eq!(
-            fixture.remote_read(&library, "b.txt", 32),
-            new_payload,
-            "the independent authority sees the externally updated target"
-        );
-        assert_eq!(
-            fs::read(root.join("new.txt")).expect("read externally added file after SIGHUP"),
-            b"added"
-        );
-        assert_eq!(old.metadata().expect("fstat old descriptor").ino(), old_ino);
-        assert_eq!(old.metadata().expect("fstat old descriptor").len(), old_len);
-        old.seek(SeekFrom::Start(0)).expect("rewind old descriptor");
-        let mut pinned = Vec::new();
-        old.read_to_end(&mut pinned)
-            .expect("read old descriptor after SIGHUP");
-        assert_eq!(pinned, b"old-content");
-        drop(old);
-
-        let mut fresh = File::open(root.join("b.txt")).expect("fresh open after old close");
-        let mut fresh_bytes = Vec::new();
-        fresh
-            .read_to_end(&mut fresh_bytes)
-            .expect("fresh read after old close");
-        assert_eq!(fresh_bytes, new_payload);
-        assert_eq!(
-            fresh.metadata().expect("fresh fstat after old close").len(),
-            new_payload.len() as u64
-        );
-        drop(fresh);
-        mounted.unmount();
+        for read_only in [false, true] {
+            sighup_refresh(&Fixture::new(publication), read_only);
+        }
     }
+}
+
+fn sighup_refresh(fixture: &Fixture, read_only: bool) {
+    let mode = if read_only { "ro" } else { "rw" };
+    let suffix = format!("{}-{mode}", fixture.publication().as_str());
+    let library = fixture.volume_config(&format!("lib-sighup-{suffix}"), Frontend::Library, false);
+    fixture.library_seed(&library, "a.txt", b"old-content");
+    let config =
+        fixture.volume_config(&format!("stage-sighup-{suffix}"), Frontend::Fuse, read_only);
+    let mountpoint = fixture.temp.path().join(format!("mnt-sighup-{suffix}"));
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let root = mounted.mountpoint().to_path_buf();
+
+    let old_path = root.join("a.txt");
+    let mut old = File::open(&old_path).expect("open old descriptor before refresh");
+    let old_ino = inode(&old_path);
+    let old_len = fs::metadata(&old_path).expect("warm old dentry").len();
+    let mut old_bytes = Vec::new();
+    old.read_to_end(&mut old_bytes).expect("read old bytes");
+    assert_eq!(old_bytes, b"old-content");
+
+    let new_payload = b"new-content-longer";
+    fixture.remote_rename(&library, "a.txt", "b.txt");
+    fixture.remote_write(&library, "b.txt", new_payload);
+    fixture.remote_create(&library, "new.txt");
+    fixture.remote_write(&library, "new.txt", b"added");
+
+    mounted.refresh_sighup();
+    let refresh_log =
+        mounted.wait_for_output_line("yy: fuse refresh: done (", Duration::from_secs(30));
+    let completion = refresh_log
+        .lines()
+        .find(|line| line.contains("yy: fuse refresh: done ("))
+        .expect("refresh completion line");
+    let (inode_count, entry_count, error_count) = refresh_counts(completion);
+    assert!(
+        inode_count > 0 && entry_count > 0 && error_count == 0,
+        "refresh must acknowledge native notifications (inode={inode_count} \
+         entries={entry_count} errors={error_count}):\n{refresh_log}"
+    );
+
+    assert_errno(
+        fs::metadata(&old_path).expect_err("renamed source must disappear after SIGHUP"),
+        &[ENOENT],
+        "stat renamed source after SIGHUP",
+    );
+    let shared = fs::metadata(root.join("b.txt")).expect("stat renamed target after SIGHUP");
+    assert_eq!(shared.ino(), old_ino);
+    assert_eq!(shared.len(), old_len);
+    assert_eq!(
+        fs::read(root.join("b.txt")).expect("read renamed target after SIGHUP"),
+        b"old-content",
+        "the live mount keeps the shared pinned view while the old descriptor is active"
+    );
+    assert_eq!(
+        fixture.remote_read(&library, "b.txt", 32),
+        new_payload,
+        "the independent authority sees the externally updated target"
+    );
+    assert_eq!(
+        fs::read(root.join("new.txt")).expect("read externally added file after SIGHUP"),
+        b"added"
+    );
+    assert_eq!(old.metadata().expect("fstat old descriptor").ino(), old_ino);
+    assert_eq!(old.metadata().expect("fstat old descriptor").len(), old_len);
+    old.seek(SeekFrom::Start(0)).expect("rewind old descriptor");
+    let mut pinned = Vec::new();
+    old.read_to_end(&mut pinned)
+        .expect("read old descriptor after SIGHUP");
+    assert_eq!(pinned, b"old-content");
+    drop(old);
+
+    let mut fresh = File::open(root.join("b.txt")).expect("fresh open after old close");
+    let mut fresh_bytes = Vec::new();
+    fresh
+        .read_to_end(&mut fresh_bytes)
+        .expect("fresh read after old close");
+    assert_eq!(
+        fresh_bytes,
+        new_payload,
+        "fresh bytes after old close for publication={} read_only={read_only}",
+        fixture.publication().as_str()
+    );
+    assert_eq!(
+        fresh.metadata().expect("fresh fstat after old close").len(),
+        new_payload.len() as u64,
+        "fresh fstat after old close for publication={} read_only={read_only}",
+        fixture.publication().as_str()
+    );
+    drop(fresh);
+    mounted.unmount();
 }
 
 #[test]
