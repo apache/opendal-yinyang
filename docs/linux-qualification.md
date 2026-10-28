@@ -64,20 +64,20 @@ The initial qualified combination is:
 - one local systemd user manager on a single host;
 - object publication or authenticated single-host loopback service publication;
 - Managed Mount and finite ordinary-directory Managed Sync;
-- read-only and conditional-writable Direct Mount plus finite Direct Sync;
-- isolated MinIO-compatible Silo continuously, with Amazon S3 only when its
-  explicit run is recorded.
+- read-only and conditional-writable Direct Mount plus finite Direct Sync on
+  isolated MinIO-compatible Silo;
+- read-only Direct and conditional mutation primitives on the explicitly
+  recorded Amazon S3 buckets.
 
 The metadata service remains one authenticated loopback authority. This matrix
 does not claim TLS, HA, network-safe service exposure, multi-host locking,
 automatic Sync watching, or automatic garbage collection.
 
-Deterministic Direct coverage uses isolated loopback Silo. Real Amazon S3
-Direct qualification is a separate credentials-gated run and does not become a
-matrix entry until its source, bucket, versioning, request and binary evidence
-is recorded. Other S3-compatible services remain outside the matrix unless they
-satisfy exact recursive LIST, conditional ETag mutation and the tested
-version/range behavior.
+Deterministic writable Direct Mount and Direct Sync coverage uses isolated
+loopback Silo. The Amazon S3 record covers read-only Direct and raw conditional
+primitives, not writable Direct Mount or Direct Sync. Other S3-compatible
+services remain outside the matrix unless they satisfy exact recursive LIST,
+conditional ETag mutation and the tested version/range behavior.
 
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed
