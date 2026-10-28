@@ -6,12 +6,14 @@ uses a real `/dev/fuse` mount or the Managed Sync CLI. One-shot
 `yy publish`/`yy restore` scenarios use the object authority because that is the
 only authority supported by those commands.
 
-The benchmark uses isolated Silo (S3-compatible) settings, a unique remote root,
-and a new staging directory. A loopback HTTP counting proxy sits between YinYang
-and Silo. It parses HTTP/1 request framing before counting request methods, and
-counts request and response bytes without instrumenting production code. The
-proxy accepts connections without polling and disables Nagle on both relay
-sockets so collector delay does not dominate small range and proof requests.
+The default full and read-only matrices use isolated Silo (S3-compatible)
+settings, a unique remote root, and a new staging directory. A loopback HTTP
+counting proxy sits between YinYang and Silo. It parses HTTP/1 request framing
+before counting request methods, and counts request and response bytes without
+instrumenting production code. The proxy accepts connections without polling
+and disables Nagle on both relay sockets so collector delay does not dominate
+small range and proof requests. The real Amazon S3 repeated/random workload
+instead uses the benchmark-only in-process telemetry described below.
 
 Service publication uses a second transparent TCP proxy in front of the metadata
 service. The current transport creates one loopback TCP connection for each RPC,
@@ -171,7 +173,9 @@ Linux benchmark.
 ## Limits
 
 The benchmark does not claim production capacity, cross-host performance, or a
-performance regression threshold. It measures one isolated loopback Silo on the
-recorded host. It does not replace the functional Linux acceptance suites. Do
-not commit generated datasets or large build artifacts; retain only bounded
-evidence and reusable tooling in the repository.
+performance regression threshold. Default matrices measure one isolated
+loopback Silo on the recorded host; the repeated/random report records its
+separate real Amazon S3 region, host and sampling limits. These measurements do
+not replace the functional Linux acceptance suites. Do not commit generated
+datasets or large build artifacts; retain only bounded evidence and reusable
+tooling in the repository.
