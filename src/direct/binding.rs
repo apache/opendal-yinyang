@@ -150,3 +150,38 @@ fn endpoint_has_userinfo(endpoint: &str) -> bool {
         .unwrap_or_default();
     authority.contains('@')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_endpoint_is_preserved_and_secrets_are_rejected() {
+        let binding = DirectStorageBinding::new(
+            "s3",
+            "minio",
+            "Bucket",
+            "root/",
+            "http://Host.Example:9000/Case/Path/",
+        )
+        .unwrap();
+        assert_eq!(binding.root(), "/root");
+        assert_eq!(binding.endpoint(), "http://Host.Example:9000/Case/Path/");
+        assert!(
+            binding
+                .description()
+                .contains("Host.Example:9000/Case/Path/")
+        );
+
+        for endpoint in [
+            "http://user@host/path",
+            "http://host/path?query=1",
+            "http://host/path#fragment",
+        ] {
+            assert!(
+                DirectStorageBinding::new("s3", "minio", "bucket", "/", endpoint).is_err(),
+                "accepted secret endpoint {endpoint:?}"
+            );
+        }
+    }
+}
