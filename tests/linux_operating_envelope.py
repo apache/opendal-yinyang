@@ -421,7 +421,9 @@ class Workload:
         self.lock = threading.Lock()
         self.write_latencies: list[float] = []
         self.read_latencies: list[float] = []
-        self.write_errors = 0
+        self.pwrite_errors = 0
+        self.fsync_errors = 0
+        self.uncertain_files: set[int] = set()
         self.read_errors = 0
         self.fatal: list[str] = []
 
@@ -468,22 +470,40 @@ class Workload:
                         count = os.pwrite(descriptors[index], view, offset + written)
                         if count <= 0:
                             raise OSError("short pwrite through FUSE")
+                        segment = page[written : written + count]
+                        self.expected[index][
+                            offset + written : offset + written + count
+                        ] = segment
                         written += count
                         view = view[count:]
-                    os.fsync(descriptors[index])
-                    self.expected[index][offset : offset + PAGE_BYTES] = page
-                    with self.lock:
-                        self.write_latencies.append(
-                            (time.monotonic() - started) * 1000
-                        )
-                    failures = 0
                 except OSError as error:
                     with self.lock:
-                        self.write_errors += 1
+                        self.pwrite_errors += 1
+                        self.uncertain_files.add(index)
                     failures += 1
                     if failures >= 3:
-                        self.fatal.append(f"three consecutive fsync writes failed: {error}")
+                        self.fatal.append(f"three consecutive writes failed: {error}")
                         self.stop.set()
+                else:
+                    try:
+                        os.fsync(descriptors[index])
+                    except OSError as error:
+                        with self.lock:
+                            self.fsync_errors += 1
+                            self.uncertain_files.add(index)
+                        failures += 1
+                        if failures >= 3:
+                            self.fatal.append(
+                                f"three consecutive fsync writes failed: {error}"
+                            )
+                            self.stop.set()
+                    else:
+                        with self.lock:
+                            self.write_latencies.append(
+                                (time.monotonic() - started) * 1000
+                            )
+                            self.uncertain_files.discard(index)
+                        failures = 0
                 elapsed = time.monotonic() - started
                 self.stop.wait(max(0.0, self.write_interval - elapsed))
         except OSError as error:
@@ -536,14 +556,19 @@ class Workload:
             raise EnvelopeError("workload thread did not stop within its bounded timeout")
         if self.fatal:
             raise EnvelopeError("; ".join(self.fatal))
+        write_errors = self.pwrite_errors + self.fsync_errors
+        writers = {
+            **latency_summary(self.write_latencies, write_errors),
+            "interval_seconds": self.write_interval,
+            "threads": self.writers,
+            "bytes_per_write": PAGE_BYTES,
+            "fsync_each_write": True,
+            "pwrite_errors": self.pwrite_errors,
+            "fsync_errors": self.fsync_errors,
+            "uncertain_files": sorted(self.uncertain_files),
+        }
         return {
-            "writers": {
-                **latency_summary(self.write_latencies, self.write_errors),
-                "interval_seconds": self.write_interval,
-                "threads": self.writers,
-                "bytes_per_write": PAGE_BYTES,
-                "fsync_each_write": True,
-            },
+            "writers": writers,
             "readers": {
                 **latency_summary(self.read_latencies, self.read_errors),
                 "interval_seconds": self.read_interval,
@@ -1087,6 +1112,28 @@ class Harness:
             "doctor": doctor,
         }
         self.report["request_accounting"] = self.request_accounting
+        uncertain_files = sorted(
+            set(first["writers"]["uncertain_files"])
+            | set(second["writers"]["uncertain_files"])
+        )
+        self.report["durability"] = {
+            "status": "unknown" if uncertain_files else "known",
+            "uncertain_files": uncertain_files,
+            "pwrite_errors": (
+                first["writers"]["pwrite_errors"]
+                + second["writers"]["pwrite_errors"]
+            ),
+            "fsync_errors": (
+                first["writers"]["fsync_errors"]
+                + second["writers"]["fsync_errors"]
+            ),
+        }
+        if uncertain_files:
+            self.report["status"] = "fail"
+            raise EnvelopeError(
+                "pwrite/fsync failures left uncertain durability for files "
+                f"{uncertain_files}; byte assertions completed but the run is not accepted"
+            )
         self.report["status"] = "pass"
         self.report["phase"] = "complete"
         self.report["ended_at"] = utc_now()

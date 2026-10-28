@@ -51,6 +51,14 @@ The raw JSON evidence contains:
 - unmount exit, remount readiness, `doctor` result, SQLite integrity and final
   latest-state bytes compared with the expected in-memory dataset.
 
+The expected-byte oracle advances after every successful `pwrite` segment, not
+only after the following `fsync`. Partial writes therefore remain represented
+in the local and remote byte assertions. `pwrite` failures and `fsync` failures
+are counted separately; a file remains durability-unknown until a later
+successful fsync covers its dirty bytes. Three consecutive write or fsync
+failures abort the phase; otherwise any unresolved uncertainty makes the run
+fail after the byte assertions are evaluated and recorded.
+
 File counts, dimensions, concurrency, sampling period and duration are bounded
 inputs, not extrapolated capacity. A run that exceeds the bounded interval or
 dataset is separate evidence.
@@ -148,12 +156,21 @@ The smoke reached the following bounded observations:
 
 An earlier 90-second run at source `7fd4d87602f3aa98b53dca31eeca9bf6d8ce2f3e`
 reported a same-length mismatch for `file-0015.bin` during the first-phase
-restore. The harness was strengthened to compare the mounted view before
-unmount and to record both byte hashes; the repeat at `79506c0` passed. The
-cause of the original mismatch is not established, so neither run is treated
-as a stable capacity result. The final integrated soak must detect,
-reproduce or explain this residual risk before claiming a settled operating
-envelope.
+restore. The original JSON did not retain per-operation error counters, so that
+historical event is not proven. Source review identified an oracle defect:
+the expected bytes were updated only after `fsync`, although a successful
+`pwrite` had already acknowledged bytes and a failed fsync could later be
+published by close/flush. A local tmp-file fault injection reproduced the
+result: the old oracle rejected the actual successful pwrite bytes, while the
+updated oracle matched them and reported `fsync_errors=1` and
+`uncertain_files=[0]`.
+
+The harness now advances expected bytes per successful pwrite segment, records
+pwrite and fsync failures separately, and fails a run after byte assertions if
+durability remains uncertain. The earlier 795 repeat passed with the enhanced
+verification, but the historical mismatch is not counted as a proven product
+defect. The final integrated soak must still retain the full byte assertions
+and resolve any observed durability uncertainty.
 
 Request count is unavailable for this smoke because no compatible
 process-scoped counter was supplied; the report keeps that field explicit
