@@ -281,6 +281,14 @@ may finish inside that window. A `NotFound` notification result is expected
 only explicit connection-ended errors (`ENODEV`, `ENOTCONN`, `EPIPE`,
 `ECONNRESET`, `ESHUTDOWN`) stop the batch before it would otherwise finish.
 
+Namespace callbacks do not issue synchronous `inval_entry` notifications before
+replying. The kernel already updates the dentry involved in CREATE, UNLINK or
+RENAME; a reverse entry invalidation from inside that request can deadlock while
+the kernel holds the related parent lock. Callback-side refresh updates only the
+adapter snapshot and pending overlay. Metadata-only inode invalidation and
+dentry invalidation remain confined to the explicit SIGHUP path, outside a
+related mutation request.
+
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at
 completion, so an acceptance harness can confirm a refresh finished.
