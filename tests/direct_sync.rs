@@ -601,7 +601,12 @@ async fn tampered_unknown_input_fails_without_dispatch() {
     let artifact = status
         .artifacts
         .iter()
-        .find(|artifact| artifact.kind == ArtifactKind::Upload && artifact.origin == "file")
+        .find(|artifact| {
+            artifact.kind == ArtifactKind::Upload
+                && artifact.origin == "file"
+                && std::fs::read(fixture.state.join("artifacts").join(&artifact.name))
+                    .is_ok_and(|bytes| bytes == b"v2")
+        })
         .unwrap();
     std::fs::write(
         fixture.state.join("artifacts").join(&artifact.name),
