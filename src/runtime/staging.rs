@@ -713,6 +713,10 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!temp.path().join("runtime.lock").exists());
+        eprintln!(
+            "unknown-profile read-only rejection files: {:?}",
+            names(temp.path())
+        );
         assert!(
             names(temp.path()).iter().all(|name| matches!(
                 name.as_str(),
