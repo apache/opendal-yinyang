@@ -647,6 +647,142 @@ fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart(
     remounted.unmount();
 }
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_fresh_open_after_external_replace_uses_new_snapshot_identity() {
+    let fixture = Fixture::new();
+    let old = payload(64 * 1024 + 7, 0x13);
+    let new = payload(16 * 1024 + 5, 0x6b);
+    fixture.write_raw("replace.txt", &old);
+    let staging = fixture.path("direct-write-replace-state");
+    let config = fixture.writable_config("direct-write-replace", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-replace");
+    fs::create_dir(&mountpoint).expect("create writable Direct replace mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("replace.txt");
+
+    let mut old_fd = File::open(&path).expect("open old Direct version");
+    let mut old_bytes = Vec::new();
+    old_fd
+        .read_to_end(&mut old_bytes)
+        .expect("read old Direct version");
+    assert_eq!(old_bytes, old);
+    fixture.write_raw("replace.txt", &new);
+    mounted.refresh_and_wait(Duration::from_secs(30));
+
+    let mut fresh = File::open(&path).expect("fresh Direct open after replacement");
+    assert_eq!(
+        fresh.metadata().expect("stat fresh Direct version").len(),
+        new.len() as u64,
+        "fresh Direct open reused cached old attributes"
+    );
+    let mut fresh_bytes = Vec::new();
+    fresh
+        .read_to_end(&mut fresh_bytes)
+        .expect("read fresh Direct version");
+    assert_eq!(
+        fresh_bytes, new,
+        "fresh Direct open reused cached old bytes"
+    );
+
+    old_fd
+        .seek(SeekFrom::Start(0))
+        .expect("rewind retained Direct fd");
+    match old_fd.read_to_end(&mut old_bytes) {
+        Ok(_) => assert_eq!(
+            old_bytes, old,
+            "retained Direct fd was rebased to replacement bytes"
+        ),
+        Err(error) => assert_errno(
+            &error,
+            &[libc::EIO, libc::ESTALE],
+            "retained Direct fd after replacement",
+        ),
+    }
+    drop(fresh);
+    drop(old_fd);
+    mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_unflushed_create_and_append_survive_crash() {
+    let fixture = Fixture::new();
+    let staging = fixture.path("direct-write-crash-state");
+    let config = fixture.writable_config("direct-write-crash", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-crash");
+    fs::create_dir(&mountpoint).expect("create writable Direct crash mountpoint");
+    let first_mount = fixture.spawn_writable_mount(&config, &mountpoint);
+
+    let created_bytes = b"fresh";
+    let mut created = File::create(first_mount.mountpoint().join("created-crash.txt"))
+        .expect("create unflushed Direct file");
+    created
+        .write_all(created_bytes)
+        .expect("write unflushed Direct create bytes");
+    assert_eq!(
+        created
+            .metadata()
+            .expect("stat unflushed Direct file")
+            .len(),
+        created_bytes.len() as u64
+    );
+    first_mount.crash();
+    drop(created);
+    assert_eq!(
+        fixture.raw_get("created-crash.txt"),
+        None,
+        "unflushed Direct create reached remote storage before crash"
+    );
+
+    let second_mount = fixture.spawn_writable_mount(&config, &mountpoint);
+    assert_eq!(
+        fs::read(second_mount.mountpoint().join("created-crash.txt"))
+            .expect("read recovered unflushed Direct create"),
+        created_bytes
+    );
+    let base = payload(16 * 1024 + 1, 0x2d);
+    fixture.write_raw("append-crash.txt", &base);
+    let mut mounted_again = second_mount;
+    mounted_again.refresh_and_wait(Duration::from_secs(30));
+    let mut append = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mounted_again.mountpoint().join("append-crash.txt"))
+        .expect("open existing Direct append file");
+    append
+        .seek(SeekFrom::End(0))
+        .expect("seek Direct append EOF");
+    let extension = b"-unflushed-extension";
+    append
+        .write_all(extension)
+        .expect("append unflushed Direct bytes");
+    assert_eq!(
+        append
+            .metadata()
+            .expect("stat unflushed Direct append")
+            .len(),
+        base.len() as u64 + extension.len() as u64
+    );
+    mounted_again.crash();
+    drop(append);
+    assert_eq!(
+        fixture.raw_get("append-crash.txt").as_deref(),
+        Some(base.as_slice()),
+        "unflushed Direct append reached remote storage before crash"
+    );
+
+    let final_mount = fixture.spawn_writable_mount(&config, &mountpoint);
+    let mut expected = base;
+    expected.extend_from_slice(extension);
+    assert_eq!(
+        fs::read(final_mount.mountpoint().join("append-crash.txt"))
+            .expect("read recovered unflushed Direct append"),
+        expected
+    );
+    final_mount.unmount();
+}
+
 fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     let fixture = Fixture::new();
     let original = payload(32 * 1024 + 1, 0x15);
