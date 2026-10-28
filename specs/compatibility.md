@@ -101,19 +101,33 @@ identity when the authenticated bytes and identities remain unchanged.
 
 Local staging, Sync, directory-journal, replica, and backup state have separate
 owners and schemas. Their specifications remain authoritative for supported
-transitions. The current repository accepts these identifiers:
+transitions. The current repository accepts this bounded matrix:
 
 | Local state | Current identifiers | Existing transition boundary |
 | --- | --- | --- |
-| File staging | `yinyang-stage-1`, `yinyang-stage-2` | [File-operation runtime](file-runtime.md) defines the supported stage-1 opening path. |
-| Sync journal | `yinyang-sync-1`, `yinyang-sync-2` | [Sync runtime](sync-runtime.md) defines the supported sync-1 opening path. |
-| Directory publication | `yinyang-directory-1` | [Directory transfer](directory-transfer.md) defines retained intent and receipt recovery. |
-| Directory replica | `yinyang-directory-replica-1` | The local-state specification must define its admission and recovery boundary. |
-| Backup manifest | `YYBK0001` version 1 | [Linux operations](linux-operations.md) defines the package boundary. |
+| File staging | `yinyang-stage-1`, `yinyang-stage-2` | Exact stage-1 schema upgrades once to stage-2 in a SQLite transaction; read-only inspection accepts both. |
+| Sync journal | `yinyang-sync-1`, `yinyang-sync-2` | Exact sync-1 schema upgrades once to sync-2 in a SQLite transaction; read-only inspection accepts both. |
+| Directory publication | `yinyang-directory-1` | The exact schema is read; there is no journal schema migration. Retained intents remain replayable. |
+| Directory replica | `yinyang-directory-replica-1` | Known base schemas and additive columns upgrade transactionally; required/unknown shapes are rejected. |
+| Backup manifest | `YYBK0001` version 1 | Package restore validates component profiles before creating destinations; only listed local transitions may run afterward. |
 
 This table inventories names only. It does not convert a local implementation
 gap into a core compatibility promise. A local format change must update its
 authoritative specification and this table in the same change.
+
+The authoritative local details are in
+[file operation](file-runtime.md), [Sync](sync-runtime.md), [directory
+transfer](directory-transfer.md), [Linux Sync](linux-sync.md), and
+[directory reconciliation](directory-sync.md). A writer preflights every
+existing component before changing any of them. Unknown profiles and partial
+known schemas fail before WAL configuration, DDL, runtime cleanup, replica
+recovery, or restore destination creation.
+
+The local regression fixtures downgrade current databases to known older shapes
+with explicit SQL. They prove the current reader/writer transitions and
+no-mutation rejection behavior, but they are not evidence produced by an old
+binary. Actual `fd1338c2` binary cross-read/recovery remains separate
+qualification; no result from these synthetic fixtures expands that boundary.
 
 ## Conformance evidence
 
