@@ -71,6 +71,27 @@ impl DirectMutationId {
     }
 }
 
+/// Process-local identity for one shared Direct object entry.
+///
+/// The value survives clean-entry rebinding across Direct snapshot pins and is
+/// intentionally not persisted across runtime restarts.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DirectObjectId([u8; 16]);
+
+impl DirectObjectId {
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn new() -> Self {
+        Self(*uuid::Uuid::new_v4().as_bytes())
+    }
+}
+
 /// The durable local state of one Direct object generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectObjectState {
@@ -81,6 +102,17 @@ pub enum DirectObjectState {
     Unknown,
     Failed,
     Discarded,
+}
+
+/// Explicit decision for one retained Conflict or Unknown object generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectConflictResolution {
+    /// Rebase local bytes onto the currently observed ETag/absence and stage a
+    /// new conditional generation.
+    KeepLocal,
+    /// Drop local bytes without a storage request and expose the current remote
+    /// namespace after refresh.
+    KeepRemote,
 }
 
 /// The operation represented by a durable Direct mutation.
@@ -246,6 +278,7 @@ impl ObjectIdentity {
 }
 
 struct ObjectEntry {
+    object_id: DirectObjectId,
     identity: ObjectIdentity,
     inner: AsyncMutex<ObjectInner>,
 }
@@ -269,6 +302,7 @@ struct ObjectInner {
 impl ObjectEntry {
     fn new(identity: ObjectIdentity, inner: ObjectInner) -> Self {
         Self {
+            object_id: DirectObjectId::new(),
             identity,
             inner: AsyncMutex::new(inner),
         }
@@ -292,7 +326,10 @@ impl DirectRuntime {
         path: &Path,
         binding: Option<&super::DirectStorageBinding>,
     ) -> Result<DirectRuntimeInspection> {
-        if !path.exists() {
+        if !path
+            .try_exists()
+            .map_err(|error| local_io("inspect Direct runtime path", error))?
+        {
             return Ok(DirectRuntimeInspection {
                 state: DirectRuntimeInspectionState::Missing,
                 profile: None,
@@ -302,8 +339,19 @@ impl DirectRuntime {
                 mutations: DirectMutationCounts::default(),
             });
         }
+        if !std::fs::metadata(path)
+            .map_err(|error| local_io("inspect Direct runtime path", error))?
+            .is_dir()
+        {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                "Direct runtime staging path is not a directory",
+            ));
+        }
         let database = path.join("runtime.db");
-        if !database.exists()
+        if !database
+            .try_exists()
+            .map_err(|error| local_io("inspect Direct runtime database", error))?
             || std::fs::metadata(&database)
                 .map_err(|error| local_io("inspect Direct runtime database", error))?
                 .len()
@@ -697,6 +745,98 @@ impl DirectRuntime {
         Ok(())
     }
 
+    /// Resolve one retained Conflict/Unknown object generation explicitly.
+    ///
+    /// `KeepLocal` rebases the retained bytes onto the currently observed
+    /// ETag/absence; the next flush still uses a conditional write. `KeepRemote`
+    /// removes only the local overlay and never mutates storage.
+    pub async fn resolve_object(
+        &self,
+        id: DirectId,
+        resolution: DirectConflictResolution,
+    ) -> Result<DirectObjectStatus> {
+        if self.read_only {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct runtime is read-only",
+            ));
+        }
+        let entry = if let Some(entry) = self.objects.lock().await.get(&id).cloned() {
+            entry
+        } else {
+            let store = self.store.as_ref().expect("writable runtime has a store");
+            let record = guard(store).object_by_id(*id.as_bytes())?.ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, "Direct local object is not retained")
+            })?;
+            entry_from_record(store, record)?
+        };
+        let mut inner = entry.inner.lock().await;
+        if !matches!(
+            inner.state,
+            DirectObjectState::Conflict | DirectObjectState::Unknown | DirectObjectState::Failed
+        ) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct object has no resolvable Conflict or Unknown state",
+            ));
+        }
+        let observation = self.observe_key(&entry.identity.key).await;
+        if matches!(observation, DirectObservation::Unavailable { .. }) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "cannot resolve Direct conflict without an exact observation",
+            ));
+        }
+        match resolution {
+            DirectConflictResolution::KeepLocal => {
+                match &observation {
+                    DirectObservation::Present(pin) => {
+                        let etag = pin.etag().ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Unsupported,
+                                "observed Direct object exposes no ETag",
+                            )
+                        })?;
+                        inner.precondition = Some(DirectPrecondition::Etag(etag.to_owned()));
+                        entry.identity.existed_remote.store(true, Ordering::SeqCst);
+                    }
+                    DirectObservation::Missing => {
+                        inner.precondition = Some(DirectPrecondition::Absent);
+                        entry.identity.existed_remote.store(false, Ordering::SeqCst);
+                    }
+                    DirectObservation::Unavailable { .. } => unreachable!("checked above"),
+                }
+                inner.generation = inner.generation.saturating_add(1);
+                inner.digest = None;
+                inner.state = DirectObjectState::Staged;
+                inner.accepted = None;
+                inner.observed = observation;
+                inner.pending_mutation = None;
+                inner.error = None;
+                let store = self.store.as_ref().expect("writable runtime has a store");
+                guard(store).put_object(&record_from_entry(&entry, &inner))?;
+                Ok(status_from_entry_locked(&entry, &inner))
+            }
+            DirectConflictResolution::KeepRemote => {
+                let store = self.store.as_ref().expect("writable runtime has a store");
+                let data = inner.data_path.take();
+                guard(store).remove_object(*entry.identity.id().as_bytes())?;
+                if let Some(data) = data {
+                    remove_if_exists(&data)?;
+                }
+                inner.state = DirectObjectState::Discarded;
+                inner.observed = observation;
+                inner.pending_mutation = None;
+                inner.error = Some("Direct local bytes were discarded explicitly".to_owned());
+                let status = status_from_entry_locked(&entry, &inner);
+                let id = entry.identity.id();
+                drop(inner);
+                self.objects.lock().await.remove(&id);
+                Ok(status)
+            }
+        }
+    }
+
     /// Conditionally delete one observed file.
     ///
     /// If a dirty local handle exists, its bytes remain readable while the name
@@ -794,7 +934,7 @@ impl DirectRuntime {
                 false,
             )
         };
-        let mutation = MutationRecord {
+        let mut mutation = MutationRecord {
             id: *DirectMutationId::new().as_bytes(),
             kind: MUTATION_KIND_DELETE,
             state: MUTATION_DISPATCHING,
@@ -817,7 +957,6 @@ impl DirectRuntime {
                 precondition_from_record(&mutation.source.as_ref().unwrap().precondition),
             )
             .await;
-        let mut mutation = mutation;
         match outcome {
             Ok(DirectMutationOutcome::Applied { .. }) => {
                 mutation.state = MUTATION_APPLIED;
@@ -879,7 +1018,10 @@ impl DirectRuntime {
             }
         }
         match object {
-            Some(object) => guard(store).put_records(&[object], &[mutation.clone()])?,
+            Some(object) => guard(store).put_records(
+                std::slice::from_ref(&object),
+                std::slice::from_ref(&mutation),
+            )?,
             None => guard(store).put_mutation(&mutation)?,
         }
         status_from_mutation(&mutation)
@@ -1177,6 +1319,7 @@ impl DirectRuntime {
     }
 
     async fn apply_mutation_to_object(&self, mutation: &MutationRecord) -> Result<()> {
+        let store = self.store.as_ref().expect("writable runtime has a store");
         let endpoint = match mutation.kind {
             MUTATION_KIND_PUBLISH | MUTATION_KIND_CREATE | MUTATION_KIND_COPY => {
                 mutation.destination.as_ref()
@@ -1206,6 +1349,17 @@ impl DirectRuntime {
         match mutation_state(mutation.state)? {
             DirectMutationState::Applied => {
                 if mutation.kind == MUTATION_KIND_DELETE {
+                    if inner.generation == inner.durable_generation {
+                        let data = inner.data_path.take();
+                        let id = entry.identity.id();
+                        drop(inner);
+                        guard(store).remove_object(*id.as_bytes())?;
+                        if let Some(data) = data {
+                            remove_if_exists(&data)?;
+                        }
+                        self.objects.lock().await.remove(&id);
+                        return Ok(());
+                    }
                     inner.state = DirectObjectState::Conflict;
                     inner.observed = observation_from_record(mutation.source_observed.clone());
                     inner.error =
@@ -1222,6 +1376,7 @@ impl DirectRuntime {
                     {
                         inner.precondition = Some(DirectPrecondition::Etag(etag));
                         inner.state = DirectObjectState::Clean;
+                        inner.pending_mutation = None;
                         inner.error = None;
                     }
                 }
@@ -1249,7 +1404,6 @@ impl DirectRuntime {
             _ => {}
         }
         let object = record_from_entry(&entry, &inner);
-        let store = self.store.as_ref().expect("writable runtime has a store");
         guard(store).put_object(&object)
     }
 
@@ -1650,17 +1804,17 @@ impl DirectRuntime {
         drop(candidates);
         if let Some(store) = &self.store {
             let record = { guard(store).object(key.as_str())? };
-            if let Some(record) = record {
-                if record.state != 0 {
-                    let entry = entry_from_record(store, record)?;
-                    return Ok(self
-                        .objects
-                        .lock()
-                        .await
-                        .entry(entry.identity.id())
-                        .or_insert_with(|| entry.clone())
-                        .clone());
-                }
+            if let Some(record) = record
+                && record.state != 0
+            {
+                let entry = entry_from_record(store, record)?;
+                return Ok(self
+                    .objects
+                    .lock()
+                    .await
+                    .entry(entry.identity.id())
+                    .or_insert_with(|| entry.clone())
+                    .clone());
             }
         }
 
@@ -1876,7 +2030,8 @@ impl DirectRuntime {
                 | DirectObjectState::Pending
                 | DirectObjectState::Failed
         ) {
-            return Ok(flush_outcome_from_entry(entry, &inner));
+            let mutation = inner.pending_mutation.unwrap_or_else(DirectMutationId::new);
+            return Ok(flush_outcome_from_entry(entry, &inner, mutation));
         }
         if inner.file.is_none() {
             return Err(Error::new(
@@ -1950,7 +2105,10 @@ impl DirectRuntime {
         let mut object = record_from_entry(entry, &inner);
         mutation.state = MUTATION_DISPATCHING;
         object.state = OBJECT_PENDING;
-        guard(store).put_records(&[object], &[mutation.clone()])?;
+        guard(store).put_records(
+            std::slice::from_ref(&object),
+            std::slice::from_ref(&mutation),
+        )?;
         inner.state = DirectObjectState::Pending;
 
         let outcome = self
@@ -1975,20 +2133,21 @@ impl DirectRuntime {
                 inner.observed = DirectObservation::Unavailable {
                     message: "not observed".to_owned(),
                 };
-                inner.pending_mutation = Some(mutation_id);
                 inner.durable_generation = inner.generation;
                 if let Some(etag) = accepted.as_ref().and_then(DirectObjectPin::etag) {
                     inner.precondition = Some(DirectPrecondition::Etag(etag.to_owned()));
                     inner.state = DirectObjectState::Clean;
+                    inner.pending_mutation = None;
                     inner.error = None;
                 } else {
                     inner.state = DirectObjectState::Failed;
+                    inner.pending_mutation = Some(mutation_id);
                     inner.error =
                         Some("successful Direct write response omitted an ETag".to_owned());
                 }
                 let object = record_from_entry(entry, &inner);
                 guard(store).put_records(&[object], &[mutation])?;
-                Ok(flush_outcome_from_entry(entry, &inner))
+                Ok(flush_outcome_from_entry(entry, &inner, mutation_id))
             }
             Ok(DirectMutationOutcome::Conflict { observed }) => {
                 mutation.state = MUTATION_CONFLICT;
@@ -2000,7 +2159,7 @@ impl DirectRuntime {
                 inner.error = mutation.error.clone();
                 let object = record_from_entry(entry, &inner);
                 guard(store).put_records(&[object], &[mutation])?;
-                Ok(flush_outcome_from_entry(entry, &inner))
+                Ok(flush_outcome_from_entry(entry, &inner, mutation_id))
             }
             Ok(DirectMutationOutcome::Unknown { observed, message }) => {
                 mutation.state = MUTATION_UNKNOWN;
@@ -2011,7 +2170,7 @@ impl DirectRuntime {
                 inner.error = Some(message);
                 let object = record_from_entry(entry, &inner);
                 guard(store).put_records(&[object], &[mutation])?;
-                Ok(flush_outcome_from_entry(entry, &inner))
+                Ok(flush_outcome_from_entry(entry, &inner, mutation_id))
             }
             Ok(DirectMutationOutcome::Unsupported { message }) => {
                 mutation.state = MUTATION_FAILED;
@@ -2020,7 +2179,7 @@ impl DirectRuntime {
                 inner.error = Some(message);
                 let object = record_from_entry(entry, &inner);
                 guard(store).put_records(&[object], &[mutation])?;
-                Ok(flush_outcome_from_entry(entry, &inner))
+                Ok(flush_outcome_from_entry(entry, &inner, mutation_id))
             }
             Err(error) => {
                 // Dispatch was durable before the call. A process-level or
@@ -2031,7 +2190,7 @@ impl DirectRuntime {
                 inner.error = Some(error.to_string());
                 let object = record_from_entry(entry, &inner);
                 guard(store).put_records(&[object], &[mutation])?;
-                Ok(flush_outcome_from_entry(entry, &inner))
+                Ok(flush_outcome_from_entry(entry, &inner, mutation_id))
             }
         }
     }
@@ -2048,6 +2207,10 @@ pub struct DirectFileHandle {
 impl DirectFileHandle {
     pub fn id(&self) -> DirectId {
         self.entry.identity.id()
+    }
+
+    pub fn object_id(&self) -> DirectObjectId {
+        self.entry.object_id
     }
 
     pub fn key(&self) -> &DirectKey {
@@ -2342,6 +2505,10 @@ fn record_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> ObjectRecord {
 
 async fn status_from_entry(entry: &ObjectEntry) -> DirectObjectStatus {
     let inner = entry.inner.lock().await;
+    status_from_entry_locked(entry, &inner)
+}
+
+fn status_from_entry_locked(entry: &ObjectEntry, inner: &ObjectInner) -> DirectObjectStatus {
     DirectObjectStatus {
         id: entry.identity.id(),
         key: entry.identity.key.clone(),
@@ -2429,8 +2596,11 @@ fn endpoint_from_record(record: &EndpointRecord) -> Result<DirectMutationEndpoin
     })
 }
 
-fn flush_outcome_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> DirectFlushOutcome {
-    let mutation = inner.pending_mutation.unwrap_or_else(DirectMutationId::new);
+fn flush_outcome_from_entry(
+    entry: &ObjectEntry,
+    inner: &ObjectInner,
+    mutation: DirectMutationId,
+) -> DirectFlushOutcome {
     match inner.state {
         DirectObjectState::Clean if inner.generation == inner.durable_generation => {
             if inner.accepted.is_some() {
@@ -2855,7 +3025,7 @@ mod tests {
         let status = file.status().await.unwrap();
         assert_eq!(status.state, DirectObjectState::Clean);
         assert!(status.existed_remote);
-        assert!(status.pending_mutation.is_some());
+        assert!(status.pending_mutation.is_none());
     }
 
     #[tokio::test]
@@ -2916,6 +3086,44 @@ mod tests {
             b"local"
         );
         assert_eq!(operator.read("file").await.unwrap().to_vec(), b"external");
+    }
+
+    #[tokio::test]
+    async fn keep_local_resolution_rebases_to_the_observed_etag() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let file_id = snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let file = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        file.truncate(0).await.unwrap();
+        file.write(0, b"local").await.unwrap();
+        operator.write("file", b"external".to_vec()).await.unwrap();
+        assert!(matches!(
+            file.flush().await.unwrap(),
+            DirectFlushOutcome::Conflict { .. }
+        ));
+
+        let status = runtime
+            .resolve_object(file.id(), DirectConflictResolution::KeepLocal)
+            .await
+            .unwrap();
+        assert_eq!(status.state, DirectObjectState::Staged);
+        assert!(status.pending_mutation.is_none());
+        assert!(matches!(
+            file.flush().await.unwrap(),
+            DirectFlushOutcome::Applied { .. }
+        ));
+        assert_eq!(operator.read("file").await.unwrap().to_vec(), b"local");
     }
 
     #[tokio::test]
@@ -3016,6 +3224,7 @@ mod tests {
             .open_file(&second_snapshot, second_id, false)
             .await
             .unwrap();
+        assert_ne!(old.object_id(), new.object_id());
         assert_eq!(new.read(0, 2).await.unwrap(), b"v2");
         assert_eq!(old.read(0, 2).await.unwrap_err().kind(), ErrorKind::Stale);
     }
@@ -3038,6 +3247,7 @@ mod tests {
         .unwrap();
         let reader = runtime.open_file(&snapshot, file_id, false).await.unwrap();
         let writer = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        assert_eq!(reader.object_id(), writer.object_id());
         writer.truncate(0).await.unwrap();
         writer.write(0, b"local").await.unwrap();
         assert_eq!(reader.read(0, 5).await.unwrap(), b"local");
@@ -3083,6 +3293,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reader.id(), second_id);
+        assert_eq!(reader.object_id(), writer.object_id());
         writer.append(b"!").await.unwrap();
         assert_eq!(reader.read(0, 4).await.unwrap(), b"one!");
     }
@@ -3249,6 +3460,43 @@ mod tests {
         ));
         assert!(operator.stat("file").await.is_err());
         assert_eq!(file.read(0, 5).await.unwrap(), b"local");
+    }
+
+    #[tokio::test]
+    async fn conditional_create_conflict_keeps_same_handle_readable() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "created")
+            .await
+            .unwrap();
+        file.write(0, b"local").await.unwrap();
+        operator
+            .write("created", b"external".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            file.flush().await.unwrap(),
+            DirectFlushOutcome::Conflict {
+                observed: DirectObservation::Present(_),
+                ..
+            }
+        ));
+        assert_eq!(file.read(0, 5).await.unwrap(), b"local");
+        assert_eq!(
+            operator.read("created").await.unwrap().to_vec(),
+            b"external"
+        );
     }
 
     #[tokio::test]
