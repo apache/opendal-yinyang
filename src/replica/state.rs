@@ -18,13 +18,307 @@
 use super::{Error, Result};
 use super::{LocalKind, LocalNode, LocalSnapshot};
 use crate::replica::linux::{ContentHash, Identity};
+use crate::runtime::schema;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use yinyang_core::{Node, NodeId, NodeKind, Revision};
 
 pub(super) const PROFILE: &str = "yinyang-directory-replica-1";
 pub(super) type IdentityMap = BTreeMap<(u64, u64), (u64, u64)>;
+
+const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[
+    (
+        "binding",
+        &[
+            "singleton",
+            "profile",
+            "filesystem",
+            "root",
+            "root_dev",
+            "root_ino",
+            "state_dev",
+            "state_ino",
+        ],
+    ),
+    ("baseline_meta", &["singleton", "revision"]),
+    (
+        "artifacts",
+        &[
+            "id",
+            "origin",
+            "name",
+            "kind",
+            "reason",
+            "remote_revision",
+            "phase",
+            "error",
+        ],
+    ),
+    (
+        "installs",
+        &[
+            "id",
+            "path",
+            "parent",
+            "name",
+            "temporary",
+            "temporary_dev",
+            "temporary_ino",
+            "expected_digest",
+            "expected_length",
+            "expected_dev",
+            "expected_ino",
+            "parent_dev",
+            "parent_ino",
+            "replacement_digest",
+            "replacement_length",
+            "remote_revision",
+            "artifact",
+            "phase",
+            "error",
+        ],
+    ),
+];
+const TABLE_NAMES: &[&str] = &[
+    "binding",
+    "baseline",
+    "baseline_meta",
+    "artifacts",
+    "installs",
+    "conflicts",
+    "work",
+];
+const CONFLICTS_SCHEMA: schema::TableColumns<'static> = (
+    "conflicts",
+    &[
+        "id",
+        "path",
+        "original_path",
+        "desired_path",
+        "local",
+        "remote",
+        "local_artifact",
+        "remote_node",
+        "remote_revision",
+        "error",
+    ],
+);
+const BASELINE_BASE: &[&str] = &[
+    "path",
+    "node",
+    "directory",
+    "executable",
+    "remote_digest",
+    "remote_length",
+    "local_present",
+    "local_digest",
+    "local_length",
+    "local_executable",
+    "local_dev",
+    "local_ino",
+    "local_parent_dev",
+    "local_parent_ino",
+];
+const BASELINE_OPTIONAL: &[&str] = &["remote_revision"];
+const WORK_BASE: &[&str] = &[
+    "id",
+    "path",
+    "original_path",
+    "desired_path",
+    "operation",
+    "local_kind",
+    "local_digest",
+    "local_length",
+    "local_executable",
+    "baseline_node",
+    "baseline_revision",
+    "remote_revision",
+    "state",
+    "error",
+];
+const WORK_OPTIONAL: &[&str] = &[
+    "seq",
+    "local_dev",
+    "local_ino",
+    "local_parent_dev",
+    "local_parent_ino",
+    "commit_id",
+    "conflict",
+    "source_artifact",
+];
+const WORK_UPGRADE_ORDER: &[&str] = &[
+    "seq",
+    "conflict",
+    "source_artifact",
+    "local_dev",
+    "local_ino",
+    "local_parent_dev",
+    "local_parent_ino",
+    "commit_id",
+];
+const WORK_COLUMNS: &[&str] = &[
+    "seq",
+    "id",
+    "path",
+    "original_path",
+    "desired_path",
+    "operation",
+    "local_kind",
+    "local_digest",
+    "local_length",
+    "local_executable",
+    "local_dev",
+    "local_ino",
+    "local_parent_dev",
+    "local_parent_ino",
+    "baseline_node",
+    "baseline_revision",
+    "remote_revision",
+    "commit_id",
+    "conflict",
+    "source_artifact",
+    "state",
+    "error",
+];
+const CREATE_CONFLICTS_TABLE: &str = "
+    CREATE TABLE conflicts(
+      id TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      original_path TEXT,
+      desired_path TEXT,
+      local TEXT NOT NULL,
+      remote TEXT NOT NULL,
+      local_artifact TEXT,
+      remote_node BLOB,
+      remote_revision BLOB,
+      error TEXT NOT NULL
+    );";
+const CREATE_WORK_TABLE: &str = "
+    CREATE TABLE work(
+      id BLOB PRIMARY KEY,
+      seq INTEGER NOT NULL DEFAULT 0,
+      path TEXT NOT NULL,
+      original_path TEXT,
+      desired_path TEXT,
+      operation TEXT NOT NULL,
+      local_kind TEXT,
+      local_digest BLOB,
+      local_length INTEGER,
+      local_executable INTEGER,
+      local_dev BLOB,
+      local_ino BLOB,
+      local_parent_dev BLOB,
+      local_parent_ino BLOB,
+      baseline_node BLOB,
+      baseline_revision BLOB NOT NULL,
+      remote_revision BLOB,
+      commit_id BLOB,
+      conflict TEXT,
+      source_artifact TEXT,
+      state TEXT NOT NULL,
+      error TEXT
+    );";
+
+const CREATE_SCHEMA: &str = "
+    CREATE TABLE binding(
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      profile TEXT NOT NULL,
+      filesystem BLOB NOT NULL,
+      root TEXT NOT NULL,
+      root_dev BLOB NOT NULL,
+      root_ino BLOB NOT NULL,
+      state_dev BLOB NOT NULL,
+      state_ino BLOB NOT NULL
+    );
+    CREATE TABLE baseline(
+      path TEXT PRIMARY KEY,
+      node BLOB NOT NULL,
+      directory INTEGER NOT NULL,
+      executable INTEGER NOT NULL,
+      remote_digest BLOB,
+      remote_length INTEGER,
+      local_present INTEGER NOT NULL,
+      local_digest BLOB,
+      local_length INTEGER,
+      local_executable INTEGER,
+      local_dev BLOB,
+      local_ino BLOB,
+      local_parent_dev BLOB,
+      local_parent_ino BLOB,
+      remote_revision BLOB
+    );
+    CREATE TABLE baseline_meta(
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      revision BLOB NOT NULL
+    );
+    CREATE TABLE artifacts(
+      id TEXT PRIMARY KEY,
+      origin TEXT NOT NULL,
+      name TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      remote_revision BLOB,
+      phase TEXT NOT NULL,
+      error TEXT
+    );
+    CREATE TABLE installs(
+      id TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      parent TEXT NOT NULL,
+      name TEXT NOT NULL,
+      temporary TEXT NOT NULL,
+      temporary_dev BLOB,
+      temporary_ino BLOB,
+      expected_digest BLOB NOT NULL,
+      expected_length INTEGER NOT NULL,
+      expected_dev BLOB NOT NULL,
+      expected_ino BLOB NOT NULL,
+      parent_dev BLOB NOT NULL,
+      parent_ino BLOB NOT NULL,
+      replacement_digest BLOB,
+      replacement_length INTEGER,
+      remote_revision BLOB,
+      artifact TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      error TEXT
+    );
+    CREATE TABLE conflicts(
+      id TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      original_path TEXT,
+      desired_path TEXT,
+      local TEXT NOT NULL,
+      remote TEXT NOT NULL,
+      local_artifact TEXT,
+      remote_node BLOB,
+      remote_revision BLOB,
+      error TEXT NOT NULL
+    );
+    CREATE TABLE work(
+      id BLOB PRIMARY KEY,
+      seq INTEGER NOT NULL DEFAULT 0,
+      path TEXT NOT NULL,
+      original_path TEXT,
+      desired_path TEXT,
+      operation TEXT NOT NULL,
+      local_kind TEXT,
+      local_digest BLOB,
+      local_length INTEGER,
+      local_executable INTEGER,
+      local_dev BLOB,
+      local_ino BLOB,
+      local_parent_dev BLOB,
+      local_parent_ino BLOB,
+      baseline_node BLOB,
+      baseline_revision BLOB NOT NULL,
+      remote_revision BLOB,
+      commit_id BLOB,
+      conflict TEXT,
+      source_artifact TEXT,
+      state TEXT NOT NULL,
+      error TEXT
+    );";
 
 #[derive(Clone, Debug)]
 pub(super) struct Binding {
@@ -173,137 +467,67 @@ pub(super) struct WorkRecord {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct Shape {
+    initialized: bool,
+    has_conflicts: bool,
+    has_work: bool,
+    baseline_remote_revision: bool,
+    work_columns: BTreeSet<String>,
+    work_missing: Vec<&'static str>,
+}
+
 pub(super) struct Store {
     connection: Connection,
+    shape: Shape,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path).map_err(|e| Error::io("open", path, e))?;
+        let exists = path
+            .try_exists()
+            .map_err(|e| Error::io("inspect", path, e))?;
+        let mut connection = Connection::open_with_flags(
+            path,
+            if exists {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            } else {
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            },
+        )
+        .map_err(|e| Error::io("open", path, e))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .map_err(|e| Error::io("configure replica timeout", path, e))?;
+        let empty = schema::table_names(&connection)
+            .map_err(|e| Error::io("read replica schema", path, e))?
+            .is_empty();
+        if empty {
+            let transaction = connection
+                .transaction()
+                .map_err(|e| Error::io("begin replica initialization", path, e))?;
+            transaction
+                .execute_batch(CREATE_SCHEMA)
+                .map_err(|e| Error::io("initialize replica state", path, e))?;
+            transaction
+                .commit()
+                .map_err(|e| Error::io("commit replica initialization", path, e))?;
+        } else {
+            let shape = validate_profile(&connection)?;
+            upgrade(&mut connection, &shape)?;
+        }
+        let shape = validate_profile(&connection)?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=FULL;
-                 PRAGMA foreign_keys=ON;
-                 CREATE TABLE IF NOT EXISTS binding(
-                   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                   profile TEXT NOT NULL,
-                   filesystem BLOB NOT NULL,
-                   root TEXT NOT NULL,
-                   root_dev BLOB NOT NULL,
-                   root_ino BLOB NOT NULL,
-                   state_dev BLOB NOT NULL,
-                   state_ino BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS baseline(
-                   path TEXT PRIMARY KEY,
-                   node BLOB NOT NULL,
-                   directory INTEGER NOT NULL,
-                   executable INTEGER NOT NULL,
-                   remote_digest BLOB,
-                   remote_length INTEGER,
-                   local_present INTEGER NOT NULL,
-                   local_digest BLOB,
-                   local_length INTEGER,
-                   local_executable INTEGER,
-                   local_dev BLOB,
-                   local_ino BLOB,
-                   local_parent_dev BLOB,
-                   local_parent_ino BLOB,
-                   remote_revision BLOB
-                 );
-                 CREATE TABLE IF NOT EXISTS baseline_meta(
-                   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                   revision BLOB NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS artifacts(
-                   id TEXT PRIMARY KEY,
-                   origin TEXT NOT NULL,
-                   name TEXT NOT NULL UNIQUE,
-                   kind TEXT NOT NULL,
-                   reason TEXT NOT NULL,
-                   remote_revision BLOB,
-                   phase TEXT NOT NULL,
-                   error TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS installs(
-                   id TEXT PRIMARY KEY,
-                   path TEXT NOT NULL,
-                   parent TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   temporary TEXT NOT NULL,
-                   temporary_dev BLOB,
-                   temporary_ino BLOB,
-                   expected_digest BLOB NOT NULL,
-                   expected_length INTEGER NOT NULL,
-                   expected_dev BLOB NOT NULL,
-                   expected_ino BLOB NOT NULL,
-                   parent_dev BLOB NOT NULL,
-                   parent_ino BLOB NOT NULL,
-                   replacement_digest BLOB,
-                   replacement_length INTEGER,
-                   remote_revision BLOB,
-                   artifact TEXT NOT NULL,
-                   phase TEXT NOT NULL,
-                   error TEXT
-                 );
-                 CREATE TABLE IF NOT EXISTS conflicts(
-                   id TEXT PRIMARY KEY,
-                   path TEXT NOT NULL,
-                   original_path TEXT,
-                   desired_path TEXT,
-                   local TEXT NOT NULL,
-                   remote TEXT NOT NULL,
-                   local_artifact TEXT,
-                   remote_node BLOB,
-                   remote_revision BLOB,
-                   error TEXT NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS work(
-                   id BLOB PRIMARY KEY,
-                   seq INTEGER NOT NULL DEFAULT 0,
-                   path TEXT NOT NULL,
-                   original_path TEXT,
-                   desired_path TEXT,
-                   operation TEXT NOT NULL,
-                   local_kind TEXT,
-                   local_digest BLOB,
-                   local_length INTEGER,
-                   local_executable INTEGER,
-                   local_dev BLOB,
-                   local_ino BLOB,
-                   local_parent_dev BLOB,
-                   local_parent_ino BLOB,
-                   baseline_node BLOB,
-                   baseline_revision BLOB NOT NULL,
-                   remote_revision BLOB,
-                   commit_id BLOB,
-                   conflict TEXT,
-                   source_artifact TEXT,
-                   state TEXT NOT NULL,
-                   error TEXT
-                 );",
+                 PRAGMA foreign_keys=ON;",
             )
-            .map_err(|e| Error::io("initialize replica state", path, e))?;
-        ensure_column(&connection, "baseline", "remote_revision", "BLOB")
-            .map_err(|e| Error::io("migrate replica baseline", path, e))?;
-        ensure_column(&connection, "work", "seq", "INTEGER NOT NULL DEFAULT 0")
-            .map_err(|e| Error::io("migrate replica work", path, e))?;
-        ensure_column(&connection, "work", "conflict", "TEXT")
-            .map_err(|e| Error::io("migrate replica work", path, e))?;
-        ensure_column(&connection, "work", "source_artifact", "TEXT")
-            .map_err(|e| Error::io("migrate replica work", path, e))?;
-        for column in [
-            "local_dev",
-            "local_ino",
-            "local_parent_dev",
-            "local_parent_ino",
-            "commit_id",
-        ] {
-            ensure_column(&connection, "work", column, "BLOB")
-                .map_err(|e| Error::io("migrate replica work", path, e))?;
-        }
-        Ok(Self { connection })
+            .map_err(|e| Error::io("configure replica state", path, e))?;
+        Ok(Self { connection, shape })
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
@@ -314,12 +538,33 @@ impl Store {
         )
         .map_err(|e| Error::io("open", path, e))?;
         connection
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .map_err(|e| Error::io("configure replica inspection", path, e))?;
+        let shape = if schema::table_names(&connection)
+            .map_err(|e| Error::io("read replica schema", path, e))?
+            .is_empty()
+        {
+            Shape {
+                initialized: false,
+                has_conflicts: false,
+                has_work: false,
+                baseline_remote_revision: false,
+                work_columns: BTreeSet::new(),
+                work_missing: Vec::new(),
+            }
+        } else {
+            validate_profile(&connection)?
+        };
+        connection
             .execute_batch("PRAGMA query_only=ON")
             .map_err(|e| Error::io("configure replica inspection", path, e))?;
-        Ok(Self { connection })
+        Ok(Self { connection, shape })
     }
 
     pub fn binding(&self) -> Result<Option<Binding>> {
+        if !self.shape.initialized {
+            return Ok(None);
+        }
         self.connection
             .query_row(
                 "SELECT filesystem,root,root_dev,root_ino,state_dev,state_ino
@@ -865,6 +1110,9 @@ impl Store {
     }
 
     pub fn load_baseline(&self) -> Result<Option<BaselineRecord>> {
+        if !self.shape.initialized {
+            return Ok(None);
+        }
         let revision: Option<Vec<u8>> = self
             .connection
             .query_row(
@@ -877,19 +1125,24 @@ impl Store {
         let Some(revision) = revision else {
             return Ok(None);
         };
-        let _revision: [u8; 24] = fixed(&revision, "baseline revision")
+        let global_revision: [u8; 24] = fixed(&revision, "baseline revision")
             .map_err(|e| Error::corrupt(format!("decode baseline revision: {e}")))?;
         let mut remote = BTreeMap::new();
         let mut local = BTreeMap::new();
+        let remote_revision = if self.shape.baseline_remote_revision {
+            "remote_revision"
+        } else {
+            "NULL AS remote_revision"
+        };
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT path,node,directory,executable,remote_digest,remote_length,
                         local_present,local_digest,local_length,local_executable,
                         local_dev,local_ino,local_parent_dev,local_parent_ino,
-                        remote_revision
-                 FROM baseline ORDER BY path",
-            )
+                        {remote_revision}
+                 FROM baseline ORDER BY path"
+            ))
             .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
         let rows = statement
             .query_map([], |row| -> rusqlite::Result<_> {
@@ -902,7 +1155,7 @@ impl Store {
                 let local_ino: Option<Vec<u8>> = row.get(11)?;
                 let local_parent_dev: Option<Vec<u8>> = row.get(12)?;
                 let local_parent_ino: Option<Vec<u8>> = row.get(13)?;
-                let revision: Vec<u8> = row.get(14)?;
+                let revision: Option<Vec<u8>> = row.get(14)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     NodeId::from_bytes(fixed(&node, "baseline node")?),
@@ -944,7 +1197,12 @@ impl Store {
                         .as_deref()
                         .map(|value| number(value, "baseline parent inode"))
                         .transpose()?,
-                    Revision::from_bytes(fixed(&revision, "baseline revision")?),
+                    revision
+                        .as_deref()
+                        .map(|value| fixed(value, "baseline entry revision"))
+                        .transpose()?
+                        .map(Revision::from_bytes)
+                        .unwrap_or_else(|| Revision::from_bytes(global_revision)),
                 ))
             })
             .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
@@ -1042,6 +1300,9 @@ impl Store {
     }
 
     pub fn conflicts(&self) -> Result<Vec<ConflictRecord>> {
+        if !self.shape.has_conflicts {
+            return Ok(Vec::new());
+        }
         let mut query = self
             .connection
             .prepare(
@@ -1202,15 +1463,25 @@ impl Store {
     }
 
     pub fn work(&self) -> Result<Vec<WorkRecord>> {
+        if !self.shape.has_work {
+            return Ok(Vec::new());
+        }
+        let projection = WORK_COLUMNS
+            .iter()
+            .map(|column| {
+                if self.shape.work_columns.contains(*column) {
+                    (*column).to_owned()
+                } else if *column == "seq" {
+                    "0 AS seq".to_owned()
+                } else {
+                    format!("NULL AS {column}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let mut query = self
             .connection
-            .prepare(
-                "SELECT seq,id,path,original_path,desired_path,operation,local_kind,local_digest,
-                        local_length,local_executable,local_dev,local_ino,local_parent_dev,
-                        local_parent_ino,baseline_node,baseline_revision,remote_revision,
-                        commit_id,conflict,source_artifact,state,error
-                 FROM work ORDER BY path,id",
-            )
+            .prepare(&format!("SELECT {projection} FROM work ORDER BY path,id"))
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
         query
             .query_map([], |row| {
@@ -1516,25 +1787,161 @@ fn fixed<const N: usize>(bytes: &[u8], name: &str) -> rusqlite::Result<[u8; N]> 
         .map_err(|_| corrupt_sql(format!("invalid {name} length")))
 }
 
-/// Add a column to an existing table when an older database predates it.
-/// `CREATE TABLE IF NOT EXISTS` only covers fresh databases.
-fn ensure_column(
-    connection: &Connection,
+fn validate_profile(connection: &Connection) -> Result<Shape> {
+    let profile: Option<String> = connection
+        .query_row("SELECT profile FROM binding WHERE singleton=1", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|error| Error::corrupt(format!("read replica profile: {error}")))?;
+    if profile.as_deref().is_some_and(|profile| profile != PROFILE) {
+        return Err(Error::unsupported(format!(
+            "replica state uses unsupported profile {}",
+            profile.as_deref().unwrap_or_default()
+        )));
+    }
+    let tables = schema::table_names(connection)
+        .map_err(|error| Error::corrupt(format!("read replica tables: {error}")))?;
+    if tables
+        .iter()
+        .any(|table| !TABLE_NAMES.contains(&table.as_str()))
+    {
+        return Err(Error::corrupt(
+            "replica state contains an unsupported table",
+        ));
+    }
+    if !schema::columns_match(connection, REQUIRED_SCHEMA)
+        .map_err(|error| Error::corrupt(format!("read replica schema: {error}")))?
+    {
+        return Err(Error::corrupt(
+            "replica state has an unsupported required-table schema",
+        ));
+    }
+
+    let baseline = schema::column_names(connection, "baseline")
+        .map_err(|error| Error::corrupt(format!("read baseline schema: {error}")))?
+        .ok_or_else(|| Error::corrupt("replica state is missing its baseline table"))?;
+    let baseline_set = baseline.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    validate_columns("baseline", &baseline_set, BASELINE_BASE, BASELINE_OPTIONAL)?;
+    let baseline_remote_revision = baseline_set.contains("remote_revision");
+
+    let has_conflicts = tables.contains("conflicts");
+    if has_conflicts
+        && !schema::columns_match(connection, &[CONFLICTS_SCHEMA])
+            .map_err(|error| Error::corrupt(format!("read conflict schema: {error}")))?
+    {
+        return Err(Error::corrupt(
+            "replica state has an unsupported conflicts schema",
+        ));
+    }
+
+    let has_work = tables.contains("work");
+    let mut work_columns = BTreeSet::new();
+    let mut work_missing = Vec::new();
+    if has_work {
+        let columns = schema::column_names(connection, "work")
+            .map_err(|error| Error::corrupt(format!("read work schema: {error}")))?
+            .ok_or_else(|| Error::corrupt("replica state is missing its work table"))?;
+        work_columns.extend(columns);
+        let work_set = work_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        validate_columns("work", &work_set, WORK_BASE, WORK_OPTIONAL)?;
+        work_missing = WORK_UPGRADE_ORDER
+            .iter()
+            .copied()
+            .filter(|column| !work_columns.contains(*column))
+            .collect();
+    }
+
+    Ok(Shape {
+        initialized: true,
+        has_conflicts,
+        has_work,
+        baseline_remote_revision,
+        work_columns,
+        work_missing,
+    })
+}
+
+fn validate_columns(
     table: &str,
-    column: &str,
-    declaration: &str,
-) -> rusqlite::Result<()> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let existing = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-    if existing.iter().any(|name| name == column) {
+    actual: &BTreeSet<&str>,
+    base: &[&str],
+    optional: &[&str],
+) -> Result<()> {
+    if base.iter().any(|column| !actual.contains(column)) {
+        return Err(Error::corrupt(format!(
+            "replica {table} table is missing a required column"
+        )));
+    }
+    if actual
+        .iter()
+        .any(|column| !base.contains(column) && !optional.contains(column))
+    {
+        return Err(Error::corrupt(format!(
+            "replica {table} table contains an unsupported column"
+        )));
+    }
+    Ok(())
+}
+
+fn upgrade(connection: &mut Connection, shape: &Shape) -> Result<()> {
+    if shape.has_conflicts
+        && shape.has_work
+        && shape.baseline_remote_revision
+        && shape.work_missing.is_empty()
+    {
         return Ok(());
     }
-    connection.execute_batch(&format!(
-        "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-    ))
+    let transaction = connection
+        .transaction()
+        .map_err(|error| Error::corrupt(format!("begin replica upgrade: {error}")))?;
+    if !shape.has_conflicts {
+        transaction
+            .execute_batch(CREATE_CONFLICTS_TABLE)
+            .map_err(|error| Error::corrupt(format!("create conflicts table: {error}")))?;
+    }
+    if !shape.baseline_remote_revision {
+        transaction
+            .execute_batch("ALTER TABLE baseline ADD COLUMN remote_revision BLOB")
+            .map_err(|error| Error::corrupt(format!("add baseline revision: {error}")))?;
+    }
+    if !shape.has_work {
+        transaction
+            .execute_batch(CREATE_WORK_TABLE)
+            .map_err(|error| Error::corrupt(format!("create work table: {error}")))?;
+    } else {
+        for column in &shape.work_missing {
+            let declaration = if *column == "seq" {
+                "INTEGER NOT NULL DEFAULT 0"
+            } else if matches!(*column, "conflict" | "source_artifact") {
+                "TEXT"
+            } else {
+                "BLOB"
+            };
+            transaction
+                .execute_batch(&format!(
+                    "ALTER TABLE work ADD COLUMN {column} {declaration}"
+                ))
+                .map_err(|error| Error::corrupt(format!("add work column {column}: {error}")))?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| Error::corrupt(format!("commit replica upgrade: {error}")))?;
+    let upgraded = validate_profile(connection)?;
+    if !upgraded.has_conflicts
+        || !upgraded.has_work
+        || !upgraded.baseline_remote_revision
+        || !upgraded.work_missing.is_empty()
+    {
+        return Err(Error::corrupt(
+            "replica upgrade did not produce the supported schema",
+        ));
+    }
+    Ok(())
 }
 
 fn number(bytes: &[u8], name: &str) -> rusqlite::Result<u64> {
@@ -1571,4 +1978,133 @@ fn corrupt_sql(message: impl Into<String>) -> rusqlite::Error {
         rusqlite::types::Type::Blob,
         Box::new(Error::corrupt(message)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replica::ErrorKind;
+
+    fn create_database(path: &Path, profile: &str, schema: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.execute_batch(schema).unwrap();
+        connection
+            .execute(
+                "INSERT INTO binding VALUES(1,?1,zeroblob(16),'/root',1,2,1,3)",
+                [profile],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unsupported_profile_is_rejected_before_sqlite_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("replica.db");
+        create_database(&path, "yinyang-directory-replica-99", CREATE_SCHEMA);
+        assert_eq!(
+            Store::open_read_only(&path).err().unwrap().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            Store::open(&path).err().unwrap().kind(),
+            ErrorKind::Unsupported
+        );
+        let connection = Connection::open(path).unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn readable_legacy_shape_upgrades_after_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("replica.db");
+        create_database(&path, PROFILE, CREATE_SCHEMA);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE baseline DROP COLUMN remote_revision;
+                 ALTER TABLE work DROP COLUMN seq;
+                 ALTER TABLE work DROP COLUMN conflict;
+                 ALTER TABLE work DROP COLUMN source_artifact;
+                 ALTER TABLE work DROP COLUMN local_dev;
+                 ALTER TABLE work DROP COLUMN local_ino;
+                 ALTER TABLE work DROP COLUMN local_parent_dev;
+                 ALTER TABLE work DROP COLUMN local_parent_ino;
+                 ALTER TABLE work DROP COLUMN commit_id;
+                 INSERT INTO work(
+                   id,path,original_path,desired_path,operation,local_kind,
+                   local_digest,local_length,local_executable,baseline_node,
+                   baseline_revision,remote_revision,state,error
+                 ) VALUES(
+                   zeroblob(32),'legacy',NULL,NULL,'content',NULL,NULL,NULL,NULL,
+                   NULL,zeroblob(24),NULL,'pending',NULL
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+        let store = Store::open_read_only(&path).unwrap();
+        let work = store.work().unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].seq, 0);
+        assert!(work[0].source_artifact.is_none());
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        let work = store.work().unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].path, "legacy");
+        let connection = Connection::open(path).unwrap();
+        let baseline: Vec<String> = {
+            let mut statement = connection.prepare("PRAGMA table_info(baseline)").unwrap();
+            statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert!(baseline.iter().any(|column| column == "remote_revision"));
+        let work: Vec<String> = {
+            let mut statement = connection.prepare("PRAGMA table_info(work)").unwrap();
+            statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        for column in WORK_OPTIONAL {
+            assert!(work.iter().any(|actual| actual == *column));
+        }
+    }
+
+    #[test]
+    fn known_profile_missing_a_required_column_is_not_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("replica.db");
+        create_database(&path, PROFILE, CREATE_SCHEMA);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE work DROP COLUMN path")
+            .unwrap();
+        assert_eq!(
+            Store::open_read_only(&path).err().unwrap().kind(),
+            ErrorKind::Corrupt
+        );
+        assert_eq!(Store::open(&path).err().unwrap().kind(), ErrorKind::Corrupt);
+        let connection = Connection::open(path).unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        let work: Vec<String> = {
+            let mut statement = connection.prepare("PRAGMA table_info(work)").unwrap();
+            statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert!(!work.iter().any(|column| column == "path"));
+    }
 }

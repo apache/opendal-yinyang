@@ -104,7 +104,9 @@ object publication additionally requires conditional replacement. Service
 publication relies on the service transaction authority for metadata atomicity.
 Direct instead requires stat, read, recursive list, version reads, and
 conditional ETag reads. It never negotiates write or Managed transaction
-primitives.
+primitives. The selected service must also enumerate current keys exactly:
+capability flags cannot repair a lossy LIST that hides `a/b` when file key `a`
+exists, because the mount layer cannot read a key name it never receives.
 
 Writable baseline capabilities are read, list, write, append, truncate,
 atomic-rename, stable-identity, pinned-reads, retained-unlink-read, remote-fsync,

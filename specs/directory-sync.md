@@ -24,6 +24,25 @@ The baseline exists only after admission and is stored in the replica database.
 Status never reports `in_sync` for a binding without an accepted common
 baseline.
 
+Profile `yinyang-directory-replica-1` binds the state to one filesystem. Its
+required tables and positionally inserted columns have exact signatures. The
+historically additive columns remain supported upgrade inputs:
+
+- `baseline.remote_revision`;
+- `work.seq`, `work.conflict`, `work.source_artifact`, `work.local_dev`,
+  `work.local_ino`, `work.local_parent_dev`, `work.local_parent_ino`, and
+  `work.commit_id`;
+- the historical absence of the `work` table before managed reconciliation was
+  introduced.
+
+`baseline` and `work` queries name their columns, so those two tables accept
+their historical column order. Every missing required base column or unknown
+column is corruption. A writer validates the complete known shape, then adds all
+known missing columns in one SQLite transaction using the historical upgrade
+order; an unbound table set may be initialized with the profile inserted by
+`sync init`. Read-only inspection accepts the known old shapes and synthesizes
+neutral values for absent historical columns without writing.
+
 ## Admission
 
 An unbound state directory admits exactly one empty side. Recreation validates

@@ -353,6 +353,29 @@ impl Replica {
         Ok(replica)
     }
 
+    /// Validate existing replica state without taking the lease, upgrading the
+    /// schema, recovering installs, or observing the local root.
+    pub(super) fn validate_existing(state: &Path, filesystem: NodeId) -> Result<()> {
+        let path = state.join("replica.db");
+        if !path
+            .try_exists()
+            .map_err(|e| Error::io("inspect", &path, e))?
+        {
+            return Ok(());
+        }
+        let store = Store::open_read_only(&path)?;
+        if let Some(binding) = store.binding()?
+            && binding.filesystem != filesystem
+        {
+            return Err(Error::invalid(format!(
+                "replica is bound to filesystem {}, not {}",
+                hex(binding.filesystem.as_bytes()),
+                hex(filesystem.as_bytes())
+            )));
+        }
+        Ok(())
+    }
+
     pub fn open(state: &Path, filesystem: NodeId) -> Result<Self> {
         let state =
             std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;

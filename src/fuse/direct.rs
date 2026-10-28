@@ -191,6 +191,13 @@ impl DirectInner {
         guard(&self.dentries).insert((parent.0, name.to_owned()));
     }
 
+    fn live_file_attr(&self, id: DirectId) -> Option<FileAttr> {
+        guard(&self.files)
+            .values()
+            .find(|open| open._file.id() == id)
+            .map(|open| open.attr)
+    }
+
     async fn refresh_once(&self) {
         match self.namespace.observe().await {
             Ok(snapshot) => {
@@ -303,6 +310,9 @@ impl DirectInner {
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
+        if let Some(attr) = self.live_file_attr(id) {
+            return reply.attr(&ATTR_TTL, &attr);
+        }
         let snapshot = match self.current() {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),

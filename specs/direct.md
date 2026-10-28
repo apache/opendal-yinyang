@@ -36,7 +36,13 @@ Direct admission accepts only:
 - the `amazon-s3` and `minio` profiles;
 - an S3 operator that reports `stat`, `read`, recursive `list`, version reads,
   and conditional ETag reads. Both read pin modes are required because bucket
-  versioning state does not prove that every object has an immutable version.
+  versioning state does not prove that every object has an immutable version;
+- a conforming backend whose LIST returns every current object key exactly.
+  A service that hides a descendant such as `a/b` merely because file key `a`
+  exists cannot be repaired by the mount layer: with no key name, no
+  read-only API can discover the omitted object. Capability flags describe
+  operations, not this exact-enumeration property, so selecting a conforming
+  service remains an operator prerequisite.
 
 The mount entry point also requires `frontend=fuse`. Unsupported access,
 publication, frontend, write policy or required capabilities fail before the
@@ -73,16 +79,17 @@ The observation also rejects, with the original object keys in the diagnostic:
 - a file-prefix collision such as keys `a` and `a/b`;
 - any two keys that map to one path.
 
-One unrepresentable object rejects the complete observation. The adapter never
-filters an object out of a successful listing.
+One unrepresentable object returned by a conforming LIST rejects the complete
+observation. The adapter never filters an object out of a successful listing.
 
 ## Namespace observation
 
-`DirectNamespace::observe` performs one recursive OpenDAL list and builds a
-complete immutable `DirectSnapshot`. A multi-page S3 list is not an atomic
-namespace snapshot: external writers can make different pages describe
-different moments. `DirectRevision` identifies the exact accepted result; it
-does not claim transaction isolation.
+`DirectNamespace::observe` performs one recursive OpenDAL list and builds an
+immutable `DirectSnapshot` complete over the exact key set returned by that
+conforming list. A multi-page S3 list is not an atomic namespace snapshot:
+external writers can make different pages describe different moments.
+`DirectRevision` identifies the exact accepted result; it does not claim
+transaction isolation.
 
 The FUSE adapter accepts one snapshot at startup and reuses it for LOOKUP,
 GETATTR and directory enumeration. `SIGHUP` observes and atomically replaces
@@ -183,6 +190,9 @@ staging database, metadata database, publication lease or remote object.
   profile; it does not auto-detect arbitrary S3-compatible semantics.
 - Recursive enumeration memory and request cost grow with namespace size.
 - LIST pages are not an atomic cross-page snapshot.
+- The selected service must return exact keys. A lossy LIST that omits hidden
+  descendants cannot be made complete by guessing key names or by per-object
+  probes, and such a service is outside the Direct support boundary.
 - Directory markers, invalid components and file-prefix collisions reject the
   complete view rather than being renamed by mutating storage.
 - The current version rejects empty components; it does not define an

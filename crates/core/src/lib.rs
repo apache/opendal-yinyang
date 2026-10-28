@@ -18,6 +18,7 @@
 //! Indexed transactional filesystem and authenticated immutable content.
 
 mod authority;
+mod compatibility;
 pub mod data;
 pub use authority::Authority;
 mod error;
@@ -39,6 +40,8 @@ pub use object::{
 pub use snapshot::{DirectoryPage, FileVersion, ScanToken};
 pub use transaction::{Planner, Transaction};
 
+#[cfg(test)]
+mod compatibility_tests;
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod support;

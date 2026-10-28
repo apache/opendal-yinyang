@@ -19,6 +19,7 @@
 use super::{
     DirectoryManifest, install_directory, prepare_directory_request, validate_install_entries,
 };
+use crate::runtime::schema;
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,24 @@ use yinyang_core::{
 };
 
 const PROFILE: &str = "yinyang-directory-1";
+const SCHEMA: &[schema::TableColumns<'static>] = &[
+    ("binding", &["singleton", "profile", "filesystem", "root"]),
+    (
+        "publications",
+        &[
+            "commit_id",
+            "baseline",
+            "request_digest",
+            "source",
+            "request",
+            "manifest",
+            "state",
+            "receipt_revision",
+            "receipt_ordinal",
+            "failure",
+        ],
+    ),
+];
 const PREPARED: u8 = 0;
 const UNKNOWN: u8 = 1;
 const COMMITTED: u8 = 2;
@@ -163,57 +182,27 @@ impl DirectoryJournal {
         let filesystem = *fs.filesystem().as_bytes();
         let root = *fs.root().as_bytes();
         let database = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut connection = Connection::open(path).map_err(sql)?;
+            let exists = path.try_exists().map_err(local)?;
+            let mut connection = Connection::open_with_flags(
+                &path,
+                if exists {
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                } else {
+                    OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | OpenFlags::SQLITE_OPEN_CREATE
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                },
+            )
+            .map_err(sql)?;
             connection
                 .busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(sql)?;
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            let has_binding: bool = tx
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM sqlite_master WHERE type='table' AND name='binding'
-                     )",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(sql)?;
-            if has_binding {
+            if exists && !schema::matches(&tx, &[]).map_err(sql)? {
                 validate_binding(&tx, filesystem, root)?;
-                let has_publications: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM sqlite_master
-                            WHERE type='table' AND name='publications'
-                         )",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql)?;
-                if !has_publications {
-                    return Err(Error::local_kind(
-                        ErrorKind::Corrupt,
-                        "directory journal is missing its publications table",
-                    ));
-                }
             } else {
-                let has_tables: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM sqlite_master
-                            WHERE type='table' AND name NOT LIKE 'sqlite_%'
-                         )",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql)?;
-                if has_tables {
-                    return Err(Error::local_kind(
-                        ErrorKind::Corrupt,
-                        "directory journal is missing its binding",
-                    ));
-                }
                 tx.execute_batch(
                     "CREATE TABLE binding(
                          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -241,6 +230,7 @@ impl DirectoryJournal {
                 )
                 .map_err(sql)?;
             }
+            validate_binding(&tx, filesystem, root)?;
             tx.commit().map_err(sql)?;
             connection
                 .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
@@ -570,6 +560,12 @@ impl DirectoryJournal {
                     "directory journal uses an unsupported profile",
                 ));
             }
+            if !schema::matches(&connection, SCHEMA).map_err(sql)? {
+                return Err(Error::local_kind(
+                    ErrorKind::Corrupt,
+                    format!("directory journal profile {profile} has an unsupported schema"),
+                ));
+            }
             let mut statement = connection
                 .prepare(
                     "SELECT commit_id,baseline,request_digest,source,request,manifest,
@@ -752,6 +748,12 @@ fn validate_binding(connection: &Connection, filesystem: [u8; 16], root: [u8; 16
         return Err(Error::local_kind(
             ErrorKind::Unsupported,
             "directory journal uses an unsupported profile",
+        ));
+    }
+    if !schema::matches(connection, SCHEMA).map_err(sql)? {
+        return Err(Error::local_kind(
+            ErrorKind::Corrupt,
+            format!("directory journal profile {profile} has an unsupported schema"),
         ));
     }
     if bound_filesystem != filesystem || bound_root != root {
