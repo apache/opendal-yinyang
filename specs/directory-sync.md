@@ -41,7 +41,10 @@ column is corruption. A writer validates the complete known shape, then adds all
 known missing columns in one SQLite transaction using the historical upgrade
 order; an unbound table set may be initialized with the profile inserted by
 `sync init`. Read-only inspection accepts the known old shapes and synthesizes
-neutral values for absent historical columns without writing.
+neutral values for absent historical columns without changing the authoritative
+database or existing WAL/journal bytes. SQLite may create an empty `-wal` and
+may create or update derived `-shm`; existing WAL/journal bytes remain
+protected.
 
 ## Admission
 
