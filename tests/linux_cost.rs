@@ -145,6 +145,7 @@ struct RunContext {
     metadata_transport: String,
     network_source: String,
     range_cache_policy: String,
+    expect_range_reuse: bool,
     source_sha: String,
     source_dirty: bool,
     binary_path: String,
@@ -360,6 +361,7 @@ fn linux_cost_benchmark() {
     };
     let range_cache_policy = std::env::var("YINYANG_COST_RANGE_POLICY")
         .unwrap_or_else(|_| "unspecified; select the exact measured binary policy".to_owned());
+    let expect_range_reuse = std::env::var("YINYANG_COST_EXPECT_RANGE_REUSE").as_deref() == Ok("1");
     let context = RunContext {
         profile,
         workload,
@@ -368,6 +370,7 @@ fn linux_cost_benchmark() {
         metadata_transport,
         network_source,
         range_cache_policy,
+        expect_range_reuse,
         source_sha,
         source_dirty,
         binary_blake3: blake3_file(&binary_path),
@@ -1111,6 +1114,12 @@ fn run_repeated_random_matrix(
             expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
         );
     });
+    if context.expect_range_reuse {
+        assert_eq!(
+            repeated.network.requests, 0,
+            "same-range warm reads must reuse the exact immutable version"
+        );
+    }
     repeated.record(
         recorder,
         context,
@@ -1168,6 +1177,12 @@ fn run_repeated_random_matrix(
                 expected[boundary_offset as usize..boundary_offset as usize + boundary_length]
             );
         });
+    if context.expect_range_reuse {
+        assert_eq!(
+            boundary_warm.network.requests, 0,
+            "warm boundary reads must reuse both immutable units and their proofs"
+        );
+    }
     boundary_warm.record(
         recorder,
         context,
@@ -1222,6 +1237,12 @@ fn run_repeated_random_matrix(
                 expected[offset as usize..offset as usize + RANGE_BYTES]
             );
         });
+    if context.expect_range_reuse {
+        assert_eq!(
+            hot_warm.network.requests, 0,
+            "the filled hot working set must remain within the configured reuse bound"
+        );
+    }
     hot_warm.record(
         recorder,
         context,
@@ -3073,6 +3094,7 @@ impl Recorder {
                 metadata_transport: context.metadata_transport.clone(),
                 network_source: context.network_source.clone(),
                 range_cache_policy: context.range_cache_policy.clone(),
+                expect_range_reuse: context.expect_range_reuse,
                 source_sha: context.source_sha.clone(),
                 source_dirty: context.source_dirty,
                 binary_path: context.binary_path.clone(),

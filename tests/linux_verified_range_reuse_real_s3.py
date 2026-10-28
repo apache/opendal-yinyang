@@ -64,6 +64,9 @@ def main() -> int:
     output = required_environment("YINYANG_BENCH_OUTPUT")
     label = required_environment("YINYANG_BENCH_LABEL")
     range_policy = required_environment("YINYANG_BENCH_RANGE_POLICY")
+    expect_reuse = os.environ.get("YINYANG_BENCH_EXPECT_REUSE", "0")
+    if expect_reuse not in {"0", "1"}:
+        raise SystemExit("YINYANG_BENCH_EXPECT_REUSE must be 0 or 1")
     if not re.fullmatch(r"[a-z0-9-]+", label):
         raise SystemExit("YINYANG_BENCH_LABEL must contain lowercase letters, digits and hyphens")
     region = os.environ.get("YINYANG_QUALIFICATION_REGION", "us-east-2")
@@ -118,6 +121,7 @@ def main() -> int:
                 f"Amazon S3 {region} over HTTPS; role-scoped non-loopback fixture"
             ),
             "YINYANG_COST_RANGE_POLICY": range_policy,
+            "YINYANG_COST_EXPECT_RANGE_REUSE": expect_reuse,
         }
     )
 
