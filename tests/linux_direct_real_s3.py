@@ -80,6 +80,9 @@ def main() -> int:
     aws_cli = os.environ.get("AWS_CLI_BIN", "aws")
     if shutil.which(aws_cli) is None:
         raise SystemExit(f"AWS CLI is not executable: {aws_cli}")
+    aws_version = subprocess.check_output(
+        [aws_cli, "--version"], stderr=subprocess.STDOUT, text=True
+    ).strip()
 
     inherited = {
         name: value
@@ -123,7 +126,7 @@ def main() -> int:
         "real Amazon S3 Direct qualification: "
         f"source={source} region={region} "
         f"unversioned={unversioned} versioned={versioned} "
-        f"aws_cli={aws_cli}",
+        f"aws_cli={aws_cli} aws_version={aws_version}",
         flush=True,
     )
     completed = subprocess.run(

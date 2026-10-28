@@ -244,16 +244,7 @@ impl AwsS3 {
 
     fn get(&self, key: &str, version: Option<&str>, if_match: Option<&str>) -> (Vec<u8>, Value) {
         let output_file = NamedTempFile::new().expect("create S3 GET output");
-        let mut args = vec![
-            "--key".to_owned(),
-            key.to_owned(),
-            "--outfile".to_owned(),
-            output_file
-                .path()
-                .to_str()
-                .expect("S3 GET output path is UTF-8")
-                .to_owned(),
-        ];
+        let mut args = vec!["--key".to_owned(), key.to_owned()];
         if let Some(version) = version {
             args.push("--version-id".to_owned());
             args.push(version.to_owned());
@@ -262,6 +253,13 @@ impl AwsS3 {
             args.push("--if-match".to_owned());
             args.push(if_match.to_owned());
         }
+        args.push(
+            output_file
+                .path()
+                .to_str()
+                .expect("S3 GET output path is UTF-8")
+                .to_owned(),
+        );
         let output = self.s3api("get-object", &args, Duration::from_secs(180));
         output.success_or(&format!("AWS CLI exact GET for {key:?}"));
         let value: Value = serde_json::from_slice(&output.stdout).expect("GET JSON");
@@ -279,6 +277,7 @@ impl AwsS3 {
                 prefix.to_owned(),
                 "--max-keys".to_owned(),
                 max_keys.to_string(),
+                "--no-paginate".to_owned(),
             ];
             if let Some(continuation) = &continuation {
                 args.push("--continuation-token".to_owned());
@@ -319,7 +318,11 @@ impl AwsS3 {
         let mut version_marker: Option<String> = None;
         let mut versions = Vec::new();
         loop {
-            let mut args = vec!["--prefix".to_owned(), prefix.to_owned()];
+            let mut args = vec![
+                "--prefix".to_owned(),
+                prefix.to_owned(),
+                "--no-paginate".to_owned(),
+            ];
             if let Some(key_marker) = &key_marker {
                 args.push("--key-marker".to_owned());
                 args.push(key_marker.clone());
