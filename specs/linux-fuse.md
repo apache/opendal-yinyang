@@ -293,12 +293,15 @@ An `unlink` or `rename` precondition conflict does not install a refreshed
 remote snapshot and returns `EAGAIN`, not `ESTALE`. Linux namei automatically
 retries `ESTALE` once inside the same syscall; a concurrent global refresh
 could make that retry use the external source or destination pin as a new
-intent. `EAGAIN` leaves the decision to an explicit caller retry.
+intent. `EAGAIN` prevents that implicit retry and leaves the decision to the
+caller.
 
-The pending Conflict observation remains visible, and the failed snapshot is
-retained. Explicit `SIGHUP` performs the rebase needed before a later operation
-can target the observed replacement. Lookup or handle failures that cannot
-revalidate identity continue to report `ESTALE`.
+The pending Conflict observation remains visible, and the failed callback does
+not install a refreshed snapshot. A caller can explicitly refresh with `SIGHUP`
+and then issue a new operation. Any later caller-owned request is a new intent
+and may observe a later accepted global snapshot, including one advanced by an
+unrelated successful mutation. Lookup or handle failures that cannot revalidate
+identity continue to report `ESTALE`.
 
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at
