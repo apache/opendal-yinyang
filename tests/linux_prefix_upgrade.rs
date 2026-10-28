@@ -340,10 +340,6 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         SYNC_V2
     );
 
-    run_ok(
-        current_yy_command(&current_yy, &storage, &service_root).args(["create"]),
-        "fd1338c create installed service authority",
-    );
     let service_database = temp.path().join("metadata/metadata.db");
     fs::create_dir_all(service_database.parent().expect("metadata parent"))
         .expect("create metadata directory");
