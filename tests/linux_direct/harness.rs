@@ -203,7 +203,7 @@ impl Fixture {
     }
 
     pub fn spawn_mount(&self, config: &Path, mountpoint: &Path, _frontend: &str) -> Mounted {
-        let mut command = self.yy_command(&[
+        let command = self.yy_command(&[
             "--volume",
             config.to_str().expect("Direct config path is UTF-8"),
             "mount",
@@ -211,6 +211,23 @@ impl Fixture {
                 .to_str()
                 .expect("Direct mountpoint path is UTF-8"),
         ]);
+        Mounted::spawn(command, mountpoint)
+    }
+
+    fn full_key(&self, key: &str) -> String {
+        format!("{}/{key}", self.root)
+    }
+}
+
+pub struct Mounted {
+    child: Option<Child>,
+    mountpoint: PathBuf,
+    logs: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl Mounted {
+    pub fn spawn(mut command: Command, mountpoint: &Path) -> Self {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
             .spawn()
@@ -229,20 +246,6 @@ impl Fixture {
         mounted.wait_visible(Duration::from_secs(30));
         mounted
     }
-
-    fn full_key(&self, key: &str) -> String {
-        format!("{}/{key}", self.root)
-    }
-}
-
-pub struct Mounted {
-    child: Option<Child>,
-    mountpoint: PathBuf,
-    logs: Arc<Mutex<Vec<u8>>>,
-    readers: Vec<JoinHandle<()>>,
-}
-
-impl Mounted {
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
