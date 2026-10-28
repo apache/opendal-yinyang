@@ -585,6 +585,7 @@ class Harness:
         ]
         self.root = f"linux-operating-envelope/{uuid.uuid4().hex}"
         self.env = self.storage_environment()
+        self.aws_cli = os.environ.get("AWS_CLI_BIN", "aws")
         self.aws_env = self.aws_environment()
         self.config = self.config_dir / "envelope.json"
         self.mount = MountProcess(
@@ -639,6 +640,15 @@ class Harness:
             name: value
             for name, value in os.environ.items()
             if not name.startswith("YINYANG_")
+            and name
+            not in {
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_SECURITY_TOKEN",
+                "AWS_ENDPOINT_URL",
+                "AWS_ENDPOINT_URL_S3",
+            }
         }
         env["AWS_ACCESS_KEY_ID"] = self.source_environment[
             "YINYANG_S3_ACCESS_KEY_ID"
@@ -650,8 +660,13 @@ class Harness:
             env["AWS_SESSION_TOKEN"] = token
         else:
             env.pop("AWS_SESSION_TOKEN", None)
+        env["AWS_REGION"] = self.source_environment["YINYANG_S3_REGION"]
         env["AWS_DEFAULT_REGION"] = self.source_environment["YINYANG_S3_REGION"]
+        env["AWS_CONFIG_FILE"] = os.devnull
+        env["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
         env["AWS_EC2_METADATA_DISABLED"] = "true"
+        env["AWS_PAGER"] = ""
+        env["AWS_CLI_BIN"] = self.aws_cli
         return env
 
     def run(
@@ -688,10 +703,21 @@ class Harness:
 
     def aws(self, arguments: list[str], timeout: float = 120) -> dict[str, Any]:
         completed = self.run(
-            ["aws", "s3api", *arguments, "--output", "json"],
+            [
+                self.aws_cli,
+                "s3api",
+                *arguments,
+                "--region",
+                self.source_environment["YINYANG_S3_REGION"],
+                "--no-cli-pager",
+                "--output",
+                "json",
+            ],
             self.aws_env,
             timeout=timeout,
         )
+        if not completed.stdout.strip():
+            return {}
         try:
             return json.loads(completed.stdout)
         except json.JSONDecodeError as error:
@@ -700,9 +726,11 @@ class Harness:
     def preflight(self) -> None:
         if platform.system() != "Linux" or platform.machine() != "x86_64":
             raise EnvelopeError("operating-envelope qualification requires Linux x86_64")
-        for command in ("aws", "fusermount3", "sqlite3"):
+        for command in ("fusermount3", "sqlite3"):
             if shutil.which(command) is None:
                 raise EnvelopeError(f"required command is unavailable: {command}")
+        if shutil.which(self.aws_cli) is None:
+            raise EnvelopeError(f"AWS CLI is not executable: {self.aws_cli}")
         if not Path("/dev/fuse").exists():
             raise EnvelopeError("/dev/fuse is unavailable")
         if not self.yy.is_file():

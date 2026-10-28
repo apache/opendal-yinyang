@@ -84,22 +84,31 @@ The workload does not establish:
 
 ## Reproduce
 
-Build or install the selected binary on Linux, provide isolated S3 settings in
-the environment, and point the harness at a private output path:
+Build or install the selected binary on Linux. The credential wrapper reads one
+short-lived STS Credentials JSON document from stdin, removes inherited
+credential and endpoint overrides, and invokes the measured binary:
 
 ```shell
-python3 tests/linux_operating_envelope.py \
-  --yy "$HOME/.local/lib/yinyang/current/bin/yy" \
-  --source-sha "$(git rev-parse HEAD)" \
-  --backend-label amazon-s3-us-east-2 \
-  --duration-seconds 2700 \
-  --output /var/tmp/yinyang-envelope.json
+aws sts assume-role ... --output json |
+  YINYANG_QUALIFICATION_REGION=us-east-2 \
+  YINYANG_OPERATING_ENVELOPE_BUCKET=replace-with-dedicated-versioned-bucket \
+  YINYANG_OPERATING_ENVELOPE_YY="$HOME/.local/lib/yinyang/current/bin/yy" \
+  YINYANG_OPERATING_ENVELOPE_OUTPUT=/var/tmp/yinyang-envelope.json \
+  YINYANG_OPERATING_ENVELOPE_DURATION=2700 \
+  AWS_CLI_BIN=/absolute/path/to/aws \
+  python3 tests/linux_operating_envelope_real_s3.py
 ```
 
-Credentials are inherited through environment variables and are never accepted
-as command-line arguments or written to the output. The bucket must already
-have versioning enabled. The harness performs a read-only versioning preflight
-and refuses to begin if remote retained-history accounting is unavailable.
+The wrapper never prints, writes or places credential values in command
+arguments. `AWS_CLI_BIN` is required when the official AWS CLI is intentionally
+installed outside `PATH`. The bucket must already have versioning enabled. The
+harness performs read-only versioning and listing preflight checks and refuses
+to begin if remote retained-history accounting is unavailable.
+
+When a compatible process-scoped request counter exists for the same source and
+binary, set `YINYANG_OPERATING_ENVELOPE_REQUEST_ACCOUNTING` to its JSON path.
+Otherwise the report records request count as unavailable rather than inferring
+it from connections.
 
 Run the workload only in an otherwise excluded measurement window. Concurrent
 latency benchmarks, native acceptance mounts and other S3 workloads can
