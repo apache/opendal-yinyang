@@ -34,6 +34,7 @@ use yinyang::core::{
     Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction,
 };
 use yinyang::replica::{DirectorySync, Resolution};
+use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 use yinyang::sync::{FileMetadata, Sync};
 
 /// An independent snapshot of a real tree on one side of a sync.
@@ -1028,4 +1029,111 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
         "the converged renamed subtree must report in sync"
     );
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
+}
+
+fn make_replica_shape_legacy(state: &Path) {
+    rusqlite::Connection::open(state.join("replica.db"))
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE baseline DROP COLUMN remote_revision;
+             ALTER TABLE work DROP COLUMN seq;
+             ALTER TABLE work DROP COLUMN source_artifact;",
+        )
+        .unwrap();
+}
+
+fn replica_has_column(state: &Path, table: &str, column: &str) -> bool {
+    let connection = rusqlite::Connection::open(state.join("replica.db")).unwrap();
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .any(|value| value.unwrap() == column)
+}
+
+#[tokio::test]
+async fn composite_preflight_rejects_unknown_sync_before_replica_upgrade() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let state = temp.path().join("state");
+    drop(
+        DirectorySync::init(authority.clone(), &state, &root)
+            .await
+            .unwrap(),
+    );
+    make_replica_shape_legacy(&state);
+    rusqlite::Connection::open(state.join("sync.db"))
+        .unwrap()
+        .execute(
+            "UPDATE binding SET profile='yinyang-sync-99' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+
+    let error = DirectorySync::open(authority, &state).await.unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<yinyang::runtime::Error>()
+            .unwrap()
+            .kind(),
+        RuntimeErrorKind::Unsupported
+    );
+    assert!(!replica_has_column(&state, "work", "source_artifact"));
+    assert!(!replica_has_column(&state, "work", "seq"));
+    assert!(!replica_has_column(&state, "baseline", "remote_revision"));
+}
+
+#[tokio::test]
+async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let state = temp.path().join("state");
+    drop(
+        DirectorySync::init(authority.clone(), &state, &root)
+            .await
+            .unwrap(),
+    );
+    make_replica_shape_legacy(&state);
+    rusqlite::Connection::open(state.join("content/staging.db"))
+        .unwrap()
+        .execute(
+            "UPDATE authority SET profile='yinyang-stage-99' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+
+    let error = DirectorySync::open(authority, &state).await.unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<yinyang::runtime::Error>()
+            .unwrap()
+            .kind(),
+        RuntimeErrorKind::Unsupported
+    );
+    assert!(!replica_has_column(&state, "work", "source_artifact"));
+    assert!(!replica_has_column(&state, "work", "seq"));
+    assert!(!replica_has_column(&state, "baseline", "remote_revision"));
+    let profile: String = rusqlite::Connection::open(state.join("content/staging.db"))
+        .unwrap()
+        .query_row(
+            "SELECT profile FROM authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(profile, "yinyang-stage-99");
 }

@@ -124,7 +124,11 @@ async fn validate_database(
     .map_err(Error::local)?
 }
 
-async fn preflight_open(directory: &Path, filesystem: NodeId, require_journal: bool) -> Result<()> {
+pub(crate) async fn preflight_open(
+    directory: &Path,
+    filesystem: NodeId,
+    require_journal: bool,
+) -> Result<()> {
     let journal = directory.join("sync.db");
     let staging = directory.join("content/staging.db");
     let journal_exists = journal.try_exists().map_err(Error::local)?;

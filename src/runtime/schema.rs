@@ -22,6 +22,38 @@ use std::collections::BTreeSet;
 
 pub(crate) type TableColumns<'a> = (&'a str, &'a [&'a str]);
 
+pub(crate) fn table_names(connection: &Connection) -> rusqlite::Result<BTreeSet<String>> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type='table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()
+}
+
+pub(crate) fn column_names(
+    connection: &Connection,
+    table: &str,
+) -> rusqlite::Result<Option<Vec<String>>> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1
+         )",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(columns))
+}
+
 /// Compare the database's ordinary tables and ordered columns with one profile.
 ///
 /// SQLite internal tables are excluded. Column order is part of the signature
@@ -30,16 +62,7 @@ pub(crate) fn matches(
     connection: &Connection,
     expected: &[TableColumns<'_>],
 ) -> rusqlite::Result<bool> {
-    let actual_tables = {
-        let mut statement = connection.prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type='table' AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-        )?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()?
-    };
+    let actual_tables = table_names(connection)?;
     let expected_tables = expected
         .iter()
         .map(|(table, _)| (*table).to_owned())
@@ -47,12 +70,17 @@ pub(crate) fn matches(
     if actual_tables != expected_tables {
         return Ok(false);
     }
+    columns_match(connection, expected)
+}
+
+/// Compare only the listed tables and their ordered columns.
+pub(crate) fn columns_match(
+    connection: &Connection,
+    expected: &[TableColumns<'_>],
+) -> rusqlite::Result<bool> {
     for (table, expected_columns) in expected {
-        let actual_columns = {
-            let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+        let Some(actual_columns) = column_names(connection, table)? else {
+            return Ok(false);
         };
         let expected_columns = expected_columns
             .iter()
