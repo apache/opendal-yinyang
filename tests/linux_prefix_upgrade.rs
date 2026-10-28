@@ -229,7 +229,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     let mut frozen_command =
         volume_file_command(&current_yy, &storage, &object_root, &object_config);
     frozen_command
-        .args(["file", "fsync", &frozen_handle])
+        .args(["fsync", &frozen_handle])
         .env("YINYANG_S3_ENDPOINT", object_gate.endpoint())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
