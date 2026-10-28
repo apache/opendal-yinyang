@@ -656,11 +656,10 @@ impl DirectRuntime {
             };
             (
                 endpoint_from_identity(&identity, DirectPrecondition::Etag(etag.to_owned())),
-                node.id(),
+                0,
                 false,
             )
         };
-        let _ = dirty;
         let mutation = MutationRecord {
             id: *DirectMutationId::new().as_bytes(),
             kind: MUTATION_KIND_DELETE,
@@ -2495,7 +2494,6 @@ fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::direct::{DirectObjectPin, DirectPrecondition};
     use crate::support::TestBackend;
 
     fn binding(bucket: &str) -> super::super::DirectStorageBinding {
@@ -2814,14 +2812,17 @@ mod tests {
             )
             .unwrap(),
         ] {
-            let error = DirectRuntime::open(
+            let error = match DirectRuntime::open(
                 namespace(&operator),
                 Some(state.path().to_owned()),
                 false,
                 wrong,
             )
             .await
-            .unwrap_err();
+            {
+                Ok(_) => panic!("wrong Direct storage binding was accepted"),
+                Err(error) => error,
+            };
             assert_eq!(error.kind(), ErrorKind::Invalid);
         }
     }
@@ -2838,14 +2839,17 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let error = DirectRuntime::open(
+        let error = match DirectRuntime::open(
             namespace(&operator),
             Some(state.path().to_owned()),
             false,
             binding("bucket"),
         )
         .await
-        .unwrap_err();
+        {
+            Ok(_) => panic!("partial Direct runtime database was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), ErrorKind::Storage);
         assert!(!state.path().join("runtime.lock").exists());
         assert!(!state.path().join("objects").exists());
