@@ -39,7 +39,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -221,12 +221,28 @@ pub enum DirectFlushOutcome {
 }
 
 struct ObjectIdentity {
-    id: DirectId,
+    id: RwLock<DirectId>,
     key: DirectKey,
     path: String,
     parent: DirectId,
     name: String,
     existed_remote: AtomicBool,
+}
+
+impl ObjectIdentity {
+    fn id(&self) -> DirectId {
+        *self
+            .id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn rebind_id(&self, id: DirectId) {
+        *self
+            .id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = id;
+    }
 }
 
 struct ObjectEntry {
@@ -581,7 +597,7 @@ impl DirectRuntime {
             .open(&data_path)
             .map_err(|error| local_io("open staged Direct object", error))?;
         let identity = ObjectIdentity {
-            id,
+            id: RwLock::new(id),
             key,
             path,
             parent,
@@ -751,7 +767,7 @@ impl DirectRuntime {
                 )
             })?;
             let identity = ObjectIdentity {
-                id: node.id(),
+                id: RwLock::new(node.id()),
                 key: key.clone(),
                 path: node.path().to_owned(),
                 parent: node.parent().ok_or_else(|| {
@@ -821,11 +837,11 @@ impl DirectRuntime {
             let mut inner = entry.inner.lock().await;
             match mutation.state {
                 MUTATION_APPLIED if !dirty => {
-                    guard(store).remove_object(*entry.identity.id.as_bytes())?;
+                    guard(store).remove_object(*entry.identity.id().as_bytes())?;
                     if let Some(path) = inner.data_path.take() {
                         remove_if_exists(&path)?;
                     }
-                    self.objects.lock().await.remove(&entry.identity.id);
+                    self.objects.lock().await.remove(&entry.identity.id());
                 }
                 MUTATION_APPLIED => {
                     inner.state = DirectObjectState::Conflict;
@@ -961,7 +977,7 @@ impl DirectRuntime {
                 MUTATION_KIND_PUBLISH | MUTATION_KIND_CREATE | MUTATION_KIND_COPY,
                 DirectMutationState::Staged,
             ) => {
-                self.verify_mutation_input(&mutation)?;
+                let mutation = self.verify_mutation_input_or_fail(mutation)?;
                 let input = guard(store).input_path(mutation.id);
                 self.dispatch_destination(mutation, &input).await?
             }
@@ -979,7 +995,7 @@ impl DirectRuntime {
                 self.cleanup_rename_source(mutation).await?
             }
             (MUTATION_KIND_RENAME, DirectMutationState::Staged) => {
-                self.verify_mutation_input(&mutation)?;
+                let mutation = self.verify_mutation_input_or_fail(mutation)?;
                 let input = guard(store).input_path(mutation.id);
                 let mutation = self.dispatch_destination(mutation, &input).await?;
                 if mutation.state == MUTATION_DESTINATION_APPLIED {
@@ -1021,7 +1037,7 @@ impl DirectRuntime {
             guard(store).put_mutation(&mutation)?;
             return Ok(mutation);
         }
-        self.verify_mutation_input(&mutation)?;
+        let mutation = self.verify_mutation_input_or_fail(mutation)?;
         let input = guard(store).input_path(mutation.id);
         self.dispatch_destination(mutation, &input).await
     }
@@ -1130,6 +1146,22 @@ impl DirectRuntime {
             ));
         }
         Ok(())
+    }
+
+    fn verify_mutation_input_or_fail(
+        &self,
+        mut mutation: MutationRecord,
+    ) -> Result<MutationRecord> {
+        match self.verify_mutation_input(&mutation) {
+            Ok(()) => Ok(mutation),
+            Err(error) => {
+                mutation.state = MUTATION_FAILED;
+                mutation.error = Some(error.to_string());
+                let store = self.store.as_ref().expect("writable runtime has a store");
+                guard(store).put_mutation(&mutation)?;
+                Err(error)
+            }
+        }
     }
 
     async fn apply_mutation_to_object(&self, mutation: &MutationRecord) -> Result<()> {
@@ -1412,7 +1444,7 @@ impl DirectRuntime {
                     mutation.state = if mutation.kind == MUTATION_KIND_RENAME {
                         MUTATION_DESTINATION_APPLIED
                     } else {
-                        MUTATION_FAILED
+                        MUTATION_APPLIED
                     };
                     mutation.error = Some(
                         "successful Direct write response omitted a usable identity".to_owned(),
@@ -1447,16 +1479,16 @@ impl DirectRuntime {
 
     async fn cleanup_rename_source(&self, mut mutation: MutationRecord) -> Result<MutationRecord> {
         let store = self.store.as_ref().expect("writable runtime has a store");
-        let accepted = mutation
-            .accepted
-            .clone()
-            .map(pin_from_record)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unsupported,
-                    "Direct rename destination has no verifiable accepted pin",
-                )
-            })?;
+        let accepted = match mutation.accepted.clone().map(pin_from_record) {
+            Some(accepted) => accepted,
+            None => {
+                mutation.state = MUTATION_DESTINATION_APPLIED;
+                mutation.error =
+                    Some("Direct rename destination has no verifiable accepted pin".to_owned());
+                guard(store).put_mutation(&mutation)?;
+                return Ok(mutation);
+            }
+        };
         let destination = mutation
             .destination
             .as_ref()
@@ -1570,28 +1602,18 @@ impl DirectRuntime {
             .filter(|entry| entry.identity.key == key)
             .cloned()
             .collect::<Vec<_>>();
-        let mut stale_clean = Vec::new();
+        let mut clean = Vec::new();
         for entry in &candidates {
-            let state = entry.inner.lock().await.state;
+            let inner = entry.inner.lock().await;
+            let state = inner.state;
             if state != DirectObjectState::Clean {
                 return Ok(entry.clone());
             }
-            if entry.identity.id != node.id() {
-                stale_clean.push(entry.identity.id);
+            if inner.file.is_some() && inner.accepted.is_some() {
+                clean.push(entry.clone());
             }
         }
         drop(candidates);
-        if !stale_clean.is_empty() {
-            let mut objects = self.objects.lock().await;
-            for id in stale_clean {
-                if objects
-                    .get(&id)
-                    .is_some_and(|entry| Arc::strong_count(entry) == 1)
-                {
-                    objects.remove(&id);
-                }
-            }
-        }
         if let Some(store) = &self.store {
             let record = { guard(store).object(key.as_str())? };
             if let Some(record) = record {
@@ -1601,7 +1623,7 @@ impl DirectRuntime {
                         .objects
                         .lock()
                         .await
-                        .entry(entry.identity.id)
+                        .entry(entry.identity.id())
                         .or_insert_with(|| entry.clone())
                         .clone());
                 }
@@ -1609,11 +1631,44 @@ impl DirectRuntime {
         }
 
         let file = snapshot.open_file(node.id()).await?;
+        let observed = DirectObservation::Present(pin_from_direct_file(&file));
+        for entry in &clean {
+            let mut inner = entry.inner.lock().await;
+            let matches = inner
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| observation_matches_pin(&observed, accepted));
+            if !matches {
+                continue;
+            }
+            let old_id = entry.identity.id();
+            inner.remote = Some(file.clone());
+            entry.identity.rebind_id(node.id());
+            entry.identity.existed_remote.store(true, Ordering::SeqCst);
+            if let Some(store) = &self.store {
+                let record = record_from_entry(&entry, &inner);
+                guard(store).put_object(&record)?;
+            }
+            let mut objects = self.objects.lock().await;
+            if old_id != node.id() {
+                objects.remove(&old_id);
+                objects.insert(node.id(), entry.clone());
+            }
+            return Ok(entry.clone());
+        }
+        {
+            let mut objects = self.objects.lock().await;
+            for entry in &clean {
+                if Arc::strong_count(entry) == 2 {
+                    objects.remove(&entry.identity.id());
+                }
+            }
+        }
         let precondition = file
             .etag()
             .map(|etag| DirectPrecondition::Etag(etag.to_owned()));
         let identity = ObjectIdentity {
-            id: node.id(),
+            id: RwLock::new(node.id()),
             key: key.clone(),
             path: node.path().to_owned(),
             parent: node.parent().ok_or_else(|| {
@@ -1676,7 +1731,7 @@ impl DirectRuntime {
         self.verify_remote(&entry.identity.key, &precondition)
             .await?;
 
-        let id = *entry.identity.id.as_bytes();
+        let id = *entry.identity.id().as_bytes();
         let target = guard(store).data_path(id);
         let temporary = guard(store).temporary_path("objects", id);
         remove_if_exists(&temporary)?;
@@ -1939,7 +1994,7 @@ pub struct DirectFileHandle {
 
 impl DirectFileHandle {
     pub fn id(&self) -> DirectId {
-        self.entry.identity.id
+        self.entry.identity.id()
     }
 
     pub fn key(&self) -> &DirectKey {
@@ -2181,7 +2236,7 @@ fn entry_from_record(store: &Arc<Mutex<Store>>, record: ObjectRecord) -> Result<
             .map_err(|error| local_io("discard unacknowledged Direct object tail", error))?;
     }
     let identity = ObjectIdentity {
-        id: record.direct_id(),
+        id: RwLock::new(record.direct_id()),
         key: DirectKey::from_storage_key(&record.key)?,
         path: record.path,
         parent: DirectId::from_bytes(record.parent),
@@ -2208,7 +2263,7 @@ fn entry_from_record(store: &Arc<Mutex<Store>>, record: ObjectRecord) -> Result<
 
 fn record_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> ObjectRecord {
     ObjectRecord {
-        id: *entry.identity.id.as_bytes(),
+        id: *entry.identity.id().as_bytes(),
         key: entry.identity.key.as_str().to_owned(),
         path: entry.identity.path.clone(),
         parent: *entry.identity.parent.as_bytes(),
@@ -2235,7 +2290,7 @@ fn record_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> ObjectRecord {
 async fn status_from_entry(entry: &ObjectEntry) -> DirectObjectStatus {
     let inner = entry.inner.lock().await;
     DirectObjectStatus {
-        id: entry.identity.id,
+        id: entry.identity.id(),
         key: entry.identity.key.clone(),
         path: entry.identity.path.clone(),
         parent: entry.identity.parent,
@@ -2301,7 +2356,7 @@ fn endpoint_from_identity(
     precondition: DirectPrecondition,
 ) -> EndpointRecord {
     EndpointRecord {
-        id: *identity.id.as_bytes(),
+        id: *identity.id().as_bytes(),
         key: identity.key.as_str().to_owned(),
         path: identity.path.clone(),
         parent: *identity.parent.as_bytes(),
@@ -2453,6 +2508,15 @@ fn pin_to_record(value: &DirectObjectPin) -> PinRecord {
 fn pin_from_record(value: PinRecord) -> DirectObjectPin {
     let modified = value.modified_time();
     DirectObjectPin::from_parts(value.version, value.etag, value.size, modified)
+}
+
+fn pin_from_direct_file(file: &DirectFile) -> DirectObjectPin {
+    DirectObjectPin::from_parts(
+        file.version().map(str::to_owned),
+        file.etag().map(str::to_owned),
+        file.length(),
+        file.modified(),
+    )
 }
 
 fn observation_to_record(value: &DirectObservation) -> ObservationRecord {
@@ -2769,6 +2833,7 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(file.read(0, 5).await.unwrap(), b"local");
         let id = file.id();
         drop(file);
         drop(runtime);
@@ -2900,6 +2965,73 @@ mod tests {
             .unwrap();
         assert_eq!(new.read(0, 2).await.unwrap(), b"v2");
         assert_eq!(old.read(0, 2).await.unwrap_err().kind(), ErrorKind::Stale);
+    }
+
+    #[tokio::test]
+    async fn shared_reader_tracks_the_current_local_generation() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let file_id = snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let reader = runtime.open_file(&snapshot, file_id, false).await.unwrap();
+        let writer = runtime.open_file(&snapshot, file_id, true).await.unwrap();
+        writer.truncate(0).await.unwrap();
+        writer.write(0, b"local").await.unwrap();
+        assert_eq!(reader.read(0, 5).await.unwrap(), b"local");
+        assert!(matches!(
+            writer.flush().await.unwrap(),
+            DirectFlushOutcome::Applied { .. }
+        ));
+        assert_eq!(reader.read(0, 5).await.unwrap(), b"local");
+    }
+
+    #[tokio::test]
+    async fn accepted_flush_rebinds_clean_entry_to_new_snapshot_pin() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("file", b"remote".to_vec()).await.unwrap();
+        let first_snapshot = snapshot(&operator, &backend);
+        let first_id = first_snapshot.resolve("file").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let writer = runtime
+            .open_file(&first_snapshot, first_id, true)
+            .await
+            .unwrap();
+        writer.truncate(0).await.unwrap();
+        writer.write(0, b"one").await.unwrap();
+        assert!(matches!(
+            writer.flush().await.unwrap(),
+            DirectFlushOutcome::Applied { .. }
+        ));
+
+        let second_snapshot = snapshot(&operator, &backend);
+        let second_id = second_snapshot.resolve("file").unwrap().id();
+        assert_ne!(first_id, second_id);
+        let reader = runtime
+            .open_file(&second_snapshot, second_id, false)
+            .await
+            .unwrap();
+        assert_eq!(reader.id(), second_id);
+        writer.append(b"!").await.unwrap();
+        assert_eq!(reader.read(0, 4).await.unwrap(), b"one!");
     }
 
     #[tokio::test]
@@ -3087,7 +3219,7 @@ mod tests {
         let id = file.id();
         file.write(0, b"bytes").await.unwrap();
         runtime.discard_local(id).await.unwrap();
-        assert!(!operator.stat("local").await.is_ok());
+        assert!(operator.stat("local").await.is_err());
         assert!(matches!(
             file.flush().await.unwrap(),
             DirectFlushOutcome::Unsupported { .. }
