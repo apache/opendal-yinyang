@@ -251,10 +251,15 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::support::TestBackend;
+    use super::{VolumeConfig, reject_unpublished_staging};
+    use crate::core::{BackendProfile, Fs};
+    use crate::mount::Mount;
+    use crate::runtime::Runtime;
+    use crate::support;
     use crate::volume::{Access, Capability, Frontend, Model, Publication, StorageProfile};
     use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use yinyang_core::Authority;
 
     fn direct_config() -> VolumeConfig {
         VolumeConfig {
@@ -264,7 +269,7 @@ mod tests {
             frontend: Frontend::Fuse,
             publication: Publication::Object,
             storage_profile: StorageProfile::Minio,
-            staging: PathBuf::new(),
+            staging: std::path::PathBuf::new(),
             read_only: true,
             require: BTreeSet::new(),
             service_address: None,
@@ -273,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn mount_admission_rejects_before_storage_or_kernel_mount() {
-        let backend = TestBackend::default();
+        let backend = support::TestBackend::default();
         let temp = tempfile::tempdir().unwrap();
         for invalid in [
             VolumeConfig {
@@ -309,17 +314,6 @@ mod tests {
             assert!(state.objects.is_empty(), "admission changed storage");
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::reject_unpublished_staging;
-    use crate::core::{BackendProfile, Fs};
-    use crate::mount::Mount;
-    use crate::runtime::Runtime;
-    use crate::support;
-    use std::sync::Arc;
-    use yinyang_core::Authority;
 
     #[tokio::test]
     async fn read_only_mount_refuses_unpublished_staging() {
