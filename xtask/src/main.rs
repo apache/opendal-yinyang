@@ -59,6 +59,7 @@ impl Command {
             SubCommand::Macos(cmd) => cmd.run(),
             SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
+            SubCommand::TestLinuxDirect(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
             SubCommand::TestLinuxOperations(cmd) => cmd.run(),
             SubCommand::TestLinuxRecovery(cmd) => cmd.run(),
@@ -84,6 +85,10 @@ enum SubCommand {
         about = "Run real Linux Managed Sync acceptance through yy and ordinary directories (requires isolated S3 settings)."
     )]
     TestManagedSync(CommandTestManagedSync),
+    #[clap(
+        about = "Run real read-only S3 Direct acceptance through yy and /dev/fuse (requires isolated S3 settings)."
+    )]
+    TestLinuxDirect(CommandTestLinuxDirect),
     #[clap(
         about = "Run real Linux FUSE acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
@@ -432,6 +437,19 @@ impl CommandTestManagedSync {
             "--test-threads=1",
         ]);
         run_command(cmd);
+    }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-direct")]
+struct CommandTestLinuxDirect {}
+
+impl CommandTestLinuxDirect {
+    fn run(self) {
+        require_linux("Direct acceptance");
+        require_fuse("Direct acceptance");
+        require_isolated_storage("Direct acceptance");
+        run_ignored_test("linux_direct", Some("direct_"));
     }
 }
 
