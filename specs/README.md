@@ -11,7 +11,8 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Metadata service](metadata-service.md) | Experimental durable SQLite authority and authenticated loopback protocol. |
 | [File-operation runtime](file-runtime.md) | Pinned Managed handles, durable staging, conditional fsync, and recovery. |
 | [Mount runtime](mount-runtime.md) | Instance-local shared nodes, explicit refresh, remote fsync, and retained failures. |
-| [Read-only Direct volumes](direct.md) | Reversible key mapping, storage-native object pins, cached observations, and Linux FUSE reads. |
+| [Direct volumes](direct.md) | Reversible key mapping, storage-native object pins, conditional writes, cached observations, and Linux FUSE reads. |
+| [Direct conditional mutations](direct-mutations.md) | Conditional object publication/delete, durable whole-object staging, safe-save namespace mutation, and local state format. |
 | [Direct Sync](direct-sync.md) | Finite ordinary-directory reconciliation over storage-native Direct pins and conditional mutations. |
 | [Sync runtime](sync-runtime.md) | Experimental content and namespace coordinator against an explicit remote baseline. |
 | [Linux Managed Sync](linux-sync.md) | The `yy ... sync` ordinary-directory CLI: admission, exit codes, offline retained-byte export, and the `yinyang.sync.status.v1` document. |

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
-use yinyang::direct::DirectNamespace;
+use yinyang::direct::{DirectNamespace, DirectRuntime, DirectRuntimeInspectionState};
 use yinyang::runtime::Runtime;
 use yinyang::volume::{Access, Frontend, Model, Publication, Volume, VolumeConfig};
 
@@ -312,6 +312,9 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             ),
         }
         if admitted {
+            if config.model == Model::Direct && !config.read_only {
+                check_direct_runtime_state(&config, &operator, &mut report);
+            }
             match config.model {
                 Model::Direct => check_direct_namespace(&config, operator, &mut report).await,
                 Model::Managed => check_authority(&config, operator, &mut report).await,
@@ -564,16 +567,6 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
         ),
     }
     if config.model == Model::Direct {
-        if config.staging.join("runtime.db").exists() {
-            report.push(
-                "mount-state",
-                Health::Info,
-                "Direct runtime state exists; doctor did not acquire its lease, run recovery, or mutate it",
-                Some(
-                    "inspect `yy --volume CONFIG status` and preserve staging while pending, conflict or Unknown objects remain",
-                ),
-            );
-        }
         return;
     }
     if config.access != Access::Mount || !config.staging.join("staging.db").exists() {
@@ -612,6 +605,87 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
             error.to_string(),
             Some(
                 "stop the mount, preserve its staging directory, and inspect the SQLite/WAL state before retrying",
+            ),
+        ),
+    }
+}
+
+fn check_direct_runtime_state(
+    config: &VolumeConfig,
+    operator: &opendal::Operator,
+    report: &mut DoctorReport,
+) {
+    let binding = match yinyang::volume::direct_storage_binding(config, operator) {
+        Ok(binding) => binding,
+        Err(error) => {
+            report.push(
+                "mount-state",
+                Health::ActionRequired,
+                error.to_string(),
+                Some("correct the Direct storage profile, bucket, root or endpoint environment"),
+            );
+            return;
+        }
+    };
+    match DirectRuntime::inspect(&config.staging, Some(&binding)) {
+        Ok(inspection) => match inspection.state {
+            DirectRuntimeInspectionState::Missing
+            | DirectRuntimeInspectionState::Uninitialized => report.push(
+                "mount-state",
+                Health::Pass,
+                "Direct runtime state is not initialized; doctor did not create it",
+                None::<String>,
+            ),
+            DirectRuntimeInspectionState::Ready => {
+                let objects = inspection.objects;
+                let mutations = inspection.mutations;
+                let unresolved_objects = objects.pending
+                    + objects.conflict
+                    + objects.unknown
+                    + objects.failed;
+                let unresolved_mutations = mutations.staged
+                    + mutations.dispatching
+                    + mutations.conflict
+                    + mutations.unknown
+                    + mutations.destination_applied
+                    + mutations.pending_source_cleanup
+                    + mutations.failed
+                    + mutations.source_dispatching;
+                let healthy = unresolved_objects == 0 && unresolved_mutations == 0;
+                report.push(
+                    "mount-state",
+                    if healthy {
+                        Health::Pass
+                    } else {
+                        Health::ActionRequired
+                    },
+                    format!(
+                        "Direct runtime profile {:?} is readable; objects: pending={} conflict={} unknown={} failed={}; mutations: staged={} dispatching={} conflict={} unknown={} destination-applied={} source-cleanup={} failed={}",
+                        inspection.profile.as_deref().unwrap_or("unknown"),
+                        objects.pending,
+                        objects.conflict,
+                        objects.unknown,
+                        objects.failed,
+                        mutations.staged,
+                        mutations.dispatching,
+                        mutations.conflict,
+                        mutations.unknown,
+                        mutations.destination_applied,
+                        mutations.pending_source_cleanup,
+                        mutations.failed
+                    ),
+                    (!healthy).then_some(
+                        "preserve the Direct staging directory and inspect its retained objects/mutations before retrying publication",
+                    ),
+                );
+            }
+        },
+        Err(error) => report.push(
+            "mount-state",
+            Health::ActionRequired,
+            error.to_string(),
+            Some(
+                "preserve the Direct staging directory and correct the runtime profile, schema or storage binding before startup",
             ),
         ),
     }
