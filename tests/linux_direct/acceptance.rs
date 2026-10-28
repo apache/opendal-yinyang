@@ -561,10 +561,17 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
             .map(|entry| entry.path().to_owned())
             .collect::<BTreeSet<_>>()
     });
+    let directory_stat = runtime.block_on(async {
+        operator
+            .stat("a/")
+            .await
+            .map(|metadata| format!("{:?}", metadata.mode()))
+            .unwrap_or_else(|error| format!("{error}"))
+    });
     assert_eq!(
         paths,
         ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
-        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?} after={after_paths:?} versions={version_paths:?} v1={v1_paths:?}"
+        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?} after={after_paths:?} versions={version_paths:?} v1={v1_paths:?} stat={directory_stat:?}"
     );
 
     let namespace = yinyang::direct::DirectNamespace::new(operator).expect("admit Direct operator");
