@@ -276,6 +276,76 @@ class Completed:
     returncode: int
 
 
+def file_status_snapshot(stdout: str) -> dict[str, Any]:
+    declared_handles = None
+    handles = []
+    errors = []
+    failed = 0
+    for line in stdout.splitlines():
+        if line.startswith("local handles: "):
+            if declared_handles is not None:
+                raise EnvelopeError("status reported local handles more than once")
+            declared_handles = int(line.removeprefix("local handles: "))
+        elif line.startswith("handle: "):
+            fields = line.split()
+            if (
+                len(fields) != 14
+                or fields[8] != "pending:"
+                or fields[10] != "frozen:"
+                or fields[12] != "conflict:"
+            ):
+                raise EnvelopeError(f"unrecognized handle status line: {line}")
+            pending = fields[9]
+            frozen = fields[11]
+            conflict = fields[13]
+            if pending not in {"true", "false"}:
+                raise EnvelopeError(f"invalid pending state: {pending}")
+            if frozen not in {"true", "false"}:
+                raise EnvelopeError(f"invalid frozen state: {frozen}")
+            if conflict not in {"true", "false"}:
+                raise EnvelopeError(f"invalid conflict state: {conflict}")
+            handles.append(
+                {
+                    "pending": pending == "true",
+                    "frozen": frozen == "true",
+                    "conflict": conflict == "true",
+                }
+            )
+        elif line.startswith("handle error: "):
+            failed += 1
+        elif line.startswith("error "):
+            fields = line.split(maxsplit=6)
+            if len(fields) < 6 or fields[2] != "handle" or fields[4] != "persisted":
+                raise EnvelopeError(f"unrecognized ledger status line: {line}")
+            persisted = fields[5]
+            if persisted not in {"true:", "false:"}:
+                raise EnvelopeError(f"invalid persisted state: {persisted}")
+            errors.append(
+                {
+                    "sequence": int(fields[1]),
+                    "handle": fields[3],
+                    "persisted": persisted == "true:",
+                }
+            )
+    if declared_handles is None or declared_handles != len(handles):
+        raise EnvelopeError(
+            "status local handle count does not match printed handle records"
+        )
+    if failed > len(handles):
+        raise EnvelopeError("status printed more handle errors than handles")
+    sequences = [error["sequence"] for error in errors]
+    return {
+        "local_handles": declared_handles,
+        "pending": sum(handle["pending"] for handle in handles),
+        "frozen": sum(handle["frozen"] for handle in handles),
+        "conflicts": sum(handle["conflict"] for handle in handles),
+        "failed": failed,
+        "ledger_errors": len(errors),
+        "sequences": sequences,
+        "errors": errors,
+    }
+
+
 class MountProcess:
     def __init__(
         self,
@@ -1218,13 +1288,143 @@ class Harness:
             time.monotonic() - self.report_started
         )
         completion["sqlite"] = self.sqlite_integrity()
-        completion["doctor"] = self.doctor()
-        if uncertain_files:
-            self.report["status"] = "fail"
+        retry_counts = {
+            "pwrite_errors": self.report["durability"]["pwrite_errors"],
+            "reader_errors": first["readers"]["errors"] + second["readers"]["errors"],
+            "fsync_errors": self.report["durability"]["fsync_errors"],
+            "fsync_retry_attempts": (
+                first["writers"]["fsync_retry_attempts"]
+                + second["writers"]["fsync_retry_attempts"]
+            ),
+            "fsync_retry_successes": (
+                first["writers"]["fsync_retry_successes"]
+                + second["writers"]["fsync_retry_successes"]
+            ),
+            "uncertain_files": uncertain_files,
+            "fatal": [*first["fatal"], *second["fatal"]],
+            "clean_unmounts": [stopped_one, stopped_two],
+        }
+        status_command = [
+            str(self.yy),
+            "--volume",
+            str(self.config),
+            "status",
+        ]
+        pre_status = self.yy_run(status_command[1:], timeout=180, check=False)
+        acknowledgment = {
+            "policy": (
+                "acknowledge only persisted ledger entries after every fsync "
+                "recovered and all byte, SQLite, and handle-state checks pass"
+            ),
+            "retry": retry_counts,
+            "pre_status": {
+                "command": status_command,
+                "returncode": pre_status.returncode,
+                "stdout": pre_status.stdout,
+                "stderr": pre_status.stderr,
+            },
+            "through": None,
+            "command": None,
+        }
+        completion["acknowledgment"] = acknowledgment
+        unsafe = []
+        if retry_counts["pwrite_errors"]:
+            unsafe.append(f"pwrite_errors={retry_counts['pwrite_errors']}")
+        if retry_counts["reader_errors"]:
+            unsafe.append(f"reader_errors={retry_counts['reader_errors']}")
+        if retry_counts["fatal"]:
+            unsafe.append("fatal is not empty")
+        if retry_counts["uncertain_files"]:
+            unsafe.append(f"uncertain_files={retry_counts['uncertain_files']}")
+        if retry_counts["fsync_errors"]:
+            if not retry_counts["fsync_retry_attempts"]:
+                unsafe.append("fsync errors have no retry attempts")
+            if not retry_counts["fsync_retry_successes"]:
+                unsafe.append("fsync errors have no retry successes")
+        if (
+            retry_counts["fsync_retry_successes"]
+            > retry_counts["fsync_retry_attempts"]
+        ):
+            unsafe.append("fsync retry successes exceed attempts")
+        for unmount in retry_counts["clean_unmounts"]:
+            if not unmount.get("stopped") or unmount.get("returncode") != 0:
+                unsafe.append("mount did not stop cleanly")
+                break
+        if pre_status.returncode != 0:
+            unsafe.append(f"pre-acknowledgment status exit={pre_status.returncode}")
+            pre_snapshot = None
+        else:
+            pre_snapshot = file_status_snapshot(pre_status.stdout)
+            acknowledgment["pre_status"]["counts"] = pre_snapshot
+            for name in ("pending", "frozen", "conflicts", "failed"):
+                if pre_snapshot[name]:
+                    unsafe.append(f"pre-acknowledgment {name}={pre_snapshot[name]}")
+            sequences = pre_snapshot["sequences"]
+            if sequences != sorted(set(sequences)):
+                unsafe.append("ledger sequences are not unique and ordered")
+            if any(sequence <= 0 for sequence in sequences):
+                unsafe.append("ledger contains a non-persisted sequence")
+            if any(not error["persisted"] for error in pre_snapshot["errors"]):
+                unsafe.append("ledger contains an unpersisted error")
+        if unsafe:
             raise EnvelopeError(
-                "pwrite/fsync failures left uncertain durability for files "
-                f"{uncertain_files}; byte assertions completed but the run is not accepted"
+                "acknowledgment safety gate failed: " + "; ".join(unsafe)
             )
+        if pre_snapshot["ledger_errors"]:
+            through = pre_snapshot["sequences"][-1]
+            acknowledge_command = [
+                str(self.yy),
+                "--volume",
+                str(self.config),
+                "file",
+                "acknowledge-errors",
+                str(through),
+            ]
+            acknowledged = self.yy_run(
+                acknowledge_command[1:], timeout=180, check=False
+            )
+            acknowledgment["through"] = through
+            acknowledgment["command"] = acknowledge_command
+            acknowledgment["result"] = {
+                "returncode": acknowledged.returncode,
+                "stdout": acknowledged.stdout,
+                "stderr": acknowledged.stderr,
+            }
+            post_status = self.yy_run(status_command[1:], timeout=180, check=False)
+            acknowledgment["post_status"] = {
+                "command": status_command,
+                "returncode": post_status.returncode,
+                "stdout": post_status.stdout,
+                "stderr": post_status.stderr,
+            }
+            if acknowledged.returncode != 0:
+                unsafe.append(
+                    f"acknowledge-errors exit={acknowledged.returncode}"
+                )
+            if post_status.returncode != 0:
+                unsafe.append(
+                    f"post-acknowledgment status exit={post_status.returncode}"
+                )
+            else:
+                post_snapshot = file_status_snapshot(post_status.stdout)
+                acknowledgment["post_status"]["counts"] = post_snapshot
+                for name in (
+                    "pending",
+                    "frozen",
+                    "conflicts",
+                    "failed",
+                    "ledger_errors",
+                ):
+                    if post_snapshot[name]:
+                        unsafe.append(f"post-acknowledgment {name}={post_snapshot[name]}")
+            if unsafe:
+                raise EnvelopeError(
+                    "acknowledgment did not converge: " + "; ".join(unsafe)
+                )
+        doctor = self.doctor()
+        completion["doctor"] = doctor
+        if doctor.get("status") != "pass":
+            raise EnvelopeError(f"doctor status is {doctor.get('status')!r}")
         self.report["status"] = "pass"
         self.report["phase"] = "complete"
         self.report["ended_at"] = utc_now()

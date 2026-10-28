@@ -147,6 +147,42 @@ class FsyncRetryFaultTest(unittest.TestCase):
         self.assertEqual(summary["first_errors"][0]["operation"], "fsync")
         self.assertEqual(summary["first_errors"][0]["errno"], errno.EIO)
 
+    def test_file_status_snapshot_retains_counts_and_sequences(self) -> None:
+        module = load_envelope()
+        snapshot = module.file_status_snapshot(
+            """\
+volume: test model: Managed access: Mount frontend: fuse read-only: false
+local handles: 2
+handle: 00000000-0000-0000-0000-000000000001 local: 1 remote: 1 revision: 000000000000000000000000 pending: true frozen: false conflict: false
+handle error: retryable publication
+handle: 00000000-0000-0000-0000-000000000002 local: 0 remote: 0 revision: 000000000000000000000000 pending: false frozen: false conflict: true
+error 4 handle 00000000-0000-0000-0000-000000000001 persisted true: retryable publication
+"""
+        )
+        self.assertEqual(snapshot["local_handles"], 2)
+        self.assertEqual(snapshot["pending"], 1)
+        self.assertEqual(snapshot["frozen"], 0)
+        self.assertEqual(snapshot["conflicts"], 1)
+        self.assertEqual(snapshot["failed"], 1)
+        self.assertEqual(snapshot["ledger_errors"], 1)
+        self.assertEqual(snapshot["sequences"], [4])
+        self.assertTrue(snapshot["errors"][0]["persisted"])
+
+    def test_file_status_snapshot_rejects_inconsistent_handle_count(self) -> None:
+        module = load_envelope()
+        with self.assertRaises(module.EnvelopeError):
+            module.file_status_snapshot("local handles: 1")
+
+    def test_file_status_snapshot_retains_unpersisted_ledger_error(self) -> None:
+        module = load_envelope()
+        snapshot = module.file_status_snapshot(
+            "local handles: 0\n"
+            "error 0 handle 00000000-0000-0000-0000-000000000001 "
+            "persisted false: volatile failure\n"
+        )
+        self.assertEqual(snapshot["sequences"], [0])
+        self.assertFalse(snapshot["errors"][0]["persisted"])
+
 
 if __name__ == "__main__":
     unittest.main()

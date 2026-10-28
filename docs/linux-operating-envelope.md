@@ -104,6 +104,40 @@ The workload does not establish:
 - behavior after the tested duration or outside the exact backend and host;
 - stable release, cryptographic signing or support for arbitrary upgrades.
 
+## Operational acknowledgment
+
+A recovered fsync can still leave a durable error-ledger entry. Doctor remains
+`action_required` until an operator explicitly acknowledges the reviewed
+entries with `yy --volume CONFIG file acknowledge-errors THROUGH`. This removes
+ledger rows through the observed sequence; it does not resolve pending data,
+frozen requests, conflicts, failed handles, or uncertain durability.
+
+The harness first stops and releases the mount, verifies independently restored
+bytes, samples remote history, and checks SQLite integrity. It then captures
+the complete raw `yy --volume CONFIG status` output, retry counters and parsed
+handle/ledger counts. It will not acknowledge any entry unless all of the
+following hold:
+
+- pwrite and reader errors are zero;
+- every fsync failure has bounded retry attempts and at least one successful
+  retry, and no file remains uncertain;
+- fatal lists are empty and both unmounts report a clean release;
+- pending, frozen, conflict and failed-handle counts are zero;
+- every retained ledger row is persisted, has a positive sequence, and is
+  present in the complete ordered status capture.
+
+When retained rows exist, `completion.acknowledgment` records the exact
+acknowledgment command, the selected `through` sequence, its result, and
+complete post-acknowledgment status. The post-status handle and ledger counts
+must all be zero before the harness accepts doctor. Doctor must subsequently
+return `status=pass`; a nonzero exit or non-pass status still fails the run and
+retains the raw error.
+
+The acknowledgment is an explicit operator decision based on reviewed evidence,
+not an automatic error suppressor. Failed or diagnostic staging remains
+unchanged and must never be acknowledged merely to make a later health check
+green.
+
 ## Reproduce
 
 Build or install the selected binary on Linux. The credential wrapper reads one
