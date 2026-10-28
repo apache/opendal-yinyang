@@ -112,7 +112,11 @@ def copy_sqlite_state(source, destination, databases):
     destination.mkdir(parents=True, exist_ok=True)
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
-        if relative in databases or path.name.endswith(("-wal", "-shm")):
+        if (
+            relative in databases
+            or path.name.endswith(("-wal", "-shm"))
+            or path.name.endswith(".lock")
+        ):
             continue
         target = destination / relative
         if path.is_dir():
