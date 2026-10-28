@@ -44,6 +44,7 @@ impl GateRequest {
     }
 }
 
+#[allow(dead_code)] // Shared test crates use different subsets of gate actions.
 #[derive(Clone, Copy)]
 pub enum CommitAction {
     /// Read the complete request, signal interception, and wait before sending
@@ -64,6 +65,7 @@ enum GateEvent {
     CommitFailed(String),
 }
 
+#[allow(dead_code)] // Direct targets one object while directory tests target the head commit.
 #[derive(Clone)]
 enum GateTarget {
     HeadCommit,
@@ -112,6 +114,7 @@ pub struct S3Gate {
 }
 
 impl S3Gate {
+    #[allow(dead_code)]
     pub fn start(action: CommitAction) -> Self {
         Self::start_for(action, GateTarget::HeadCommit)
     }
@@ -211,6 +214,7 @@ impl S3Gate {
         }
     }
 
+    #[allow(dead_code)]
     pub fn wait_commit_succeeded(&self) {
         match self
             .events

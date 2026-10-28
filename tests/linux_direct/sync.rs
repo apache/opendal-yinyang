@@ -306,27 +306,38 @@ fn direct_sync_empty_directories_and_kind_changes_are_never_silently_ignored() {
     let local = fixture.path("direct-sync-directory-local");
     fs::create_dir(&local).expect("create Direct Sync directory root");
     fs::create_dir(local.join("local-empty")).expect("create local-only empty directory");
-    fixture
-        .yy_ok(&[
-            "--volume",
-            path_text(&config),
-            "sync",
-            "init",
-            "--directory",
-            path_text(&local),
-        ])
-        .success_or("Direct Sync empty-directory init");
-    sync_run(&fixture, &config);
-    let status = sync_status(&fixture, &config);
-    if status["summary"]["in_sync"] == true {
-        assert_eq!(
-            fixture.raw_get("local-empty/").as_deref(),
-            Some(b"".as_slice()),
-            "Direct Sync ignored an empty local directory: {status:#}"
+    let init = fixture.yy(&[
+        "--volume",
+        path_text(&config),
+        "sync",
+        "init",
+        "--directory",
+        path_text(&local),
+    ]);
+    if !init.status.success() {
+        assert!(
+            init.text()
+                .to_ascii_lowercase()
+                .contains("empty directory markers"),
+            "Direct Sync empty-directory rejection was not explicit:\n{}",
+            init.text()
         );
+        assert!(!state.join("direct-sync.db").exists());
+        assert_eq!(fixture.raw_get("local-empty/"), None);
         assert!(local.join("local-empty").is_dir());
     } else {
-        assert_explicit_directory_boundary(&status, "local-empty", "local empty directory");
+        sync_run(&fixture, &config);
+        let status = sync_status(&fixture, &config);
+        if status["summary"]["in_sync"] == true {
+            assert_eq!(
+                fixture.raw_get("local-empty/").as_deref(),
+                Some(b"".as_slice()),
+                "Direct Sync ignored an empty local directory: {status:#}"
+            );
+            assert!(local.join("local-empty").is_dir());
+        } else {
+            assert_explicit_directory_boundary(&status, "local-empty", "local empty directory");
+        }
     }
 
     let marker_fixture = Fixture::new();
@@ -335,29 +346,40 @@ fn direct_sync_empty_directories_and_kind_changes_are_never_silently_ignored() {
     let marker_local = marker_fixture.path("direct-sync-marker-local");
     fs::create_dir(&marker_local).expect("create marker Direct Sync root");
     marker_fixture.write_raw("remote-empty/", b"");
-    marker_fixture
-        .yy_ok(&[
-            "--volume",
-            path_text(&marker_config),
-            "sync",
-            "init",
-            "--directory",
-            path_text(&marker_local),
-        ])
-        .success_or("Direct Sync remote-marker init");
-    sync_run(&marker_fixture, &marker_config);
-    let marker_status = sync_status(&marker_fixture, &marker_config);
-    if marker_status["summary"]["in_sync"] == true {
+    let marker_init = marker_fixture.yy(&[
+        "--volume",
+        path_text(&marker_config),
+        "sync",
+        "init",
+        "--directory",
+        path_text(&marker_local),
+    ]);
+    if !marker_init.status.success() {
         assert!(
-            marker_local.join("remote-empty").is_dir(),
-            "Direct Sync ignored a remote empty-directory marker: {marker_status:#}"
+            marker_init
+                .text()
+                .to_ascii_lowercase()
+                .contains("empty directory markers"),
+            "Direct Sync remote-marker rejection was not explicit:\n{}",
+            marker_init.text()
         );
+        assert!(!marker_state.join("direct-sync.db").exists());
+        assert!(!marker_local.join("remote-empty").exists());
     } else {
-        assert_explicit_directory_boundary(
-            &marker_status,
-            "remote-empty",
-            "remote empty-directory marker",
-        );
+        sync_run(&marker_fixture, &marker_config);
+        let marker_status = sync_status(&marker_fixture, &marker_config);
+        if marker_status["summary"]["in_sync"] == true {
+            assert!(
+                marker_local.join("remote-empty").is_dir(),
+                "Direct Sync ignored a remote empty-directory marker: {marker_status:#}"
+            );
+        } else {
+            assert_explicit_directory_boundary(
+                &marker_status,
+                "remote-empty",
+                "remote empty-directory marker",
+            );
+        }
     }
     assert_eq!(
         marker_fixture.raw_get("remote-empty/").as_deref(),
@@ -365,48 +387,87 @@ fn direct_sync_empty_directories_and_kind_changes_are_never_silently_ignored() {
         "Direct Sync changed the remote directory marker without support"
     );
 
-    let transition = marker_local.join("remote-empty");
-    if transition.is_dir() {
-        fs::remove_dir(&transition).expect("remove materialized empty directory");
-    }
-    fs::write(&transition, b"local file").expect("write file over remote directory");
-    sync_run(&marker_fixture, &marker_config);
-    let transition_status = sync_status(&marker_fixture, &marker_config);
-    assert_explicit_directory_boundary(
-        &transition_status,
-        "remote-empty",
-        "remote directory to local file transition",
-    );
+    let kind_fixture = Fixture::new();
+    let kind_state = kind_fixture.path("direct-sync-kind-state");
+    let kind_config = sync_config(&kind_fixture, "direct-sync-kind", &kind_state);
+    let kind_local = kind_fixture.path("direct-sync-kind-local");
+    fs::create_dir(&kind_local).expect("create kind Direct Sync root");
+    fs::write(kind_local.join("kind"), b"baseline file").expect("write local kind baseline");
+    kind_fixture
+        .yy_ok(&[
+            "--volume",
+            path_text(&kind_config),
+            "sync",
+            "init",
+            "--directory",
+            path_text(&kind_local),
+        ])
+        .success_or("Direct Sync kind init");
+    sync_run(&kind_fixture, &kind_config);
     assert_eq!(
-        fs::read(&transition).expect("read retained local transition file"),
-        b"local file"
-    );
-    assert_eq!(
-        marker_fixture.raw_get("remote-empty/").as_deref(),
-        Some(b"".as_slice()),
-        "unsupported directory transition deleted the remote marker"
-    );
-
-    fs::write(local.join("kind"), b"baseline file").expect("write local kind baseline");
-    sync_run(&fixture, &config);
-    assert_eq!(
-        fixture.raw_get("kind").as_deref(),
+        kind_fixture.raw_get("kind").as_deref(),
         Some(b"baseline file".as_slice())
     );
-    fs::remove_file(local.join("kind")).expect("remove local kind baseline file");
-    fs::create_dir(local.join("kind")).expect("replace local file with directory");
-    fs::write(local.join("kind/child.txt"), b"local child").expect("write local kind child");
-    sync_run(&fixture, &config);
-    let kind_status = sync_status(&fixture, &config);
+    fs::remove_file(kind_local.join("kind")).expect("remove local kind baseline file");
+    fs::create_dir(kind_local.join("kind")).expect("replace local file with directory");
+    fs::write(kind_local.join("kind/child.txt"), b"local child").expect("write local kind child");
+    sync_run(&kind_fixture, &kind_config);
+    let kind_status = sync_status(&kind_fixture, &kind_config);
     assert_explicit_directory_boundary(&kind_status, "kind", "local file to directory transition");
     assert_eq!(
-        fixture.raw_get("kind").as_deref(),
+        kind_fixture.raw_get("kind").as_deref(),
         Some(b"baseline file".as_slice()),
         "unsupported local kind change overwrote the remote baseline file"
     );
     assert_eq!(
-        fs::read(local.join("kind/child.txt")).expect("read retained local kind child"),
+        fs::read(kind_local.join("kind/child.txt")).expect("read retained local kind child"),
         b"local child"
+    );
+
+    let remote_kind_fixture = Fixture::new();
+    let remote_kind_state = remote_kind_fixture.path("direct-sync-remote-kind-state");
+    let remote_kind_config = sync_config(
+        &remote_kind_fixture,
+        "direct-sync-remote-kind",
+        &remote_kind_state,
+    );
+    let remote_kind_local = remote_kind_fixture.path("direct-sync-remote-kind-local");
+    fs::create_dir(&remote_kind_local).expect("create remote kind Direct Sync root");
+    remote_kind_fixture.write_raw("remote-kind/child.txt", b"remote child");
+    remote_kind_fixture
+        .yy_ok(&[
+            "--volume",
+            path_text(&remote_kind_config),
+            "sync",
+            "init",
+            "--directory",
+            path_text(&remote_kind_local),
+        ])
+        .success_or("Direct Sync remote-kind init");
+    sync_run(&remote_kind_fixture, &remote_kind_config);
+    assert!(remote_kind_local.join("remote-kind").is_dir());
+    fs::remove_dir_all(remote_kind_local.join("remote-kind"))
+        .expect("remove materialized remote kind directory");
+    fs::write(remote_kind_local.join("remote-kind"), b"local file")
+        .expect("write local file over remote directory");
+    sync_run(&remote_kind_fixture, &remote_kind_config);
+    let remote_kind_status = sync_status(&remote_kind_fixture, &remote_kind_config);
+    assert_explicit_directory_boundary(
+        &remote_kind_status,
+        "remote-kind",
+        "remote directory to local file transition",
+    );
+    assert_eq!(
+        fs::read(remote_kind_local.join("remote-kind"))
+            .expect("read retained local remote-kind file"),
+        b"local file"
+    );
+    assert_eq!(
+        remote_kind_fixture
+            .raw_get("remote-kind/child.txt")
+            .as_deref(),
+        Some(b"remote child".as_slice()),
+        "unsupported remote directory transition changed its descendant object"
     );
 }
 
