@@ -21,7 +21,9 @@ use super::state::{
     ArtifactKind, ArtifactPhase, ArtifactRecord, DesiredFile, InstallOperation, InstallRecord,
     InstallState, LocalFingerprint, Store,
 };
-use crate::replica::{ContentHash, Error, Identity, LocalNode, LocalSnapshot, Result, scan_path};
+use crate::replica::{
+    ContentHash, Error, ErrorKind, Identity, LocalNode, LocalSnapshot, Result, scan_path,
+};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
     AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, flock, fstat, fsync,
