@@ -317,8 +317,7 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
     );
 
     fixture.write_raw("replace.bin", &shorter);
-    mounted.refresh();
-    mounted.wait_for_log("refresh", Duration::from_secs(30));
+    mounted.refresh_and_wait();
     let mut fresh = File::open(&path).expect("fresh Direct open after SIGHUP");
     assert!(
         fresh
@@ -358,8 +357,7 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
     drop(old_fd);
 
     fixture.delete_raw("replace.bin");
-    mounted.refresh();
-    mounted.wait_for_log("refresh", Duration::from_secs(30));
+    mounted.refresh_and_wait();
     assert!(
         fs::metadata(&path).is_err(),
         "a fresh lookup after external delete must not serve the removed raw key"
@@ -418,8 +416,7 @@ fn direct_true_versioning_replacement_keeps_old_fd_bytes_and_attributes() {
     assert!(retained.is_file());
     assert_eq!(retained.len(), old.len() as u64);
 
-    mounted.refresh();
-    mounted.wait_for_log("refresh", Duration::from_secs(30));
+    mounted.refresh_and_wait();
     let mut fresh = File::open(&path).expect("fresh versioned Direct open after SIGHUP");
     let fresh_metadata = fresh.metadata().expect("fstat fresh versioned Direct fd");
     assert!(fresh_metadata.is_file());
