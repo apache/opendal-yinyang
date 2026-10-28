@@ -99,14 +99,15 @@ impl Fixture {
         self.temp.path().join(name)
     }
 
-    pub fn write_raw(&self, key: &str, bytes: &[u8]) {
+    pub fn write_raw(&self, key: &str, bytes: &[u8]) -> u16 {
         let key = self.full_key(key);
-        self.raw.put(&key, bytes);
+        let status = self.raw.put(&key, bytes);
         assert_eq!(
             self.raw.get(&key).as_deref(),
             Some(bytes),
             "raw S3 did not preserve the requested key {key:?}"
         );
+        status
     }
 
     pub fn delete_raw(&self, key: &str) {

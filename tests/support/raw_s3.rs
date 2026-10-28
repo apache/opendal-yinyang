@@ -78,7 +78,7 @@ impl RawS3 {
         }
     }
 
-    pub fn put(&self, key: &str, bytes: &[u8]) {
+    pub fn put(&self, key: &str, bytes: &[u8]) -> u16 {
         let response = self.request("PUT", Some(key), "", bytes);
         assert!(
             (200..300).contains(&response.status),
@@ -86,6 +86,7 @@ impl RawS3 {
             response.status,
             String::from_utf8_lossy(&response.body)
         );
+        response.status
     }
 
     pub fn delete(&self, key: &str) {

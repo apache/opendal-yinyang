@@ -487,8 +487,8 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
 fn direct_list_preserves_file_prefix_aliases_without_folding() {
     let fixture = Fixture::new();
-    fixture.write_raw("a", b"file");
-    fixture.write_raw("a/b", b"child");
+    let parent_status = fixture.write_raw("a", b"file");
+    let child_status = fixture.write_raw("a/b", b"child");
     assert_eq!(
         fixture.read_raw("a").as_deref(),
         Some(b"file".as_slice()),
@@ -512,7 +512,7 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
         "raw LIST unexpectedly exposed the descendant alias:\n{list_xml}"
     );
     eprintln!(
-        "direct alias evidence: both GETs returned exact bytes; raw LIST contains {parent_key:?} and omits {child_key:?}"
+        "direct alias evidence: raw PUT a={parent_status}, a/b={child_status}; both GETs returned exact bytes; raw LIST contains {parent_key:?} and omits {child_key:?}"
     );
     eprintln!("direct alias raw LIST XML:\n{list_xml}");
 
