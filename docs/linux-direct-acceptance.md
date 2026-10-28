@@ -13,9 +13,10 @@ The command requires:
   enabled.
 
 The harness uses its own path-style signed requests rather than OpenDAL's path
-abstraction. Every seeded key is immediately fetched and listed again, so a
-test cannot claim to cover a percent sign, DEL, trailing marker, case or
-Unicode spelling that the client normalized before storage.
+abstraction. Every seeded key is immediately fetched by exact GET, and native
+cases compare the backend's actual LIST inventory. The controlled complete-list
+collision fixture is the exception: it verifies both exact keys and deliberately
+supplies the protocol response because the selected backend omits one.
 
 The Silo test endpoint rejects keys containing `.`/`..` components, empty path
 components or NUL before they can be stored. Those reversible-mapping and
