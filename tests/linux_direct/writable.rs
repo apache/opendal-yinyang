@@ -127,6 +127,58 @@ fn direct_write_admission_requires_staging_and_publishes_limited_capabilities() 
 }
 
 #[test]
+#[ignore = "requires isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_doctor_rejects_invalid_staging_without_state_or_storage_effects() {
+    let fixture = Fixture::new();
+    fixture.write_raw("doctor.txt", b"doctor");
+    let inventory = fixture.inventory();
+    let staging = fixture.path("direct-write-doctor-state");
+    fs::write(&staging, b"not a directory").expect("write invalid Direct staging file");
+    let config = fixture.writable_config("direct-write-doctor", "fuse", &staging);
+
+    let doctor = fixture.yy(&["--volume", path_text(&config), "doctor", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap_or_else(|error| {
+        panic!(
+            "Direct doctor returned invalid JSON: {error}\n{}",
+            doctor.text()
+        )
+    });
+    assert_ne!(
+        value["status"], "pass",
+        "writable Direct doctor reported ready with a non-directory staging path: {value:#}"
+    );
+    let local_state = value["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "local-state")
+        .expect("doctor local-state check");
+    assert_ne!(local_state["status"], "pass", "{value:#}");
+    assert!(
+        local_state["detail"].as_str().is_some_and(
+            |detail| detail.contains("staging") || detail.contains(path_text(&staging))
+        ),
+        "doctor did not identify the invalid Direct staging path: {value:#}"
+    );
+    assert_eq!(
+        fs::read(&staging).expect("read invalid Direct staging file"),
+        b"not a directory"
+    );
+    assert_eq!(
+        fixture.inventory(),
+        inventory,
+        "invalid Direct staging doctor mutated raw storage"
+    );
+    assert!(
+        fixture
+            .inventory()
+            .keys()
+            .all(|key| !key.starts_with(".yinyang/")),
+        "invalid Direct staging doctor created Managed metadata"
+    );
+}
+
+#[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
 fn direct_write_mount_publishes_whole_objects_and_persists_remount() {
     let fixture = Fixture::new();
