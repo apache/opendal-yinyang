@@ -18,7 +18,6 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -112,117 +111,109 @@ impl DirectRemote for MemoryRemote {
         self.namespace.clone()
     }
 
-    fn observe(&self) -> impl Future<Output = yinyang::replica::Result<RemoteSnapshot>> + Send {
+    async fn observe(&self) -> yinyang::replica::Result<RemoteSnapshot> {
         let objects = self.objects.clone();
         let directories = self.directories.clone();
-        async move {
-            let objects = objects.lock().unwrap();
-            let directories = directories.lock().unwrap();
-            let mut entries = BTreeMap::new();
-            for (path, bytes) in objects.iter() {
-                entries.insert(
-                    path.clone(),
-                    RemoteEntry {
-                        path: path.clone(),
-                        kind: RemoteKind::File,
-                        size: bytes.len() as u64,
-                        pin: Some(pin(path, bytes)),
-                        observation: observation(path, bytes),
-                    },
-                );
-            }
-            for path in directories.iter() {
-                entries.insert(
-                    path.clone(),
-                    RemoteEntry {
-                        path: path.clone(),
-                        kind: RemoteKind::Directory,
-                        size: 0,
-                        pin: None,
-                        observation: observation(path, &[]),
-                    },
-                );
-            }
-            Ok(RemoteSnapshot {
-                revision: Some(format!("generation-{}", observation_all(&objects))),
-                entries,
-            })
+        let objects = objects.lock().unwrap();
+        let directories = directories.lock().unwrap();
+        let mut entries = BTreeMap::new();
+        for (path, bytes) in objects.iter() {
+            entries.insert(
+                path.clone(),
+                RemoteEntry {
+                    path: path.clone(),
+                    kind: RemoteKind::File,
+                    size: bytes.len() as u64,
+                    pin: Some(pin(path, bytes)),
+                    observation: observation(path, bytes),
+                },
+            );
         }
+        for path in directories.iter() {
+            entries.insert(
+                path.clone(),
+                RemoteEntry {
+                    path: path.clone(),
+                    kind: RemoteKind::Directory,
+                    size: 0,
+                    pin: None,
+                    observation: observation(path, &[]),
+                },
+            );
+        }
+        Ok(RemoteSnapshot {
+            revision: Some(format!("generation-{}", observation_all(&objects))),
+            entries,
+        })
     }
 
-    fn read_to_path<'a>(
-        &'a self,
-        entry: &'a RemoteEntry,
-        output: &'a Path,
-    ) -> impl Future<Output = yinyang::replica::Result<()>> + Send + 'a {
-        async move {
-            let bytes = self
-                .objects
-                .lock()
-                .unwrap()
-                .get(&entry.path)
-                .cloned()
-                .ok_or_else(|| yinyang::replica::Error::conflict("remote object disappeared"))?;
-            if observation(&entry.path, &bytes) != entry.observation {
-                return Err(yinyang::replica::Error::conflict(
-                    "remote object changed after observation",
-                ));
-            }
-            std::fs::write(output, bytes)
-                .map_err(|error| yinyang::replica::Error::io("write download", output, error))
+    async fn read_to_path(
+        &self,
+        entry: &RemoteEntry,
+        output: &Path,
+    ) -> yinyang::replica::Result<()> {
+        let bytes = self
+            .objects
+            .lock()
+            .unwrap()
+            .get(&entry.path)
+            .cloned()
+            .ok_or_else(|| yinyang::replica::Error::conflict("remote object disappeared"))?;
+        if observation(&entry.path, &bytes) != entry.observation {
+            return Err(yinyang::replica::Error::conflict(
+                "remote object changed after observation",
+            ));
         }
+        std::fs::write(output, bytes)
+            .map_err(|error| yinyang::replica::Error::io("write download", output, error))
     }
 
-    fn publish_file<'a>(
-        &'a self,
-        path: &'a str,
-        source: &'a Path,
-        precondition: &'a RemotePrecondition,
-    ) -> impl Future<Output = yinyang::replica::Result<MutationOutcome>> + Send + 'a {
-        async move {
-            let mut bytes = Vec::new();
-            std::fs::File::open(source)
-                .and_then(|mut file| file.read_to_end(&mut bytes))
-                .map_err(|error| yinyang::replica::Error::io("read upload", source, error))?;
-            {
-                let objects = self.objects.lock().unwrap();
-                if !condition_matches(path, objects.get(path), precondition) {
-                    return Ok(MutationOutcome::Conflict);
-                }
-            }
-            self.objects
-                .lock()
-                .unwrap()
-                .insert(path.to_owned(), bytes.clone());
-            self.generation.fetch_add(1, Ordering::SeqCst);
-            if self.pause_next_publish.swap(false, Ordering::SeqCst) {
-                self.publish_reached.notify_waiters();
-                self.publish_release.notified().await;
-            }
-            if self.unknown_next_publish.swap(false, Ordering::SeqCst) {
-                return Ok(MutationOutcome::Unknown {
-                    error: "test lost the successful response".to_owned(),
-                });
-            }
-            Ok(MutationOutcome::Applied {
-                accepted: Some(pin(path, &bytes)),
-            })
-        }
-    }
-
-    fn delete<'a>(
-        &'a self,
-        path: &'a str,
-        precondition: &'a RemotePrecondition,
-    ) -> impl Future<Output = yinyang::replica::Result<MutationOutcome>> + Send + 'a {
-        async move {
-            let mut objects = self.objects.lock().unwrap();
+    async fn publish_file(
+        &self,
+        path: &str,
+        source: &Path,
+        precondition: &RemotePrecondition,
+    ) -> yinyang::replica::Result<MutationOutcome> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(source)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(|error| yinyang::replica::Error::io("read upload", source, error))?;
+        {
+            let objects = self.objects.lock().unwrap();
             if !condition_matches(path, objects.get(path), precondition) {
                 return Ok(MutationOutcome::Conflict);
             }
-            objects.remove(path);
-            Ok(MutationOutcome::Applied { accepted: None })
         }
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), bytes.clone());
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.pause_next_publish.swap(false, Ordering::SeqCst) {
+            self.publish_reached.notify_waiters();
+            self.publish_release.notified().await;
+        }
+        if self.unknown_next_publish.swap(false, Ordering::SeqCst) {
+            return Ok(MutationOutcome::Unknown {
+                error: "test lost the successful response".to_owned(),
+            });
+        }
+        Ok(MutationOutcome::Applied {
+            accepted: Some(pin(path, &bytes)),
+        })
+    }
+
+    async fn delete(
+        &self,
+        path: &str,
+        precondition: &RemotePrecondition,
+    ) -> yinyang::replica::Result<MutationOutcome> {
+        let mut objects = self.objects.lock().unwrap();
+        if !condition_matches(path, objects.get(path), precondition) {
+            return Ok(MutationOutcome::Conflict);
+        }
+        objects.remove(path);
+        Ok(MutationOutcome::Applied { accepted: None })
     }
 }
 
