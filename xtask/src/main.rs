@@ -91,7 +91,7 @@ enum SubCommand {
     )]
     TestCompatibility(CommandTestCompatibility),
     #[clap(
-        about = "Run real read-only S3 Direct acceptance through yy and /dev/fuse (requires isolated S3 settings)."
+        about = "Run deterministic Direct Mount and Sync acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
     TestLinuxDirect(CommandTestLinuxDirect),
     #[clap(
@@ -482,7 +482,7 @@ impl CommandTestLinuxDirect {
                 "YINYANG_DIRECT_VERSIONED_BUCKET is unset; Direct acceptance must cover a true-versioning bucket"
             );
         }
-        run_ignored_test("linux_direct", Some("direct_"));
+        run_ignored_test_skipping("linux_direct", Some("direct_"), &["direct_amazon_s3_"]);
     }
 }
 
@@ -644,12 +644,19 @@ fn require_isolated_storage(context: &str) {
 }
 
 fn run_ignored_test(target: &str, filter: Option<&str>) {
+    run_ignored_test_skipping(target, filter, &[]);
+}
+
+fn run_ignored_test_skipping(target: &str, filter: Option<&str>, skips: &[&str]) {
     let mut cmd = find_command("cargo");
     cmd.args(["test", "-p", "yinyang", "--test", target]);
     if let Some(filter) = filter {
         cmd.arg(filter);
     }
     cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
+    for skip in skips {
+        cmd.args(["--skip", skip]);
+    }
     run_command(cmd);
 }
 
