@@ -893,6 +893,7 @@ impl DirectInner {
                 reply.ok();
             }
             Some(errno) => {
+                let errno = namespace_conflict_errno(errno);
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
                 }
@@ -986,6 +987,7 @@ impl DirectInner {
                 reply.ok();
             }
             Some(errno) => {
+                let errno = namespace_conflict_errno(errno);
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse rename: cannot retain mutation state: {pending:?}");
                 }
@@ -1487,11 +1489,21 @@ fn mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
     }
 }
 
+fn namespace_conflict_errno(errno: fuser::Errno) -> fuser::Errno {
+    // Linux namei retries ESTALE once inside the same syscall. Report a
+    // precondition conflict as EAGAIN instead, so no automatic retry can use a
+    // globally refreshed source or destination pin as a new intent.
+    if errno.code() == fuser::Errno::ESTALE.code() {
+        fuser::Errno::EAGAIN
+    } else {
+        errno
+    }
+}
+
 fn should_rebase_namespace_after_failure(errno: fuser::Errno) -> bool {
-    // VFS can retry UNLINK or RENAME after ESTALE. Keep the failed pin until
-    // explicit SIGHUP so a retry cannot use a refreshed destination or source
-    // precondition and silently replace an external namespace change.
-    errno.code() != fuser::Errno::ESTALE.code()
+    // Conflict retains the failed pin until explicit SIGHUP. Other namespace
+    // failures return EIO/EOPNOTSUPP and may install the successful refresh.
+    errno.code() != fuser::Errno::EAGAIN.code()
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -2009,8 +2021,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn namespace_conflicts_retain_the_failed_pin_for_vfs_retry() {
-        assert!(!should_rebase_namespace_after_failure(fuser::Errno::ESTALE));
+    fn namespace_conflicts_use_non_retrying_errno_and_retain_pin() {
+        assert_eq!(
+            namespace_conflict_errno(fuser::Errno::ESTALE).code(),
+            fuser::Errno::EAGAIN.code()
+        );
+        assert_eq!(
+            namespace_conflict_errno(fuser::Errno::EIO).code(),
+            fuser::Errno::EIO.code()
+        );
+        assert!(!should_rebase_namespace_after_failure(fuser::Errno::EAGAIN));
         assert!(should_rebase_namespace_after_failure(fuser::Errno::EIO));
         assert!(should_rebase_namespace_after_failure(
             fuser::Errno::EOPNOTSUPP

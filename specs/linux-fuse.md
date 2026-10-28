@@ -290,12 +290,15 @@ dentry invalidation remain confined to the explicit SIGHUP path, outside a
 related mutation request.
 
 An `unlink` or `rename` precondition conflict does not install a refreshed
-remote snapshot before returning `ESTALE`. VFS may retry the namespace request
-after this result; retaining the failed pin makes the retry repeat the stale
-condition instead of deleting or replacing an external namespace change with
-its newly observed ETag. The pending Conflict observation remains visible, and
-explicit `SIGHUP` performs the rebase needed before a later operation can
-target the observed replacement.
+remote snapshot and returns `EAGAIN`, not `ESTALE`. Linux namei automatically
+retries `ESTALE` once inside the same syscall; a concurrent global refresh
+could make that retry use the external source or destination pin as a new
+intent. `EAGAIN` leaves the decision to an explicit caller retry.
+
+The pending Conflict observation remains visible, and the failed snapshot is
+retained. Explicit `SIGHUP` performs the rebase needed before a later operation
+can target the observed replacement. Lookup or handle failures that cannot
+revalidate identity continue to report `ESTALE`.
 
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at
