@@ -313,6 +313,62 @@ fn direct_write_append_flags_and_shared_fd_visibility() {
     mounted.unmount();
 }
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_create_is_conditional_and_never_clobbers_external_appearance() {
+    let fixture = Fixture::new();
+    let staging = fixture.path("direct-write-create-state");
+    let config = fixture.writable_config("direct-write-create", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-create");
+    fs::create_dir(&mountpoint).expect("create writable Direct create mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+
+    let created_bytes = payload(12 * 1024 + 5, 0x27);
+    let mut created =
+        File::create(mounted.mountpoint().join("created.txt")).expect("create Direct file");
+    created
+        .write_all(&created_bytes)
+        .expect("write new Direct file");
+    created
+        .sync_all()
+        .expect("publish conditional Direct creation");
+    drop(created);
+    assert_eq!(
+        fixture.raw_get("created.txt").as_deref(),
+        Some(created_bytes.as_slice())
+    );
+
+    let local = payload(20 * 1024 + 17, 0x51);
+    let external = payload(20 * 1024 + 3, 0x73);
+    let mut raced =
+        File::create(mounted.mountpoint().join("raced.txt")).expect("create raced Direct file");
+    raced
+        .write_all(&local)
+        .expect("write raced Direct local bytes");
+    fixture.write_raw("raced.txt", &external);
+    let error = raced
+        .sync_all()
+        .expect_err("external object appearance must reject Direct creation");
+    assert_errno(
+        &error,
+        &[libc::EIO, libc::ESTALE],
+        "conditional Direct creation",
+    );
+    assert_eq!(
+        fixture.raw_get("raced.txt").as_deref(),
+        Some(external.as_slice()),
+        "conditional Direct creation overwrote an externally created object"
+    );
+    raced.seek(SeekFrom::Start(0)).expect("rewind raced file");
+    let mut retained = Vec::new();
+    raced
+        .read_to_end(&mut retained)
+        .expect("read raced Direct local bytes");
+    assert_eq!(retained, local);
+    drop(raced);
+    mounted.unmount();
+}
+
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes()).expect("test path has no NUL");
     let name = CString::new(name).expect("xattr name has no NUL");
@@ -519,4 +575,204 @@ fn direct_write_safe_save_retries_source_cleanup_without_atomic_rename_claim() {
         "safe-save retry did not remove the conditional source object"
     );
     mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart() {
+    let fixture = Fixture::new();
+    let original = payload(48 * 1024 + 3, 0x11);
+    let local = payload(48 * 1024 + 5, 0x29);
+    let external = payload(48 * 1024 + 7, 0x43);
+    fixture.write_raw("conflict.txt", &original);
+    let staging = fixture.path("direct-write-conflict-state");
+    let config = fixture.writable_config("direct-write-conflict", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-conflict");
+    fs::create_dir(&mountpoint).expect("create writable Direct conflict mountpoint");
+    let mounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("conflict.txt");
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open conflict Direct writer");
+    file.write_all(&local).expect("stage local conflict bytes");
+    file.set_len(local.len() as u64)
+        .expect("set local conflict length");
+    fixture.write_raw("conflict.txt", &external);
+    let refresh = mounted.refresh_and_wait(Duration::from_secs(30));
+    assert!(
+        refresh.contains("inode=") && refresh.contains("entries="),
+        "writable Direct refresh omitted its invalidation counts: {refresh}"
+    );
+    let error = file
+        .sync_all()
+        .expect_err("external replacement must make Direct publication conflict");
+    assert_errno(
+        &error,
+        &[libc::EIO, libc::ESTALE],
+        "Direct external replacement conflict",
+    );
+    assert_eq!(
+        fixture.raw_get("conflict.txt").as_deref(),
+        Some(external.as_slice()),
+        "conflicting Direct publication overwrote the external object"
+    );
+    assert_eq!(
+        file.metadata().expect("stat conflicted Direct fd").len(),
+        local.len() as u64
+    );
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind conflicted Direct fd");
+    let mut retained = Vec::new();
+    file.read_to_end(&mut retained)
+        .expect("read retained conflict bytes");
+    assert_eq!(retained, local);
+    drop(file);
+    mounted.unmount();
+
+    let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    assert_eq!(
+        fs::read(remounted.mountpoint().join("conflict.txt"))
+            .expect("read recovered Direct conflict bytes"),
+        local,
+        "restart discarded the locally retained conflict bytes"
+    );
+    assert_eq!(
+        fixture.raw_get("conflict.txt").as_deref(),
+        Some(external.as_slice()),
+        "restart automatically retried and overwrote the external conflict"
+    );
+    remounted.unmount();
+}
+
+fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
+    let fixture = Fixture::new();
+    let original = payload(32 * 1024 + 1, 0x15);
+    let local = payload(32 * 1024 + 9, 0x37);
+    let newer = payload(32 * 1024 + 3, 0x59);
+    fixture.write_raw("uncertain.txt", &original);
+    let staging = fixture.path("direct-write-uncertain-state");
+    let config = fixture.writable_config("direct-write-uncertain", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-uncertain");
+    fs::create_dir(&mountpoint).expect("create writable Direct uncertainty mountpoint");
+
+    let suffix = format!("/{}/uncertain.txt", fixture.root());
+    let gate = S3Gate::start_for_path(action, "PUT", suffix);
+    let mut command = fixture.mount_command(&config, &mountpoint);
+    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let mounted = Mounted::spawn_writable(command, &mountpoint);
+    let path = mounted.mountpoint().join("uncertain.txt");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open uncertain Direct writer");
+    file.write_all(&local)
+        .expect("stage uncertain Direct publication");
+    file.set_len(local.len() as u64)
+        .expect("set uncertain Direct length");
+
+    let publication = thread::spawn(move || {
+        let result = file.sync_all();
+        (file, result)
+    });
+    let intercepted = gate.wait_intercepted();
+    assert_eq!(intercepted.method, "PUT");
+    assert!(
+        intercepted.target.contains("/uncertain.txt"),
+        "uncertainty gate intercepted the wrong object: {}",
+        intercepted.target
+    );
+    assert!(
+        intercepted.header("if-match").is_some(),
+        "Direct replacement omitted its conditional ETag: {:?}",
+        intercepted.headers
+    );
+
+    if delivered {
+        fixture.wait_raw_bytes("uncertain.txt", &local, Duration::from_secs(30));
+    } else {
+        assert_eq!(
+            fixture.raw_get("uncertain.txt").as_deref(),
+            Some(original.as_slice()),
+            "dropped Direct request reached upstream storage"
+        );
+    }
+    mounted.crash();
+    gate.release();
+    if !delivered {
+        gate.wait_original_dropped();
+    }
+    drop(gate);
+
+    let (file, error) = publication
+        .join()
+        .expect("uncertain Direct publication panicked");
+    let error = error.expect_err("uncertain Direct publication reported success");
+    assert_errno(
+        &error,
+        &[libc::EIO, libc::ESTALE, libc::ENOTCONN],
+        "uncertain Direct publication",
+    );
+    drop(file);
+
+    let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    assert_eq!(
+        fs::read(remounted.mountpoint().join("uncertain.txt"))
+            .expect("read retained uncertain Direct bytes"),
+        local,
+        "restart discarded uncertain local bytes"
+    );
+    let expected_remote = if delivered {
+        local.as_slice()
+    } else {
+        original.as_slice()
+    };
+    assert_eq!(
+        fixture.raw_get("uncertain.txt").as_deref(),
+        Some(expected_remote),
+        "restart incorrectly changed the uncertain backend outcome"
+    );
+
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(remounted.mountpoint().join("uncertain.txt"))
+        .expect("open newer Direct edit");
+    writer
+        .write_all(&newer)
+        .expect("stage newer Direct local edit");
+    writer
+        .set_len(newer.len() as u64)
+        .expect("set newer Direct length");
+    remounted.crash();
+    drop(writer);
+
+    let final_mount = fixture.spawn_writable_mount(&config, &mountpoint);
+    assert_eq!(
+        fs::read(final_mount.mountpoint().join("uncertain.txt"))
+            .expect("read newer local Direct bytes after restart"),
+        newer,
+        "restart lost a newer local edit made after the uncertain outcome"
+    );
+    assert_eq!(
+        fixture.raw_get("uncertain.txt").as_deref(),
+        Some(expected_remote),
+        "restart auto-resolved the uncertain outcome with a newer local edit"
+    );
+    final_mount.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_dropped_request_remains_unknown() {
+    exercise_uncertain_publication(CommitAction::DropBeforeCommit, false);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_lost_response_remains_unknown() {
+    exercise_uncertain_publication(CommitAction::DropResponse, true);
 }
