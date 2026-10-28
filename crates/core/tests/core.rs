@@ -47,8 +47,9 @@ async fn indexed_disjoint_files_and_fenced_delayed_attempts() {
     right.set_executable(b, true).await.unwrap();
     let left = left.finish().unwrap();
     let right = right.finish().unwrap();
+    let competing = object_fs(&backend).await;
     backend.state.lock().unwrap().head_barrier = Some((Arc::new(tokio::sync::Barrier::new(2)), 2));
-    let (left, right) = tokio::join!(fs.commit(&left), fs.commit(&right));
+    let (left, right) = tokio::join!(fs.commit(&left), competing.commit(&right));
     committed(left.unwrap());
     committed(right.unwrap());
     let old = fs.observe_latest().await.unwrap();
@@ -69,6 +70,42 @@ async fn indexed_disjoint_files_and_fenced_delayed_attempts() {
     assert_ne!(
         pending_condition,
         Some(state.objects[".yinyang/head"].etag.clone())
+    );
+}
+
+#[tokio::test]
+async fn cloned_disjoint_commits_serialize_within_one_authority() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut seed = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let empty = fs.data().prepare(&mut b"".as_slice()).await.unwrap();
+    let a = seed
+        .create_file(fs.root(), "a", empty.clone(), false)
+        .await
+        .unwrap();
+    let b = seed
+        .create_file(fs.root(), "b", empty, false)
+        .await
+        .unwrap();
+    committed(fs.commit(&seed.finish().unwrap()).await.unwrap());
+
+    let old = fs.observe_latest().await.unwrap();
+    let mut left = Planner::new(&old, CommitId::generate());
+    left.set_executable(a, true).await.unwrap();
+    let mut right = Planner::new(&old, CommitId::generate());
+    right.set_executable(b, true).await.unwrap();
+    let left = left.finish().unwrap();
+    let right = right.finish().unwrap();
+    let clone = fs.clone();
+    let before = backend.state.lock().unwrap().head_conditional_writes;
+    backend.state.lock().unwrap().head_read_yield = 1;
+
+    let (left, right) = tokio::join!(fs.commit(&left), clone.commit(&right));
+    committed(left.unwrap());
+    committed(right.unwrap());
+    assert_eq!(
+        backend.state.lock().unwrap().head_conditional_writes - before,
+        2
     );
 }
 
@@ -406,8 +443,9 @@ async fn indexed_disjoint_creates_survive_cas_race_and_preserve_snapshots() {
     let mut right = Planner::new(&old, CommitId::generate());
     let b = right.create_directory(fs.root(), "b").await.unwrap();
     let right = right.finish().unwrap();
+    let competing = object_fs(&backend).await;
     backend.state.lock().unwrap().head_barrier = Some((Arc::new(tokio::sync::Barrier::new(2)), 2));
-    let (l, r) = tokio::join!(fs.commit(&left), fs.commit(&right));
+    let (l, r) = tokio::join!(fs.commit(&left), competing.commit(&right));
     let l = committed(l.unwrap());
     let r = committed(r.unwrap());
     assert_ne!(l.cursor, r.cursor);

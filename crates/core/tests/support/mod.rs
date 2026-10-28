@@ -44,6 +44,8 @@ pub struct TestState {
     pub corrupt_pack_on_close: bool,
     pub read_paths: Vec<String>,
     pub written_bytes: u64,
+    pub head_conditional_writes: u64,
+    pub head_read_yield: usize,
     pub head_barrier: Option<(Arc<tokio::sync::Barrier>, usize)>,
     pub delay_next_head: bool,
     pub fail_head_read_after: Option<usize>,
@@ -205,6 +207,7 @@ impl Service for TestService {
             ));
         }
         Ok(TestReader {
+            head: path == ".yinyang/head",
             object,
             state: self.state.clone(),
             data: path.contains("/packs/"),
@@ -268,6 +271,7 @@ impl Service for TestService {
 
 #[derive(Debug)]
 pub struct TestReader {
+    pub head: bool,
     pub object: StoredObject,
     pub state: Arc<Mutex<TestState>>,
     pub data: bool,
@@ -284,6 +288,20 @@ impl oio::Read for TestReader {
 
     async fn read(&self, range: BytesRange) -> opendal::Result<(RpRead, Buffer)> {
         let range = range.to_content_range(self.object.bytes.len())?;
+        if self.head {
+            let should_yield = {
+                let mut state = self.state.lock().unwrap();
+                if state.head_read_yield == 0 {
+                    false
+                } else {
+                    state.head_read_yield -= 1;
+                    true
+                }
+            };
+            if should_yield {
+                tokio::task::yield_now().await;
+            }
+        }
         if self.data {
             let mut state = self.state.lock().unwrap();
             state.data_read_bytes += range.len() as u64;
@@ -316,6 +334,9 @@ impl oio::Write for TestWriter {
     async fn close(&mut self) -> opendal::Result<Metadata> {
         if self.state.lock().unwrap().offline {
             return Err(unavailable());
+        }
+        if self.path == ".yinyang/head" && (self.if_match.is_some() || self.if_not_exists) {
+            self.state.lock().unwrap().head_conditional_writes += 1;
         }
         if self.path == ".yinyang/head" && self.if_match.is_some() {
             let barrier = {
