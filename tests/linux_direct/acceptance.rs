@@ -43,13 +43,13 @@ fn direct_raw_s3_harness_preserves_requested_keys() {
     );
     let keys = [
         "literal%.txt",
-        "../escape",
-        "./dot",
         "control\u{7f}",
-        "a//b",
-        "/leading",
         "trailing/",
-        "nul\0byte",
+        "space name.txt",
+        "Case.txt",
+        "case.txt",
+        "caf\u{e9}",
+        "cafe\u{301}",
     ];
     for (index, suffix) in keys.iter().enumerate() {
         let key = format!("{root}/{suffix}");
@@ -171,6 +171,24 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
         initial_inventory,
         "Direct capabilities and doctor must not mutate raw storage"
     );
+    let status = fixture.yy_ok(&["--volume", path_text(&config), "status"]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout)
+            .to_ascii_lowercase()
+            .contains("direct"),
+        "Direct status did not identify the Direct namespace:\n{}",
+        status.text()
+    );
+    assert_eq!(
+        local_paths(fixture.temp.path()),
+        local_before,
+        "Direct status must not create staging or authority state"
+    );
+    assert_eq!(
+        fixture.inventory(),
+        initial_inventory,
+        "Direct status must not mutate raw storage"
+    );
 
     let mountpoint = fixture.path("mnt");
     fs::create_dir(&mountpoint).expect("create Direct mountpoint");
@@ -256,6 +274,44 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
         fixture.inventory(),
         initial_inventory,
         "rejected Direct writable admission must not mutate raw storage"
+    );
+
+    let staging = fixture.path("direct-staging-must-not-exist");
+    let with_staging = fixture.config(
+        "direct-staging",
+        "fuse",
+        Some(true),
+        Some(staging.as_path()),
+    );
+    let requests = RequestCounter::start();
+    let rejected_mountpoint = fixture.path("mnt-staging");
+    fs::create_dir(&rejected_mountpoint).expect("create staging rejection mountpoint");
+    let mut rejected_command = fixture.yy_command(&[
+        "--volume",
+        path_text(&with_staging),
+        "mount",
+        path_text(&rejected_mountpoint),
+    ]);
+    rejected_command.env("YINYANG_S3_ENDPOINT", requests.endpoint());
+    let rejected = run_timeout(rejected_command, Duration::from_secs(30));
+    assert!(
+        !rejected.status.success(),
+        "Direct staging configuration was accepted"
+    );
+    assert!(
+        rejected.text().to_ascii_lowercase().contains("staging"),
+        "Direct staging rejection did not identify the field:\n{}",
+        rejected.text()
+    );
+    requests.assert_no_requests("Direct staging rejection");
+    assert!(
+        !staging.exists(),
+        "Direct staging rejection created the configured path"
+    );
+    assert_eq!(
+        fixture.inventory(),
+        initial_inventory,
+        "Direct staging rejection mutated raw storage"
     );
 }
 
@@ -447,8 +503,7 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
     let fixture = Fixture::new();
     fixture.write_raw("plain.txt", b"plain");
     fixture.write_raw("literal%.txt", b"percent");
-    fixture.write_raw("../escape", b"dotdot");
-    fixture.write_raw("./dot", b"dot");
+    fixture.write_raw("literal%25.txt", b"percent-encoded-spelling");
     fixture.write_raw("control\u{7f}", b"control");
     fixture.write_raw("Case.txt", b"uppercase");
     fixture.write_raw("case.txt", b"lowercase");
@@ -467,12 +522,8 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
         b"percent"
     );
     assert_eq!(
-        fs::read(root.join(find_encoded(root, "..").join("escape"))).unwrap(),
-        b"dotdot"
-    );
-    assert_eq!(
-        fs::read(root.join(find_encoded(root, ".").join("dot"))).unwrap(),
-        b"dot"
+        fs::read(root.join(find_encoded(root, "literal%25.txt"))).unwrap(),
+        b"percent-encoded-spelling"
     );
     assert_eq!(
         fs::read(root.join(find_encoded(root, "control\u{7f}"))).unwrap(),
@@ -502,11 +553,6 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
                 ("a/b".to_owned(), b"child".as_slice()),
             ],
             "file-prefix collision",
-        ),
-        (
-            "empty-component",
-            vec![("a//b".to_owned(), b"empty".as_slice())],
-            "empty",
         ),
         (
             "directory-marker",

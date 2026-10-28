@@ -54,6 +54,10 @@ Managed Mount and Managed Sync remain experimental. The metadata service is one
 authenticated single-host loopback authority, not TLS, HA or a network-safe
 service. There is no automatic Sync watcher or timer.
 
+Read-only Direct Mount is implemented as a separate experimental frontend. It
+does not use staging, the metadata service or Managed recovery state, and the
+Managed qualification results below do not qualify Direct.
+
 ## Prerequisites
 
 On the tested host:
@@ -360,10 +364,11 @@ yyvol object --volume "$HOME/.config/yinyang/volumes/object.json" doctor --json
 `yy doctor` exits `0` when all checks pass and `1` when any check requires
 action. Its `tested_host` field records whether this is the Ubuntu 24.04
 x86_64 qualification combination; an untested Linux host is reported as
-information, not as a CLI runtime restriction. The `scope` object states the
-boundary: the state probe writes and removes one namespaced temporary file,
+information, not as a CLI runtime restriction. For Managed, the `scope` object
+states that the state probe writes and removes one namespaced temporary file,
 does not initialize the catalog or acquire a runtime lease, and the authority
-check only observes the latest revision.
+check only observes the latest revision. For Direct, no state probe occurs;
+doctor performs one recursive read-only namespace observation.
 
 Stop services without deleting state:
 
@@ -395,6 +400,7 @@ journalctl --user -u yinyang-mount@object.service --since "30 minutes ago"
 | --- | --- | --- |
 | `doctor` reports `environment` | `YINYANG_S3_BUCKET`, profile, endpoint and access-key pair presence | Correct the environment file; do not print values |
 | `doctor` reports `authority` with a 403 | Credential expiry, bucket policy, and the exact S3 backend | Use `tested_host` and the authority error; do not guess whether the cause is a key or policy |
+| `doctor` reports `namespace` with invalid names or a collision | The named object keys and the Direct mapping contract | Rename or remove the object key; Direct does not filter or rewrite it |
 | `doctor` reports a connection or timeout | `service_address`, listener status, endpoint DNS/TLS and outbound network | Restart the loopback service or correct the endpoint; preserve state |
 | `doctor` reports `local-state` | State parent permissions, filesystem space and path overlap with mounted/source data | Fix the path or free space; do not delete staging or WAL files |
 | `doctor` reports `mount-state` pending/frozen/conflict | The volume `status` output and journal | Preserve staging, inspect the handle/ledger, and resolve the exact uncertain request |

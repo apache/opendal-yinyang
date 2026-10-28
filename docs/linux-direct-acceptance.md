@@ -14,8 +14,14 @@ The command requires:
 
 The harness uses its own path-style signed requests rather than OpenDAL's path
 abstraction. Every seeded key is immediately fetched and listed again, so a
-test cannot claim to cover a leading slash, repeated slash, dot component,
-control byte or NUL key that the client normalized before storage.
+test cannot claim to cover a percent sign, DEL, trailing marker, case or
+Unicode spelling that the client normalized before storage.
+
+The Silo test endpoint rejects keys containing `.`/`..` components, empty path
+components or NUL before they can be stored. Those reversible-mapping and
+rejection rules are covered by the Direct mapper's deterministic unit tests;
+the native FUSE fixture does not mislabel a normalized or rejected seed as
+storage evidence.
 
 Acceptance covers:
 
@@ -23,8 +29,8 @@ Acceptance covers:
   `false` is rejected by the actual mount entry point before any S3 connection;
 - `capabilities` and `doctor` without Managed write primitives, staging state
   or authoritative YinYang metadata;
-- complete-observation rejection for invalid components, file-prefix
-  conflicts, non-empty directory markers and overlong names;
+- complete-observation rejection for file-prefix conflicts, non-empty
+  directory markers and overlong names that the selected backend can store;
 - the reversible percent mapping while preserving case and Unicode
   normalization distinctions;
 - raw external replacement and deletion, retained descriptor attributes,

@@ -52,7 +52,13 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   isolated macOS 27 / Xcode 27 prototypes. They share the native bridge and
   runtimes, but ordinary volume CLI admission does not select them. See the
   [macOS frontend contract](specs/macos-frontends.md).
-- **Direct:** Direct volumes are not implemented in the current architecture.
+- **Read-only Direct:** The library and Linux FUSE frontend can browse and read
+  an existing S3-compatible object namespace without importing it into Managed
+  metadata. Keys use a reversible Linux-name mapping, recursive listing is an
+  explicit SIGHUP-refreshed observation, and each descriptor pins a real object
+  version or uses conditional ETag ranges. See the
+  [Direct contract](specs/direct.md). Writable Direct and Direct Sync remain
+  unimplemented.
 
 The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
 tracks the remaining integration and platform work.
