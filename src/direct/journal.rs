@@ -31,6 +31,7 @@ pub(super) const OBJECT_PENDING: u8 = 2;
 pub(super) const OBJECT_CONFLICT: u8 = 3;
 pub(super) const OBJECT_UNKNOWN: u8 = 4;
 pub(super) const OBJECT_FAILED: u8 = 5;
+pub(super) const OBJECT_DISCARDED: u8 = 6;
 
 pub(super) const MUTATION_STAGED: u8 = 0;
 pub(super) const MUTATION_DISPATCHING: u8 = 1;
@@ -146,7 +147,8 @@ pub(super) struct MutationRecord {
     pub input_length: u64,
     pub input_digest: Option<[u8; 32]>,
     pub accepted: Option<PinRecord>,
-    pub observed: ObservationRecord,
+    pub source_observed: ObservationRecord,
+    pub destination_observed: ObservationRecord,
     pub error: Option<String>,
 }
 
