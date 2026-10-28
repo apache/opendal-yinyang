@@ -333,7 +333,7 @@ impl MetadataService {
             .read(".yinyang/head")
             .await
             .map_err(|e| Error::from_storage("read authority binding", e))?;
-        let (filesystem, root) = parse_service_binding(&marker)?;
+        let (filesystem, root) = parse_service_binding(&marker.to_vec())?;
         if filesystem != self.filesystem || root != self.root {
             return Err(Error::invalid(
                 "open metadata authority",

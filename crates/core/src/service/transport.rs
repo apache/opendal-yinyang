@@ -331,7 +331,7 @@ impl ServiceClient {
             .read(".yinyang/head")
             .await
             .map_err(|e| Error::from_storage("verify service data binding", e))?;
-        let (bound_filesystem, bound_root) = super::parse_service_binding(&marker)?;
+        let (bound_filesystem, bound_root) = super::parse_service_binding(&marker.to_vec())?;
         if bound_filesystem != NodeId::from_bytes(fs) || bound_root != NodeId::from_bytes(root) {
             return Err(Error::invalid(
                 "connect service",
