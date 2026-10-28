@@ -42,6 +42,7 @@ reports `yinyang.operational-health.v1` with this shape:
   "config": "...",
   "volume": {
     "name": "...",
+    "model": "managed|direct",
     "access": "mount|sync",
     "frontend": "fuse|library",
     "authority": "object|authenticated-loopback-service"
@@ -70,8 +71,9 @@ Checks are ordered from local policy to remote observation:
   host receives an informational check and does not become unhealthy merely
   because it is untested. A non-Linux host reports the operational restriction
   instead of implying native Linux frontend support.
-- `configuration`: parses the strict volume document and resolves a relative
-  staging path against the document directory.
+- `configuration`: parses the strict volume document and resolves a non-empty
+  relative staging path against the document directory. Direct has no staging
+  path to resolve.
 - `environment`: requires a bucket, a complete explicit access-key pair when
   either key is set, and, for service publication, a 32..=1024 byte service
   token. The volume document's `storage_profile` is authoritative for a
@@ -81,9 +83,10 @@ Checks are ordered from local policy to remote observation:
   read/write and close it without mounting, then require `fusermount3` on
   `PATH` to pass the current user's execute-access check. File existence alone
   is not treated as readiness.
-- `local-state`: write one namespaced owner-only temporary file under the
-  nearest existing state-directory ancestor, sync and remove it, or probe the
-  existing state directory. It does not create the configured staging
+- `local-state`: Managed writes one namespaced owner-only temporary file under
+  the nearest existing state-directory ancestor, syncs and removes it, or probes
+  the existing state directory. Direct reports this check as informational and
+  performs no filesystem write. Doctor does not create the configured staging
   directory, initialize `staging.db` or `sync.db`, run recovery, acquire the
   runtime or publication lease, or inspect a live Mount as unhealthy merely
   because that Mount holds its lease.
@@ -92,10 +95,14 @@ Checks are ordered from local policy to remote observation:
   records require action; read-only inspection itself is not a failure.
 - `admission`: construct the S3 operator and validate the effective
   four-layer capability intersection.
-- `authority`: connect and observe the latest revision. Object mode checks the
+- `authority`: Managed connects and observes the latest revision. Object mode checks the
   storage authority. Service mode uses the configured loopback address and
   separately supplied token; the check fails if either authentication or
   reachability fails. No mutation is issued.
+- `namespace`: Direct validates the storage-native mapping and performs one
+  recursive read-only object observation. Invalid names, file-prefix
+  collisions, unsupported storage, authentication failure and unavailable
+  endpoints require action. No object or YinYang metadata is created.
 - `sync-convergence`: for `access=sync`, this is informational only. A finite
   `sync run` exit code is not convergence. The operator must run `sync status
   --json` and require `summary.in_sync=true` with an available remote.

@@ -1,23 +1,25 @@
 # Linux FUSE frontend
 
-**Status: experimental Managed mount; protocol transport is the
-`fuser` 0.17 binding, not a YinYang FUSE implementation.**
+**Status: experimental Managed and read-only Direct mounts; protocol transport
+is the `fuser` 0.17 binding, not a YinYang FUSE implementation.**
 
 The Linux frontend mounts one Managed volume through the kernel FUSE ABI with
 `yy --volume CONFIG mount MOUNTPOINT` and keeps the process in the foreground.
-It uses the shared Authority, Mount and Runtime contracts directly; it never
-initializes or reformats remote storage. The macOS bridge crate is not part of
-the Linux path.
+Managed uses the shared Authority, Mount and Runtime contracts directly.
+Direct uses a separate storage-native snapshot and file-pin contract rather
+than Managed NodeIds, proofs or staging. Neither initializes or reformats
+remote storage, and the macOS bridge crate is not part of the Linux path.
 
 ## Startup and admission
 
-The volume configuration must declare `model = "managed"`, `access = "mount"`
-and `frontend = "fuse"`. Both read-only and writable mounts use the shared
-admission rules in [`volume-capabilities.md`](volume-capabilities.md); the
-frontend is rejected entirely on non-Linux targets. Object and service
-publication authorities are both accepted through `Volume::connect`.
+The volume configuration must declare `access = "mount"` and
+`frontend = "fuse"`. Managed accepts read-only and writable policies and
+object or service publication. Direct accepts read-only object publication.
+Both use the admission rules in [`volume-capabilities.md`](volume-capabilities.md);
+Direct's mapping, pin and error contract is in [`direct.md`](direct.md). The
+frontend is rejected entirely on non-Linux targets.
 
-Startup order:
+Managed startup order:
 
 1. validate the configuration and the storage capability intersection;
 2. connect the object or service authority;
@@ -27,6 +29,16 @@ Startup order:
    mount if any handle is pending, frozen, conflicted or failed;
 5. observe the latest remote snapshot and verify the root is a directory;
 6. handshake with the kernel as `fuse.yinyang` and serve requests.
+
+Direct startup validates the complete configuration, creates no staging or
+Managed authority, performs one read-only recursive object observation, and
+then hands the accepted snapshot to the kernel. Recursive LIST is not an atomic
+multi-page namespace transaction. LOOKUP and path GETATTR reuse the accepted
+snapshot; SIGHUP replaces it. Direct inode identity includes the accepted
+object version or ETag, size and whole-second mtime, so a later observation of
+replaced content receives a new inode and an old descriptor keeps the accepted
+attributes and pinned ranges. The complete behavior is in
+[`direct.md`](direct.md).
 
 Step 4 is the read-only dirty-data boundary. Recovered clean observations are
 disposable and reclaimed by existing Mount recovery, while unpublished staged

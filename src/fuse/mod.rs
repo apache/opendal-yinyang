@@ -15,21 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Linux FUSE mount frontend for Managed volumes.
+//! Linux FUSE mount frontend for Managed and read-only Direct volumes.
 //!
 //! The CLI form is `yy --volume CONFIG mount MOUNTPOINT`; the process stays in
 //! the foreground until unmounted. The volume must declare `frontend = "fuse"`;
-//! read-only and writable Managed mounts are supported. The shared admission rules in
-//! [`crate::volume`] reject every other combination before an authority
-//! connection or staging lease is created.
+//! read-only and writable Managed mounts plus read-only Direct mounts are
+//! supported. The shared admission rules in [`crate::volume`] reject every
+//! other combination before an authority connection or staging lease is
+//! created.
 //!
-//! Startup takes the staging lease through [`crate::mount::Mount`]. A read-only
-//! mount refuses to serve a staging database that still holds unpublished,
-//! frozen, conflicted or failed handles: a read-only snapshot view must never
-//! surface those locally staged bytes as if they were remote. A writable mount
-//! serves recovered pending/error state through the shared Mount, where flush
-//! or fsync reports the real outcome. Clean observations are disposable and are
-//! reclaimed by the existing Mount recovery.
+//! Managed startup takes the staging lease through [`crate::mount::Mount`]. A
+//! read-only Managed mount refuses to serve a staging database that still holds
+//! unpublished, frozen, conflicted or failed handles: a read-only snapshot view
+//! must never surface those locally staged bytes as if they were remote. A
+//! writable mount serves recovered pending/error state through the shared Mount,
+//! where flush or fsync reports the real outcome. Clean observations are
+//! disposable and are reclaimed by the existing Mount recovery. Direct creates
+//! no staging state and observes the storage namespace directly.
 //!
 //! The session mounts as `fuse.yinyang` and runs in the foreground. SIGINT and
 //! SIGTERM detach the mount and wait briefly for the session. Lazy unmounting
@@ -41,11 +43,12 @@
 //! See `specs/linux-fuse.md` for the full read-only contract.
 
 mod attrs;
+mod direct;
 mod frontend;
 mod inode;
 
 use crate::mount::Mount;
-use crate::volume::{Volume, VolumeConfig};
+use crate::volume::{Frontend, Model, Volume, VolumeConfig};
 use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,13 +71,20 @@ pub enum Outcome {
 
 /// Mount a validated read-only or writable FUSE volume in the foreground.
 ///
-/// `staging` must already be resolved to an absolute path by the CLI.
+/// Managed `staging` must already be resolved to an absolute path by the CLI.
 pub async fn run(
     config: VolumeConfig,
     operator: opendal::Operator,
     token: Option<String>,
     mountpoint: PathBuf,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
+    if config.frontend != Frontend::Fuse {
+        return Err("the mount command requires frontend=fuse".into());
+    }
+    config.validate(&operator)?;
+    if config.model == Model::Direct {
+        return direct::run(config, operator, mountpoint).await;
+    }
     let read_only = config.read_only;
     let authority = Volume::connect(&config, operator, token).await?;
     let mount = Mount::open(authority, &config.staging, read_only).await?;
@@ -242,13 +252,69 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::reject_unpublished_staging;
+    use super::{VolumeConfig, reject_unpublished_staging, run};
     use crate::core::{BackendProfile, Fs};
     use crate::mount::Mount;
     use crate::runtime::Runtime;
     use crate::support;
+    use crate::volume::{Access, Capability, Frontend, Model, Publication, StorageProfile};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use yinyang_core::Authority;
+
+    fn direct_config() -> VolumeConfig {
+        VolumeConfig {
+            name: "direct".to_owned(),
+            model: Model::Direct,
+            access: Access::Mount,
+            frontend: Frontend::Fuse,
+            publication: Publication::Object,
+            storage_profile: StorageProfile::Minio,
+            staging: std::path::PathBuf::new(),
+            read_only: true,
+            require: BTreeSet::new(),
+            service_address: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_admission_rejects_before_storage_or_kernel_mount() {
+        let backend = support::TestBackend::default();
+        let temp = tempfile::tempdir().unwrap();
+        for invalid in [
+            VolumeConfig {
+                read_only: false,
+                ..direct_config()
+            },
+            VolumeConfig {
+                access: Access::Sync,
+                ..direct_config()
+            },
+            VolumeConfig {
+                publication: Publication::Service,
+                service_address: Some("127.0.0.1:7447".parse().unwrap()),
+                ..direct_config()
+            },
+            VolumeConfig {
+                frontend: Frontend::Library,
+                ..direct_config()
+            },
+            VolumeConfig {
+                require: [Capability::Write].into_iter().collect(),
+                ..direct_config()
+            },
+        ] {
+            assert!(
+                run(invalid, backend.operator(), None, temp.path().to_owned())
+                    .await
+                    .is_err()
+            );
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.stat_calls, 0, "admission performed a storage stat");
+            assert!(state.read_paths.is_empty(), "admission read object data");
+            assert!(state.objects.is_empty(), "admission changed storage");
+        }
+    }
 
     #[tokio::test]
     async fn read_only_mount_refuses_unpublished_staging() {

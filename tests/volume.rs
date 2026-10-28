@@ -139,6 +139,52 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     };
     assert!(invalid.validate(&backend.operator()).is_err());
 }
+
+#[test]
+fn direct_defaults_to_read_only_and_does_not_require_staging() {
+    let direct: VolumeConfig = VolumeConfig::from_json(
+        br#"{
+            "name": "objects",
+            "model": "direct",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio"
+        }"#,
+    )
+    .unwrap();
+    assert!(direct.read_only, "Direct must default to read-only");
+    assert!(direct.staging.as_os_str().is_empty());
+    let serialized = serde_json::to_value(&direct).unwrap();
+    assert!(serialized.get("staging").is_none());
+
+    let managed = config(std::path::PathBuf::from("state"));
+    let managed = VolumeConfig::from_json(&serde_json::to_vec(&managed).unwrap()).unwrap();
+    assert!(
+        !managed.read_only,
+        "Managed must retain its existing writable default"
+    );
+
+    let with_staging: VolumeConfig = VolumeConfig::from_json(
+        br#"{
+            "name": "objects",
+            "model": "direct",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": "must-not-exist"
+        }"#,
+    )
+    .unwrap();
+    let backend = TestBackend::default();
+    let error = with_staging.validate(&backend.operator()).unwrap_err();
+    assert!(error.to_string().contains("do not use staging"));
+
+    let error = direct.validate(&backend.operator()).unwrap_err();
+    assert!(error.to_string().contains("direct admission"));
+    assert!(!error.to_string().contains("local staging"));
+}
 #[tokio::test]
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let temp = tempfile::tempdir().unwrap();

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tokio::io::AsyncReadExt;
 use yinyang::runtime::{Runtime, RuntimeStatus};
-use yinyang::volume::{Volume, VolumeConfig};
+use yinyang::volume::{Model, Volume, VolumeConfig};
 
 #[derive(Subcommand)]
 pub enum FileCommand {
@@ -126,7 +126,7 @@ async fn destination(
 }
 pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut config = VolumeConfig::from_json(&tokio::fs::read(path).await?)?;
-    if config.staging.is_relative() {
+    if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
         config.staging = path
             .parent()
             .unwrap_or(Path::new("."))
@@ -141,9 +141,32 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
     }
     if matches!(command, Command::Status { .. }) {
         println!(
-            "volume: {} access: {:?} frontend: {:?} read-only: {}",
-            config.name, config.access, config.frontend, config.read_only
+            "volume: {} model: {:?} access: {:?} frontend: {:?} read-only: {}",
+            config.name, config.model, config.access, config.frontend, config.read_only
         );
+        if config.model == Model::Direct {
+            println!("local staging: not used by Direct");
+            match operator() {
+                Ok(operator) => match yinyang::volume::direct_namespace(&config, operator) {
+                    Ok(namespace) => match namespace.observe().await {
+                        Ok(snapshot) => {
+                            let root = snapshot.read_dir(snapshot.root()).unwrap_or_default();
+                            let directories =
+                                root.iter().filter(|node| node.is_directory()).count();
+                            println!(
+                                "direct namespace: {} ({} root entries, {directories} directories)",
+                                snapshot.revision().to_hex(),
+                                root.len()
+                            );
+                        }
+                        Err(error) => println!("direct namespace: unavailable ({error})"),
+                    },
+                    Err(error) => println!("direct namespace: unavailable ({error})"),
+                },
+                Err(error) => println!("direct namespace: unavailable ({error})"),
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         if config.staging.join("staging.db").exists() {
             status(Runtime::inspect(&config.staging).await?);
         } else {
@@ -172,6 +195,9 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
         return Ok(ExitCode::SUCCESS);
     }
     if let Command::Receipt { commit_id } = command {
+        if config.model == Model::Direct {
+            return Err("Direct volumes have no Managed publication receipts".into());
+        }
         let authority = Volume::connect(&config, operator, token).await?;
         let Some(receipt) = authority
             .observe_latest()
