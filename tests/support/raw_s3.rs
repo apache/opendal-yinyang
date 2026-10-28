@@ -109,6 +109,19 @@ impl RawS3 {
         }
     }
 
+    pub fn get_version(&self, key: &str, version: &str) -> Option<Vec<u8>> {
+        let query = format!("versionId={}", query_encode(version));
+        let response = self.request("GET", Some(key), &query, &[]);
+        match response.status {
+            200 => Some(response.body),
+            404 => None,
+            status => panic!(
+                "raw S3 GET {key:?} version {version} failed with {status}:\n{}",
+                String::from_utf8_lossy(&response.body)
+            ),
+        }
+    }
+
     pub fn inventory(&self, prefix: &str) -> RawInventory {
         let mut keys = Vec::new();
         let mut token = None;

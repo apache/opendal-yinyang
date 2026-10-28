@@ -62,9 +62,9 @@ rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 futures-util.workspace = true
-hmac = "0.12.1"
+hmac = "0.13.0"
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 tempfile = "3"
 
 [workspace]

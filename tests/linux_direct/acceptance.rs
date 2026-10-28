@@ -17,7 +17,7 @@
 
 //! Real S3/FUSE acceptance for read-only Direct volumes.
 
-use crate::harness::{Fixture, assert_errno, path_text};
+use crate::harness::{Fixture, RequestCounter, assert_errno, path_text, run_timeout};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -228,7 +228,17 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
     assert_direct_read_only_capabilities(&effective_capabilities(&capabilities.stdout));
 
     let explicit_false = fixture.config("direct-false", "fuse", Some(false), None);
-    let rejected = fixture.yy(&["--volume", path_text(&explicit_false), "capabilities"]);
+    let requests = RequestCounter::start();
+    let rejected_mountpoint = fixture.path("mnt-false");
+    fs::create_dir(&rejected_mountpoint).expect("create rejected Direct mountpoint");
+    let mut rejected_command = fixture.yy_command(&[
+        "--volume",
+        path_text(&explicit_false),
+        "mount",
+        path_text(&rejected_mountpoint),
+    ]);
+    rejected_command.env("YINYANG_S3_ENDPOINT", requests.endpoint());
+    let rejected = run_timeout(rejected_command, Duration::from_secs(30));
     assert!(
         !rejected.status.success(),
         "Direct writable admission must fail before mounting"
@@ -241,6 +251,7 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
         "Direct writable rejection did not identify its admission boundary:\n{}",
         rejected.text()
     );
+    requests.assert_no_requests("Direct writable mount");
     assert_eq!(
         fixture.inventory(),
         initial_inventory,
@@ -289,6 +300,13 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
     let path = mounted.mountpoint().join("replace.bin");
 
     let mut old_fd = File::open(&path).expect("open old Direct version");
+    assert!(
+        old_fd
+            .metadata()
+            .expect("fstat old Direct version")
+            .is_file(),
+        "old Direct fd must expose a regular file identity"
+    );
     assert_eq!(
         old_fd.metadata().expect("fstat old Direct version").len(),
         old.len() as u64
@@ -302,6 +320,13 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
     mounted.refresh();
     mounted.wait_for_log("refresh", Duration::from_secs(30));
     let mut fresh = File::open(&path).expect("fresh Direct open after SIGHUP");
+    assert!(
+        fresh
+            .metadata()
+            .expect("fstat fresh Direct version")
+            .is_file(),
+        "fresh Direct fd must expose a regular file identity"
+    );
     assert_eq!(
         fresh.metadata().expect("fstat fresh Direct version").len(),
         shorter.len() as u64
@@ -340,6 +365,80 @@ fn direct_external_replacement_and_delete_do_not_mix_open_versions() {
         "a fresh lookup after external delete must not serve the removed raw key"
     );
     mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse, an isolated true-versioning bucket, and cargo x test-linux-direct"]
+fn direct_true_versioning_replacement_keeps_old_fd_bytes_and_attributes() {
+    let fixture = Fixture::versioned();
+    let old = payload(256 * 1024 + 41, 0x41);
+    let shorter = payload(32 * 1024 + 13, 0x13);
+    fixture.write_raw("versioned.bin", &old);
+    let seeded = fixture.inventory();
+    let version = seeded["versioned.bin"]
+        .version
+        .as_deref()
+        .filter(|version| *version != "null")
+        .unwrap_or_else(|| {
+            panic!(
+                "true-versioning Direct acceptance requires versionId, got {:?}",
+                seeded["versioned.bin"].version
+            )
+        })
+        .to_owned();
+
+    let config = fixture.config("direct-versioned", "fuse", None, None);
+    let mountpoint = fixture.path("mnt-versioned");
+    fs::create_dir(&mountpoint).expect("create versioned Direct mountpoint");
+    let mounted = fixture.spawn_mount(&config, &mountpoint, "fuse");
+    let path = mounted.mountpoint().join("versioned.bin");
+    let mut old_fd = File::open(&path).expect("open versioned old Direct fd");
+    let old_metadata = old_fd.metadata().expect("fstat versioned old Direct fd");
+    assert!(old_metadata.is_file());
+    assert_eq!(old_metadata.len(), old.len() as u64);
+    assert_eq!(
+        read_fully_at(&old_fd, 0, 4096).expect("read versioned old prefix"),
+        old[..4096]
+    );
+
+    fixture.write_raw("versioned.bin", &shorter);
+    let replaced = fixture.inventory();
+    assert_ne!(
+        replaced["versioned.bin"].version.as_deref(),
+        Some(version.as_str()),
+        "a real overwrite in a versioned bucket must allocate a new version identity"
+    );
+    assert_eq!(
+        read_fully_at(&old_fd, (old.len() - 4096) as u64, 4096)
+            .expect("versioned old range read must retain the pinned version"),
+        old[old.len() - 4096..],
+        "true object versioning must let an open Direct fd keep reading its exact version"
+    );
+    let retained = old_fd.metadata().expect("fstat retained versioned fd");
+    assert!(retained.is_file());
+    assert_eq!(retained.len(), old.len() as u64);
+
+    mounted.refresh();
+    mounted.wait_for_log("refresh", Duration::from_secs(30));
+    let mut fresh = File::open(&path).expect("fresh versioned Direct open after SIGHUP");
+    let fresh_metadata = fresh.metadata().expect("fstat fresh versioned Direct fd");
+    assert!(fresh_metadata.is_file());
+    assert_eq!(fresh_metadata.len(), shorter.len() as u64);
+    let mut fresh_bytes = Vec::new();
+    fresh
+        .read_to_end(&mut fresh_bytes)
+        .expect("read fresh versioned Direct file");
+    assert_eq!(fresh_bytes, shorter);
+    assert_ne!(
+        fresh_metadata.len(),
+        old.len() as u64,
+        "fresh versioned open must not inherit the old immutable length"
+    );
+
+    drop(fresh);
+    drop(old_fd);
+    mounted.unmount();
+    let _ = version;
 }
 
 #[test]
