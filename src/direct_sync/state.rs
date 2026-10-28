@@ -170,10 +170,10 @@ impl RemotePin {
     /// reads. Version IDs strengthen the pin when both sides expose one;
     /// otherwise ETag, size and known whole-second mtime identify the value.
     pub fn matches(&self, observed: &Self) -> bool {
-        if let Some(expected) = &self.version {
-            if let Some(observed) = &observed.version {
-                return expected == observed;
-            }
+        if let Some(expected) = &self.version
+            && let Some(observed) = &observed.version
+        {
+            return expected == observed;
         }
         let etag_matches = match (&self.etag, &observed.etag) {
             (Some(expected), Some(observed)) => expected == observed,
@@ -315,25 +315,25 @@ pub struct WorkRecord {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstallOperation {
-    CreateFile,
-    ReplaceFile,
-    DeleteFile,
+    Create,
+    Replace,
+    Delete,
 }
 
 impl InstallOperation {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::CreateFile => "create-file",
-            Self::ReplaceFile => "replace-file",
-            Self::DeleteFile => "delete-file",
+            Self::Create => "create-file",
+            Self::Replace => "replace-file",
+            Self::Delete => "delete-file",
         }
     }
 
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "create-file" => Ok(Self::CreateFile),
-            "replace-file" => Ok(Self::ReplaceFile),
-            "delete-file" => Ok(Self::DeleteFile),
+            "create-file" => Ok(Self::Create),
+            "replace-file" => Ok(Self::Replace),
+            "delete-file" => Ok(Self::Delete),
             _ => Err(Error::corrupt(format!(
                 "unknown Direct Sync install operation {value:?}"
             ))),

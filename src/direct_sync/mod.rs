@@ -902,7 +902,7 @@ impl<R: DirectRemote> DirectSync<R> {
         let mut file = self.local.open_artifact(&artifact.name)?;
         std::io::copy(&mut file, output)
             .map(|_| ())
-            .map_err(|error| Error::io("export Direct Sync artifact", &self.local.state(), error))
+            .map_err(|error| Error::io("export Direct Sync artifact", self.local.state(), error))
     }
 
     /// Export one retained artifact without constructing an operator, acquiring
@@ -1309,11 +1309,7 @@ impl<R: DirectRemote> DirectSync<R> {
         let artifact = self.local.capture_local(node, ArtifactKind::Upload)?;
         self.store.insert_artifact(&artifact)?;
         let local = LocalFingerprint::from_node(node)?;
-        let operation = if baseline_remote.is_some() {
-            RemoteOperation::Publish
-        } else {
-            RemoteOperation::Publish
-        };
+        let operation = RemoteOperation::Publish;
         let id = work_identity(
             operation,
             path,
@@ -1376,9 +1372,9 @@ impl<R: DirectRemote> DirectSync<R> {
             id: uuid::Uuid::new_v4().to_string(),
             path: entry.path.clone(),
             operation: if expected_local.is_some() {
-                InstallOperation::ReplaceFile
+                InstallOperation::Replace
             } else {
-                InstallOperation::CreateFile
+                InstallOperation::Create
             },
             state: InstallState::Prepared,
             expected_local,
@@ -1429,7 +1425,7 @@ impl<R: DirectRemote> DirectSync<R> {
         let mut install = InstallRecord {
             id: uuid::Uuid::new_v4().to_string(),
             path: baseline.path.clone(),
-            operation: InstallOperation::DeleteFile,
+            operation: InstallOperation::Delete,
             state: InstallState::Prepared,
             expected_local: Some(baseline.local),
             desired_local: None,
@@ -1566,7 +1562,7 @@ impl<R: DirectRemote> DirectSync<R> {
                         let mut install = InstallRecord {
                             id: uuid::Uuid::new_v4().to_string(),
                             path: conflict.path.clone(),
-                            operation: InstallOperation::DeleteFile,
+                            operation: InstallOperation::Delete,
                             state: InstallState::Prepared,
                             expected_local: Some(local),
                             desired_local: None,
@@ -1769,7 +1765,7 @@ impl<R: DirectRemote> DirectSync<R> {
                         let mut install = InstallRecord {
                             id: uuid::Uuid::new_v4().to_string(),
                             path: work.path.clone(),
-                            operation: InstallOperation::DeleteFile,
+                            operation: InstallOperation::Delete,
                             state: InstallState::Prepared,
                             expected_local: Some(local),
                             desired_local: None,
