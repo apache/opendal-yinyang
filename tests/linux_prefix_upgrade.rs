@@ -875,18 +875,10 @@ impl ServiceProcess {
     fn stop(mut self) {
         if let Some(mut child) = self.child.take() {
             child.kill().expect("stop metadata service");
-            let status = child.wait().expect("wait for metadata service");
-            if !matches!(
-                status.code(),
-                Some(code) if code == 0
-            ) {
-                if let Some(stderr) = self.stderr.take() {
-                    let bytes = stderr.join().unwrap_or_default();
-                    if !bytes.is_empty() {
-                        eprintln!("{}", String::from_utf8_lossy(&bytes));
-                    }
-                }
-            }
+            child.wait().expect("wait for metadata service");
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
         }
     }
 }
@@ -1227,7 +1219,7 @@ fn sqlite_journal_mode(database: &Path) -> String {
 
 fn assert_no_installed_writer(prefix: &Path, work: &Path) {
     let output = Command::new("pgrep")
-        .args(["-f", &path_text(prefix)])
+        .args(["-f", path_text(prefix)])
         .output()
         .expect("run pgrep for installed prefix");
     if output.status.success() {
