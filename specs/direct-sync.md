@@ -33,7 +33,8 @@ Direct Sync requires a Linux host and this configuration combination:
 The existing `staging` field is the Direct Sync state directory. It is not
 object payload staging for a Managed runtime. It must be non-empty, outside the
 local root, on the same filesystem as the local root, and writable only as
-required by the installing account.
+required by the installing account. The state directory must not grant group or
+other permissions.
 
 Admission runs before state creation or storage effects. In addition to the
 read prerequisites in [`direct.md`](direct.md), Direct Sync requires:

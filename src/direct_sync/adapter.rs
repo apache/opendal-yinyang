@@ -109,8 +109,16 @@ impl DirectRemote for DirectRemoteAdapter {
                 ))
             })?;
         let file = snapshot.open_file(node.id()).await.map_err(direct_error)?;
-        let mut output = std::fs::File::create(output_path)
-            .map_err(|error| Error::io("create Direct Sync download", output_path, error))?;
+        let fd = rustix::fs::open(
+            output_path,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::TRUNC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(|error| Error::errno("create Direct Sync download", output_path, error))?;
+        let mut output = std::fs::File::from(fd);
         let mut offset = 0_u64;
         while offset < file.length() {
             let end = offset.saturating_add(64 * 1024).min(file.length());

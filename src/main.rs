@@ -57,7 +57,7 @@ enum Command {
         #[command(subcommand)]
         command: file_cli::FileCommand,
     },
-    /// Reconcile a bound ordinary directory with the Managed volume (requires --volume).
+    /// Reconcile a bound ordinary directory with a Managed or Direct volume (requires --volume).
     #[cfg(target_os = "linux")]
     Sync {
         #[command(subcommand)]

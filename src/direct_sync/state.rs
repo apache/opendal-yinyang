@@ -169,10 +169,10 @@ impl RemotePin {
     /// reads. Version IDs strengthen the pin when both sides expose one;
     /// otherwise ETag, size and known whole-second mtime identify the value.
     pub fn matches(&self, observed: &Self) -> bool {
-        if let (Some(expected), Some(observed)) = (&self.version, &observed.version)
-            && expected != observed
-        {
-            return false;
+        if let Some(expected) = &self.version {
+            if let Some(observed) = &observed.version {
+                return expected == observed;
+            }
         }
         let etag_matches = match (&self.etag, &observed.etag) {
             (Some(expected), Some(observed)) => expected == observed,
@@ -1126,6 +1126,27 @@ impl Store {
 }
 
 fn validate_schema(connection: &Connection) -> Result<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?;
+    let actual_tables = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?;
+    let mut expected_tables = TABLES
+        .iter()
+        .map(|(table, _)| (*table).to_owned())
+        .collect::<Vec<_>>();
+    expected_tables.sort();
+    if actual_tables != expected_tables {
+        return Err(Error::corrupt(format!(
+            "Direct Sync tables are {actual_tables:?}, expected {expected_tables:?}"
+        )));
+    }
     for (table, expected) in TABLES {
         let mut statement = connection
             .prepare(&format!("PRAGMA table_info({table})"))

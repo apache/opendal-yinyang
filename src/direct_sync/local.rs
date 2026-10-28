@@ -47,7 +47,7 @@ pub(super) struct LocalTree {
 impl LocalTree {
     pub fn create(root: &Path, state: &Path) -> Result<Self> {
         prepare_directory(root, "create Direct Sync root")?;
-        prepare_directory(state, "create Direct Sync state")?;
+        prepare_private_directory(state, "create Direct Sync state")?;
         Self::open(root, state)
     }
 
@@ -56,6 +56,7 @@ impl LocalTree {
             .map_err(|error| Error::io("canonicalize Direct Sync root", root, error))?;
         let state = std::fs::canonicalize(state)
             .map_err(|error| Error::io("canonicalize Direct Sync state", state, error))?;
+        validate_private_state(&state)?;
         if root == state || root.starts_with(&state) || state.starts_with(&root) {
             return Err(Error::invalid(format!(
                 "Direct Sync root {} and state {} must not contain one another",
@@ -703,6 +704,9 @@ impl LocalTree {
         {
             return self.install_conflict(store, install, "local delete parent changed");
         }
+        if optional_stat(&parent_fd, name, &self.root.join(&install.path))?.is_none() {
+            return self.install_conflict(store, install, "local delete target disappeared");
+        }
         let (length, digest, identity) = hash_at(&parent_fd, name, &self.root.join(&install.path))?;
         if identity != expected.identity()
             || length != expected.length
@@ -1111,6 +1115,53 @@ fn prepare_directory(path: &Path, operation: &str) -> Result<()> {
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(Error::unsupported(format!(
             "{} must be an ordinary directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_private_directory(path: &Path, operation: &str) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(Error::io(operation, path, error)),
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| Error::io(operation, path, error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::unsupported(format!(
+            "{} must be an ordinary directory",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::invalid(format!(
+            "Direct Sync state {} must not be accessible by group or other users",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_private_state(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| Error::io("inspect Direct Sync state", path, error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::unsupported(format!(
+            "{} must be an ordinary directory",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::invalid(format!(
+            "Direct Sync state {} must not be accessible by group or other users",
             path.display()
         )));
     }
