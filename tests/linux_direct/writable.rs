@@ -486,7 +486,13 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
         String::from_utf8_lossy(&response),
         retained.as_ref().and_then(|object| object.etag.as_deref()),
     );
-    let error = result.expect_err("Direct unlink must reject an externally replaced ETag");
+    let error = match result {
+        Ok(()) => panic!(
+            "Direct unlink unexpectedly deleted an externally replaced ETag\nmount logs:\n{}",
+            mounted.logs()
+        ),
+        Err(error) => error,
+    };
     assert_errno(
         &error,
         &[libc::ESTALE, libc::EIO],
