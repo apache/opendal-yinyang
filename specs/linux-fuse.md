@@ -289,6 +289,13 @@ adapter snapshot and pending overlay. Metadata-only inode invalidation and
 dentry invalidation remain confined to the explicit SIGHUP path, outside a
 related mutation request.
 
+An `unlink` precondition conflict does not install a refreshed remote snapshot
+before returning `ESTALE`. VFS may retry `UNLINK` after this result; retaining
+the failed pin makes the retry fail against the same stale condition instead of
+deleting the external replacement with its newly observed ETag. The pending
+Conflict observation remains visible, and explicit `SIGHUP` performs the rebase
+needed before a later unlink can target the replacement.
+
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at
 completion, so an acceptance harness can confirm a refresh finished.
