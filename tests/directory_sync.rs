@@ -1078,7 +1078,7 @@ async fn composite_preflight_rejects_unknown_sync_before_replica_upgrade() {
         )
         .unwrap();
 
-    let error = DirectorySync::open(authority, &state).await.unwrap_err();
+    let error = DirectorySync::open(authority, &state).await.err().unwrap();
     assert_eq!(
         error
             .downcast_ref::<yinyang::runtime::Error>()
@@ -1116,7 +1116,7 @@ async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
         )
         .unwrap();
 
-    let error = DirectorySync::open(authority, &state).await.unwrap_err();
+    let error = DirectorySync::open(authority, &state).await.err().unwrap();
     assert_eq!(
         error
             .downcast_ref::<yinyang::runtime::Error>()
