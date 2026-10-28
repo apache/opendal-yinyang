@@ -528,10 +528,32 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
             .map(|entry| (entry.path().to_owned(), entry.metadata().mode()))
             .collect::<Vec<_>>()
     });
+    let after_paths = runtime.block_on(async {
+        operator
+            .list_with("")
+            .start_after("a")
+            .recursive(true)
+            .await
+            .expect("list after the parent alias")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
+    let version_paths = runtime.block_on(async {
+        operator
+            .list_with("")
+            .versions(true)
+            .recursive(true)
+            .await
+            .expect("list versioned keys")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
     assert_eq!(
         paths,
         ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
-        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?}"
+        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?} after={after_paths:?} versions={version_paths:?}"
     );
 
     let namespace = yinyang::direct::DirectNamespace::new(operator).expect("admit Direct operator");
