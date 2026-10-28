@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
-use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
+use yinyang_core::{Authority, FileVersion, FileVersionReader, NodeId, Receipt};
 
 struct Node {
     handle: Mutex<FileHandle>,
@@ -31,6 +31,7 @@ struct Node {
 #[derive(Debug)]
 struct ReadOnlyNode {
     version: FileVersion,
+    reader: FileVersionReader,
     references: AtomicUsize,
 }
 struct OpenGate {
@@ -269,8 +270,10 @@ impl Mount {
                 .await?
                 .open_file(id)
                 .await?;
+            let reader = version.reusable_reader();
             let node = Arc::new(ReadOnlyNode {
                 version,
+                reader,
                 references: AtomicUsize::new(0),
             });
             {
@@ -424,7 +427,7 @@ impl MountReadOnlyFile {
         &self.node.version
     }
     pub async fn read(&self, offset: u64, length: usize) -> yinyang_core::Result<Vec<u8>> {
-        self.node.version.read(offset, length).await
+        self.node.reader.read(offset, length).await
     }
 }
 impl Drop for MountFile {
