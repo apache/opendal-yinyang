@@ -82,12 +82,20 @@ fn sync_rejects_a_mount_volume() {
 }
 
 #[test]
-fn sync_rejects_a_direct_volume() {
+fn sync_status_dispatches_a_direct_sync_volume() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path(), "direct", "direct", "sync");
-    let output = yy(&["--volume", config.to_str().unwrap(), "sync", "status"]);
-    assert!(!output.status.success());
-    assert_stderr(&output, "requires a Managed volume with access=sync");
+    let output = yy(&[
+        "--volume",
+        config.to_str().unwrap(),
+        "sync",
+        "status",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], "yinyang.direct-sync.status.v1");
+    assert_eq!(value["binding"]["state"], "unbound");
 }
 
 #[test]
