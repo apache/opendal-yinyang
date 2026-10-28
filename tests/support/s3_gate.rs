@@ -36,6 +36,7 @@ pub struct GateRequest {
 }
 
 impl GateRequest {
+    #[allow(dead_code)] // Not every gate target inspects request headers.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -109,6 +110,7 @@ pub struct S3Gate {
     events: mpsc::Receiver<GateEvent>,
     release: Arc<(Mutex<bool>, Condvar)>,
     stop: Arc<AtomicBool>,
+    #[allow(dead_code)] // Non-S3 test targets never drop a response.
     poisoned: Arc<AtomicBool>,
     intercepted_request: Arc<Mutex<Option<GateRequest>>>,
     thread: Option<JoinHandle<()>>,
@@ -125,6 +127,7 @@ impl S3Gate {
     /// `path` is the request path without its query string. Callers whose keys
     /// contain non-ASCII bytes should pass the exact percent-encoded suffix
     /// observed in the signed request.
+    #[allow(dead_code)]
     pub fn start_for_path(action: CommitAction, method: &str, path: impl Into<String>) -> Self {
         Self::start_for(
             action,
@@ -259,6 +262,7 @@ impl S3Gate {
 
     /// Resume forwarding after the intentionally dropped response has been
     /// observed. The first matching request remains intercepted for life.
+    #[allow(dead_code)]
     pub fn resume(&self) {
         self.poisoned.store(false, Ordering::SeqCst);
     }
