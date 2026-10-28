@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Linux FUSE adapter for storage-native Direct namespaces.
+//! Linux FUSE adapter for storage-native Direct namespaces.
+//!
+//! Read-only mounts pin remote versions directly. Writable mounts share the
+//! storage-bound Direct object runtime and serve its retained local generations
+//! as an overlay without creating Managed metadata.
 
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE};
 use super::{Outcome, TEARDOWN_GRACE, blocking_error, shutdown_signal};
@@ -351,6 +355,13 @@ impl DirectInner {
         attribute_with_size(ino, false, view.size, view.modified, self.read_only)
     }
 
+    fn live_file_attr(&self, ino: INodeNo, id: DirectId) -> Option<FileAttr> {
+        guard(&self.files)
+            .values()
+            .find(|open| open.id == id)
+            .map(|open| self.open_attr(ino, open))
+    }
+
     fn status_attr(&self, ino: INodeNo, status: &DirectObjectStatus) -> FileAttr {
         let modified = status
             .accepted
@@ -540,6 +551,9 @@ impl DirectInner {
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
+        if let Some(attr) = self.live_file_attr(ino, id) {
+            return reply.attr(&self.attr_ttl(), &attr);
+        }
         if let Some(status) = self.pending_status(id) {
             return reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
         }
@@ -988,8 +1002,16 @@ impl DirectInner {
         }
     }
 
-    async fn read(&self, fh: FileHandle, offset: u64, size: u32, reply: ReplyData) {
-        let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
+    async fn read(&self, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, reply: ReplyData) {
+        let id = self.node(ino);
+        let open = {
+            let files = guard(&self.files);
+            files.get(&fh.0).cloned().or_else(|| {
+                let id = id?;
+                files.values().find(|open| open.id == id).cloned()
+            })
+        };
+        let Some(open) = open else {
             return reply.error(fuser::Errno::EBADF);
         };
         let result = match &open.source {
@@ -1600,7 +1622,7 @@ impl Filesystem for DirectFuseFrontend {
     fn read(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -1610,7 +1632,7 @@ impl Filesystem for DirectFuseFrontend {
     ) {
         let inner = self.inner.clone();
         self.inner
-            .spawn(async move { inner.read(fh, offset, size, reply).await });
+            .spawn(async move { inner.read(ino, fh, offset, size, reply).await });
     }
 
     fn release(

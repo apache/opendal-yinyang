@@ -109,6 +109,7 @@ transitions. The current repository accepts this bounded matrix:
 | Sync journal | `yinyang-sync-1`, `yinyang-sync-2` | Exact sync-1 schema upgrades once to sync-2 in a SQLite transaction; read-only inspection accepts both. |
 | Directory publication | `yinyang-directory-1` | The exact schema is read; there is no journal schema migration. Retained intents remain replayable. |
 | Directory replica | `yinyang-directory-replica-1` | Known base schemas and additive columns upgrade transactionally; required/unknown shapes are rejected. |
+| Direct mutation runtime | `yinyang-direct-runtime-1` | The exact schema and Borsh records are read; partial/unknown profiles reject before runtime files or recovery. There is no migration. |
 | Backup manifest | `YYBK0001` version 1 | Package restore validates component profiles before creating destinations; only listed local transitions may run afterward. |
 
 This table inventories names only. It does not convert a local implementation

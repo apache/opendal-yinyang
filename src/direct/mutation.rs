@@ -504,6 +504,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_delete_target_is_an_explicit_conflict_observation() {
+        let backend = TestBackend::default();
+        let mutation = mutation(backend.operator());
+        let key = DirectKey::from_storage_key("objects/missing").unwrap();
+
+        let outcome = mutation
+            .delete(&key, DirectPrecondition::Etag("\"stale\"".to_owned()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            DirectMutationOutcome::Conflict {
+                observed: DirectObservation::Missing
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_observation_is_not_reported_as_missing() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let etag = seed(&operator, "objects/file", b"remote").await;
+        let input = source(b"local");
+        let key = DirectKey::from_storage_key("objects/file").unwrap();
+        backend.state.lock().unwrap().offline = true;
+
+        let outcome = mutation(operator)
+            .publish_file(&key, input.path(), DirectPrecondition::Etag(etag))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            DirectMutationOutcome::Unknown {
+                observed: DirectObservation::Unavailable { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn unsupported_primitives_are_rejected_before_effect() {
         let operator = Operator::new(Memory::default()).unwrap();
         let mutation = mutation(operator.clone());
