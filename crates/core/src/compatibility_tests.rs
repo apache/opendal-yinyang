@@ -419,7 +419,7 @@ async fn service_binding_fixtures_distinguish_unknown_malformed_and_mismatch() {
             Some(kind) => {
                 let error = result.err().expect("binding must be rejected");
                 assert_eq!(error.kind(), kind);
-                assert!(error.message().contains(message), "{error}");
+                assert!(error.to_string().contains(message), "{error}");
             }
             None => {
                 result.expect("current binding must connect");
