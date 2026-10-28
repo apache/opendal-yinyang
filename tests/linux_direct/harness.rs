@@ -113,6 +113,10 @@ impl Fixture {
         self.raw.delete(&self.full_key(key));
     }
 
+    pub fn raw_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.raw.get(&self.full_key(key))
+    }
+
     pub fn inventory(&self) -> Inventory {
         let prefix = format!("{}/", self.root);
         self.raw

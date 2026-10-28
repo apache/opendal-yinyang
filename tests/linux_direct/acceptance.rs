@@ -571,11 +571,11 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
             fixture.write_raw(key, bytes);
         }
         let inventory = fixture.inventory();
-        for (key, _) in &objects {
-            assert!(
-                inventory.contains_key(key),
-                "raw S3 inventory for {label} omitted requested key {key:?}: {:?}",
-                inventory.keys().collect::<Vec<_>>()
+        for (key, bytes) in &objects {
+            assert_eq!(
+                fixture.raw_get(key).as_deref(),
+                Some(*bytes),
+                "raw S3 GET for {label} did not retain requested key {key:?}"
             );
         }
         let config = fixture.config(&format!("direct-{label}"), "fuse", None, None);
