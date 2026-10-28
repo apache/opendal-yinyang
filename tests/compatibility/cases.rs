@@ -458,7 +458,8 @@ fn compatibility_fd1338c_service_unknown_profile_rejects_without_mutation() {
         &database,
         "UPDATE authority SET profile='yinyang-sqlite-99'",
     );
-    let before = authoritative_tree(storage.temp.path());
+    let databases = [database.clone()];
+    let before = authoritative_tree(storage.temp.path(), &databases);
     let rejected = run_timeout(
         storage.command(
             &current_binary(),
@@ -485,6 +486,7 @@ fn compatibility_fd1338c_service_unknown_profile_rejects_without_mutation() {
     assert_authoritative_state_unchanged(
         storage.temp.path(),
         &before,
+        &databases,
         "unknown service profile rejection",
     );
 }
@@ -636,10 +638,11 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
         "object",
         None,
     );
+    let stage_databases = [stage.join("staging.db")];
     assert_profile_rejection(
         temp.path(),
         &["--volume", stage_config.to_str().unwrap(), "status"],
-        Some(&stage),
+        Some((&stage, &stage_databases)),
     );
 
     let journal = temp.path().join("journal");
@@ -653,6 +656,7 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
         &journal.join("directory.db"),
         "UPDATE binding SET profile='yinyang-directory-99'",
     );
+    let journal_databases = [journal.join("directory.db")];
     assert_profile_rejection(
         temp.path(),
         &[
@@ -662,7 +666,7 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
             journal.to_str().unwrap(),
             "--json",
         ],
-        Some(&journal),
+        Some((&journal, &journal_databases)),
     );
 
     let sync = temp.path().join("sync");
@@ -676,6 +680,11 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
     );
     let sync_config = temp.path().join("sync.json");
     write_config(&sync_config, "unknown-sync", "sync", &sync, "object", None);
+    let sync_databases = [
+        sync.join("sync.db"),
+        sync.join("replica.db"),
+        sync.join("content/staging.db"),
+    ];
     assert_profile_rejection(
         temp.path(),
         &[
@@ -685,7 +694,7 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
             "status",
             "--json",
         ],
-        Some(&sync),
+        Some((&sync, &sync_databases)),
     );
 
     let extra = temp.path().join("extra");
@@ -699,6 +708,7 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
         &extra.join("directory.db"),
         "ALTER TABLE publications ADD COLUMN future_value TEXT",
     );
+    let extra_databases = [extra.join("directory.db")];
     assert_profile_rejection(
         temp.path(),
         &[
@@ -708,7 +718,7 @@ fn compatibility_unknown_profiles_reject_without_local_mutation() {
             extra.to_str().unwrap(),
             "--json",
         ],
-        Some(&extra),
+        Some((&extra, &extra_databases)),
     );
 }
 
@@ -719,8 +729,12 @@ fn sqlite_execute(database: &Path, sql: &str) {
         .unwrap();
 }
 
-fn assert_profile_rejection(temp: &Path, args: &[&str], local: Option<&Path>) {
-    let before = local.map(authoritative_tree);
+fn assert_profile_rejection(
+    temp: &Path,
+    args: &[&str],
+    local: Option<(&Path, &[std::path::PathBuf])>,
+) {
+    let before = local.map(|(root, databases)| authoritative_tree(root, databases));
     let mut command = Command::new(current_binary());
     command.args(args);
     command.current_dir(temp);
@@ -756,27 +770,41 @@ fn assert_profile_rejection(temp: &Path, args: &[&str], local: Option<&Path>) {
         "rejection did not reach a profile/schema boundary for {args:?}:\n{}",
         rejected.text()
     );
-    if let Some(local) = local {
+    if let Some((root, databases)) = local {
         assert_authoritative_state_unchanged(
-            local,
+            root,
             &before.unwrap(),
+            databases,
             &format!("unknown profile rejection for {args:?}"),
         );
     }
 }
 
-fn authoritative_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+fn authoritative_tree(root: &Path, databases: &[std::path::PathBuf]) -> Vec<(String, Vec<u8>)> {
+    let shm = databases
+        .iter()
+        .map(|database| sidecar(root, database, "-shm"))
+        .collect::<Vec<_>>();
     tree_files(root)
         .into_iter()
-        .filter(|(path, _)| !path.ends_with(".db-shm"))
+        .filter(|(path, _)| !shm.contains(path))
         .collect()
 }
 
 fn assert_authoritative_state_unchanged(
     root: &Path,
     before: &[(String, Vec<u8>)],
+    databases: &[std::path::PathBuf],
     context: &str,
 ) {
+    let shm = databases
+        .iter()
+        .map(|database| sidecar(root, database, "-shm"))
+        .collect::<Vec<_>>();
+    let wal = databases
+        .iter()
+        .map(|database| sidecar(root, database, "-wal"))
+        .collect::<Vec<_>>();
     let after = tree_files(root);
     for (path, bytes) in before {
         let current = after
@@ -792,16 +820,20 @@ fn assert_authoritative_state_unchanged(
         if before.iter().any(|(candidate, _)| candidate == &path) {
             continue;
         }
-        if path.ends_with(".db-shm") {
+        if shm.contains(&path) {
             continue;
         }
-        if path.ends_with(".db-wal") {
-            assert!(
-                bytes.is_empty(),
-                "{context} created non-empty WAL {path:?}"
-            );
+        if wal.contains(&path) {
+            assert!(bytes.is_empty(), "{context} created non-empty WAL {path:?}");
             continue;
         }
         panic!("{context} created unexpected file {path:?}");
     }
+}
+
+fn sidecar(root: &Path, database: &Path, suffix: &str) -> String {
+    let relative = database
+        .strip_prefix(root)
+        .unwrap_or_else(|_| panic!("database {} is outside {root:?}", database.display()));
+    format!("{}{suffix}", relative.display())
 }
