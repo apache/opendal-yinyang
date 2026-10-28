@@ -1015,6 +1015,17 @@ class Harness:
                 )
         finally:
             summary = workload.finish()
+            summary["pwrite_acknowledged_expected"] = {
+                "basis": "pwrite-acknowledged expected bytes; fsync uncertainty is separate",
+                "files": [
+                    {
+                        "file": f"file-{index:04d}.bin",
+                        "length": len(bytes_),
+                        "sha256": bytes_sha256(bytes_),
+                    }
+                    for index, bytes_ in enumerate(expected)
+                ],
+            }
             summary["planned_seconds"] = duration
             summary["actual_seconds"] = round(time.monotonic() - phase_started, 3)
             summary["phase_started_report_elapsed_seconds"] = round(

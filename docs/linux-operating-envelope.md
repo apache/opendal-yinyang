@@ -63,6 +63,11 @@ The run fails when the retry deadline expires; three consecutive `pwrite`
 failures also abort the phase. Otherwise any unresolved uncertainty makes the
 run fail after the byte assertions are evaluated and recorded.
 
+After the workload joins, the phase report retains a per-file length and
+SHA-256 manifest derived from the in-memory expected buffers. It is labeled
+`pwrite-acknowledged expected bytes`; it is not a claim of remote equality
+while fsync or publication is still uncertain.
+
 File counts, dimensions, concurrency, sampling period and duration are bounded
 inputs, not extrapolated capacity. A run that exceeds the bounded interval or
 dataset is separate evidence.
