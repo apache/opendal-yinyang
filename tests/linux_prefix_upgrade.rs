@@ -345,6 +345,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     fs::create_dir_all(service_database.parent().expect("metadata parent"))
         .expect("create metadata directory");
     let service = ServiceProcess::start(&current_yy, &storage, &service_root, &service_database);
+    let (service_wal_reader, service_journal_mode) = sqlite_wal_reader(&service_database);
     let service_config = temp.path().join("service.json");
     write_config(
         &service_config,
@@ -394,14 +395,15 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     );
     service.kill_without_cleanup();
     let wal = service_database.with_extension("db-wal");
-    assert_eq!(
-        sqlite_journal_mode(&service_database),
-        "wal",
-        "fd1338c service authority did not use WAL mode"
+    let wal_metadata = wal
+        .metadata()
+        .unwrap_or_else(|error| panic!("fd1338c service WAL is missing: {error}"));
+    assert!(
+        wal_metadata.len() > 0,
+        "fd1338c service WAL must remain non-empty until the target reopens it"
     );
-    assert_sqlite_integrity(&service_database);
-    let service_wal_present = wal.exists();
-    let wal_bytes = wal.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let wal_bytes = wal_metadata.len();
+    let wal_sha256 = sha256_file(&wal);
 
     assert_no_installed_writer(&prefix, temp.path());
     let previous_target =
@@ -600,6 +602,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         &["close", &service_read_handle],
     );
     restarted_service.stop();
+    drop(service_wal_reader);
     assert_sqlite_integrity(&service_database);
 
     let doctor = run_ok(
@@ -644,9 +647,9 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
             "sync_unknown_commit": sync_commit,
             "sync_unknown_request_digest": sync_digest,
             "service_commit": service_commit,
-            "service_journal_mode": "wal",
-            "service_wal_present": service_wal_present,
+            "service_journal_mode": service_journal_mode,
             "service_wal_bytes": wal_bytes,
+            "service_wal_sha256": wal_sha256,
         },
         "target_convergence": {
             "file_bytes": true,
@@ -1208,13 +1211,24 @@ fn assert_sqlite_integrity(database: &Path) {
     assert_eq!(result, "ok", "service database integrity failure");
 }
 
-fn sqlite_journal_mode(database: &Path) -> String {
+fn sqlite_wal_reader(database: &Path) -> (rusqlite::Connection, String) {
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("open service database read-only");
-    connection
+    let journal_mode = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .expect("read service SQLite journal mode")
+        .expect("read service SQLite journal mode");
+    assert_eq!(
+        journal_mode, "wal",
+        "fd1338c service authority did not use WAL mode"
+    );
+    connection
+        .execute_batch("BEGIN")
+        .expect("begin service WAL read snapshot");
+    let _: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+        .expect("establish service WAL read snapshot");
+    (connection, journal_mode)
 }
 
 fn assert_no_installed_writer(prefix: &Path, work: &Path) {
