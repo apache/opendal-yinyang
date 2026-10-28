@@ -39,8 +39,10 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
 - `run` performs one finite reconciliation pass: it retries any associated
   durable work, pulls remote changes, and publishes eligible local edits.
 - `status` reports the current binding, remote and local observations, and the
-  derived per-path state. It never mutates state or acquires the publication
-  lease, so it stays usable while `run` holds the lease.
+  derived per-path state. It never changes authoritative database/WAL bytes,
+  logical state, or acquires the publication lease, so it stays usable while
+  `run` holds the lease. SQLite may create an empty `-wal` and may create or
+  update derived `-shm`; existing WAL/journal bytes remain protected.
 - `export` writes retained bytes. `--artifact` selects a retained artifact from
   `status`; `--conflict` with `--side` selects one side of a conflict. The output
   path must not exist.
@@ -115,13 +117,22 @@ captured by the quiesced backup, not against the install's historical
 `expected_digest`; the existing conflict rules may therefore report the
 retained artifact as conflicted without discarding its bytes.
 
-Restore requires a same-version package, a matching filesystem, absent
-destination paths, and terminal install records. It rejects malformed
+Restore requires the supported manifest profile, documented local component
+profiles, a matching filesystem, absent destination paths, and terminal install
+records. It rejects malformed
 checksums, unsafe/duplicate paths or artifact names, wrong profiles, incomplete
 installs, and ambiguous old-to-new identity collisions before creating or
 rebinding destinations. The package format is experimental and is not an
 online snapshot or migration contract. See
 [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
+
+Before package copy, restore validates `replica.db`, `sync.db`, and
+`content/staging.db` read-only and binds the manifest to the replica binding.
+The package container remains `YYBK0001`. Supported `fd1338c2` local profiles
+may be restored and are upgraded only by the normal writer open after the
+isolated destinations exist; unknown profiles or partial known schemas fail
+without creating either destination. Other cross-version restore combinations
+remain unsupported.
 
 ## Status document
 

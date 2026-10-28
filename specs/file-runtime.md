@@ -167,13 +167,39 @@ Incomplete opens were never exposed and are discarded on reopen. Completed
 handles and accepted writes survive process restart. There is no stable
 migration promise for this local experimental format.
 
-Opening stage-1 performs a single SQLite transaction that adds nullable
-`failure BLOB` columns to handles and errors and advances the profile to
-stage-2. Original handle records, chunks, frozen requests and ledger sequences
-are preserved. Inspect supports either profile without upgrading it. Old
+The supported schema signatures are exact table sets and ordered columns.
+Stage-1 has `authority`, `handles`, `chunks`, and `errors` without typed-failure
+columns. Stage-2 adds the nullable `failure` column after `record` in `handles`
+and after `message` in `errors`. Column order is part of the signature because
+maintained writers use positional inserts. SQLite internal tables are excluded;
+primary-key definitions, declared types, and other constraints are not treated
+as an independent signature.
+
+A writer preflights an existing database read-only. A supported stage-1 database
+is first fully decoded, then one SQLite transaction adds both columns and
+advances the profile to stage-2. Original handle records, chunks, frozen
+requests, CommitIds, and ledger sequences are preserved. A stage-2 database is
+validated without DDL. Unknown profiles or missing/extra/reordered maintained
+columns are rejected before PRAGMA journal-mode configuration, DDL,
+runtime-lock creation, or incomplete-open cleanup. SQLite's standard read-only
+WAL path may create an empty `-wal` and may create or update derived `-shm`.
+Those files are not logical staging records: the main database, any existing
+WAL/journal bytes, configured journal mode, schema, rows, lease, and cleanup
+state remain unchanged.
+
+An absent or zero-table database is initialized only after the writer lease is
+held. A writer that finishes between preflight and lease acquisition may have
+already upgraded stage-1 to stage-2; the lock holder revalidates and accepts
+that state rather than requiring an unchanged preflight profile.
+
+Inspect and backup validation accept stage-1 or stage-2 without upgrading,
+changing authoritative database/WAL bytes or journal mode, cleaning handles, or
+acquiring the writer lease. SQLite may create an empty `-wal` and may create or
+update derived `-shm`; existing WAL/journal bytes remain protected. Old
 message-only failures report Unclassified; their kind and commit identity are
-not inferred from prose. Older binaries reject stage-2; downgrade is unsupported.
-The upgrade changes only local staging, not remote metadata or content.
+not inferred from prose. A frozen plan still exposes its exact CommitId.
+Older binaries reject stage-2; downgrade is unsupported. The upgrade changes
+only local staging, not remote metadata or content.
 
 Failure blobs use Borsh `(kind: u8, message: String, commit: Option<[u8;16]>)`.
 Kind tags, in order from 0 through 21, are Invalid, InvalidName, NotFound,

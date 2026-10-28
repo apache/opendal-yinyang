@@ -20,7 +20,7 @@
 use super::linux::{
     Identity, LocalKind, LocalNode, LocalSnapshot, Replica, observe_path, validate_path,
 };
-use super::state::{Binding, IdentityMap};
+use super::state::{Binding, IdentityMap, Store};
 use super::{Error, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::Connection;
@@ -400,6 +400,7 @@ impl BackupManifest {
     fn validate_package(&self, backup: &Path) -> Result<()> {
         let mut identities = IdentityMap::new();
         self.validate_databases(backup)?;
+        self.validate_local_state(backup)?;
         let root = snapshot(&backup.join("root"))?;
         let root = root
             .nodes()
@@ -435,6 +436,30 @@ impl BackupManifest {
                 &mut identities,
                 &format!("backup artifact {}", artifact.id),
             )?;
+        }
+        Ok(())
+    }
+
+    fn validate_local_state(&self, backup: &Path) -> Result<()> {
+        let store = Store::open_read_only(&backup.join("state/replica.db"))?;
+        let binding = store
+            .binding()?
+            .ok_or_else(|| Error::invalid("backup replica state has no binding"))?;
+        if binding.filesystem != self.filesystem()
+            || binding.root != self.binding.root
+            || binding.root_dev != self.binding.root_dev
+            || binding.root_ino != self.binding.root_ino
+            || binding.state_dev != self.binding.state_dev
+            || binding.state_ino != self.binding.state_ino
+        {
+            return Err(Error::corrupt(
+                "backup replica binding does not match its manifest",
+            ));
+        }
+        if !store.incomplete_installs()?.is_empty() {
+            return Err(Error::invalid(
+                "backup replica state contains an incomplete local install",
+            ));
         }
         Ok(())
     }
@@ -810,6 +835,70 @@ fn sync_snapshot_directories(destination: &Path, nodes: &[SnapshotNode]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_rejects_an_unknown_component_profile_before_creating_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("backup");
+        fs::create_dir_all(backup.join("state/content")).unwrap();
+        fs::create_dir_all(backup.join("state/quarantine")).unwrap();
+        {
+            let database = rusqlite::Connection::open(backup.join("state/replica.db")).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TABLE binding(
+                         singleton INTEGER PRIMARY KEY,
+                         profile TEXT NOT NULL,
+                         filesystem BLOB NOT NULL,
+                         root TEXT NOT NULL,
+                         root_dev BLOB NOT NULL,
+                         root_ino BLOB NOT NULL,
+                         state_dev BLOB NOT NULL,
+                         state_ino BLOB NOT NULL
+                     );
+                     INSERT INTO binding VALUES(
+                         1,'yinyang-directory-replica-99',zeroblob(16),'/old',1,2,1,3
+                     );",
+                )
+                .unwrap();
+        }
+        fs::write(backup.join("state/sync.db"), b"not reached").unwrap();
+        fs::write(backup.join("state/content/staging.db"), b"not reached").unwrap();
+        let databases = DATABASES
+            .into_iter()
+            .map(|path| {
+                let (length, hash) = hash_file(&backup.join(path)).unwrap();
+                DatabaseEvidence {
+                    path: path.to_owned(),
+                    length,
+                    hash,
+                }
+            })
+            .collect();
+        let manifest = BackupManifest {
+            magic: MAGIC,
+            version: VERSION,
+            filesystem: [1; 16],
+            binding: BackupBinding {
+                root: "/old".to_owned(),
+                root_dev: 1,
+                root_ino: 2,
+                state_dev: 1,
+                state_ino: 3,
+            },
+            root: Vec::new(),
+            artifacts: Vec::new(),
+            databases,
+        };
+        let root = temp.path().join("restored-root");
+        let state = temp.path().join("restored-state");
+        let error = manifest
+            .copy_to(&backup, &root, &state)
+            .expect_err("unsupported component profile was accepted");
+        assert_eq!(error.kind(), crate::replica::ErrorKind::Unsupported);
+        assert!(!root.exists());
+        assert!(!state.exists());
+    }
 
     #[test]
     fn manifest_path_traversal_is_rejected_before_restore_io() {

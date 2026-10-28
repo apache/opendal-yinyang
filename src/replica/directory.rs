@@ -243,14 +243,18 @@ pub struct DirectorySync {
 }
 
 impl DirectorySync {
+    async fn preflight(authority: &dyn Authority, state: &Path) -> Result<()> {
+        Replica::validate_existing(state, authority.filesystem())?;
+        crate::sync::preflight_open(state, authority.filesystem(), false).await?;
+        Ok(())
+    }
+
     /// Write one quiesced local Sync backup package. The caller must not run a
     /// second writer; this method holds the existing replica and runtime leases
     /// while it captures the root and SQLite state.
     pub async fn backup(&self, output: &Path) -> Result<()> {
-        Sync::validate_restore(self.replica.state(), self.sync.authority().filesystem())
-            .await
-            .map_err(Box::new)?;
-        BackupManifest::create(&self.replica, output).map_err(Box::new)?;
+        Sync::validate_restore(self.replica.state(), self.sync.authority().filesystem()).await?;
+        BackupManifest::create(&self.replica, output)?;
         Ok(())
     }
 
@@ -262,7 +266,7 @@ impl DirectorySync {
         state: &Path,
         root: &Path,
     ) -> Result<Self> {
-        let manifest = BackupManifest::load(backup).map_err(Box::new)?;
+        let manifest = BackupManifest::load(backup)?;
         if manifest.filesystem() != authority.filesystem() {
             return Err(format!(
                 "backup belongs to filesystem {}, not {}",
@@ -271,24 +275,23 @@ impl DirectorySync {
             )
             .into());
         }
-        Sync::validate_restore(backup.join("state"), authority.filesystem())
-            .await
-            .map_err(Box::new)?;
-        manifest.copy_to(backup, root, state).map_err(Box::new)?;
+        Sync::validate_restore(backup.join("state"), authority.filesystem()).await?;
+        manifest.copy_to(backup, root, state)?;
         Sync::validate_restore(state, authority.filesystem()).await?;
-        let replica =
-            Replica::restore(state, root, authority.filesystem(), &manifest).map_err(Box::new)?;
+        let replica = Replica::restore(state, root, authority.filesystem(), &manifest)?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
     }
 
     pub async fn open(authority: Arc<dyn Authority>, state: &Path) -> Result<Self> {
+        Self::preflight(authority.as_ref(), state).await?;
         let replica = Replica::open(state, authority.filesystem())?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
     }
 
     pub async fn init(authority: Arc<dyn Authority>, state: &Path, root: &Path) -> Result<Self> {
+        Self::preflight(authority.as_ref(), state).await?;
         let replica = Replica::init(state, root, authority.filesystem())?;
         let sync = Sync::open(authority, state).await?;
         Ok(Self { sync, replica })
