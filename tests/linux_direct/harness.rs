@@ -181,6 +181,10 @@ impl Fixture {
     }
 
     pub fn operator(&self) -> opendal::Operator {
+        self.operator_with(&[])
+    }
+
+    pub fn operator_with(&self, extra: &[(&str, &str)]) -> opendal::Operator {
         opendal::install_default();
         let mut config = std::env::vars()
             .filter_map(|(key, value)| {
@@ -189,6 +193,11 @@ impl Fixture {
             })
             .collect::<Vec<_>>();
         config.push(("root".to_owned(), self.root.clone()));
+        config.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+        );
         opendal::Operator::via_iter("s3", config).expect("construct Direct test operator")
     }
 
