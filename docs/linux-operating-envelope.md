@@ -12,12 +12,13 @@ concurrency and duration.
 
 The default qualification workload is:
 
-- Ubuntu 24.04 x86_64, one systemd user manager and one host;
-- one installed Managed Mount with object publication on a dedicated,
+- Ubuntu 24.04 x86_64 on one host; the installed systemd lifecycle is covered
+  separately and is not a prerequisite for this harness;
+- one built or installed Managed Mount with object publication on a dedicated,
   versioning-enabled Amazon S3 bucket;
 - 24 files of 256 KiB, four concurrent range writers and two concurrent range
   readers;
-- four-byte-page-aligned writers, each owning separate files, with `fsync` after
+- 4 KiB page-aligned writers, each owning separate files, with `fsync` after
   every 4 KiB overwrite;
 - a 45-minute target duration, split by one clean unmount/remount interval near
   the midpoint;
@@ -27,6 +28,10 @@ The workload deliberately uses whole-file Managed staging rather than claiming
 delta upload. Each acknowledged overwrite can retain a complete new object
 version. Retained object count and stored bytes are sampled separately from
 local staging and SQLite state.
+
+The harness does not delete the remote prefix after a run. Its owner must
+remove the isolated prefix after preserving the JSON evidence; the verifier
+does not silently clean up retained-history evidence.
 
 ## Measurements
 
@@ -108,7 +113,9 @@ to begin if remote retained-history accounting is unavailable.
 When a compatible process-scoped request counter exists for the same source and
 binary, set `YINYANG_OPERATING_ENVELOPE_REQUEST_ACCOUNTING` to its JSON path.
 Otherwise the report records request count as unavailable rather than inferring
-it from connections.
+it from connections. The accepted document must use
+`yinyang.linux-request-accounting.v1`, include the exact `source_sha` and
+`binary_sha256`, and expose the counter windows and their accounting scope.
 
 Run the workload only in an otherwise excluded measurement window. Concurrent
 latency benchmarks, native acceptance mounts and other S3 workloads can
