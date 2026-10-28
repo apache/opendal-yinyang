@@ -218,7 +218,8 @@ impl LocalTree {
         origin: &str,
         kind: ArtifactKind,
     ) -> Result<ArtifactRecord> {
-        let mut source = std::fs::File::open(source)
+        let source_path = source;
+        let mut source = std::fs::File::open(source_path)
             .map_err(|error| Error::io("open explicit resolution input", source, error))?;
         let id = uuid::Uuid::new_v4().to_string();
         let name = format!("artifact-{id}");
@@ -235,7 +236,7 @@ impl LocalTree {
         loop {
             let count = source
                 .read(&mut buffer)
-                .map_err(|error| Error::io("read resolution input", &source, error))?;
+                .map_err(|error| Error::io("read resolution input", source_path, error))?;
             if count == 0 {
                 break;
             }
