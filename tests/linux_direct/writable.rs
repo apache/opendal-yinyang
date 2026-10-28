@@ -729,6 +729,52 @@ fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart(
     drop(file);
     mounted.unmount();
 
+    let doctor = fixture.yy(&["--volume", path_text(&config), "doctor", "--json"]);
+    let doctor_value: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("writable Direct conflict doctor JSON");
+    assert_ne!(doctor_value["status"], "pass", "{doctor_value:#}");
+    let local_state = doctor_value["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "local-state")
+        .expect("doctor local-state check");
+    assert_ne!(local_state["status"], "pass", "{doctor_value:#}");
+    assert!(
+        local_state["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("conflict") || detail.contains("failed")),
+        "doctor did not report retained Direct conflict state: {doctor_value:#}"
+    );
+    let mut wrong_binding =
+        fixture.yy_command(&["--volume", path_text(&config), "doctor", "--json"]);
+    wrong_binding.env(
+        "YINYANG_S3_ROOT",
+        format!("{}-wrong-binding", fixture.root()),
+    );
+    let wrong_binding = run_timeout(wrong_binding, Duration::from_secs(120));
+    let wrong_value: serde_json::Value = serde_json::from_slice(&wrong_binding.stdout)
+        .expect("wrong-binding writable Direct doctor JSON");
+    assert_ne!(wrong_value["status"], "pass", "{wrong_value:#}");
+    assert!(
+        wrong_value["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .filter(|check| check["name"] == "local-state")
+            .any(|check| {
+                check["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("bound"))
+            }),
+        "doctor did not identify the Direct state binding mismatch: {wrong_value:#}"
+    );
+    assert_eq!(
+        fixture.raw_get("conflict.txt").as_deref(),
+        Some(external.as_slice()),
+        "read-only Direct doctor changed the external conflict object"
+    );
+
     let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
     assert_eq!(
         fs::read(remounted.mountpoint().join("conflict.txt"))
