@@ -31,6 +31,13 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+mod mutation;
+
+pub use mutation::{
+    DirectMutation, DirectMutationCapability, DirectMutationOutcome, DirectObjectPin,
+    DirectPrecondition,
+};
+
 const NAME_MAX: usize = 255;
 const PATH_MAX: usize = 4095;
 const INODE_DOMAIN: &[u8] = b"yinyang direct inode v1";
@@ -212,6 +219,97 @@ impl DirectNode {
 
     pub fn modified(&self) -> Option<SystemTime> {
         self.modified
+    }
+
+    /// The accepted storage version for a file node.
+    pub fn version(&self) -> Option<&str> {
+        self.pin.as_ref()?.version.as_deref()
+    }
+
+    /// The accepted storage ETag for a file node.
+    pub fn etag(&self) -> Option<&str> {
+        self.pin.as_ref()?.etag.as_deref()
+    }
+}
+
+/// A validated whole-object key in the Direct namespace.
+///
+/// Mutation APIs take this type instead of accepting either a mapped Linux path
+/// or a storage key ambiguously. `from_path` reverses the Linux name mapping,
+/// while `from_storage_key` validates a key already returned by storage.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DirectKey(String);
+
+impl DirectKey {
+    /// Validate a raw storage object key.
+    pub fn from_storage_key(key: &str) -> Result<Self> {
+        let record = ObjectRecord {
+            key: key.to_owned(),
+            size: 0,
+            etag: None,
+            version: None,
+            directory: false,
+            modified: None,
+        };
+        represent_key(&record)?;
+        Ok(Self(key.to_owned()))
+    }
+
+    /// Convert one canonical mapped Linux path into its raw storage key.
+    pub fn from_path(path: &str) -> Result<Self> {
+        if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
+            return Err(Error::new(
+                ErrorKind::InvalidName,
+                format!("{path:?} is not a canonical mapped file path"),
+            ));
+        }
+        let mut components = Vec::new();
+        for encoded in path.split('/') {
+            let component = decode_component(encoded).map_err(|message| {
+                Error::new(
+                    ErrorKind::InvalidName,
+                    format!("mapped component {encoded:?} is invalid: {message}"),
+                )
+            })?;
+            if component.is_empty() || component.contains('/') {
+                return Err(Error::new(
+                    ErrorKind::InvalidName,
+                    format!("mapped component {encoded:?} does not decode to one key component"),
+                ));
+            }
+            let canonical = encode_component(&component).map_err(|message| {
+                Error::new(
+                    ErrorKind::InvalidName,
+                    format!("mapped component {encoded:?} is invalid: {message}"),
+                )
+            })?;
+            if canonical != encoded {
+                return Err(Error::new(
+                    ErrorKind::InvalidName,
+                    format!("mapped component {encoded:?} is not canonical ({canonical:?})"),
+                ));
+            }
+            components.push(component);
+        }
+        Self::from_storage_key(&components.join("/"))
+    }
+
+    /// The exact raw storage key.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The canonical mapped Linux path.
+    pub fn path(&self) -> Result<String> {
+        let record = ObjectRecord {
+            key: self.0.clone(),
+            size: 0,
+            etag: None,
+            version: None,
+            directory: false,
+            modified: None,
+        };
+        Ok(represent_key(&record)?.join("/"))
     }
 }
 
@@ -1013,6 +1111,27 @@ mod tests {
             encode_component("café").unwrap(),
             encode_component("cafe\u{301}").unwrap()
         );
+    }
+
+    #[test]
+    fn direct_keys_reverse_only_canonical_paths() {
+        let key = DirectKey::from_path("100%25/%2E%2E/café").unwrap();
+        assert_eq!(key.as_str(), "100%/../café");
+        assert_eq!(key.path().unwrap(), "100%25/%2E%2E/café");
+
+        for invalid in [
+            "",
+            "/file",
+            "file/",
+            "dir//file",
+            "100%file",
+            "100%2fname",
+            "%2e",
+            "plain/..",
+        ] {
+            let error = DirectKey::from_path(invalid).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidName, "{invalid:?}");
+        }
     }
 
     #[test]
