@@ -486,6 +486,11 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
         String::from_utf8_lossy(&response),
         retained.as_ref().and_then(|object| object.etag.as_deref()),
     );
+    assert_eq!(
+        if_matches.len(),
+        1,
+        "conditional unlink was automatically retried"
+    );
     let error = match result {
         Ok(()) => panic!(
             "Direct unlink unexpectedly deleted an externally replaced ETag\nmount logs:\n{}",
@@ -493,11 +498,7 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
         ),
         Err(error) => error,
     };
-    assert_errno(
-        &error,
-        &[libc::ESTALE, libc::EIO],
-        "conditional Direct unlink",
-    );
+    assert_errno(&error, &[libc::EAGAIN], "conditional Direct unlink");
     assert_eq!(
         fixture.raw_get("unlink.txt").as_deref(),
         Some(external.as_slice()),
@@ -588,8 +589,13 @@ fn direct_write_rename_conflict_retains_external_destination_before_explicit_ref
     };
     assert_errno(
         &error,
-        &[libc::ESTALE, libc::EIO],
+        &[libc::EAGAIN],
         "conditional rename destination conflict",
+    );
+    assert_eq!(
+        attempts.len(),
+        1,
+        "conditional rename was automatically retried"
     );
     for attempt in &attempts {
         assert_eq!(
