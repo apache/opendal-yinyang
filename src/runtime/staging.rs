@@ -19,11 +19,46 @@
 //! generation atomic; chunks bound memory independently of the file length.
 use super::*;
 use borsh::{BorshDeserialize, BorshSerialize};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::fs::File;
 use tokio::sync::Mutex;
 
 pub(super) const CHUNK: u64 = 64 * 1024;
+const PROFILE_V1: &str = "yinyang-stage-1";
+const PROFILE_V2: &str = "yinyang-stage-2";
+const SCHEMA_V1: &[schema::TableColumns<'static>] = &[
+    ("authority", &["singleton", "profile", "filesystem"]),
+    ("handles", &["id", "record"]),
+    ("chunks", &["handle", "position", "data"]),
+    ("errors", &["sequence", "handle", "message"]),
+];
+const SCHEMA_V2: &[schema::TableColumns<'static>] = &[
+    ("authority", &["singleton", "profile", "filesystem"]),
+    ("handles", &["id", "record", "failure"]),
+    ("chunks", &["handle", "position", "data"]),
+    ("errors", &["sequence", "handle", "message", "failure"]),
+];
+
+const CREATE_SCHEMA_V2: &str = "
+    CREATE TABLE authority(
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      profile TEXT NOT NULL,
+      filesystem BLOB NOT NULL
+    );
+    CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB NOT NULL, failure BLOB);
+    CREATE TABLE chunks(
+      handle BLOB NOT NULL,
+      position INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY(handle,position)
+    );
+    CREATE TABLE errors(
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      handle BLOB NOT NULL,
+      message TEXT NOT NULL,
+      failure BLOB
+    );";
+
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub(super) struct Record {
     pub id: [u8; 16],
@@ -128,6 +163,45 @@ fn has_failure(c: &Connection, table: &str) -> Result<bool> {
     )
     .map_err(local)
 }
+
+fn validate_schema(c: &Connection, profile: &str) -> Result<()> {
+    let expected = match profile {
+        PROFILE_V1 => SCHEMA_V1,
+        PROFILE_V2 => SCHEMA_V2,
+        _ => {
+            return Err(Error::State(
+                ErrorKind::Unsupported,
+                "unknown staging profile",
+            ));
+        }
+    };
+    if !schema::matches(c, expected).map_err(local)? {
+        return Err(Error::local_kind(
+            ErrorKind::Corrupt,
+            format!("staging profile {profile} has an unsupported schema"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile(c: &Connection, filesystem: Option<NodeId>) -> Result<String> {
+    let (profile, bound): (String, Vec<u8>) = c
+        .query_row(
+            "SELECT profile,filesystem FROM authority WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| {
+            Error::local_kind(ErrorKind::Corrupt, format!("read staging profile: {error}"))
+        })?;
+    validate_schema(c, &profile)?;
+    if let Some(filesystem) = filesystem
+        && bound != filesystem.as_bytes()
+    {
+        return Err(Error::Invalid("staging belongs to a different filesystem"));
+    }
+    Ok(profile)
+}
 fn decoded_record(bytes: &[u8], failure: Option<Vec<u8>>) -> Result<Record> {
     let mut r = decode(bytes)?;
     r.failure = failure
@@ -223,21 +297,14 @@ fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
 impl Stage {
     pub async fn validate(path: PathBuf, fs: NodeId) -> Result<()> {
         tokio::task::spawn_blocking(move || {
-            let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            let c = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(local)?;
+            c.busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(local)?;
-            let (profile, filesystem): (String, Vec<u8>) = c
-                .query_row(
-                    "SELECT profile,filesystem FROM authority WHERE singleton=1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(local)?;
-            if !matches!(profile.as_str(), "yinyang-stage-1" | "yinyang-stage-2") {
-                return Err(Error::Invalid("unknown staging profile"));
-            }
-            if filesystem != fs.as_bytes() {
-                return Err(Error::Invalid("staging belongs to a different filesystem"));
-            }
+            validate_profile(&c, Some(fs))?;
             let _ = records(&c)?;
             let _ = errors(&c)?;
             Ok(())
@@ -248,16 +315,14 @@ impl Stage {
 
     pub async fn inspect(path: PathBuf) -> Result<RuntimeStatus> {
         tokio::task::spawn_blocking(move || {
-            let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            let c = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(local)?;
+            c.busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(local)?;
-            let profile: String = c
-                .query_row("SELECT profile FROM authority WHERE singleton=1", [], |r| {
-                    r.get(0)
-                })
-                .map_err(local)?;
-            if profile != "yinyang-stage-1" && profile != "yinyang-stage-2" {
-                return Err(Error::Invalid("unknown staging profile"));
-            }
+            validate_profile(&c, None)?;
             Ok(RuntimeStatus {
                 handles: records(&c)?.iter().map(Record::status).collect(),
                 errors: errors(&c)?,
@@ -269,42 +334,111 @@ impl Stage {
     pub async fn open(path: PathBuf, fs: NodeId) -> Result<Self> {
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&path).map_err(local)?;
-            let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.join("runtime.lock")).map_err(local)?;
-            lock.try_lock().map_err(|e| match e {
-                std::fs::TryLockError::WouldBlock => Error::State(ErrorKind::Busy, "staging directory is already in use"),
-                std::fs::TryLockError::Error(e) => local(e),
-            })?;
-            let mut c = Connection::open(path.join("staging.db")).map_err(local)?;
-            c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-                CREATE TABLE IF NOT EXISTS authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS handles(id BLOB PRIMARY KEY, record BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS chunks(handle BLOB NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(handle,position));
-                CREATE TABLE IF NOT EXISTS errors(sequence INTEGER PRIMARY KEY AUTOINCREMENT, handle BLOB NOT NULL, message TEXT NOT NULL);").map_err(local)?;
-            let tx = c.transaction().map_err(local)?;
-            tx.execute("INSERT OR IGNORE INTO authority VALUES(1,'yinyang-stage-1',?1)",params![fs.as_bytes().as_slice()]).map_err(local)?;
-            let (profile,bound): (String,Vec<u8>) = tx.query_row("SELECT profile,filesystem FROM authority WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(local)?;
-            if (profile!="yinyang-stage-1" && profile!="yinyang-stage-2") || bound!=fs.as_bytes() { return Err(Error::Invalid("staging belongs to a different filesystem or profile")); }
-            for table in ["handles", "errors"] {
-                if !has_failure(&tx, table)? {
-                    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN failure BLOB")).map_err(local)?;
+            let database = path.join("staging.db");
+            if database.try_exists().map_err(local)? {
+                let c = Connection::open_with_flags(
+                    &database,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(local)?;
+                c.busy_timeout(std::time::Duration::from_secs(1))
+                    .map_err(local)?;
+                if !schema::matches(&c, &[]).map_err(local)? {
+                    validate_profile(&c, Some(fs))?;
                 }
             }
-            tx.execute("UPDATE authority SET profile='yinyang-stage-2' WHERE singleton=1", []).map_err(local)?;
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path.join("runtime.lock"))
+                .map_err(local)?;
+            lock.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => {
+                    Error::State(ErrorKind::Busy, "staging directory is already in use")
+                }
+                std::fs::TryLockError::Error(e) => local(e),
+            })?;
+            let exists = database.try_exists().map_err(local)?;
+            let mut c = Connection::open_with_flags(
+                &database,
+                if exists {
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                } else {
+                    OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | OpenFlags::SQLITE_OPEN_CREATE
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                },
+            )
+            .map_err(local)?;
+            c.busy_timeout(std::time::Duration::from_secs(1))
+                .map_err(local)?;
+            // Revalidate after taking the process lease. A writer that finished
+            // between preflight and locking may have performed the supported
+            // stage-1 to stage-2 upgrade; accept the resulting known profile.
+            let profile = if exists && !schema::matches(&c, &[]).map_err(local)? {
+                Some(validate_profile(&c, Some(fs))?)
+            } else {
+                None
+            };
+            let tx = c.transaction().map_err(local)?;
+            match profile.as_deref() {
+                None => {
+                    tx.execute_batch(CREATE_SCHEMA_V2).map_err(local)?;
+                    tx.execute(
+                        "INSERT INTO authority VALUES(1,?1,?2)",
+                        params![PROFILE_V2, fs.as_bytes().as_slice()],
+                    )
+                    .map_err(local)?;
+                }
+                Some(PROFILE_V1) => {
+                    let _ = records(&tx)?;
+                    let _ = errors(&tx)?;
+                    tx.execute_batch(
+                        "ALTER TABLE handles ADD COLUMN failure BLOB;
+                         ALTER TABLE errors ADD COLUMN failure BLOB;
+                         UPDATE authority SET profile='yinyang-stage-2' WHERE singleton=1;",
+                    )
+                    .map_err(local)?;
+                }
+                Some(PROFILE_V2) => {
+                    let _ = records(&tx)?;
+                    let _ = errors(&tx)?;
+                }
+                Some(_) => unreachable!("profile validation rejected unsupported state"),
+            }
+            validate_profile(&tx, Some(fs))?;
             // Incomplete opens have never been exposed or accepted application writes.
             let all = {
-                let mut q=tx.prepare("SELECT record FROM handles").map_err(local)?;
-                q.query_map([],|r|r.get::<_,Vec<u8>>(0)).map_err(local)?.collect::<std::result::Result<Vec<_>,_>>().map_err(local)?
+                let mut q = tx.prepare("SELECT record FROM handles").map_err(local)?;
+                q.query_map([], |r| r.get::<_, Vec<u8>>(0))
+                    .map_err(local)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(local)?
             };
             for bytes in all {
-                let r=decode(&bytes)?;
+                let r = decode(&bytes)?;
                 if !r.ready {
-                    tx.execute("DELETE FROM chunks WHERE handle=?1",params![r.id.as_slice()]).map_err(local)?;
-                    tx.execute("DELETE FROM handles WHERE id=?1",params![r.id.as_slice()]).map_err(local)?;
+                    tx.execute(
+                        "DELETE FROM chunks WHERE handle=?1",
+                        params![r.id.as_slice()],
+                    )
+                    .map_err(local)?;
+                    tx.execute("DELETE FROM handles WHERE id=?1", params![r.id.as_slice()])
+                        .map_err(local)?;
                 }
             }
             tx.commit().map_err(local)?;
-            Ok(Self{db:Arc::new(Mutex::new(c)),_lock:Arc::new(lock)})
-        }).await.map_err(local)?
+            c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+                .map_err(local)?;
+            Ok(Self {
+                db: Arc::new(Mutex::new(c)),
+                _lock: Arc::new(lock),
+            })
+        })
+        .await
+        .map_err(local)?
     }
     async fn call<T: Send + 'static>(
         &self,
@@ -494,6 +628,105 @@ fn mutable(r: &Record) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_database(path: &std::path::Path, profile: &str, typed_failures: bool) -> NodeId {
+        let fs = NodeId::generate();
+        let failure = if typed_failures { ",failure BLOB" } else { "" };
+        let c = Connection::open(path).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE authority(singleton INTEGER PRIMARY KEY, profile TEXT, filesystem BLOB);
+             CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB{handle_failure});
+             CREATE TABLE chunks(handle BLOB, position INTEGER, data BLOB, PRIMARY KEY(handle,position));
+             CREATE TABLE errors(sequence INTEGER PRIMARY KEY AUTOINCREMENT, handle BLOB, message TEXT{error_failure});",
+            handle_failure = failure,
+            error_failure = failure,
+        ))
+        .unwrap();
+        c.execute(
+            "INSERT INTO authority VALUES(1,?1,?2)",
+            params![profile, fs.as_bytes().as_slice()],
+        )
+        .unwrap();
+        fs
+    }
+
+    #[tokio::test]
+    async fn unsupported_profile_is_rejected_without_creating_a_lease_or_changing_sqlite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        let fs = raw_database(&path, "yinyang-stage-99", true);
+        assert_eq!(
+            Stage::inspect(path.clone()).await.unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            Stage::validate(path.clone(), fs).await.unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            Stage::open(temp.path().to_owned(), fs)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
+        assert!(!temp.path().join("runtime.lock").exists());
+        let c = Connection::open(path).unwrap();
+        let mode: String = c
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        let profile: String = c
+            .query_row(
+                "SELECT profile FROM authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(profile, "yinyang-stage-99");
+    }
+
+    #[tokio::test]
+    async fn known_profile_with_partial_schema_is_not_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        let fs = raw_database(&path, PROFILE_V2, false);
+        assert_eq!(
+            Stage::inspect(path.clone()).await.unwrap_err().kind(),
+            ErrorKind::Corrupt
+        );
+        assert_eq!(
+            Stage::open(temp.path().to_owned(), fs)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
+        );
+        assert!(!temp.path().join("runtime.lock").exists());
+        let c = Connection::open(path).unwrap();
+        let handles: Vec<String> = {
+            let mut statement = c.prepare("PRAGMA table_info(handles)").unwrap();
+            statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(handles, ["id", "record"]);
+    }
+
+    #[tokio::test]
+    async fn empty_database_is_initialized_after_acquiring_the_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("staging.db"), []).unwrap();
+        let fs = NodeId::generate();
+        let stage = Stage::open(temp.path().to_owned(), fs).await.unwrap();
+        assert!(temp.path().join("runtime.lock").exists());
+        assert!(stage.list().await.unwrap().is_empty());
+        Stage::validate(temp.path().join("staging.db"), fs)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn release_retains_typed_failure_when_the_ledger_is_unwritable() {

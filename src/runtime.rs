@@ -27,6 +27,7 @@ use yinyang_core::{
 
 mod staging;
 use staging::{CHUNK, Record, Stage};
+mod schema;
 
 mod error;
 pub use error::{Error, ErrorKind, Failure, Result};

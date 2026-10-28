@@ -654,6 +654,10 @@ async fn journal_rejects_a_future_profile_before_changing_its_schema() {
             .kind(),
         RuntimeErrorKind::Unsupported
     );
+    assert_eq!(
+        DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
+        RuntimeErrorKind::Unsupported
+    );
     let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
     let mode: String = database
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -672,6 +676,60 @@ async fn journal_rejects_a_future_profile_before_changing_its_schema() {
         !publications,
         "rejecting a future profile must not initialize the v1 schema"
     );
+}
+
+#[tokio::test]
+async fn journal_rejects_a_partial_known_schema_without_repairing_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("journal");
+    tokio::fs::create_dir(&state).await.unwrap();
+    {
+        let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE binding(
+                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                     profile TEXT NOT NULL,
+                     filesystem BLOB NOT NULL,
+                     root BLOB NOT NULL
+                 );
+                 INSERT INTO binding VALUES(1,'yinyang-directory-1',zeroblob(16),zeroblob(16));
+                 CREATE TABLE publications(
+                     commit_id BLOB PRIMARY KEY,
+                     baseline BLOB NOT NULL,
+                     request_digest BLOB NOT NULL,
+                     source TEXT NOT NULL,
+                     request BLOB NOT NULL,
+                     manifest BLOB NOT NULL,
+                     state INTEGER NOT NULL,
+                     receipt_revision BLOB,
+                     receipt_ordinal INTEGER
+                 );",
+            )
+            .unwrap();
+    }
+    let fs = filesystem(&TestBackend::default()).await;
+    assert_eq!(
+        DirectoryJournal::open(&fs, &state)
+            .await
+            .unwrap_err()
+            .kind(),
+        RuntimeErrorKind::Corrupt
+    );
+    assert_eq!(
+        DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
+        RuntimeErrorKind::Corrupt
+    );
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    let columns: Vec<String> = {
+        let mut statement = database.prepare("PRAGMA table_info(publications)").unwrap();
+        statement
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(!columns.iter().any(|column| column == "failure"));
 }
 
 #[tokio::test]

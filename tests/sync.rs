@@ -924,3 +924,104 @@ async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
     backend.state.lock().unwrap().offline = false;
     sync.publish(edit).await.unwrap();
 }
+
+#[tokio::test]
+async fn sync_one_upgrades_after_exact_legacy_schema_validation() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    drop(Sync::open(authority.clone(), &state).await.unwrap());
+    {
+        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE namespaces;
+                 UPDATE binding SET profile='yinyang-sync-1';",
+            )
+            .unwrap();
+    }
+
+    drop(Sync::open(authority, &state).await.unwrap());
+    let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+    let profile: String = connection
+        .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(profile, "yinyang-sync-2");
+    let namespaces: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='namespaces'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(namespaces);
+}
+
+#[tokio::test]
+async fn unsupported_and_partial_sync_schemas_are_not_repaired() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    drop(Sync::open(authority.clone(), &state).await.unwrap());
+    {
+        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE namespaces;
+                 UPDATE binding SET profile='yinyang-sync-99';",
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        Sync::open(authority.clone(), &state)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    {
+        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        let profile: String = connection
+            .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(profile, "yinyang-sync-99");
+        let namespaces: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='namespaces'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!namespaces);
+        connection
+            .execute("UPDATE binding SET profile='yinyang-sync-2'", [])
+            .unwrap();
+    }
+    assert_eq!(
+        Sync::open(authority.clone(), &state)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+    assert_eq!(
+        Sync::inspect(&state).await.unwrap_err().kind(),
+        ErrorKind::Corrupt
+    );
+}
