@@ -20,8 +20,9 @@
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE};
 use super::{Outcome, TEARDOWN_GRACE, blocking_error, shutdown_signal};
 use crate::direct::{
-    DirectFile, DirectId, DirectKind, DirectNamespace, DirectNode, DirectSnapshot,
-    Error as DirectError, ErrorKind as DirectErrorKind,
+    DirectFile, DirectFileHandle, DirectFlushOutcome, DirectId, DirectKind, DirectNamespace,
+    DirectNode, DirectObjectPin, DirectObjectState, DirectObjectStatus, DirectRuntime,
+    DirectSnapshot, Error as DirectError, ErrorKind as DirectErrorKind,
 };
 use crate::volume::VolumeConfig;
 use fuser::{
@@ -41,6 +42,53 @@ use tokio::runtime::Handle;
 const ROOT_INODE: u64 = 1;
 const INODE_DOMAIN: &[u8] = b"yinyang direct fuse inode v1";
 const FALLBACK_STAMP_SECONDS: u64 = 1_600_000_000;
+
+fn has_open_flag(flags: i32, flag: nix::fcntl::OFlag) -> bool {
+    flags & flag.bits() != 0
+}
+
+fn writable_open(flags: OpenFlags) -> bool {
+    flags.acc_mode() != OpenAccMode::O_RDONLY
+}
+
+fn writable_create(flags: i32) -> bool {
+    flags & libc::O_ACCMODE != libc::O_RDONLY
+}
+
+fn representable_mode(mode: u32, umask: u32, read_only: bool, directory: bool) -> bool {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    let file_type = mode & S_IFMT;
+    let type_ok = file_type == 0
+        || (directory && file_type == S_IFDIR)
+        || (!directory && file_type == S_IFREG);
+    if !type_ok || mode & !(S_IFMT | 0o777) != 0 {
+        return false;
+    }
+    let effective = mode & !umask & 0o777;
+    let expected = if directory {
+        if read_only { 0o555 } else { 0o755 }
+    } else if read_only {
+        0o444
+    } else {
+        0o644
+    };
+    effective == expected
+}
+
+fn rename_replace(flags: RenameFlags) -> Result<bool, fuser::Errno> {
+    let known =
+        RenameFlags::RENAME_NOREPLACE | RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT;
+    if flags.bits() & !known.bits() != 0 {
+        return Err(fuser::Errno::EINVAL);
+    }
+    if flags.contains(RenameFlags::RENAME_EXCHANGE) || flags.contains(RenameFlags::RENAME_WHITEOUT)
+    {
+        return Err(fuser::Errno::EOPNOTSUPP);
+    }
+    Ok(!flags.contains(RenameFlags::RENAME_NOREPLACE))
+}
 
 struct DirectInodeTable {
     by_inode: BTreeMap<u64, DirectId>,
@@ -99,9 +147,27 @@ impl DirectInodeTable {
     }
 }
 
+#[derive(Clone)]
+struct FileView {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone)]
+enum OpenSource {
+    Remote(DirectFile),
+    Staged(DirectFileHandle),
+}
+
+#[derive(Clone)]
 struct OpenFile {
-    _file: DirectFile,
-    attr: FileAttr,
+    id: DirectId,
+    key: String,
+    source: OpenSource,
+    writable: bool,
+    parent: Option<INodeNo>,
+    name: String,
+    view: Arc<Mutex<FileView>>,
 }
 
 #[derive(Clone)]
@@ -119,7 +185,11 @@ struct DirCursor {
 
 pub(super) struct DirectInner {
     namespace: DirectNamespace,
+    read_only: bool,
+    direct: Option<DirectRuntime>,
     snapshot: RwLock<Arc<DirectSnapshot>>,
+    pending: Mutex<BTreeMap<DirectId, DirectObjectStatus>>,
+    views: Mutex<BTreeMap<String, Arc<Mutex<FileView>>>>,
     refresh_error: Mutex<Option<String>>,
     inodes: Mutex<DirectInodeTable>,
     files: Mutex<BTreeMap<u64, Arc<OpenFile>>>,
@@ -127,15 +197,31 @@ pub(super) struct DirectInner {
     dentries: Mutex<BTreeSet<(u64, String)>>,
     notifier: Mutex<Option<Notifier>>,
     next_handle: AtomicU64,
-    runtime: Handle,
+    tokio: Handle,
 }
 
 impl DirectInner {
-    fn new(namespace: DirectNamespace, snapshot: DirectSnapshot, runtime: Handle) -> Self {
+    fn new(
+        namespace: DirectNamespace,
+        read_only: bool,
+        direct: Option<DirectRuntime>,
+        pending: Vec<DirectObjectStatus>,
+        snapshot: DirectSnapshot,
+        tokio: Handle,
+    ) -> Self {
         let root = snapshot.root();
         Self {
             namespace,
+            read_only,
+            direct,
             snapshot: RwLock::new(Arc::new(snapshot)),
+            pending: Mutex::new(
+                pending
+                    .into_iter()
+                    .map(|status| (status.id, status))
+                    .collect(),
+            ),
+            views: Mutex::new(BTreeMap::new()),
             refresh_error: Mutex::new(None),
             inodes: Mutex::new(DirectInodeTable::new(root)),
             files: Mutex::new(BTreeMap::new()),
@@ -143,16 +229,120 @@ impl DirectInner {
             dentries: Mutex::new(BTreeSet::new()),
             notifier: Mutex::new(None),
             next_handle: AtomicU64::new(0),
-            runtime,
+            tokio,
         }
     }
 
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        self.runtime.spawn(future);
+        self.tokio.spawn(future);
     }
 
     fn next_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn pending_status(&self, id: DirectId) -> Option<DirectObjectStatus> {
+        guard(&self.pending).get(&id).cloned()
+    }
+
+    fn pending_child(&self, parent: DirectId, name: &str) -> Option<DirectObjectStatus> {
+        guard(&self.pending)
+            .values()
+            .find(|status| status.parent == parent && status.name == name)
+            .cloned()
+    }
+
+    fn store_pending(&self, status: DirectObjectStatus) {
+        let mut pending = guard(&self.pending);
+        if status.state == DirectObjectState::Clean {
+            pending.remove(&status.id);
+        } else {
+            pending.insert(status.id, status);
+        }
+    }
+
+    async fn refresh_pending(&self) -> Result<(), fuser::Errno> {
+        let Some(direct) = &self.direct else {
+            return Ok(());
+        };
+        let statuses = direct
+            .pending_objects()
+            .await
+            .map_err(|error| direct_errno(&error))?;
+        let mut pending = BTreeMap::new();
+        for status in statuses {
+            if status.state != DirectObjectState::Clean {
+                pending.insert(status.id, status);
+            }
+        }
+        *guard(&self.pending) = pending;
+        Ok(())
+    }
+
+    fn view_for(
+        &self,
+        key: &str,
+        size: u64,
+        modified: Option<std::time::SystemTime>,
+    ) -> Arc<Mutex<FileView>> {
+        let mut views = guard(&self.views);
+        let view = views
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(FileView { size, modified })))
+            .clone();
+        {
+            let mut current = guard(&view);
+            current.size = size;
+            if modified.is_some() {
+                current.modified = modified;
+            }
+        }
+        view
+    }
+
+    fn view_attr(
+        &self,
+        ino: INodeNo,
+        key: &str,
+        fallback_modified: Option<std::time::SystemTime>,
+    ) -> Option<FileAttr> {
+        let has_open = guard(&self.files).values().any(|open| open.key == key);
+        let has_pending = guard(&self.pending)
+            .values()
+            .any(|status| status.key.as_str() == key);
+        if !has_open && !has_pending {
+            return None;
+        }
+        let view = guard(&self.views).get(key).cloned()?;
+        let view = guard(&view).clone();
+        Some(attribute_with_size(
+            ino,
+            false,
+            view.size,
+            view.modified.or(fallback_modified),
+            self.read_only,
+        ))
+    }
+
+    fn open_attr(&self, ino: INodeNo, open: &OpenFile) -> FileAttr {
+        let view = guard(&open.view).clone();
+        attribute_with_size(ino, false, view.size, view.modified, self.read_only)
+    }
+
+    fn status_attr(&self, ino: INodeNo, status: &DirectObjectStatus) -> FileAttr {
+        let modified = status
+            .accepted
+            .as_ref()
+            .and_then(DirectObjectPin::modified)
+            .or_else(|| {
+                status
+                    .observed
+                    .present()
+                    .and_then(DirectObjectPin::modified)
+            });
+        let view = self.view_for(status.key.as_str(), status.length, modified);
+        let view = guard(&view).clone();
+        attribute_with_size(ino, false, view.size, view.modified, self.read_only)
     }
 
     fn install_notifier(&self, notifier: Notifier) {
@@ -169,6 +359,14 @@ impl DirectInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         Ok(snapshot)
+    }
+
+    fn attr_ttl(&self) -> std::time::Duration {
+        if self.read_only {
+            ATTR_TTL
+        } else {
+            std::time::Duration::ZERO
+        }
     }
 
     fn node(&self, ino: INodeNo) -> Option<DirectId> {
@@ -191,13 +389,6 @@ impl DirectInner {
         guard(&self.dentries).insert((parent.0, name.to_owned()));
     }
 
-    fn live_file_attr(&self, id: DirectId) -> Option<FileAttr> {
-        guard(&self.files)
-            .values()
-            .find(|open| open._file.id() == id)
-            .map(|open| open.attr)
-    }
-
     async fn refresh_once(&self) {
         match self.namespace.observe().await {
             Ok(snapshot) => {
@@ -211,8 +402,12 @@ impl DirectInner {
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(snapshot);
                 *guard(&self.refresh_error) = None;
+                if let Err(errno) = self.refresh_pending().await {
+                    eprintln!("yy: fuse refresh: cannot load Direct pending state: {errno:?}");
+                }
+                let pending = guard(&self.pending).len();
                 eprintln!(
-                    "yy: fuse refresh: Direct observation {revision} with {root_entries} root entries"
+                    "yy: fuse refresh: Direct observation {revision} with {root_entries} root entries and {pending} pending objects"
                 );
                 self.invalidate_known().await;
             }
@@ -279,6 +474,19 @@ impl DirectInner {
         let Some(parent_id) = self.node(parent) else {
             return reply.error(fuser::Errno::ESTALE);
         };
+        if let Some(status) = self.pending_child(parent_id, &name) {
+            let ino = match self.inode_for(status.id) {
+                Ok(ino) => ino,
+                Err(errno) => return reply.error(errno),
+            };
+            self.record_dentry(parent, &name);
+            self.remember_lookup(ino);
+            return reply.entry(
+                &self.attr_ttl(),
+                &self.status_attr(ino, &status),
+                Generation(0),
+            );
+        }
         let snapshot = match self.current() {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),
@@ -295,8 +503,8 @@ impl DirectInner {
         self.record_dentry(parent, &name);
         self.remember_lookup(ino);
         reply.entry(
-            &ATTR_TTL,
-            &attribute(ino, node, node.modified()),
+            &self.attr_ttl(),
+            &attribute(ino, node, node.modified(), self.read_only),
             Generation(0),
         );
     }
@@ -305,13 +513,13 @@ impl DirectInner {
         if let Some(fh) = fh
             && let Some(open) = guard(&self.files).get(&fh.0).cloned()
         {
-            return reply.attr(&ATTR_TTL, &open.attr);
+            return reply.attr(&self.attr_ttl(), &self.open_attr(ino, &open));
         }
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
-        if let Some(attr) = self.live_file_attr(id) {
-            return reply.attr(&ATTR_TTL, &attr);
+        if let Some(status) = self.pending_status(id) {
+            return reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
         }
         let snapshot = match self.current() {
             Ok(snapshot) => snapshot,
@@ -320,18 +528,116 @@ impl DirectInner {
         let Some(node) = snapshot.node(id) else {
             return reply.error(fuser::Errno::ENOENT);
         };
-        reply.attr(&ATTR_TTL, &attribute(ino, node, node.modified()));
+        let key = node.key().unwrap_or(node.path());
+        if let Some(attr) = self.view_attr(ino, key, node.modified()) {
+            return reply.attr(&self.attr_ttl(), &attr);
+        }
+        reply.attr(
+            &self.attr_ttl(),
+            &attribute(ino, node, node.modified(), self.read_only),
+        );
     }
 
     async fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        if flags.acc_mode() != OpenAccMode::O_RDONLY
-            || flags.0 & nix::fcntl::OFlag::O_TRUNC.bits() != 0
-        {
-            return reply.error(fuser::Errno::EROFS);
-        }
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
+        let writable = writable_open(flags);
+        let truncate = has_open_flag(flags.0, nix::fcntl::OFlag::O_TRUNC);
+        if truncate && !writable {
+            return reply.error(fuser::Errno::EINVAL);
+        }
+        if self.read_only {
+            if writable {
+                return reply.error(fuser::Errno::EROFS);
+            }
+            return self.open_read_only(ino, id, reply).await;
+        }
+        let Some(direct) = &self.direct else {
+            return reply.error(fuser::Errno::EIO);
+        };
+        let (file, key, modified, parent) = if let Some(status) = self.pending_status(id) {
+            let modified = status
+                .accepted
+                .as_ref()
+                .and_then(DirectObjectPin::modified)
+                .or_else(|| {
+                    status
+                        .observed
+                        .present()
+                        .and_then(DirectObjectPin::modified)
+                });
+            let parent = match self.inode_for(status.parent) {
+                Ok(parent) => Some(parent),
+                Err(errno) => return reply.error(errno),
+            };
+            let file = match direct.open_pending(id, writable).await {
+                Ok(file) => file,
+                Err(error) => return reply.error(direct_errno(&error)),
+            };
+            (file, status.key.as_str().to_owned(), modified, parent)
+        } else {
+            let snapshot = match self.current() {
+                Ok(snapshot) => snapshot,
+                Err(errno) => return reply.error(errno),
+            };
+            let Some(node) = snapshot.node(id) else {
+                return reply.error(fuser::Errno::ESTALE);
+            };
+            if node.is_directory() {
+                return reply.error(fuser::Errno::EISDIR);
+            }
+            let parent = match node.parent() {
+                Some(parent) => match self.inode_for(parent) {
+                    Ok(parent) => Some(parent),
+                    Err(errno) => return reply.error(errno),
+                },
+                None => None,
+            };
+            let file = match direct.open_file(&snapshot, id, writable).await {
+                Ok(file) => file,
+                Err(error) => return reply.error(direct_errno(&error)),
+            };
+            (
+                file,
+                node.key().unwrap_or(node.path()).to_owned(),
+                node.modified(),
+                parent,
+            )
+        };
+        if let Err(errno) = self.invalidate_before_open(ino).await {
+            return reply.error(errno);
+        }
+        if truncate && let Err(error) = file.truncate(0).await {
+            return reply.error(direct_errno(&error));
+        }
+        let length = match file.len().await {
+            Ok(length) => length,
+            Err(error) => return reply.error(direct_errno(&error)),
+        };
+        let view = self.view_for(&key, length, modified);
+        let parent = parent;
+        let name = file.name().to_owned();
+        if let Err(error) = file.status().await {
+            return reply.error(direct_errno(&error));
+        }
+        let fh = self.next_handle();
+        guard(&self.files).insert(
+            fh,
+            Arc::new(OpenFile {
+                id,
+                key,
+                source: OpenSource::Staged(file),
+                writable,
+                parent,
+                name,
+                view,
+            }),
+        );
+        reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    async fn open_read_only(&self, ino: INodeNo, id: DirectId, reply: ReplyOpen) {
         let snapshot = match self.current() {
             Ok(snapshot) => snapshot,
             Err(errno) => return reply.error(errno),
@@ -349,10 +655,139 @@ impl DirectInner {
         if let Err(errno) = self.invalidate_before_open(ino).await {
             return reply.error(errno);
         }
-        let attr = open_attr(ino, node);
+        let key = node.key().unwrap_or(node.path()).to_owned();
+        let view = self.view_for(&key, node.size(), node.modified());
+        let parent = match node.parent() {
+            Some(parent) => match self.inode_for(parent) {
+                Ok(parent) => Some(parent),
+                Err(errno) => return reply.error(errno),
+            },
+            None => None,
+        };
         let fh = self.next_handle();
-        guard(&self.files).insert(fh, Arc::new(OpenFile { _file: file, attr }));
+        guard(&self.files).insert(
+            fh,
+            Arc::new(OpenFile {
+                id,
+                key,
+                source: OpenSource::Remote(file),
+                writable: false,
+                parent,
+                name: node.name().to_owned(),
+                view,
+            }),
+        );
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    async fn create(
+        &self,
+        parent: INodeNo,
+        name: String,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        if !representable_mode(mode, umask, false, false) {
+            return reply.error(fuser::Errno::EOPNOTSUPP);
+        }
+        let Some(parent_id) = self.node(parent) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        let snapshot = match self.current() {
+            Ok(snapshot) => snapshot,
+            Err(errno) => return reply.error(errno),
+        };
+        let Some(direct) = &self.direct else {
+            return reply.error(fuser::Errno::EIO);
+        };
+        let file = match direct.create_file(&snapshot, parent_id, &name).await {
+            Ok(file) => file,
+            Err(error) => return reply.error(direct_errno(&error)),
+        };
+        let writable = writable_create(flags);
+        if !writable {
+            let flush = match file.flush().await {
+                Ok(flush) => flush,
+                Err(error) => return reply.error(direct_errno(&error)),
+            };
+            match flush {
+                DirectFlushOutcome::Unchanged | DirectFlushOutcome::Applied { .. } => {
+                    self.refresh_once().await;
+                }
+                DirectFlushOutcome::Conflict { .. } => {
+                    let _ = self.refresh_pending().await;
+                    return reply.error(fuser::Errno::ESTALE);
+                }
+                DirectFlushOutcome::Unknown { .. } => {
+                    let _ = self.refresh_pending().await;
+                    return reply.error(fuser::Errno::EIO);
+                }
+                DirectFlushOutcome::Unsupported { message } => {
+                    let _ = self.refresh_pending().await;
+                    eprintln!("yy: fuse create: Direct publication is unsupported: {message}");
+                    return reply.error(fuser::Errno::EOPNOTSUPP);
+                }
+            }
+        }
+        let status = match file.status().await {
+            Ok(status) => status,
+            Err(error) => return reply.error(direct_errno(&error)),
+        };
+        self.store_pending(status.clone());
+        let id = if writable {
+            file.id()
+        } else {
+            match self.current() {
+                Ok(snapshot) => snapshot
+                    .lookup(parent_id, &name)
+                    .ok()
+                    .flatten()
+                    .map(DirectNode::id)
+                    .unwrap_or_else(|| file.id()),
+                Err(_) => file.id(),
+            }
+        };
+        let ino = match self.inode_for(id) {
+            Ok(ino) => ino,
+            Err(errno) => return reply.error(errno),
+        };
+        let modified = status
+            .accepted
+            .as_ref()
+            .and_then(DirectObjectPin::modified)
+            .or_else(|| {
+                status
+                    .observed
+                    .present()
+                    .and_then(DirectObjectPin::modified)
+            });
+        let view = self.view_for(status.key.as_str(), status.length, modified);
+        let fh = self.next_handle();
+        let open = OpenFile {
+            id,
+            key: status.key.as_str().to_owned(),
+            source: OpenSource::Staged(file),
+            writable,
+            parent: Some(parent),
+            name: name.clone(),
+            view,
+        };
+        self.record_dentry(parent, &name);
+        self.remember_lookup(ino);
+        let attr = self.open_attr(ino, &open);
+        guard(&self.files).insert(fh, Arc::new(open));
+        reply.created(
+            &self.attr_ttl(),
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::FOPEN_DIRECT_IO,
+        );
     }
 
     async fn invalidate_before_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
@@ -382,14 +817,257 @@ impl DirectInner {
         let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
             return reply.error(fuser::Errno::EBADF);
         };
-        match open._file.read(offset, size as usize).await {
+        let result = match &open.source {
+            OpenSource::Remote(file) => file
+                .read(offset, size as usize)
+                .await
+                .map_err(|error| direct_errno(&error)),
+            OpenSource::Staged(file) => file
+                .read(offset, size as usize)
+                .await
+                .map_err(|error| direct_errno(&error)),
+        };
+        match result {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(direct_errno(&error)),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    async fn write(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        data: Vec<u8>,
+        flags: OpenFlags,
+        reply: ReplyWrite,
+    ) {
+        let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        if !open.writable {
+            return reply.error(fuser::Errno::EBADF);
+        }
+        let OpenSource::Staged(file) = &open.source else {
+            return reply.error(fuser::Errno::EROFS);
+        };
+        let append = has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND);
+        let sync = has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
+            || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC);
+        let written = match u32::try_from(data.len()) {
+            Ok(written) => written,
+            Err(_) => return reply.error(fuser::Errno::EINVAL),
+        };
+        let staged = if append {
+            file.append(&data).await.map(|_| ())
+        } else {
+            file.write(offset, &data).await
+        };
+        if let Err(error) = staged {
+            return reply.error(direct_errno(&error));
+        }
+        if let Ok(length) = file.len().await {
+            let mut view = guard(&open.view);
+            view.size = length;
+            view.modified = Some(std::time::SystemTime::now());
+        }
+        if let Ok(status) = file.status().await {
+            self.store_pending(status);
+        }
+        if sync && let Err(errno) = self.flush_staged(&open).await {
+            return reply.error(errno);
+        }
+        reply.written(written);
+    }
+
+    async fn flush(&self, fh: FileHandle, reply: ReplyEmpty) {
+        let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        match self.flush_staged(&open).await {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    async fn fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
+        self.flush(fh, reply).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn setattr(
+        &self,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<std::time::SystemTime>,
+        crtime: Option<std::time::SystemTime>,
+        chgtime: Option<std::time::SystemTime>,
+        bkuptime: Option<std::time::SystemTime>,
+        flags: Option<BsdFileFlags>,
+        fh: Option<FileHandle>,
+        reply: ReplyAttr,
+    ) {
+        let kernel_timestamps = atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some()
+            || bkuptime.is_some();
+        if mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || flags.is_some()
+            || (size.is_none() && kernel_timestamps)
+        {
+            return reply.error(fuser::Errno::EOPNOTSUPP);
+        }
+        let Some(length) = size else {
+            let Some(id) = self.node(ino) else {
+                return reply.error(fuser::Errno::ESTALE);
+            };
+            if let Some(status) = self.pending_status(id) {
+                return reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
+            }
+            let snapshot = match self.current() {
+                Ok(snapshot) => snapshot,
+                Err(errno) => return reply.error(errno),
+            };
+            let Some(node) = snapshot.node(id) else {
+                return reply.error(fuser::Errno::ENOENT);
+            };
+            let key = node.key().unwrap_or(node.path());
+            let attr = self
+                .view_attr(ino, key, node.modified())
+                .unwrap_or_else(|| attribute(ino, node, node.modified(), self.read_only));
+            return reply.attr(&self.attr_ttl(), &attr);
+        };
+        if self.read_only {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        if let Some(fh) = fh {
+            let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
+                return reply.error(fuser::Errno::EBADF);
+            };
+            if !open.writable {
+                return reply.error(fuser::Errno::EINVAL);
+            }
+            let OpenSource::Staged(file) = &open.source else {
+                return reply.error(fuser::Errno::EROFS);
+            };
+            if let Err(error) = file.truncate(length).await {
+                return reply.error(direct_errno(&error));
+            }
+            if let Ok(size) = file.len().await {
+                let mut view = guard(&open.view);
+                view.size = size;
+                view.modified = Some(std::time::SystemTime::now());
+            }
+            if let Ok(status) = file.status().await {
+                self.store_pending(status);
+            }
+            return reply.attr(&self.attr_ttl(), &self.open_attr(ino, &open));
+        }
+
+        let Some(id) = self.node(ino) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        let Some(direct) = &self.direct else {
+            return reply.error(fuser::Errno::EIO);
+        };
+        let file = if self.pending_status(id).is_some() {
+            match direct.open_pending(id, true).await {
+                Ok(file) => file,
+                Err(error) => return reply.error(direct_errno(&error)),
+            }
+        } else {
+            let snapshot = match self.current() {
+                Ok(snapshot) => snapshot,
+                Err(errno) => return reply.error(errno),
+            };
+            let Some(node) = snapshot.node(id) else {
+                return reply.error(fuser::Errno::ENOENT);
+            };
+            if node.is_directory() {
+                return reply.error(fuser::Errno::EISDIR);
+            }
+            match direct.open_file(&snapshot, id, true).await {
+                Ok(file) => file,
+                Err(error) => return reply.error(direct_errno(&error)),
+            }
+        };
+        if let Err(error) = file.truncate(length).await {
+            return reply.error(direct_errno(&error));
+        }
+        if let Err(errno) = self.flush_handle(&file).await {
+            return reply.error(errno);
+        }
+        let status = match file.status().await {
+            Ok(status) => status,
+            Err(error) => return reply.error(direct_errno(&error)),
+        };
+        self.store_pending(status.clone());
+        let current_id = match self.current() {
+            Ok(snapshot) => snapshot
+                .resolve(&status.path)
+                .map(DirectNode::id)
+                .unwrap_or(status.id),
+            Err(_) => status.id,
+        };
+        let ino = match self.inode_for(current_id) {
+            Ok(ino) => ino,
+            Err(errno) => return reply.error(errno),
+        };
+        reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
+    }
+
+    async fn flush_staged(&self, open: &OpenFile) -> Result<(), fuser::Errno> {
+        if !open.writable {
+            return Ok(());
+        }
+        let OpenSource::Staged(file) = &open.source else {
+            return Err(fuser::Errno::EROFS);
+        };
+        self.flush_handle(file).await
+    }
+
+    async fn flush_handle(&self, file: &DirectFileHandle) -> Result<(), fuser::Errno> {
+        match file.flush().await.map_err(|error| direct_errno(&error))? {
+            DirectFlushOutcome::Unchanged => Ok(()),
+            DirectFlushOutcome::Applied { .. } => {
+                if let Ok(status) = file.status().await {
+                    self.store_pending(status);
+                }
+                self.refresh_once().await;
+                Ok(())
+            }
+            DirectFlushOutcome::Conflict { .. } => {
+                if let Err(errno) = self.refresh_pending().await {
+                    eprintln!("yy: fuse flush: cannot retain Direct conflict state: {errno:?}");
+                }
+                Err(fuser::Errno::ESTALE)
+            }
+            DirectFlushOutcome::Unknown { .. } => {
+                if let Err(errno) = self.refresh_pending().await {
+                    eprintln!("yy: fuse flush: cannot retain Direct unknown state: {errno:?}");
+                }
+                Err(fuser::Errno::EIO)
+            }
+            DirectFlushOutcome::Unsupported { message } => {
+                eprintln!("yy: fuse flush: Direct publication is unsupported: {message}");
+                Err(fuser::Errno::EOPNOTSUPP)
+            }
         }
     }
 
     async fn release(&self, fh: FileHandle, reply: ReplyEmpty) {
         guard(&self.files).remove(&fh.0);
+        if let Err(errno) = self.refresh_pending().await {
+            eprintln!("yy: fuse release: cannot refresh Direct pending state: {errno:?}");
+        }
         reply.ok();
     }
 
@@ -418,21 +1096,44 @@ impl DirectInner {
             Ok(children) => children,
             Err(error) => return reply.error(direct_errno(&error)),
         };
-        let mut items = Vec::with_capacity(children.len());
+        let mut items = BTreeMap::new();
         for node in children {
             let ino = match self.inode_for(node.id()) {
                 Ok(ino) => ino.0,
                 Err(errno) => return reply.error(errno),
             };
-            items.push(DirItem {
-                ino,
-                kind: match node.kind() {
-                    DirectKind::Directory => FileType::Directory,
-                    DirectKind::File => FileType::RegularFile,
+            items.insert(
+                node.name().to_owned(),
+                DirItem {
+                    ino,
+                    kind: match node.kind() {
+                        DirectKind::Directory => FileType::Directory,
+                        DirectKind::File => FileType::RegularFile,
+                    },
+                    name: node.name().to_owned(),
                 },
-                name: node.name().to_owned(),
-            });
+            );
         }
+        let pending = guard(&self.pending).values().cloned().collect::<Vec<_>>();
+        for status in pending {
+            if status.parent != id {
+                continue;
+            }
+            let ino = match self.inode_for(status.id) {
+                Ok(ino) => ino.0,
+                Err(errno) => return reply.error(errno),
+            };
+            items.insert(
+                status.name.clone(),
+                DirItem {
+                    ino,
+                    kind: FileType::RegularFile,
+                    name: status.name,
+                },
+            );
+        }
+        // A pending replacement wins over the last remote observation.
+        let items = items.into_values().collect::<Vec<_>>();
         let fh = self.next_handle();
         guard(&self.dirs).insert(
             fh,
@@ -484,13 +1185,18 @@ impl DirectInner {
     }
 }
 
-fn attribute(ino: INodeNo, node: &DirectNode, modified: Option<std::time::SystemTime>) -> FileAttr {
-    attribute_with_size(ino, node.is_directory(), node.size(), modified)
+fn attribute(
+    ino: INodeNo,
+    node: &DirectNode,
+    modified: Option<std::time::SystemTime>,
+    read_only: bool,
+) -> FileAttr {
+    attribute_with_size(ino, node.is_directory(), node.size(), modified, read_only)
 }
 
-fn open_attr(ino: INodeNo, node: &DirectNode) -> FileAttr {
+fn open_attr(ino: INodeNo, node: &DirectNode, read_only: bool) -> FileAttr {
     debug_assert!(node.is_file());
-    attribute(ino, node, node.modified())
+    attribute(ino, node, node.modified(), read_only)
 }
 
 fn attribute_with_size(
@@ -498,6 +1204,7 @@ fn attribute_with_size(
     directory: bool,
     node_size: u64,
     modified: Option<std::time::SystemTime>,
+    read_only: bool,
 ) -> FileAttr {
     use nix::unistd::{getegid, geteuid};
     let stamp = modified.unwrap_or_else(|| {
@@ -517,7 +1224,13 @@ fn attribute_with_size(
         } else {
             FileType::RegularFile
         },
-        perm: if directory { 0o555 } else { 0o444 },
+        perm: if directory {
+            if read_only { 0o555 } else { 0o755 }
+        } else if read_only {
+            0o444
+        } else {
+            0o644
+        },
         nlink: if directory { 2 } else { 1 },
         uid: geteuid().as_raw(),
         gid: getegid().as_raw(),
@@ -548,13 +1261,30 @@ pub(super) async fn run(
     operator: opendal::Operator,
     mountpoint: std::path::PathBuf,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let namespace = DirectNamespace::new(operator)?;
+    let namespace = DirectNamespace::new(operator.clone())?;
+    let (direct, pending) = if config.read_only {
+        (None, Vec::new())
+    } else {
+        let binding = crate::volume::direct_storage_binding(&config, &operator)?;
+        let direct = DirectRuntime::open(
+            namespace.clone(),
+            Some(config.staging.clone()),
+            false,
+            binding,
+        )
+        .await?;
+        let pending = direct.pending_objects().await?;
+        (Some(direct), pending)
+    };
     let snapshot = namespace.observe().await?;
     if !snapshot.root_node().is_directory() {
         return Err(std::io::Error::other("Direct namespace root is not a directory").into());
     }
     let inner = Arc::new(DirectInner::new(
         namespace,
+        config.read_only,
+        direct,
+        pending,
         snapshot,
         tokio::runtime::Handle::current(),
     ));
@@ -563,10 +1293,12 @@ pub(super) async fn run(
     };
     let mut options = Config::default();
     options.mount_options = vec![
-        MountOption::RO,
         MountOption::FSName(format!("yinyang-{}", config.name)),
         MountOption::Subtype("yinyang".into()),
     ];
+    if config.read_only {
+        options.mount_options.insert(0, MountOption::RO);
+    }
     options.acl = SessionACL::Owner;
     let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(signal) => Some(signal),
@@ -578,8 +1310,13 @@ pub(super) async fn run(
     let session = Session::new(filesystem, &mountpoint, &options)?;
     inner.install_notifier(session.notifier());
     println!(
-        "yy: mounted {} read-only Direct at {} (fuse.yinyang)",
+        "yy: mounted {} {} Direct at {} (fuse.yinyang)",
         config.name,
+        if config.read_only {
+            "read-only"
+        } else {
+            "read-write"
+        },
         mountpoint.display()
     );
     let background = session.spawn()?;
@@ -709,22 +1446,26 @@ impl Filesystem for DirectFuseFrontend {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.flush(fh, reply).await });
     }
 
     fn fsync(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.fsync(fh, reply).await });
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -775,7 +1516,7 @@ impl Filesystem for DirectFuseFrontend {
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        if mask.contains(AccessFlags::W_OK) {
+        if self.inner.read_only && mask.contains(AccessFlags::W_OK) {
             reply.error(fuser::Errno::EROFS);
         } else {
             reply.ok();
@@ -789,22 +1530,30 @@ impl Filesystem for DirectFuseFrontend {
     fn setattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<std::time::SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<std::time::SystemTime>,
-        _chgtime: Option<std::time::SystemTime>,
-        _bkuptime: Option<std::time::SystemTime>,
-        _flags: Option<BsdFileFlags>,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<std::time::SystemTime>,
+        fh: Option<FileHandle>,
+        crtime: Option<std::time::SystemTime>,
+        chgtime: Option<std::time::SystemTime>,
+        bkuptime: Option<std::time::SystemTime>,
+        flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let inner = self.inner.clone();
+        self.inner.spawn(async move {
+            inner
+                .setattr(
+                    ino, mode, uid, gid, size, atime, mtime, ctime, crtime, chgtime, bkuptime,
+                    flags, fh, reply,
+                )
+                .await
+        });
     }
 
     fn readlink(&self, _req: &Request, _ino: INodeNo, reply: ReplyData) {
@@ -821,7 +1570,11 @@ impl Filesystem for DirectFuseFrontend {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(if self.inner.read_only {
+            fuser::Errno::EROFS
+        } else {
+            fuser::Errno::EOPNOTSUPP
+        });
     }
 
     fn mkdir(
@@ -833,7 +1586,11 @@ impl Filesystem for DirectFuseFrontend {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(if self.inner.read_only {
+            fuser::Errno::EROFS
+        } else {
+            fuser::Errno::EOPNOTSUPP
+        });
     }
 
     fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
@@ -852,7 +1609,11 @@ impl Filesystem for DirectFuseFrontend {
         _target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(if self.inner.read_only {
+            fuser::Errno::EROFS
+        } else {
+            fuser::Errno::EOPNOTSUPP
+        });
     }
 
     fn rename(
@@ -865,7 +1626,11 @@ impl Filesystem for DirectFuseFrontend {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(if self.inner.read_only {
+            fuser::Errno::EROFS
+        } else {
+            fuser::Errno::EOPNOTSUPP
+        });
     }
 
     fn link(
@@ -876,22 +1641,29 @@ impl Filesystem for DirectFuseFrontend {
         _newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(if self.inner.read_only {
+            fuser::Errno::EROFS
+        } else {
+            fuser::Errno::EOPNOTSUPP
+        });
     }
 
     fn write(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: u64,
-        _data: &[u8],
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
         _write_flags: WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let data = data.to_vec();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.write(fh, offset, data, flags, reply).await });
     }
 
     fn setxattr(
@@ -929,14 +1701,20 @@ impl Filesystem for DirectFuseFrontend {
     fn create(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        let Some(name) = name.to_str() else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let name = name.to_owned();
+        let inner = self.inner.clone();
+        self.inner
+            .spawn(async move { inner.create(parent, name, mode, umask, flags, reply).await });
     }
 
     fn fallocate(
@@ -949,7 +1727,11 @@ impl Filesystem for DirectFuseFrontend {
         _mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(fuser::Errno::EROFS);
+        reply.error(if self.inner.read_only {
+            fuser::Errno::EROFS
+        } else {
+            fuser::Errno::EOPNOTSUPP
+        });
     }
 
     fn lseek(
@@ -972,13 +1754,13 @@ mod tests {
     #[test]
     fn attributes_use_storage_time_and_safe_fallback() {
         let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
-        let file = attribute_with_size(INodeNo(42), false, 7, Some(modified));
+        let file = attribute_with_size(INodeNo(42), false, 7, Some(modified), true);
         assert_eq!(file.ino, INodeNo(42));
         assert_eq!(file.size, 7);
         assert_eq!(file.mtime, modified);
         assert_eq!(file.ctime, modified);
 
-        let directory = attribute_with_size(INodeNo(43), true, 0, None);
+        let directory = attribute_with_size(INodeNo(43), true, 0, None, true);
         assert_eq!(directory.size, DIRECTORY_SIZE);
         assert_eq!(
             directory.mtime,
@@ -995,9 +1777,48 @@ mod tests {
             19,
             Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123)),
         );
-        let attr = open_attr(INodeNo(88), &node);
+        let attr = open_attr(INodeNo(88), &node, true);
         assert_eq!(attr.kind, FileType::RegularFile);
         assert_eq!(attr.size, 19);
         assert_eq!(attr.perm, 0o444);
+    }
+
+    #[test]
+    fn writable_modes_match_the_storage_native_contract() {
+        assert_eq!(
+            attribute_with_size(INodeNo(44), false, 7, None, false).perm,
+            0o644
+        );
+        assert_eq!(
+            attribute_with_size(INodeNo(45), true, 0, None, false).perm,
+            0o755
+        );
+        assert!(representable_mode(0o100644, 0o022, false, false));
+        assert!(representable_mode(0o755, 0, false, true));
+        assert!(!representable_mode(0o100600, 0o022, false, false));
+        assert!(!representable_mode(0o100755, 0, false, false));
+        assert!(!representable_mode(0o1004644, 0, false, false));
+        assert!(!representable_mode(0o100644, 0, true, false));
+    }
+
+    #[test]
+    fn rename_flags_name_supported_replace_semantics() {
+        assert!(matches!(rename_replace(RenameFlags::empty()), Ok(true)));
+        assert!(matches!(
+            rename_replace(RenameFlags::RENAME_NOREPLACE),
+            Ok(false)
+        ));
+        assert!(matches!(
+            rename_replace(RenameFlags::RENAME_EXCHANGE),
+            Err(errno) if format!("{errno:?}") == "EOPNOTSUPP"
+        ));
+        assert!(matches!(
+            rename_replace(RenameFlags::RENAME_WHITEOUT),
+            Err(errno) if format!("{errno:?}") == "EOPNOTSUPP"
+        ));
+        assert!(matches!(
+            rename_replace(RenameFlags::from_bits_retain(1 << 20)),
+            Err(errno) if format!("{errno:?}") == "EINVAL"
+        ));
     }
 }
