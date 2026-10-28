@@ -467,18 +467,19 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
         "conditional unlink targeted the wrong object: {}",
         intercepted.target
     );
-    assert_eq!(
-        intercepted
-            .header("if-match")
-            .expect("conditional unlink omitted If-Match")
-            .trim_matches('"'),
-        original_etag.trim_matches('"'),
-    );
+    let if_match = intercepted
+        .header("if-match")
+        .expect("conditional unlink omitted If-Match")
+        .to_owned();
+    assert_eq!(if_match.trim_matches('"'), original_etag.trim_matches('"'),);
     gate.release();
-    let error = unlink
-        .join()
-        .expect("conditional unlink thread panicked")
-        .expect_err("Direct unlink must reject an externally replaced ETag");
+    let result = unlink.join().expect("conditional unlink thread panicked");
+    let response = gate.last_commit_response().unwrap_or_default();
+    eprintln!(
+        "conditional Direct unlink: if-match={if_match} upstream={} result={result:?}",
+        String::from_utf8_lossy(&response)
+    );
+    let error = result.expect_err("Direct unlink must reject an externally replaced ETag");
     assert_errno(
         &error,
         &[libc::ESTALE, libc::EIO],

@@ -113,6 +113,7 @@ pub struct S3Gate {
     #[allow(dead_code)] // Non-S3 test targets never drop a response.
     poisoned: Arc<AtomicBool>,
     intercepted_request: Arc<Mutex<Option<GateRequest>>>,
+    last_commit_response: Arc<Mutex<Option<Vec<u8>>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -147,12 +148,14 @@ impl S3Gate {
         let intercepted = Arc::new(AtomicBool::new(false));
         let poisoned = Arc::new(AtomicBool::new(false));
         let intercepted_request = Arc::new(Mutex::new(None));
+        let last_commit_response = Arc::new(Mutex::new(None));
         let (sender, receiver) = mpsc::channel();
         let thread_release = release.clone();
         let thread_stop = stop.clone();
         let thread_intercepted = intercepted.clone();
         let thread_poisoned = poisoned.clone();
         let thread_request = intercepted_request.clone();
+        let thread_response = last_commit_response.clone();
         let thread = thread::spawn(move || {
             for incoming in listener.incoming() {
                 if thread_stop.load(Ordering::SeqCst) {
@@ -165,6 +168,7 @@ impl S3Gate {
                 let intercepted = thread_intercepted.clone();
                 let poisoned = thread_poisoned.clone();
                 let intercepted_request = thread_request.clone();
+                let last_commit_response = thread_response.clone();
                 let target = target.clone();
                 let sender = sender.clone();
                 thread::spawn(move || {
@@ -177,6 +181,7 @@ impl S3Gate {
                         intercepted,
                         poisoned,
                         intercepted_request,
+                        last_commit_response,
                         sender,
                     );
                 });
@@ -189,12 +194,21 @@ impl S3Gate {
             stop,
             poisoned,
             intercepted_request,
+            last_commit_response,
             thread: Some(thread),
         }
     }
 
     pub fn endpoint(&self) -> String {
         format!("http://{}", self.address)
+    }
+
+    #[allow(dead_code)]
+    pub fn last_commit_response(&self) -> Option<Vec<u8>> {
+        self.last_commit_response
+            .lock()
+            .expect("S3 gate response lock")
+            .clone()
     }
 
     #[allow(dead_code)]
@@ -313,6 +327,7 @@ fn handle_connection(
     intercepted: Arc<AtomicBool>,
     poisoned: Arc<AtomicBool>,
     intercepted_request: Arc<Mutex<Option<GateRequest>>>,
+    last_commit_response: Arc<Mutex<Option<Vec<u8>>>>,
     sender: mpsc::Sender<GateEvent>,
 ) {
     let mut client = client;
@@ -368,6 +383,7 @@ fn handle_connection(
         return;
     };
     if is_commit {
+        *last_commit_response.lock().expect("S3 gate response lock") = Some(response.bytes.clone());
         if !(200..300).contains(&response.status) {
             let message = format!(
                 "targeted S3 mutation returned HTTP {}, expected 2xx",
