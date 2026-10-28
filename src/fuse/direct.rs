@@ -179,6 +179,10 @@ enum ViewKey {
     Staged(DirectObjectId),
 }
 
+fn prune_unreferenced_views(views: &mut BTreeMap<ViewKey, Arc<Mutex<FileView>>>) {
+    views.retain(|_, view| Arc::strong_count(view) > 1);
+}
+
 #[derive(Clone)]
 enum OpenSource {
     Remote(DirectFile),
@@ -330,6 +334,7 @@ impl DirectInner {
         modified: Option<std::time::SystemTime>,
     ) -> Arc<Mutex<FileView>> {
         let mut views = guard(&self.views);
+        prune_unreferenced_views(&mut views);
         let view = views
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(FileView { size, modified })))
@@ -1272,6 +1277,10 @@ impl DirectInner {
 
     async fn release(&self, fh: FileHandle, reply: ReplyEmpty) {
         guard(&self.files).remove(&fh.0);
+        {
+            let mut views = guard(&self.views);
+            prune_unreferenced_views(&mut views);
+        }
         if let Err(errno) = self.refresh_pending().await {
             eprintln!("yy: fuse release: cannot refresh Direct pending state: {errno:?}");
         }
@@ -1981,6 +1990,32 @@ impl Filesystem for DirectFuseFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_pruning_keeps_live_versions_and_reclaims_released_ones() {
+        let live_id = DirectId::from_bytes([1; 16]);
+        let released_id = DirectId::from_bytes([2; 16]);
+        let live = Arc::new(Mutex::new(FileView {
+            size: 7,
+            modified: None,
+        }));
+        let released = Arc::new(Mutex::new(FileView {
+            size: 11,
+            modified: None,
+        }));
+        let mut views = BTreeMap::from([
+            (ViewKey::Remote(live_id), live.clone()),
+            (ViewKey::Remote(released_id), released),
+        ]);
+
+        prune_unreferenced_views(&mut views);
+        assert_eq!(views.len(), 1);
+        assert!(views.contains_key(&ViewKey::Remote(live_id)));
+
+        drop(live);
+        prune_unreferenced_views(&mut views);
+        assert!(views.is_empty());
+    }
 
     #[test]
     fn attributes_use_storage_time_and_safe_fallback() {
