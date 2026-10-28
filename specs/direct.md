@@ -65,6 +65,10 @@ on backend version history and are not a portable Direct guarantee.
 An object key is split on `/` into UTF-8 path components. File keys must not
 contain empty components. A key ending in `/` is a directory marker only when
 its object length is zero; a non-empty marker is rejected rather than hidden.
+The storage listing may identify a trailing-slash key as a directory without
+exposing its object length, so Direct confirms every listed marker with a
+one-byte range GET pinned by the listed ETag. Any returned byte rejects the
+complete observation.
 
 Each component is mapped as follows:
 
