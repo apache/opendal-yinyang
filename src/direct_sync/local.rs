@@ -149,6 +149,10 @@ impl LocalTree {
         })
     }
 
+    pub fn prune_parents_of(&self, path: &str) -> Result<()> {
+        self.prune_empty_ancestors(path)
+    }
+
     pub fn create_install_file(&self, prefix: &str) -> Result<(String, PathBuf, std::fs::File)> {
         let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let name = format!("{prefix}-{}-{sequence}", std::process::id());
@@ -407,6 +411,7 @@ impl LocalTree {
                                     error,
                                 )
                             })?;
+                            self.prune_empty_ancestors(&install.path)?;
                         }
                         self.settle_displaced_artifact(store, &install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
@@ -780,6 +785,7 @@ impl LocalTree {
         fsync(&self.install_fd).map_err(|error| {
             Error::errno("persist Direct Sync delete quarantine", &self.state, error)
         })?;
+        self.prune_empty_ancestors(&install.path)?;
         store.complete_install(&install.id, None, &install.path)?;
         Ok(())
     }
@@ -1045,6 +1051,39 @@ impl LocalTree {
             }
         }
         Ok(Some(directory))
+    }
+
+    fn prune_empty_ancestors(&self, path: &str) -> Result<()> {
+        let (parent, _) = split_path(path)?;
+        if parent.is_empty() {
+            return Ok(());
+        }
+        let components = parent.split('/').collect::<Vec<_>>();
+        for depth in (1..=components.len()).rev() {
+            let directory = components[..depth].join("/");
+            let parent_path = components[..depth - 1].join("/");
+            let parent_fd = self.open_relative_dir(&parent_path)?;
+            match unlinkat(&parent_fd, components[depth - 1], AtFlags::REMOVEDIR) {
+                Ok(()) => {
+                    fsync(&parent_fd).map_err(|error| {
+                        Error::errno(
+                            "persist Direct Sync directory cleanup",
+                            &self.root.join(&parent_path),
+                            error,
+                        )
+                    })?;
+                }
+                Err(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::NOENT) => break,
+                Err(error) => {
+                    return Err(Error::errno(
+                        "remove empty Direct Sync directory",
+                        &self.root.join(&directory),
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -367,6 +367,7 @@ impl<R: DirectRemote> DirectSync<R> {
             .into_iter()
             .map(|record| record.path)
             .chain(self.store.installs()?.into_iter().map(|record| record.path))
+            .chain(self.store.baseline()?.into_keys())
             .collect::<BTreeSet<_>>();
         reject_unsupported_directories(&observed_local, &observed_remote, &pending_paths)?;
         self.backfill_conflicts(&observed_local, &observed_remote)
@@ -434,6 +435,10 @@ impl<R: DirectRemote> DirectSync<R> {
                         &message,
                     )
                     .await?;
+                }
+                Action::RemoveBaseline { path } => {
+                    self.store.remove_baseline(&path)?;
+                    self.local.prune_parents_of(&path)?;
                 }
             }
         }
@@ -706,6 +711,7 @@ impl<R: DirectRemote> DirectSync<R> {
             .iter()
             .map(|record| record.path.clone())
             .chain(installs.iter().map(|record| record.path.clone()))
+            .chain(baseline.keys().cloned())
             .collect::<BTreeSet<_>>();
         let mut unsupported_paths = BTreeSet::new();
         if let Some(local) = &local_snapshot {
@@ -1737,6 +1743,9 @@ enum Action {
         remote: Option<RemoteEntry>,
         message: String,
     },
+    RemoveBaseline {
+        path: String,
+    },
 }
 
 fn plan_actions(
@@ -1768,6 +1777,7 @@ fn plan_actions(
     let mut install = Vec::new();
     let mut delete_remote = Vec::new();
     let mut delete_local = Vec::new();
+    let mut remove_baseline = Vec::new();
     let mut conflicts = Vec::new();
     for path in paths {
         if has_path_or_parent(&path, &blocked_subtrees) {
@@ -1796,6 +1806,11 @@ fn plan_actions(
         }
         let local_change = local_path_changed(baseline_entry, local_node);
         let remote_change = remote_path_changed(baseline_entry, remote_entry);
+
+        if baseline_entry.is_some() && local_node.is_none() && remote_entry.is_none() {
+            remove_baseline.push(Action::RemoveBaseline { path });
+            continue;
+        }
 
         if !local_change && !remote_change {
             continue;
@@ -1843,6 +1858,7 @@ fn plan_actions(
     actions.extend(install);
     actions.extend(delete_remote);
     actions.extend(delete_local);
+    actions.extend(remove_baseline);
     actions.extend(conflicts);
     Ok(actions)
 }

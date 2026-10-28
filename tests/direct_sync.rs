@@ -367,6 +367,74 @@ async fn upload_pull_and_conditional_deletes_use_storage_native_state() {
 }
 
 #[tokio::test]
+async fn nested_last_child_deletes_prune_only_sync_created_empty_parents() {
+    let remote_fixture = Fixture::new();
+    remote_fixture.handle.put("nested/remote.txt", b"remote");
+    let mut sync = remote_fixture.init().await;
+    sync.run().await.unwrap();
+    assert_eq!(remote_fixture.read("nested/remote.txt"), b"remote");
+    drop(sync);
+
+    remote_fixture.handle.delete("nested/remote.txt");
+    let mut sync = remote_fixture.open().await;
+    let outcome = sync.run().await.unwrap();
+    assert_eq!(outcome.deleted_local, 1);
+    assert!(!remote_fixture.root.join("nested/remote.txt").exists());
+    assert!(
+        !remote_fixture.root.join("nested").exists(),
+        "the empty parent of the deleted remote child was not pruned"
+    );
+    assert!(outcome.in_sync);
+    let second = sync.run().await.unwrap();
+    assert!(second.in_sync);
+    assert_eq!(second.deleted_local, 0);
+    drop(sync);
+
+    let local_fixture = Fixture::new();
+    local_fixture.write("nested/local.txt", b"local");
+    let mut sync = local_fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+    std::fs::create_dir(local_fixture.root.join("manual-empty")).unwrap();
+    let mut sync = local_fixture.open().await;
+    let error = sync
+        .run()
+        .await
+        .expect_err("manual empty directory must fail");
+    assert!(error.to_string().contains("empty directory markers"));
+    assert_eq!(
+        local_fixture.handle.read("nested/local.txt").as_deref(),
+        Some(b"local".as_slice())
+    );
+    drop(sync);
+    std::fs::remove_dir(local_fixture.root.join("manual-empty")).unwrap();
+    std::fs::remove_file(local_fixture.root.join("nested/local.txt")).unwrap();
+    let mut sync = local_fixture.open().await;
+    let outcome = sync.run().await.unwrap();
+    assert_eq!(outcome.deleted_remote, 1);
+    assert!(local_fixture.handle.read("nested/local.txt").is_none());
+    assert!(!local_fixture.root.join("nested").exists());
+    assert!(outcome.in_sync);
+
+    let both_fixture = Fixture::new();
+    both_fixture.write("both/file.txt", b"both");
+    let mut sync = both_fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+    std::fs::remove_file(both_fixture.root.join("both/file.txt")).unwrap();
+    both_fixture.handle.delete("both/file.txt");
+    let mut sync = both_fixture.open().await;
+    let outcome = sync.run().await.unwrap();
+    assert!(outcome.in_sync);
+    assert!(!both_fixture.root.join("both").exists());
+    drop(sync);
+    let status =
+        DirectSync::<MemoryRemote>::inspect(Some(&both_fixture.remote), &both_fixture.state, None)
+            .await;
+    assert!(status.summary.in_sync, "{status:?}");
+}
+
+#[tokio::test]
 async fn external_and_local_replacement_conflict_retains_both_sides() {
     let fixture = Fixture::new();
     fixture.write("file", b"base");
