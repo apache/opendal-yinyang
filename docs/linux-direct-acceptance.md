@@ -56,3 +56,96 @@ remaining backend qualification stays open.
 
 The shared `YINYANG_S3_BUCKET` is never versioned by the suite. The separate
 versioned bucket is a test resource and remains isolated from Managed suites.
+
+## Amazon S3 backend qualification
+
+The default `cargo x test-linux-direct` command uses isolated Silo so it can
+run without cloud credentials. It does not qualify Amazon S3's complete
+enumeration, TLS endpoint, version retention or conditional mutation
+primitives. Those properties require the explicit real-Amazon-S3 suite:
+
+```shell
+python3 tests/linux_direct_real_s3.py
+```
+
+The helper reads one STS Credentials JSON document from stdin. It accepts
+either the bare `Credentials` object or a wrapping `{"Credentials": ...}`
+document. It then removes inherited `YINYANG_*` and AWS endpoint settings,
+installs only short-lived credentials in the child environment and runs:
+
+```text
+cargo test --locked -p yinyang --test linux_direct direct_amazon_s3_
+  -- --ignored --nocapture --test-threads=1
+```
+
+An optional argument beginning with `direct_amazon_s3_` restricts a targeted
+rerun to one qualified scenario while preserving the same credential and
+endpoint checks.
+
+Do not put credentials in environment assignments visible in a command line,
+files or logs. A qualification invocation through the shared Linux runner
+looks like:
+
+```shell
+aws sts assume-role ... --duration-seconds 7200 --output json \
+  | ssh <linux-host> \
+      'cd <pinned-worktree> && \
+       YINYANG_DIRECT_UNVERSIONED_BUCKET=<plain-bucket> \
+       YINYANG_DIRECT_VERSIONED_BUCKET=<versioned-bucket> \
+       YINYANG_QUALIFICATION_REGION=us-east-2 \
+       AWS_CLI_BIN=/home/ubuntu/.local/bin/aws \
+       bash <validation-runner> <unique-label> \
+       python3 tests/linux_direct_real_s3.py'
+```
+
+The two buckets must be task-owned, in the same region and distinct:
+
+- the unversioned bucket has never enabled Versioning;
+- the versioned bucket has `Status=Enabled` before the suite starts.
+
+The default test does not set `YINYANG_S3_ENDPOINT`, `AWS_ENDPOINT_URL` or
+`AWS_ENDPOINT_URL_S3`; it must use the provider's Amazon S3 endpoint. The
+tests reject an endpoint override instead of treating a proxy or compatible
+service as Amazon S3 evidence.
+
+Fixture writes and exact GET/LIST observations use the official AWS CLI
+outside the mount. The mounted `yy` process is the only component exercising
+the Direct implementation. Coverage includes:
+
+- raw `ListObjectsV2` continuation across more than 1000 keys, followed by
+  exact GET and a successful FUSE mount that exposes the complete set;
+- a second namespace where `a` and `a/b` are both returned by raw LIST and
+  `a/b` appears only on a later page; the actual mount must reject the
+  file-prefix collision without changing either object;
+- reversible percent mapping, DEL, spaces, case distinctions and composed
+  versus decomposed Unicode names, with successful exact GET and FUSE reads;
+- Versioning-enabled version IDs, `ListObjectVersions` retention, replacement,
+  delete markers, pinned old descriptors, `SIGHUP`, `fstat` and fresh opens;
+- the never-versioned bucket's ETag-pinned path, including bounded failure
+  after external replacement or deletion rather than an unconditional read;
+- zero-length trailing-slash markers as visible directories and data-bearing
+  markers as whole-observation errors in both versioning modes, with raw exact
+  GET and inventory bytes preserved;
+- `If-None-Match: *` creates, `If-Match` replacements, concurrent competing
+  precondition requests, and conditional DELETE using the current ETag;
+- stale conditional DELETE leaving the replacement intact, successful
+  conditional DELETE, and explicit missing-key or delete-marker behavior;
+- raw inventory equality around read-only mounts, refused writable opens,
+  SIGTERM teardown and clean remount.
+
+The tests use small objects and delete their object prefixes and versions after
+each case. The task-owned buckets and temporary assumable role remain until all
+qualification consumers finish; deleting them is a separate coordinator
+decision. A report recording the exact source, binary, host, bucket names,
+role ARN, AWS CLI version, test commands and observed limitations belongs with
+the qualification evidence.
+
+This matrix covers Amazon S3 general-purpose buckets with default regional
+endpoints in us-east-2 and the recorded temporary role policy. Buckets with
+suspended versioning, Requester Pays, Object Lock, access points, directory
+buckets, other AWS partitions, S3-compatible services and endpoint overrides
+remain outside this qualification.
+
+The bounded source, binary, fixture, raw LIST and conditional-request evidence
+is recorded in
+[`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md).

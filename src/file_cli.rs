@@ -86,7 +86,10 @@ fn operator() -> Result<opendal::Operator, opendal::Error> {
                 .map(|k| (k.to_ascii_lowercase(), v))
         })
         .collect::<Vec<_>>();
-    opendal::Operator::via_iter("s3", config)
+    let operator = opendal::Operator::via_iter("s3", config)?;
+    #[cfg(feature = "benchmark-telemetry")]
+    let operator = yinyang::benchmark::instrument(operator);
+    Ok(operator)
 }
 fn status(value: RuntimeStatus) {
     println!("local handles: {}", value.handles.len());

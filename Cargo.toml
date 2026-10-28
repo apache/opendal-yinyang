@@ -34,10 +34,14 @@ rust-version.workspace = true
 name = "yy"
 path = "src/main.rs"
 
+[features]
+benchmark-telemetry = ["dep:metrics", "opendal/layers-metrics"]
+
 [dependencies]
 blake3.workspace = true
 borsh.workspace = true
 clap.workspace = true
+metrics = { version = "0.24", optional = true }
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
