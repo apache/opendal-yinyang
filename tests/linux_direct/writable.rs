@@ -514,6 +514,120 @@ fn direct_write_unlink_is_conditional_and_refreshes_before_retry() {
     mounted.unmount();
 }
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_write_rename_conflict_retains_external_destination_before_explicit_refresh() {
+    let fixture = Fixture::new();
+    let source_bytes = payload(24 * 1024 + 3, 0x17);
+    let original_destination = payload(24 * 1024 + 5, 0x31);
+    let external_destination = payload(24 * 1024 + 7, 0x59);
+    fixture.write_raw("rename-source.txt", &source_bytes);
+    fixture.write_raw("rename-destination.txt", &original_destination);
+    let original_etag = fixture
+        .raw_object("rename-destination.txt")
+        .expect("raw original rename destination")
+        .etag
+        .expect("raw original rename destination ETag");
+
+    let staging = fixture.path("direct-write-rename-conflict-state");
+    let config = fixture.writable_config("direct-write-rename-conflict", "fuse", &staging);
+    let mountpoint = fixture.path("mnt-direct-write-rename-conflict");
+    fs::create_dir(&mountpoint).expect("create writable Direct rename conflict mountpoint");
+
+    let suffix = format!("/{}/rename-destination.txt", fixture.root());
+    let gate = S3Gate::start_for_path(CommitAction::HoldBeforeCommit, "PUT", suffix);
+    let mut command = fixture.mount_command(&config, &mountpoint);
+    command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
+    let mounted = Mounted::spawn_writable(command, &mountpoint);
+    let source = mounted.mountpoint().join("rename-source.txt");
+    let destination = mounted.mountpoint().join("rename-destination.txt");
+
+    fixture.write_raw("rename-destination.txt", &external_destination);
+    let external_etag = fixture
+        .raw_object("rename-destination.txt")
+        .expect("raw external rename destination")
+        .etag
+        .expect("raw external rename destination ETag");
+    assert_ne!(
+        original_etag, external_etag,
+        "external rename destination replacement did not change the raw ETag"
+    );
+
+    let source_for_thread = source.clone();
+    let destination_for_thread = destination.clone();
+    let rename = thread::spawn(move || fs::rename(source_for_thread, destination_for_thread));
+    let intercepted = gate.wait_intercepted_for(Duration::from_secs(30));
+    assert_eq!(intercepted.method, "PUT");
+    assert!(
+        intercepted.target.contains("/rename-destination.txt"),
+        "rename conflict targeted the wrong destination: {}",
+        intercepted.target
+    );
+    let first_if_match = intercepted
+        .header("if-match")
+        .expect("conditional rename destination omitted If-Match")
+        .to_owned();
+    assert_eq!(
+        first_if_match.trim_matches('"'),
+        original_etag.trim_matches('"'),
+    );
+    gate.release();
+
+    let result = rename.join().expect("rename conflict thread panicked");
+    let attempts = gate
+        .matched_requests()
+        .into_iter()
+        .filter_map(|request| request.header("if-match").map(str::to_owned))
+        .collect::<Vec<_>>();
+    let error = match result {
+        Ok(()) => panic!(
+            "conditional rename unexpectedly published over an external destination\nattempts: {attempts:?}\nmount logs:\n{}",
+            mounted.logs()
+        ),
+        Err(error) => error,
+    };
+    assert_errno(
+        &error,
+        &[libc::ESTALE, libc::EIO],
+        "conditional rename destination conflict",
+    );
+    assert!(
+        attempts.len() >= 2,
+        "VFS did not exercise the implicit rename retry: {attempts:?}"
+    );
+    for attempt in &attempts {
+        assert_eq!(
+            attempt.trim_matches('"'),
+            original_etag.trim_matches('"'),
+            "implicit rename retry used a refreshed destination ETag"
+        );
+    }
+    assert_eq!(
+        fixture.raw_get("rename-destination.txt").as_deref(),
+        Some(external_destination.as_slice()),
+        "rename conflict overwrote the external destination"
+    );
+    assert_eq!(
+        fixture.raw_get("rename-source.txt").as_deref(),
+        Some(source_bytes.as_slice()),
+        "rename conflict removed the source before explicit refresh"
+    );
+
+    mounted.refresh_and_wait(Duration::from_secs(30));
+    fs::rename(&source, &destination).expect("retry rename after explicit refresh");
+    assert_eq!(
+        fixture.raw_get("rename-destination.txt").as_deref(),
+        Some(external_destination.as_slice()),
+        "refreshed rename did not preserve the accepted destination bytes"
+    );
+    assert_eq!(
+        fixture.raw_get("rename-source.txt"),
+        None,
+        "refreshed rename did not remove the source"
+    );
+    mounted.unmount();
+}
+
 fn set_xattr(path: &Path) -> std::io::Result<()> {
     let mut command = Command::new("python3");
     command.args([
