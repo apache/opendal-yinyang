@@ -726,7 +726,7 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
         );
         for (key, _) in &objects {
             assert!(
-                rejected.text().contains(&key),
+                rejected.text().contains(key),
                 "Direct rejection {label} omitted original object key {key:?}:\n{}",
                 rejected.text()
             );
