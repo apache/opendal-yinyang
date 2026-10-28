@@ -65,14 +65,17 @@ two listed buckets, default us-east-2 endpoint, temporary role and sampled
 pagination/version behavior; it does not turn the loopback Silo suite into
 Amazon S3 evidence.
 
-The separate real-Amazon-S3 entrypoint run used source
-`f629ed207cce81f196b55915bdd1154a3269a79a` and debug `yy` SHA-256
-`3dfe4c573b2d3311e07d4bf7c3be225a21d8541eec6fc7dc02262638ce06b9a0`.
-It passed the writable remount entrypoint and finite Direct Sync entrypoint
-through provider-default HTTPS. This is source-specific Direct entrypoint
-evidence; the final `f74fecfa837de4bd8f909f571f2c8860ceeb65f1` candidate was
-not rerun for these Direct entrypoints. The separate Managed operating-envelope
-run at `f74` is not this Direct entrypoint record.
+The source-pinned real-Amazon-S3 Direct entrypoint run remains the
+`f629ed207cce81f196b55915bdd1154a3269a79a` record. The final integrated source
+`17361970d1722ea3d60c5381bbb5323d11818184` did not repeat those Direct,
+backend, or range workloads.
+
+Final integrated source `17361970d1722ea3d60c5381bbb5323d11818184` passed the
+repository gates, Rust 1.91 locked check, default release archive, actual
+`fd1338c` installed upgrade with a 74,192-byte service WAL, the 2700-second
+Managed operating envelope, and the private final-evidence validator. Details,
+sampling gaps and limitations are recorded in
+[`linux-operating-envelope.md`](linux-operating-envelope.md).
 
 ## Matrix
 
@@ -99,14 +102,17 @@ automatic Sync watching, or automatic garbage collection.
 Deterministic writable Direct Mount and Direct Sync coverage uses isolated
 loopback Silo. Silo ignores `DELETE If-Match`; deterministic injected `412`
 responses and request-count checks cover the local fault path, but they are not
-conditional-DELETE provider certification. The separate source-pinned Amazon
-S3 entrypoint evidence covers writable remount and finite Direct Sync at
+conditional-DELETE provider certification. The source-pinned Amazon S3
+entrypoint evidence covers writable remount and finite Direct Sync at
 `f629ed2`, while the Amazon S3 primitive record covers read-only Direct and raw
-conditional requests. Neither record claims the final `f74` candidate was rerun
-for those Direct entrypoints; the separate Managed operating-envelope run at
-`f74` is not part of that claim. Other S3-compatible services remain outside the
-matrix unless they satisfy exact recursive LIST, conditional ETag mutation and
-the tested version/range behavior.
+conditional requests. The accepted Core115 proof at `b630ef2` covers Managed
+FUSE 27 tests, operations 1, Managed Sync 12, compatibility 8, recovery 4, and
+Direct 30 passed plus 8 filtered tests. Subsequent final-source changes were
+documentation/specification text and Python test-loader registration only.
+Those Direct/backend/range workloads were not repeated at `1736197`. Other
+S3-compatible services remain outside the matrix unless they satisfy exact
+recursive LIST, conditional ETag mutation and the tested version/range
+behavior.
 
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed

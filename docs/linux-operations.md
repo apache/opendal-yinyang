@@ -47,12 +47,14 @@ and finite Sync convergence. The real Amazon S3 run used the installed binary
 prefix with no endpoint override. Evidence is limited to the named backend
 class and host; it is not a capacity, multi-host or HA claim.
 
-The installed-prefix upgrade harness additionally passed at target source
-`79506c0684c47b37bc93364eaa7192d65a770ede` against the exact `fd1338c`
+The installed-prefix upgrade harness passed at final integrated source
+`17361970d1722ea3d60c5381bbb5323d11818184` against the exact `fd1338c`
 producer. It retained frozen and pending handles, the original file and Sync
-receipts, and a 74,192-byte service WAL before target recovery. That target was
-an O-only preparatory build; the final integrated candidate still requires its
-own run with the same test binary selected through `YY_UPGRADE_BIN`.
+receipts, and a 74,192-byte service WAL before target recovery. The target
+archive binary SHA-256 is
+`a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c`.
+The earlier `79506c0` run remains preparatory history, not a substitute for
+this source-specific result.
 
 The tested `target/debug/yy` from source `7759518` had SHA-256
 `b9acff232c66f6dd898deeccb315e2a1f70af4e9e37959793bc7ba98425ed705`.

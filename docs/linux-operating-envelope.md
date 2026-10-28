@@ -1,6 +1,7 @@
 # Linux operating envelope
 
-**Status: harness prepared; final-target evidence pending.**
+**Status: passed for the exact final source and Amazon S3 combination below.
+Sampling gaps and result boundaries remain explicit.**
 
 This page records one finite, bounded operating-envelope sample for an installed
 `yy` build. It is not a capacity rating, service-level objective, long-running
@@ -176,7 +177,88 @@ latency benchmarks, native acceptance mounts and other S3 workloads can
 contaminate p50/p95 values and request timing even when final bytes remain
 correct.
 
-## Current evidence
+## Final integrated evidence
+
+### Final source
+
+The final integrated source is
+`17361970d1722ea3d60c5381bbb5323d11818184`. Its default Ubuntu 24.04
+x86_64 archive is
+`yinyang-0.0.24-ubuntu-24.04-x86_64-17361970d172.tar.gz` with SHA-256
+`ca339b309f0132b2a21bd685fd9cab75d5d5e982059344bba06e77f523dcffb4`.
+The archive's `bin/yy` SHA-256 is
+`a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c`.
+
+AWS repository gates passed at this source: `cargo x lint`, `cargo x check`,
+`cargo x test`, `cargo x licenses`, Rust 1.91.0 locked all-target check, Python
+3.12 fault tests and Ruff 0.17.2. The accepted Core115 native proof at
+`b630ef2` covers Managed FUSE 27 tests, operations 1, Managed Sync 12,
+compatibility 8, recovery 4, and Direct 30 passed plus 8 filtered tests.
+Subsequent A wording and Python test-loader changes did not modify production
+code, and those native workloads were not duplicated.
+
+The installed-prefix upgrade
+`o-pin-1736197-upgrade` passed against the immutable
+`fd1338c2f924a90e9da752b9158e748d1d3acaf4` producer. It retained a
+`74,192`-byte service WAL with SHA-256
+`c5c186dba36d6b2fc866243f46541bf7c1f2a108f065164686c67b5cf122ad60`,
+then converged target file bytes, Sync, service, receipt and doctor state.
+
+### Final operating envelope
+
+Run `o-pin-1736197-envelope-45m-r2` completed with runner exit `0` and report
+status `pass`. It used the 24-file/256 KiB dataset, four range writers, two
+range readers, the default intervals, and the dedicated
+`yinyang-direct-q-35b90fdf-versioned` bucket in `us-east-2`.
+
+| phase | planned | actual | writer ops | reader ops | pwrite/fsync/retry errors | uncertain |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| steady-state-one | 1350s | 1409.689s | 1345 | 3011 | 0 / 0 / 0 | none |
+| steady-state-two | 1350s | 1728.775s | 1484 | 3469 | 0 / 0 / 0 | none |
+
+The phase durations total `3138.464s`; the full report spans `3285.049s`.
+Synchronous history collection and the final checks explain why neither is a
+45-minute wall-clock claim. Resource sampling produced 243 rows rather than a
+nominal five-second count of 540. The first phase retained 172 rows with a
+maximum gap of `209.392s`; the second retained 71 rows with a maximum gap of
+`441.46s`. These are sampled observations and lower bounds, not continuous
+telemetry.
+
+Both phases had empty `fatal` and `uncertain_files` lists.
+`durability.status=known` with zero pwrite and fsync errors. The pre-doctor
+status showed `pending=0 frozen=0 conflicts=0 failed=0 ledger-errors=0`; no
+ledger acknowledgment command was needed or invoked. `doctor` passed, the
+retained `staging.db` integrity check returned `ok`, both unmounts were clean,
+and the 24-file/6,291,456-byte restores matched at the midpoint and final
+check. The final paginated history contained 36,124 versions, zero delete
+markers and 840,781,692 stored bytes across 37 pages. Peak sampled RSS/HWM was
+35,586,048 bytes, peak staging allocation was 10,665,984 bytes, and peak open
+descriptors was 22.
+
+Exact Amazon S3 request count remains unavailable because the TLS path is
+outside the plain-HTTP counting proxy and no compatible process-scoped counter
+was supplied. The report does not infer requests from connections or verifier
+calls.
+
+The private final-evidence validator returned `status=pass` for the archive,
+installed upgrade, envelope report and source identity. Raw evidence is
+retained outside the repository; the principal paths are listed with the
+historical and diagnostic records below.
+
+Principal final evidence paths:
+
+- archive and checksum: `O-archive-1736197/`;
+- upgrade JSON: `O-upgrade-1736197.json`;
+- envelope JSON: `O-envelope-45m-1736197-r2.json`;
+- validator output: `O-final-1736197/validator.json`;
+- derived raw review: `O-final-1736197/raw-review.json`;
+- gate logs and exits: `O-final-1736197/o-pin-1736197-*.log` and `.exit`;
+- credential metadata without secret values: `O-credentials-1736197.json`.
+
+These relative names are under
+`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/`.
+
+### Earlier smoke evidence
 
 The operating-envelope harness has passed a 90-second real Amazon S3 smoke at
 source `79506c0684c47b37bc93364eaa7192d65a770ede` with binary SHA-256
@@ -215,8 +297,8 @@ The harness now advances expected bytes per successful pwrite segment, records
 pwrite and fsync failures separately, and fails a run after byte assertions if
 durability remains uncertain. The earlier 795 repeat passed with the enhanced
 verification, but the historical mismatch is not counted as a proven product
-defect. The final integrated soak must still retain the full byte assertions
-and resolve any observed durability uncertainty.
+defect. The final integrated run retained those assertions and observed zero
+fsync errors or uncertain files.
 
 Request count is unavailable for this smoke because no compatible
 process-scoped counter was supplied; the report keeps that field explicit
@@ -234,6 +316,28 @@ qualify the final integrated implementation.
 
 The local Ubuntu 24.04 archive built from the same source has SHA-256
 `4368831f2bd3b9729caaaed511312749e9f98100a3d22a733a339222a9da159c`; the
-archive's binary hash matches the smoke target. No final 45-minute
-operating-envelope run has been made against the integrated
-P/W/M/S candidate yet.
+archive's binary hash matches that smoke target. It remains historical
+preparatory evidence, not the final qualification recorded above.
+
+### Retained failure and diagnostic evidence
+
+The pre-fix 45-minute run at source `455842b` failed before midpoint when an
+fsync retry deadline expired; it retained no final restore, doctor or completion
+record. Its raw report and failure state remain under
+`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/` as
+`O-envelope-45m-455842b-failed-r1.*` and `O-failure-ve13q2nn/`.
+
+The bounded diagnostic at source `de86d1c` classified the observed terminal
+retry as CAS exhaustion rather than folded storage error, but its runner exited
+`1` because doctor reported `ledger-errors=1`. The diagnostic branch is not part
+of the final source. Its classification, raw work directory and exact counters
+remain under `O-diagnostic-de86d1c-r1-failure/`; the failed diagnostic database
+was not acknowledged.
+
+The Rust gate run at source `235419a` exposed a Python 3.12 test-loader
+registration failure before the final loader fix. The failed log remains at
+`O-final-1736197/O-pin-235419a-python-failure.log`; it is not a product or
+workload failure. The first FIFO launch attempt for the final run also exited
+before STS credentials reached the wrapper and performed no S3 workload; run
+`o-pin-1736197-envelope-45m` retains that startup failure, while the accepted
+run is `o-pin-1736197-envelope-45m-r2`.
