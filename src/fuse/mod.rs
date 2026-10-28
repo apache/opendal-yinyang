@@ -47,7 +47,7 @@ mod frontend;
 mod inode;
 
 use crate::mount::Mount;
-use crate::volume::{Model, Volume, VolumeConfig};
+use crate::volume::{Frontend, Model, Volume, VolumeConfig};
 use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,6 +77,10 @@ pub async fn run(
     token: Option<String>,
     mountpoint: PathBuf,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
+    if config.frontend != Frontend::Fuse {
+        return Err("the mount command requires frontend=fuse".into());
+    }
+    config.validate(&operator)?;
     if config.model == Model::Direct {
         return direct::run(config, operator, mountpoint).await;
     }
@@ -242,6 +246,68 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use crate::volume::{Access, Capability, Frontend, Model, Publication, StorageProfile};
+    use std::collections::BTreeSet;
+
+    fn direct_config() -> VolumeConfig {
+        VolumeConfig {
+            name: "direct".to_owned(),
+            model: Model::Direct,
+            access: Access::Mount,
+            frontend: Frontend::Fuse,
+            publication: Publication::Object,
+            storage_profile: StorageProfile::Minio,
+            staging: PathBuf::new(),
+            read_only: true,
+            require: BTreeSet::new(),
+            service_address: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_admission_rejects_before_storage_or_kernel_mount() {
+        let backend = TestBackend::default();
+        let temp = tempfile::tempdir().unwrap();
+        for invalid in [
+            VolumeConfig {
+                read_only: false,
+                ..direct_config()
+            },
+            VolumeConfig {
+                access: Access::Sync,
+                ..direct_config()
+            },
+            VolumeConfig {
+                publication: Publication::Service,
+                service_address: Some("127.0.0.1:7447".parse().unwrap()),
+                ..direct_config()
+            },
+            VolumeConfig {
+                frontend: Frontend::Library,
+                ..direct_config()
+            },
+            VolumeConfig {
+                require: [Capability::Write].into_iter().collect(),
+                ..direct_config()
+            },
+        ] {
+            assert!(
+                run(invalid, backend.operator(), None, temp.path().to_owned())
+                    .await
+                    .is_err()
+            );
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.stat_calls, 0, "admission performed a storage stat");
+            assert!(state.read_paths.is_empty(), "admission read object data");
+            assert!(state.objects.is_empty(), "admission changed storage");
+        }
     }
 }
 

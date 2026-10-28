@@ -126,7 +126,7 @@ async fn destination(
 }
 pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut config = VolumeConfig::from_json(&tokio::fs::read(path).await?)?;
-    if config.staging.is_relative() {
+    if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
         config.staging = path
             .parent()
             .unwrap_or(Path::new("."))

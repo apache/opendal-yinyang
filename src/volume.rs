@@ -65,9 +65,7 @@ fn managed() -> CapabilitySet {
 /// claim: an unversioned ETag-pinned descriptor becomes Stale after a delete.
 fn direct() -> CapabilitySet {
     use Capability::*;
-    [Read, List, StableIdentity, PinnedReads]
-        .into_iter()
-        .collect()
+    [Read, List, PinnedReads].into_iter().collect()
 }
 fn read_only() -> CapabilitySet {
     use Capability::*;
