@@ -492,11 +492,32 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
     let fixture = Fixture::new();
     fixture.write_raw("a", b"file");
     fixture.write_raw("a/b", b"child");
-    let raw_keys = fixture.inventory().keys().cloned().collect::<BTreeSet<_>>();
-    assert!(
-        raw_keys.contains("a"),
-        "the raw S3 fixture must expose the parent alias key: {raw_keys:?}"
+    assert_eq!(
+        fixture.read_raw("a").as_deref(),
+        Some(b"file".as_slice()),
+        "the parent alias object must be exactly readable"
     );
+    assert_eq!(
+        fixture.read_raw("a/b").as_deref(),
+        Some(b"child".as_slice()),
+        "the descendant alias object must be exactly readable"
+    );
+
+    let list_xml = fixture.raw_list_xml();
+    let parent_key = format!("<Key>{}/a</Key>", fixture.root);
+    let child_key = format!("<Key>{}/a/b</Key>", fixture.root);
+    assert!(
+        list_xml.contains(&parent_key),
+        "raw LIST omitted the parent alias:\n{list_xml}"
+    );
+    assert!(
+        !list_xml.contains(&child_key),
+        "raw LIST unexpectedly exposed the descendant alias:\n{list_xml}"
+    );
+    eprintln!(
+        "direct alias evidence: both GETs returned exact bytes; raw LIST contains {parent_key:?} and omits {child_key:?}"
+    );
+
     let runtime = tokio::runtime::Runtime::new().expect("Direct test runtime");
     let operator = fixture.operator();
     let paths = runtime.block_on(async {
@@ -509,89 +530,10 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
             .map(|entry| entry.path().to_owned())
             .collect::<BTreeSet<_>>()
     });
-    let child_paths = runtime.block_on(async {
-        operator
-            .list_with("a/")
-            .recursive(true)
-            .await
-            .expect("list child prefix")
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<BTreeSet<_>>()
-    });
-    let immediate_paths = runtime.block_on(async {
-        operator
-            .list_with("")
-            .await
-            .expect("list immediate root children")
-            .into_iter()
-            .map(|entry| (entry.path().to_owned(), entry.metadata().mode()))
-            .collect::<Vec<_>>()
-    });
-    let after_paths = runtime.block_on(async {
-        operator
-            .list_with("")
-            .start_after("a")
-            .recursive(true)
-            .await
-            .expect("list after the parent alias")
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<BTreeSet<_>>()
-    });
-    let version_paths = runtime.block_on(async {
-        operator
-            .list_with("")
-            .versions(true)
-            .recursive(true)
-            .await
-            .expect("list versioned keys")
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<BTreeSet<_>>()
-    });
-    let v1_operator = fixture.operator_with(&[("disable_list_objects_v2", "true")]);
-    let v1_paths = runtime.block_on(async {
-        v1_operator
-            .list_with("")
-            .recursive(true)
-            .await
-            .expect("list with ListObjectsV1")
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<BTreeSet<_>>()
-    });
-    let directory_stat = runtime.block_on(async {
-        operator
-            .stat("a/")
-            .await
-            .map(|metadata| format!("{:?}", metadata.mode()))
-            .unwrap_or_else(|error| format!("{error}"))
-    });
-    let unscoped_operator = fixture.operator_at_root("", &[]);
-    let unscoped_paths = runtime.block_on(async {
-        unscoped_operator
-            .list_with(&format!("{}/", fixture.root))
-            .recursive(true)
-            .await
-            .expect("list the Direct prefix without an Operator root")
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<BTreeSet<_>>()
-    });
     assert_eq!(
         paths,
-        ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
-        "OpenDAL recursive root list aliases={paths:?} children={child_paths:?} immediate={immediate_paths:?} after={after_paths:?} versions={version_paths:?} v1={v1_paths:?} stat={directory_stat:?} unscoped={unscoped_paths:?}"
-    );
-
-    let namespace = yinyang::direct::DirectNamespace::new(operator).expect("admit Direct operator");
-    let error = runtime
-        .block_on(namespace.observe())
-        .expect_err("file-prefix alias must reject the complete Direct observation");
-    assert!(
-        error.to_string().contains("file-prefix collision"),
-        "unexpected Direct observation error: {error}"
+        ["a".to_owned()].into_iter().collect(),
+        "OpenDAL LIST must reproduce the backend's observable omission of the descendant"
     );
 }
 

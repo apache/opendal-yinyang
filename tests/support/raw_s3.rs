@@ -185,6 +185,27 @@ impl RawS3 {
             .collect()
     }
 
+    pub fn list_xml(&self, prefix: &str) -> String {
+        let mut query = vec![
+            ("list-type".to_owned(), "2".to_owned()),
+            ("prefix".to_owned(), prefix.to_owned()),
+        ];
+        query.sort();
+        let query = query
+            .into_iter()
+            .map(|(key, value)| format!("{}={}", query_encode(&key), query_encode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let response = self.request("GET", None, &query, &[]);
+        assert_eq!(
+            response.status,
+            200,
+            "raw S3 LIST failed:\n{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        String::from_utf8(response.body).expect("S3 ListObjectsV2 is UTF-8 XML")
+    }
+
     fn head(&self, key: &str) -> Option<Head> {
         let response = self.request("HEAD", Some(key), "", &[]);
         if response.status == 404 {
