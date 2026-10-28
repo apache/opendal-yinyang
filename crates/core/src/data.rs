@@ -24,12 +24,13 @@ use futures_util::TryStreamExt as _;
 use opendal::Operator;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use crate::compatibility::{
+    CONTENT_DESCRIPTOR_MAGIC, CONTENT_HASH_CONTEXT, CONTENT_INDEX_MAGIC, CONTENT_UNIT_BYTES,
+};
 use crate::{Error, NodeId, Result};
 
-/// Fixed logical verification unit of the experimental content profile.
-pub const BLOCK_BYTES: usize = 64 * 1024;
-const FILE_MAGIC: [u8; 8] = *b"YYFILE02";
-const NODE_MAGIC: [u8; 8] = *b"YYHASH02";
+/// Fixed logical verification unit of the YYFILE02 content profile.
+pub const BLOCK_BYTES: usize = CONTENT_UNIT_BYTES;
 const MAX_NODE_BYTES: u32 = 512;
 
 pub(crate) type RefWire = ([u8; 16], u64, u32, [u8; 32]);
@@ -129,13 +130,17 @@ impl ContentDescriptor {
         if bytes.len() > MAX_NODE_BYTES as usize {
             return Err(corrupt("descriptor is too large"));
         }
-        let (magic, filesystem, length, root): FileWire = decode(bytes)?;
-        if magic != FILE_MAGIC {
+        if bytes.len() < CONTENT_DESCRIPTOR_MAGIC.len() {
+            return Err(corrupt("truncated content descriptor"));
+        }
+        if bytes[..CONTENT_DESCRIPTOR_MAGIC.len()] != CONTENT_DESCRIPTOR_MAGIC {
             return Err(Error::unsupported(
                 "decode content",
                 "unknown content profile",
             ));
         }
+        let (magic, filesystem, length, root): FileWire = decode(bytes)?;
+        debug_assert_eq!(magic, CONTENT_DESCRIPTOR_MAGIC);
         if (length == 0) != root.is_none() {
             return Err(corrupt("empty content has an invalid root"));
         }
@@ -616,14 +621,22 @@ enum HashNode {
 impl HashNode {
     fn bytes(&self) -> Result<Vec<u8>> {
         match self {
-            Self::Leaf(reference) => encode(&(NODE_MAGIC, 0_u8, reference.wire())),
-            Self::Branch(left, right) => encode(&(NODE_MAGIC, 1_u8, left.wire(), right.wire())),
+            Self::Leaf(reference) => encode(&(CONTENT_INDEX_MAGIC, 0_u8, reference.wire())),
+            Self::Branch(left, right) => {
+                encode(&(CONTENT_INDEX_MAGIC, 1_u8, left.wire(), right.wire()))
+            }
         }
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
-        if !bytes.starts_with(&NODE_MAGIC) {
-            return Err(corrupt("invalid hash index profile"));
+        if bytes.len() < CONTENT_INDEX_MAGIC.len() {
+            return Err(corrupt("truncated hash index node"));
+        }
+        if bytes[..CONTENT_INDEX_MAGIC.len()] != CONTENT_INDEX_MAGIC {
+            return Err(Error::unsupported(
+                "decode content index",
+                "unknown content index profile",
+            ));
         }
         match bytes.get(8) {
             Some(0) => Ok(Self::Leaf(PackedRef::from_wire(decode(&bytes[9..])?)?)),
@@ -763,7 +776,7 @@ fn split(count: u64) -> u64 {
 }
 
 fn domain(tag: &[u8]) -> blake3::Hasher {
-    let mut hash = blake3::Hasher::new_derive_key("Apache OpenDAL YinYang content profile 2");
+    let mut hash = blake3::Hasher::new_derive_key(CONTENT_HASH_CONTEXT);
     hash.update(tag);
     hash
 }

@@ -49,7 +49,7 @@ pub struct TestState {
     pub fail_next_head_write_and_go_offline: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredObject {
     pub bytes: Vec<u8>,
     pub etag: String,
