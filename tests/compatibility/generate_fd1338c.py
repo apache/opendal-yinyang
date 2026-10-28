@@ -107,6 +107,25 @@ def sqlite_backup(source, destination):
         source_connection.close()
 
 
+def copy_sqlite_state(source, destination, databases):
+    databases = {Path(relative) for relative in databases}
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        if relative in databases or path.name.endswith(("-wal", "-shm")):
+            continue
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif path.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        else:
+            fail(f"SQLite state contains unsupported path {path}")
+    for relative in databases:
+        sqlite_backup(source / relative, destination / relative)
+
+
 def head_identity(path):
     data = path.read_bytes()
     if data[:8] == b"YYHEAD02":
@@ -432,8 +451,8 @@ def create_object_fixture(binary, output, s3, temp):
     shutil.copytree(source1, destination / "source-v1")
     shutil.copytree(source2, destination / "source-v2")
     shutil.copytree(journal_source, destination / "journal-source")
-    shutil.copytree(journal, destination / "journal")
-    shutil.copytree(staging, destination / "stage-pending")
+    copy_sqlite_state(journal, destination / "journal", ["directory.db"])
+    copy_sqlite_state(staging, destination / "stage-pending", ["staging.db"])
     write_config(
         destination / "object-volume.json",
         "compat-object-stage",
@@ -663,7 +682,11 @@ def create_sync_fixture(binary, output, s3, temp):
 
     destination = output / "sync"
     keys = s3.copy_prefix(f"{root}/", destination / "storage")
-    shutil.copytree(state, destination / "state")
+    copy_sqlite_state(
+        state,
+        destination / "state",
+        ["replica.db", "sync.db", "content/staging.db"],
+    )
     shutil.copytree(local, destination / "local")
     shutil.copytree(backup, destination / "backup")
     write_config(
