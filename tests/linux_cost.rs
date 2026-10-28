@@ -482,7 +482,6 @@ fn require_benchmark_environment() {
     }
     for name in [
         "YINYANG_S3_BUCKET",
-        "YINYANG_S3_ENDPOINT",
         "YINYANG_S3_REGION",
         "YINYANG_S3_ACCESS_KEY_ID",
         "YINYANG_S3_SECRET_ACCESS_KEY",
@@ -490,6 +489,12 @@ fn require_benchmark_environment() {
         assert!(
             std::env::var_os(name).is_some(),
             "{name} is unset; the benchmark fails hard instead of skipping"
+        );
+    }
+    if std::env::var("YINYANG_STORAGE_PROFILE").as_deref() == Ok("minio") {
+        assert!(
+            std::env::var_os("YINYANG_S3_ENDPOINT").is_some(),
+            "YINYANG_S3_ENDPOINT is unset for the MinIO benchmark profile"
         );
     }
 }
@@ -1072,14 +1077,15 @@ fn run_repeated_random_matrix(
     );
 
     let midpoint = (size / 2) as u64;
-    let cold_file = File::open(&large).expect("cold open repeated-random FUSE file");
-    let cold = measure_telemetry_batch(&meter, mounted.pid(), 1, |_| {
+    let (cold_file, cold) = measure_telemetry_single(&meter, mounted.pid(), || {
+        let file = File::open(&large).expect("cold open repeated-random FUSE file");
         let mut value = vec![0_u8; RANGE_BYTES];
-        read_exact_at(&cold_file, &mut value, midpoint);
+        read_exact_at(&file, &mut value, midpoint);
         assert_eq!(
             value,
             expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
         );
+        file
     });
     assert!(
         cold.network.get > 0,
@@ -1123,15 +1129,15 @@ fn run_repeated_random_matrix(
     );
     let boundary_offset = BLOCK_BYTES as u64 - RANGE_BYTES as u64 / 2;
     let boundary_length = RANGE_BYTES * 2;
-    let boundary_file =
-        File::open(&large).expect("open repeated-random boundary-crossing FUSE file");
-    let boundary_cold = measure_telemetry_batch(&meter, mounted.pid(), 1, |_| {
+    let (boundary_file, boundary_cold) = measure_telemetry_single(&meter, mounted.pid(), || {
+        let file = File::open(&large).expect("open repeated-random boundary-crossing FUSE file");
         let mut value = vec![0_u8; boundary_length];
-        read_exact_at(&boundary_file, &mut value, boundary_offset);
+        read_exact_at(&file, &mut value, boundary_offset);
         assert_eq!(
             value,
             expected[boundary_offset as usize..boundary_offset as usize + boundary_length]
         );
+        file
     });
     assert!(
         boundary_cold.network.get > 0,
@@ -1278,14 +1284,15 @@ fn run_repeated_random_matrix(
         space_snapshot(&fixture, None, None, Some(&staging)),
         vec!["replacement read-only mount type=fuse.yinyang".to_owned()],
     );
-    let restart_file = File::open(&large).expect("open after repeated-random restart");
-    let restart_cold = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
+    let (restart_file, restart_cold) = measure_telemetry_single(&meter, restarted.pid(), || {
+        let file = File::open(&large).expect("open after repeated-random restart");
         let mut value = vec![0_u8; RANGE_BYTES];
-        read_exact_at(&restart_file, &mut value, midpoint);
+        read_exact_at(&file, &mut value, midpoint);
         assert_eq!(
             value,
             expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
         );
+        file
     });
     assert!(
         restart_cold.network.get > 0,
@@ -2059,6 +2066,30 @@ fn measure_telemetry_batch(
         io,
         network,
     }
+}
+
+fn measure_telemetry_single<T>(
+    network: &NetworkMeter<'_>,
+    pid: u32,
+    operation: impl FnOnce() -> T,
+) -> (T, OperationBatch) {
+    network.settle();
+    let net_before = network.snapshot();
+    let io_before = read_proc_io(pid);
+    let started = Instant::now();
+    let value = operation();
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let io = read_proc_io(pid).since(io_before);
+    network.settle();
+    let network = network.snapshot().since(net_before);
+    (
+        value,
+        OperationBatch {
+            latencies: vec![latency_ms],
+            io,
+            network,
+        },
+    )
 }
 
 fn run_yy_operation(
