@@ -198,9 +198,14 @@ impl S3Gate {
     }
 
     pub fn wait_intercepted(&self) -> GateRequest {
+        self.wait_intercepted_for(COMMIT_TIMEOUT)
+    }
+
+    #[allow(dead_code)]
+    pub fn wait_intercepted_for(&self, timeout: Duration) -> GateRequest {
         match self
             .events
-            .recv_timeout(COMMIT_TIMEOUT)
+            .recv_timeout(timeout)
             .expect("S3 gate did not intercept the targeted publication")
         {
             GateEvent::Intercepted => self

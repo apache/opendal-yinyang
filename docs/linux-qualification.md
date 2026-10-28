@@ -37,6 +37,7 @@ These checks require infrastructure that hosted CI does not provide:
 | --- | --- | --- |
 | `cargo x test-linux-operations --systemd` | running systemd user manager, `/dev/fuse`, isolated Silo | install/start/restart/stop/uninstall templates for service, Mount and finite Sync |
 | `cargo x test-linux-operations --amazon-s3` | real Amazon S3 credentials and bucket, `/dev/fuse` | installed CLI lifecycle against the named S3 backend |
+| `python3 tests/linux_direct_real_s3.py` | task-owned versioned and never-versioned Amazon S3 buckets, temporary role, AWS CLI, `/dev/fuse` | read-only Direct pagination, reversible keys, version/ETag retention, conditional primitives and Linux FUSE lifecycle |
 | `cargo x bench-linux-cost --workload read-only-range` | matched source identities, release binary, isolated S3, `/dev/fuse` | bounded FUSE range latency, requests, payload and staging |
 
 The systemd lifecycle remains an explicit qualified-host command. Hosted CI
@@ -48,6 +49,12 @@ command evidence.
 The Amazon S3 run qualifies only the bucket, region, endpoint and credential
 mode actually recorded. A loopback Silo run does not imply Amazon S3 behavior,
 and this matrix does not claim another S3-compatible provider.
+
+The explicit real-Amazon-S3 Direct record is
+[`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md). It qualifies only the
+two listed buckets, default us-east-2 endpoint, temporary role and sampled
+pagination/version behavior; it does not turn the loopback Silo suite into
+Amazon S3 evidence.
 
 ## Matrix
 
