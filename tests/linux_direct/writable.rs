@@ -392,8 +392,12 @@ fn direct_write_create_is_conditional_and_never_clobbers_external_appearance() {
 
     let local = payload(20 * 1024 + 17, 0x51);
     let external = payload(20 * 1024 + 3, 0x73);
-    let mut raced =
-        File::create(mounted.mountpoint().join("raced.txt")).expect("create raced Direct file");
+    let mut raced = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(mounted.mountpoint().join("raced.txt"))
+        .expect("create raced Direct file");
     raced
         .write_all(&local)
         .expect("write raced Direct local bytes");
@@ -997,7 +1001,9 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     );
     drop(file);
 
-    let remounted = fixture.spawn_writable_mount(&config, &mountpoint);
+    let mut remount = fixture.mount_command(&config, &mountpoint);
+    remount.env("YINYANG_S3_ENDPOINT", &endpoint);
+    let remounted = Mounted::spawn_writable(remount, &mountpoint);
     assert_eq!(
         fs::read(remounted.mountpoint().join("uncertain.txt"))
             .expect("read retained uncertain Direct bytes"),
@@ -1029,7 +1035,9 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     remounted.crash();
     drop(writer);
 
-    let final_mount = fixture.spawn_writable_mount(&config, &mountpoint);
+    let mut final_remount = fixture.mount_command(&config, &mountpoint);
+    final_remount.env("YINYANG_S3_ENDPOINT", &endpoint);
+    let final_mount = Mounted::spawn_writable(final_remount, &mountpoint);
     assert_eq!(
         fs::read(final_mount.mountpoint().join("uncertain.txt"))
             .expect("read newer local Direct bytes after restart"),

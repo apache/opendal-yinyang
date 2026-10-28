@@ -197,6 +197,7 @@ impl S3Gate {
         format!("http://{}", self.address)
     }
 
+    #[allow(dead_code)]
     pub fn wait_intercepted(&self) -> GateRequest {
         self.wait_intercepted_for(COMMIT_TIMEOUT)
     }
