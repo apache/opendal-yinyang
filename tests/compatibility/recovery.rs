@@ -27,6 +27,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::thread;
 use std::time::Duration;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
@@ -556,30 +557,52 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
     );
 
     write_sync_bytes(&directory.join("hello.txt"), SYNC_V1);
-    let gate = S3Gate::start(CommitAction::DropResponse);
+    let original_head = storage
+        .raw_get(".yinyang/head")
+        .expect("fd1338c object head");
+    let gate = S3Gate::start(CommitAction::DropBeforeCommit);
     let mut command = storage.command(
         &legacy,
         &["--volume", config.to_str().unwrap(), "sync", "run"],
     );
     command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
-    let lost = run_timeout(command, PROCESS_TIMEOUT);
+    let worker = thread::spawn(move || run_timeout(command, PROCESS_TIMEOUT));
+    gate.wait_intercepted();
+    gate.release();
+    gate.wait_original_dropped();
+    drop(gate);
+    let lost = worker.join().expect("join fd1338c Sync process");
     assert!(
         !lost.status.success(),
-        "fd1338c Sync must observe response loss as an Unknown failure:\n{}",
+        "fd1338c Sync must observe the dropped request as failure:\n{}",
         lost.text()
     );
-    gate.wait_intercepted();
-    drop(gate);
+    assert_eq!(
+        storage.raw_get(".yinyang/head"),
+        Some(original_head),
+        "the dropped Sync request must not commit upstream"
+    );
 
     write_sync_bytes(&directory.join("hello.txt"), SYNC_V2);
     let retained = sync_status(&storage, &current, &config);
     assert_eq!(retained["summary"]["unknown"], 1, "{retained:#}");
+    assert!(
+        retained["summary"]["pending"].as_u64().unwrap_or(0) >= 1,
+        "newer local v2 must remain pending:\n{retained:#}"
+    );
     let entry = sync_entry(&retained, "hello.txt");
     assert_eq!(entry["outcome"]["state"], "unknown");
     let frozen_commit = entry["intent"]["commit_id"]
         .as_str()
         .expect("old Sync intent commit identity")
         .to_owned();
+    let (stored_commit, frozen_digest, stored_state) =
+        sync_unknown_identity(&state.join("sync.db"));
+    assert_eq!(stored_state, 1, "fd1338c must persist Sync state UNKNOWN");
+    assert_eq!(stored_commit, frozen_commit);
+    let frozen_uuid = uuid::Uuid::parse_str(&frozen_commit)
+        .expect("fd1338c Sync commit is a UUID")
+        .to_string();
     assert_eq!(
         sync_entry(&retained, "hello.txt")["intent"]["commit_id"],
         frozen_commit.as_str()
@@ -604,7 +627,9 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
         "resolving v1 must not acknowledge the newer local v2"
     );
 
-    let receipt = receipt(&storage, &current, &frozen_commit);
+    let receipt = receipt(&storage, &current, &frozen_uuid);
+    assert_eq!(field(&receipt, "commit"), frozen_uuid);
+    assert_eq!(field(&receipt, "request digest"), frozen_digest);
     let revision = field(&receipt, "revision").to_owned();
     let restored_v1 = storage.path("sync-restored-v1");
     run_ok(
@@ -636,6 +661,9 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
     assert_eq!(converged["summary"]["in_sync"], true, "{converged:#}");
     assert_eq!(converged["summary"]["unknown"], 0);
     assert_eq!(fs::read(directory.join("hello.txt")).unwrap(), SYNC_V2);
+    let retained_receipt = receipt(&storage, &current, &frozen_uuid);
+    assert_eq!(field(&retained_receipt, "revision"), revision);
+    assert_eq!(field(&retained_receipt, "request digest"), frozen_digest);
     let restored_v2 = storage.path("sync-restored-v2");
     run_ok(
         &storage,
@@ -908,4 +936,34 @@ fn sync_entry<'a>(status: &'a Value, path: &str) -> &'a Value {
         .iter()
         .find(|entry| entry["path"] == path)
         .unwrap_or_else(|| panic!("Sync entry {path:?} missing:\n{status:#}"))
+}
+
+fn sync_unknown_identity(database: &Path) -> (String, String, u8) {
+    let connection =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open fd1338c Sync journal read-only");
+    let mut statement = connection
+        .prepare("SELECT commit_id,request_digest,state FROM namespaces WHERE state=1")
+        .expect("prepare fd1338c Sync Unknown query");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u8>(2)?,
+            ))
+        })
+        .expect("query fd1338c Sync Unknown state");
+    let rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read fd1338c Sync Unknown state");
+    assert_eq!(rows.len(), 1, "expected exactly one Sync Unknown intent");
+    let (commit, digest, state) = &rows[0];
+    assert_eq!(commit.len(), 16, "Sync commit identity length");
+    assert_eq!(digest.len(), 32, "Sync request digest length");
+    (
+        commit.iter().map(|byte| format!("{byte:02x}")).collect(),
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        *state,
+    )
 }
