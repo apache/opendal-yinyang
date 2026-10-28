@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use yinyang::direct::DirectStorageBinding;
 use yinyang::direct_sync::{
-    BindingState, DirectRemote, DirectSync, EntryState, MutationOutcome, RemoteEntry, RemoteKind,
-    RemotePin, RemotePrecondition, RemoteSnapshot, Resolution,
+    ArtifactKind, BindingState, DirectRemote, DirectSync, EntryState, MutationOutcome, RemoteEntry,
+    RemoteKind, RemotePin, RemotePrecondition, RemoteSnapshot, Resolution,
 };
 
 #[derive(Clone)]
@@ -580,6 +580,49 @@ async fn unknown_does_not_become_a_conflict_or_overwrite_an_external_successor()
         DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
     assert_eq!(status.entries[0].state, EntryState::Unknown);
     assert_eq!(status.summary.conflicts, 0);
+}
+
+#[tokio::test]
+async fn tampered_unknown_input_fails_without_dispatch() {
+    let fixture = Fixture::new();
+    fixture.write("file", b"v1");
+    let mut sync = fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.write("file", b"v2");
+    fixture.handle.lose_next_publish_response();
+    let mut sync = fixture.open().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    let status =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    let artifact = status
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == ArtifactKind::Upload && artifact.origin == "file")
+        .unwrap();
+    std::fs::write(
+        fixture.state.join("artifacts").join(&artifact.name),
+        b"tampered",
+    )
+    .unwrap();
+
+    let mut sync = fixture.open().await;
+    let error = sync
+        .run()
+        .await
+        .expect_err("tampered retained input must fail");
+    assert!(error.to_string().contains("no longer matches"));
+    assert_eq!(
+        fixture.handle.read("file").as_deref(),
+        Some(b"v2".as_slice())
+    );
+    drop(sync);
+    let status =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    assert_eq!(status.entries[0].state, EntryState::Failed);
 }
 
 #[tokio::test]

@@ -923,9 +923,28 @@ impl<R: DirectRemote> DirectSync<R> {
         )
         .map_err(|error| Error::errno("open Direct Sync artifact", &path, error))?;
         let mut file = std::fs::File::from(fd);
-        std::io::copy(&mut file, output)
-            .map(|_| ())
-            .map_err(|error| Error::io("export Direct Sync artifact", &path, error))
+        let mut hasher = blake3::Hasher::new();
+        let mut length = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer)
+                .map_err(|error| Error::io("read Direct Sync artifact", &path, error))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| Error::io("export Direct Sync artifact", &path, error))?;
+            hasher.update(&buffer[..read]);
+            length = length.saturating_add(read as u64);
+        }
+        if length != artifact.length || hasher.finalize().as_bytes() != artifact.digest.as_slice() {
+            return Err(Error::corrupt(format!(
+                "Direct Sync artifact {} changed before export",
+                artifact.id
+            )));
+        }
+        Ok(())
     }
 
     pub fn export_conflict_side_local(
@@ -1108,48 +1127,92 @@ impl<R: DirectRemote> DirectSync<R> {
 
     async fn dispatch_existing_work(&mut self, work: WorkRecord) -> Result<bool> {
         let was_unknown = work.state == WorkState::Unknown;
+        let precondition = match Self::remote_precondition(&work) {
+            Ok(precondition) => precondition,
+            Err(error) => {
+                self.store.update_work_state(
+                    work.id,
+                    WorkState::Failed,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        let source = match Self::work_source(&self.store, &self.local, &work) {
+            Ok(source) => source,
+            Err(error) => {
+                self.store.update_work_state(
+                    work.id,
+                    WorkState::Failed,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
         self.store
             .update_work_state(work.id, WorkState::Unknown, work.error.as_deref())?;
-        let precondition = match work.operation {
+        let outcome = match work.operation {
+            RemoteOperation::Publish => {
+                self.remote
+                    .publish_file(
+                        &work.path,
+                        source
+                            .as_deref()
+                            .expect("publish work has a retained input"),
+                        &precondition,
+                    )
+                    .await?
+            }
+            RemoteOperation::Delete => self.remote.delete(&work.path, &precondition).await?,
+        };
+        self.apply_remote_outcome(work, was_unknown, outcome).await
+    }
+
+    fn remote_precondition(work: &WorkRecord) -> Result<RemotePrecondition> {
+        match work.operation {
             RemoteOperation::Publish if work.baseline_remote.is_none() => {
-                RemotePrecondition::Absent
+                Ok(RemotePrecondition::Absent)
             }
             RemoteOperation::Publish | RemoteOperation::Delete => {
                 let pin = work
                     .baseline_remote
                     .as_ref()
                     .ok_or_else(|| Error::corrupt("Direct Sync delete has no remote baseline"))?;
-                RemotePrecondition::Etag(
-                    pin.cas_etag()
-                        .ok_or_else(|| {
-                            Error::unsupported(format!(
-                                "object {:?} has no ETag for conditional mutation",
-                                work.path
-                            ))
-                        })?
-                        .to_owned(),
-                )
-            }
-        };
-        let outcome = match work.operation {
-            RemoteOperation::Publish => {
-                let artifact_id = work.desired_artifact.as_deref().ok_or_else(|| {
-                    Error::corrupt("Direct Sync publish work has no retained input")
+                let etag = pin.cas_etag().ok_or_else(|| {
+                    Error::unsupported(format!(
+                        "object {:?} has no ETag for conditional mutation",
+                        work.path
+                    ))
                 })?;
-                let artifact = self
-                    .store
-                    .artifacts()?
-                    .into_iter()
-                    .find(|artifact| artifact.id == artifact_id)
-                    .ok_or_else(|| Error::corrupt("Direct Sync upload artifact disappeared"))?;
-                let path = self.local.artifact_path(&artifact);
-                self.remote
-                    .publish_file(&work.path, &path, &precondition)
-                    .await?
+                Ok(RemotePrecondition::Etag(etag.to_owned()))
             }
-            RemoteOperation::Delete => self.remote.delete(&work.path, &precondition).await?,
-        };
-        self.apply_remote_outcome(work, was_unknown, outcome).await
+        }
+    }
+
+    fn work_source(store: &Store, local: &LocalTree, work: &WorkRecord) -> Result<Option<PathBuf>> {
+        if work.operation != RemoteOperation::Publish {
+            return Ok(None);
+        }
+        let artifact_id = work
+            .desired_artifact
+            .as_deref()
+            .ok_or_else(|| Error::corrupt("Direct Sync publish work has no retained input"))?;
+        let artifact = store
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == artifact_id)
+            .ok_or_else(|| Error::corrupt("Direct Sync upload artifact disappeared"))?;
+        local.verify_artifact(&artifact)?;
+        let path = local.artifact_path(&artifact);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| Error::io("inspect retained Direct Sync upload", &path, error))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(Error::corrupt(format!(
+                "retained Direct Sync upload {} is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(Some(path))
     }
 
     async fn apply_remote_outcome(
