@@ -43,6 +43,8 @@ use serde::{Deserialize, Serialize};
 mod fixture;
 
 use fixture::{Fixture, Publication, SyncPaths};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
 const RESULT_SCHEMA: &str = "yinyang.linux-cost.v4";
 const CHUNK: usize = 64 * 1024;
@@ -92,7 +94,7 @@ impl PublicationFilter {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Scale {
     Small,
     Medium,
@@ -1415,7 +1417,8 @@ fn run_repeated_random_matrix(
         space_snapshot(&fixture, None, None, Some(&staging)),
         vec!["old descriptor bytes verified".to_owned()],
     );
-    fixture.remote_replace_file("replace.bin", &new_bytes);
+    fixture.remote_remove("replace.bin");
+    fixture.remote_create_file("replace.bin", &new_bytes, false);
     restarted.refresh_sighup();
     restarted.wait_for_output_line("yy: fuse refresh: done (", Duration::from_secs(30));
     let fresh = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
@@ -1794,6 +1797,7 @@ struct FuseMount {
     child: Child,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
+    stderr_seen: Arc<Mutex<Vec<u8>>>,
     mountpoint: PathBuf,
     finished: bool,
 }
@@ -1816,10 +1820,15 @@ impl FuseMount {
         let mut child = command.spawn().expect("spawn benchmark yy mount");
         let stdout = child.stdout.take().expect("mount stdout is piped");
         let stderr = child.stderr.take().expect("mount stderr is piped");
+        let stderr_seen = Arc::new(Mutex::new(Vec::new()));
+        let stderr_copy = stderr_seen.clone();
         let mut mounted = Self {
             child,
             stdout: Some(thread::spawn(move || read_all(stdout))),
-            stderr: Some(thread::spawn(move || read_all(stderr))),
+            stderr: Some(thread::spawn(move || {
+                read_all_observed(stderr, stderr_copy)
+            })),
+            stderr_seen,
             mountpoint: mountpoint.to_path_buf(),
             finished: false,
         };
@@ -1867,6 +1876,35 @@ impl FuseMount {
         self.child.id()
     }
 
+    fn refresh_sighup(&self) {
+        kill(Pid::from_raw(self.pid() as i32), Signal::SIGHUP)
+            .expect("send SIGHUP to benchmark mount");
+    }
+
+    fn wait_for_output_line(&self, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = String::from_utf8_lossy(
+                &self
+                    .stderr_seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+            .into_owned();
+            if output
+                .lines()
+                .any(|line| line.contains(needle) && line.trim_end().ends_with(')'))
+            {
+                return output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "benchmark mount did not print {needle:?} within {timeout:?}:\n{output}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn unmount(&mut self) {
         if self.finished {
             return;
@@ -1893,10 +1931,15 @@ impl FuseMount {
     }
 
     fn join_stderr(&mut self) -> Vec<u8> {
-        self.stderr
+        let _ = self
+            .stderr
             .take()
             .and_then(|thread| thread.join().ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.stderr_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn join_stdout(&mut self) {
@@ -2085,6 +2128,26 @@ fn run_observed(mut command: Command, timeout: Duration) -> ObservedOutput {
 fn read_all(mut reader: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     let _ = reader.read_to_end(&mut bytes);
+    bytes
+}
+
+fn read_all_observed(mut reader: impl Read, observed: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
     bytes
 }
 
