@@ -896,7 +896,13 @@ impl DirectInner {
                 if let Err(pending) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
                 }
-                self.refresh_remote_only().await;
+                // ESTALE can make VFS retry UNLINK. Do not replace the failed
+                // pin before replying, or the retry could delete the external
+                // replacement with its new ETag. SIGHUP performs the explicit
+                // rebase.
+                if status.state != DirectMutationState::Conflict {
+                    self.refresh_remote_only().await;
+                }
                 eprintln!(
                     "yy: fuse unlink: Direct mutation {} retained in {:?}: {}",
                     status.id.to_hex(),
