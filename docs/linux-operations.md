@@ -99,7 +99,8 @@ date, target, Cargo/Rust versions and binary SHA-256. The script refuses a dirty
 worktree and requires Linux x86_64 so the archive cannot silently claim a
 source/build identity it did not test.
 
-This artifact is local qualification input, not an Apache Software Foundation
+The script requires Ubuntu 24.04 x86_64, the tested host combination. This
+artifact is local qualification input, not an Apache Software Foundation
 release. It has no ASF signature, vote, provenance approval or publication
 authorization.
 

@@ -59,7 +59,14 @@ done
 }
 
 if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
-  printf 'package-release.sh requires Linux x86_64\n' >&2
+  printf 'package-release.sh requires Ubuntu 24.04 x86_64\n' >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+. /etc/os-release
+if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 ]]; then
+  printf 'package-release.sh requires Ubuntu 24.04 x86_64\n' >&2
   exit 1
 fi
 
@@ -87,7 +94,7 @@ version=$(
     python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "yinyang"))'
 )
 release="${version}+${source_short}"
-name="yinyang-${version}-linux-x86_64-${source_short}"
+name="yinyang-${version}-ubuntu-24.04-x86_64-${source_short}"
 archive="$output_dir/$name.tar.gz"
 
 mkdir -p "$output_dir"
@@ -141,7 +148,7 @@ rustc_version=$(rustc --version)
   printf 'release=%s\n' "$release"
   printf 'source_commit=%s\n' "$source_sha"
   printf 'source_date_epoch=%s\n' "$source_date_epoch"
-  printf 'target=linux-x86_64\n'
+  printf 'target=ubuntu-24.04-x86_64\n'
   printf 'yy_sha256=%s\n' "$binary_sha256"
   printf 'cargo=%s\n' "$cargo_version"
   printf 'rustc=%s\n' "$rustc_version"
