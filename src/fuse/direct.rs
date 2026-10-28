@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Linux FUSE adapter for storage-native Direct namespaces.
+//! Linux FUSE adapter for storage-native Direct namespaces.
+//!
+//! Read-only mounts pin remote versions directly. Writable mounts share the
+//! storage-bound Direct object runtime and serve its retained local generations
+//! as an overlay without creating Managed metadata.
 
 use super::attrs::{ATTR_TTL, DIRECTORY_SIZE};
 use super::{Outcome, TEARDOWN_GRACE, blocking_error, shutdown_signal};

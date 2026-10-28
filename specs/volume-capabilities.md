@@ -193,10 +193,13 @@ strict volume document, reports whether the current host is the tested
 operational combination, checks FUSE device/helper access, and validates
 admission. Managed performs one owner-only temporary state-path write probe,
 removes it, inspects persisted Mount records read-only, and observes the selected
-authority. Direct performs no state probe and reports a recursive namespace
-observation instead. Doctor does not create staging, initialize `staging.db` or
-`sync.db`, run recovery, acquire a runtime or publication lease, or publish. Its
-JSON form and exit codes are specified in
+authority. Read-only Direct performs no state probe. Writable Direct probes the
+configured staging directory with one temporary owner-only file, then validates
+the retained Direct runtime profile, storage binding and object/mutation state
+read-only. Both Direct policies report a recursive namespace observation.
+Doctor does not create staging, initialize `staging.db`, `sync.db` or
+`runtime.db`, run recovery, acquire a runtime or publication lease, or publish.
+Its JSON form and exit codes are specified in
 [`linux-operations.md`](linux-operations.md).
 
 `doctor` reports readiness, not reconciliation convergence. In particular, a
@@ -213,8 +216,12 @@ revision or explicit unavailability. Local status remains inspectable when
 the service or credentials are unavailable. The status command creates no
 staging state and performs no publication.
 
-For Direct, `status` reports the namespace observation digest and root entry
-counts. It has no local handles, remote receipt revision or staging lease.
+Read-only Direct `status` reports the namespace observation digest and root
+entry counts without local state. Writable Direct Mount inspects its runtime
+database read-only and reports object/mutation state before attempting network
+access; it does not acquire the runtime lease or run recovery. Direct Sync
+reports its binding and convergence through the existing `sync status` rather
+than the Managed or Direct Mount status path.
 
 A live in-process status additionally includes non-persisted errors when the
 local disk could not save them. Another process can report only durable errors.
