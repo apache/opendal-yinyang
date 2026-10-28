@@ -237,7 +237,11 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     let mut frozen_process = frozen_command
         .spawn()
         .expect("spawn fd1338c frozen file fsync");
-    object_gate.wait_intercepted();
+    wait_gate_or_child_exit(
+        &object_gate,
+        &mut frozen_process,
+        "fd1338c frozen file fsync",
+    );
     frozen_process.kill().expect("kill fd1338c frozen fsync");
     let _ = frozen_process.wait();
     object_gate.release();
@@ -312,7 +316,8 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let sync_process = sync_command.spawn().expect("spawn fd1338c gated Sync");
-    sync_gate.wait_intercepted();
+    let mut sync_process = sync_process;
+    wait_gate_or_child_exit(&sync_gate, &mut sync_process, "fd1338c gated Sync");
     sync_gate.release();
     sync_gate.wait_original_dropped();
     drop(sync_gate);
@@ -907,6 +912,28 @@ fn run_ok(command: &mut Command, context: &str) -> Output {
             );
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_gate_or_child_exit(gate: &S3Gate, child: &mut Child, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if gate.wait_intercepted_timeout(Duration::from_millis(100)) {
+            return;
+        }
+        if child.try_wait().expect("poll gated child").is_some() {
+            let output = child
+                .wait_with_output()
+                .expect("collect gated child output");
+            panic!(
+                "{context} exited before the S3 gate intercepted its commit:\n{}",
+                output_text(&output)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context} did not reach the S3 gate within 90s"
+        );
     }
 }
 
