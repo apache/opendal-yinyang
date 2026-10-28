@@ -374,7 +374,18 @@ fn path_encode(value: &str) -> String {
 }
 
 fn path_encode_with_slashes(value: &str) -> String {
-    encode(value.as_bytes(), true)
+    value
+        .split('/')
+        .map(|component| {
+            let encoded = encode(component.as_bytes(), false);
+            if component == "." || component == ".." {
+                encoded.replace('.', "%2E")
+            } else {
+                encoded
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn query_encode(value: &str) -> String {
