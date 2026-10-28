@@ -651,6 +651,7 @@ async fn check_direct_sync_state(
     remote_error: Option<String>,
     report: &mut DoctorReport,
 ) {
+    let config_path = report.config.clone();
     let (remote, remote_error) = match operator {
         Some(operator) => match crate::direct_sync_cli::remote_adapter(config, operator.clone()) {
             Ok(remote) => (Some(remote), remote_error),
@@ -674,7 +675,7 @@ async fn check_direct_sync_state(
             "Direct Sync state is not initialized; doctor did not create it",
             Some(format!(
                 "run `yy --volume {} sync init --directory ROOT` before the first Sync run",
-                config.name
+                config_path
             )),
         ),
         BindingState::Error => report.push(
@@ -713,7 +714,7 @@ async fn check_direct_sync_state(
                 detail,
                 (!summary.in_sync).then_some(format!(
                     "run `yy --volume {} sync status --json` and inspect pending, Unknown, conflict or failed state",
-                    config.name
+                    config_path
                 )),
             );
         }
