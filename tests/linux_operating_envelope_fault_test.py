@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import errno
 import importlib.util
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +35,7 @@ def load_envelope():
     path = Path(__file__).with_name("linux_operating_envelope.py")
     spec = importlib.util.spec_from_file_location("linux_operating_envelope", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
