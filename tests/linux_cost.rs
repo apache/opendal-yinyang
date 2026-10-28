@@ -1478,7 +1478,6 @@ fn run_repeated_random_matrix(
         space_snapshot(&fixture, None, None, Some(&staging)),
         vec!["old descriptor bytes remained pinned after refresh".to_owned()],
     );
-    drop(fresh);
     drop(old);
     restarted.unmount();
 }
