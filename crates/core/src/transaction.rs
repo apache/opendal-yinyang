@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compatibility::{
+    NODE_IDENTITY_CONTEXT, REQUEST_HASH_CONTEXT, REQUEST_MAGIC, TRANSACTION_PLAN_MAGIC,
+};
 use crate::data::PreparedContent;
 use crate::namespace::{DirectoryEntry, Link, Node, NodeKind, encode, entry_key};
 use crate::snapshot::{Change, Snapshot};
@@ -117,7 +120,7 @@ impl Transaction {
     }
     fn computed_digest(&self) -> Result<[u8; 32]> {
         let bytes = encode(&(
-            *b"YYREQ002",
+            REQUEST_MAGIC,
             *self.filesystem.as_bytes(),
             self.conditions
                 .iter()
@@ -128,10 +131,7 @@ impl Transaction {
                 .map(Mutation::logical)
                 .collect::<Result<Vec<_>>>()?,
         ))?;
-        Ok(blake3::derive_key(
-            "Apache OpenDAL YinYang request profile 2",
-            &bytes,
-        ))
+        Ok(blake3::derive_key(REQUEST_HASH_CONTEXT, &bytes))
     }
     pub(crate) fn validate(&self, filesystem: NodeId) -> Result<()> {
         if self.filesystem != filesystem || self.computed_digest()? != self.digest {
@@ -201,7 +201,7 @@ impl Transaction {
             })
             .collect::<Result<Vec<_>>>()?;
         encode(&(
-            *b"YYPLAN01",
+            TRANSACTION_PLAN_MAGIC,
             *self.filesystem.as_bytes(),
             *self.id.as_bytes(),
             self.base.to_bytes(),
@@ -261,13 +261,21 @@ impl Transaction {
                 "plan exceeds 16 MiB",
             ));
         }
-        let wire: RequestWire = crate::namespace::decode(bytes)?;
-        if wire.0 != *b"YYPLAN01" {
-            return Err(Error::invalid(
+        if bytes.len() < TRANSACTION_PLAN_MAGIC.len() {
+            return Err(Error::new(
+                crate::ErrorKind::Corrupt,
+                "restore transaction",
+                "truncated plan",
+            ));
+        }
+        if bytes[..TRANSACTION_PLAN_MAGIC.len()] != TRANSACTION_PLAN_MAGIC {
+            return Err(Error::unsupported(
                 "restore transaction",
                 "unknown plan profile",
             ));
         }
+        let wire: RequestWire = crate::namespace::decode(bytes)?;
+        debug_assert_eq!(wire.0, TRANSACTION_PLAN_MAGIC);
         Ok(wire)
     }
     pub(crate) async fn restore(
@@ -330,8 +338,7 @@ impl Transaction {
                         bool,
                     ) = crate::namespace::decode(&bytes)?;
                     let seed = encode(&(fs, id, mutations.len() as u64))?;
-                    let derived =
-                        blake3::derive_key("Apache OpenDAL YinYang node identity profile 2", &seed);
+                    let derived = blake3::derive_key(NODE_IDENTITY_CONTEXT, &seed);
                     if node != derived[..16] {
                         return Err(Error::invalid(
                             "restore transaction",
@@ -364,7 +371,12 @@ impl Transaction {
                     let (_, node): (u8, [u8; 16]) = crate::namespace::decode(&bytes)?;
                     Mutation::Remove(NodeId::from_bytes(node))
                 }
-                _ => return Err(Error::invalid("restore transaction", "unknown mutation")),
+                _ => {
+                    return Err(Error::unsupported(
+                        "restore transaction",
+                        "unknown mutation profile",
+                    ));
+                }
             };
             work.apply(&mutation).await?;
             mutations.push(mutation);
@@ -461,7 +473,7 @@ impl Planner {
             *self.id.as_bytes(),
             self.mutations.len() as u64,
         ))?;
-        let digest = blake3::derive_key("Apache OpenDAL YinYang node identity profile 2", &seed);
+        let digest = blake3::derive_key(NODE_IDENTITY_CONTEXT, &seed);
         let id = NodeId::from_bytes(digest[..16].try_into().unwrap());
         self.push(Mutation::Create {
             id,
@@ -922,6 +934,15 @@ pub(crate) struct Delta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{ContentDescriptor, DataStore};
+    use crate::support::{StoredObject, TestBackend};
+
+    const PLAN: &[u8] = include_bytes!("../tests/fixtures/compatibility-v2/transaction.plan");
+    const DESCRIPTOR: &[u8] =
+        include_bytes!("../tests/fixtures/compatibility-v2/content.descriptor");
+    const PACK: &[u8] = include_bytes!("../tests/fixtures/compatibility-v2/content.pack");
+    const DIGEST: &str = include_str!("../tests/fixtures/compatibility-v2/request.digest");
+
     #[test]
     fn canonical_noop_request_vector() {
         let request = Transaction {
@@ -942,5 +963,53 @@ mod tests {
             increment(u64::MAX).unwrap_err().kind(),
             crate::ErrorKind::Unsupported
         );
+    }
+
+    #[tokio::test]
+    async fn independent_frozen_request_vector_matches_digest_and_plan() {
+        let backend = TestBackend::default();
+        let filesystem = NodeId::from_bytes([0x11; 16]);
+        let object = [0x22; 16];
+        let key = format!(
+            ".yinyang/v2/{}/packs/{}",
+            uuid::Uuid::from_bytes(*filesystem.as_bytes()).simple(),
+            uuid::Uuid::from_bytes(object).simple()
+        );
+        backend.state.lock().unwrap().objects.insert(
+            key,
+            StoredObject {
+                bytes: PACK.to_vec(),
+                etag: "fixture".into(),
+            },
+        );
+        let store = DataStore::new(backend.operator(), filesystem).unwrap();
+        let descriptor = ContentDescriptor::from_bytes(DESCRIPTOR).unwrap();
+        let prepared = store.import(&descriptor).await.unwrap();
+        let mut request = Transaction {
+            filesystem,
+            base: crate::Revision::from_bytes({
+                let mut bytes = [0; 24];
+                bytes[..8].copy_from_slice(&7_u64.to_be_bytes());
+                bytes[8..].copy_from_slice(&[0x44; 16]);
+                bytes
+            }),
+            id: CommitId::from_bytes([0x33; 16]),
+            digest: [0; 32],
+            conditions: vec![],
+            mutations: vec![Mutation::Create {
+                id: NodeId::from_bytes([0x66; 16]),
+                parent: NodeId::from_bytes([0x55; 16]),
+                name: "file".into(),
+                file: Some(prepared),
+                executable: true,
+            }],
+        };
+        request.digest = request.computed_digest().unwrap();
+        let expected = DIGEST.trim();
+        assert_eq!(
+            blake3::Hash::from(request.digest).to_hex().as_str(),
+            expected
+        );
+        assert_eq!(request.to_bytes().unwrap().as_slice(), PLAN);
     }
 }

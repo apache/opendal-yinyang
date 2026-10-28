@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compatibility::OBJECT_INDEX_MAGIC;
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -156,7 +157,7 @@ impl Page {
                 .map(|(k, r)| (k.clone(), Vec::new(), Some(r.wire())))
                 .collect(),
         };
-        let bytes = borsh::to_vec(&(*b"YYINDEX2", self.level(), records))
+        let bytes = borsh::to_vec(&(OBJECT_INDEX_MAGIC, self.level(), records))
             .map_err(|e| corrupt(e.to_string()))?;
         if bytes.len() > PAGE_BYTES as usize {
             return Err(corrupt("index page exceeds its bound"));
@@ -184,9 +185,18 @@ impl Index {
         Self::decode_page(&bytes, root)
     }
     fn decode_page(bytes: &[u8], root: bool) -> Result<Page> {
+        if bytes.len() < OBJECT_INDEX_MAGIC.len() {
+            return Err(corrupt("truncated index page"));
+        }
+        if bytes[..OBJECT_INDEX_MAGIC.len()] != OBJECT_INDEX_MAGIC {
+            return Err(Error::unsupported(
+                "read metadata index",
+                "unknown index profile",
+            ));
+        }
         let (magic, level, records): Wire =
             borsh::from_slice(bytes).map_err(|e| corrupt(e.to_string()))?;
-        if magic != *b"YYINDEX2"
+        if magic != OBJECT_INDEX_MAGIC
             || level > 32
             || records.is_empty()
             || records.len() > MAX
@@ -593,7 +603,7 @@ mod tests {
         let backend = TestBackend::default();
         let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
         let invalid: Wire = (
-            *b"YYINDEX2",
+            OBJECT_INDEX_MAGIC,
             0,
             vec![(b"b".to_vec(), vec![], None), (b"a".to_vec(), vec![], None)],
         );
