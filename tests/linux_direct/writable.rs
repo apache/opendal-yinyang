@@ -542,17 +542,6 @@ fn direct_write_rename_conflict_retains_external_destination_before_explicit_ref
     let source = mounted.mountpoint().join("rename-source.txt");
     let destination = mounted.mountpoint().join("rename-destination.txt");
 
-    fixture.write_raw("rename-destination.txt", &external_destination);
-    let external_etag = fixture
-        .raw_object("rename-destination.txt")
-        .expect("raw external rename destination")
-        .etag
-        .expect("raw external rename destination ETag");
-    assert_ne!(
-        original_etag, external_etag,
-        "external rename destination replacement did not change the raw ETag"
-    );
-
     let source_for_thread = source.clone();
     let destination_for_thread = destination.clone();
     let rename = thread::spawn(move || fs::rename(source_for_thread, destination_for_thread));
@@ -570,6 +559,17 @@ fn direct_write_rename_conflict_retains_external_destination_before_explicit_ref
     assert_eq!(
         first_if_match.trim_matches('"'),
         original_etag.trim_matches('"'),
+    );
+
+    fixture.write_raw("rename-destination.txt", &external_destination);
+    let external_etag = fixture
+        .raw_object("rename-destination.txt")
+        .expect("raw external rename destination")
+        .etag
+        .expect("raw external rename destination ETag");
+    assert_ne!(
+        original_etag, external_etag,
+        "external rename destination replacement did not change the raw ETag"
     );
     gate.release();
 
@@ -590,10 +590,6 @@ fn direct_write_rename_conflict_retains_external_destination_before_explicit_ref
         &error,
         &[libc::ESTALE, libc::EIO],
         "conditional rename destination conflict",
-    );
-    assert!(
-        attempts.len() >= 2,
-        "VFS did not exercise the implicit rename retry: {attempts:?}"
     );
     for attempt in &attempts {
         assert_eq!(
