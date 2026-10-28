@@ -921,10 +921,22 @@ fn wait_gate_or_child_exit(gate: &S3Gate, child: &mut Child, context: &str) {
         if gate.wait_intercepted_timeout(Duration::from_millis(100)) {
             return;
         }
-        if child.try_wait().expect("poll gated child").is_some() {
-            let output = child
-                .wait_with_output()
-                .expect("collect gated child output");
+        if let Some(status) = child.try_wait().expect("poll gated child") {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout)
+                    .expect("read gated child stdout");
+            }
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_end(&mut stderr)
+                    .expect("read gated child stderr");
+            }
+            let output = Output {
+                status,
+                stdout,
+                stderr,
+            };
             panic!(
                 "{context} exited before the S3 gate intercepted its commit:\n{}",
                 output_text(&output)
