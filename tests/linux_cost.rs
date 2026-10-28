@@ -37,20 +37,20 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[path = "linux_sync/harness.rs"]
 mod fixture;
 
 use fixture::{Fixture, Publication, SyncPaths};
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v3";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v4";
 const CHUNK: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
-const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io while alive; terminal increments can be missed, so values are lower bounds and character I/O includes sockets";
-const STORAGE_BACKEND: &str = "loopback Silo, MinIO-compatible S3 over HTTP";
-const METADATA_TRANSPORT: &str = "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC";
+const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io and /proc/PID/status while alive; terminal increments can be missed, so values are lower bounds, character I/O includes sockets, and RSS/HWM are process-wide rather than cache-only";
+const REPEATED_RANDOM_SAMPLES: usize = 32;
+const RANDOM_SEED: u64 = 0x79_59_4d_32_37_37_32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -62,6 +62,7 @@ enum Profile {
 enum Workload {
     Full,
     ReadOnlyRange,
+    RepeatedRandom,
 }
 
 impl Workload {
@@ -69,6 +70,7 @@ impl Workload {
         match self {
             Self::Full => "full",
             Self::ReadOnlyRange => "read-only-range",
+            Self::RepeatedRandom => "repeated-random",
         }
     }
 }
@@ -137,6 +139,10 @@ struct RunContext {
     profile: Profile,
     workload: Workload,
     publication_filter: PublicationFilter,
+    storage_backend: String,
+    metadata_transport: String,
+    network_source: String,
+    range_cache_policy: String,
     source_sha: String,
     source_dirty: bool,
     binary_path: String,
@@ -168,20 +174,30 @@ impl BenchFixture {
 
     fn network<'a>(&'a self, storage: &'a CountingProxy) -> NetworkMeter<'a> {
         NetworkMeter {
-            storage,
+            storage: NetworkSource::Proxy(storage),
             service: self.service_proxy.as_ref(),
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum NetworkSource<'a> {
+    Proxy(&'a CountingProxy),
+    Telemetry(&'a TelemetryMeter),
+}
+
+#[derive(Clone, Copy)]
 struct NetworkMeter<'a> {
-    storage: &'a CountingProxy,
+    storage: NetworkSource<'a>,
     service: Option<&'a CountingServiceProxy>,
 }
 
 impl NetworkMeter<'_> {
     fn snapshot(&self) -> NetworkSnapshot {
-        let mut snapshot = self.storage.snapshot();
+        let mut snapshot = match self.storage {
+            NetworkSource::Proxy(proxy) => proxy.snapshot(),
+            NetworkSource::Telemetry(telemetry) => telemetry.snapshot(),
+        };
         if let Some(service) = self.service {
             let service = service.snapshot();
             snapshot.service_connections = service.connections;
@@ -190,6 +206,88 @@ impl NetworkMeter<'_> {
         }
         snapshot
     }
+
+    fn settle(&self) {
+        if matches!(self.storage, NetworkSource::Telemetry(_)) {
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    fn telemetry_path(&self) -> Option<&Path> {
+        match self.storage {
+            NetworkSource::Proxy(_) => None,
+            NetworkSource::Telemetry(telemetry) => Some(&telemetry.path),
+        }
+    }
+}
+
+struct TelemetryMeter {
+    path: PathBuf,
+}
+
+impl TelemetryMeter {
+    fn new(path: PathBuf) -> Self {
+        let meter = Self { path };
+        meter.reset();
+        meter
+    }
+
+    fn reset(&self) {
+        let snapshot = TelemetrySnapshot {
+            schema: "yinyang.benchmark-http.v1".to_owned(),
+            requests: 0,
+            request_bytes: 0,
+            response_bytes: 0,
+            read_requests: 0,
+        };
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).expect("create benchmark telemetry directory");
+        }
+        fs::write(
+            &self.path,
+            serde_json::to_vec(&snapshot).expect("serialize zero benchmark telemetry"),
+        )
+        .expect("reset benchmark telemetry");
+    }
+
+    fn snapshot(&self) -> NetworkSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = fs::read(&self.path)
+                && let Ok(snapshot) = serde_json::from_slice::<TelemetrySnapshot>(&bytes)
+            {
+                assert_eq!(
+                    snapshot.schema,
+                    "yinyang.benchmark-http.v1",
+                    "unexpected benchmark telemetry schema in {}",
+                    self.path.display()
+                );
+                return NetworkSnapshot {
+                    requests: snapshot.requests,
+                    request_bytes: snapshot.request_bytes,
+                    response_bytes: snapshot.response_bytes,
+                    get: snapshot.read_requests,
+                    other: snapshot.requests.saturating_sub(snapshot.read_requests),
+                    ..NetworkSnapshot::default()
+                };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "benchmark telemetry {} did not become readable",
+                self.path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct TelemetrySnapshot {
+    schema: String,
+    requests: u64,
+    request_bytes: u64,
+    response_bytes: u64,
+    read_requests: u64,
 }
 
 #[test]
@@ -204,7 +302,10 @@ fn linux_cost_benchmark() {
     let workload = match std::env::var("YINYANG_COST_WORKLOAD").as_deref() {
         Ok("full") | Err(_) => Workload::Full,
         Ok("read-only-range") => Workload::ReadOnlyRange,
-        value => panic!("YINYANG_COST_WORKLOAD must be full or read-only-range, got {value:?}"),
+        Ok("repeated-random") => Workload::RepeatedRandom,
+        value => panic!(
+            "YINYANG_COST_WORKLOAD must be full, read-only-range, or repeated-random, got {value:?}"
+        ),
     };
     let publication_filter = match std::env::var("YINYANG_COST_PUBLICATION").as_deref() {
         Ok("all") | Err(_) => PublicationFilter::All,
@@ -212,8 +313,10 @@ fn linux_cost_benchmark() {
         Ok("service") => PublicationFilter::Service,
         value => panic!("YINYANG_COST_PUBLICATION must be all, object, or service, got {value:?}"),
     };
-    if matches!(workload, Workload::ReadOnlyRange) && profile != Profile::Full {
-        panic!("read-only-range workload requires YINYANG_COST_PROFILE=full");
+    if matches!(workload, Workload::ReadOnlyRange | Workload::RepeatedRandom)
+        && profile != Profile::Full
+    {
+        panic!("range workloads require YINYANG_COST_PROFILE=full");
     }
     if matches!(workload, Workload::Full)
         && matches!(profile, Profile::Early)
@@ -232,10 +335,37 @@ fn linux_cost_benchmark() {
         .expect("set YINYANG_COST_SOURCE_SHA to the exact tested source commit");
     let source_dirty = std::env::var("YINYANG_COST_SOURCE_DIRTY").as_deref() == Ok("1");
     let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let storage_backend = std::env::var("YINYANG_COST_STORAGE_LABEL").unwrap_or_else(|_| {
+        if std::env::var("YINYANG_S3_ENDPOINT")
+            .is_ok_and(|endpoint| endpoint.starts_with("https://"))
+        {
+            "non-loopback S3-compatible storage over HTTPS".to_owned()
+        } else {
+            "loopback Silo, MinIO-compatible S3 over HTTP".to_owned()
+        }
+    });
+    let network_source = if workload == Workload::RepeatedRandom {
+        "OpenDAL released MetricsLayer in the measured yy process; HTTP request count and body bytes only"
+            .to_owned()
+    } else {
+        "loopback HTTP/1 parser; request and response bytes include headers".to_owned()
+    };
+    let metadata_transport = if workload == Workload::RepeatedRandom {
+        "object authority directly over HTTPS; no metadata service".to_owned()
+    } else {
+        "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC"
+            .to_owned()
+    };
+    let range_cache_policy = std::env::var("YINYANG_COST_RANGE_POLICY")
+        .unwrap_or_else(|_| "unspecified; select the exact measured binary policy".to_owned());
     let context = RunContext {
         profile,
         workload,
         publication_filter,
+        storage_backend,
+        metadata_transport,
+        network_source,
+        range_cache_policy,
         source_sha,
         source_dirty,
         binary_blake3: blake3_file(&binary_path),
@@ -243,6 +373,32 @@ fn linux_cost_benchmark() {
         host: host_identity(),
         rustc: command_line("rustc", &["--version"]),
     };
+    let mut recorder = Recorder::new(&context, &output, &summary);
+
+    if workload == Workload::RepeatedRandom {
+        assert!(
+            cfg!(feature = "benchmark-telemetry"),
+            "repeated-random measurement requires --features benchmark-telemetry"
+        );
+        let publications = &[Publication::Object];
+        for &publication in publications {
+            for &scale in &[Scale::Small, Scale::Medium] {
+                run_repeated_random_matrix(
+                    &context,
+                    publication,
+                    scale,
+                    &output.with_extension(format!(
+                        "telemetry-{}-{}",
+                        publication.as_str(),
+                        scale.as_str()
+                    )),
+                    &mut recorder,
+                );
+            }
+        }
+        recorder.finish();
+        return;
+    }
 
     let upstream = s3_upstream();
     let proxy = Arc::new(CountingProxy::start(upstream));
@@ -274,9 +430,8 @@ fn linux_cost_benchmark() {
             &[Scale::Small, Scale::Medium]
         }
         (Workload::Full, Profile::Early) => &[Scale::Small],
+        (Workload::RepeatedRandom, _) => unreachable!("repeated-random returns above"),
     };
-    let mut recorder = Recorder::new(&context, &output, &summary);
-
     if matches!(workload, Workload::ReadOnlyRange) {
         for &publication in publications {
             for &scale in scales {
@@ -506,6 +661,9 @@ fn run_fuse_matrix(
         file_size_bytes: Some(size as u64),
         range_bytes: Some(RANGE_BYTES as u64),
         writers: None,
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     };
     recorder.record(
         context,
@@ -694,6 +852,9 @@ fn run_read_only_range_matrix(
         file_size_bytes: Some(size as u64),
         range_bytes: Some(RANGE_BYTES as u64),
         writers: None,
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     };
     recorder.record(
         context,
@@ -842,6 +1003,500 @@ fn run_read_only_range_matrix(
     restarted.unmount();
 }
 
+fn run_repeated_random_matrix(
+    context: &RunContext,
+    publication: Publication,
+    scale: Scale,
+    telemetry_base: &Path,
+    recorder: &mut Recorder,
+) {
+    assert_eq!(
+        publication,
+        Publication::Object,
+        "repeated-random measurement uses the object authority"
+    );
+    let fixture = Fixture::new_with_storage_endpoint(publication, None);
+    let size = scale.file_size();
+    let expected = payload(size, 0x6d);
+    fixture.remote_create_file("large.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        &fixture,
+        &format!(
+            "repeated-random-{}-{}",
+            publication.as_str(),
+            scale.as_str()
+        ),
+        true,
+    );
+    fs::create_dir(&mountpoint).expect("create repeated-random benchmark mountpoint");
+    let telemetry_path = PathBuf::from(format!(
+        "{}-{}-{}.json",
+        telemetry_base.display(),
+        publication.as_str(),
+        scale.as_str()
+    ));
+    let telemetry = TelemetryMeter::new(telemetry_path);
+    let meter = NetworkMeter {
+        storage: NetworkSource::Telemetry(&telemetry),
+        service: None,
+    };
+    let (mut mounted, mount_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    let large = mountpoint.join("large.bin");
+    let base_dataset = Dataset {
+        kind: "single_large_read_only_file_repeated_random".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: Some(RANGE_BYTES as u64),
+        writers: None,
+        read_pattern: Some("cold and repeated same-offset reads".to_owned()),
+        working_set_bytes: Some(size as u64),
+        random_seed: Some(RANDOM_SEED),
+    };
+    recorder.record(
+        context,
+        "fuse_repeated_random_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts; telemetry and RSS settle after latency stops",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["read-only mount type=fuse.yinyang".to_owned()],
+    );
+
+    let midpoint = (size / 2) as u64;
+    let cold_file = File::open(&large).expect("cold open repeated-random FUSE file");
+    let cold = measure_telemetry_batch(&meter, mounted.pid(), 1, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&cold_file, &mut value, midpoint);
+        assert_eq!(
+            value,
+            expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+        );
+    });
+    assert!(
+        cold.network.get > 0,
+        "cold read must not be satisfied by an application cache"
+    );
+    cold.record(
+        recorder,
+        context,
+        "fuse_repeated_random_same_range_cold_4k",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "cold open plus one 4 KiB pread at the midpoint",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["cold midpoint range verified".to_owned()],
+    );
+
+    let repeated = measure_telemetry_batch(&meter, mounted.pid(), REPEATED_RANDOM_SAMPLES, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&cold_file, &mut value, midpoint);
+        assert_eq!(
+            value,
+            expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+        );
+    });
+    repeated.record(
+        recorder,
+        context,
+        "fuse_repeated_random_same_range_warm_4k",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some(format!(
+                "{REPEATED_RANDOM_SAMPLES} repeated 4 KiB reads at one offset"
+            )),
+            ..base_dataset.clone()
+        },
+        "all reads use one open descriptor and the same pinned version",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all repeated range bytes verified".to_owned()],
+    );
+    let boundary_offset = BLOCK_BYTES as u64 - RANGE_BYTES as u64 / 2;
+    let boundary_length = RANGE_BYTES * 2;
+    let boundary_file =
+        File::open(&large).expect("open repeated-random boundary-crossing FUSE file");
+    let boundary_cold = measure_telemetry_batch(&meter, mounted.pid(), 1, |_| {
+        let mut value = vec![0_u8; boundary_length];
+        read_exact_at(&boundary_file, &mut value, boundary_offset);
+        assert_eq!(
+            value,
+            expected[boundary_offset as usize..boundary_offset as usize + boundary_length]
+        );
+    });
+    assert!(
+        boundary_cold.network.get > 0,
+        "cold boundary-crossing read must reach storage"
+    );
+    let boundary_dataset = Dataset {
+        range_bytes: Some(boundary_length as u64),
+        read_pattern: Some("one cold 8 KiB read spanning a 64 KiB unit boundary".to_owned()),
+        ..base_dataset.clone()
+    };
+    boundary_cold.record(
+        recorder,
+        context,
+        "fuse_repeated_random_boundary_cold_8k",
+        publication,
+        scale,
+        boundary_dataset.clone(),
+        "cold open plus one 8 KiB pread spanning a verification-unit boundary",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["boundary-crossing bytes verified".to_owned()],
+    );
+    let boundary_warm =
+        measure_telemetry_batch(&meter, mounted.pid(), REPEATED_RANDOM_SAMPLES, |_| {
+            let mut value = vec![0_u8; boundary_length];
+            read_exact_at(&boundary_file, &mut value, boundary_offset);
+            assert_eq!(
+                value,
+                expected[boundary_offset as usize..boundary_offset as usize + boundary_length]
+            );
+        });
+    boundary_warm.record(
+        recorder,
+        context,
+        "fuse_repeated_random_boundary_warm_8k",
+        publication,
+        scale,
+        boundary_dataset,
+        "all reads use one open descriptor and the same pinned version",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all boundary-crossing range bytes verified".to_owned()],
+    );
+    drop(boundary_file);
+
+    let working_units = 8 * 1024 * 1024 / BLOCK_BYTES;
+    let fill_units = shuffled_units(working_units, RANDOM_SEED);
+    let fill = measure_telemetry_batch(&meter, mounted.pid(), fill_units.len(), |sample| {
+        let offset = unit_offset(fill_units[sample]);
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&cold_file, &mut value, offset);
+        assert_eq!(
+            value,
+            expected[offset as usize..offset as usize + RANGE_BYTES]
+        );
+    });
+    let hot_dataset = Dataset {
+        read_pattern: Some(format!(
+            "deterministic random 4 KiB reads across a {} byte hot working set",
+            8 * 1024 * 1024
+        )),
+        working_set_bytes: Some(8 * 1024 * 1024),
+        ..base_dataset.clone()
+    };
+    fill.record(
+        recorder,
+        context,
+        "fuse_repeated_random_hot_set_fill_4k",
+        publication,
+        scale,
+        hot_dataset.clone(),
+        "one read in each distinct hot-set verification unit, in deterministic random order",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all hot-set fill bytes verified".to_owned()],
+    );
+    let hot_units = shuffled_units(working_units, RANDOM_SEED ^ 0xa5a5_a5a5);
+    let hot_warm =
+        measure_telemetry_batch(&meter, mounted.pid(), REPEATED_RANDOM_SAMPLES, |sample| {
+            let offset = unit_offset(hot_units[sample]);
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&cold_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+    hot_warm.record(
+        recorder,
+        context,
+        "fuse_repeated_random_hot_set_warm_4k",
+        publication,
+        scale,
+        hot_dataset,
+        "deterministic random reads drawn from the filled hot working set",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all warm hot-set range bytes verified".to_owned()],
+    );
+
+    if scale == Scale::Medium {
+        let units = size / BLOCK_BYTES;
+        let full_units = shuffled_units(units, RANDOM_SEED ^ 0x5a5a_5a5a);
+        let full_random = measure_telemetry_batch(&meter, mounted.pid(), 288, |sample| {
+            let offset = unit_offset(full_units[sample]);
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&cold_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+        full_random.record(
+            recorder,
+            context,
+            "fuse_repeated_random_over_capacity_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some(
+                    "288 deterministic random 4 KiB reads across the complete 32 MiB file"
+                        .to_owned(),
+                ),
+                working_set_bytes: Some(size as u64),
+                ..base_dataset.clone()
+            },
+            "random offsets exceed any intended bounded content-reuse working set",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["all over-capacity range bytes verified".to_owned()],
+        );
+    }
+    drop(cold_file);
+    mounted.unmount();
+
+    telemetry.reset();
+    let (mut restarted, restart_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_repeated_random_restart_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before the replacement mount spawn and ends when fuse.yinyang appears; telemetry and RSS settle after latency stops",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["replacement read-only mount type=fuse.yinyang".to_owned()],
+    );
+    let restart_file = File::open(&large).expect("open after repeated-random restart");
+    let restart_cold = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&restart_file, &mut value, midpoint);
+        assert_eq!(
+            value,
+            expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+        );
+    });
+    assert!(
+        restart_cold.network.get > 0,
+        "restart cold read must not reuse a previous process's content"
+    );
+    restart_cold.record(
+        recorder,
+        context,
+        "fuse_repeated_random_restart_cold_4k",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("cold read in a replacement mount process".to_owned()),
+            ..base_dataset.clone()
+        },
+        "replacement mount observes the same immutable version from storage",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["restart cold range bytes verified".to_owned()],
+    );
+
+    if scale == Scale::Medium {
+        let sentinel = unit_offset(0);
+        let sentinel_file = File::open(&large).expect("open eviction sentinel file");
+        let before = measure_telemetry_batch(&meter, restarted.pid(), 8, |_| {
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&sentinel_file, &mut value, sentinel);
+            assert_eq!(
+                value,
+                expected[sentinel as usize..sentinel as usize + RANGE_BYTES]
+            );
+        });
+        before.record(
+            recorder,
+            context,
+            "fuse_repeated_random_eviction_sentinel_warm_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some("repeated sentinel reads before eviction pressure".to_owned()),
+                working_set_bytes: Some(BLOCK_BYTES as u64),
+                ..base_dataset.clone()
+            },
+            "sentinel is read before loading more unique units than the bounded reuse capacity",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["sentinel bytes verified before eviction pressure".to_owned()],
+        );
+
+        let pressure = measure_telemetry_batch(&meter, restarted.pid(), 272, |sample| {
+            let offset = unit_offset(sample + 1);
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&sentinel_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+        pressure.record(
+            recorder,
+            context,
+            "fuse_repeated_random_eviction_pressure_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some(
+                    "272 distinct verification units loaded after the sentinel".to_owned(),
+                ),
+                working_set_bytes: Some(272 * BLOCK_BYTES as u64),
+                ..base_dataset.clone()
+            },
+            "the loaded units exceed a 16 MiB intended content bound before the sentinel is reread",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["all eviction-pressure range bytes verified".to_owned()],
+        );
+        let after = measure_telemetry_batch(&meter, restarted.pid(), 8, |_| {
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&sentinel_file, &mut value, sentinel);
+            assert_eq!(
+                value,
+                expected[sentinel as usize..sentinel as usize + RANGE_BYTES]
+            );
+        });
+        after.record(
+            recorder,
+            context,
+            "fuse_repeated_random_eviction_sentinel_reread_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some("repeated sentinel reads after eviction pressure".to_owned()),
+                working_set_bytes: Some(BLOCK_BYTES as u64),
+                ..base_dataset.clone()
+            },
+            "the first sample must observe the evicted sentinel again; later samples may reuse it",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["sentinel bytes verified after eviction pressure".to_owned()],
+        );
+        drop(sentinel_file);
+    }
+    drop(restart_file);
+
+    let old_bytes = payload(256 * 1024, 0x31);
+    let new_bytes = payload(256 * 1024 + 17, 0x71);
+    fixture.remote_create_file("replace.bin", &old_bytes, false);
+    let old = File::open(mountpoint.join("replace.bin")).expect("open old replacement descriptor");
+    let old_offset = 3 * RANGE_BYTES as u64;
+    let old_read = measure_telemetry_batch(&meter, restarted.pid(), 2, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&old, &mut value, old_offset);
+        assert_eq!(
+            value,
+            old_bytes[old_offset as usize..old_offset as usize + RANGE_BYTES]
+        );
+    });
+    old_read.record(
+        recorder,
+        context,
+        "fuse_repeated_random_old_descriptor_warm_4k",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_replaced_read_only_file".to_owned(),
+            logical_bytes: old_bytes.len() as u64,
+            file_size_bytes: Some(old_bytes.len() as u64),
+            read_pattern: Some("repeated old-version reads".to_owned()),
+            working_set_bytes: Some(BLOCK_BYTES as u64),
+            ..base_dataset.clone()
+        },
+        "the old descriptor remains pinned before the external replacement and refresh",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["old descriptor bytes verified".to_owned()],
+    );
+    fixture.remote_replace_file("replace.bin", &new_bytes);
+    restarted.refresh_sighup();
+    restarted.wait_for_output_line("yy: fuse refresh: done (", Duration::from_secs(30));
+    let fresh = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
+        let file = File::open(mountpoint.join("replace.bin")).expect("fresh replacement open");
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&file, &mut value, old_offset);
+        assert_eq!(
+            value,
+            new_bytes[old_offset as usize..old_offset as usize + RANGE_BYTES]
+        );
+    });
+    assert!(
+        fresh.network.get > 0,
+        "fresh replacement open must not reuse the old logical version"
+    );
+    fresh.record(
+        recorder,
+        context,
+        "fuse_repeated_random_fresh_descriptor_cold_4k",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_replaced_read_only_file".to_owned(),
+            logical_bytes: new_bytes.len() as u64,
+            file_size_bytes: Some(new_bytes.len() as u64),
+            read_pattern: Some("fresh open after replacement and SIGHUP".to_owned()),
+            working_set_bytes: Some(BLOCK_BYTES as u64),
+            ..base_dataset.clone()
+        },
+        "fresh path open observes the replacement version after explicit refresh",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["fresh replacement bytes verified".to_owned()],
+    );
+    let retained = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&old, &mut value, old_offset);
+        assert_eq!(
+            value,
+            old_bytes[old_offset as usize..old_offset as usize + RANGE_BYTES]
+        );
+    });
+    retained.record(
+        recorder,
+        context,
+        "fuse_repeated_random_old_descriptor_after_refresh_4k",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_replaced_read_only_file".to_owned(),
+            logical_bytes: old_bytes.len() as u64,
+            file_size_bytes: Some(old_bytes.len() as u64),
+            read_pattern: Some("old descriptor read after replacement and SIGHUP".to_owned()),
+            working_set_bytes: Some(BLOCK_BYTES as u64),
+            ..base_dataset
+        },
+        "the pre-replacement descriptor retains its exact immutable bytes",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["old descriptor bytes remained pinned after refresh".to_owned()],
+    );
+    drop(fresh);
+    drop(old);
+    restarted.unmount();
+}
+
+fn shuffled_units(count: usize, seed: u64) -> Vec<usize> {
+    let mut units = (0..count).collect::<Vec<_>>();
+    let mut state = seed | 1;
+    for index in (1..units.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let selected = (state as usize) % (index + 1);
+        units.swap(index, selected);
+    }
+    units
+}
+
+fn unit_offset(unit: usize) -> u64 {
+    unit as u64 * BLOCK_BYTES as u64 + 3 * RANGE_BYTES as u64
+}
+
 fn run_concurrent_matrix(
     context: &RunContext,
     proxy: &Arc<CountingProxy>,
@@ -870,6 +1525,9 @@ fn run_concurrent_matrix(
         file_size_bytes: Some(writer_bytes as u64),
         range_bytes: None,
         writers: Some(writers),
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     };
     let expected = (0..writers)
         .map(|index| {
@@ -957,7 +1615,7 @@ fn run_publish_restore_matrix(
 ) {
     let fixture = Fixture::new_with_storage_endpoint(Publication::Object, Some(proxy.endpoint()));
     let meter = NetworkMeter {
-        storage: proxy,
+        storage: NetworkSource::Proxy(proxy),
         service: None,
     };
     let source = fixture.path(format!("publish-source-{}", scale.as_str()));
@@ -1036,6 +1694,9 @@ fn tree_dataset(root: &Path) -> Dataset {
         file_size_bytes: Some(1024),
         range_bytes: None,
         writers: None,
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     }
 }
 
@@ -1101,13 +1762,18 @@ fn mount_paths(fixture: &Fixture, name: &str, read_only: bool) -> (PathBuf, Path
     let staging = fixture.path(format!("{name}-state"));
     let mountpoint = fixture.path(format!("{name}-mount"));
     let config = fixture.path(format!("{name}.json"));
+    let storage_profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
+        Ok("minio") => "minio",
+        Ok("amazon-s3") => "amazon-s3",
+        value => panic!("YINYANG_STORAGE_PROFILE must be minio or amazon-s3, got {value:?}"),
+    };
     let mut value = serde_json::json!({
         "name": name,
         "model": "managed",
         "access": "mount",
         "frontend": "fuse",
         "publication": fixture.publication.as_str(),
-        "storage_profile": "minio",
+        "storage_profile": storage_profile,
         "staging": staging,
         "read_only": read_only,
         "require": [],
@@ -1143,6 +1809,9 @@ impl FuseMount {
         let started = Instant::now();
         let mut command =
             fixture.yy_command(&["--volume", path_str(config), "mount", path_str(mountpoint)]);
+        if let Some(path) = network.telemetry_path() {
+            command.env("YINYANG_BENCH_METRICS_FILE", path);
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn benchmark yy mount");
         let stdout = child.stdout.take().expect("mount stdout is piped");
@@ -1162,9 +1831,11 @@ impl FuseMount {
                 if current != IoSnapshot::default() {
                     io = current;
                 }
+                let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+                network.settle();
                 let measurement = Measurement {
                     value: (),
-                    latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    latency_ms,
                     io,
                     network: network.snapshot().since(network_before),
                 };
@@ -1319,6 +1990,35 @@ fn measure_mount_operation<T>(
     }
 }
 
+fn measure_telemetry_batch(
+    network: &NetworkMeter<'_>,
+    pid: u32,
+    samples: usize,
+    mut operation: impl FnMut(usize),
+) -> OperationBatch {
+    assert!(
+        samples > 0,
+        "telemetry batch must contain at least one sample"
+    );
+    network.settle();
+    let net_before = network.snapshot();
+    let io_before = read_proc_io(pid);
+    let mut latencies = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let started = Instant::now();
+        operation(sample);
+        latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let io = read_proc_io(pid).since(io_before);
+    network.settle();
+    let network = network.snapshot().since(net_before);
+    OperationBatch {
+        latencies,
+        io,
+        network,
+    }
+}
+
 fn run_yy_operation(
     network: &NetworkMeter<'_>,
     command: Command,
@@ -1396,6 +2096,8 @@ struct IoSnapshot {
     syscw: u64,
     read_bytes: u64,
     write_bytes: u64,
+    rss_kib: u64,
+    peak_rss_kib: u64,
 }
 
 impl IoSnapshot {
@@ -1407,6 +2109,8 @@ impl IoSnapshot {
             syscw: self.syscw.saturating_sub(before.syscw),
             read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
             write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            rss_kib: self.rss_kib,
+            peak_rss_kib: self.peak_rss_kib,
         }
     }
 
@@ -1417,6 +2121,8 @@ impl IoSnapshot {
         self.syscw = self.syscw.saturating_add(other.syscw);
         self.read_bytes = self.read_bytes.saturating_add(other.read_bytes);
         self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
+        self.rss_kib = self.rss_kib.max(other.rss_kib);
+        self.peak_rss_kib = self.peak_rss_kib.max(other.peak_rss_kib);
     }
 }
 
@@ -1438,6 +2144,23 @@ fn read_proc_io(pid: u32) -> IoSnapshot {
             "read_bytes" => value.read_bytes = number,
             "write_bytes" => value.write_bytes = number,
             _ => {}
+        }
+    }
+    if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in text.lines() {
+            let Some((key, raw)) = line.split_once(':') else {
+                continue;
+            };
+            let number = raw
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            match key {
+                "VmRSS" => value.rss_kib = number,
+                "VmHWM" => value.peak_rss_kib = number,
+                _ => {}
+            }
         }
     }
     value
@@ -2111,6 +2834,9 @@ struct Dataset {
     file_size_bytes: Option<u64>,
     range_bytes: Option<u64>,
     writers: Option<usize>,
+    read_pattern: Option<String>,
+    working_set_bytes: Option<u64>,
+    random_seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -2166,13 +2892,17 @@ impl NetworkPerSample {
     }
 }
 
-fn cache_policy(scenario: &str) -> &'static str {
+fn cache_policy(context: &RunContext, scenario: &str) -> String {
+    if context.workload == Workload::RepeatedRandom && scenario.starts_with("fuse_") {
+        return context.range_cache_policy.clone();
+    }
     if scenario.starts_with("fuse_") {
-        "FUSE FOPEN_DIRECT_IO; no kernel page cache for file pages; clean nodes are reclaimed on last release"
+        "FUSE FOPEN_DIRECT_IO; no kernel page cache for file pages; clean nodes are reclaimed on last release".to_owned()
     } else if scenario.starts_with("sync_") {
         "one CLI process per finite run; no OS page-cache drop and no cross-run content cache state"
+            .to_owned()
     } else {
-        "one CLI process; no OS page-cache drop and no retained application cache"
+        "one CLI process; no OS page-cache drop and no retained application cache".to_owned()
     }
 }
 
@@ -2202,9 +2932,10 @@ struct CostRecord {
     binary_blake3: String,
     host: String,
     rustc: String,
-    storage_backend: &'static str,
-    metadata_transport: &'static str,
-    cache_policy: &'static str,
+    storage_backend: String,
+    metadata_transport: String,
+    network_source: String,
+    cache_policy: String,
     dataset: Dataset,
     completion: String,
     iterations: usize,
@@ -2245,6 +2976,10 @@ impl Recorder {
                 profile: context.profile,
                 workload: context.workload,
                 publication_filter: context.publication_filter,
+                storage_backend: context.storage_backend.clone(),
+                metadata_transport: context.metadata_transport.clone(),
+                network_source: context.network_source.clone(),
+                range_cache_policy: context.range_cache_policy.clone(),
                 source_sha: context.source_sha.clone(),
                 source_dirty: context.source_dirty,
                 binary_path: context.binary_path.clone(),
@@ -2297,9 +3032,10 @@ impl Recorder {
             binary_blake3: context.binary_blake3.clone(),
             host: context.host.clone(),
             rustc: context.rustc.clone(),
-            storage_backend: STORAGE_BACKEND,
-            metadata_transport: METADATA_TRANSPORT,
-            cache_policy: cache_policy(scenario),
+            storage_backend: context.storage_backend.clone(),
+            metadata_transport: context.metadata_transport.clone(),
+            network_source: context.network_source.clone(),
+            cache_policy: cache_policy(context, scenario),
             dataset,
             completion: completion.to_owned(),
             iterations: latencies.len(),
@@ -2366,9 +3102,10 @@ impl Recorder {
             binary_blake3: context.binary_blake3.clone(),
             host: context.host.clone(),
             rustc: context.rustc.clone(),
-            storage_backend: STORAGE_BACKEND,
-            metadata_transport: METADATA_TRANSPORT,
-            cache_policy: cache_policy(scenario),
+            storage_backend: context.storage_backend.clone(),
+            metadata_transport: context.metadata_transport.clone(),
+            network_source: context.network_source.clone(),
+            cache_policy: cache_policy(context, scenario),
             dataset: Dataset {
                 kind: "not_run".to_owned(),
                 files: 0,
@@ -2377,6 +3114,9 @@ impl Recorder {
                 file_size_bytes: None,
                 range_bytes: None,
                 writers: None,
+                read_pattern: None,
+                working_set_bytes: None,
+                random_seed: None,
             },
             completion: "not applicable".to_owned(),
             iterations: 0,
