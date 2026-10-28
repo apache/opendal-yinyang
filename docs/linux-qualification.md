@@ -38,7 +38,7 @@ These checks require infrastructure that hosted CI does not provide:
 | --- | --- | --- |
 | `cargo x test-linux-operations --systemd` | running systemd user manager, `/dev/fuse`, isolated Silo | install/start/restart/stop/uninstall templates for service, Mount and finite Sync |
 | `cargo x test-linux-operations --amazon-s3` | real Amazon S3 credentials and bucket, `/dev/fuse` | installed CLI lifecycle against the named S3 backend |
-| `python3 tests/linux_direct_real_s3.py` | task-owned versioned and never-versioned Amazon S3 buckets, temporary role, AWS CLI, `/dev/fuse` | read-only Direct pagination, reversible keys, version/ETag retention, conditional primitives and Linux FUSE lifecycle |
+| `python3 tests/linux_direct_real_s3.py` | task-owned versioned and never-versioned Amazon S3 buckets, temporary role, AWS CLI, `/dev/fuse` | read-only Direct pagination, reversible keys, version/ETag retention, conditional primitives and Linux FUSE lifecycle; a separate source-pinned run covers writable remount and finite Direct Sync |
 | `cargo x bench-linux-cost --workload read-only-range` | matched source identities, release binary, isolated S3, `/dev/fuse` | bounded FUSE range latency, requests, payload and staging |
 | `cargo test --test linux_prefix_upgrade` | isolated Silo, exact `fd1338c` and final-target binaries, `sqlite3` | stopped versioned-prefix replacement with pending/Unknown state, receipts and service WAL recovery |
 | `tests/linux_operating_envelope_real_s3.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `sqlite3`, scoped AWS CLI | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
@@ -65,6 +65,13 @@ two listed buckets, default us-east-2 endpoint, temporary role and sampled
 pagination/version behavior; it does not turn the loopback Silo suite into
 Amazon S3 evidence.
 
+The separate real-Amazon-S3 entrypoint run used source
+`f629ed207cce81f196b55915bdd1154a3269a79a` and debug `yy` SHA-256
+`3dfe4c573b2d3311e07d4bf7c3be225a21d8541eec6fc7dc02262638ce06b9a0`.
+It passed the writable remount entrypoint and finite Direct Sync entrypoint
+through provider-default HTTPS. This is source-specific evidence; the final
+`f74fecfa837de4bd8f909f571f2c8860ceeb65f1` candidate was not rerun on AWS.
+
 ## Matrix
 
 The initial qualified combination is:
@@ -86,10 +93,15 @@ does not claim TLS, HA, network-safe service exposure, multi-host locking,
 automatic Sync watching, or automatic garbage collection.
 
 Deterministic writable Direct Mount and Direct Sync coverage uses isolated
-loopback Silo. The Amazon S3 record covers read-only Direct and raw conditional
-primitives, not writable Direct Mount or Direct Sync. Other S3-compatible
-services remain outside the matrix unless they satisfy exact recursive LIST,
-conditional ETag mutation and the tested version/range behavior.
+loopback Silo. Silo ignores `DELETE If-Match`; deterministic injected `412`
+responses and request-count checks cover the local fault path, but they are not
+conditional-DELETE provider certification. The separate source-pinned Amazon
+S3 entrypoint evidence covers writable remount and finite Direct Sync at
+`f629ed2`, while the Amazon S3 primitive record covers read-only Direct and raw
+conditional requests. Neither record claims the final `f74` candidate was rerun
+on AWS. Other S3-compatible services remain outside the matrix unless they
+satisfy exact recursive LIST, conditional ETag mutation and the tested
+version/range behavior.
 
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed

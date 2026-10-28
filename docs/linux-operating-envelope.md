@@ -55,9 +55,13 @@ The expected-byte oracle advances after every successful `pwrite` segment, not
 only after the following `fsync`. Partial writes therefore remain represented
 in the local and remote byte assertions. `pwrite` failures and `fsync` failures
 are counted separately; a file remains durability-unknown until a later
-successful fsync covers its dirty bytes. Three consecutive write or fsync
-failures abort the phase; otherwise any unresolved uncertainty makes the run
-fail after the byte assertions are evaluated and recorded.
+successful fsync covers its dirty bytes. After a failed `fsync`, the workload
+retries the same descriptor with bounded backoff for
+`--fsync-retry-seconds` (default 30 seconds) without issuing a new `pwrite`.
+The retry counts and first operation errors are retained in the phase report.
+The run fails when the retry deadline expires; three consecutive `pwrite`
+failures also abort the phase. Otherwise any unresolved uncertainty makes the
+run fail after the byte assertions are evaluated and recorded.
 
 File counts, dimensions, concurrency, sampling period and duration are bounded
 inputs, not extrapolated capacity. A run that exceeds the bounded interval or
