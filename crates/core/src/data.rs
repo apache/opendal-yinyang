@@ -1134,15 +1134,14 @@ mod tests {
             "the trust-promotion read path must remain uncached"
         );
 
-        let key = backend
-            .state
-            .lock()
-            .unwrap()
-            .objects
-            .keys()
-            .find(|key| key.contains("/packs/"))
-            .unwrap()
-            .clone();
+        let key = store.key(
+            file.descriptor()
+                .root
+                .as_ref()
+                .expect("nonempty cached content")
+                .reference
+                .object,
+        );
         backend
             .state
             .lock()
