@@ -151,7 +151,8 @@ impl RawS3 {
             );
             let body = String::from_utf8(response.body).expect("S3 ListObjectsV2 is UTF-8 XML");
             for encoded in xml_values(&body, "Key") {
-                let key = utf8(percent_decode(&xml_unescape(&encoded)), "listed S3 key");
+                let encoded = xml_unescape(&encoded).replace('+', " ");
+                let key = utf8(percent_decode(&encoded), "listed S3 key");
                 keys.push(key);
             }
             token = xml_values(&body, "NextContinuationToken")
