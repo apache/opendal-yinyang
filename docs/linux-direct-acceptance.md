@@ -123,6 +123,9 @@ the Direct implementation. Coverage includes:
   delete markers, pinned old descriptors, `SIGHUP`, `fstat` and fresh opens;
 - the never-versioned bucket's ETag-pinned path, including bounded failure
   after external replacement or deletion rather than an unconditional read;
+- zero-length trailing-slash markers as visible directories and data-bearing
+  markers as whole-observation errors in both versioning modes, with raw exact
+  GET and inventory bytes preserved;
 - `If-None-Match: *` creates, `If-Match` replacements, concurrent competing
   precondition requests, and conditional DELETE using the current ETag;
 - stale conditional DELETE leaving the replacement intact, successful

@@ -18,16 +18,16 @@ S3-compatible service.
 | Rust | `rustc 1.99.1`, `cargo 1.99.1` |
 | OpenDAL | 0.59.5 |
 | Raw evidence client | official AWS CLI 2.39.0 |
-| Measured source | `ddd70b626f6201c86795a269ad8ab88dfed97a2e` |
+| Measured source | `c5a010df9856fff5b13361f459edf76bfb8a05d5` |
 
-The measured source contains the OpenDAL 0.59.5 dependency foundation needed
-to evaluate conditional Direct mutation. Commits after the measured source
-that only add this qualification record do not change the executable.
+The measured source contains the OpenDAL 0.59.5 dependency foundation and the
+data-bearing directory-marker probe. Commits after the measured source that
+only add this qualification record do not change the executable.
 
 The debug `yy` binary under test had SHA-256
-`05d87bcbbf4b945879351590cf68a2b1887bb218e6fd482a634e3b1f37c1f587`.
+`3c852bd8e55d0b6c30640a05358e92336caf85b65cc64b64d6104aba6695a6cf`.
 The `linux_direct` test executable had SHA-256
-`d1fde0b6d86f7d030f69b26e7741bf12f6f85a2cee1b94a0cd08a75ecc1f5b02`.
+`d76a678d66b873e5a10e5f27db709c2113d121e448ea559e64ffd609e60893f8`.
 These are native acceptance binary identities, not release artifacts.
 
 ## Fixtures and authority
@@ -59,7 +59,7 @@ decision.
 
 ## Executed acceptance
 
-The command on the qualified host was:
+The seven-scenario suite on source `ddd70b6` ran:
 
 ```text
 bash /home/ubuntu/Code/opendal-yinyang/experiments/linux-devbox/run-validation.sh \
@@ -73,7 +73,21 @@ test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out;
 finished in 154.74s
 ```
 
-The seven tests covered:
+Source `c5a010d` then added the directory-marker probe and reran that focused
+scenario against both versioning modes:
+
+```text
+bash /home/ubuntu/Code/opendal-yinyang/experiments/linux-devbox/run-validation.sh \
+  q-direct-marker-c5a010d-r1 \
+  python3 tests/linux_direct_real_s3.py \
+  direct_amazon_s3_directory_marker_probe_is_lossless
+```
+
+That run reported one test passed in 23.34 s. The full seven scenarios remain
+attributable to `ddd70b6`; the later fix changes only trailing-slash marker
+observation, so the large pagination workload was not repeated.
+
+The tests covered:
 
 - 1005-object recursive LIST through 28 non-aggregated ListObjectsV2 pages,
   exact GET, complete FUSE enumeration and byte comparison at the first,
@@ -89,7 +103,10 @@ The seven tests covered:
   descriptor retained its attributes but reads returned stale errors and a
   fresh SIGHUP observation exposed the replacement or absence;
 - unversioned and versioned conditional create, replace and delete primitives,
-  concurrent races, stale delete protection and missing-key behavior.
+  concurrent races, stale delete protection and missing-key behavior;
+- zero-length trailing-slash markers as visible directories and data-bearing
+  markers as complete-observation errors in both versioning modes, with raw
+  exact GET and inventory bytes preserved.
 
 ### Complete LIST evidence
 
@@ -168,20 +185,24 @@ The raw runner log is retained outside the repository at:
 
 ```text
 /Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/Q-real-s3-ddd70b6-r5.log
+/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/Q-real-s3-marker-c5a010d-r1.log
 ```
 
 It contains the source SHA, exact tests, observed request outcomes, page
 sizes, key-set digests, pass count and timestamps. Its SHA-256 is
 `06f4b873173dff70088c5afd6a1620fcd2d613cc560e02dbee4f06ba7932ba88`.
+The marker-only log's SHA-256 is
+`da7a89ca70e472e90df0733a70f78a09d20b5328bf79a53e4c59b8e8af8e21fd`.
 The retained fixture manifest, role trust and inline-policy documents are
 siblings with filenames beginning `Q-fixture-manifest`, `Q-aws-role-trust` and
 `Q-aws-role-policy`.
 
-After the suite, both buckets had zero current keys and zero retained
-version/delete-marker entries. No `yy` process or `fuse.yinyang` mount remained.
-The versioned bucket still reported `Status=Enabled`; the unversioned bucket's
-GetBucketVersioning response remained empty. EC2 and the unrelated Silo
-fixture remain running.
+Every Q fixture prefix returned zero current keys and zero retained
+version/delete-marker entries after its case. The shared buckets remain
+available to other consumers and may contain their objects. The versioned
+bucket still reported `Status=Enabled`; the never-versioned bucket still
+returned an empty GetBucketVersioning body. No `yy` process or `fuse.yinyang`
+mount remained. EC2 and the unrelated Silo fixture remain running.
 
 ## Limits
 
