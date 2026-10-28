@@ -47,6 +47,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
 const BASE_BYTES: &[u8] = b"fd1338c installed base bytes\n";
 const FROZEN_BYTES: &[u8] = b"fd1338c frozen upgrade bytes\n";
 const PENDING_BYTES: &[u8] = b"fd1338c pending upgrade bytes\n";
+const SYNC_BASE: &[u8] = b"fd1338c installed Sync base\n";
 const SYNC_V1: &[u8] = b"fd1338c sync upgrade version one\n";
 const SYNC_V2: &[u8] = b"target-local sync version two\n";
 const SERVICE_BYTES: &[u8] = b"fd1338c service WAL bytes\n";
@@ -284,6 +285,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         "object",
         None,
     );
+    fs::create_dir_all(&sync_directory).expect("create installed Sync directory");
     run_ok(
         volume_command(&current_yy, &storage, &sync_root, &sync_config, None).args([
             "sync",
@@ -293,6 +295,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         ]),
         "fd1338c bind installed Sync directory",
     );
+    fs::write(sync_directory.join("hello.txt"), SYNC_BASE).expect("write Sync base");
     run_ok(
         volume_command(&current_yy, &storage, &sync_root, &sync_config, None).args(["sync", "run"]),
         "fd1338c initial installed Sync",
