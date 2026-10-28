@@ -181,6 +181,9 @@ Every process-local `ObjectEntry` receives a random `DirectObjectId` once. All
 handles sharing that entry return the same `object_id()` even when the entry is
 rebound to a newer DirectId; independently retained old/new pin entries return
 different ObjectIds. The value is coordination metadata, not durable state.
+`DirectFileHandle::id()` may therefore change on a clean-pin rebind; callers
+that cache process-local views by shared entry must use `object_id()`, not the
+snapshot DirectId.
 
 Every successful local write, append or truncate:
 

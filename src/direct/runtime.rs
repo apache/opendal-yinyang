@@ -1049,7 +1049,7 @@ impl DirectRuntime {
             .await?;
         self.persist_staged_mutation(&mutation)?;
         let mutation = self.dispatch_destination(mutation, &input).await?;
-        Ok(status_from_mutation(&mutation)?)
+        status_from_mutation(&mutation)
     }
 
     /// Safe-save a file: conditionally publish the destination from pinned
@@ -1082,7 +1082,7 @@ impl DirectRuntime {
         } else {
             mutation
         };
-        Ok(status_from_mutation(&mutation)?)
+        status_from_mutation(&mutation)
     }
 
     /// Observe the current endpoints of one retained mutation without dispatch.
@@ -1139,15 +1139,10 @@ impl DirectRuntime {
                 MUTATION_KIND_PUBLISH | MUTATION_KIND_CREATE | MUTATION_KIND_COPY,
                 DirectMutationState::Unknown,
             ) => self.retry_destination(mutation).await?,
-            (MUTATION_KIND_RENAME, state)
-                if matches!(
-                    state,
-                    DirectMutationState::DestinationApplied
-                        | DirectMutationState::PendingSourceCleanup
-                ) =>
-            {
-                self.cleanup_rename_source(mutation).await?
-            }
+            (
+                MUTATION_KIND_RENAME,
+                DirectMutationState::DestinationApplied | DirectMutationState::PendingSourceCleanup,
+            ) => self.cleanup_rename_source(mutation).await?,
             (MUTATION_KIND_RENAME, DirectMutationState::Staged) => {
                 let mutation = self.verify_mutation_input_or_fail(mutation)?;
                 let input = guard(store).input_path(mutation.id);
@@ -1471,13 +1466,13 @@ impl DirectRuntime {
             ));
         }
         let store = self.store.as_ref().expect("writable runtime has a store");
-        if let Some(record) = { guard(store).object(source_key.as_str())? } {
-            if record.state != 0 || record.generation != record.durable_generation {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "Direct source has local edits; flush or discard them before rename/copy",
-                ));
-            }
+        if let Some(record) = { guard(store).object(source_key.as_str())? }
+            && (record.state != 0 || record.generation != record.durable_generation)
+        {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "Direct source has local edits; flush or discard them before rename/copy",
+            ));
         }
         if { guard(store).object(destination_key.as_str())? }.is_some() {
             return Err(Error::new(
@@ -1802,20 +1797,18 @@ impl DirectRuntime {
             }
         }
         drop(candidates);
-        if let Some(store) = &self.store {
-            let record = { guard(store).object(key.as_str())? };
-            if let Some(record) = record
-                && record.state != 0
-            {
-                let entry = entry_from_record(store, record)?;
-                return Ok(self
-                    .objects
-                    .lock()
-                    .await
-                    .entry(entry.identity.id())
-                    .or_insert_with(|| entry.clone())
-                    .clone());
-            }
+        if let Some(store) = &self.store
+            && let Some(record) = { guard(store).object(key.as_str())? }
+            && record.state != 0
+        {
+            let entry = entry_from_record(store, record)?;
+            return Ok(self
+                .objects
+                .lock()
+                .await
+                .entry(entry.identity.id())
+                .or_insert_with(|| entry.clone())
+                .clone());
         }
 
         let file = snapshot.open_file(node.id()).await?;
@@ -1834,7 +1827,7 @@ impl DirectRuntime {
             entry.identity.rebind_id(node.id());
             entry.identity.existed_remote.store(true, Ordering::SeqCst);
             if let Some(store) = &self.store {
-                let record = record_from_entry(&entry, &inner);
+                let record = record_from_entry(entry, &inner);
                 guard(store).put_object(&record)?;
             }
             let mut objects = self.objects.lock().await;
@@ -2304,7 +2297,7 @@ impl DirectFileHandle {
     pub async fn append(&self, bytes: &[u8]) -> Result<u64> {
         self.require_writable()?;
         if bytes.is_empty() {
-            return Ok(self.len().await?);
+            return self.len().await;
         }
         let mut inner = self.entry.inner.lock().await;
         if inner.state == DirectObjectState::Discarded {
