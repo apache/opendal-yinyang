@@ -32,6 +32,7 @@ pub struct TestState {
     pub objects: BTreeMap<String, StoredObject>,
     pub next_revision: u64,
     pub fail_after_head_write: bool,
+    pub fail_next_write_response: bool,
     pub stat_calls: u64,
     pub head_stat_calls: u64,
     pub fail_data_close: bool,
@@ -83,6 +84,10 @@ impl TestBackend {
             .fail_next_head_write_and_go_offline = true;
     }
 
+    pub fn lose_next_write_response(&self) {
+        self.state.lock().unwrap().fail_next_write_response = true;
+    }
+
     pub fn stat_calls(&self) -> u64 {
         self.state.lock().unwrap().stat_calls
     }
@@ -111,7 +116,7 @@ impl Service for TestService {
     type Reader = TestReader;
     type Writer = TestWriter;
     type Lister = ();
-    type Deleter = ();
+    type Deleter = oio::OneShotDeleter<TestDeleter>;
     type Copier = ();
     type Composer = ();
 
@@ -128,6 +133,8 @@ impl Service for TestService {
             write_can_empty: true,
             write_with_if_match: true,
             write_with_if_not_exists: true,
+            delete: true,
+            delete_with_if_match: true,
             shared: true,
             ..Default::default()
         }
@@ -185,7 +192,9 @@ impl Service for TestService {
     }
 
     fn delete(&self, _: &OperationContext) -> opendal::Result<Self::Deleter> {
-        Err(unsupported())
+        Ok(oio::OneShotDeleter::new(TestDeleter {
+            state: self.state.clone(),
+        }))
     }
 
     fn list(&self, _: &OperationContext, _: &str, _: OpList) -> opendal::Result<Self::Lister> {
@@ -334,6 +343,13 @@ impl oio::Write for TestWriter {
         }
         let metadata = metadata(&object);
         state.objects.insert(self.path.clone(), object);
+        if state.fail_next_write_response {
+            state.fail_next_write_response = false;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "write response was lost",
+            ));
+        }
         if self.path.contains("/packs/")
             && let Some(path) = state.file_to_change_on_data_close.take()
         {
@@ -363,6 +379,33 @@ impl oio::Write for TestWriter {
             self.state.lock().unwrap().data_aborts += 1;
         }
         self.bytes.clear();
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct TestDeleter {
+    state: Arc<Mutex<TestState>>,
+}
+
+impl oio::OneShotDelete for TestDeleter {
+    async fn delete_once(&self, path: String, args: OpDelete) -> opendal::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.offline {
+            return Err(unavailable());
+        }
+        if let Some(etag) = args.if_match()
+            && state
+                .objects
+                .get(&path)
+                .is_none_or(|object| object.etag != etag)
+        {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::ConditionNotMatch,
+                "ETag does not match",
+            ));
+        }
+        state.objects.remove(&path);
         Ok(())
     }
 }
