@@ -32,13 +32,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const STORAGE_ENV: [&str; 5] = [
-    "YINYANG_S3_BUCKET",
-    "YINYANG_S3_ENDPOINT",
-    "YINYANG_S3_REGION",
-    "YINYANG_S3_ACCESS_KEY_ID",
-    "YINYANG_S3_SECRET_ACCESS_KEY",
-];
 const STORAGE_ENV_WITH_SESSION: [&str; 6] = [
     "YINYANG_S3_BUCKET",
     "YINYANG_S3_ENDPOINT",
