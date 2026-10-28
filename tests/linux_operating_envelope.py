@@ -1182,26 +1182,11 @@ class Harness:
         }
         self.report["phase"] = "steady-state-two"
         second = self.run_phase("steady-state-two", second_duration, expected)
-        self.verify_mount_bytes(expected)
-        self.report["phase"] = "final-stop"
-        stopped_two = self.mount.stop(self.redact)
-        final_verify = self.verify_bytes("final", expected)
-        final_history = self.remote_history(time.monotonic() - self.report_started)
-        integrity = self.sqlite_integrity()
-        doctor = self.doctor()
-        self.finalize_statistics()
         self.report["phases"] = {
             "steady-state-one": first,
             "steady-state-two": second,
         }
-        self.report["completion"] = {
-            "clean_unmounts": [stopped_one, stopped_two],
-            "restart_restore": first_verify,
-            "final_restore": final_verify,
-            "final_remote_history": final_history,
-            "sqlite": integrity,
-            "doctor": doctor,
-        }
+        self.finalize_statistics()
         self.report["request_accounting"] = self.request_accounting
         uncertain_files = sorted(
             set(first["writers"]["uncertain_files"])
@@ -1219,6 +1204,21 @@ class Harness:
                 + second["writers"]["fsync_errors"]
             ),
         }
+        self.verify_mount_bytes(expected)
+        self.report["phase"] = "final-stop"
+        stopped_two = self.mount.stop(self.redact)
+        completion = {
+            "clean_unmounts": [stopped_one, stopped_two],
+            "restart_restore": first_verify,
+        }
+        self.report["completion"] = completion
+        final_verify = self.verify_bytes("final", expected)
+        completion["final_restore"] = final_verify
+        completion["final_remote_history"] = self.remote_history(
+            time.monotonic() - self.report_started
+        )
+        completion["sqlite"] = self.sqlite_integrity()
+        completion["doctor"] = self.doctor()
         if uncertain_files:
             self.report["status"] = "fail"
             raise EnvelopeError(
