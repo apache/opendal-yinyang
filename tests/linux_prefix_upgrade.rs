@@ -20,8 +20,10 @@
 #![cfg(target_os = "linux")]
 
 #[path = "support/raw_s3.rs"]
+#[allow(dead_code)]
 mod raw_s3;
 #[path = "support/s3_gate.rs"]
+#[allow(dead_code)]
 mod s3_gate;
 
 use borsh::BorshDeserialize;

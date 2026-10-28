@@ -84,7 +84,10 @@ tagging or publishing it:
 ```shell
 mkdir -p /var/tmp/yinyang-artifacts
 tools/linux/package-release.sh --output-dir /var/tmp/yinyang-artifacts
-sha256sum -c /var/tmp/yinyang-artifacts/*.tar.gz.sha256
+(
+  cd /var/tmp/yinyang-artifacts
+  sha256sum -c ./*.tar.gz.sha256
+)
 ```
 
 The archive contains `bin/yy`, the three systemd user-unit templates, the

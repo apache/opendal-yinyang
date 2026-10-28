@@ -596,6 +596,7 @@ class Harness:
         self.report["samples"] = self.samples
         self.report["history_samples"] = self.history_samples
         self.report["workdir"] = str(self.work)
+        self.report["backend"]["storage_root"] = self.root
 
     def redact(self, text: str) -> str:
         output = text
@@ -1197,5 +1198,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda _signum, _frame: (_ for _ in ()).throw(KeyboardInterrupt()))
+    def interrupt(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
     sys.exit(main())
