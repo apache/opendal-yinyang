@@ -615,7 +615,7 @@ fn direct_write_safe_save_retries_source_cleanup_without_atomic_rename_claim() {
     let source_for_thread = source.clone();
     let destination_for_thread = destination.clone();
     let rename = thread::spawn(move || fs::rename(source_for_thread, destination_for_thread));
-    let intercepted = gate.wait_intercepted();
+    let intercepted = gate.wait_intercepted_for(Duration::from_secs(30));
     assert_eq!(intercepted.method, "DELETE");
     assert!(
         intercepted.target.contains("/safe.txt.tmp"),
@@ -911,7 +911,7 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
         let result = file.sync_all();
         (file, result)
     });
-    let intercepted = gate.wait_intercepted();
+    let intercepted = gate.wait_intercepted_for(Duration::from_secs(60));
     assert_eq!(intercepted.method, "PUT");
     assert!(
         intercepted.target.contains("/uncertain.txt"),

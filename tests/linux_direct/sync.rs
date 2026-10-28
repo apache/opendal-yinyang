@@ -532,7 +532,7 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
         command
     };
     let mut running = RunningCommand::spawn(command);
-    let intercepted = gate.wait_intercepted();
+    let intercepted = gate.wait_intercepted_for(Duration::from_secs(60));
     assert_eq!(intercepted.method, "PUT");
     assert!(
         intercepted.header("if-match").is_some(),
