@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -172,14 +173,13 @@ pub enum DirectFlushOutcome {
     },
 }
 
-#[derive(Clone)]
 struct ObjectIdentity {
     id: DirectId,
     key: DirectKey,
     path: String,
     parent: DirectId,
     name: String,
-    existed_remote: bool,
+    existed_remote: AtomicBool,
 }
 
 struct ObjectEntry {
@@ -283,7 +283,7 @@ impl DirectRuntime {
             .cloned()
             .collect::<Vec<_>>();
         for entry in entries {
-            let status = status_from_entry(entry).await;
+            let status = status_from_entry(&entry).await;
             if status.state != DirectObjectState::Clean || !status.existed_remote {
                 statuses.insert(status.id, status);
             }
@@ -475,7 +475,7 @@ impl DirectRuntime {
             path,
             parent,
             name: name.to_owned(),
-            existed_remote: false,
+            existed_remote: AtomicBool::new(false),
         };
         let inner = ObjectInner {
             remote: None,
@@ -570,7 +570,7 @@ impl DirectRuntime {
                 Error::new(ErrorKind::Invalid, "file node does not have a parent")
             })?,
             name: node.name().to_owned(),
-            existed_remote: true,
+            existed_remote: AtomicBool::new(true),
         };
         let inner = ObjectInner {
             remote: Some(file),
@@ -762,7 +762,7 @@ impl DirectRuntime {
 
         let destination = endpoint_from_identity(&entry.identity, precondition.clone());
         let id = mutation_id.0;
-        let kind = if entry.identity.existed_remote {
+        let kind = if entry.identity.existed_remote.load(Ordering::SeqCst) {
             MUTATION_KIND_PUBLISH
         } else {
             MUTATION_KIND_CREATE
@@ -806,6 +806,7 @@ impl DirectRuntime {
                 mutation.state = MUTATION_APPLIED;
                 mutation.accepted = accepted.as_ref().map(pin_to_record);
                 mutation.error = None;
+                entry.identity.existed_remote.store(true, Ordering::SeqCst);
                 inner.accepted = accepted.clone();
                 inner.observed = DirectObservation::Unavailable {
                     message: "not observed".to_owned(),
@@ -902,7 +903,7 @@ impl DirectFileHandle {
     }
 
     pub fn existed_remote(&self) -> bool {
-        self.entry.identity.existed_remote
+        self.entry.identity.existed_remote.load(Ordering::SeqCst)
     }
 
     pub fn is_writable(&self) -> bool {
@@ -1111,7 +1112,7 @@ fn entry_from_record(store: &Arc<Mutex<Store>>, record: ObjectRecord) -> Result<
         path: record.path,
         parent: DirectId::from_bytes(record.parent),
         name: record.name,
-        existed_remote: record.existed_remote,
+        existed_remote: atomic_bool(record.existed_remote),
     };
     let inner = ObjectInner {
         remote: None,
@@ -1138,7 +1139,7 @@ fn record_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> ObjectRecord {
         path: entry.identity.path.clone(),
         parent: *entry.identity.parent.as_bytes(),
         name: entry.identity.name.clone(),
-        existed_remote: entry.identity.existed_remote,
+        existed_remote: entry.identity.existed_remote.load(Ordering::SeqCst),
         precondition: precondition_to_record(
             inner
                 .precondition
@@ -1167,7 +1168,7 @@ async fn status_from_entry(entry: &ObjectEntry) -> DirectObjectStatus {
         name: entry.identity.name.clone(),
         length: inner.length,
         state: inner.state,
-        existed_remote: entry.identity.existed_remote,
+        existed_remote: entry.identity.existed_remote.load(Ordering::SeqCst),
         generation: inner.generation,
         precondition: inner.precondition.clone(),
         accepted: inner.accepted.clone(),
@@ -1390,6 +1391,10 @@ fn observation_from_record(value: ObservationRecord) -> DirectObservation {
         ObservationRecord::Missing => DirectObservation::Missing,
         ObservationRecord::Unavailable(message) => DirectObservation::Unavailable { message },
     }
+}
+
+fn atomic_bool(value: bool) -> AtomicBool {
+    AtomicBool::new(value)
 }
 
 fn freeze_object(file: &mut File, temporary: &Path, target: &Path) -> Result<(u64, [u8; 32])> {
