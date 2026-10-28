@@ -720,7 +720,7 @@ fn sqlite_execute(database: &Path, sql: &str) {
 }
 
 fn assert_profile_rejection(temp: &Path, args: &[&str], local: Option<&Path>) {
-    let before = local.map(|path| tree_hashes(path));
+    let before = local.map(tree_hashes);
     let mut command = Command::new(current_binary());
     command.args(args);
     command.current_dir(temp);
