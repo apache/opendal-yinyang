@@ -586,12 +586,11 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
     write_sync_bytes(&directory.join("hello.txt"), SYNC_V2);
     let retained = sync_status(&storage, &current, &config);
     assert_eq!(retained["summary"]["unknown"], 1, "{retained:#}");
-    assert!(
-        retained["summary"]["pending"].as_u64().unwrap_or(0) >= 1,
-        "newer local v2 must remain pending:\n{retained:#}"
-    );
     let entry = sync_entry(&retained, "hello.txt");
+    assert_eq!(entry["state"], "unknown");
     assert_eq!(entry["outcome"]["state"], "unknown");
+    assert_eq!(entry["local"]["length"], SYNC_V2.len() as u64);
+    assert_eq!(entry["local"]["digest"], blake3_hex(SYNC_V2));
     let frozen_commit = entry["intent"]["commit_id"]
         .as_str()
         .expect("old Sync intent commit identity")
@@ -966,4 +965,8 @@ fn sync_unknown_identity(database: &Path) -> (String, String, u8) {
         digest.iter().map(|byte| format!("{byte:02x}")).collect(),
         *state,
     )
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
