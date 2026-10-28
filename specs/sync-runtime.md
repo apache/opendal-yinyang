@@ -99,10 +99,26 @@ The required interleavings are:
 
 The dedicated directory contains `sync.db` (SQLite WAL, `synchronous=FULL`) and
 `content/` (the existing runtime's durable staging and exclusive process lock).
-Profile `yinyang-sync-2` binds the journal to one filesystem. Opening a valid
-`yinyang-sync-1` journal upgrades it in place without dropping content edit
-records. A mismatched filesystem or unknown profile is an error. Keep both
-databases and their WALs together.
+Profile `yinyang-sync-2` binds the journal to one filesystem. Its exact schema is
+`binding`, `edits`, and `namespaces`; the maintained positional writers make
+ordered columns part of that signature. Profile `yinyang-sync-1` is the known
+two-table schema `binding` and `edits`.
+
+A writer validates both the journal and existing staging database read-only
+before changing either component. A valid sync-1 journal is then upgraded in one
+SQLite transaction by creating `namespaces` and advancing the profile to
+sync-2; content mappings, staged bytes, frozen requests, and receipts are not
+rewritten. A sync-2 journal is validated without DDL. Unknown profiles or
+missing/extra/reordered maintained columns fail before WAL configuration, DDL,
+staging migration, or incomplete-content cleanup. A missing filesystem binding
+or mismatched filesystem remains an error.
+
+Opening through `DirectorySync` preflights existing replica, Sync, and content
+staging state as a group before replica upgrade or recovery starts. Inspect and
+backup validation accept sync-1 or sync-2 without migration or a writer lease.
+Keep both databases and their WALs together. Older binaries do not accept a
+state that requires their own unsupported newer profile; downgrade is not
+inferred.
 
 The content edit table maps 32-byte EditIds to 16-byte staged handle IDs. A
 mapping is committed only after all local bytes are accepted; publication is

@@ -1,14 +1,15 @@
 # Linux backup and isolated recovery
 
-**Status: experimental, same-version, quiesced backup and restore.**
+**Status: experimental, quiesced backup and bounded local-profile restore.**
 
 This procedure preserves one consistent point in time across the YinYang
 object metadata, immutable content, metadata-service database, local Mount/Sync
 state, retained artifacts, and publication journals. It is not an online
 snapshot protocol: every writer must be stopped before the backup begins.
 
-Restore the package with the same YinYang commit and the same local and SQLite
-profiles used to create it. Cross-version migration and downgrade are not
+Restore a `YYBK0001` package with supported local and SQLite profiles. The
+bounded `fd1338c2` local-state transition may be upgraded by the normal writer
+after isolated copy. General cross-version migration and downgrade are not
 provided.
 
 ## Freeze writers
@@ -119,8 +120,8 @@ The SQLite files are created with `VACUUM INTO`, not by copying a live main
 database. `manifest.bin` records the filesystem identity, the complete
 quiesced local snapshot with content hashes, each retained artifact's current
 tree and hash, the SQLite file hashes, and the original filesystem identities.
-It is an experimental same-version package format, not a public migration or
-online replication format.
+It is an experimental package format, not a public migration or online
+replication format.
 
 The backup command refuses a destination inside the synchronized root or
 state, refuses a non-terminal local install, and verifies the copied files
@@ -207,9 +208,10 @@ these paths with real `yy` processes and an isolated S3-compatible authority.
 
 ## Limits
 
-This is a quiesced, same-version procedure. It does not provide online
-consistency, distributed leases, backup encryption, deduplication, garbage
-collection, cross-version migration, or a promise that a copied database is
-usable without its immutable content prefix. A filesystem copy must preserve
-the supported filesystem semantics; use isolated restoration rather than
-overwriting a live root.
+This is a quiesced procedure with only the local-state compatibility explicitly
+documented for `fd1338c2`. It does not provide online consistency, distributed
+leases, backup encryption, deduplication, garbage collection, general
+cross-version migration, or a promise that a copied database is usable without
+its immutable content prefix. A filesystem copy must preserve the supported
+filesystem semantics; use isolated restoration rather than overwriting a live
+root.
