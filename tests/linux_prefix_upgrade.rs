@@ -515,7 +515,11 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     assert_eq!(target_sync["summary"]["unknown"], 1, "{target_sync:#}");
     let entry = sync_entry(&target_sync, "hello.txt");
     assert_eq!(entry["state"], "unknown");
-    assert_eq!(entry["intent"]["commit_id"], sync_commit.as_str());
+    assert_eq!(
+        entry["intent"]["commit_id"],
+        sync_commit.replace('-', ""),
+        "Sync status and frozen transaction must name the same CommitId"
+    );
     assert_eq!(
         fs::read(sync_directory.join("hello.txt")).expect("read target local Sync bytes"),
         SYNC_V2
