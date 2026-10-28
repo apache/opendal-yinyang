@@ -8,8 +8,7 @@ and reads existing objects without creating YinYang metadata, Managed NodeIds,
 content proofs, transactions or Managed identities. This specification defines
 the read-only observation and FUSE contract. The separate
 [Direct mutation runtime](direct-mutations.md) defines conditional publication,
-retained local generations and safe-save namespace mutation. Writable FUSE
-admission and Direct Sync remain separate integration work.
+retained local generations and safe-save namespace mutation.
 
 ## Configuration and admission
 
@@ -199,8 +198,11 @@ admission before observing storage. `yy --volume CONFIG status` reports a
 Direct observation summary without creating staging state.
 
 `yy --volume CONFIG doctor` validates admission, recursively observes the
-namespace, and reports `namespace` health. It does not create a staging path,
-staging database, metadata database, publication lease or remote object.
+namespace, and reports `namespace` health. Writable Direct Mount additionally
+inspects its runtime profile read-only. Direct Sync additionally inspects its
+SQLite binding and persisted pending, Unknown and conflict state read-only.
+Doctor does not create a staging path, staging database, metadata database,
+publication lease or remote object, and does not run recovery.
 
 ## Limits
 
@@ -222,6 +224,6 @@ staging database, metadata database, publication lease or remote object.
 - Direct does not provide rename-stable identity, hard links, symlinks, xattrs,
   distributed locks, cross-client or cross-object transactions, version
   browsing, automatic garbage collection or Managed receipts.
-- Writable FUSE admission, Direct Sync, non-Linux Direct FUSE and filesystem
-  directory atomicity remain future integration work. The mutation library's
-  file rename is explicitly non-atomic safe-save.
+- Non-Linux Direct FUSE and filesystem directory atomicity remain future
+  integration work. The mutation library's file rename is explicitly
+  non-atomic safe-save.

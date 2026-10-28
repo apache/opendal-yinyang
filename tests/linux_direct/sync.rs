@@ -23,6 +23,7 @@ use crate::harness::{
 use crate::s3_gate::{CommitAction, S3Gate};
 use serde_json::{Value, json};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -64,6 +65,15 @@ fn sync_status_at(fixture: &Fixture, config: &Path, endpoint: Option<&str>) -> V
     let status: Value = serde_json::from_slice(&output.stdout).expect("Direct Sync status JSON");
     assert_eq!(status["schema"], "yinyang.direct-sync.status.v1");
     status
+}
+
+fn doctor_check<'a>(document: &'a Value, name: &str) -> &'a Value {
+    document["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("doctor omitted {name:?}: {document:#}"))
 }
 
 fn run_sync_command(
@@ -286,6 +296,127 @@ fn direct_sync_conflicts_export_and_explicit_resolution() {
         Some(b"second remote side".as_slice())
     );
     assert_in_sync(&sync_status(&fixture, &config));
+}
+
+#[test]
+#[ignore = "requires isolated S3; run with cargo x test-linux-direct"]
+fn direct_sync_doctor_reports_persisted_state_without_mount_assumptions() {
+    let fixture = Fixture::new();
+    let state = fixture.path("direct-sync-doctor-state");
+    let config = sync_config(&fixture, "direct-sync-doctor", &state);
+    let local = fixture.path("direct-sync-doctor-local");
+    fs::create_dir(&local).expect("create Direct Sync doctor local root");
+    fs::write(local.join("shared.txt"), b"baseline").expect("write Direct Sync doctor baseline");
+    fixture
+        .yy_ok(&[
+            "--volume",
+            path_text(&config),
+            "sync",
+            "init",
+            "--directory",
+            path_text(&local),
+        ])
+        .success_or("Direct Sync doctor init");
+    sync_run(&fixture, &config);
+
+    fs::write(local.join("shared.txt"), b"local side").expect("write local doctor conflict");
+    fixture.write_raw("shared.txt", b"remote side");
+    sync_run(&fixture, &config);
+    let status = sync_status(&fixture, &config);
+    assert_eq!(status["summary"]["conflicts"], 1, "{status:#}");
+    let before_inventory = fixture.inventory();
+    let before_local = fs::read(local.join("shared.txt")).expect("read local doctor conflict");
+
+    let doctor = fixture.yy(&["--volume", path_text(&config), "doctor", "--json"]);
+    assert!(doctor.status.success(), "{}", doctor.text());
+    let value: Value = serde_json::from_slice(&doctor.stdout).expect("Direct Sync doctor JSON");
+    assert_eq!(value["schema"], "yinyang.operational-health.v1");
+    assert_eq!(value["status"], "pass", "{value:#}");
+    let sync_state = doctor_check(&value, "sync-state");
+    assert_eq!(sync_state["status"], "info", "{value:#}");
+    let detail = sync_state["detail"].as_str().expect("sync-state detail");
+    assert!(detail.contains("conflicts=1"), "{value:#}");
+    assert!(detail.contains("unknown=0"), "{value:#}");
+    assert!(
+        !value["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .any(|check| check["name"] == "mount-state"),
+        "Direct Sync doctor used a Mount-runtime state check: {value:#}"
+    );
+    assert_eq!(fixture.inventory(), before_inventory);
+    assert_eq!(
+        fs::read(local.join("shared.txt")).expect("read local doctor conflict after doctor"),
+        before_local
+    );
+    assert_eq!(
+        sync_status(&fixture, &config)["summary"]["conflicts"],
+        1,
+        "doctor changed Direct Sync conflict state"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated S3; run with cargo x test-linux-direct"]
+fn direct_sync_doctor_rejects_unrepresentable_state_without_effects() {
+    let private_fixture = Fixture::new();
+    let private_state = private_fixture.path("direct-sync-doctor-private-state");
+    fs::create_dir(&private_state).expect("create private Direct Sync doctor state");
+    fs::set_permissions(&private_state, fs::Permissions::from_mode(0o755))
+        .expect("make Direct Sync doctor state non-private");
+    let private_config = sync_config(
+        &private_fixture,
+        "direct-sync-doctor-private",
+        &private_state,
+    );
+    let private_local = private_fixture.path("direct-sync-doctor-private-local");
+    fs::create_dir(&private_local).expect("create private Direct Sync doctor local root");
+    let private_report =
+        private_fixture.yy(&["--volume", path_text(&private_config), "doctor", "--json"]);
+    let private_value: Value =
+        serde_json::from_slice(&private_report.stdout).expect("private Direct Sync doctor JSON");
+    assert_ne!(private_value["status"], "pass", "{private_value:#}");
+    let private_state_check = doctor_check(&private_value, "sync-state");
+    assert_eq!(
+        private_state_check["status"], "action_required",
+        "{private_value:#}"
+    );
+    assert!(
+        private_state_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("group or other")),
+        "{private_value:#}"
+    );
+    assert!(!private_state.join("direct-sync.db").exists());
+
+    let marker_fixture = Fixture::new();
+    let marker_state = marker_fixture.path("direct-sync-doctor-marker-state");
+    let marker_config = sync_config(&marker_fixture, "direct-sync-doctor-marker", &marker_state);
+    let marker_local = marker_fixture.path("direct-sync-doctor-marker-local");
+    fs::create_dir(&marker_local).expect("create marker Direct Sync doctor local root");
+    marker_fixture.write_raw("empty/", b"");
+    let marker_report =
+        marker_fixture.yy(&["--volume", path_text(&marker_config), "doctor", "--json"]);
+    let marker_value: Value =
+        serde_json::from_slice(&marker_report.stdout).expect("marker Direct Sync doctor JSON");
+    assert_ne!(marker_value["status"], "pass", "{marker_value:#}");
+    let marker_namespace = doctor_check(&marker_value, "namespace");
+    assert_eq!(
+        marker_namespace["status"], "action_required",
+        "{marker_value:#}"
+    );
+    assert!(
+        marker_namespace["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("empty directory markers")),
+        "{marker_value:#}"
+    );
+    assert!(!marker_state.join("direct-sync.db").exists());
+    assert_eq!(
+        marker_fixture.raw_get("empty/").as_deref(),
+        Some(b"".as_slice())
+    );
 }
 
 fn assert_explicit_directory_boundary(status: &Value, path: &str, context: &str) {

@@ -95,6 +95,14 @@ fn operator() -> Result<opendal::Operator, opendal::Error> {
 }
 
 fn admit(config: &VolumeConfig) -> Result<DirectRemoteAdapter, Box<dyn std::error::Error>> {
+    let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
+    remote_adapter(config, operator)
+}
+
+pub(crate) fn remote_adapter(
+    config: &VolumeConfig,
+    operator: opendal::Operator,
+) -> Result<DirectRemoteAdapter, Box<dyn std::error::Error>> {
     if config.model != Model::Direct
         || config.access != Access::Sync
         || config.frontend != Frontend::Library
@@ -109,7 +117,6 @@ fn admit(config: &VolumeConfig) -> Result<DirectRemoteAdapter, Box<dyn std::erro
     if config.staging.as_os_str().is_empty() {
         return Err("Direct Sync requires a non-empty staging path".into());
     }
-    let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
     config.validate(&operator)?;
     let binding = storage_binding(config, &operator)?;
     let namespace = yinyang::volume::direct_namespace(config, operator)?;

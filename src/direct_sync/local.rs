@@ -43,6 +43,63 @@ pub(super) struct LocalTree {
     _lease: std::fs::File,
 }
 
+pub(super) struct ExistingBinding {
+    pub root: PathBuf,
+    pub root_identity: Identity,
+    pub state_identity: Identity,
+}
+
+struct ExistingPaths {
+    root: PathBuf,
+    state: PathBuf,
+    root_fd: OwnedFd,
+    state_fd: OwnedFd,
+    root_identity: Identity,
+    state_identity: Identity,
+}
+
+fn open_existing_paths(root: &Path, state: &Path) -> Result<ExistingPaths> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| Error::io("canonicalize Direct Sync root", root, error))?;
+    let state = std::fs::canonicalize(state)
+        .map_err(|error| Error::io("canonicalize Direct Sync state", state, error))?;
+    validate_private_state(&state)?;
+    if root == state || root.starts_with(&state) || state.starts_with(&root) {
+        return Err(Error::invalid(format!(
+            "Direct Sync root {} and state {} must not contain one another",
+            root.display(),
+            state.display()
+        )));
+    }
+    let root_fd = open(
+        &root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::errno("open Direct Sync root", &root, error))?;
+    let state_fd = open(
+        &state,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::errno("open Direct Sync state", &state, error))?;
+    let root_identity = identity(&root_fd, &root, "inspect Direct Sync root")?;
+    let state_identity = identity(&state_fd, &state, "inspect Direct Sync state")?;
+    if root_identity.dev != state_identity.dev {
+        return Err(Error::unsupported(
+            "Direct Sync root and state must share a filesystem for atomic local installs",
+        ));
+    }
+    Ok(ExistingPaths {
+        root,
+        state,
+        root_fd,
+        state_fd,
+        root_identity,
+        state_identity,
+    })
+}
+
 impl LocalTree {
     pub fn create(root: &Path, state: &Path) -> Result<Self> {
         prepare_directory(root, "create Direct Sync root")?;
@@ -51,37 +108,14 @@ impl LocalTree {
     }
 
     pub fn open(root: &Path, state: &Path) -> Result<Self> {
-        let root = std::fs::canonicalize(root)
-            .map_err(|error| Error::io("canonicalize Direct Sync root", root, error))?;
-        let state = std::fs::canonicalize(state)
-            .map_err(|error| Error::io("canonicalize Direct Sync state", state, error))?;
-        validate_private_state(&state)?;
-        if root == state || root.starts_with(&state) || state.starts_with(&root) {
-            return Err(Error::invalid(format!(
-                "Direct Sync root {} and state {} must not contain one another",
-                root.display(),
-                state.display()
-            )));
-        }
-        let root_fd = open(
-            &root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| Error::errno("open Direct Sync root", &root, error))?;
-        let state_fd = open(
-            &state,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| Error::errno("open Direct Sync state", &state, error))?;
-        let root_identity = identity(&root_fd, &root, "inspect Direct Sync root")?;
-        let state_identity = identity(&state_fd, &state, "inspect Direct Sync state")?;
-        if root_identity.dev != state_identity.dev {
-            return Err(Error::unsupported(
-                "Direct Sync root and state must share a filesystem for atomic local installs",
-            ));
-        }
+        let ExistingPaths {
+            root,
+            state,
+            root_fd,
+            state_fd,
+            root_identity,
+            state_identity,
+        } = open_existing_paths(root, state)?;
         let _lease = acquire_lease(&state_fd, &state)?;
         let install_fd = open_private_directory(&state_fd, "install", &state)?;
         let artifact_fd = open_private_directory(&state_fd, "artifacts", &state)?;
@@ -94,6 +128,17 @@ impl LocalTree {
             install_fd,
             artifact_fd,
             _lease,
+        })
+    }
+
+    /// Validate an existing root and state without acquiring the writer lease
+    /// or creating any state subdirectories.
+    pub fn inspect_binding(root: &Path, state: &Path) -> Result<ExistingBinding> {
+        let paths = open_existing_paths(root, state)?;
+        Ok(ExistingBinding {
+            root: paths.root,
+            root_identity: paths.root_identity,
+            state_identity: paths.state_identity,
         })
     }
 
