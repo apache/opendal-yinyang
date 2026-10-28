@@ -31,11 +31,20 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+mod binding;
+mod journal;
 mod mutation;
+mod runtime;
 
+pub use binding::DirectStorageBinding;
 pub use mutation::{
     DirectMutation, DirectMutationCapability, DirectMutationOutcome, DirectObjectPin,
-    DirectPrecondition,
+    DirectObservation, DirectPrecondition,
+};
+pub use runtime::{
+    DirectFileHandle, DirectFlushOutcome, DirectMutationEndpoint, DirectMutationId,
+    DirectMutationKind, DirectMutationState, DirectMutationStatus, DirectObjectState,
+    DirectObjectStatus, DirectRuntime,
 };
 
 const NAME_MAX: usize = 255;
@@ -118,7 +127,6 @@ impl DirectId {
         &self.0
     }
 
-    #[cfg(all(test, target_os = "linux"))]
     pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }

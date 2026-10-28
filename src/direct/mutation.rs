@@ -39,6 +39,20 @@ pub struct DirectObjectPin {
 }
 
 impl DirectObjectPin {
+    pub(super) fn from_parts(
+        version: Option<String>,
+        etag: Option<String>,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            version,
+            etag,
+            size,
+            modified,
+        }
+    }
+
     fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             version: pin_value(metadata.version()).map(str::to_owned),
@@ -103,6 +117,30 @@ pub struct DirectMutationCapability {
     pub delete: bool,
 }
 
+/// Explicit evidence observed for a conflict or ambiguous outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectObservation {
+    /// The object exists with this exact storage identity.
+    Present(DirectObjectPin),
+    /// The selected key does not currently exist.
+    Missing,
+    /// No trustworthy observation could be made.
+    Unavailable { message: String },
+}
+
+impl DirectObservation {
+    pub fn present(&self) -> Option<&DirectObjectPin> {
+        match self {
+            Self::Present(pin) => Some(pin),
+            Self::Missing | Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
 /// The observed result of one conditional backend request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectMutationOutcome {
@@ -110,10 +148,10 @@ pub enum DirectMutationOutcome {
     /// write and `None` for a delete.
     Applied { accepted: Option<DirectObjectPin> },
     /// The supplied condition did not hold.
-    Conflict { observed: Option<DirectObjectPin> },
+    Conflict { observed: DirectObservation },
     /// A request may have reached storage, but no definitive outcome is known.
     Unknown {
-        observed: Option<DirectObjectPin>,
+        observed: DirectObservation,
         message: String,
     },
     /// The selected backend does not provide the required native primitive.
@@ -300,12 +338,20 @@ impl DirectMutation {
         }
     }
 
-    async fn observe(&self, key: &DirectKey) -> Option<DirectObjectPin> {
+    async fn observe(&self, key: &DirectKey) -> DirectObservation {
         match self.operator.stat(key.as_str()).await {
             Ok(metadata) if metadata.mode() != opendal::EntryMode::DIR => {
-                Some(DirectObjectPin::from_metadata(&metadata))
+                DirectObservation::Present(DirectObjectPin::from_metadata(&metadata))
             }
-            _ => None,
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
+                DirectObservation::Missing
+            }
+            Ok(_) => DirectObservation::Unavailable {
+                message: "observed Direct key is a directory".to_owned(),
+            },
+            Err(error) => DirectObservation::Unavailable {
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -379,7 +425,7 @@ mod tests {
             .await
             .unwrap();
         let DirectMutationOutcome::Conflict {
-            observed: Some(observed),
+            observed: DirectObservation::Present(observed),
         } = outcome
         else {
             panic!("stale replacement was not a conflict: {outcome:?}");
@@ -411,7 +457,7 @@ mod tests {
             .await
             .unwrap();
         let DirectMutationOutcome::Unknown {
-            observed: Some(observed),
+            observed: DirectObservation::Present(observed),
             ..
         } = outcome
         else {
@@ -440,7 +486,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             outcome,
-            DirectMutationOutcome::Conflict { observed: Some(_) }
+            DirectMutationOutcome::Conflict {
+                observed: DirectObservation::Present(_)
+            }
         ));
         assert_eq!(
             operator.read("objects/file").await.unwrap().to_vec(),
