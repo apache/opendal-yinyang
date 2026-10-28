@@ -771,10 +771,12 @@ class Harness:
         finally:
             os.close(descriptor)
 
-    def prepare(self) -> list[bytearray]:
+    def prepare_authority(self) -> None:
         self.write_config()
         self.yy_run(["create"], timeout=300)
         self.yy_run(["--volume", str(self.config), "capabilities"], timeout=300)
+
+    def create_dataset(self) -> list[bytearray]:
         dataset = [
             bytearray(
                 random.Random(self.args.seed + index).randbytes(self.args.file_bytes)
@@ -1032,8 +1034,9 @@ class Harness:
         self.report["started_at"] = utc_now()
         self.report_started = time.monotonic()
         self.report["phase"] = "mount-start"
+        self.prepare_authority()
         self.mount.start(self.redact)
-        expected = self.prepare()
+        expected = self.create_dataset()
         self.remote_history(time.monotonic() - self.report_started)
         first_duration = self.args.duration_seconds / 2
         second_duration = self.args.duration_seconds - first_duration
