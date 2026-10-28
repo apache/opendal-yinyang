@@ -613,8 +613,8 @@ fn direct_write_rename_conflict_retains_external_destination_before_explicit_ref
     fs::rename(&source, &destination).expect("retry rename after explicit refresh");
     assert_eq!(
         fixture.raw_get("rename-destination.txt").as_deref(),
-        Some(external_destination.as_slice()),
-        "refreshed rename did not preserve the accepted destination bytes"
+        Some(source_bytes.as_slice()),
+        "refreshed rename did not deliberately publish the source bytes"
     );
     assert_eq!(
         fixture.raw_get("rename-source.txt"),
