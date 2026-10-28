@@ -55,16 +55,15 @@ cannot be distinguished by the condition alone.
 
 ## Storage binding
 
-State is bound to the non-secret canonical
-`DirectStorageBinding` for scheme, storage profile, bucket, root and endpoint.
+State is bound to the non-secret `DirectStorageBinding` for scheme, storage
+profile, bucket, root and endpoint.
 The binding stores its 32-byte digest, never credentials. Reusing a state
 directory with another bucket, root, profile or endpoint is rejected before
 recovery, local installation or remote mutation.
 
-The binding canonicalization rejects URL userinfo, query and fragment
-components. The endpoint retains its scheme and case-sensitive path. Provider
-default endpoint selection is represented explicitly rather than by an empty
-or guessed value.
+Binding validation rejects URL userinfo, query and fragment components. The
+endpoint retains its scheme and case-sensitive path. Provider default endpoint
+selection is represented explicitly rather than by an empty or guessed value.
 
 ## Durable baseline
 
@@ -197,8 +196,10 @@ Direct Sync preserves both available sides when:
 - both sides contain files at a new path;
 - a file changed into a directory or a directory into a file;
 - a local edit races a remote materialization;
-- a conditional remote mutation loses its precondition;
-- an `Unknown` result cannot be proven by replay.
+- a prepared conditional remote mutation loses its precondition.
+
+An `Unknown` result remains separately typed from a conflict. Its retained
+input is exportable, and replay or explicit resolution is required.
 
 Conflicts have stable identities derived from the path and observable local and
 remote evidence. Re-detecting the same evidence refreshes the existing record.
