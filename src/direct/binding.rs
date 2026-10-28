@@ -82,17 +82,10 @@ impl DirectStorageBinding {
                 "Direct storage binding endpoint is empty or contains a control character",
             ));
         }
-        if endpoint_has_userinfo(&endpoint) {
+        if endpoint.contains('?') || endpoint.contains('#') || endpoint_has_userinfo(&endpoint) {
             return Err(Error::new(
                 ErrorKind::Invalid,
-                "Direct storage binding endpoint must not contain URL userinfo",
-            ));
-        }
-        let endpoint = endpoint.trim_end_matches('/').to_owned();
-        if endpoint.is_empty() {
-            return Err(Error::new(
-                ErrorKind::Invalid,
-                "Direct storage binding endpoint has no authority",
+                "Direct storage binding endpoint must not contain userinfo, query, or fragment",
             ));
         }
 
@@ -134,11 +127,13 @@ impl DirectStorageBinding {
         &self.endpoint
     }
 
-    pub(super) fn digest(&self) -> [u8; 32] {
+    /// Stable non-secret identity for durable baseline/state associations.
+    pub fn namespace_id(&self) -> [u8; 32] {
         self.digest
     }
 
-    pub(super) fn diagnostic(&self) -> String {
+    /// Canonical diagnostic description without credentials.
+    pub fn description(&self) -> String {
         format!(
             "scheme={} profile={} bucket={} root={} endpoint={}",
             self.scheme, self.profile, self.bucket, self.root, self.endpoint

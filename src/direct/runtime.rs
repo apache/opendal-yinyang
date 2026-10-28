@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -172,14 +173,13 @@ pub enum DirectFlushOutcome {
     },
 }
 
-#[derive(Clone)]
 struct ObjectIdentity {
     id: DirectId,
     key: DirectKey,
     path: String,
     parent: DirectId,
     name: String,
-    existed_remote: bool,
+    existed_remote: AtomicBool,
 }
 
 struct ObjectEntry {
@@ -275,8 +275,15 @@ impl DirectRuntime {
                 }
             }
         }
-        for entry in self.objects.lock().await.values() {
-            let status = status_from_entry(entry).await;
+        let entries = self
+            .objects
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let status = status_from_entry(&entry).await;
             if status.state != DirectObjectState::Clean || !status.existed_remote {
                 statuses.insert(status.id, status);
             }
@@ -448,6 +455,7 @@ impl DirectRuntime {
             precondition: PreconditionRecord::Absent,
             state: OBJECT_STAGED,
             generation: 1,
+            durable_generation: 0,
             length: 0,
             digest: Some(EMPTY_DIGEST),
             accepted: None,
@@ -467,7 +475,7 @@ impl DirectRuntime {
             path,
             parent,
             name: name.to_owned(),
-            existed_remote: false,
+            existed_remote: AtomicBool::new(false),
         };
         let inner = ObjectInner {
             remote: None,
@@ -476,7 +484,7 @@ impl DirectRuntime {
             state: DirectObjectState::Staged,
             length: 0,
             generation: 1,
-            durable_generation: 1,
+            durable_generation: 0,
             digest: Some(EMPTY_DIGEST),
             precondition: Some(DirectPrecondition::Absent),
             accepted: None,
@@ -502,15 +510,38 @@ impl DirectRuntime {
         _writable: bool,
     ) -> Result<Arc<ObjectEntry>> {
         let key = DirectKey::from_storage_key(node.key().expect("file node has key"))?;
-        if let Some(entry) = self
+        if let Some(entry) = self.objects.lock().await.get(&node.id()).cloned() {
+            return Ok(entry);
+        }
+        let candidates = self
             .objects
             .lock()
             .await
             .values()
-            .find(|entry| entry.identity.key == key)
+            .filter(|entry| entry.identity.key == key)
             .cloned()
-        {
-            return Ok(entry);
+            .collect::<Vec<_>>();
+        let mut stale_clean = Vec::new();
+        for entry in &candidates {
+            let state = entry.inner.lock().await.state;
+            if state != DirectObjectState::Clean {
+                return Ok(entry.clone());
+            }
+            if entry.identity.id != node.id() {
+                stale_clean.push(entry.identity.id);
+            }
+        }
+        drop(candidates);
+        if !stale_clean.is_empty() {
+            let mut objects = self.objects.lock().await;
+            for id in stale_clean {
+                if objects
+                    .get(&id)
+                    .is_some_and(|entry| Arc::strong_count(entry) == 1)
+                {
+                    objects.remove(&id);
+                }
+            }
         }
         if let Some(store) = &self.store {
             if let Some(record) = guard(store).object(key.as_str())? {
@@ -539,7 +570,7 @@ impl DirectRuntime {
                 Error::new(ErrorKind::Invalid, "file node does not have a parent")
             })?,
             name: node.name().to_owned(),
-            existed_remote: true,
+            existed_remote: AtomicBool::new(true),
         };
         let inner = ObjectInner {
             remote: Some(file),
@@ -731,7 +762,7 @@ impl DirectRuntime {
 
         let destination = endpoint_from_identity(&entry.identity, precondition.clone());
         let id = mutation_id.0;
-        let kind = if entry.identity.existed_remote {
+        let kind = if entry.identity.existed_remote.load(Ordering::SeqCst) {
             MUTATION_KIND_PUBLISH
         } else {
             MUTATION_KIND_CREATE
@@ -775,6 +806,7 @@ impl DirectRuntime {
                 mutation.state = MUTATION_APPLIED;
                 mutation.accepted = accepted.as_ref().map(pin_to_record);
                 mutation.error = None;
+                entry.identity.existed_remote.store(true, Ordering::SeqCst);
                 inner.accepted = accepted.clone();
                 inner.observed = DirectObservation::Unavailable {
                     message: "not observed".to_owned(),
@@ -871,7 +903,7 @@ impl DirectFileHandle {
     }
 
     pub fn existed_remote(&self) -> bool {
-        self.entry.identity.existed_remote
+        self.entry.identity.existed_remote.load(Ordering::SeqCst)
     }
 
     pub fn is_writable(&self) -> bool {
@@ -912,55 +944,74 @@ impl DirectFileHandle {
 
     pub async fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         self.require_writable()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let mut inner = self.entry.inner.lock().await;
-        let file = inner.file.as_mut().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Invalid,
-                "writable Direct handle is not materialized",
-            )
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| local_io("seek staged Direct object", error))?;
-        file.write_all(bytes)
-            .map_err(|error| local_io("write staged Direct object", error))?;
+        {
+            let file = inner.file.as_mut().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Invalid,
+                    "writable Direct handle is not materialized",
+                )
+            })?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| local_io("seek staged Direct object", error))?;
+            file.write_all(bytes)
+                .map_err(|error| local_io("write staged Direct object", error))?;
+            file.sync_data()
+                .map_err(|error| local_io("sync staged Direct object", error))?;
+        }
         inner.length = inner.length.max(offset.saturating_add(bytes.len() as u64));
         bump_generation(&mut inner);
+        self.persist_object(&mut inner)?;
         Ok(())
     }
 
     pub async fn append(&self, bytes: &[u8]) -> Result<u64> {
         self.require_writable()?;
+        if bytes.is_empty() {
+            return Ok(self.len().await?);
+        }
         let mut inner = self.entry.inner.lock().await;
         let offset = inner.length;
-        let file = inner.file.as_mut().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Invalid,
-                "writable Direct handle is not materialized",
-            )
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| local_io("seek staged Direct object", error))?;
-        file.write_all(bytes)
-            .map_err(|error| local_io("append staged Direct object", error))?;
+        {
+            let file = inner.file.as_mut().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Invalid,
+                    "writable Direct handle is not materialized",
+                )
+            })?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| local_io("seek staged Direct object", error))?;
+            file.write_all(bytes)
+                .map_err(|error| local_io("append staged Direct object", error))?;
+            file.sync_data()
+                .map_err(|error| local_io("sync staged Direct object", error))?;
+        }
         inner.length = inner.length.saturating_add(bytes.len() as u64);
         bump_generation(&mut inner);
+        self.persist_object(&mut inner)?;
         Ok(offset)
     }
 
     pub async fn truncate(&self, length: u64) -> Result<()> {
         self.require_writable()?;
         let mut inner = self.entry.inner.lock().await;
-        let file = inner.file.as_mut().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Invalid,
-                "writable Direct handle is not materialized",
-            )
-        })?;
-        file.set_len(length)
-            .map_err(|error| local_io("truncate staged Direct object", error))?;
         if inner.length != length {
+            let file = inner.file.as_mut().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Invalid,
+                    "writable Direct handle is not materialized",
+                )
+            })?;
+            file.set_len(length)
+                .map_err(|error| local_io("truncate staged Direct object", error))?;
+            file.sync_data()
+                .map_err(|error| local_io("sync staged Direct object", error))?;
             inner.length = length;
             bump_generation(&mut inner);
+            self.persist_object(&mut inner)?;
         }
         Ok(())
     }
@@ -1006,10 +1057,25 @@ impl DirectFileHandle {
         }
         Ok(())
     }
+
+    fn persist_object(&self, inner: &mut ObjectInner) -> Result<()> {
+        let store = self
+            .runtime
+            .store
+            .as_ref()
+            .expect("writable runtime has a store");
+        let record = record_from_entry(&self.entry, inner);
+        if let Err(error) = guard(store).put_object(&record) {
+            inner.error = Some(error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 fn bump_generation(inner: &mut ObjectInner) {
     inner.generation = inner.generation.saturating_add(1);
+    inner.digest = None;
     if inner.state == DirectObjectState::Clean {
         inner.state = DirectObjectState::Staged;
     }
@@ -1018,7 +1084,7 @@ fn bump_generation(inner: &mut ObjectInner) {
 
 fn entry_from_record(store: &Arc<Mutex<Store>>, record: ObjectRecord) -> Result<Arc<ObjectEntry>> {
     let data_path = guard(store).data_path(record.id);
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&data_path)
@@ -1046,7 +1112,7 @@ fn entry_from_record(store: &Arc<Mutex<Store>>, record: ObjectRecord) -> Result<
         path: record.path,
         parent: DirectId::from_bytes(record.parent),
         name: record.name,
-        existed_remote: record.existed_remote,
+        existed_remote: atomic_bool(record.existed_remote),
     };
     let inner = ObjectInner {
         remote: None,
@@ -1055,7 +1121,7 @@ fn entry_from_record(store: &Arc<Mutex<Store>>, record: ObjectRecord) -> Result<
         state: object_state(record.state)?,
         length: record.length,
         generation: record.generation,
-        durable_generation: record.generation,
+        durable_generation: record.durable_generation,
         digest: record.digest,
         precondition: Some(precondition_from_record(&record.precondition)),
         accepted: record.accepted.map(pin_from_record),
@@ -1073,7 +1139,7 @@ fn record_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> ObjectRecord {
         path: entry.identity.path.clone(),
         parent: *entry.identity.parent.as_bytes(),
         name: entry.identity.name.clone(),
-        existed_remote: entry.identity.existed_remote,
+        existed_remote: entry.identity.existed_remote.load(Ordering::SeqCst),
         precondition: precondition_to_record(
             inner
                 .precondition
@@ -1082,6 +1148,7 @@ fn record_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> ObjectRecord {
         ),
         state: object_state_code(inner.state),
         generation: inner.generation,
+        durable_generation: inner.durable_generation,
         length: inner.length,
         digest: inner.digest,
         accepted: inner.accepted.as_ref().map(pin_to_record),
@@ -1101,7 +1168,7 @@ async fn status_from_entry(entry: &ObjectEntry) -> DirectObjectStatus {
         name: entry.identity.name.clone(),
         length: inner.length,
         state: inner.state,
-        existed_remote: entry.identity.existed_remote,
+        existed_remote: entry.identity.existed_remote.load(Ordering::SeqCst),
         generation: inner.generation,
         precondition: inner.precondition.clone(),
         accepted: inner.accepted.clone(),
@@ -1192,6 +1259,7 @@ fn flush_outcome_from_entry(entry: &ObjectEntry, inner: &ObjectInner) -> DirectF
                 DirectFlushOutcome::Unchanged
             }
         }
+        DirectObjectState::Clean => DirectFlushOutcome::Unchanged,
         DirectObjectState::Conflict => DirectFlushOutcome::Conflict {
             mutation,
             observed: inner.observed.clone(),
@@ -1303,7 +1371,8 @@ fn pin_to_record(value: &DirectObjectPin) -> PinRecord {
 }
 
 fn pin_from_record(value: PinRecord) -> DirectObjectPin {
-    DirectObjectPin::from_parts(value.version, value.etag, value.size, value.modified_time())
+    let modified = value.modified_time();
+    DirectObjectPin::from_parts(value.version, value.etag, value.size, modified)
 }
 
 fn observation_to_record(value: &DirectObservation) -> ObservationRecord {
@@ -1322,6 +1391,10 @@ fn observation_from_record(value: ObservationRecord) -> DirectObservation {
         ObservationRecord::Missing => DirectObservation::Missing,
         ObservationRecord::Unavailable(message) => DirectObservation::Unavailable { message },
     }
+}
+
+fn atomic_bool(value: bool) -> AtomicBool {
+    AtomicBool::new(value)
 }
 
 fn freeze_object(file: &mut File, temporary: &Path, target: &Path) -> Result<(u64, [u8; 32])> {
