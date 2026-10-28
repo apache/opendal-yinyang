@@ -35,6 +35,7 @@ const REGION: &str = "YINYANG_QUALIFICATION_REGION";
 const UNVERSIONED_BUCKET: &str = "YINYANG_DIRECT_UNVERSIONED_BUCKET";
 const VERSIONED_BUCKET: &str = "YINYANG_DIRECT_VERSIONED_BUCKET";
 const PAGE_SIZE: usize = 37;
+const EIO: i32 = 5;
 const ENOENT: i32 = 2;
 const EROFS: i32 = 30;
 const ESTALE: i32 = 116;
@@ -1035,8 +1036,7 @@ fn direct_amazon_s3_version_ids_survive_replacement_and_delete_marker() {
         "ListObjectVersions did not report the retained first version: {versions:?}"
     );
 
-    mounted.refresh();
-    mounted.wait_for_log("refresh", Duration::from_secs(60));
+    mounted.refresh_and_wait(Duration::from_secs(60));
     let mut fresh = File::open(&path).expect("open replacement after SIGHUP");
     let mut fresh_bytes = Vec::new();
     fresh
@@ -1070,14 +1070,121 @@ fn direct_amazon_s3_version_ids_survive_replacement_and_delete_marker() {
             .len(),
         old.len() as u64
     );
-    mounted.refresh();
-    mounted.wait_for_log("refresh", Duration::from_secs(60));
+    mounted.refresh_and_wait(Duration::from_secs(60));
     let error = File::open(&path).expect_err("delete marker must hide a fresh Direct open");
     assert_errno(&error, &[ENOENT, ESTALE], "fresh open after delete marker");
     drop(fresh);
     drop(old_fd);
     mounted.unmount();
     fixture.cleanup_versions();
+}
+
+#[test]
+#[ignore = "requires two real Amazon S3 buckets; run with tests/linux_direct_real_s3.py"]
+fn direct_amazon_s3_unversioned_etag_descriptor_stales_on_external_change() {
+    let fixture = Fixture::unversioned();
+    assert_eq!(fixture.aws.versioning(), json!({}));
+    let key = "etag-pinned.bin";
+    let raw_key = fixture.full_key(key);
+    let old = payload(160 * 1024 + 17, 0x19);
+    let new = payload(48 * 1024 + 23, 0x79);
+    fixture
+        .aws
+        .put(&raw_key, &old, None, Some("*"))
+        .success_or("initial If-None-Match create");
+    let initial_head = fixture.aws.head(&raw_key).expect("initial object");
+    let initial_etag = initial_head.etag.as_deref().expect("initial ETag");
+    assert!(initial_head.version.is_none());
+
+    let config = fixture.config("amazon-s3-etag-pin");
+    let mountpoint = fixture.temp.path().join("mnt-etag-pin");
+    fs::create_dir(&mountpoint).expect("create ETag pin mountpoint");
+    let mounted = fixture.spawn_mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join(key);
+    let old_fd = File::open(&path).expect("open unversioned Direct descriptor");
+    assert_eq!(
+        old_fd.metadata().expect("fstat initial ETag pin").len(),
+        old.len() as u64
+    );
+    assert_eq!(
+        read_fully_at(&old_fd, 0, 4096).expect("read initial ETag pin prefix"),
+        old[..4096]
+    );
+
+    fixture
+        .aws
+        .put(&raw_key, &new, Some(initial_etag), None)
+        .success_or("If-Match replacement of the accepted object");
+    let replaced = fixture.inventory();
+    assert_eq!(replaced[key].size, new.len() as u64);
+    let replacement_head = fixture.aws.head(&raw_key).expect("replacement object");
+    let replacement_etag = replacement_head.etag.as_deref().expect("replacement ETag");
+    assert_ne!(initial_etag, replacement_etag);
+    assert_eq!(fixture.aws.get(&raw_key, None, None).0, new);
+    assert_eq!(
+        old_fd
+            .metadata()
+            .expect("fstat descriptor after replacement")
+            .len(),
+        old.len() as u64,
+        "an unversioned replacement must not rebase an existing Direct descriptor"
+    );
+    let error = read_fully_at(&old_fd, (old.len() - 4096) as u64, 4096)
+        .expect_err("the old ETag-pinned descriptor must fail after replacement");
+    assert_errno(
+        &error,
+        &[EIO, ESTALE],
+        "old ETag-pinned descriptor after replacement",
+    );
+
+    mounted.refresh_and_wait(Duration::from_secs(60));
+    let mut fresh = File::open(&path).expect("open replacement after SIGHUP");
+    let mut fresh_bytes = Vec::new();
+    fresh
+        .read_to_end(&mut fresh_bytes)
+        .expect("read replacement after SIGHUP");
+    assert_eq!(fresh_bytes, new);
+    assert_eq!(
+        fixture.inventory(),
+        replaced,
+        "FUSE reads and SIGHUP changed the replaced raw inventory"
+    );
+
+    fixture
+        .aws
+        .delete(&raw_key, Some(replacement_etag), None)
+        .success_or("conditional DELETE of the replacement");
+    assert!(fixture.aws.head(&raw_key).is_none());
+    let deleted = fixture.inventory();
+    assert!(deleted.is_empty());
+    assert_eq!(
+        old_fd
+            .metadata()
+            .expect("fstat descriptor after deletion")
+            .len(),
+        old.len() as u64,
+        "external deletion must not rebase an existing Direct descriptor"
+    );
+    let error = read_fully_at(&old_fd, (old.len() - 4096) as u64, 4096)
+        .expect_err("the deleted ETag-pinned descriptor must fail");
+    assert_errno(
+        &error,
+        &[EIO, ESTALE],
+        "old ETag-pinned descriptor after deletion",
+    );
+
+    mounted.refresh_and_wait(Duration::from_secs(60));
+    let error = File::open(&path).expect_err("deleted key must not reopen after SIGHUP");
+    assert_errno(&error, &[ENOENT, ESTALE], "fresh open after deletion");
+    assert_eq!(
+        fixture.inventory(),
+        deleted,
+        "deleted-key failure and SIGHUP changed raw storage"
+    );
+    drop(fresh);
+    drop(old_fd);
+    mounted.unmount();
+    fixture.cleanup();
 }
 
 #[test]

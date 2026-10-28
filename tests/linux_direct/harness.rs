@@ -299,6 +299,14 @@ impl Mounted {
         kill(self.pid(), Signal::SIGHUP).expect("send SIGHUP to Direct mount");
     }
 
+    pub fn refresh_and_wait(&self, timeout: Duration) {
+        let completed = self.logs().matches("yy: fuse refresh: done").count();
+        self.refresh();
+        wait_until(timeout, "the Direct refresh to complete", || {
+            self.logs().matches("yy: fuse refresh: done").count() > completed
+        });
+    }
+
     pub fn wait_for_log(&self, needle: &str, timeout: Duration) {
         wait_until(timeout, &format!("mount log containing {needle:?}"), || {
             self.logs().contains(needle)
