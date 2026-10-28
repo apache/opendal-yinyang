@@ -84,6 +84,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
 
     let legacy_sha256 = sha256_file(&legacy_source);
     let candidate_sha256 = sha256_file(&candidate_source);
+    let target_source = target_source();
     let fixture_manifest: Value = serde_json::from_slice(
         &fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -399,6 +400,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         "fd1338c service authority did not use WAL mode"
     );
     assert_sqlite_integrity(&service_database);
+    let service_wal_present = wal.exists();
     let wal_bytes = wal.metadata().map(|metadata| metadata.len()).unwrap_or(0);
 
     assert_no_installed_writer(&prefix, temp.path());
@@ -624,8 +626,15 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
             "binary_sha256": legacy_sha256,
         },
         "target": {
+            "source": target_source,
             "release": candidate_release,
             "binary_sha256": candidate_sha256,
+        },
+        "backend": {
+            "profile": "minio",
+            "endpoint": std::env::var("YINYANG_S3_ENDPOINT").expect("isolated endpoint"),
+            "region": std::env::var("YINYANG_S3_REGION").expect("isolated region"),
+            "bucket": std::env::var("YINYANG_S3_BUCKET").expect("isolated bucket"),
         },
         "retained": {
             "frozen_commit": frozen_commit,
@@ -635,6 +644,8 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
             "sync_unknown_commit": sync_commit,
             "sync_unknown_request_digest": sync_digest,
             "service_commit": service_commit,
+            "service_journal_mode": "wal",
+            "service_wal_present": service_wal_present,
             "service_wal_bytes": wal_bytes,
         },
         "target_convergence": {
@@ -677,6 +688,26 @@ fn require_environment() {
             .starts_with("http://"),
         "installed-prefix fault injection requires the plain-HTTP Silo endpoint"
     );
+}
+
+fn target_source() -> String {
+    if let Ok(source) = std::env::var("YINYANG_UPGRADE_SOURCE") {
+        return source;
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run git rev-parse for upgrade target");
+    assert!(
+        output.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("target source is UTF-8")
+        .trim()
+        .to_owned()
 }
 
 struct Storage {
