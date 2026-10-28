@@ -25,8 +25,8 @@ use super::attrs::{ATTR_TTL, DIRECTORY_SIZE};
 use super::{Outcome, TEARDOWN_GRACE, blocking_error, shutdown_signal};
 use crate::direct::{
     DirectFile, DirectFileHandle, DirectFlushOutcome, DirectId, DirectKind, DirectMutationState,
-    DirectMutationStatus, DirectNamespace, DirectNode, DirectObjectPin, DirectObjectState,
-    DirectObjectStatus, DirectRuntime, DirectSnapshot, Error as DirectError,
+    DirectMutationStatus, DirectNamespace, DirectNode, DirectObjectId, DirectObjectPin,
+    DirectObjectState, DirectObjectStatus, DirectRuntime, DirectSnapshot, Error as DirectError,
     ErrorKind as DirectErrorKind,
 };
 use crate::volume::VolumeConfig;
@@ -173,6 +173,12 @@ struct FileView {
     modified: Option<std::time::SystemTime>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ViewKey {
+    Remote(DirectId),
+    Staged(DirectObjectId),
+}
+
 #[derive(Clone)]
 enum OpenSource {
     Remote(DirectFile),
@@ -182,10 +188,22 @@ enum OpenSource {
 #[derive(Clone)]
 struct OpenFile {
     id: DirectId,
-    key: String,
     source: OpenSource,
     writable: bool,
     view: Arc<Mutex<FileView>>,
+}
+
+impl OpenFile {
+    fn current_id(&self) -> DirectId {
+        match &self.source {
+            OpenSource::Remote(file) => file.id(),
+            OpenSource::Staged(file) => file.id(),
+        }
+    }
+
+    fn matches_id(&self, id: DirectId) -> bool {
+        self.id == id || self.current_id() == id
+    }
 }
 
 #[derive(Clone)]
@@ -207,7 +225,7 @@ pub(super) struct DirectInner {
     direct: Option<DirectRuntime>,
     snapshot: RwLock<Arc<DirectSnapshot>>,
     pending: Mutex<BTreeMap<DirectId, DirectObjectStatus>>,
-    views: Mutex<BTreeMap<String, Arc<Mutex<FileView>>>>,
+    views: Mutex<BTreeMap<ViewKey, Arc<Mutex<FileView>>>>,
     refresh_error: Mutex<Option<String>>,
     inodes: Mutex<DirectInodeTable>,
     files: Mutex<BTreeMap<u64, Arc<OpenFile>>>,
@@ -307,13 +325,13 @@ impl DirectInner {
 
     fn view_for(
         &self,
-        key: &str,
+        key: ViewKey,
         size: u64,
         modified: Option<std::time::SystemTime>,
     ) -> Arc<Mutex<FileView>> {
         let mut views = guard(&self.views);
         let view = views
-            .entry(key.to_owned())
+            .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(FileView { size, modified })))
             .clone();
         {
@@ -329,17 +347,13 @@ impl DirectInner {
     fn view_attr(
         &self,
         ino: INodeNo,
-        key: &str,
+        id: DirectId,
         fallback_modified: Option<std::time::SystemTime>,
     ) -> Option<FileAttr> {
-        let has_open = guard(&self.files).values().any(|open| open.key == key);
-        let has_pending = guard(&self.pending)
+        let view = guard(&self.files)
             .values()
-            .any(|status| status.key.as_str() == key);
-        if !has_open && !has_pending {
-            return None;
-        }
-        let view = guard(&self.views).get(key).cloned()?;
+            .find(|open| open.current_id() == id)
+            .map(|open| open.view.clone())?;
         let view = guard(&view).clone();
         Some(attribute_with_size(
             ino,
@@ -358,7 +372,7 @@ impl DirectInner {
     fn live_file_attr(&self, ino: INodeNo, id: DirectId) -> Option<FileAttr> {
         guard(&self.files)
             .values()
-            .find(|open| open.id == id)
+            .find(|open| open.matches_id(id))
             .map(|open| self.open_attr(ino, open))
     }
 
@@ -373,9 +387,7 @@ impl DirectInner {
                     .present()
                     .and_then(DirectObjectPin::modified)
             });
-        let view = self.view_for(status.key.as_str(), status.length, modified);
-        let view = guard(&view).clone();
-        attribute_with_size(ino, false, view.size, view.modified, self.read_only)
+        attribute_with_size(ino, false, status.length, modified, self.read_only)
     }
 
     fn install_notifier(&self, notifier: Notifier) {
@@ -570,8 +582,7 @@ impl DirectInner {
         let Some(node) = snapshot.node(id) else {
             return reply.error(fuser::Errno::ENOENT);
         };
-        let key = node.key().unwrap_or(node.path());
-        if let Some(attr) = self.view_attr(ino, key, node.modified()) {
+        if let Some(attr) = self.view_attr(ino, id, node.modified()) {
             return reply.attr(&self.attr_ttl(), &attr);
         }
         reply.attr(
@@ -598,7 +609,7 @@ impl DirectInner {
         let Some(direct) = &self.direct else {
             return reply.error(fuser::Errno::EIO);
         };
-        let (file, key, modified) = if let Some(status) = self.pending_status(id) {
+        let (file, modified) = if let Some(status) = self.pending_status(id) {
             if status.observed.is_missing() {
                 return reply.error(fuser::Errno::ENOENT);
             }
@@ -616,7 +627,7 @@ impl DirectInner {
                 Ok(file) => file,
                 Err(error) => return reply.error(direct_errno(&error)),
             };
-            (file, status.key.as_str().to_owned(), modified)
+            (file, modified)
         } else {
             let snapshot = match self.current() {
                 Ok(snapshot) => snapshot,
@@ -632,11 +643,7 @@ impl DirectInner {
                 Ok(file) => file,
                 Err(error) => return reply.error(direct_errno(&error)),
             };
-            (
-                file,
-                node.key().unwrap_or(node.path()).to_owned(),
-                node.modified(),
-            )
+            (file, node.modified())
         };
         if let Err(errno) = self.invalidate_before_open(ino).await {
             return reply.error(errno);
@@ -648,7 +655,7 @@ impl DirectInner {
             Ok(length) => length,
             Err(error) => return reply.error(direct_errno(&error)),
         };
-        let view = self.view_for(&key, length, modified);
+        let view = self.view_for(ViewKey::Staged(file.object_id()), length, modified);
         if let Err(error) = file.status().await {
             return reply.error(direct_errno(&error));
         }
@@ -657,7 +664,6 @@ impl DirectInner {
             fh,
             Arc::new(OpenFile {
                 id,
-                key,
                 source: OpenSource::Staged(file),
                 writable,
                 view,
@@ -684,14 +690,12 @@ impl DirectInner {
         if let Err(errno) = self.invalidate_before_open(ino).await {
             return reply.error(errno);
         }
-        let key = node.key().unwrap_or(node.path()).to_owned();
-        let view = self.view_for(&key, node.size(), node.modified());
+        let view = self.view_for(ViewKey::Remote(id), node.size(), node.modified());
         let fh = self.next_handle();
         guard(&self.files).insert(
             fh,
             Arc::new(OpenFile {
                 id,
-                key,
                 source: OpenSource::Remote(file),
                 writable: false,
                 view,
@@ -789,11 +793,10 @@ impl DirectInner {
                     .present()
                     .and_then(DirectObjectPin::modified)
             });
-        let view = self.view_for(status.key.as_str(), status.length, modified);
+        let view = self.view_for(ViewKey::Staged(file.object_id()), status.length, modified);
         let fh = self.next_handle();
         let open = OpenFile {
             id,
-            key: status.key.as_str().to_owned(),
             source: OpenSource::Staged(file),
             writable,
             view,
@@ -1014,7 +1017,7 @@ impl DirectInner {
             let files = guard(&self.files);
             files.get(&fh.0).cloned().or_else(|| {
                 let id = id?;
-                files.values().find(|open| open.id == id).cloned()
+                files.values().find(|open| open.matches_id(id)).cloned()
             })
         };
         let Some(open) = open else {
@@ -1142,9 +1145,8 @@ impl DirectInner {
             let Some(node) = snapshot.node(id) else {
                 return reply.error(fuser::Errno::ENOENT);
             };
-            let key = node.key().unwrap_or(node.path());
             let attr = self
-                .view_attr(ino, key, node.modified())
+                .view_attr(ino, id, node.modified())
                 .unwrap_or_else(|| attribute(ino, node, node.modified(), self.read_only));
             return reply.attr(&self.attr_ttl(), &attr);
         };
