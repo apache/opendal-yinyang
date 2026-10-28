@@ -1,30 +1,30 @@
 {
   "storage_keys": [
     ".yinyang/head",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/1f26dad9325444feb68c8b2269852bfd",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/2dc3403910e843afb711d5b4bc615276",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/44056cf1f8f74cfcaa608d5f0175afba",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/466e0a9ee3694de38b7f50ba30ef1394",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/4b6386b1198c4358a9fb1c6cd2214c16",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/4d20594a51e448d7968a96da17a79642",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/5870b66feb3043a6a74d002c799ee6d8",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/5b89549ab8f440b597428a011bf62333",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/6fabc1b1abda42ce883dc71616b15220",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/7f477fbecf4b4adb910243a7799187d9",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/809bf6c64de04daa911360089837996a",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/819ac3a77927455680ed2bfe008f968a",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/91455f5608af49e9979a2b5a7266df1b",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/9dd60dd5d32240319274c1cf9baf10a3",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/a3cb08aa4e1b42dc8e01568bbdebbd27",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/a8274ce0068148a49bbfd6828e1d80f3",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/af5ef7adf2b940938cfc558636b7ac10",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/b75eefd009944d8b94cb433983e3dbac",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/cb739c0b1e8f4538ac20aafa56b41024",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/cd17d46eaaa345dc8258de503857ea61",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/d2b8506aa9654c00b19e81ba9b7ad33d",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/d6c39b2c3dce4b41917f3a48a146fa18",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/de134deaf23a4b728499726a32659963",
-    ".yinyang/v2/1f05871e29ab4933b778791cddb4bf9e/packs/e991bd2c67044d60a523341febef5fae"
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/005118253d604df1a025c6de5306b4b2",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/0ba2be3da94d42319a6333643616a92b",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/1b30df9900014d5aa4207af9d328f1dc",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/238aa1dd7a23483d8129e81d83cac634",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/284dc8b998c94a59b6c3227a584b78f1",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/3b2b0edd77224a1aa2500b49fd472c6f",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/4399eea3e5624abba395ba3fcd2c13ac",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/472eae68ee04428a93ac3e744df0cbe9",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/539b8a6a89eb4dd590ae5d5088aae43d",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/53a711196d9641dca23adf2170851f14",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/59efb05821694934bc08ca3673763969",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/62664e8348064ec58d5f2693de4de818",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/65a9084b37dc4313a2d5ce11ded28549",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/6bb413d31c0a464da27b6e020e6c320c",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/6e8ce69e3a99455fbfba32139ae16a7d",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/736383fe2f494310b5e91407e04099c0",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/7962aa445a934bb6b342f8b20df2b0a1",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/b5d3260380774710af8002345d5eaae6",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/c436a921ea444f4c8b3f9f6facf69040",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/c61e863bbbe44545a9d5d14c19a86ae6",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/c6935ec054f3427bb97945b8dd02a802",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/d895d53ccd6a4d40a9562330efa38ca2",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/f6161f9adad047088268a29d2db4ad6b",
+    ".yinyang/v2/7330e4e87d714808b542a0bfe06d6648/packs/f98d5e5e8565406daa3954efd568164e"
   ],
   "local": [
     {
@@ -50,14 +50,14 @@
     "schema": "yinyang.sync.status.v1",
     "binding": {
       "state": "bound",
-      "state_directory": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state",
-      "root": "/tmp/yinyang-compatibility-180gp6kv/sync-work/local",
-      "filesystem": "1f05871e29ab4933b778791cddb4bf9e",
+      "state_directory": "/tmp/yinyang-compatibility-0ovceth7/sync-work/sync-state",
+      "root": "/tmp/yinyang-compatibility-0ovceth7/sync-work/local",
+      "filesystem": "7330e4e87d714808b542a0bfe06d6648",
       "same_filesystem": true
     },
     "remote": {
       "availability": "available",
-      "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285",
+      "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b",
       "error": null
     },
     "local": {
@@ -91,19 +91,19 @@
           "digest": null,
           "executable": false,
           "presence": "present",
-          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "28f07fc60f8a0caa7168dc834c65531e",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "baseline": {
-          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "28f07fc60f8a0caa7168dc834c65531e",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "intent": {
-          "id": "3ba6984400ba8f5669a50e0f38c1b049a403b8bbbcf2619d2a31098b7dc16188",
+          "id": "3e2278aeef6bb128c07e220f56e6ada07961b9f14376308fc9f01174a56ee9cc",
           "operation": "create_directory",
           "state": "committed",
-          "commit_id": "a84fae8c7e8eaa8be76f21b8fd8f0bd9",
-          "receipt_revision": "000000000000000146fdfab5d0ef443eb436c71784e85dff"
+          "commit_id": "4fd42a18952eca75f647ccb293a3612d",
+          "receipt_revision": "00000000000000019a92f6d19dd14ce59de967fd026565fb"
         },
         "outcome": {
           "state": "remote_completed",
@@ -129,19 +129,19 @@
           "digest": "8b6e8e7afc13ad19dbda880a74217bc132f02679c34b4338cd318b6c264c7714",
           "executable": false,
           "presence": "present",
-          "node": "c290a53ad83821844069bb200840f8ab",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "a92dc3582d2cbf9107ab24644c327192",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "baseline": {
-          "node": "c290a53ad83821844069bb200840f8ab",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "a92dc3582d2cbf9107ab24644c327192",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "intent": {
-          "id": "eeb183e10dd45976a2221035488c0a2c8fa0ab1d584d67298e17f7a70c0e053d",
+          "id": "b303ebe88347759e6052b1822b644046eb1d87ed3bb6a5ba427ae130ec28c05f",
           "operation": "create_file",
           "state": "committed",
-          "commit_id": "cf1d4151a88b89fe0c39051c42129f3d",
-          "receipt_revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "commit_id": "89c2d204df39a3c3ab788a3645b39edf",
+          "receipt_revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "outcome": {
           "state": "remote_completed",
@@ -167,19 +167,19 @@
           "digest": "6625c65ddda30f757434c13bbe4ad406276b625f04c7d0cec0667f56332f7a1d",
           "executable": false,
           "presence": "present",
-          "node": "af4d8daddaaeca4de357cb2920f89476",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "2118439864ab460b889dd232b62dbcd4",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "baseline": {
-          "node": "af4d8daddaaeca4de357cb2920f89476",
-          "revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+          "node": "2118439864ab460b889dd232b62dbcd4",
+          "revision": "000000000000000265acba435db94fe1abb1eb841280839f"
         },
         "intent": {
-          "id": "8bfc36f993505d12c7656c3a90f67406ec30e406a0718aae7e485ff2e7b8b575",
+          "id": "1449703d3582323ff05778fd900ef30008eaca9dbe5f9b50a5f98f626927d623",
           "operation": "create_file",
           "state": "committed",
-          "commit_id": "f6c2f9e8cfb70fb5eb23538fff9b98f6",
-          "receipt_revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+          "commit_id": "7981d7ff9f5363310d8388824dfefe58",
+          "receipt_revision": "000000000000000265acba435db94fe1abb1eb841280839f"
         },
         "outcome": {
           "state": "remote_completed",
@@ -191,20 +191,20 @@
     "conflicts": [],
     "artifacts": [
       {
-        "id": "010341eb-ba81-4b82-b413-bcb12aac120f",
+        "id": "5c8b5836-4a62-4335-baed-5f8b38218454",
         "origin": "sync.txt",
         "kind": "upload_retained",
         "phase": "retained",
-        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-010341eb-ba81-4b82-b413-bcb12aac120f",
+        "path": "/tmp/yinyang-compatibility-0ovceth7/sync-work/sync-state/quarantine/upload-5c8b5836-4a62-4335-baed-5f8b38218454",
         "exportable": true,
         "error": null
       },
       {
-        "id": "2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "id": "e0e1f699-7a99-4672-a52a-cb3f067bae6f",
         "origin": "nested/empty",
         "kind": "upload_retained",
         "phase": "retained",
-        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "path": "/tmp/yinyang-compatibility-0ovceth7/sync-work/sync-state/quarantine/upload-e0e1f699-7a99-4672-a52a-cb3f067bae6f",
         "exportable": true,
         "error": null
       }
@@ -214,14 +214,14 @@
     "schema": "yinyang.sync.status.v1",
     "binding": {
       "state": "bound",
-      "state_directory": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state",
-      "root": "/tmp/yinyang-compatibility-180gp6kv/sync-work/local",
-      "filesystem": "1f05871e29ab4933b778791cddb4bf9e",
+      "state_directory": "/tmp/yinyang-compatibility-0ovceth7/sync-work/sync-state",
+      "root": "/tmp/yinyang-compatibility-0ovceth7/sync-work/local",
+      "filesystem": "7330e4e87d714808b542a0bfe06d6648",
       "same_filesystem": true
     },
     "remote": {
       "availability": "available",
-      "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285",
+      "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b",
       "error": null
     },
     "local": {
@@ -255,19 +255,19 @@
           "digest": null,
           "executable": false,
           "presence": "present",
-          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "28f07fc60f8a0caa7168dc834c65531e",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "baseline": {
-          "node": "f8bc603dcbb3a7c7b525b08d780d6c5d",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "28f07fc60f8a0caa7168dc834c65531e",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "intent": {
-          "id": "3ba6984400ba8f5669a50e0f38c1b049a403b8bbbcf2619d2a31098b7dc16188",
+          "id": "3e2278aeef6bb128c07e220f56e6ada07961b9f14376308fc9f01174a56ee9cc",
           "operation": "create_directory",
           "state": "committed",
-          "commit_id": "a84fae8c7e8eaa8be76f21b8fd8f0bd9",
-          "receipt_revision": "000000000000000146fdfab5d0ef443eb436c71784e85dff"
+          "commit_id": "4fd42a18952eca75f647ccb293a3612d",
+          "receipt_revision": "00000000000000019a92f6d19dd14ce59de967fd026565fb"
         },
         "outcome": {
           "state": "remote_completed",
@@ -293,19 +293,19 @@
           "digest": "8b6e8e7afc13ad19dbda880a74217bc132f02679c34b4338cd318b6c264c7714",
           "executable": false,
           "presence": "present",
-          "node": "c290a53ad83821844069bb200840f8ab",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "a92dc3582d2cbf9107ab24644c327192",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "baseline": {
-          "node": "c290a53ad83821844069bb200840f8ab",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "a92dc3582d2cbf9107ab24644c327192",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "intent": {
-          "id": "eeb183e10dd45976a2221035488c0a2c8fa0ab1d584d67298e17f7a70c0e053d",
+          "id": "b303ebe88347759e6052b1822b644046eb1d87ed3bb6a5ba427ae130ec28c05f",
           "operation": "create_file",
           "state": "committed",
-          "commit_id": "cf1d4151a88b89fe0c39051c42129f3d",
-          "receipt_revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "commit_id": "89c2d204df39a3c3ab788a3645b39edf",
+          "receipt_revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "outcome": {
           "state": "remote_completed",
@@ -331,19 +331,19 @@
           "digest": "6625c65ddda30f757434c13bbe4ad406276b625f04c7d0cec0667f56332f7a1d",
           "executable": false,
           "presence": "present",
-          "node": "af4d8daddaaeca4de357cb2920f89476",
-          "revision": "0000000000000003c503cf7676ec4e2ea8a62625435fa285"
+          "node": "2118439864ab460b889dd232b62dbcd4",
+          "revision": "00000000000000038f3b9b79815c4198b47036e41bf9832b"
         },
         "baseline": {
-          "node": "af4d8daddaaeca4de357cb2920f89476",
-          "revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+          "node": "2118439864ab460b889dd232b62dbcd4",
+          "revision": "000000000000000265acba435db94fe1abb1eb841280839f"
         },
         "intent": {
-          "id": "8bfc36f993505d12c7656c3a90f67406ec30e406a0718aae7e485ff2e7b8b575",
+          "id": "1449703d3582323ff05778fd900ef30008eaca9dbe5f9b50a5f98f626927d623",
           "operation": "create_file",
           "state": "committed",
-          "commit_id": "f6c2f9e8cfb70fb5eb23538fff9b98f6",
-          "receipt_revision": "0000000000000002e37caa6c5b9b4b4490b9a8b6df594beb"
+          "commit_id": "7981d7ff9f5363310d8388824dfefe58",
+          "receipt_revision": "000000000000000265acba435db94fe1abb1eb841280839f"
         },
         "outcome": {
           "state": "remote_completed",
@@ -355,20 +355,20 @@
     "conflicts": [],
     "artifacts": [
       {
-        "id": "010341eb-ba81-4b82-b413-bcb12aac120f",
+        "id": "5c8b5836-4a62-4335-baed-5f8b38218454",
         "origin": "sync.txt",
         "kind": "upload_retained",
         "phase": "retained",
-        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-010341eb-ba81-4b82-b413-bcb12aac120f",
+        "path": "/tmp/yinyang-compatibility-0ovceth7/sync-work/sync-state/quarantine/upload-5c8b5836-4a62-4335-baed-5f8b38218454",
         "exportable": true,
         "error": null
       },
       {
-        "id": "2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "id": "e0e1f699-7a99-4672-a52a-cb3f067bae6f",
         "origin": "nested/empty",
         "kind": "upload_retained",
         "phase": "retained",
-        "path": "/tmp/yinyang-compatibility-180gp6kv/sync-work/sync-state/quarantine/upload-2ab6f3f8-0227-4181-8ff0-35d0e410c4d0",
+        "path": "/tmp/yinyang-compatibility-0ovceth7/sync-work/sync-state/quarantine/upload-e0e1f699-7a99-4672-a52a-cb3f067bae6f",
         "exportable": true,
         "error": null
       }
@@ -377,9 +377,9 @@
   "head": {
     "profile": "YYHEAD02",
     "mode": 0,
-    "filesystem": "1f05871e29ab4933b778791cddb4bf9e",
-    "root": "f9757a6972e2422da720299a7e4e9cd2",
-    "revision": "0300000000000000c503cf7676ec4e2ea8a62625435fa285"
+    "filesystem": "7330e4e87d714808b542a0bfe06d6648",
+    "root": "c11789cf19db46c9b3e2a841c2b75f60",
+    "revision": "03000000000000008f3b9b79815c4198b47036e41bf9832b"
   },
-  "filesystem": "1F05871E29AB4933B778791CDDB4BF9E"
+  "filesystem": "7330E4E87D714808B542A0BFE06D6648"
 }
