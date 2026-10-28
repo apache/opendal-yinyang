@@ -595,9 +595,8 @@ fn compatibility_fd1338c_sync_unknown_retry_preserves_newer_local_edit() {
         .as_str()
         .expect("old Sync intent commit identity")
         .to_owned();
-    let (stored_commit, frozen_digest, stored_state) =
-        sync_unknown_identity(&state.join("sync.db"));
-    assert_eq!(stored_state, 1, "fd1338c must persist Sync state UNKNOWN");
+    let (stored_commit, frozen_digest) =
+        staging_unknown_identity(&state.join("content/staging.db"));
     assert_eq!(stored_commit, frozen_commit);
     let frozen_uuid = uuid::Uuid::parse_str(&frozen_commit)
         .expect("fd1338c Sync commit is a UUID")
@@ -937,34 +936,37 @@ fn sync_entry<'a>(status: &'a Value, path: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("Sync entry {path:?} missing:\n{status:#}"))
 }
 
-fn sync_unknown_identity(database: &Path) -> (String, String, u8) {
+fn staging_unknown_identity(database: &Path) -> (String, String) {
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open fd1338c Sync journal read-only");
+            .expect("open fd1338c content staging read-only");
     let mut statement = connection
-        .prepare("SELECT commit_id,request_digest,state FROM namespaces WHERE state=1")
-        .expect("prepare fd1338c Sync Unknown query");
+        .prepare("SELECT record FROM handles")
+        .expect("prepare fd1338c frozen handle query");
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, u8>(2)?,
-            ))
-        })
-        .expect("query fd1338c Sync Unknown state");
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .expect("query fd1338c content handles");
     let rows = rows
         .collect::<rusqlite::Result<Vec<_>>>()
-        .expect("read fd1338c Sync Unknown state");
-    assert_eq!(rows.len(), 1, "expected exactly one Sync Unknown intent");
-    let (commit, digest, state) = &rows[0];
-    assert_eq!(commit.len(), 16, "Sync commit identity length");
-    assert_eq!(digest.len(), 32, "Sync request digest length");
-    (
-        commit.iter().map(|byte| format!("{byte:02x}")).collect(),
-        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
-        *state,
-    )
+        .expect("read fd1338c content handles");
+    let mut frozen = Vec::new();
+    for bytes in rows {
+        let record: StageRecord = borsh::from_slice(&bytes).expect("decode content stage record");
+        if let Some(plan) = record.plan {
+            let (_, commit, digest) =
+                yinyang_core::Transaction::inspect_identity(&plan).expect("inspect frozen content");
+            frozen.push((
+                uuid::Uuid::from_bytes(*commit.as_bytes()).to_string(),
+                digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+            ));
+        }
+    }
+    assert_eq!(
+        frozen.len(),
+        1,
+        "expected exactly one frozen Sync content handle"
+    );
+    frozen.pop().unwrap()
 }
 
 fn blake3_hex(bytes: &[u8]) -> String {
