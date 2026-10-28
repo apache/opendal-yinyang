@@ -312,8 +312,10 @@ impl<R: DirectRemote> DirectSync<R> {
                 state.display()
             )));
         }
-        let mut store = Store::open(&database)?;
-        let binding = store.binding()?;
+        let binding = {
+            let probe = Store::open_read_only(&database)?;
+            probe.binding()?
+        };
         let local = LocalTree::open(&binding.root, state)?;
         if local.root_identity() != binding.root_identity
             || local.state_identity() != binding.state_identity
@@ -329,6 +331,7 @@ impl<R: DirectRemote> DirectSync<R> {
                 binding.namespace, namespace
             )));
         }
+        let mut store = Store::open(&database)?;
         local.recover_installs(&mut store)?;
         Ok(Self {
             remote,
@@ -366,9 +369,13 @@ impl<R: DirectRemote> DirectSync<R> {
             .chain(self.store.installs()?.into_iter().map(|record| record.path))
             .collect::<BTreeSet<_>>();
         reject_unsupported_directories(&observed_local, &observed_remote, &pending_paths)?;
+        self.backfill_conflicts(&observed_local, &observed_remote)
+            .await?;
 
         for work in self.store.work()? {
-            if matches!(work.state, WorkState::Prepared | WorkState::Unknown) {
+            if matches!(work.state, WorkState::Prepared | WorkState::Unknown)
+                && work_matches_local_input(&work, &observed_local)
+            {
                 let _ = self.dispatch_existing_work(work).await?;
             }
         }
@@ -479,6 +486,19 @@ impl<R: DirectRemote> DirectSync<R> {
         if !database.exists() {
             return unbound;
         }
+        if let Err(error) = local::validate_private_state(state) {
+            return Inspection {
+                binding: BindingEvidence {
+                    state: BindingState::Error,
+                    state_directory,
+                    root: None,
+                    namespace: None,
+                    same_filesystem: None,
+                    error: Some(error.to_string()),
+                },
+                ..unbound
+            };
+        }
         let store = match Store::open_read_only(&database) {
             Ok(store) => store,
             Err(error) => {
@@ -519,12 +539,13 @@ impl<R: DirectRemote> DirectSync<R> {
                     state: BindingState::Error,
                     state_directory,
                     root: Some(binding.root),
-                    namespace: Some(binding.namespace),
+                    namespace: Some(binding.namespace.clone()),
                     same_filesystem: Some(binding.root_identity.dev == binding.state_identity.dev),
-                    error: Some(
-                        "configured storage namespace does not match the Direct Sync binding"
-                            .to_owned(),
-                    ),
+                    error: Some(format!(
+                        "configured storage namespace {} does not match the Direct Sync binding {}",
+                        remote.namespace_id(),
+                        binding.namespace
+                    )),
                 },
                 ..unbound
             };
@@ -842,7 +863,10 @@ impl<R: DirectRemote> DirectSync<R> {
             && pending == 0
             && unknown == 0
             && failed == 0
-            && conflicts.is_empty();
+            && conflicts.is_empty()
+            && entries
+                .iter()
+                .all(|entry| entry.state == EntryState::InSync);
         Ok(Inspection {
             binding: binding_evidence,
             remote: remote_status,
@@ -877,6 +901,7 @@ impl<R: DirectRemote> DirectSync<R> {
     /// Export one retained artifact without constructing an operator, acquiring
     /// the writer lease or contacting storage.
     pub fn export_artifact_local(state: &Path, id: &str, output: &mut dyn Write) -> Result<()> {
+        local::validate_private_state(state)?;
         let store = Store::open_read_only(&state.join("direct-sync.db"))?;
         let artifact = store
             .artifacts()?
@@ -884,8 +909,13 @@ impl<R: DirectRemote> DirectSync<R> {
             .find(|artifact| artifact.id == id)
             .ok_or_else(|| Error::invalid("unknown Direct Sync artifact"))?;
         let path = state.join("artifacts").join(&artifact.name);
-        let mut file = std::fs::File::open(&path)
-            .map_err(|error| Error::io("open Direct Sync artifact", &path, error))?;
+        let fd = rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| Error::errno("open Direct Sync artifact", &path, error))?;
+        let mut file = std::fs::File::from(fd);
         std::io::copy(&mut file, output)
             .map(|_| ())
             .map_err(|error| Error::io("export Direct Sync artifact", &path, error))
@@ -1022,6 +1052,53 @@ impl<R: DirectRemote> DirectSync<R> {
         Ok(blocked)
     }
 
+    async fn backfill_conflicts(
+        &mut self,
+        local: &LocalSnapshot,
+        remote: &RemoteSnapshot,
+    ) -> Result<()> {
+        let existing = self
+            .store
+            .conflicts()?
+            .into_iter()
+            .map(|conflict| conflict.path)
+            .collect::<BTreeSet<_>>();
+        let mut missing = BTreeMap::new();
+        for work in self
+            .store
+            .work()?
+            .into_iter()
+            .filter(|work| work.state == WorkState::Conflict)
+        {
+            missing.entry(work.path).or_insert_with(|| {
+                work.error
+                    .unwrap_or_else(|| "retained Direct Sync work is in conflict".to_owned())
+            });
+        }
+        for install in self
+            .store
+            .installs()?
+            .into_iter()
+            .filter(|install| install.state == InstallState::Conflict)
+        {
+            missing.entry(install.path).or_insert_with(|| {
+                install
+                    .error
+                    .unwrap_or_else(|| "retained Direct Sync install is in conflict".to_owned())
+            });
+        }
+        for (path, error) in missing {
+            if existing.contains(&path) {
+                continue;
+            }
+            let local_node = local.get(&path);
+            let remote_entry = remote.entries.get(&path);
+            self.record_conflict(&path, local_node, remote_entry, None, None, &error)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn dispatch_existing_work(&mut self, work: WorkRecord) -> Result<bool> {
         let was_unknown = work.state == WorkState::Unknown;
         self.store
@@ -1109,11 +1186,6 @@ impl<R: DirectRemote> DirectSync<R> {
                         Some("the original request outcome remains unknown; its accepted precondition no longer matches"),
                     )?;
                 } else {
-                    self.store.update_work_state(
-                        work.id,
-                        WorkState::Conflict,
-                        Some("the accepted remote precondition no longer matches"),
-                    )?;
                     let remote_snapshot = self.remote.observe().await?;
                     let local_snapshot = self.local.scan()?;
                     let local = local_file(&local_snapshot, &work.path).cloned();
@@ -1127,6 +1199,11 @@ impl<R: DirectRemote> DirectSync<R> {
                         "remote replacement or deletion conflicted with the accepted baseline",
                     )
                     .await?;
+                    self.store.update_work_state(
+                        work.id,
+                        WorkState::Conflict,
+                        Some("the accepted remote precondition no longer matches"),
+                    )?;
                 }
             }
             MutationOutcome::Unknown { error } => {
@@ -1670,6 +1747,7 @@ fn plan_actions(
 ) -> Result<Vec<Action>> {
     let local_entries = all_local_entries(local);
     let remote_entries = all_remote_entries(remote);
+    let mut blocked_subtrees = blocked.clone();
     let mut paths = BTreeSet::new();
     paths.extend(baseline.keys().cloned());
     paths.extend(
@@ -1692,49 +1770,33 @@ fn plan_actions(
     let mut delete_local = Vec::new();
     let mut conflicts = Vec::new();
     for path in paths {
-        if blocked.contains(&path) {
+        if has_path_or_parent(&path, &blocked_subtrees) {
             continue;
         }
         let baseline_entry = baseline.get(&path);
         let local_node = local_entries.get(&path);
         let remote_entry = remote_entries.get(&path);
+        let local_directory =
+            local_node.is_some_and(|node| matches!(node.kind, LocalKind::Directory));
+        let local_file = local_node.is_some_and(|node| matches!(node.kind, LocalKind::File { .. }));
+        let remote_directory = remote_entry.is_some_and(|entry| !entry.is_file());
+        let remote_file = remote_entry.is_some_and(RemoteEntry::is_file);
+        if (local_directory && remote_file)
+            || (local_file && remote_directory)
+            || (baseline_entry.is_some() && (local_directory || remote_directory))
+        {
+            conflicts.push(Action::Conflict {
+                path: path.clone(),
+                local: local_node.cloned(),
+                remote: remote_entry.cloned(),
+                message: "file and directory kinds cannot be reconciled automatically".to_owned(),
+            });
+            blocked_subtrees.insert(path);
+            continue;
+        }
         let local_change = local_path_changed(baseline_entry, local_node);
         let remote_change = remote_path_changed(baseline_entry, remote_entry);
 
-        if local_node.is_some_and(|node| matches!(node.kind, LocalKind::Directory))
-            && remote_entry.is_some_and(RemoteEntry::is_file)
-        {
-            conflicts.push(Action::Conflict {
-                path: path.clone(),
-                local: local_node.cloned(),
-                remote: remote_entry.cloned(),
-                message: "local directory conflicts with a remote file".to_owned(),
-            });
-            continue;
-        }
-        if local_node.is_some_and(|node| matches!(node.kind, LocalKind::File { .. }))
-            && remote_entry.is_some_and(|entry| !entry.is_file())
-        {
-            conflicts.push(Action::Conflict {
-                path: path.clone(),
-                local: local_node.cloned(),
-                remote: remote_entry.cloned(),
-                message: "local file conflicts with a remote directory".to_owned(),
-            });
-            continue;
-        }
-        if baseline_entry.is_some()
-            && (local_node.is_some_and(|node| matches!(node.kind, LocalKind::Directory))
-                || remote_entry.is_some_and(|entry| !entry.is_file()))
-        {
-            conflicts.push(Action::Conflict {
-                path: path.clone(),
-                local: local_node.cloned(),
-                remote: remote_entry.cloned(),
-                message: "a baselined file changed kind on one side".to_owned(),
-            });
-            continue;
-        }
         if !local_change && !remote_change {
             continue;
         }
@@ -1815,6 +1877,26 @@ fn local_path_changed(baseline: Option<&BaselineEntry>, local: Option<&LocalNode
     }
 }
 
+fn work_matches_local_input(work: &WorkRecord, local: &LocalSnapshot) -> bool {
+    match work.operation {
+        RemoteOperation::Publish => {
+            let Some(desired) = work.desired_local else {
+                return false;
+            };
+            let Some(node) = local_file(local, &work.path) else {
+                return false;
+            };
+            match node.kind {
+                LocalKind::File { length, digest } => {
+                    desired.length == length && desired.digest == *digest.as_bytes()
+                }
+                LocalKind::Directory => false,
+            }
+        }
+        RemoteOperation::Delete => local.get(&work.path).is_none(),
+    }
+}
+
 fn remote_path_changed(baseline: Option<&BaselineEntry>, remote: Option<&RemoteEntry>) -> bool {
     match (baseline, remote) {
         (Some(baseline), Some(remote)) if remote.is_file() => remote
@@ -1889,6 +1971,15 @@ fn has_descendant_file<T>(files: &BTreeMap<String, T>, directory: &str) -> bool 
 fn is_pending_parent(directory: &str, pending_paths: &BTreeSet<String>) -> bool {
     let prefix = format!("{directory}/");
     pending_paths.iter().any(|path| path.starts_with(&prefix))
+}
+
+fn has_path_or_parent(path: &str, blocked: &BTreeSet<String>) -> bool {
+    blocked.iter().any(|blocked| {
+        path == blocked
+            || path
+                .strip_prefix(blocked)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
 }
 
 fn remote_files(snapshot: &RemoteSnapshot) -> BTreeMap<String, RemoteEntry> {
@@ -2045,7 +2136,15 @@ fn hash_pin(hasher: &mut blake3::Hasher, pin: &RemotePin) {
         }
     }
     hasher.update(&pin.size.to_be_bytes());
-    hasher.update(&pin.modified.unwrap_or_default().to_be_bytes());
+    match pin.modified {
+        Some(modified) => {
+            hasher.update(&[1]);
+            hasher.update(&modified.to_be_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

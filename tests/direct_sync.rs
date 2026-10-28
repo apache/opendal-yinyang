@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
+use yinyang::direct::DirectStorageBinding;
 use yinyang::direct_sync::{
     BindingState, DirectRemote, DirectSync, EntryState, MutationOutcome, RemoteEntry, RemoteKind,
     RemotePin, RemotePrecondition, RemoteSnapshot, Resolution,
@@ -49,8 +50,7 @@ struct RemoteHandle {
 impl MemoryRemote {
     fn new() -> (Self, RemoteHandle) {
         let remote = Self {
-            namespace: "scheme=s3;profile=minio;bucket=test;root=/objects/;endpoint=loopback"
-                .to_owned(),
+            namespace: namespace_id("minio", "test", "/objects/", "http://127.0.0.1:9000"),
             objects: Arc::new(Mutex::new(BTreeMap::new())),
             directories: Arc::new(Mutex::new(BTreeSet::new())),
             generation: Arc::new(AtomicU64::new(1)),
@@ -272,8 +272,17 @@ fn observation_all(objects: &BTreeMap<String, Vec<u8>>) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+fn namespace_id(profile: &str, bucket: &str, root: &str, endpoint: &str) -> String {
+    DirectStorageBinding::new("s3", profile, bucket, root, endpoint)
+        .unwrap()
+        .namespace_id()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 struct Fixture {
-    temp: tempfile::TempDir,
+    _temp: tempfile::TempDir,
     root: PathBuf,
     state: PathBuf,
     remote: MemoryRemote,
@@ -288,7 +297,7 @@ impl Fixture {
         std::fs::create_dir(&root).unwrap();
         let (remote, handle) = MemoryRemote::new();
         Self {
-            temp,
+            _temp: temp,
             root,
             state,
             remote,
@@ -398,6 +407,34 @@ async fn external_and_local_replacement_conflict_retains_both_sides() {
 }
 
 #[tokio::test]
+async fn explicit_keep_remote_materializes_the_observed_remote_state() {
+    let fixture = Fixture::new();
+    fixture.write("file", b"base");
+    let mut sync = fixture.init().await;
+    sync.run().await.unwrap();
+    drop(sync);
+
+    fixture.write("file", b"local");
+    fixture.handle.put("file", b"remote");
+    let mut sync = fixture.open().await;
+    sync.run().await.unwrap();
+    let inspection =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    let conflict = inspection.conflicts.first().unwrap().id.clone();
+    sync.resolve(&conflict, Resolution::KeepRemote)
+        .await
+        .unwrap();
+    assert_eq!(fixture.read("file"), b"remote");
+    assert_eq!(
+        fixture.handle.read("file").as_deref(),
+        Some(b"remote".as_slice())
+    );
+    let inspection =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    assert!(inspection.summary.in_sync, "{inspection:?}");
+}
+
+#[tokio::test]
 async fn unknown_survives_restart_and_explicit_keep_local_observes_current_state() {
     let fixture = Fixture::new();
     fixture.write("file", b"v1");
@@ -495,8 +532,7 @@ async fn wrong_storage_binding_rejects_before_recovery_or_effects() {
 
     let before = fixture.handle.read("file");
     let mut wrong = fixture.remote.clone();
-    wrong.namespace =
-        "scheme=s3;profile=minio;bucket=other;root=/objects/;endpoint=loopback".to_owned();
+    wrong.namespace = namespace_id("minio", "other", "/objects/", "http://127.0.0.1:9000");
     let error = DirectSync::open(wrong.clone(), &fixture.state)
         .await
         .err()
@@ -506,6 +542,37 @@ async fn wrong_storage_binding_rejects_before_recovery_or_effects() {
 
     let inspection = DirectSync::<MemoryRemote>::inspect(Some(&wrong), &fixture.state, None).await;
     assert_eq!(inspection.binding.state, BindingState::Error);
+}
+
+#[test]
+fn storage_binding_distinguishes_profile_bucket_root_and_endpoint() {
+    let base = namespace_id("minio", "test", "/objects/", "http://127.0.0.1:9000/v1");
+    for changed in [
+        namespace_id("amazon-s3", "test", "/objects/", "http://127.0.0.1:9000/v1"),
+        namespace_id("minio", "other", "/objects/", "http://127.0.0.1:9000/v1"),
+        namespace_id("minio", "test", "/other/", "http://127.0.0.1:9000/v1"),
+        namespace_id("minio", "test", "/objects/", "http://127.0.0.1:9001/v1"),
+        namespace_id("minio", "test", "/objects/", "http://127.0.0.1:9000/V1"),
+    ] {
+        assert_ne!(base, changed);
+    }
+}
+
+#[test]
+fn remote_pin_version_is_not_weakened_by_a_later_etag_or_mtime() {
+    let accepted = RemotePin {
+        version: Some("version-1".to_owned()),
+        etag: None,
+        size: 7,
+        modified: None,
+    };
+    let observed = RemotePin {
+        version: Some("version-1".to_owned()),
+        etag: Some("\"etag\"".to_owned()),
+        size: 7,
+        modified: Some(42),
+    };
+    assert!(accepted.matches(&observed));
 }
 
 #[tokio::test]
@@ -548,6 +615,7 @@ async fn file_to_directory_transition_is_an_explicit_conflict() {
     fixture.handle.delete("node");
     fixture.handle.mkdir("node");
     fixture.handle.put("node/child", b"child");
+    fixture.write("node/local-child", b"local-child");
     let mut sync = fixture.open().await;
     let outcome = sync.run().await.unwrap();
     assert_eq!(outcome.conflicts, 1);
@@ -556,5 +624,9 @@ async fn file_to_directory_transition_is_an_explicit_conflict() {
     assert_eq!(
         fixture.handle.read("node/child").as_deref(),
         Some(b"child".as_slice())
+    );
+    assert!(
+        fixture.handle.read("node/local-child").is_none(),
+        "a file-to-directory conflict must not publish descendant objects from the same pass"
     );
 }

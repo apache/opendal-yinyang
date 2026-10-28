@@ -27,7 +27,7 @@ use yinyang::direct_sync::{
     EvidenceKind, Inspection, InstallState, LocalScanState, RemoteAvailability, RemoteOperation,
     Resolution, RunOutcome, STATUS_SCHEMA, WorkState,
 };
-use yinyang::volume::{Access, Frontend, Model, StorageProfile, VolumeConfig};
+use yinyang::volume::{Access, Frontend, Model, VolumeConfig};
 
 const EXIT_UNBOUND: u8 = 3;
 const EXIT_INVALID_BINDING: u8 = 4;
@@ -123,19 +123,7 @@ fn storage_binding(
     config: &VolumeConfig,
     operator: &opendal::Operator,
 ) -> Result<DirectStorageBinding, Box<dyn std::error::Error>> {
-    let profile = match config.storage_profile {
-        StorageProfile::AmazonS3 => "amazon-s3",
-        StorageProfile::Minio => "minio",
-    };
-    let endpoint =
-        std::env::var("YINYANG_S3_ENDPOINT").unwrap_or_else(|_| "provider-default".to_owned());
-    Ok(DirectStorageBinding::new(
-        operator.info().scheme(),
-        profile,
-        operator.info().name(),
-        operator.info().root(),
-        endpoint,
-    )?)
+    Ok(yinyang::volume::direct_storage_binding(config, operator)?)
 }
 
 async fn init(
@@ -372,7 +360,8 @@ fn status_document(inspection: &Inspection, state: &Path) -> Value {
             "kind": artifact_kind(artifact.kind),
             "phase": artifact_phase(artifact.phase),
             "path": state.join("artifacts").join(&artifact.name).display().to_string(),
-            "exportable": artifact.phase != ArtifactPhase::Failed,
+            "exportable": artifact.phase != ArtifactPhase::Failed
+                && state.join("artifacts").join(&artifact.name).is_file(),
             "error": artifact.error,
         })).collect::<Vec<_>>(),
     })

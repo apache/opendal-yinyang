@@ -12,6 +12,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [File-operation runtime](file-runtime.md) | Pinned Managed handles, durable staging, conditional fsync, and recovery. |
 | [Mount runtime](mount-runtime.md) | Instance-local shared nodes, explicit refresh, remote fsync, and retained failures. |
 | [Read-only Direct volumes](direct.md) | Reversible key mapping, storage-native object pins, cached observations, and Linux FUSE reads. |
+| [Direct Sync](direct-sync.md) | Finite ordinary-directory reconciliation over storage-native Direct pins and conditional mutations. |
 | [Sync runtime](sync-runtime.md) | Experimental content and namespace coordinator against an explicit remote baseline. |
 | [Linux Managed Sync](linux-sync.md) | The `yy ... sync` ordinary-directory CLI: admission, exit codes, offline retained-byte export, and the `yinyang.sync.status.v1` document. |
 | [Linux operations](linux-operations.md) | Health diagnostics, user-service lifecycle and installed-prefix state boundaries. |
