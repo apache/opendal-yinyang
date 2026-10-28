@@ -1303,6 +1303,22 @@ class Harness:
             "uncertain_files": uncertain_files,
             "fatal": [*first["fatal"], *second["fatal"]],
             "clean_unmounts": [stopped_one, stopped_two],
+            "phases": [
+                {
+                    "name": name,
+                    "fsync_errors": phase["writers"]["fsync_errors"],
+                    "fsync_retry_attempts": phase["writers"][
+                        "fsync_retry_attempts"
+                    ],
+                    "fsync_retry_successes": phase["writers"][
+                        "fsync_retry_successes"
+                    ],
+                }
+                for name, phase in (
+                    ("steady-state-one", first),
+                    ("steady-state-two", second),
+                )
+            ],
         }
         status_command = [
             str(self.yy),
@@ -1336,16 +1352,23 @@ class Harness:
             unsafe.append("fatal is not empty")
         if retry_counts["uncertain_files"]:
             unsafe.append(f"uncertain_files={retry_counts['uncertain_files']}")
-        if retry_counts["fsync_errors"]:
-            if not retry_counts["fsync_retry_attempts"]:
-                unsafe.append("fsync errors have no retry attempts")
-            if not retry_counts["fsync_retry_successes"]:
-                unsafe.append("fsync errors have no retry successes")
-        if (
-            retry_counts["fsync_retry_successes"]
-            > retry_counts["fsync_retry_attempts"]
-        ):
-            unsafe.append("fsync retry successes exceed attempts")
+        for phase in retry_counts["phases"]:
+            errors = phase["fsync_errors"]
+            attempts = phase["fsync_retry_attempts"]
+            successes = phase["fsync_retry_successes"]
+            if attempts != errors:
+                unsafe.append(
+                    f"{phase['name']} fsync retry attempts={attempts} errors={errors}"
+                )
+            if successes > attempts:
+                unsafe.append(
+                    f"{phase['name']} fsync retry successes={successes} "
+                    f"attempts={attempts}"
+                )
+            if (successes > 0) != (errors > 0):
+                unsafe.append(
+                    f"{phase['name']} fsync retry successes={successes} errors={errors}"
+                )
         for unmount in retry_counts["clean_unmounts"]:
             if not unmount.get("stopped") or unmount.get("returncode") != 0:
                 unsafe.append("mount did not stop cleanly")

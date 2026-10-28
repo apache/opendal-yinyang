@@ -119,8 +119,9 @@ handle/ledger counts. It will not acknowledge any entry unless all of the
 following hold:
 
 - pwrite and reader errors are zero;
-- every fsync failure has bounded retry attempts and at least one successful
-  retry, and no file remains uncertain;
+- each phase has `fsync_retry_attempts == fsync_errors`,
+  `fsync_retry_successes <= fsync_retry_attempts`, and retry successes are
+  positive exactly when fsync errors are positive; no file remains uncertain;
 - fatal lists are empty and both unmounts report a clean release;
 - pending, frozen, conflict and failed-handle counts are zero;
 - every retained ledger row is persisted, has a positive sequence, and is
@@ -128,15 +129,17 @@ following hold:
 
 When retained rows exist, `completion.acknowledgment` records the exact
 acknowledgment command, the selected `through` sequence, its result, and
-complete post-acknowledgment status. The post-status handle and ledger counts
-must all be zero before the harness accepts doctor. Doctor must subsequently
-return `status=pass`; a nonzero exit or non-pass status still fails the run and
-retains the raw error.
+complete post-acknowledgment status. The post-status pending, frozen, conflict,
+failed-handle and ledger counts must all be zero before the harness accepts
+doctor. Doctor must subsequently return `status=pass`; a nonzero exit or
+non-pass status still fails the run and retains the raw error.
 
-The acknowledgment is an explicit operator decision based on reviewed evidence,
-not an automatic error suppressor. Failed or diagnostic staging remains
-unchanged and must never be acknowledged merely to make a later health check
-green.
+Invoking this harness authorizes its guarded acknowledgment only on the
+isolated, fresh test state that the harness created. Raw status and error
+evidence remains in the report. Existing or other non-test volumes require
+explicit operator review and are outside this workflow. Acknowledgment is not
+an error suppressor: failed or diagnostic staging remains unchanged and must
+never be acknowledged merely to make a later health check green.
 
 ## Reproduce
 
