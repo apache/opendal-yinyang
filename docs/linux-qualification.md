@@ -41,6 +41,12 @@ These checks require infrastructure that hosted CI does not provide:
 | `cargo test --test linux_prefix_upgrade` | isolated Silo, exact `fd1338c` and final-target binaries, `sqlite3` | stopped versioned-prefix replacement with pending/Unknown state, receipts and service WAL recovery |
 | `tests/linux_operating_envelope.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `sqlite3` | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
 
+The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
+`fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and
+optional `YINYANG_UPGRADE_SOURCE`/`YINYANG_UPGRADE_EVIDENCE` values for the
+exact target source and JSON output path. When `YY_UPGRADE_BIN` is omitted,
+the integration-test binary built from the current worktree is used.
+
 The systemd lifecycle remains an explicit qualified-host command. Hosted CI
 does not enable linger, create a boot service, or change FUSE configuration to
 manufacture a user session. Run it on a disposable Linux host with an already
