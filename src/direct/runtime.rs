@@ -530,6 +530,12 @@ impl DirectRuntime {
                 "Direct runtime is read-only",
             ));
         }
+        if !self.mutation.capability().create {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "storage does not advertise conditional creation",
+            ));
+        }
         let parent_node = snapshot
             .node(parent)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "parent is not in this snapshot"))?;
@@ -705,6 +711,12 @@ impl DirectRuntime {
             return Err(Error::new(
                 ErrorKind::Unsupported,
                 "Direct runtime is read-only",
+            ));
+        }
+        if !self.mutation.capability().delete {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "storage does not advertise conditional delete",
             ));
         }
         let node = snapshot
@@ -1343,6 +1355,28 @@ impl DirectRuntime {
         } else {
             DirectPrecondition::Absent
         };
+        let capability = self.mutation.capability();
+        match destination_precondition {
+            DirectPrecondition::Absent if !capability.create => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "storage does not advertise conditional creation",
+                ));
+            }
+            DirectPrecondition::Etag(_) if !capability.replace => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "storage does not advertise conditional replacement",
+                ));
+            }
+            _ => {}
+        }
+        if kind == MUTATION_KIND_RENAME && !capability.delete {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "storage does not advertise conditional delete for safe-save rename",
+            ));
+        }
         let destination_id = existing_destination
             .map(DirectNode::id)
             .unwrap_or_else(|| derive_id(&destination_path, super::DirectKind::File, None));
@@ -1716,6 +1750,12 @@ impl DirectRuntime {
             ));
         }
         let store = self.store.as_ref().expect("writable runtime has a store");
+        if !self.mutation.capability().replace {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "storage does not advertise conditional replacement",
+            ));
+        }
         let precondition = inner.precondition.clone().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
@@ -1850,6 +1890,19 @@ impl DirectRuntime {
                 "object exposes no ETag for conditional mutation",
             )
         })?;
+        match precondition {
+            DirectPrecondition::Absent if !self.mutation.capability().create => {
+                return Ok(DirectFlushOutcome::Unsupported {
+                    message: "storage does not advertise conditional creation".to_owned(),
+                });
+            }
+            DirectPrecondition::Etag(_) if !self.mutation.capability().replace => {
+                return Ok(DirectFlushOutcome::Unsupported {
+                    message: "storage does not advertise conditional replacement".to_owned(),
+                });
+            }
+            _ => {}
+        }
         let mutation_id = DirectMutationId::new();
         let input_path = guard(store).input_path(mutation_id.0);
         let temporary = guard(store).temporary_path("inputs", mutation_id.0);
