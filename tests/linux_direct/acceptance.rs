@@ -724,7 +724,7 @@ fn direct_unrepresentable_names_reject_the_complete_observation_without_writes()
             "Direct rejection {label} did not identify {diagnostic:?}:\n{}",
             rejected.text()
         );
-        for (key, _) in objects {
+        for (key, _) in &objects {
             assert!(
                 rejected.text().contains(&key),
                 "Direct rejection {label} omitted original object key {key:?}:\n{}",
