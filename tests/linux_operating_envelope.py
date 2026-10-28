@@ -83,6 +83,10 @@ def binary_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def bytes_sha256(bytes_: bytes | bytearray) -> str:
+    return hashlib.sha256(bytes_).hexdigest()
+
+
 def tree_usage(root: Path) -> dict[str, int]:
     files = 0
     logical = 0
@@ -936,7 +940,8 @@ class Harness:
             if actual != expected_bytes:
                 raise EnvelopeError(
                     f"{label} restore byte mismatch for {path.name}: "
-                    f"expected {len(expected_bytes)} bytes, got {len(actual)}"
+                    f"expected {len(expected_bytes)} bytes sha256={bytes_sha256(expected_bytes)}, "
+                    f"got {len(actual)} bytes sha256={bytes_sha256(actual)}"
                 )
             total += len(actual)
             sha256.update(path.name.encode())
@@ -948,7 +953,9 @@ class Harness:
             actual = (self.mountpoint / f"file-{index:04d}.bin").read_bytes()
             if actual != expected_bytes:
                 raise EnvelopeError(
-                    f"mounted bytes changed across restart for file-{index:04d}.bin"
+                    f"mounted bytes mismatch for file-{index:04d}.bin: "
+                    f"expected {len(expected_bytes)} bytes sha256={bytes_sha256(expected_bytes)}, "
+                    f"got {len(actual)} bytes sha256={bytes_sha256(actual)}"
                 )
 
     def sqlite_integrity(self) -> list[dict[str, Any]]:
@@ -1045,6 +1052,7 @@ class Harness:
         second_duration = self.args.duration_seconds - first_duration
         self.report["phase"] = "steady-state-one"
         first = self.run_phase("steady-state-one", first_duration, expected)
+        self.verify_mount_bytes(expected)
         self.report["phase"] = "restart"
         stopped_one = self.mount.stop(self.redact)
         first_verify = self.verify_bytes("first-phase", expected)
@@ -1058,6 +1066,7 @@ class Harness:
         }
         self.report["phase"] = "steady-state-two"
         second = self.run_phase("steady-state-two", second_duration, expected)
+        self.verify_mount_bytes(expected)
         self.report["phase"] = "final-stop"
         stopped_two = self.mount.stop(self.redact)
         final_verify = self.verify_bytes("final", expected)
