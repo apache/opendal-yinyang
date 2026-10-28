@@ -9,7 +9,8 @@ content proofs, transactions or Managed identities. This specification defines
 the read-only observation and FUSE contract. The separate
 [Direct mutation runtime](direct-mutations.md) defines conditional publication,
 retained local generations and safe-save namespace mutation. Writable FUSE
-admission and Direct Sync remain separate integration work.
+admission is defined by the Linux FUSE frontend. Direct Sync remains separate
+integration work.
 
 ## Configuration and admission
 
@@ -222,6 +223,6 @@ staging database, metadata database, publication lease or remote object.
 - Direct does not provide rename-stable identity, hard links, symlinks, xattrs,
   distributed locks, cross-client or cross-object transactions, version
   browsing, automatic garbage collection or Managed receipts.
-- Writable FUSE admission, Direct Sync, non-Linux Direct FUSE and filesystem
-  directory atomicity remain future integration work. The mutation library's
-  file rename is explicitly non-atomic safe-save.
+- Direct Sync, non-Linux Direct FUSE and filesystem directory atomicity remain
+  future integration work. The mutation library's file rename is explicitly
+  non-atomic safe-save.
