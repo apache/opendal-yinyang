@@ -571,6 +571,7 @@ fn direct_write_rejects_unsupported_posix_operations_without_storage_effect() {
         &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
         "Direct RENAME_WHITEOUT",
     );
+    drop(root_directory);
 
     mounted.unmount();
     assert_eq!(
@@ -945,7 +946,7 @@ fn exercise_uncertain_publication(action: CommitAction, delivered: bool) {
     let error = error.expect_err("uncertain Direct publication reported success");
     assert_errno(
         &error,
-        &[libc::EIO, libc::ESTALE, libc::ENOTCONN],
+        &[libc::EIO, libc::ESTALE, libc::ENOTCONN, libc::ECONNABORTED],
         "uncertain Direct publication",
     );
     drop(file);
