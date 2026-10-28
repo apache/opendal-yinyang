@@ -417,7 +417,7 @@ async fn service_binding_fixtures_distinguish_unknown_malformed_and_mismatch() {
         let result = ServiceClient::connect(addr, token.into(), backend.operator()).await;
         match kind {
             Some(kind) => {
-                let error = result.err().expect("binding must be rejected");
+                let error = result.expect_err("binding must be rejected");
                 assert_eq!(error.kind(), kind);
                 assert!(error.to_string().contains(message), "{error}");
             }

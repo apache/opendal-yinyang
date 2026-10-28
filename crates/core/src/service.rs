@@ -92,7 +92,7 @@ fn check_columns(conn: &Connection, table: &str, expected: &[(&str, &str)]) -> R
             .iter()
             .zip(expected)
             .any(|((name, kind), (expected_name, expected_kind))| {
-                name.as_str() != *expected_name || !kind.eq_ignore_ascii_case(*expected_kind)
+                name.as_str() != *expected_name || !kind.eq_ignore_ascii_case(expected_kind)
             })
     {
         return Err(corrupt_schema(format!(
