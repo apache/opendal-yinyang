@@ -66,15 +66,18 @@ pagination/version behavior; it does not turn the loopback Silo suite into
 Amazon S3 evidence.
 
 The source-pinned real-Amazon-S3 Direct entrypoint run remains the
-`f629ed207cce81f196b55915bdd1154a3269a79a` record. The final integrated source
-`17361970d1722ea3d60c5381bbb5323d11818184` did not repeat those Direct,
+`f629ed207cce81f196b55915bdd1154a3269a79a` record with debug `yy` SHA-256
+`3dfe4c573b2d3311e07d4bf7c3be225a21d8541eec6fc7dc02262638ce06b9a0`.
+Its public boundary is recorded in
+[`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md). The final integrated
+source `17361970d1722ea3d60c5381bbb5323d11818184` did not repeat those Direct,
 backend, or range workloads.
 
 Final integrated source `17361970d1722ea3d60c5381bbb5323d11818184` passed the
 repository gates, Rust 1.91 locked check, default release archive, actual
 `fd1338c` installed upgrade with a 74,192-byte service WAL, the 2700-second
-Managed operating envelope, and the private final-evidence validator. Details,
-sampling gaps and limitations are recorded in
+Managed operating envelope. Details, sampling gaps, limitations and public raw
+JSON are recorded in
 [`linux-operating-envelope.md`](linux-operating-envelope.md).
 
 ## Matrix
@@ -108,8 +111,10 @@ entrypoint evidence covers writable remount and finite Direct Sync at
 conditional requests. The accepted Core115 proof at `b630ef2` covers Managed
 FUSE 27 tests, operations 1, Managed Sync 12, compatibility 8, recovery 4, and
 Direct 30 passed plus 8 filtered tests. Subsequent final-source changes were
-documentation/specification text and Python test-loader registration only.
-Those Direct/backend/range workloads were not repeated at `1736197`. Other
+the doctor remediation text, documentation/specification text, harness
+procedure and Python test-loader registration; they did not change native
+contracts. Those Direct/backend/range workloads were not repeated at
+`1736197`. Other
 S3-compatible services remain outside the matrix unless they satisfy exact
 recursive LIST, conditional ETag mutation and the tested version/range
 behavior.

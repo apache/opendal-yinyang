@@ -1,0 +1,10 @@
+schema=yinyang-linux-release-artifact.v1
+package=yinyang
+version=0.0.24
+release=0.0.24+17361970d172
+source_commit=17361970d1722ea3d60c5381bbb5323d11818184
+source_date_epoch=1793208710
+target=ubuntu-24.04-x86_64
+yy_sha256=a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c
+cargo=cargo 1.99.1 (5f94df478 2026-08-27)
+rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)

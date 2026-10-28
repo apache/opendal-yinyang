@@ -190,12 +190,14 @@ The archive's `bin/yy` SHA-256 is
 `a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c`.
 
 AWS repository gates passed at this source: `cargo x lint`, `cargo x check`,
-`cargo x test`, `cargo x licenses`, Rust 1.91.0 locked all-target check, Python
-3.12 fault tests and Ruff 0.17.2. The accepted Core115 native proof at
+`cargo x test`, `cargo x licenses`, and Rust 1.91.0 locked all-target check.
+The accepted Core115 native proof at
 `b630ef2` covers Managed FUSE 27 tests, operations 1, Managed Sync 12,
 compatibility 8, recovery 4, and Direct 30 passed plus 8 filtered tests.
-Subsequent A wording and Python test-loader changes did not modify production
-code, and those native workloads were not duplicated.
+The subsequent A revision changed only the doctor remediation text in
+`operations_cli.rs`; later harness/procedure and Python test-loader changes did
+not alter native contracts. Those native workloads were not repeated at
+`1736197`.
 
 The installed-prefix upgrade
 `o-pin-1736197-upgrade` passed against the immutable
@@ -240,104 +242,33 @@ outside the plain-HTTP counting proxy and no compatible process-scoped counter
 was supplied. The report does not infer requests from connections or verifier
 calls.
 
-The private final-evidence validator returned `status=pass` for the archive,
-installed upgrade, envelope report and source identity. Raw evidence is
-retained outside the repository; the principal paths are listed with the
-historical and diagnostic records below.
+Public raw evidence:
 
-Principal final evidence paths:
+- [accepted operating-envelope JSON](benchmarks/linux-envelope-amazon-s3-2026-10-28-1736197.json),
+  SHA-256
+  `858a7dd40e3662b536bef7206ead861ee6261580ef18d2b2893fc01a4d089c0e`;
+- [installed-upgrade JSON](benchmarks/linux-prefix-upgrade-2026-10-28-1736197.json),
+  SHA-256
+  `403bbcddbd6aac3cb5f6c1a5eae42d8b04b7720f7305b72a670ca7b56ff6b656`;
+- [release build manifest](benchmarks/linux-release-manifest-2026-10-28-1736197.txt),
+  SHA-256
+  `d34e92efe67ac3e9b52d5574f5889c49e6c2b29e4fabe1b44b3fcda95343d37c`.
 
-- archive and checksum: `O-archive-1736197/`;
-- upgrade JSON: `O-upgrade-1736197.json`;
-- envelope JSON: `O-envelope-45m-1736197-r2.json`;
-- validator output: `O-final-1736197/validator.json`;
-- derived raw review: `O-final-1736197/raw-review.json`;
-- gate logs and exits: `O-final-1736197/o-pin-1736197-*.log` and `.exit`;
-- credential metadata without secret values: `O-credentials-1736197.json`.
+The archive is prepared for this qualification but is not published as a
+release artifact.
 
-These relative names are under
-`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/`.
+### Earlier smoke and failure evidence
 
-### Earlier smoke evidence
-
-The operating-envelope harness has passed a 90-second real Amazon S3 smoke at
-source `79506c0684c47b37bc93364eaa7192d65a770ede` with binary SHA-256
-`b4985f099f1aff9447a2990f2ec3bdc8945237732eb8985a576f7666147cd979`.
-It used the dedicated `yinyang-direct-q-35b90fdf-versioned` bucket in
-`us-east-2` and the 24-file/256 KiB default dataset. The two workload phases
-ran for 48.156 and 48.552 seconds; final version-list verification added time,
-so this is not presented as a 90-second wall-clock result.
-
-The smoke reached the following bounded observations:
-
-- peak sampled Mount RSS and high-water RSS: 27,070,464 bytes;
-- peak Mount staging allocation: 10,608,640 bytes;
-- peak observed open descriptors: 21;
-- two clean unmounts and one successful remount;
-- final latest-state restore: 24 files, 6,291,456 bytes;
-- final S3 history: 3,558 object versions, 0 delete markers, 41,388,760 stored
-  bytes across 4 version-list pages;
-- 48 successful fsync-write operations in each phase, with no writer/reader
-  errors;
-- `doctor` passed and the retained SQLite `staging.db` integrity check reported
-  `ok`.
-
-An earlier 90-second run at source `7fd4d87602f3aa98b53dca31eeca9bf6d8ce2f3e`
-reported a same-length mismatch for `file-0015.bin` during the first-phase
-restore. The original JSON did not retain per-operation error counters, so that
-historical event is not proven. Source review identified an oracle defect:
-the expected bytes were updated only after `fsync`, although a successful
-`pwrite` had already acknowledged bytes and a failed fsync could later be
-published by close/flush. A local tmp-file fault injection reproduced the
-result: the old oracle rejected the actual successful pwrite bytes, while the
-updated oracle matched them and reported `fsync_errors=1` and
-`uncertain_files=[0]`.
-
-The harness now advances expected bytes per successful pwrite segment, records
-pwrite and fsync failures separately, and fails a run after byte assertions if
-durability remains uncertain. The earlier 795 repeat passed with the enhanced
-verification, but the historical mismatch is not counted as a proven product
-defect. The final integrated run retained those assertions and observed zero
-fsync errors or uncertain files.
-
-Request count is unavailable for this smoke because no compatible
-process-scoped counter was supplied; the report keeps that field explicit
-rather than inferring it from local I/O. The raw JSON is retained outside the
-repository at
-`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/O-envelope-smoke-79506c0.json`.
-
-A separate installed-prefix run at the same source upgraded the
-`fd1338c` producer to the target release binary, preserved a 74,192-byte
-service WAL before target startup, and passed target file, Sync, service,
-receipt and `doctor` checks. Its digest is recorded in
-`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/O-upgrade-79506c0.json`.
-That run is preparatory evidence for the operations harness; it does not
-qualify the final integrated implementation.
-
-The local Ubuntu 24.04 archive built from the same source has SHA-256
-`4368831f2bd3b9729caaaed511312749e9f98100a3d22a733a339222a9da159c`; the
-archive's binary hash matches that smoke target. It remains historical
-preparatory evidence, not the final qualification recorded above.
-
-### Retained failure and diagnostic evidence
+Earlier 90-second smoke runs are historical, not final proof. One exposed an
+oracle defect where expected bytes advanced only after `fsync`; the harness now
+advances the oracle after every successful `pwrite` segment and records fsync
+uncertainty separately. Their raw files remain private development evidence and
+are not used to support the final claims above.
 
 The pre-fix 45-minute run at source `455842b` failed before midpoint when an
-fsync retry deadline expired; it retained no final restore, doctor or completion
-record. Its raw report and failure state remain under
-`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/` as
-`O-envelope-45m-455842b-failed-r1.*` and `O-failure-ve13q2nn/`.
-
-The bounded diagnostic at source `de86d1c` classified the observed terminal
-retry as CAS exhaustion rather than folded storage error, but its runner exited
-`1` because doctor reported `ledger-errors=1`. The diagnostic branch is not part
-of the final source. Its classification, raw work directory and exact counters
-remain under `O-diagnostic-de86d1c-r1-failure/`; the failed diagnostic database
-was not acknowledged.
-
-The Rust gate run at source `235419a` exposed a Python 3.12 test-loader
-registration failure before the final loader fix. The failed log remains at
-`O-final-1736197/O-pin-235419a-python-failure.log`; it is not a product or
-workload failure. The first FIFO launch attempt for the final run also exited
-before STS credentials reached the wrapper and performed no S3 workload; run
-`o-pin-1736197-envelope-45m` retains that startup failure, while the accepted
-run is `o-pin-1736197-envelope-45m-r2`.
+fsync retry deadline expired. The bounded `de86d1c` diagnostic classified the
+observed terminal retry as CAS exhaustion rather than folded storage error, but
+its runner exited `1` because doctor reported `ledger-errors=1`. These pre-fix
+states motivated the accepted same-client serialization fix and guarded
+acknowledgment procedure; they are not part of the final source, and the
+diagnostic database was not acknowledged.
