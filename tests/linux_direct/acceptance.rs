@@ -491,6 +491,114 @@ fn direct_percent_mapping_preserves_case_unicode_and_reserved_components() {
     );
 }
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_unrepresentable_names_reject_the_complete_observation_without_writes() {
+    let cases: Vec<(&str, Vec<(String, &[u8])>, &str)> = vec![
+        (
+            "file-prefix",
+            vec![
+                ("a".to_owned(), b"file".as_slice()),
+                ("a/b".to_owned(), b"child".as_slice()),
+            ],
+            "file-prefix collision",
+        ),
+        (
+            "empty-component",
+            vec![("a//b".to_owned(), b"empty".as_slice())],
+            "empty",
+        ),
+        (
+            "directory-marker",
+            vec![("dir/".to_owned(), b"not-a-directory".as_slice())],
+            "directory marker",
+        ),
+        (
+            "name-max",
+            vec![("x".repeat(256), b"too-long".as_slice())],
+            "NAME_MAX",
+        ),
+    ];
+    for (label, objects, diagnostic) in cases {
+        let fixture = Fixture::new();
+        for (key, bytes) in &objects {
+            fixture.write_raw(key, bytes);
+        }
+        let inventory = fixture.inventory();
+        let config = fixture.config(&format!("direct-{label}"), "fuse", None, None);
+        let mountpoint = fixture.path(&format!("mnt-{label}"));
+        fs::create_dir(&mountpoint).expect("create rejection mountpoint");
+        let rejected = run_timeout(
+            fixture.yy_command(&[
+                "--volume",
+                path_text(&config),
+                "mount",
+                path_text(&mountpoint),
+            ]),
+            Duration::from_secs(30),
+        );
+        assert!(
+            !rejected.status.success(),
+            "unrepresentable Direct namespace {label} was accepted"
+        );
+        assert!(
+            rejected
+                .text()
+                .to_ascii_lowercase()
+                .contains(&diagnostic.to_ascii_lowercase()),
+            "Direct rejection {label} did not identify {diagnostic:?}:\n{}",
+            rejected.text()
+        );
+        for (key, _) in objects {
+            assert!(
+                rejected.text().contains(&key),
+                "Direct rejection {label} omitted original object key {key:?}:\n{}",
+                rejected.text()
+            );
+        }
+        assert_eq!(
+            fixture.inventory(),
+            inventory,
+            "unrepresentable Direct namespace {label} mutated storage"
+        );
+        assert!(
+            inventory.keys().all(|key| !key.starts_with(".yinyang/")),
+            "Direct rejection {label} created authoritative metadata"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-direct"]
+fn direct_sigterm_and_restart_preserve_namespace_and_storage() {
+    let fixture = Fixture::new();
+    fixture.write_raw("lifecycle.txt", b"Direct lifecycle");
+    let inventory = fixture.inventory();
+    let config = fixture.config("direct-lifecycle", "fuse", None, None);
+    let first_mountpoint = fixture.path("mnt-lifecycle-first");
+    fs::create_dir(&first_mountpoint).expect("create first lifecycle mountpoint");
+    let first = fixture.spawn_mount(&config, &first_mountpoint, "fuse");
+    assert_eq!(
+        fs::read(first.mountpoint().join("lifecycle.txt")).unwrap(),
+        b"Direct lifecycle"
+    );
+    first.terminate();
+
+    let second_mountpoint = fixture.path("mnt-lifecycle-second");
+    fs::create_dir(&second_mountpoint).expect("create second lifecycle mountpoint");
+    let second = fixture.spawn_mount(&config, &second_mountpoint, "fuse");
+    assert_eq!(
+        fs::read(second.mountpoint().join("lifecycle.txt")).unwrap(),
+        b"Direct lifecycle"
+    );
+    second.unmount();
+    assert_eq!(
+        fixture.inventory(),
+        inventory,
+        "Direct lifecycle must leave every storage object unchanged"
+    );
+}
+
 fn find_encoded(directory: &Path, raw_component: &str) -> PathBuf {
     let matches = fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("read encoded Direct directory: {error}"))

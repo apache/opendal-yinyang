@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg(target_os = "linux")]
+
 #[path = "compatibility/mod.rs"]
 mod compatibility;
 #[path = "support/process.rs"]

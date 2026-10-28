@@ -384,7 +384,7 @@ fn query_encode(value: &str) -> String {
 fn encode(bytes: &[u8], keep_slash: bool) -> String {
     let mut output = String::new();
     for &byte in bytes {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             output.push(char::from(byte));
         } else if keep_slash && byte == b'/' {
             output.push('/');

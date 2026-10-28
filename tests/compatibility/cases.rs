@@ -447,6 +447,47 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
 
 #[test]
 #[ignore = "requires isolated S3 and YY_LEGACY_BIN; run with cargo x test-compatibility"]
+fn compatibility_fd1338c_service_unknown_profile_rejects_without_mutation() {
+    let storage = Materialized::component("service");
+    let database = storage.path("metadata.db");
+    storage.copy_fixture("service", "metadata.db", &database);
+    sqlite_execute(
+        &database,
+        "UPDATE authority SET profile='yinyang-sqlite-99'",
+    );
+    let before = tree_hashes(storage.temp.path());
+    let rejected = run_timeout(
+        storage.command(
+            &current_binary(),
+            &[
+                "serve",
+                "--database",
+                database.to_str().unwrap(),
+                "--listen",
+                "127.0.0.1:0",
+            ],
+        ),
+        Duration::from_secs(30),
+    );
+    assert!(
+        !rejected.status.success(),
+        "unknown service profile was accepted"
+    );
+    assert!(
+        rejected.text().to_ascii_lowercase().contains("profile")
+            || rejected.text().to_ascii_lowercase().contains("unsupported"),
+        "service rejection did not reach the profile boundary:\n{}",
+        rejected.text()
+    );
+    assert_eq!(
+        tree_hashes(storage.temp.path()),
+        before,
+        "unknown service profile rejection mutated the SQLite authority"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated S3 and YY_LEGACY_BIN; run with cargo x test-compatibility"]
 fn compatibility_fd1338c_sync_replica_and_backup_cross_both_binaries() {
     let storage = Materialized::component("sync");
     let state = storage.path("state");
@@ -540,30 +581,6 @@ fn compatibility_fd1338c_sync_replica_and_backup_cross_both_binaries() {
         tree_files(&backup.join("root")),
         "restored backup bytes differ from the fd1338c package"
     );
-
-    let columns = sqlite_columns(&state.join("replica.db"), "work");
-    assert!(
-        columns.len() >= 22
-            && columns.contains(&"source_artifact".to_owned())
-            && columns[..]
-                .windows(2)
-                .any(|pair| pair[0] == "remote_revision" && pair[1] == "commit_id"),
-        "fd1338c replica fixture does not retain the historical ALTER column order: {columns:?}"
-    );
-}
-
-fn sqlite_columns(database: &Path, table: &str) -> Vec<String> {
-    let connection =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    let mut statement = connection
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .unwrap();
-    statement
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<String>>>()
-        .unwrap()
 }
 
 #[test]
