@@ -180,8 +180,11 @@ is first fully decoded, then one SQLite transaction adds both columns and
 advances the profile to stage-2. Original handle records, chunks, frozen
 requests, CommitIds, and ledger sequences are preserved. A stage-2 database is
 validated without DDL. Unknown profiles or missing/extra/reordered maintained
-columns are rejected before WAL configuration, DDL, runtime-lock creation, or
-incomplete-open cleanup.
+columns are rejected before DDL, runtime-lock creation, or incomplete-open
+cleanup. SQLite's standard read-only WAL path may create or update derived
+`-wal`/`-shm` coordination files. Those files are not logical staging records:
+the main database, existing WAL/journal bytes, configured journal mode, schema,
+rows, lease, and cleanup state remain unchanged.
 
 An absent or zero-table database is initialized only after the writer lease is
 held. A writer that finishes between preflight and lease acquisition may have
@@ -189,9 +192,11 @@ already upgraded stage-1 to stage-2; the lock holder revalidates and accepts
 that state rather than requiring an unchanged preflight profile.
 
 Inspect and backup validation accept stage-1 or stage-2 without upgrading,
-changing journal mode, cleaning handles, or acquiring the writer lease. Old
-message-only failures report Unclassified; their kind and commit identity are
-not inferred from prose. A frozen plan still exposes its exact CommitId.
+changing authoritative database/WAL bytes or journal mode, cleaning handles, or
+acquiring the writer lease. SQLite may create or update derived `-wal`/`-shm`
+coordination files. Old message-only failures report Unclassified; their kind
+and commit identity are not inferred from prose. A frozen plan still exposes its
+exact CommitId.
 Older binaries reject stage-2; downgrade is unsupported. The upgrade changes
 only local staging, not remote metadata or content.
 
