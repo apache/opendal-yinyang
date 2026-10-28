@@ -43,7 +43,7 @@ pub fn require_direct_environment() {
     if !Path::new("/dev/fuse").exists() {
         panic!("/dev/fuse is unavailable; Direct acceptance must fail rather than skip");
     }
-    for tool in ["fusermount3", "timeout"] {
+    for tool in ["fusermount3", "timeout", "python3"] {
         if Command::new(tool).arg("--version").output().is_err() {
             panic!("{tool} is unavailable; Direct acceptance must fail rather than skip");
         }
@@ -112,7 +112,6 @@ impl RunningCommand {
                         String::from_utf8_lossy(&stderr)
                     );
                 }
-                None => unreachable!(),
             }
         };
         self.child.take();

@@ -24,13 +24,13 @@ use crate::harness::{
 use crate::s3_gate::{CommitAction, S3Gate};
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::unistd::{chown, getgid, getuid};
+use rustix::fs::{RenameFlags, renameat_with};
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -369,44 +369,29 @@ fn direct_write_create_is_conditional_and_never_clobbers_external_appearance() {
     mounted.unmount();
 }
 
-fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
-    let path = CString::new(path.as_os_str().as_bytes()).expect("test path has no NUL");
-    let name = CString::new(name).expect("xattr name has no NUL");
-    let result = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if result == 0 {
+fn set_xattr(path: &Path) -> std::io::Result<()> {
+    let mut command = Command::new("python3");
+    command.args([
+        "-c",
+        "import os, sys; os.setxattr(sys.argv[1], b'user.yinyang', b'unsupported')",
+    ]);
+    command.arg(path);
+    let output = run_timeout(command, Duration::from_secs(30));
+    if output.status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        Err(std::io::Error::other(output.text()))
     }
 }
 
-fn renameat2(source: &Path, destination: &Path, flags: u32) -> std::io::Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes()).expect("test source has no NUL");
-    let destination =
-        CString::new(destination.as_os_str().as_bytes()).expect("test destination has no NUL");
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            flags,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn renameat2(
+    directory: &File,
+    source: &str,
+    destination: &str,
+    flags: RenameFlags,
+) -> std::io::Result<()> {
+    renameat_with(directory, source, directory, destination, flags)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
 #[test]
@@ -436,13 +421,18 @@ fn direct_write_rejects_unsupported_posix_operations_without_storage_effect() {
     let error = chown(&base, Some(getuid()), Some(getgid()))
         .expect_err("Direct must reject ownership changes");
     assert!(
-        [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS].contains(&error as i32),
+        [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS].contains(&(error as i32)),
         "Direct chown returned unexpected errno {error}"
     );
 
-    let error = set_xattr(&base, "user.yinyang", b"unsupported")
-        .expect_err("Direct must reject extended attributes");
-    assert_errno(&error, &[libc::EOPNOTSUPP, libc::ENOSYS], "Direct xattr");
+    let error = set_xattr(&base).expect_err("Direct must reject extended attributes");
+    let diagnostic = error.to_string().to_ascii_lowercase();
+    assert!(
+        diagnostic.contains("operation not supported")
+            || diagnostic.contains("errno 95")
+            || diagnostic.contains("not implemented"),
+        "Direct xattr rejection did not identify unsupported semantics: {diagnostic}"
+    );
 
     let error = std::os::unix::fs::symlink("base.txt", root.join("symlink"))
         .expect_err("Direct must reject symlinks");
@@ -466,15 +456,26 @@ fn direct_write_rejects_unsupported_posix_operations_without_storage_effect() {
         &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
         "Direct directory rename",
     );
-    let error = renameat2(&base, &root.join("other.txt"), libc::RENAME_EXCHANGE)
-        .expect_err("Direct must reject RENAME_EXCHANGE");
+    let root_directory = File::open(root).expect("open writable Direct root");
+    let error = renameat2(
+        &root_directory,
+        "base.txt",
+        "other.txt",
+        RenameFlags::EXCHANGE,
+    )
+    .expect_err("Direct must reject RENAME_EXCHANGE");
     assert_errno(
         &error,
         &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
         "Direct RENAME_EXCHANGE",
     );
-    let error = renameat2(&base, &root.join("whiteout"), libc::RENAME_WHITEOUT)
-        .expect_err("Direct must reject RENAME_WHITEOUT");
+    let error = renameat2(
+        &root_directory,
+        "base.txt",
+        "whiteout",
+        RenameFlags::WHITEOUT,
+    )
+    .expect_err("Direct must reject RENAME_WHITEOUT");
     assert_errno(
         &error,
         &[libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL],
@@ -743,7 +744,7 @@ fn direct_write_unflushed_create_and_append_survive_crash() {
     );
     let base = payload(16 * 1024 + 1, 0x2d);
     fixture.write_raw("append-crash.txt", &base);
-    let mut mounted_again = second_mount;
+    let mounted_again = second_mount;
     mounted_again.refresh_and_wait(Duration::from_secs(30));
     let mut append = OpenOptions::new()
         .read(true)

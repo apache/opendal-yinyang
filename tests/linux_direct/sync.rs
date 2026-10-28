@@ -443,7 +443,7 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
     let gate = S3Gate::start_for_path(action, "PUT", suffix);
     let mut command = fixture.yy_command(&["--volume", path_text(&config), "sync", "run"]);
     command.env("YINYANG_S3_ENDPOINT", gate.endpoint());
-    let running = RunningCommand::spawn(command);
+    let mut running = RunningCommand::spawn(command);
     let intercepted = gate.wait_intercepted();
     assert_eq!(intercepted.method, "PUT");
     assert!(
@@ -533,7 +533,7 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
         "Direct Sync did not retain the original uncertain upload bytes"
     );
 
-    sync_run(&fixture, &config);
+    let _retry = fixture.yy(&["--volume", path_text(&config), "sync", "run"]);
     assert_eq!(
         fixture.raw_get("uncertain.txt").as_deref(),
         Some(backend_before_retry),
