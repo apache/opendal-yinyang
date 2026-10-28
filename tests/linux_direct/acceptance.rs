@@ -492,6 +492,12 @@ fn direct_list_preserves_file_prefix_aliases_without_folding() {
     let fixture = Fixture::new();
     fixture.write_raw("a", b"file");
     fixture.write_raw("a/b", b"child");
+    let raw_keys = fixture.inventory().keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        raw_keys,
+        ["a".to_owned(), "a/b".to_owned()].into_iter().collect(),
+        "the raw S3 fixture must contain both alias keys"
+    );
     let runtime = tokio::runtime::Runtime::new().expect("Direct test runtime");
     let operator = fixture.operator();
     let paths = runtime.block_on(async {
