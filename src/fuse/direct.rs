@@ -1501,7 +1501,7 @@ fn namespace_conflict_errno(errno: fuser::Errno) -> fuser::Errno {
 }
 
 fn should_rebase_namespace_after_failure(errno: fuser::Errno) -> bool {
-    // Conflict retains the failed pin until explicit SIGHUP. Other namespace
+    // A conflict callback must not rebase its failed pin. Other namespace
     // failures return EIO/EOPNOTSUPP and may install the successful refresh.
     errno.code() != fuser::Errno::EAGAIN.code()
 }
