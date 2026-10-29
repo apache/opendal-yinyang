@@ -1,0 +1,257 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Linux trial distribution
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-trial.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "deploy/linux/**"
+      - "docs/linux-operations.md"
+      - "docs/linux-qualification.md"
+      - "docs/linux-trial-distribution.md"
+      - "src/**"
+      - "specs/linux-operations.md"
+      - "specs/linux-trial-distribution.md"
+      - "tests/linux_fuse/harness.rs"
+      - "tests/linux_operations.rs"
+      - "tests/linux_prefix_upgrade.rs"
+      - "tests/linux_sync/harness.rs"
+      - "tests/linux_trial_archive.sh"
+      - "tests/linux_trial_distribution.sh"
+      - "tests/support/**"
+      - "tools/linux/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TRIAL_ROOT: ${{ runner.temp }}/yinyang-trial
+  YINYANG_S3_BUCKET: yinyang-test
+  YINYANG_S3_ENDPOINT: http://127.0.0.1:9000
+  YINYANG_S3_REGION: us-east-1
+  YINYANG_S3_ACCESS_KEY_ID: yinyang-test
+  YINYANG_S3_SECRET_ACCESS_KEY: yinyang-test-only
+  YINYANG_STORAGE_PROFILE: minio
+
+jobs:
+  trial:
+    name: Trial archive, install and upgrade
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Prepare trial evidence
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes fuse3 sqlite3
+          mkdir -p "$TRIAL_ROOT/artifacts" "$TRIAL_ROOT/evidence"
+          {
+            date --utc
+            uname -a
+            . /etc/os-release
+            printf 'os=%s %s\n' "$ID" "$VERSION_ID"
+            rustc --version
+            cargo --version
+            sha256sum --version | head -n 1
+          } | tee "$TRIAL_ROOT/evidence/host.txt"
+
+      - name: Build trial archive
+        run: |
+          set -euo pipefail
+          tools/linux/package-release.sh \
+            --output-dir "$TRIAL_ROOT/artifacts" \
+            2>&1 | tee "$TRIAL_ROOT/evidence/package.log"
+          archive=$(find "$TRIAL_ROOT/artifacts" -maxdepth 1 -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          test -f "$archive.sha256"
+          printf 'TRIAL_ARCHIVE=%s\n' "$archive" >>"$GITHUB_ENV"
+
+      - name: Verify actual archive and packaged scripts
+        run: |
+          set -euo pipefail
+          extract="$TRIAL_ROOT/extracted"
+          mkdir -p "$extract"
+          tar -xzf "$TRIAL_ARCHIVE" -C "$extract"
+          root=$(basename "$TRIAL_ARCHIVE" .tar.gz)
+          tree="$extract/$root"
+          verifier="$tree/share/yinyang/verify-release.sh"
+          installer="$tree/share/yinyang/install-release.sh"
+          test -x "$verifier"
+          test -x "$installer"
+          "$verifier" \
+            --archive "$TRIAL_ARCHIVE" \
+            --source-commit "$GITHUB_SHA" \
+            2>&1 | tee "$TRIAL_ROOT/evidence/verify.log"
+          cp "$TRIAL_ARCHIVE" "$TRIAL_ARCHIVE.sha256" "$TRIAL_ROOT/evidence/"
+          cp "$tree/BUILD-MANIFEST" "$TRIAL_ROOT/evidence/BUILD-MANIFEST"
+          cp "$tree/PREREQUISITES" "$TRIAL_ROOT/evidence/PREREQUISITES"
+          (
+            cd "$tree"
+            sha256sum bin/yy
+          ) | tee "$TRIAL_ROOT/evidence/binary.sha256"
+          printf 'VERIFIER=%s\nINSTALLER=%s\nARCHIVE_TREE=%s\n' \
+            "$verifier" "$installer" "$tree" >>"$GITHUB_ENV"
+
+      - name: Exercise archive verification, install and activation
+        run: |
+          set -euo pipefail
+          tests/linux_trial_distribution.sh \
+            --archive "$TRIAL_ARCHIVE" \
+            --verifier "$VERIFIER" \
+            --installer "$INSTALLER" \
+            --source-commit "$GITHUB_SHA" \
+            2>&1 | tee "$TRIAL_ROOT/evidence/package-scripts.log"
+
+      - name: Install the actual archive
+        run: |
+          set -euo pipefail
+          prefix="$TRIAL_ROOT/prefix"
+          "$INSTALLER" install \
+            --archive "$TRIAL_ARCHIVE" \
+            --prefix "$prefix" \
+            --activate \
+            --quiesced \
+            2>&1 | tee "$TRIAL_ROOT/evidence/install.log"
+          release=$(
+            "$INSTALLER" inspect --prefix "$prefix" |
+              awk -F'[ =]' '$1 == "release" && $5 == "active" && $6 == "true" { print $2 }'
+          )
+          test -n "$release"
+          test "$(readlink "$prefix/current")" = "$release"
+          test -x "$prefix/current/bin/yy"
+          (
+            cd "$prefix/current"
+            sha256sum bin/yy
+          ) | tee "$TRIAL_ROOT/evidence/installed-binary.sha256"
+          cmp \
+            "$TRIAL_ROOT/evidence/binary.sha256" \
+            "$TRIAL_ROOT/evidence/installed-binary.sha256"
+          "$INSTALLER" inspect --prefix "$prefix" |
+            tee "$TRIAL_ROOT/evidence/inventory.log"
+          printf 'TRIAL_PREFIX=%s\nTRIAL_YY=%s\nTRIAL_RELEASE=%s\n' \
+            "$prefix" "$prefix/current/bin/yy" "$release" >>"$GITHUB_ENV"
+
+      - name: Start isolated S3-compatible storage
+        run: |
+          set -euo pipefail
+          docker run -d --name yinyang-trial-silo -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=yinyang-test \
+            -e MINIO_ROOT_PASSWORD=yinyang-test-only \
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 \
+            server /data
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:9000/minio/health/ready
+          docker exec yinyang-trial-silo \
+            mcli alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
+          docker exec yinyang-trial-silo mcli mb local/yinyang-test
+
+      - name: Exercise installed archive bytes and doctor
+        run: |
+          set -euo pipefail
+          export YINYANG_S3_ROOT="linux-trial/archive-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          tests/linux_trial_archive.sh \
+            --yy "$TRIAL_YY" \
+            --evidence "$TRIAL_ROOT/evidence" \
+            2>&1 | tee "$TRIAL_ROOT/evidence/archive-smoke.log"
+
+      - name: Run retained-state recovery acceptance
+        run: |
+          set -euo pipefail
+          yy_sha256=$(sha256sum "$TRIAL_YY" | awk '{print $1}')
+          {
+            printf 'schema=yinyang-linux-trial-recovery-binary.v1\n'
+            printf 'source_commit=%s\n' "$GITHUB_SHA"
+            printf 'binary=%s\n' "$TRIAL_YY"
+            printf 'yy_sha256=%s\n' "$yy_sha256"
+          } | tee "$TRIAL_ROOT/evidence/recovery-binary.txt"
+          export YY_UPGRADE_BIN="$TRIAL_YY"
+          cargo x test-linux-recovery \
+            2>&1 | tee "$TRIAL_ROOT/evidence/recovery.log"
+
+      - name: Build pinned fd1338c producer
+        run: |
+          set -euo pipefail
+          legacy="$RUNNER_TEMP/opendal-yinyang-fd1338c"
+          git worktree add --detach "$legacy" fd1338c2f924a90e9da752b9158e748d1d3acaf4
+          test "$(git -C "$legacy" rev-parse HEAD)" = \
+            "fd1338c2f924a90e9da752b9158e748d1d3acaf4"
+          (
+            cd "$legacy"
+            cargo build --release --locked --bin yy
+          )
+          legacy_bin="$legacy/target/release/yy"
+          test -x "$legacy_bin"
+          sha256sum "$legacy_bin" |
+            tee "$TRIAL_ROOT/evidence/legacy-binary.sha256"
+          printf 'YY_LEGACY_BIN=%s\n' "$legacy_bin" >>"$GITHUB_ENV"
+
+      - name: Run installed-prefix upgrade with the archive target
+        run: |
+          set -euo pipefail
+          export YY_UPGRADE_BIN="$TRIAL_YY"
+          export YY_UPGRADE_RELEASE="$TRIAL_RELEASE"
+          export YINYANG_UPGRADE_SOURCE="$GITHUB_SHA"
+          export YINYANG_UPGRADE_EVIDENCE="$TRIAL_ROOT/evidence/upgrade.json"
+          cargo test \
+            -p yinyang \
+            --test linux_prefix_upgrade \
+            installed_prefix_upgrade_preserves_retained_work_and_service_wal \
+            -- \
+            --ignored \
+            --nocapture \
+            --test-threads=1 \
+            2>&1 | tee "$TRIAL_ROOT/evidence/upgrade.log"
+
+      - name: Upload trial evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yinyang-linux-trial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/yinyang-trial/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show isolated storage logs on failure
+        if: failure()
+        run: |
+          if docker container inspect yinyang-trial-silo >/dev/null 2>&1; then
+            docker logs yinyang-trial-silo
+          fi
+
+      - name: Remove isolated storage container
+        if: always()
+        run: |
+          docker rm -f yinyang-trial-silo >/dev/null 2>&1 || true
