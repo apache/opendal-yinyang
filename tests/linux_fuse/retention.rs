@@ -30,6 +30,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use yinyang::runtime::Runtime as YinYangRuntime;
+use yinyang::space::{inspect_managed_space, plan_managed_retention};
 
 const UNIT_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -40,6 +41,53 @@ const FILE_BYTES: usize = 2 * UNIT_BYTES + 2 * RANGE_BYTES + 19;
 fn fuse_space_and_retention_are_observational_during_dirty_work_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         space_and_retention_are_observational(&Fixture::new(publication));
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_space_cli_emits_versioned_documents_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let library =
+            fixture.volume_config(&format!("lib-space-cli-{suffix}"), Frontend::Library, false);
+        fixture.library_seed(&library, "cli.txt", b"cli");
+        let config =
+            fixture.volume_config(&format!("stage-space-cli-{suffix}"), Frontend::Fuse, false);
+        let mountpoint = fixture.temp.path().join(format!("mnt-space-cli-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create space CLI mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+
+        let report = fixture.yy(&[
+            "--volume",
+            config.to_str().expect("UTF-8 space CLI config"),
+            "space",
+            "report",
+            "--json",
+        ]);
+        report.success_or("space report CLI");
+        let report: Value = serde_json::from_slice(&report.stdout).expect("space report CLI JSON");
+        assert_eq!(report["schema"], "yinyang.managed-space.report.v1");
+        assert_eq!(report["deletion_authorized"], false);
+        assert!(report["reclaimable_bytes"].is_null());
+
+        let plan = fixture.yy(&[
+            "--volume",
+            config.to_str().expect("UTF-8 space CLI config"),
+            "space",
+            "retention",
+            "plan",
+            "--keep-last",
+            "1",
+            "--json",
+        ]);
+        plan.success_or("space retention plan CLI");
+        let plan: Value = serde_json::from_slice(&plan.stdout).expect("retention plan CLI JSON");
+        assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v1");
+        assert_eq!(plan["deletion_authorized"], false);
+        assert!(plan["reclaimable_bytes"].is_null());
+        mounted.unmount();
     }
 }
 
@@ -58,19 +106,6 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
         false,
         Some(gate.address()),
     );
-    let observation_config = fixture
-        .temp
-        .path()
-        .join("stage-space-frozen-observation.json");
-    let mut observation: Value =
-        serde_json::from_slice(&fs::read(&config).expect("read gated frozen config"))
-            .expect("parse gated frozen config");
-    observation["service_address"] = Value::String(fixture.service_address().to_string());
-    fs::write(
-        &observation_config,
-        serde_json::to_vec_pretty(&observation).expect("serialize frozen observation config"),
-    )
-    .expect("write frozen observation config");
     let mountpoint = fixture.temp.path().join("mnt-space-frozen");
     fs::create_dir(&mountpoint).expect("create frozen space mountpoint");
     let mut mounted = fixture.mount(&config, &mountpoint);
@@ -113,26 +148,16 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
         "a frozen publication must not expose dirty bytes while observation runs"
     );
 
-    let config_before =
-        fs::read(&observation_config).expect("read frozen volume config before observation");
+    let config_before = fs::read(&config).expect("read frozen volume config before observation");
     let remote_before = fixture.remote_object_identities();
     let staging_before = tree_identity(&staging);
-    let report = fixture.yy(&[
-        "--volume",
-        observation_config
-            .to_str()
-            .expect("UTF-8 frozen volume config"),
-        "space",
-        "report",
-        "--json",
-    ]);
-    report.success_or("space report during frozen FUSE work");
-    assert_space_report(&report.stdout, &staging);
-    assert_frozen_report(&report.stdout);
+    let report = in_process_space_report(&fixture, &staging);
+    assert_space_report(&report, &staging);
+    assert_frozen_report(&report);
     assert_no_effects(
         &fixture,
         &library,
-        &observation_config,
+        &config,
         &staging,
         &original,
         &config_before,
@@ -141,25 +166,13 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
         &mut mounted,
     );
 
-    let plan = fixture.yy(&[
-        "--volume",
-        observation_config
-            .to_str()
-            .expect("UTF-8 frozen volume config"),
-        "space",
-        "retention",
-        "plan",
-        "--keep-last",
-        "1",
-        "--json",
-    ]);
-    plan.success_or("retention plan during frozen FUSE work");
-    assert_retention_plan(&plan.stdout);
-    assert_frozen_plan(&plan.stdout);
+    let plan = in_process_retention_plan(&fixture, &staging, 1);
+    assert_retention_plan(&plan);
+    assert_frozen_plan(&plan);
     assert_no_effects(
         &fixture,
         &library,
-        &observation_config,
+        &config,
         &staging,
         &original,
         &config_before,
@@ -252,17 +265,10 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
         &mut mounted,
     );
 
-    let report = fixture.yy(&[
-        "--volume",
-        config.to_str().expect("UTF-8 volume config"),
-        "space",
-        "report",
-        "--json",
-    ]);
-    report.success_or("space report during dirty FUSE work");
+    let report = in_process_space_report(fixture, &staging);
     assert_pending_staging(&staging, false);
-    assert_space_report(&report.stdout, &staging);
-    assert_pending_report(&report.stdout);
+    assert_space_report(&report, &staging);
+    assert_pending_report(&report);
     assert_no_effects(
         fixture,
         &library,
@@ -275,19 +281,9 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
         &mut mounted,
     );
 
-    let plan = fixture.yy(&[
-        "--volume",
-        config.to_str().expect("UTF-8 volume config"),
-        "space",
-        "retention",
-        "plan",
-        "--keep-last",
-        "1",
-        "--json",
-    ]);
-    plan.success_or("retention plan during dirty FUSE work");
-    assert_retention_plan(&plan.stdout);
-    assert_pending_plan(&plan.stdout);
+    let plan = in_process_retention_plan(fixture, &staging, 1);
+    assert_retention_plan(&plan);
+    assert_pending_plan(&plan);
     assert_no_effects(
         fixture,
         &library,
@@ -357,8 +353,12 @@ fn assert_no_effects(
     );
 }
 
-fn assert_space_report(output: &[u8], staging: &Path) {
-    let document = parse_schema(output, "yinyang.managed-space.report.v1");
+fn assert_space_report(document: &Value, staging: &Path) {
+    assert_eq!(
+        document.get("schema").and_then(Value::as_str),
+        Some("yinyang.managed-space.report.v1"),
+        "unexpected space JSON schema: {document}"
+    );
     assert_eq!(
         document["staging"]["path"].as_str(),
         staging.to_str(),
@@ -402,8 +402,12 @@ fn assert_space_report(output: &[u8], staging: &Path) {
     assert_dirty_handle_count(&document["staging"]["handles"], "space report");
 }
 
-fn assert_retention_plan(output: &[u8]) {
-    let document = parse_schema(output, "yinyang.managed-retention.plan.v1");
+fn assert_retention_plan(document: &Value) {
+    assert_eq!(
+        document.get("schema").and_then(Value::as_str),
+        Some("yinyang.managed-retention.plan.v1"),
+        "unexpected retention JSON schema: {document}"
+    );
     assert_eq!(
         document["deletion_authorized"],
         Value::Bool(false),
@@ -448,8 +452,7 @@ fn assert_retention_plan(output: &[u8]) {
     );
 }
 
-fn assert_pending_report(output: &[u8]) {
-    let document: Value = serde_json::from_slice(output).expect("pending space report JSON");
+fn assert_pending_report(document: &Value) {
     assert!(
         document["staging"]["handles"]["pending"]
             .as_u64()
@@ -458,8 +461,7 @@ fn assert_pending_report(output: &[u8]) {
     );
 }
 
-fn assert_pending_plan(output: &[u8]) {
-    let document: Value = serde_json::from_slice(output).expect("pending retention plan JSON");
+fn assert_pending_plan(document: &Value) {
     assert!(
         document["protection"]["staging"]["pending"]
             .as_u64()
@@ -479,8 +481,7 @@ fn assert_dirty_handle_count(staging: &Value, context: &str) {
     );
 }
 
-fn assert_frozen_report(output: &[u8]) {
-    let document: Value = serde_json::from_slice(output).expect("frozen space report JSON");
+fn assert_frozen_report(document: &Value) {
     assert!(
         document["staging"]["handles"]["frozen"]
             .as_u64()
@@ -489,8 +490,7 @@ fn assert_frozen_report(output: &[u8]) {
     );
 }
 
-fn assert_frozen_plan(output: &[u8]) {
-    let document: Value = serde_json::from_slice(output).expect("frozen retention plan JSON");
+fn assert_frozen_plan(document: &Value) {
     assert!(
         document["protection"]["staging"]["frozen"]
             .as_u64()
@@ -514,17 +514,6 @@ fn assert_frozen_plan(output: &[u8]) {
     );
 }
 
-fn parse_schema(output: &[u8], expected: &str) -> Value {
-    let document: Value =
-        serde_json::from_slice(output).expect("space command returned valid JSON");
-    assert_eq!(
-        document.get("schema").and_then(Value::as_str),
-        Some(expected),
-        "unexpected space JSON schema: {document}"
-    );
-    document
-}
-
 fn assert_pending_staging(staging: &Path, frozen: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -542,6 +531,40 @@ fn assert_pending_staging(staging: &Path, frozen: bool) {
         handle.frozen, frozen,
         "unexpected frozen state: {status:#?}"
     );
+}
+
+fn in_process_space_report(fixture: &Fixture, staging: &Path) -> Value {
+    let authority = fixture.in_process_authority();
+    let operator = fixture.operator();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build space observation runtime");
+    let report = runtime
+        .block_on(inspect_managed_space(
+            authority.as_ref(),
+            &operator,
+            staging,
+        ))
+        .expect("inspect managed space in process");
+    serde_json::to_value(report).expect("serialize managed space report")
+}
+
+fn in_process_retention_plan(fixture: &Fixture, staging: &Path, keep_last: u64) -> Value {
+    let authority = fixture.in_process_authority();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build retention planning runtime");
+    let plan = runtime
+        .block_on(plan_managed_retention(
+            authority.as_ref(),
+            staging,
+            Some(keep_last),
+            &[],
+        ))
+        .expect("plan managed retention in process");
+    serde_json::to_value(plan).expect("serialize retention plan")
 }
 
 #[derive(Debug, Eq, PartialEq)]

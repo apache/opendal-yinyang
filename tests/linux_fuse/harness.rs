@@ -484,7 +484,7 @@ impl Fixture {
         });
     }
 
-    fn operator(&self) -> opendal::Operator {
+    pub fn operator(&self) -> opendal::Operator {
         opendal::install_default();
         let config = self
             .storage_env()
@@ -868,7 +868,7 @@ impl Fixture {
         objects
     }
 
-    fn in_process_authority(&self) -> Arc<dyn Authority> {
+    pub fn in_process_authority(&self) -> Arc<dyn Authority> {
         let operator = self.operator();
         let publication = self.publication();
         let address = self.last_service_address;
