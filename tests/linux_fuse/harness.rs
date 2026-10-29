@@ -34,6 +34,9 @@ use yinyang::core::service::ServiceClient;
 use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
 use yinyang::runtime::Runtime as YinYangRuntime;
 
+#[path = "../support/yy.rs"]
+mod yy;
+
 /// The kernel filesystem type advertised by the YinYang FUSE adapter.
 pub const MOUNT_TYPE: &str = "fuse.yinyang";
 
@@ -245,7 +248,7 @@ impl Fixture {
     }
 
     pub fn yy_command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_yy"));
+        let mut cmd = Command::new(yy::binary());
         cmd.args(args);
         for (name, value) in self.storage_env() {
             cmd.env(name, value);
