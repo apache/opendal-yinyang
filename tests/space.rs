@@ -27,8 +27,8 @@ use yinyang::core::{
     Authority, BackendProfile, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs, NodeId,
     Revision, Snapshot, Transaction,
 };
-use yinyang::runtime::ErrorKind;
-use yinyang::space::{StagingState, inspect_local_staging};
+use yinyang::runtime::{ErrorKind, Runtime};
+use yinyang::space::{StagingState, inspect_local_staging, plan_managed_retention};
 use yinyang::sync::Sync;
 
 #[derive(Debug)]
@@ -143,4 +143,66 @@ async fn namespace_only_unknown_protects_baseline_without_content_handle() {
     assert!(protected.reasons.contains(&"sync_namespace_unknown"));
     assert_eq!(std::fs::read(&sync_database).unwrap(), sync_before);
     assert_eq!(std::fs::read(&content_database).unwrap(), content_before);
+}
+
+#[tokio::test]
+async fn keep_last_and_requested_pin_select_only_declared_revisions() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
+        .await
+        .unwrap();
+    runtime
+        .create_directory(authority.root(), "one")
+        .await
+        .unwrap();
+    runtime
+        .create_directory(authority.root(), "two")
+        .await
+        .unwrap();
+    let revisions = authority.retained_revisions().await.unwrap();
+    assert_eq!(revisions.len(), 3);
+
+    let staging = temp.path().join("absent-staging");
+    let plan = plan_managed_retention(authority.as_ref(), &staging, Some(1), &[revisions[0]])
+        .await
+        .unwrap();
+
+    assert_eq!(plan.policy.mode, "bounded");
+    assert_eq!(plan.retained_revision_count, Some(3));
+    assert!(!plan.deletion_authorized);
+    assert_eq!(plan.reclaimable_bytes, None);
+    assert_eq!(plan.protection.staging.state, StagingState::Missing);
+    assert!(!staging.exists());
+    let selected = plan
+        .revisions
+        .iter()
+        .filter(|revision| revision.selected)
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 2);
+    assert!(selected.iter().any(|revision| {
+        revision.revision == hex(revisions[0]) && revision.reasons.contains(&"requested_pin")
+    }));
+    assert!(selected.iter().any(|revision| {
+        revision.revision == hex(revisions[2])
+            && revision.reasons.contains(&"current")
+            && revision.reasons.contains(&"keep_last")
+    }));
+    assert!(plan.revisions.iter().any(|revision| {
+        revision.revision == hex(revisions[1])
+            && !revision.selected
+            && revision.reasons == ["outside_bounded_policy"]
+    }));
+}
+
+fn hex(revision: Revision) -> String {
+    revision
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
