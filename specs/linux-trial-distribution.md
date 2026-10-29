@@ -120,8 +120,8 @@ The fresh-runner workflow must:
 - reject a changed archive checksum and an attempted immutable-directory
   overwrite;
 - install the actual archive and perform only explicit quiesced activation;
-- exercise installed diagnostics and recovery through the real packaged binary
-  where an existing entrypoint accepts an external binary;
+- exercise installed diagnostics and recovery through the real packaged binary,
+  using the shared native-acceptance binary selector and recording its SHA-256;
 - build the pinned legacy producer and run the existing installed-prefix
   upgrade with the archive's target binary;
 - retain pending, frozen, Unknown, receipts, Sync and service-WAL evidence;

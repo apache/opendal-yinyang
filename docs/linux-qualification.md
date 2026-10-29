@@ -24,10 +24,11 @@ skips the two operations tests that require `/dev/fuse`, so the non-FUSE job
 cannot report an accidental green or fail through a missing device.
 
 The separate trial-distribution workflow uses the verifier and installer
-packaged inside the archive. Its installed archive smoke and installed-prefix
-upgrade therefore execute the produced `bin/yy`, not the source-tree debug
-binary. Recovery remains the existing isolated recovery entrypoint as a
-separate product check; the archive-target upgrade supplies the
+packaged inside the archive. Its installed archive smoke, isolated recovery and
+installed-prefix upgrade use the produced `bin/yy`; `YY_UPGRADE_BIN` is the
+shared native-acceptance selector and falls back to the Cargo test binary only
+when unset. The workflow records the source and selected binary SHA-256 before
+recovery, and the archive-target upgrade supplies the
 pending/frozen/Unknown/receipt/WAL recovery evidence for the produced binary.
 
 Run only the first-layer read-only FUSE scenarios when isolating frontend
