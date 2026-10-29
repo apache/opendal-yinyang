@@ -27,12 +27,12 @@ bounded process-local cache; a cold miss still reads and authenticates remote
 bytes. Retain the NodeId and revision and reopen through the same authority to
 recover this observation.
 
-The recoverable `FileHandle` API below deliberately retains full materialization
-for both read-only and writable handles, including its offline staged reads.
-Use FileVersion for on-demand reads and provider downloads; use FileHandle for
-durable writable staging. Opening FileVersion does not create a staging record.
-Both paths use the same authenticated range reader. No remote format changes
-or local staging migrations are required.
+The recoverable `FileHandle` API below pins an immutable `FileVersion` as its
+base and stores only exact locally changed byte ranges. Untouched ranges are
+authenticated and read from that pinned version on demand. Opening a FileHandle
+creates durable local state but reads no file payload. Use FileVersion directly
+when no writable staging record is required. Both paths use the same
+authenticated range reader.
 
 Identity queries and enumeration use the authority's `Snapshot::node`, `lookup`
 and `scan` APIs. Keep one snapshot across directory pages: a continuation is
@@ -47,11 +47,12 @@ it. A revision from another filesystem is rejected. Reusing an old path for a
 new file never redirects an identity-based open to that new node.
 
 `open_file(path, writable)` observes latest once, resolves a stable NodeId, and
-materializes the pinned file into verified 64 KiB staging chunks. Memory used
-for materialization and upload is bounded by chunks; local disk use includes
-the complete file. Opening is not a lazy read cache. Reads are relative to the
-handle's pinned/staged version; another open observes a fresh version. Handles
-are not automatically rebased onto concurrent writes.
+pins its authenticated `FileVersion` without reading file payload. It records
+the NodeId, revision and content descriptor, then marks the handle ready in one
+SQLite transaction. Reads are relative to the handle's pinned base plus exact
+local dirty ranges; another open observes a fresh version. Handles are not
+automatically rebased onto concurrent writes. Recovering a sparse handle
+requires the authority to retain and return that exact revision and descriptor.
 
 A handle is uniquely leased in a runtime and is not cloneable. Its UUID can be
 recovered after drop or process restart. Rename does not change its node
@@ -106,10 +107,10 @@ does not by itself provide a mounted editor workflow.
 
 | Operation | Contract |
 | --- | --- |
-| read(offset, length) | Return up to EOF from the opened/staged version. |
-| write(offset, bytes) | Atomically stage bytes; gaps read as zeros. Empty writes do not extend the file. |
+| read(offset, length) | Return up to EOF by overlaying local ranges on the untouched pinned base; ranges beyond the valid base prefix read as zeros. |
+| write(offset, bytes) | Atomically stage only the exact replaced bytes; gaps read as zeros. Empty writes do not extend the file. |
 | append(bytes) | Append to this handle's private length, returning its offset. Concurrent handles do not merge appends. |
-| truncate(length) | Shrink or zero-extend. Removed bytes never reappear after extension. |
+| truncate(length) | Shrink or zero-extend. Removed bytes never reappear after extension; a durable base-prefix limit fences later reads. |
 | sync_local | Report local durable and remote published positions; does not publish. |
 | flush / fsync / commit | Prepare bytes and conditionally publish their metadata; success means remote durability, not just local acceptance. |
 | close | Publish dirty data, then release staging. Failure keeps the handle open/recoverable. |
@@ -118,19 +119,28 @@ does not by itself provide a mounted editor workflow.
 | drop | Release the in-process lease only. Neither publish nor discard staging. |
 
 Every successful write/append/truncate uses a synchronous SQLite transaction
-for changed chunks and the local generation. This intentionally provides a
-stronger local acknowledgment than a volatile writeback cache, at a per-write
-sync cost. It does not implement offline namespace reconciliation or Sync.
+for the exact changed byte segments and the local generation. This
+intentionally provides a stronger local acknowledgment than a volatile
+writeback cache, at a per-write sync cost. It does not implement offline
+namespace reconciliation or Sync.
 The reported remote generation advances only after a committed remote receipt
 and a durable local record update. A read-only or unchanged fsync need not
 create a new remote commit.
 
-Publication streams the staged file through Authority preparation, then plans
-a conditional content update against the original base revision. It saves the
-exact frozen transaction before dispatch. While frozen, new writes are
-rejected. Retry uses the same identity, digest, and predicates, including after
-process restart. Success updates the base to the receipt's revision; it never
-silently observes a newer conflicting file.
+For a same-length update whose valid base prefix still covers the file,
+publication turns ordered local dirty segments into fixed-offset
+`ContentEdit` values and calls `Authority::prepare_overwrite` against the exact
+pinned `FileVersion`. The fast path is limited to 4096 edits and 16 MiB of
+encoded edit payload so memory and the authenticated service frame stay
+bounded. Append, truncate, shrink-then-extend, larger update sets, and
+length-changing writes use the existing streaming `Authority::prepare` path.
+
+Publication then plans a conditional content update against the original base
+revision and saves the exact frozen transaction before dispatch. While frozen,
+new writes are rejected. Retry restores that same identity, digest, descriptor,
+and predicates, including after process restart; it does not reprepare or
+rebase. Success updates the durable sparse base to the receipt's revision. It
+never silently observes a newer conflicting file.
 
 A stale file generation, changed executable state, or unlink produces Conflict.
 Staged bytes remain readable for explicit recovery/export or abort. Retryable
@@ -162,47 +172,62 @@ with kind, diagnostic message and optional commit ID. Clean fsync/close returns
 the retained category until acknowledgment. Clearing the volume ledger does not
 clear an active handle's error, pending data or frozen request.
 
-The experimental local profile `yinyang-stage-2` stores filesystem binding,
-handle records, chunk rows, and an error ledger in `staging.db` with WAL and
-`synchronous=FULL`. The process lock is `runtime.lock`. Keep WAL with the
-database; a copied live main database alone is not a supported backup.
-Incomplete opens were never exposed and are discarded on reopen. Completed
-handles and accepted writes survive process restart. There is no stable
-migration promise for this local experimental format.
+The current experimental local profile `yinyang-stage-3` stores filesystem
+binding, handle records, the error ledger, sparse base descriptors, and exact
+dirty segments in `staging.db` with WAL and `synchronous=FULL`. The process
+lock is `runtime.lock`. Keep WAL with the database; a copied live main database
+alone is not a supported backup. Incomplete opens were never exposed and are
+discarded on reopen. Completed handles and accepted writes survive process
+restart. There is no stable migration promise for this local experimental
+format.
 
 The supported schema signatures are exact table sets and ordered columns.
 Stage-1 has `authority`, `handles`, `chunks`, and `errors` without typed-failure
 columns. Stage-2 adds the nullable `failure` column after `record` in `handles`
-and after `message` in `errors`. Column order is part of the signature because
-maintained writers use positional inserts. SQLite internal tables are excluded;
-primary-key definitions, declared types, and other constraints are not treated
-as an independent signature.
+and after `message` in `errors`. Stage-3 adds `bases(handle, descriptor,
+prefix)` and `segments(handle, position, data)` while retaining `chunks` for
+older full-materialization records. Column order is part of the signature
+because maintained writers use positional inserts. SQLite internal tables are
+excluded; primary-key definitions, declared types, and other constraints are
+not treated as an independent signature.
 
-A writer preflights an existing database read-only. A supported stage-1 database
-is first fully decoded, then one SQLite transaction adds both columns and
-advances the profile to stage-2. Original handle records, chunks, frozen
-requests, CommitIds, and ledger sequences are preserved. A stage-2 database is
-validated without DDL. Unknown profiles or missing/extra/reordered maintained
-columns are rejected before PRAGMA journal-mode configuration, DDL,
-runtime-lock creation, or incomplete-open cleanup. SQLite's standard read-only
-WAL path may create an empty `-wal` and may create or update derived `-shm`.
-Those files are not logical staging records: the main database, any existing
-WAL/journal bytes, configured journal mode, schema, rows, lease, and cleanup
-state remain unchanged.
+A stage-3 handle with a `bases` row uses only `segments`; missing chunk rows
+mean "read the pinned base", never zero and never a freshly observed version.
+`prefix` is the durably valid immutable-base length and cannot exceed the
+descriptor length. Writes replace exact byte intervals and coalesce adjacent
+segments. A shrink lowers `prefix`; later extension therefore reads zeros in
+the removed interval instead of resurrecting base bytes. A handle without a
+`bases` row retains stage-1/2 full-chunks semantics, where missing chunks are
+zeros. A stage-3 handle must not contain both semantics.
+
+A writer preflights an existing database read-only. A supported stage-1 or
+stage-2 database is first fully decoded, then one SQLite transaction performs
+the required typed-failure columns, adds the sparse tables, and advances the
+profile to stage-3. Original handle records, chunks, frozen requests,
+CommitIds, and ledger sequences are preserved. Old pending/frozen records keep
+their original full-chunks reads and publication requests. Unknown profiles,
+partial schemas, malformed base descriptors, overlapping segments, or mixed
+full/sparse handle state are rejected before PRAGMA journal-mode configuration,
+DDL, runtime-lock creation, or incomplete-open cleanup. SQLite's standard
+read-only WAL path may create an empty `-wal` and may create or update derived
+`-shm`. Those files are not logical staging records: the main database, any
+existing WAL/journal bytes, configured journal mode, schema, rows, lease, and
+cleanup state remain unchanged.
 
 An absent or zero-table database is initialized only after the writer lease is
 held. A writer that finishes between preflight and lease acquisition may have
-already upgraded stage-1 to stage-2; the lock holder revalidates and accepts
+already performed a supported upgrade; the lock holder revalidates and accepts
 that state rather than requiring an unchanged preflight profile.
 
-Inspect and backup validation accept stage-1 or stage-2 without upgrading,
+Inspect and backup validation accept stage-1, stage-2 or stage-3 without upgrading,
 changing authoritative database/WAL bytes or journal mode, cleaning handles, or
 acquiring the writer lease. SQLite may create an empty `-wal` and may create or
 update derived `-shm`; existing WAL/journal bytes remain protected. Old
 message-only failures report Unclassified; their kind and commit identity are
 not inferred from prose. A frozen plan still exposes its exact CommitId.
-Older binaries reject stage-2; downgrade is unsupported. The upgrade changes
-only local staging, not remote metadata or content.
+Older binaries reject stage-3; downgrade is unsupported. The upgrade changes
+only local staging, not remote metadata or content. A sparse handle cannot read
+an untouched range if its authority no longer retains the exact base revision.
 
 Failure blobs use Borsh `(kind: u8, message: String, commit: Option<[u8;16]>)`.
 Kind tags, in order from 0 through 21, are Invalid, InvalidName, NotFound,
@@ -234,20 +259,22 @@ remain available, and retry uses the same frozen request rather than treating
 the missing response as a definitive failure.
 
 For a quiesced backup, stop the file or Mount owner and create a consistent
-SQLite backup of `staging.db`. The chunks, frozen requests, generations, and
-error ledger are all in that database; `runtime.lock` is only a process lease.
+SQLite backup of `staging.db`. Base descriptors, dirty segments, legacy chunks,
+frozen requests, generations, and the error ledger are all in that database;
+`runtime.lock` is only a process lease.
 See [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
 
 ## Validation and limits
 
 The file-operation tests exercise public Runtime/FileHandle methods against
-object and authenticated service authorities. They cover sparse gaps, append,
-cross-chunk truncation/extension, pinned visibility, rename/unlink, conflicting
-writers, failed uploads/close, frozen unknown requests, and reopening staging.
-They also cover explicit reference release without publication, typed errors
-through both authorities, retained Unknown identity, and stage-1 upgrades with
-pending data and frozen requests. Range-reader tests verify bounded payload I/O
-and corruption rejection without staging.
-Production power-loss testing, capacity benchmarks, incremental upload
-optimization, OS-specific mount behavior, and Sync reconciliation remain
-separate work.
+object and authenticated service authorities. They cover exact sparse segments,
+multi-fd reads, append, cross-chunk truncation/extension, shrink-then-extend
+zeroing, pinned visibility, rename/unlink, conflicting writers, failed
+uploads/close, frozen unknown requests, and reopening staging. They also cover
+explicit reference release without publication, typed errors through both
+authorities, retained Unknown identity, stage-1/2 upgrades with pending data and
+frozen requests, and unchanged full-chunks semantics for old records.
+Range-reader tests verify bounded payload I/O and corruption rejection without
+staging.
+Production power-loss testing, multi-host capacity benchmarks, OS-specific
+mount behavior, and Sync reconciliation remain separate work.

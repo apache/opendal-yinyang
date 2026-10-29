@@ -5,16 +5,17 @@
 `yinyang::mount::Mount` owns a dedicated staging directory and one shared
 staged file version per writable NodeId, plus transient immutable file
 observations for read-only whole-volume readers. It uses the same Authority and
-durable FileHandle storage as the library runtime. Object and service
+durable sparse FileHandle storage as the library runtime. A writable node pins
+one authenticated base and stores only local dirty ranges. Object and service
 publication have identical semantics. Do not mix private library handles into
 this staging directory.
 
 `open_node` returns an access-checked reference to the shared node. Reads see
 writes from other references immediately after local acceptance. Writes,
 truncate, append and fsync are serialized per node; append chooses its offset
-under the same lock. Different nodes do not share an I/O lock. Initial
-materialization is serialized per NodeId by a short-lived open gate, and the
-instance node map is not held during a remote observation or staging read.
+under the same lock. Different nodes do not share an I/O lock. Initial base
+capture is serialized per NodeId by a short-lived open gate, and the instance
+node map is not held during the remote observation or staging write.
 The node lookup and gate registration share one critical section, so a
 completion cannot slip between them and start a second materialization.
 Success, failure and cancellation close the gate to wake every waiter for a
@@ -23,9 +24,9 @@ becomes the next single owner. Different nodes can therefore complete their
 first opens independently. Refresh and reclaim use the map for lookup and
 reference accounting; data-plane calls keep per-node locks. An incomplete
 local open is never exposed and is discarded when staging is reopened. Both
-read-only and writable references through `open_node` use full-file staging;
-this keeps a read-only descriptor on a writable volume attached to the same
-dirty view as its writer.
+read-only and writable references through `open_node` use the same sparse
+overlay; this keeps a read-only descriptor on a writable volume attached to the
+same dirty view as its writer without materializing untouched payload.
 
 `open_read_only_node` is the separate entry point for a read-only whole-volume
 frontend. It observes latest and pins `Snapshot::open_file` for the NodeId
@@ -34,8 +35,8 @@ opens of one NodeId share that immutable `FileVersion`; a later remote revision
 does not rebase an existing reference. Calls after the last reference has been
 released reclaim the zero-reference observation and observe latest again.
 Initial pinning uses its own per-NodeId open gate, with the same success,
-failure and cancellation broadcast rules as staged materialization. The method
-is rejected on a writable Mount so read-only descriptors of a writable volume
+failure and cancellation broadcast rules as staged base capture. The method is
+rejected on a writable Mount so read-only descriptors of a writable volume
 cannot bypass its shared staged state.
 
 Dropping a reference performs no I/O and never publishes or deletes data.
@@ -70,8 +71,9 @@ Busy but before the final in-flight operation dropped its reference.
 
 `refresh` replaces a clean staged observation with a fresh remote version for
 all references. It rejects pending, frozen and failed states; it never silently
-rebases writes. Failure to fetch leaves the old version available. Interrupted
-refresh may leave a disposable clean observation for restart cleanup.
+rebases writes. Failure to observe or authenticate the replacement leaves the
+old version available. Interrupted refresh may leave a disposable clean
+observation, which is removed on restart without requiring its old payload.
 There is no automatic refresh timer or implied kernel invalidation. An adapter
 must coordinate OS caches outside runtime locks before exposing refreshed bytes.
 An adapter using uncached I/O can refresh clean nodes explicitly. No OS callback
@@ -82,10 +84,11 @@ replace/no-replace rename and typed failure. A moved node keeps its shared state
 removed nodes retain staged reads but cannot publish dirty content. Namespace
 conveniences do not promise cross-process frozen-request replay.
 
-Shared contract tests cover both publication authorities, reference-local write
-permissions, cross-reference visibility, atomic append, close-one/keep-writing,
-explicit refresh, retained conflicts, and original Unknown request recovery.
-These tests are not native Linux, Windows or macOS mount acceptance.
+Shared contract tests cover both publication authorities, no-payload opens,
+exact dirty-range overlays, reference-local write permissions,
+cross-reference visibility, atomic append, close-one/keep-writing, explicit
+refresh, retained conflicts, and original Unknown request recovery. These tests
+are not native Linux, Windows or macOS mount acceptance.
 
 A quiesced backup copies Mount's `staging.db` with a consistent SQLite backup,
 not only its main database file. Pending/frozen handles remain recoverable from
