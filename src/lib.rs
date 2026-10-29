@@ -32,6 +32,7 @@ pub mod mount;
 #[cfg(target_os = "linux")]
 pub mod replica;
 pub mod runtime;
+pub mod space;
 pub mod sync;
 pub mod volume;
 
@@ -39,6 +40,11 @@ pub use directory::{
     DirectoryInspection, DirectoryIntent, DirectoryJournal, DirectoryState, DirectoryStatus,
     directory_nodes, prepare_directory, publish_directory, restore_directory,
     restore_directory_revision,
+};
+pub use space::{
+    ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, Unresolved,
+    inspect_bound_local_staging, inspect_local_staging, inspect_managed_space,
+    plan_managed_retention,
 };
 pub use yinyang_core as core;
 

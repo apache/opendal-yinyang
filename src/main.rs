@@ -25,6 +25,7 @@ mod direct_sync_cli;
 mod directory_cli;
 mod file_cli;
 mod operations_cli;
+mod space_cli;
 #[cfg(target_os = "linux")]
 mod sync_cli;
 
@@ -62,6 +63,11 @@ enum Command {
     Sync {
         #[command(subcommand)]
         command: sync_cli::SyncCommand,
+    },
+    /// Inspect Managed space and plan declarative retention (requires --volume).
+    Space {
+        #[command(subcommand)]
+        command: space_cli::SpaceCommand,
     },
     /// Run the authenticated loopback metadata authority with a local SQLite database.
     Serve {
@@ -158,6 +164,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
             #[cfg(target_os = "linux")]
             Command::Sync { command } => direct_sync_cli::run(path, command).await,
+            Command::Space { command } => space_cli::run(path, command).await,
             command => file_cli::run(path, command).await,
         };
     }
@@ -171,6 +178,9 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         #[cfg(target_os = "linux")]
         Command::Sync { .. } => {
             return Err("this command requires --volume CONFIG.json".into());
+        }
+        Command::Space { .. } => {
+            return Err("space inspection requires --volume CONFIG.json".into());
         }
         _ => {}
     }
@@ -220,6 +230,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         | Command::Mount { .. } => unreachable!(),
         #[cfg(target_os = "linux")]
         Command::Sync { .. } => unreachable!(),
+        Command::Space { .. } => unreachable!(),
         Command::Publish {
             source,
             replace,
