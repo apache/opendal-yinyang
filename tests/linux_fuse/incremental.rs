@@ -17,7 +17,7 @@
 
 //! Incremental write acceptance through real Linux FUSE descriptors.
 
-use crate::harness::{Fixture, Frontend, Publication};
+use crate::harness::{Fixture, Frontend, Publication, directory_bytes};
 use nix::unistd::{getegid, geteuid, truncate};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -26,7 +26,7 @@ use std::path::Path;
 
 const UNIT_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
-const INITIAL_BYTES: usize = 4 * UNIT_BYTES + 3 * RANGE_BYTES + 73;
+const INITIAL_BYTES: usize = 8 * UNIT_BYTES + 3 * RANGE_BYTES + 73;
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
@@ -54,23 +54,39 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
         .temp
         .path()
         .join(format!("mnt-incremental-contract-{suffix}"));
+    let staging = fixture
+        .temp
+        .path()
+        .join(format!("stage-incremental-contract-{suffix}"));
     fs::create_dir(&mountpoint).expect("create incremental contract mountpoint");
     let mut mounted = fixture.mount(&config, &mountpoint);
     let path = mounted.mountpoint().join("incremental.bin");
 
     assert_attributes(&path, expected.len() as u64);
-    let mut early_reader = File::open(&path).expect("open descriptor before sparse writes");
+    let early_reader = File::open(&path).expect("open descriptor before sparse writes");
     assert_attributes_from(&early_reader, expected.len() as u64);
-    let mut first_writer = OpenOptions::new()
+    let first_writer = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
         .expect("open first sparse writer");
-    let mut second_writer = OpenOptions::new()
+    let second_writer = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
         .expect("open second sparse writer before the first publication");
+    assert_staging_bounded(&staging, "open");
+
+    let bulk_offset = UNIT_BYTES;
+    let bulk = payload(3 * UNIT_BYTES + 123, 0x43);
+    overwrite_expected(&mut expected, bulk_offset, &bulk);
+    write_all_at(&first_writer, &bulk, bulk_offset as u64);
+    first_writer
+        .sync_all()
+        .expect("fsync a large write split across multiple FUSE requests");
+    assert_remote(fixture, &library, &expected, "large multi-request fsync");
+    assert_range(&early_reader, bulk_offset, &bulk);
+    assert_staging_bounded(&staging, "large write");
 
     let first_offset = UNIT_BYTES - RANGE_BYTES / 2;
     let first = payload(RANGE_BYTES, 0x51);
@@ -105,7 +121,7 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     assert_range(&early_reader, expected.len() - appended.len(), &appended);
     assert_attributes_from(&early_reader, expected.len() as u64);
 
-    let shrunk = 3 * UNIT_BYTES + 23;
+    let shrunk = 6 * UNIT_BYTES + 23;
     first_writer
         .set_len(shrunk as u64)
         .expect("shrink through an active descriptor");
@@ -115,7 +131,7 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     assert_attributes(&path, expected.len() as u64);
     assert_attributes_from(&early_reader, expected.len() as u64);
 
-    let extended = 3 * UNIT_BYTES + 2 * RANGE_BYTES + 9;
+    let extended = 6 * UNIT_BYTES + 2 * RANGE_BYTES + 9;
     first_writer
         .set_len(extended as u64)
         .expect("extend with a sparse zero gap");
@@ -137,7 +153,7 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     assert_eof_reads(&first_writer, &expected);
     assert_eof_reads(&early_reader, &expected);
 
-    let path_shrunk = 2 * UNIT_BYTES + 31;
+    let path_shrunk = 5 * UNIT_BYTES + 31;
     truncate(
         path.as_path(),
         i64::try_from(path_shrunk).expect("path shrink fits off_t"),
@@ -253,6 +269,14 @@ fn assert_eof_reads(file: &File, expected: &[u8]) {
         &crossing[..count],
         &expected[expected.len() - 4..],
         "a read crossing EOF returned incorrect final bytes"
+    );
+}
+
+fn assert_staging_bounded(staging: &Path, phase: &str) {
+    let bytes = directory_bytes(staging);
+    assert!(
+        bytes < INITIAL_BYTES as u64,
+        "{phase}: staging allocated {bytes} bytes for a {INITIAL_BYTES}-byte file; a complete local copy is still present"
     );
 }
 
