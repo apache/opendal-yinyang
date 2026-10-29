@@ -188,6 +188,13 @@ running binary, migration performed only because a release directory exists,
 and compatibility inferred from an equal package version are also unsupported.
 The package version and release directory identity are separate.
 
+The concrete local archive, exact inventory, verifier, versioned-prefix
+installer and stopped activation are defined by the
+[Linux trial distribution specification](linux-trial-distribution.md). The
+installer requires an explicit quiescence assertion and never starts or stops a
+user unit. It has no rollback command and does not permit an old binary to
+reopen state that a newer binary has already touched.
+
 ## Verification
 
 `tests/linux_operations.rs` exercises:
@@ -210,6 +217,11 @@ transition from the exact `fd1338c` producer to the selected target binary,
 including retained pending, frozen and Unknown work, receipts and a non-empty
 service WAL. It uses the same versioned `current` prefix as the user units while
 keeping process lifetime independent of a particular systemd user session.
+
+`tests/linux_trial_distribution.sh` verifies the actual archive, checksum
+rejection, immutable installation and explicit quiesced activation boundary.
+The dedicated Linux trial workflow uses the extracted archive scripts rather
+than trusting the source-tree command path.
 
 The real Amazon S3 smoke inherits `YINYANG_S3_SESSION_TOKEN` when temporary
 credentials are used. It must not inherit a MinIO endpoint and does not use a
