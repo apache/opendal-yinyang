@@ -307,6 +307,13 @@ enum BenchPublication {
 enum BenchWorkload {
     Full,
     ReadOnlyRange,
+    Incremental,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchIncrementalExpectation {
+    Baseline,
+    Required,
 }
 
 #[derive(Parser)]
@@ -325,9 +332,16 @@ struct CommandBenchLinuxCost {
         long,
         value_enum,
         default_value = "full",
-        help = "Select the complete product matrix or the matched read-only range workload."
+        help = "Select the complete product matrix, the matched read-only range workload, or the writable incremental workload."
     )]
     workload: BenchWorkload,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "baseline",
+        help = "For the incremental workload, record baseline behavior or reject PUT bodies consistent with full-file fallback."
+    )]
+    incremental_expect: BenchIncrementalExpectation,
     #[arg(
         long,
         help = "Write JSONL evidence here; a Markdown summary uses the same path with .md."
@@ -358,7 +372,7 @@ impl CommandBenchLinuxCost {
             }
         }
         let profile = match self.workload {
-            BenchWorkload::ReadOnlyRange => "full",
+            BenchWorkload::ReadOnlyRange | BenchWorkload::Incremental => "full",
             BenchWorkload::Full => match self.profile {
                 BenchProfile::Early => "early",
                 BenchProfile::Full => "full",
@@ -372,6 +386,11 @@ impl CommandBenchLinuxCost {
         let workload = match self.workload {
             BenchWorkload::Full => "full",
             BenchWorkload::ReadOnlyRange => "read-only-range",
+            BenchWorkload::Incremental => "incremental",
+        };
+        let incremental_expect = match self.incremental_expect {
+            BenchIncrementalExpectation::Baseline => "baseline",
+            BenchIncrementalExpectation::Required => "required",
         };
         let mut cmd = find_command("cargo");
         cmd.args([
@@ -390,6 +409,7 @@ impl CommandBenchLinuxCost {
         cmd.env("YINYANG_COST_PROFILE", profile);
         cmd.env("YINYANG_COST_WORKLOAD", workload);
         cmd.env("YINYANG_COST_PUBLICATION", publication);
+        cmd.env("YINYANG_COST_INCREMENTAL_EXPECT", incremental_expect);
         cmd.env("YINYANG_COST_OUTPUT", &self.output);
         cmd.env("YINYANG_COST_SUMMARY", self.output.with_extension("md"));
         cmd.env(
