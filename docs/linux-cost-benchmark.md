@@ -142,6 +142,9 @@ tradeoffs in the raw samples. Length-changing append or truncate behavior is
 covered by functional FUSE acceptance and is not included in the same-length
 fallback assertion.
 
+The accepted matched result and raw 16-row evidence are in
+[`linux-incremental-write-results.md`](linux-incremental-write-results.md).
+
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
