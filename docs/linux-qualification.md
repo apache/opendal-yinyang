@@ -15,12 +15,24 @@ qualification.
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object Mount and finite Sync, loopback service Mount |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
 | `cargo test --test linux_prefix_upgrade` | Ubuntu, isolated Silo, `YY_LEGACY_BIN`, `YY_UPGRADE_BIN`, `sqlite3` | Stopped installed-prefix transition from the `fd1338c` producer to a selected target with retained file, Sync and service state |
+| `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor, recovery, and an archive-target `fd1338c` upgrade |
 
 GitHub Actions runs the FUSE and installed-CLI checks in the `linux-fuse` job
 after starting isolated Silo. It runs backup and recovery acceptance in the
 `s3` job after installing `sqlite3`. The broad `s3_` test filter explicitly
 skips the two operations tests that require `/dev/fuse`, so the non-FUSE job
 cannot report an accidental green or fail through a missing device.
+
+The separate trial-distribution workflow uses the verifier and installer
+packaged inside the archive. Its installed archive smoke, isolated recovery and
+installed-prefix upgrade use the produced `bin/yy`; `YY_UPGRADE_BIN` is the
+shared native-acceptance selector and falls back to the Cargo test binary only
+when unset. The installed-operations entrypoint also copies that selected binary
+into its clean prefix and exercises a real writable `fuse.yinyang` mount,
+remount and finite Sync for both publication authorities. The workflow records
+the source and selected binary SHA-256 before those runs, and the archive-target
+upgrade supplies the pending/frozen/Unknown/receipt/WAL recovery evidence for
+the produced binary.
 
 Run only the first-layer read-only FUSE scenarios when isolating frontend
 changes:
@@ -47,7 +59,11 @@ The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
 `fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and
 optional `YINYANG_UPGRADE_SOURCE`/`YINYANG_UPGRADE_EVIDENCE` values for the
 exact target source and JSON output path. When `YY_UPGRADE_BIN` is omitted,
-the integration-test binary built from the current worktree is used.
+the integration-test binary built from the current worktree is used. A release
+binary rebuilt from the exact `fd1338c` commit in a different build environment
+is accepted only with `YINYANG_UPGRADE_LEGACY_SOURCE` and
+`YINYANG_UPGRADE_LEGACY_REBUILD=1`; the evidence records
+`source-pinned-rebuild` instead of the fixture binary hash.
 
 The systemd lifecycle remains an explicit qualified-host command. Hosted CI
 does not enable linger, create a boot service, or change FUSE configuration to

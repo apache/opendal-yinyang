@@ -14,6 +14,14 @@ The command requires:
 - the isolated `YINYANG_S3_*` settings used by the other real S3 suites;
 - `YY_LEGACY_BIN` naming the release `yy` binary built from `fd1338c`.
 
+The installed-prefix upgrade accepts the immutable fixture binary by its
+recorded SHA-256. A release rebuilt from the exact `fd1338c` commit may differ
+bit-for-bit across build environments; that path must additionally set
+`YINYANG_UPGRADE_LEGACY_SOURCE=fd1338c2f924a90e9da752b9158e748d1d3acaf4` and
+`YINYANG_UPGRADE_LEGACY_REBUILD=1`. Its evidence identifies
+`source-pinned-rebuild` separately from `fixture-binary` rather than claiming
+the recorded producer hash.
+
 MACOS and Windows runs do not skip a Linux acceptance stage inside a
 purportedly completed Linux run: `test-compatibility` fails before running any
 test when the environment or legacy binary is missing.

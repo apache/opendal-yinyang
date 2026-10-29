@@ -89,60 +89,66 @@ tree.
 
 ## Build a local qualification artifact
 
-The repository can build a deterministic local archive without signing,
-tagging or publishing it:
+The repository can build a traceable local archive without signing, tagging or
+publishing it:
 
 ```shell
 mkdir -p /var/tmp/yinyang-artifacts
 tools/linux/package-release.sh --output-dir /var/tmp/yinyang-artifacts
-(
-  cd /var/tmp/yinyang-artifacts
-  sha256sum -c ./*.tar.gz.sha256
-)
+tools/linux/verify-release.sh \
+  --archive /var/tmp/yinyang-artifacts/yinyang-*.tar.gz \
+  --source-commit "$(git rev-parse HEAD)"
 ```
 
 The archive contains `bin/yy`, the three systemd user-unit templates, the
-environment example, operational documentation and `BUILD-MANIFEST`. The
-manifest records the package version, release identity, source commit, source
-date, target, Cargo/Rust versions and binary SHA-256. The script refuses a dirty
-worktree and requires Linux x86_64 so the archive cannot silently claim a
-source/build identity it did not test.
+environment example, operational documentation, `LICENSE`, `NOTICE`,
+`PREREQUISITES`, `BUILD-MANIFEST`, `INSTALL` and the packaged verifier and
+installer. The manifest records the package version, release identity, source
+commit, source date, target, Cargo/Rust versions and binary SHA-256. The script
+refuses a dirty worktree and requires Linux x86_64 so the archive cannot silently
+claim a source/build identity it did not test.
 
 The script requires Ubuntu 24.04 x86_64, the tested host combination. This
 artifact is local qualification input, not an Apache Software Foundation
 release. It has no ASF signature, vote, provenance approval or publication
-authorization.
+authorization. See the [trial distribution guide](linux-trial-distribution.md)
+for the exact inventory, checksum and retention boundaries.
 
 ## Install a clean prefix
 
-Run these commands from the repository working tree. The version is read from the
-workspace, and the working directory is intentionally not the installation
-prefix:
+Extract the verified archive outside the installation prefix and use its packaged
+installer. The working directory is intentionally not the installation prefix:
 
 ```shell
 set -eu
 umask 077
 
-YY_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yinyang") | .version')"
-YY_SOURCE="$(git rev-parse HEAD)"
-YY_RELEASE="$YY_VERSION+${YY_SOURCE:0:12}"
+YY_ARCHIVE=/var/tmp/yinyang-artifacts/yinyang-<version>-ubuntu-24.04-x86_64-<source>.tar.gz
 YY_ROOT="$HOME/.local/lib/yinyang"
-YY_DIR="$YY_ROOT/$YY_RELEASE"
 YY_STATE="$HOME/.local/state/yinyang"
 YY_CONFIG="$HOME/.config/yinyang"
 YY_UNITS="$HOME/.config/systemd/user"
 
-cargo build --release --locked --bin yy
-install -d -m 0700 "$YY_DIR/bin" "$YY_STATE" "$YY_STATE/metadata" \
+install -d -m 0700 "$YY_STATE" "$YY_STATE/metadata" \
   "$YY_CONFIG/volumes" "$YY_UNITS" "$HOME/YinYang"
-install -m 0755 target/release/yy "$YY_DIR/bin/yy"
-ln -s "$YY_RELEASE" "$YY_ROOT/.current.new"
-mv -Tf "$YY_ROOT/.current.new" "$YY_ROOT/current"
 
-install -m 0600 deploy/linux/environment.example "$YY_CONFIG/environment"
-install -m 0644 deploy/linux/yinyang-serve.service "$YY_UNITS/"
-install -m 0644 deploy/linux/yinyang-mount@.service "$YY_UNITS/"
-install -m 0644 deploy/linux/yinyang-sync@.service "$YY_UNITS/"
+YY_EXTRACT="$(mktemp -d)"
+tar -xzf "$YY_ARCHIVE" -C "$YY_EXTRACT"
+YY_ARCHIVE_ROOT="$(basename "$YY_ARCHIVE" .tar.gz)"
+YY_INSTALLER="$YY_EXTRACT/$YY_ARCHIVE_ROOT/share/yinyang/install-release.sh"
+
+YY_INSTALL_OUTPUT="$("$YY_INSTALLER" install \
+  --archive "$YY_ARCHIVE" \
+  --prefix "$YY_ROOT" \
+  --activate \
+  --quiesced)"
+printf '%s\n' "$YY_INSTALL_OUTPUT"
+YY_RELEASE="$(awk -F= '$1 == "activated_release" { print $2 }' <<<"$YY_INSTALL_OUTPUT")"
+
+install -m 0600 "$YY_ROOT/current/share/yinyang/environment.example" "$YY_CONFIG/environment"
+install -m 0644 "$YY_ROOT/current/lib/systemd/user/yinyang-serve.service" "$YY_UNITS/"
+install -m 0644 "$YY_ROOT/current/lib/systemd/user/yinyang-mount@.service" "$YY_UNITS/"
+install -m 0644 "$YY_ROOT/current/lib/systemd/user/yinyang-sync@.service" "$YY_UNITS/"
 systemctl --user daemon-reload
 
 "$YY_ROOT/current/bin/yy" --help
@@ -166,13 +172,13 @@ directories were created mode `0700` above; the mount unit uses `UMask=0022` so
 the FUSE frontend's supported `0644`/`0755` files are not weakened to
 unrepresentable `0600` modes. The service and Sync units use `UMask=0077`.
 
-Record `git rev-parse HEAD`, the `sha256sum` output, `YY_VERSION` and the host
-identity with the qualification evidence. The release directory also includes a
-12-character source suffix because two development binaries can share one
-package version. The unit files are user services:
-installing them does not enable a system service, change the kernel FUSE
-configuration, or start anything at boot. Do not run `loginctl enable-linger`
-as part of this workflow.
+Record the archive SHA-256, `BUILD-MANIFEST`, `git rev-parse HEAD`, the
+`sha256sum` output and the host identity with the qualification evidence. The
+release directory also includes a 12-character source suffix because two
+development binaries can share one package version. The unit files are user
+services: installing them does not enable a system service, change the kernel
+FUSE configuration, or start anything at boot. Do not run
+`loginctl enable-linger` as part of this workflow.
 
 ## Configure storage and secrets
 
