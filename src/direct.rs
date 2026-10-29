@@ -25,7 +25,9 @@
 //! or, when versioning is unavailable, use conditional ETag reads for every
 //! range so bytes from different object versions are never combined.
 
-use opendal::{EntryMode, ErrorKind as OpenDalErrorKind, Operator};
+use opendal::raw::oio::ReadDyn;
+use opendal::raw::{OpRead, OpReader, ServiceDyn};
+use opendal::{EntryMode, ErrorKind as OpenDalErrorKind, Operator, options};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -244,29 +246,74 @@ impl DirectNamespace {
             .recursive(true)
             .await
             .map_err(Error::storage)?;
-        let mut records = entries
-            .into_iter()
-            .filter(|entry| !(entry.path().is_empty() && entry.metadata().mode() == EntryMode::DIR))
-            .map(|entry| {
-                let metadata = entry.metadata();
-                ObjectRecord {
-                    key: entry.path().to_owned(),
-                    size: metadata.content_length(),
-                    etag: pin_value(metadata.etag()).map(str::to_owned),
-                    version: pin_value(metadata.version()).map(str::to_owned),
-                    modified: metadata
-                        .last_modified()
-                        .map(|time| normalize_time(SystemTime::from(time))),
-                    directory: metadata.mode() == EntryMode::DIR || entry.path().ends_with('/'),
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut records = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let metadata = entry.metadata();
+            if entry.path().is_empty() && metadata.mode() == EntryMode::DIR {
+                continue;
+            }
+            let directory = metadata.mode() == EntryMode::DIR || entry.path().ends_with('/');
+            let etag = pin_value(metadata.etag()).map(str::to_owned);
+            if directory {
+                verify_empty_directory_marker(&self.operator, entry.path(), etag.as_deref())
+                    .await?;
+            }
+            records.push(ObjectRecord {
+                key: entry.path().to_owned(),
+                size: metadata.content_length(),
+                etag,
+                version: pin_value(metadata.version()).map(str::to_owned),
+                modified: metadata
+                    .last_modified()
+                    .map(|time| normalize_time(SystemTime::from(time))),
+                directory,
+            });
+        }
         records.sort_by(|left, right| {
             left.key
                 .cmp(&right.key)
                 .then(left.directory.cmp(&right.directory))
         });
         DirectSnapshot::build(self.clone(), records)
+    }
+}
+
+async fn verify_empty_directory_marker(
+    operator: &Operator,
+    path: &str,
+    etag: Option<&str>,
+) -> Result<()> {
+    let etag = etag.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unsupported,
+            format!("directory marker {path:?} has no ETag; Direct cannot verify that it is empty"),
+        )
+    })?;
+    // Operator::read rejects trailing-slash paths before dispatch. Dispatch the
+    // same path through the composed service to retain the configured policy
+    // layers while bypassing that high-level entry validation.
+    let (range, args, _): (opendal::BytesRange, OpRead, OpReader) = options::ReadOptions {
+        range: (0..1).into(),
+        if_match: Some(etag.to_owned()),
+        ..Default::default()
+    }
+    .into();
+    let reader = operator
+        .service()
+        .read_dyn(operator.context(), path, args)
+        .map_err(Error::storage)?;
+    let bytes = match reader.read_dyn(range).await {
+        Ok((_, bytes)) => bytes,
+        Err(error) if error.kind() == OpenDalErrorKind::RangeNotSatisfied => return Ok(()),
+        Err(error) => return Err(Error::storage(error)),
+    };
+    if bytes.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::Invalid,
+            format!("directory marker {path:?} contains data; Direct will not hide object data"),
+        ))
     }
 }
 
