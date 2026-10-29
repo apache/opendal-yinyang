@@ -320,6 +320,14 @@ fn put_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -> Res
     if bytes.is_empty() {
         return Ok(());
     }
+    let end = segment_end(position, bytes)?;
+    let chunk_start = position - position % CHUNK;
+    if end > chunk_start + CHUNK {
+        return Err(Error::State(
+            ErrorKind::Invalid,
+            "staging segment crosses a chunk boundary",
+        ));
+    }
     c.execute(
         "INSERT OR REPLACE INTO segments(handle,position,data) VALUES(?1,?2,?3)",
         params![
@@ -542,6 +550,13 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
             ErrorKind::Corrupt,
             "staging segment length overflows",
         ))?;
+        let chunk_start = position - position % CHUNK;
+        if end > chunk_start + CHUNK {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging segment crosses a chunk boundary",
+            ));
+        }
         if end > *handle_length {
             return Err(Error::State(
                 ErrorKind::Corrupt,
@@ -632,6 +647,21 @@ fn write_sparse(c: &Connection, id: [u8; 16], offset: u64, bytes: &[u8]) -> Resu
     let end = offset
         .checked_add(bytes.len() as u64)
         .ok_or(Error::State(ErrorKind::TooLarge, "file length overflows"))?;
+    let mut chunk_start = offset - offset % CHUNK;
+    while chunk_start < end {
+        let part_start = offset.max(chunk_start);
+        let part_end = end.min(chunk_start + CHUNK);
+        let source_start = (part_start - offset) as usize;
+        let source_end = (part_end - offset) as usize;
+        write_sparse_chunk(c, id, part_start, &bytes[source_start..source_end])?;
+        chunk_start += CHUNK;
+    }
+    Ok(())
+}
+fn write_sparse_chunk(c: &Connection, id: [u8; 16], offset: u64, bytes: &[u8]) -> Result<()> {
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::State(ErrorKind::TooLarge, "file length overflows"))?;
     let rows = {
         let mut query = c
             .prepare(
@@ -670,6 +700,7 @@ fn write_sparse(c: &Connection, id: [u8; 16], offset: u64, bytes: &[u8]) -> Resu
 fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -> Result<()> {
     let mut start = position;
     let mut data = bytes.to_vec();
+    let chunk_start = position - position % CHUNK;
     let previous: Option<(i64, Vec<u8>)> = c
         .query_row(
             "SELECT position,data FROM segments
@@ -681,7 +712,9 @@ fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -
         .map_err(local)?;
     if let Some((previous_position, previous_data)) = previous {
         let previous_position = positioned(previous_position)?;
-        if segment_end(previous_position, &previous_data)? == position {
+        if segment_end(previous_position, &previous_data)? == position
+            && previous_position / CHUNK == position / CHUNK
+        {
             delete_segment(c, id, previous_position)?;
             start = previous_position;
             data = previous_data.into_iter().chain(data).collect();
@@ -696,7 +729,9 @@ fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -
         )
         .optional()
         .map_err(local)?;
-    if let Some(next) = next {
+    if let Some(next) = next
+        && end < chunk_start + CHUNK
+    {
         delete_segment(c, id, end)?;
         data.extend(next);
     }
@@ -1615,6 +1650,68 @@ mod tests {
         assert_eq!(&read.bytes[4..6], b"WX");
         assert_eq!(&read.bytes[6..], &[0; 6]);
         assert_eq!(read.base, [0..4]);
+    }
+
+    #[tokio::test]
+    async fn sequential_sparse_writes_keep_rows_within_verification_chunks() {
+        let backend = crate::support::TestBackend::default();
+        let authority =
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap();
+        let length = CHUNK * 3;
+        let base = vec![0_u8; length as usize];
+        let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let stage = Stage::open(temp.path().to_owned(), authority.filesystem())
+            .await
+            .unwrap();
+        let id = [22_u8; 16];
+        stage
+            .save(Record {
+                id,
+                node: *NodeId::generate().as_bytes(),
+                base: [8; 24],
+                length,
+                local: 0,
+                remote: 0,
+                writable: true,
+                ready: false,
+                plan: None,
+                conflict: false,
+                error: None,
+                failure: None,
+            })
+            .await
+            .unwrap();
+        stage
+            .bind_base(id, prepared.descriptor().to_bytes(), length)
+            .await
+            .unwrap();
+
+        for offset in (0..CHUNK * 2).step_by(4096) {
+            stage
+                .write(id, Some(offset), vec![0x5a; 4096])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            stage.segment_ranges(id).await.unwrap(),
+            [(0, CHUNK), (CHUNK, CHUNK)]
+        );
+        let read = stage.read(id, CHUNK - 8, 16).await.unwrap();
+        assert_eq!(read.bytes, [0x5a; 16]);
+        assert!(read.base.is_empty());
+
+        stage.truncate(id, CHUNK + 123).await.unwrap();
+        stage.truncate(id, length).await.unwrap();
+        assert_eq!(
+            stage.segment_ranges(id).await.unwrap(),
+            [(0, CHUNK), (CHUNK, 123)]
+        );
+        let read = stage.read(id, CHUNK + 120, 16).await.unwrap();
+        assert_eq!(&read.bytes[..3], &[0x5a; 3]);
+        assert_eq!(&read.bytes[3..], &[0; 13]);
     }
 
     #[test]

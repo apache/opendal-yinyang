@@ -195,10 +195,14 @@ A stage-3 handle with a `bases` row uses only `segments`; missing chunk rows
 mean "read the pinned base", never zero and never a freshly observed version.
 `prefix` is the durably valid immutable-base length and cannot exceed the
 descriptor length. Writes replace exact byte intervals and coalesce adjacent
-segments. A shrink lowers `prefix`; later extension therefore reads zeros in
-the removed interval instead of resurrecting base bytes. A handle without a
-`bases` row retains stage-1/2 full-chunks semantics, where missing chunks are
-zeros. A stage-3 handle must not contain both semantics.
+segments only inside one fixed 64 KiB verification unit. Every persisted
+segment row is therefore at most 64 KiB and never crosses a unit boundary;
+sequential writes cannot grow one SQLite BLOB without bound, and a small read
+loads at most the intersecting unit rows. A shrink lowers `prefix`; later
+extension therefore reads zeros in the removed interval instead of
+resurrecting base bytes. A handle without a `bases` row retains stage-1/2
+full-chunks semantics, where missing chunks are zeros. A stage-3 handle must
+not contain both semantics.
 
 A writer preflights an existing database read-only. A supported stage-1 or
 stage-2 database is first fully decoded, then one SQLite transaction performs
@@ -207,8 +211,9 @@ profile to stage-3. Original handle records, chunks, frozen requests,
 CommitIds, and ledger sequences are preserved. Old pending/frozen records keep
 their original full-chunks reads and publication requests. Unknown profiles,
 partial schemas, malformed base descriptors, overlapping segments, or mixed
-full/sparse handle state are rejected before PRAGMA journal-mode configuration,
-DDL, runtime-lock creation, or incomplete-open cleanup. SQLite's standard
+full/sparse handle state, empty segments, and segments that cross a verification
+unit are rejected before PRAGMA journal-mode configuration, DDL, runtime-lock
+creation, or incomplete-open cleanup. SQLite's standard
 read-only WAL path may create an empty `-wal` and may create or update derived
 `-shm`. Those files are not logical staging records: the main database, any
 existing WAL/journal bytes, configured journal mode, schema, rows, lease, and
