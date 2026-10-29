@@ -127,7 +127,7 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
         "--json",
     ]);
     report.success_or("space report during frozen FUSE work");
-    assert_space_report(&report.stdout);
+    assert_space_report(&report.stdout, &staging);
     assert_frozen_report(&report.stdout);
     assert_no_effects(
         &fixture,
@@ -260,7 +260,8 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
         "--json",
     ]);
     report.success_or("space report during dirty FUSE work");
-    assert_space_report(&report.stdout);
+    assert_pending_staging(&staging, false);
+    assert_space_report(&report.stdout, &staging);
     assert_pending_report(&report.stdout);
     assert_no_effects(
         fixture,
@@ -356,8 +357,13 @@ fn assert_no_effects(
     );
 }
 
-fn assert_space_report(output: &[u8]) {
+fn assert_space_report(output: &[u8], staging: &Path) {
     let document = parse_schema(output, "yinyang.managed-space.report.v1");
+    assert_eq!(
+        document["staging"]["path"].as_str(),
+        staging.to_str(),
+        "space report inspected a different staging directory: {document}"
+    );
     assert_eq!(
         document["deletion_authorized"],
         Value::Bool(false),
