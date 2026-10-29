@@ -931,6 +931,47 @@ fn run_incremental_matrix(
     );
 
     let path = mountpoint.join("incremental.bin");
+    let open = measure_mount_operation(&meter, mounted.pid(), || {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open incremental benchmark file")
+    });
+    let Measurement {
+        value: writer,
+        latency_ms: open_latency_ms,
+        io: open_io,
+        network: open_network,
+    } = open;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            open_network.get_response_body_bytes < size as u64 / 2,
+            "open materialized {} bytes of a {size}-byte file; this is consistent with a full-file fallback",
+            open_network.get_response_body_bytes
+        );
+    }
+    recorder.record(
+        context,
+        "fuse_incremental_open_materialization",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "open completed before a write or fsync; GET body bytes are HTTP entity bytes, excluding headers",
+        vec![open_latency_ms],
+        open_io,
+        open_network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "writable descriptor opened successfully".to_owned(),
+            format!(
+                "get_response_body_bytes={}",
+                open_network.get_response_body_bytes
+            ),
+            format!("full_file_bytes={size}"),
+        ],
+    );
+
     let unit_center =
         (size as u64 / 2 / BLOCK_BYTES as u64) * BLOCK_BYTES as u64 + BLOCK_BYTES as u64 / 4;
     let boundary_offset =
@@ -949,14 +990,10 @@ fn run_incremental_matrix(
         let value = payload(length, seed);
         expected[offset as usize..offset as usize + length].copy_from_slice(&value);
         let measured = measure_mount_operation(&meter, mounted.pid(), || {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .expect("open incremental benchmark file");
-            write_all_at(&file, &value, offset);
-            file.sync_all()
+            write_all_at(&writer, &value, offset);
+            writer
+                .sync_all()
                 .expect("fsync incremental benchmark overwrite");
-            drop(file);
         });
         assert_eq!(
             remote_file_bytes(fixture, "incremental.bin"),
@@ -968,10 +1005,15 @@ fn run_incremental_matrix(
             "{label}: a successful fsync must publish at least one PUT"
         );
         let put_body_bytes = measured.network.put_request_body_bytes;
+        let get_body_bytes = measured.network.get_response_body_bytes;
         if expectation == IncrementalExpectation::Required {
             assert!(
                 put_body_bytes < size as u64 / 2,
                 "{label}: PUT request bodies were {put_body_bytes} bytes for a {length}-byte overwrite in a {size}-byte file; this is consistent with full-file fallback"
+            );
+            assert!(
+                get_body_bytes < size as u64 / 2,
+                "{label}: fsync preparation read {get_body_bytes} bytes for a {length}-byte overwrite in a {size}-byte file; service traffic did not hide a full-file fallback"
             );
         }
         recorder.record(
@@ -996,17 +1038,14 @@ fn run_incremental_matrix(
             vec![
                 "complete remote bytes matched the expected file".to_owned(),
                 format!("put_request_body_bytes={put_body_bytes}"),
+                format!("get_response_body_bytes={get_body_bytes}"),
                 format!("full_file_bytes={size}"),
             ],
         );
     }
 
-    let unchanged = OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .expect("open incremental file for unchanged fsync");
     let unchanged_fsync = measure_mount_operation(&meter, mounted.pid(), || {
-        unchanged
+        writer
             .sync_all()
             .expect("fsync an unchanged incremental descriptor");
     });
@@ -1028,7 +1067,7 @@ fn run_incremental_matrix(
         space_snapshot(fixture, None, None, Some(&staging)),
         vec!["unchanged fsync emitted no backend PUT".to_owned()],
     );
-    drop(unchanged);
+    drop(writer);
     mounted.unmount();
 
     let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
