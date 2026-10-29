@@ -160,10 +160,13 @@ local evidence by importing the complete file. Its fallible preparation request
 names the exact retained revision, NodeId, and bounded edits. The service
 reopens that published version from its own metadata authority, applies the
 edits through its data binding, verifies the new pack, records the resulting
-descriptor as durably ready, and only then returns it. A stale or foreign
-revision is rejected before payload reads. The authenticated client may use the
-returned descriptor as service-issued readiness, but cannot reinterpret cached
-read bytes or an arbitrary serialized descriptor as preparation evidence.
+descriptor as durably ready, and only then returns it. An unknown or unretained
+revision, missing or non-file NodeId, and wrong service binding are rejected
+before payload reads. A retained older revision remains a valid base; its
+original file predicates determine whether later publication succeeds. The
+authenticated client may use the returned descriptor as service-issued
+readiness, but cannot reinterpret cached read bytes or an arbitrary serialized
+descriptor as preparation evidence.
 
 The delta operation is same-length only. Append, truncate, hole extension, and
 any replacement whose final logical length differs use complete-source
