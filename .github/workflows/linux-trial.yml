@@ -31,9 +31,13 @@ on:
       - "src/**"
       - "specs/linux-operations.md"
       - "specs/linux-trial-distribution.md"
+      - "tests/linux_fuse/harness.rs"
+      - "tests/linux_operations.rs"
       - "tests/linux_prefix_upgrade.rs"
+      - "tests/linux_sync/harness.rs"
       - "tests/linux_trial_archive.sh"
       - "tests/linux_trial_distribution.sh"
+      - "tests/support/**"
       - "tools/linux/**"
   workflow_dispatch:
 
