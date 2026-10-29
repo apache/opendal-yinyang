@@ -703,6 +703,14 @@ async fn sparse_runtime(runtime: &Runtime, backend: &TestBackend, staging: &std:
     assert_eq!(counts("bases"), 1);
     assert_eq!(counts("chunks"), 0);
     assert_eq!(counts("segments"), 0);
+    assert!(file.read(BASE_BYTES as u64, 64).await.unwrap().is_empty());
+    assert!(
+        file.read(BASE_BYTES as u64 + 1, 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(file.read(0, 0).await.unwrap().is_empty());
 
     file.write(1000, b"WXYZ").await.unwrap();
     let segments: Vec<(i64, i64)> = {
@@ -758,8 +766,12 @@ async fn sparse_runtime(runtime: &Runtime, backend: &TestBackend, staging: &std:
     file.write(2000, b"FROZ").await.unwrap();
     newer.write(3000, b"NEW!").await.unwrap();
     backend.state.lock().unwrap().delay_next_head = true;
-    let Err(Error::Unknown(commit)) = file.fsync().await else {
-        panic!("expected sparse publication outcome to be unknown");
+    let commit = match file.fsync().await {
+        Err(Error::Unknown(commit)) => commit,
+        outcome => panic!(
+            "expected sparse publication outcome to be unknown, got {outcome:?}; status: {:?}",
+            file.status().await
+        ),
     };
     assert_eq!(file.status().await.unwrap().frozen_commit_id, Some(commit));
     assert!(file.write(0, b"blocked").await.is_err());

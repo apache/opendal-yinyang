@@ -978,6 +978,12 @@ impl Stage {
         self.call(move |c| {
             let r = record(c, id)?;
             let end = offset.saturating_add(length as u64).min(r.length);
+            if offset >= end {
+                return Ok(StagedRead {
+                    bytes: Vec::new(),
+                    base: Vec::new(),
+                });
+            }
             if let Some(base) = base(c, id)? {
                 return read_sparse(c, id, offset, end, base);
             }
