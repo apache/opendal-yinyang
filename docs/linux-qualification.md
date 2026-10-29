@@ -59,7 +59,11 @@ The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
 `fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and
 optional `YINYANG_UPGRADE_SOURCE`/`YINYANG_UPGRADE_EVIDENCE` values for the
 exact target source and JSON output path. When `YY_UPGRADE_BIN` is omitted,
-the integration-test binary built from the current worktree is used.
+the integration-test binary built from the current worktree is used. A release
+binary rebuilt from the exact `fd1338c` commit in a different build environment
+is accepted only with `YINYANG_UPGRADE_LEGACY_SOURCE` and
+`YINYANG_UPGRADE_LEGACY_REBUILD=1`; the evidence records
+`source-pinned-rebuild` instead of the fixture binary hash.
 
 The systemd lifecycle remains an explicit qualified-host command. Hosted CI
 does not enable linger, create a boot service, or change FUSE configuration to

@@ -232,7 +232,12 @@ jobs:
           test -x "$legacy_bin"
           sha256sum "$legacy_bin" |
             tee "$TRIAL_ROOT/evidence/legacy-binary.sha256"
-          printf 'YY_LEGACY_BIN=%s\n' "$legacy_bin" >>"$GITHUB_ENV"
+          {
+            printf 'YY_LEGACY_BIN=%s\n' "$legacy_bin"
+            printf 'YINYANG_UPGRADE_LEGACY_SOURCE=%s\n' \
+              fd1338c2f924a90e9da752b9158e748d1d3acaf4
+            printf 'YINYANG_UPGRADE_LEGACY_REBUILD=1\n'
+          } >>"$GITHUB_ENV"
 
       - name: Run installed-prefix upgrade with the archive target
         run: |
