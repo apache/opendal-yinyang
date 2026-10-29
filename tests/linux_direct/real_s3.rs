@@ -21,6 +21,7 @@
 //! explicitly mounted `yy` process exercises the Direct implementation.
 
 use crate::harness::{Captured, Mounted, assert_errno, path_text, run_timeout};
+use crate::raw_s3::{RawInventory, RawObject};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -101,14 +102,14 @@ fn aws_executable() -> String {
 }
 
 #[derive(Clone)]
-struct AwsS3 {
+pub(crate) struct AwsS3 {
     bucket: String,
     region: String,
     executable: String,
 }
 
 impl AwsS3 {
-    fn new(bucket: impl Into<String>) -> Self {
+    pub(crate) fn new(bucket: impl Into<String>) -> Self {
         Self {
             bucket: bucket.into(),
             region: required(REGION),
@@ -396,6 +397,48 @@ impl AwsS3 {
             .args(["s3", "rm", "--recursive", &destination])
             .arg("--only-show-errors");
         run_timeout(command, Duration::from_secs(900)).success_or("AWS CLI fixture cleanup");
+    }
+
+    pub(crate) fn raw_put(&self, key: &str, bytes: &[u8]) {
+        self.put_ok(key, bytes, None, None);
+    }
+
+    pub(crate) fn raw_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.head(key)?;
+        Some(self.get(key, None, None).0)
+    }
+
+    pub(crate) fn raw_delete(&self, key: &str) {
+        let output = self.delete(key, None, None);
+        output.success_or(&format!("AWS CLI fixture DELETE for {key:?}"));
+    }
+
+    pub(crate) fn raw_object(&self, key: &str) -> Option<RawObject> {
+        let metadata = self.head(key)?;
+        let bytes = self.get(key, None, None).0;
+        Some(RawObject {
+            bytes,
+            etag: metadata.etag,
+            last_modified: None,
+            version: metadata.version,
+        })
+    }
+
+    pub(crate) fn raw_inventory(&self, prefix: &str) -> RawInventory {
+        self.list(prefix, 1000)
+            .entries
+            .into_keys()
+            .map(|key| {
+                let object = self
+                    .raw_object(&key)
+                    .unwrap_or_else(|| panic!("listed AWS S3 key {key:?} disappeared"));
+                (key, object)
+            })
+            .collect()
+    }
+
+    pub(crate) fn raw_cleanup(&self, prefix: &str) {
+        self.remove_prefix(prefix);
     }
 }
 

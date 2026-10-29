@@ -46,6 +46,7 @@ pub struct TestState {
     pub written_bytes: u64,
     pub head_barrier: Option<(Arc<tokio::sync::Barrier>, usize)>,
     pub delay_next_head: bool,
+    pub fail_head_read_after: Option<usize>,
     pub pending_head: Option<(Vec<u8>, Option<String>)>,
     pub file_to_change_on_data_close: Option<std::path::PathBuf>,
     pub offline: bool,
@@ -181,6 +182,19 @@ impl Service for TestService {
         let mut state = self.state.lock().unwrap();
         if state.offline {
             return Err(unavailable());
+        }
+        if path == ".yinyang/head" {
+            match state.fail_head_read_after {
+                Some(0) => {
+                    state.fail_head_read_after = None;
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "head read failed before effect",
+                    ));
+                }
+                Some(remaining) => state.fail_head_read_after = Some(remaining - 1),
+                None => {}
+            }
         }
         state.read_paths.push(path.to_owned());
         let object = state.objects.get(path).cloned().ok_or_else(not_found)?;

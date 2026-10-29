@@ -28,6 +28,24 @@ const COMMIT_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateRequest {
+    pub method: String,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl GateRequest {
+    #[allow(dead_code)] // Not every gate target inspects request headers.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[allow(dead_code)] // Shared test crates use different subsets of gate actions.
 #[derive(Clone, Copy)]
 pub enum CommitAction {
     /// Read the complete request, signal interception, and wait before sending
@@ -48,17 +66,81 @@ enum GateEvent {
     CommitFailed(String),
 }
 
-/// A loopback HTTP proxy that intercepts the first `.yinyang/head` mutation.
+#[allow(dead_code)] // Direct targets one object while directory tests target the head commit.
+#[derive(Clone)]
+enum GateTarget {
+    HeadCommit,
+    Request { method: String, path_suffix: String },
+}
+
+impl GateTarget {
+    fn matches(&self, request_line: &str) -> bool {
+        let mut parts = request_line.split_whitespace();
+        let Some(method) = parts.next() else {
+            return false;
+        };
+        let Some(target) = parts.next() else {
+            return false;
+        };
+        match self {
+            Self::HeadCommit => {
+                method == "PUT"
+                    && target
+                        .split('?')
+                        .next()
+                        .is_some_and(|path| path.ends_with("/.yinyang/head"))
+            }
+            Self::Request {
+                method: expected_method,
+                path_suffix,
+            } => {
+                method.eq_ignore_ascii_case(expected_method)
+                    && target
+                        .split('?')
+                        .next()
+                        .is_some_and(|path| path.ends_with(path_suffix))
+            }
+        }
+    }
+}
+
+/// A loopback HTTP proxy that intercepts the first targeted S3 mutation.
 pub struct S3Gate {
     address: SocketAddr,
     events: mpsc::Receiver<GateEvent>,
     release: Arc<(Mutex<bool>, Condvar)>,
     stop: Arc<AtomicBool>,
+    #[allow(dead_code)] // Non-S3 test targets never drop a response.
+    poisoned: Arc<AtomicBool>,
+    intercepted_request: Arc<Mutex<Option<GateRequest>>>,
+    matched_requests: Arc<Mutex<Vec<GateRequest>>>,
+    last_commit_response: Arc<Mutex<Option<Vec<u8>>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl S3Gate {
+    #[allow(dead_code)]
     pub fn start(action: CommitAction) -> Self {
+        Self::start_for(action, GateTarget::HeadCommit)
+    }
+
+    /// Intercept the first request whose method and path suffix match.
+    ///
+    /// `path` is the request path without its query string. Callers whose keys
+    /// contain non-ASCII bytes should pass the exact percent-encoded suffix
+    /// observed in the signed request.
+    #[allow(dead_code)]
+    pub fn start_for_path(action: CommitAction, method: &str, path: impl Into<String>) -> Self {
+        Self::start_for(
+            action,
+            GateTarget::Request {
+                method: method.to_owned(),
+                path_suffix: path.into(),
+            },
+        )
+    }
+
+    fn start_for(action: CommitAction, target: GateTarget) -> Self {
         let upstream = upstream_endpoint();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind S3 gate");
         let address = listener.local_addr().expect("S3 gate address");
@@ -66,11 +148,17 @@ impl S3Gate {
         let stop = Arc::new(AtomicBool::new(false));
         let intercepted = Arc::new(AtomicBool::new(false));
         let poisoned = Arc::new(AtomicBool::new(false));
+        let intercepted_request = Arc::new(Mutex::new(None));
+        let matched_requests = Arc::new(Mutex::new(Vec::new()));
+        let last_commit_response = Arc::new(Mutex::new(None));
         let (sender, receiver) = mpsc::channel();
         let thread_release = release.clone();
         let thread_stop = stop.clone();
         let thread_intercepted = intercepted.clone();
         let thread_poisoned = poisoned.clone();
+        let thread_request = intercepted_request.clone();
+        let thread_matches = matched_requests.clone();
+        let thread_response = last_commit_response.clone();
         let thread = thread::spawn(move || {
             for incoming in listener.incoming() {
                 if thread_stop.load(Ordering::SeqCst) {
@@ -82,15 +170,23 @@ impl S3Gate {
                 let release = thread_release.clone();
                 let intercepted = thread_intercepted.clone();
                 let poisoned = thread_poisoned.clone();
+                let intercepted_request = thread_request.clone();
+                let matched_requests = thread_matches.clone();
+                let last_commit_response = thread_response.clone();
+                let target = target.clone();
                 let sender = sender.clone();
                 thread::spawn(move || {
                     handle_connection(
                         client,
                         upstream,
                         action,
+                        target,
                         release,
                         intercepted,
                         poisoned,
+                        intercepted_request,
+                        matched_requests,
+                        last_commit_response,
                         sender,
                     );
                 });
@@ -101,6 +197,10 @@ impl S3Gate {
             events: receiver,
             release,
             stop,
+            poisoned,
+            intercepted_request,
+            matched_requests,
+            last_commit_response,
             thread: Some(thread),
         }
     }
@@ -109,13 +209,40 @@ impl S3Gate {
         format!("http://{}", self.address)
     }
 
-    pub fn wait_intercepted(&self) {
+    #[allow(dead_code)]
+    pub fn last_commit_response(&self) -> Option<Vec<u8>> {
+        self.last_commit_response
+            .lock()
+            .expect("S3 gate response lock")
+            .clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn matched_requests(&self) -> Vec<GateRequest> {
+        self.matched_requests
+            .lock()
+            .expect("S3 gate requests lock")
+            .clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn wait_intercepted(&self) -> GateRequest {
+        self.wait_intercepted_for(COMMIT_TIMEOUT)
+    }
+
+    #[allow(dead_code)]
+    pub fn wait_intercepted_for(&self, timeout: Duration) -> GateRequest {
         match self
             .events
-            .recv_timeout(COMMIT_TIMEOUT)
-            .expect("S3 gate did not intercept the conditional head publication")
+            .recv_timeout(timeout)
+            .expect("S3 gate did not intercept the targeted publication")
         {
-            GateEvent::Intercepted => {}
+            GateEvent::Intercepted => self
+                .intercepted_request
+                .lock()
+                .expect("S3 gate request lock")
+                .clone()
+                .expect("S3 gate recorded the intercepted request"),
             GateEvent::CommitSucceeded => {
                 panic!("S3 gate observed a commit without reporting request interception")
             }
@@ -126,6 +253,26 @@ impl S3Gate {
         }
     }
 
+    /// Wait one bounded interval without consuming a non-intercept event.
+    #[allow(dead_code)]
+    pub fn wait_intercepted_timeout(&self, timeout: Duration) -> bool {
+        match self.events.recv_timeout(timeout) {
+            Ok(GateEvent::Intercepted) => true,
+            Ok(GateEvent::CommitSucceeded) => {
+                panic!("S3 gate observed a commit without reporting request interception")
+            }
+            Ok(GateEvent::OriginalDropped) => {
+                panic!("S3 gate dropped a request without reporting request interception")
+            }
+            Ok(GateEvent::CommitFailed(error)) => panic!("S3 gate commit failed: {error}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("S3 gate event channel disconnected before request interception")
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn wait_commit_succeeded(&self) {
         match self
             .events
@@ -165,6 +312,13 @@ impl S3Gate {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
         condvar.notify_all();
     }
+
+    /// Resume forwarding after the intentionally dropped response has been
+    /// observed. The first matching request remains intercepted for life.
+    #[allow(dead_code)]
+    pub fn resume(&self) {
+        self.poisoned.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Drop for S3Gate {
@@ -182,9 +336,13 @@ fn handle_connection(
     client: TcpStream,
     upstream: SocketAddr,
     action: CommitAction,
+    target: GateTarget,
     release: Arc<(Mutex<bool>, Condvar)>,
     intercepted: Arc<AtomicBool>,
     poisoned: Arc<AtomicBool>,
+    intercepted_request: Arc<Mutex<Option<GateRequest>>>,
+    matched_requests: Arc<Mutex<Vec<GateRequest>>>,
+    last_commit_response: Arc<Mutex<Option<Vec<u8>>>>,
     sender: mpsc::Sender<GateEvent>,
 ) {
     let mut client = client;
@@ -194,7 +352,25 @@ fn handle_connection(
     let Ok((head, request_line, headers)) = read_http_head(&mut client) else {
         return;
     };
-    let is_commit = is_head_commit(&request_line) && !intercepted.swap(true, Ordering::SeqCst);
+    let targeted = target.matches(&request_line);
+    let is_commit = targeted && !intercepted.swap(true, Ordering::SeqCst);
+    if targeted {
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_owned();
+        let target = parts.next().unwrap_or_default().to_owned();
+        let request = GateRequest {
+            method,
+            target,
+            headers: headers.clone(),
+        };
+        matched_requests
+            .lock()
+            .expect("S3 gate requests lock")
+            .push(request.clone());
+        if is_commit {
+            *intercepted_request.lock().expect("S3 gate request lock") = Some(request);
+        }
+    }
     if has_expect_continue(&headers) {
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
@@ -230,12 +406,16 @@ fn handle_connection(
         return;
     };
     if is_commit {
-        if response.status != 200 {
+        *last_commit_response.lock().expect("S3 gate response lock") = Some(response.bytes.clone());
+        if !(200..300).contains(&response.status) {
             let message = format!(
-                "conditional head PUT returned HTTP {}, expected 200",
+                "targeted S3 mutation returned HTTP {}, expected 2xx",
                 response.status
             );
             let _ = sender.send(GateEvent::CommitFailed(message));
+            let response = with_connection_close(&response.bytes);
+            let _ = client.write_all(&response);
+            let _ = client.shutdown(Shutdown::Both);
             return;
         }
         match action {
@@ -441,17 +621,6 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fn has_expect_continue(headers: &[(String, String)]) -> bool {
     header(headers, "expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
-}
-
-fn is_head_commit(request_line: &str) -> bool {
-    let mut parts = request_line.split_whitespace();
-    parts.next() == Some("PUT")
-        && parts.next().is_some_and(|target| {
-            target
-                .split('?')
-                .next()
-                .is_some_and(|path| path.ends_with("/.yinyang/head"))
-        })
 }
 
 fn upstream_endpoint() -> SocketAddr {

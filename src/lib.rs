@@ -23,6 +23,8 @@
 #[doc(hidden)]
 pub mod benchmark;
 pub mod direct;
+#[cfg(target_os = "linux")]
+pub mod direct_sync;
 mod directory;
 #[cfg(target_os = "linux")]
 pub mod fuse;

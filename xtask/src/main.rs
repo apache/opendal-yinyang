@@ -91,7 +91,7 @@ enum SubCommand {
     )]
     TestCompatibility(CommandTestCompatibility),
     #[clap(
-        about = "Run real read-only S3 Direct acceptance through yy and /dev/fuse (requires isolated S3 settings)."
+        about = "Run deterministic Direct Mount and Sync acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
     TestLinuxDirect(CommandTestLinuxDirect),
     #[clap(

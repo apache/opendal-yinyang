@@ -47,6 +47,13 @@ and finite Sync convergence. The real Amazon S3 run used the installed binary
 prefix with no endpoint override. Evidence is limited to the named backend
 class and host; it is not a capacity, multi-host or HA claim.
 
+The installed-prefix upgrade harness additionally passed at target source
+`79506c0684c47b37bc93364eaa7192d65a770ede` against the exact `fd1338c`
+producer. It retained frozen and pending handles, the original file and Sync
+receipts, and a 74,192-byte service WAL before target recovery. That target was
+an O-only preparatory build; the final integrated candidate still requires its
+own run with the same test binary selected through `YY_UPGRADE_BIN`.
+
 The tested `target/debug/yy` from source `7759518` had SHA-256
 `b9acff232c66f6dd898deeccb315e2a1f70af4e9e37959793bc7ba98425ed705`.
 
@@ -55,8 +62,10 @@ authenticated single-host loopback authority, not TLS, HA or a network-safe
 service. There is no automatic Sync watcher or timer.
 
 Read-only Direct Mount is implemented as a separate experimental frontend. It
-does not use staging, the metadata service or Managed recovery state, and the
-Managed qualification results below do not qualify Direct.
+does not use staging, the metadata service or Managed recovery state. Writable
+Direct, when enabled by its own accepted integration, requires a private
+staging directory and uses Direct runtime state for pending, conflict and
+Unknown work. Managed qualification below does not qualify either Direct mode.
 
 ## Prerequisites
 
@@ -64,7 +73,7 @@ On the tested host:
 
 ```shell
 sudo apt-get update
-sudo apt-get install --yes ca-certificates fuse3
+sudo apt-get install --yes ca-certificates fuse3 jq python3
 rustc --version
 cargo --version
 ```
@@ -76,9 +85,35 @@ for the SQLite authority and immutable storage content.
 Do not put the environment file or state under a synchronized or mounted source
 tree.
 
+## Build a local qualification artifact
+
+The repository can build a deterministic local archive without signing,
+tagging or publishing it:
+
+```shell
+mkdir -p /var/tmp/yinyang-artifacts
+tools/linux/package-release.sh --output-dir /var/tmp/yinyang-artifacts
+(
+  cd /var/tmp/yinyang-artifacts
+  sha256sum -c ./*.tar.gz.sha256
+)
+```
+
+The archive contains `bin/yy`, the three systemd user-unit templates, the
+environment example, operational documentation and `BUILD-MANIFEST`. The
+manifest records the package version, release identity, source commit, source
+date, target, Cargo/Rust versions and binary SHA-256. The script refuses a dirty
+worktree and requires Linux x86_64 so the archive cannot silently claim a
+source/build identity it did not test.
+
+The script requires Ubuntu 24.04 x86_64, the tested host combination. This
+artifact is local qualification input, not an Apache Software Foundation
+release. It has no ASF signature, vote, provenance approval or publication
+authorization.
+
 ## Install a clean prefix
 
-Run these commands from the repository checkout. The version is read from the
+Run these commands from the repository working tree. The version is read from the
 workspace, and the working directory is intentionally not the installation
 prefix:
 
@@ -87,17 +122,20 @@ set -eu
 umask 077
 
 YY_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "yinyang") | .version')"
+YY_SOURCE="$(git rev-parse HEAD)"
+YY_RELEASE="$YY_VERSION+${YY_SOURCE:0:12}"
 YY_ROOT="$HOME/.local/lib/yinyang"
-YY_RELEASE="$YY_ROOT/$YY_VERSION"
+YY_DIR="$YY_ROOT/$YY_RELEASE"
 YY_STATE="$HOME/.local/state/yinyang"
 YY_CONFIG="$HOME/.config/yinyang"
 YY_UNITS="$HOME/.config/systemd/user"
 
 cargo build --release --locked --bin yy
-install -d -m 0700 "$YY_RELEASE/bin" "$YY_STATE" "$YY_STATE/metadata" \
+install -d -m 0700 "$YY_DIR/bin" "$YY_STATE" "$YY_STATE/metadata" \
   "$YY_CONFIG/volumes" "$YY_UNITS" "$HOME/YinYang"
-install -m 0755 target/release/yy "$YY_RELEASE/bin/yy"
-ln -sfn "$YY_VERSION" "$YY_ROOT/current"
+install -m 0755 target/release/yy "$YY_DIR/bin/yy"
+ln -s "$YY_RELEASE" "$YY_ROOT/.current.new"
+mv -Tf "$YY_ROOT/.current.new" "$YY_ROOT/current"
 
 install -m 0600 deploy/linux/environment.example "$YY_CONFIG/environment"
 install -m 0644 deploy/linux/yinyang-serve.service "$YY_UNITS/"
@@ -127,7 +165,9 @@ the FUSE frontend's supported `0644`/`0755` files are not weakened to
 unrepresentable `0600` modes. The service and Sync units use `UMask=0077`.
 
 Record `git rev-parse HEAD`, the `sha256sum` output, `YY_VERSION` and the host
-identity with the qualification evidence. The unit files are user services:
+identity with the qualification evidence. The release directory also includes a
+12-character source suffix because two development binaries can share one
+package version. The unit files are user services:
 installing them does not enable a system service, change the kernel FUSE
 configuration, or start anything at boot. Do not run `loginctl enable-linger`
 as part of this workflow.
@@ -367,8 +407,12 @@ x86_64 qualification combination; an untested Linux host is reported as
 information, not as a CLI runtime restriction. For Managed, the `scope` object
 states that the state probe writes and removes one namespaced temporary file,
 does not initialize the catalog or acquire a runtime lease, and the authority
-check only observes the latest revision. For Direct, no state probe occurs;
-doctor performs one recursive read-only namespace observation.
+check only observes the latest revision. Read-only Direct performs no state
+probe and reports one recursive read-only namespace observation. Writable
+Direct probes its configured staging path with one temporary owner-only file
+and inspects `DirectRuntime` read-only for profile/schema/binding and retained
+pending, conflict or Unknown state; it does not create `runtime.db`, run
+recovery or take the runtime lease.
 
 Stop services without deleting state:
 
@@ -413,14 +457,70 @@ uncertain requests are part of the state. Backup and restore procedures are
 separate operational work; this guide only guarantees that unit stop and
 binary-prefix removal preserve state.
 
-## Reinstall and uninstall
+## Installed upgrade
 
-Until issue #79 defines a supported version migration contract, only an
-experimental same-version reinstall/rollback is in scope. Stop all units,
-preserve `$HOME/.local/state/yinyang` and every volume document, install
-another build of the exact same declared version into its versioned directory,
-switch `current`, then start and rerun `doctor`. Do not infer cross-version
-compatibility from this procedure.
+The only supported installed transition is a stopped, same-host replacement for
+an exact source pair recorded by acceptance. The producer is
+`fd1338c2f924a90e9da752b9158e748d1d3acaf4`; the target is the final accepted
+candidate that passes `tests/linux_prefix_upgrade.rs`. A build from another
+source does not inherit this result.
+
+Before switching:
+
+1. Stop every `yinyang-serve.service`,
+   `yinyang-mount@<volume>.service` and completed
+   `yinyang-sync@<volume>.service`.
+2. Confirm no `yy` process, FUSE mount or writer remains for the installation.
+3. Preserve every volume document, Mount staging directory, Sync state and
+   metadata database with its `-wal` and `-shm` files. Do not copy only SQLite
+   main files.
+4. Keep the old release directory for audit, but do not point `current` back to
+   it after the new binary has opened or written state.
+
+Install the new binary into its own directory and atomically replace the
+symlink:
+
+```shell
+set -eu
+umask 077
+YY_ROOT="$HOME/.local/lib/yinyang"
+YY_RELEASE="0.0.24+replace-with-target-source-prefix"
+YY_DIR="$YY_ROOT/$YY_RELEASE"
+
+install -d -m 0700 "$YY_DIR/bin"
+install -m 0755 /path/to/new/yy "$YY_DIR/bin/yy"
+sha256sum "$YY_DIR/bin/yy"
+ln -s "$YY_RELEASE" "$YY_ROOT/.current.new"
+mv -Tf "$YY_ROOT/.current.new" "$YY_ROOT/current"
+systemctl --user daemon-reload
+```
+
+Start the retained units and verify the transition before resuming clients:
+
+```shell
+systemctl --user start yinyang-serve.service
+systemctl --user start yinyang-mount@object.service
+findmnt --target "$HOME/YinYang/object"
+yyvol object --volume "$HOME/.config/yinyang/volumes/object.json" doctor --json
+yyvol object --volume "$HOME/.config/yinyang/volumes/object.json" status
+yyvol sync --volume "$HOME/.config/yinyang/volumes/sync.json" sync status --json
+```
+
+Accept the upgrade only when retained pending/Unknown handles and original
+receipts are unchanged, locally acknowledged bytes are readable, the metadata
+service opens the same authority, `PRAGMA integrity_check` reports `ok`, and a
+finite Sync reaches `summary.in_sync=true`. The installed-prefix acceptance uses
+the exact repository unit templates and versioned `current` symlink, but runs
+the state transition as stopped processes so it is independent of a particular
+user session. The existing systemd lifecycle test separately covers start,
+restart and stop through `systemctl --user`.
+
+Arbitrary downgrade is not supported. If the target binary has opened or written
+newer local state, atomically switching `current` back is an unsupported
+operation even when the older directory remains. Use an isolated restore of a
+backup taken before the upgrade when recovery is required.
+
+## Uninstall
 
 Uninstall the executable and user units while keeping state and configuration:
 
@@ -432,8 +532,8 @@ rm -f "$HOME/.config/systemd/user/yinyang-serve.service" \
   "$HOME/.config/systemd/user/yinyang-sync@.service"
 systemctl --user daemon-reload
 
-rm -rf "$HOME/.local/lib/yinyang/current"
-rm -rf "$HOME/.local/lib/yinyang/$YY_VERSION"
+rm -f "$HOME/.local/lib/yinyang/current"
+rm -rf "$HOME/.local/lib/yinyang/$YY_RELEASE"
 ```
 
 Do not remove `$HOME/.config/yinyang` or
@@ -441,3 +541,7 @@ Do not remove `$HOME/.config/yinyang` or
 separate explicit retention decision. The same applies to
 `$HOME/YinYang/<volume>`: it may contain acknowledged local bytes or a Sync
 source, not a disposable install artifact.
+
+Bounded sustained operation, sampled RSS/state/retained-history growth and the
+explicit non-capacity limits are recorded in
+[`linux-operating-envelope.md`](linux-operating-envelope.md).

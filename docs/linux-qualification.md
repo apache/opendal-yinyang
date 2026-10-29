@@ -11,8 +11,10 @@ qualification.
 | --- | --- | --- |
 | `cargo x test` | host-independent test runners | Rust unit and integration tests; ignored native tests are compiled but not executed |
 | `cargo x test-linux-fuse` | Ubuntu, `/dev/fuse`, isolated Silo | Real `fuse.yinyang` mount, read-only range hydration, writable recovery, corruption, refresh, restart and lifecycle |
+| `cargo x test-linux-direct` | Ubuntu, `/dev/fuse`, Python 3, isolated Silo | Read-only and conditional-writable Direct Mount, Direct Sync, raw inventory/bytes, uncertainty and restart boundaries |
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object Mount and finite Sync, loopback service Mount |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
+| `cargo test --test linux_prefix_upgrade` | Ubuntu, isolated Silo, `YY_LEGACY_BIN`, `YY_UPGRADE_BIN`, `sqlite3` | Stopped installed-prefix transition from the `fd1338c` producer to a selected target with retained file, Sync and service state |
 
 GitHub Actions runs the FUSE and installed-CLI checks in the `linux-fuse` job
 after starting isolated Silo. It runs backup and recovery acceptance in the
@@ -38,6 +40,14 @@ These checks require infrastructure that hosted CI does not provide:
 | `cargo x test-linux-operations --amazon-s3` | real Amazon S3 credentials and bucket, `/dev/fuse` | installed CLI lifecycle against the named S3 backend |
 | `python3 tests/linux_direct_real_s3.py` | task-owned versioned and never-versioned Amazon S3 buckets, temporary role, AWS CLI, `/dev/fuse` | read-only Direct pagination, reversible keys, version/ETag retention, conditional primitives and Linux FUSE lifecycle |
 | `cargo x bench-linux-cost --workload read-only-range` | matched source identities, release binary, isolated S3, `/dev/fuse` | bounded FUSE range latency, requests, payload and staging |
+| `cargo test --test linux_prefix_upgrade` | isolated Silo, exact `fd1338c` and final-target binaries, `sqlite3` | stopped versioned-prefix replacement with pending/Unknown state, receipts and service WAL recovery |
+| `tests/linux_operating_envelope_real_s3.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `sqlite3`, scoped AWS CLI | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
+
+The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
+`fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and
+optional `YINYANG_UPGRADE_SOURCE`/`YINYANG_UPGRADE_EVIDENCE` values for the
+exact target source and JSON output path. When `YY_UPGRADE_BIN` is omitted,
+the integration-test binary built from the current worktree is used.
 
 The systemd lifecycle remains an explicit qualified-host command. Hosted CI
 does not enable linger, create a boot service, or change FUSE configuration to
@@ -63,14 +73,27 @@ The initial qualified combination is:
 - one local systemd user manager on a single host;
 - object publication or authenticated single-host loopback service publication;
 - Managed Mount and finite ordinary-directory Managed Sync;
-- isolated MinIO-compatible Silo continuously, with Amazon S3 only when its
-  explicit run is recorded.
+- isolated MinIO-compatible Silo for Managed, read-only and conditional-writable
+  Direct Mount, and finite Direct Sync;
+- read-only Direct and conditional mutation primitives on the explicitly
+  recorded Amazon S3 buckets;
+- installed, stopped binary replacement only for the exact producer and target
+  source pair recorded by installed-prefix evidence; arbitrary upgrade and
+  downgrade remain unsupported.
 
 The metadata service remains one authenticated loopback authority. This matrix
 does not claim TLS, HA, network-safe service exposure, multi-host locking,
 automatic Sync watching, or automatic garbage collection.
 
+Deterministic writable Direct Mount and Direct Sync coverage uses isolated
+loopback Silo. The Amazon S3 record covers read-only Direct and raw conditional
+primitives, not writable Direct Mount or Direct Sync. Other S3-compatible
+services remain outside the matrix unless they satisfy exact recursive LIST,
+conditional ETag mutation and the tested version/range behavior.
+
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed
 in [`linux-fuse.md`](../specs/linux-fuse.md). Matched range cost evidence is in
-[`linux-range-cost-results.md`](linux-range-cost-results.md).
+[`linux-range-cost-results.md`](linux-range-cost-results.md). Bounded sustained
+operation, sampled resource growth and current limitations are recorded in
+[`linux-operating-envelope.md`](linux-operating-envelope.md).

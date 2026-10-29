@@ -22,6 +22,11 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use yinyang::direct::{DirectNamespace, DirectRuntime, DirectRuntimeInspectionState};
+#[cfg(target_os = "linux")]
+use yinyang::direct_sync::{
+    BindingState, DirectRemote, DirectRemoteAdapter, DirectSync, LocalScanState,
+    validate_remote_namespace,
+};
 use yinyang::runtime::Runtime;
 use yinyang::volume::{Access, Frontend, Model, Publication, Volume, VolumeConfig};
 
@@ -180,7 +185,13 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             .join(&config.staging);
     }
     if config.model == Model::Direct {
-        report.scope = if config.read_only {
+        report.scope = if config.access == Access::Sync {
+            DiagnosticScope {
+                state_probe: "probe the configured Direct Sync state directory with one temporary owner-only file, sync it, and remove it",
+                catalog_and_publication_state: "inspect Direct Sync SQLite state, baseline, conflicts and retained artifacts read-only; no recovery, initialization, publication or writer lease is created",
+                authority: "observe one Direct namespace; no mutation is issued",
+            }
+        } else if config.read_only {
             DiagnosticScope {
                 state_probe: "not performed; read-only Direct has no local state path",
                 catalog_and_publication_state: "recursive object listing is read-only; no object, YinYang metadata, SQLite state, recovery, publication or lease is created",
@@ -238,7 +249,7 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
     report.push(
         "environment",
         environment_status,
-        environment_detail,
+        environment_detail.clone(),
         environment_remediation,
     );
 
@@ -266,6 +277,9 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
                     path.display()
                 )),
             );
+        }
+        if config.model == Model::Direct && config.access == Access::Sync {
+            check_direct_sync_state(&config, None, Some(environment_detail), &mut report).await;
         }
         return finish(report, &secrets, json);
     }
@@ -312,7 +326,9 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             ),
         }
         if admitted {
-            if config.model == Model::Direct && !config.read_only {
+            if config.model == Model::Direct && config.access == Access::Sync {
+                check_direct_sync_state(&config, Some(&operator), None, &mut report).await;
+            } else if config.model == Model::Direct && !config.read_only {
                 check_direct_runtime_state(&config, &operator, &mut report);
             }
             match config.model {
@@ -330,6 +346,15 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
                 "not checked because volume admission failed",
                 Some("fix admission first, then rerun `yy doctor`"),
             );
+            if config.model == Model::Direct && config.access == Access::Sync {
+                check_direct_sync_state(
+                    &config,
+                    None,
+                    Some("volume admission failed".to_owned()),
+                    &mut report,
+                )
+                .await;
+            }
         }
     } else {
         report.push(
@@ -342,6 +367,15 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             "not checked because the storage operator is invalid",
             Some("fix the environment check first, then rerun `yy doctor`"),
         );
+        if config.model == Model::Direct && config.access == Access::Sync {
+            check_direct_sync_state(
+                &config,
+                None,
+                Some("the storage operator is invalid".to_owned()),
+                &mut report,
+            )
+            .await;
+        }
     }
 
     if config.access == Access::Sync {
@@ -610,6 +644,92 @@ async fn check_local_state(config: &VolumeConfig, report: &mut DoctorReport) {
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn check_direct_sync_state(
+    config: &VolumeConfig,
+    operator: Option<&opendal::Operator>,
+    remote_error: Option<String>,
+    report: &mut DoctorReport,
+) {
+    let config_path = report.config.clone();
+    let (remote, remote_error) = match operator {
+        Some(operator) => match crate::direct_sync_cli::remote_adapter(config, operator.clone()) {
+            Ok(remote) => (Some(remote), remote_error),
+            Err(error) => {
+                let detail = match remote_error {
+                    Some(previous) => format!("{previous}; {error}"),
+                    None => error.to_string(),
+                };
+                (None, Some(detail))
+            }
+        },
+        None => (None, remote_error),
+    };
+    let inspection =
+        DirectSync::<DirectRemoteAdapter>::inspect(remote.as_ref(), &config.staging, remote_error)
+            .await;
+    match inspection.binding.state {
+        BindingState::Unbound => report.push(
+            "sync-state",
+            Health::Info,
+            "Direct Sync state is not initialized; doctor did not create it",
+            Some(format!(
+                "run `yy --volume {} sync init --directory ROOT` before the first Sync run",
+                config_path
+            )),
+        ),
+        BindingState::Error => report.push(
+            "sync-state",
+            Health::ActionRequired,
+            inspection
+                .binding
+                .error
+                .unwrap_or_else(|| "Direct Sync state validation failed".to_owned()),
+            Some("preserve the Direct Sync state directory and correct the binding or permissions"),
+        ),
+        BindingState::Bound => {
+            let summary = inspection.summary;
+            let lifecycle_failed = inspection.local.scan == LocalScanState::Failed;
+            let state_failed = summary.failed > 0;
+            let detail = format!(
+                "Direct Sync state is readable; in_sync={} pending={} unknown={} conflicts={} failed={} retained_artifacts={}; remote={:?}",
+                summary.in_sync,
+                summary.pending,
+                summary.unknown,
+                summary.conflicts,
+                summary.failed,
+                summary.retained_artifacts,
+                inspection.remote.availability,
+            );
+            let health = if lifecycle_failed || state_failed {
+                Health::ActionRequired
+            } else if summary.pending > 0 || summary.unknown > 0 || summary.conflicts > 0 {
+                Health::Info
+            } else {
+                Health::Pass
+            };
+            report.push(
+                "sync-state",
+                health,
+                detail,
+                (!summary.in_sync).then_some(format!(
+                    "run `yy --volume {} sync status --json` and inspect pending, Unknown, conflict or failed state",
+                    config_path
+                )),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn check_direct_sync_state(
+    _config: &VolumeConfig,
+    _operator: Option<&opendal::Operator>,
+    _remote_error: Option<String>,
+    _report: &mut DoctorReport,
+) {
+}
+
 fn check_direct_runtime_state(
     config: &VolumeConfig,
     operator: &opendal::Operator,
@@ -696,6 +816,60 @@ async fn check_direct_namespace(
     operator: opendal::Operator,
     report: &mut DoctorReport,
 ) {
+    #[cfg(target_os = "linux")]
+    if config.access == Access::Sync {
+        let remote = match crate::direct_sync_cli::remote_adapter(config, operator) {
+            Ok(remote) => remote,
+            Err(error) => {
+                report.push(
+                    "namespace",
+                    Health::ActionRequired,
+                    error.to_string(),
+                    Some(direct_config_remediation(config)),
+                );
+                return;
+            }
+        };
+        match remote.observe().await {
+            Ok(snapshot) => {
+                let root_entries = snapshot
+                    .entries
+                    .keys()
+                    .filter(|path| !path.contains('/'))
+                    .count();
+                let root_directories = snapshot
+                    .entries
+                    .values()
+                    .filter(|entry| !entry.path.contains('/') && !entry.is_file())
+                    .count();
+                match validate_remote_namespace(&snapshot) {
+                    Ok(()) => report.push(
+                        "namespace",
+                        Health::Pass,
+                        format!(
+                            "Direct Sync namespace is readable at observation {} with {} root entries and {root_directories} root directories",
+                            snapshot.revision.as_deref().unwrap_or("<none>"),
+                            root_entries
+                        ),
+                        None::<String>,
+                    ),
+                    Err(error) => report.push(
+                        "namespace",
+                        Health::ActionRequired,
+                        error.to_string(),
+                        Some(direct_remediation(&error.to_string())),
+                    ),
+                }
+            }
+            Err(error) => report.push(
+                "namespace",
+                Health::ActionRequired,
+                error.to_string(),
+                Some(direct_remediation(&error.to_string())),
+            ),
+        }
+        return;
+    }
     let namespace = match DirectNamespace::new(operator) {
         Ok(namespace) => namespace,
         Err(error) => {

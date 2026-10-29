@@ -22,6 +22,7 @@ use support::TestBackend;
 use yinyang::core::{BackendProfile, Fs};
 use yinyang::volume::*;
 
+#[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
 fn direct_operator(backend: &TestBackend, conditional_delete: bool) -> opendal::Operator {
     backend
         .operator()
@@ -45,6 +46,7 @@ fn direct_operator(backend: &TestBackend, conditional_delete: bool) -> opendal::
         ))
 }
 
+#[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
 fn direct_config(staging: std::path::PathBuf) -> VolumeConfig {
     VolumeConfig {
         name: "objects".into(),

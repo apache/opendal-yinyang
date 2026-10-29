@@ -72,8 +72,8 @@ Checks are ordered from local policy to remote observation:
   because it is untested. A non-Linux host reports the operational restriction
   instead of implying native Linux frontend support.
 - `configuration`: parses the strict volume document and resolves a non-empty
-  relative staging path against the document directory. Direct has no staging
-  path to resolve.
+  relative staging path against the document directory. Read-only Direct has no
+  staging path; writable Direct requires one.
 - `environment`: requires a bucket, a complete explicit access-key pair when
   either key is set, and, for service publication, a 32..=1024 byte service
   token. The volume document's `storage_profile` is authoritative for a
@@ -85,14 +85,18 @@ Checks are ordered from local policy to remote observation:
   is not treated as readiness.
 - `local-state`: Managed writes one namespaced owner-only temporary file under
   the nearest existing state-directory ancestor, syncs and removes it, or probes
-  the existing state directory. Direct reports this check as informational and
-  performs no filesystem write. Doctor does not create the configured staging
-  directory, initialize `staging.db` or `sync.db`, run recovery, acquire the
-  runtime or publication lease, or inspect a live Mount as unhealthy merely
-  because that Mount holds its lease.
+  the existing state directory. Writable Direct performs the same owner-only
+  temporary-file probe and then inspects retained Direct runtime state
+  read-only; read-only Direct reports this check as informational. Doctor does
+  not create the configured staging directory, initialize `staging.db`,
+  `sync.db` or Direct `runtime.db`, run recovery, acquire the runtime or
+  publication lease, or inspect a live Mount as unhealthy merely because that
+  Mount holds its lease.
 - `mount-state`: when existing Mount staging is present, inspect persisted
-  handles without taking the lease. Pending, frozen, conflict and failed
-  records require action; read-only inspection itself is not a failure.
+  handles without taking the lease. For writable Direct staging, inspect the
+  retained runtime profile, schema, binding and pending/conflict/Unknown state
+  without creating or recovering it. Pending, frozen, conflict, Unknown and
+  failed records require action; read-only inspection itself is not a failure.
 - `admission`: construct the S3 operator and validate the effective
   four-layer capability intersection.
 - `authority`: Managed connects and observes the latest revision. Object mode checks the
@@ -147,9 +151,34 @@ receipts, WAL files, publication journals and local synchronized data. A
 successful stop is not a backup. Removing the versioned binary prefix and unit
 files does not imply deleting state or configuration.
 
-Only experimental same-version reinstall or rollback is described. Cross-version
-migration and rollback compatibility remain undefined until the compatibility
-work tracked by issue #79.
+## Installed binary transitions
+
+The supported experimental upgrade route is a stopped, same-host replacement
+of one immutable binary release:
+
+1. Stop every Mount, finite Sync and metadata-service unit.
+2. Preserve the complete configuration, Mount staging, Sync state and metadata
+   database including SQLite WAL files.
+3. Install the new binary into a new release directory, verify its identity,
+   and atomically replace the `current` symlink while no `yy` writer runs.
+4. Reopen the retained state only with a binary that advertises every persistent
+   profile reached by that state.
+5. Require the source data, pending and frozen handles, original CommitIds,
+   receipts, retained local artifacts, SQLite integrity and finite Sync status
+   to survive before accepting the transition.
+
+An exact producer and target source pair is a qualification result recorded in
+the operations guide. The general contract is not an arbitrary upgrade matrix.
+The first producer is `fd1338c2f924a90e9da752b9158e748d1d3acaf4`; a later
+accepted target is recorded only after the installed transition passes against
+the final target binary.
+
+Downgrade after the newer binary has opened or written local or authoritative
+state is unsupported. Keeping an older immutable release directory for audit or
+reinstallation does not grant downgrade permission. Hot replacement of a
+running binary, migration performed only because a release directory exists,
+and compatibility inferred from an equal package version are also unsupported.
+The package version and release directory identity are separate.
 
 ## Verification
 
@@ -167,6 +196,12 @@ work tracked by issue #79.
 - removal of the installed binary prefix while state and configuration remain;
 - when run with isolated MinIO and a systemd user manager, actual start,
   restart and stop of the three user units through `systemctl --user`.
+
+`tests/linux_prefix_upgrade.rs` separately exercises a stopped installed-prefix
+transition from the exact `fd1338c` producer to the selected target binary,
+including retained pending, frozen and Unknown work, receipts and a non-empty
+service WAL. It uses the same versioned `current` prefix as the user units while
+keeping process lifetime independent of a particular systemd user session.
 
 The real Amazon S3 smoke inherits `YINYANG_S3_SESSION_TOKEN` when temporary
 credentials are used. It must not inherit a MinIO endpoint and does not use a

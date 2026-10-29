@@ -247,7 +247,7 @@ jobs:
       - name: Run real Linux FUSE acceptance
         run: cargo x test-linux-fuse
 
-      - name: Run read-only Direct acceptance
+      - name: Run deterministic Direct Mount and Sync acceptance
         run: cargo x test-linux-direct
 
       - name: Run installed CLI operations acceptance

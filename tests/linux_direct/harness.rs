@@ -19,6 +19,7 @@
 
 pub use crate::process::{Captured, run_timeout};
 pub use crate::raw_s3::{RawInventory as Inventory, RawS3};
+use crate::real_s3::AwsS3;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
@@ -31,35 +32,137 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const STORAGE_ENV: [&str; 5] = [
+const STORAGE_ENV_WITH_SESSION: [&str; 6] = [
     "YINYANG_S3_BUCKET",
     "YINYANG_S3_ENDPOINT",
     "YINYANG_S3_REGION",
     "YINYANG_S3_ACCESS_KEY_ID",
     "YINYANG_S3_SECRET_ACCESS_KEY",
+    "YINYANG_S3_SESSION_TOKEN",
 ];
+
+pub fn direct_test_storage_profile() -> &'static str {
+    match std::env::var("YINYANG_DIRECT_TEST_STORAGE_PROFILE").as_deref() {
+        Ok("amazon-s3") => "amazon-s3",
+        Ok("minio") | Err(_) => "minio",
+        Ok(profile) => panic!("unsupported Direct acceptance storage profile {profile:?}"),
+    }
+}
 
 pub fn require_direct_environment() {
     if !Path::new("/dev/fuse").exists() {
         panic!("/dev/fuse is unavailable; Direct acceptance must fail rather than skip");
     }
-    for tool in ["fusermount3", "timeout"] {
+    for tool in ["fusermount3", "timeout", "python3"] {
         if Command::new(tool).arg("--version").output().is_err() {
             panic!("{tool} is unavailable; Direct acceptance must fail rather than skip");
         }
     }
-    for name in STORAGE_ENV {
-        if std::env::var_os(name).is_none() {
+    let amazon_s3 = direct_test_storage_profile() == "amazon-s3";
+    for name in STORAGE_ENV_WITH_SESSION {
+        if amazon_s3 && name == "YINYANG_S3_ENDPOINT" {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "{name} must be unset for the Amazon S3 default endpoint"
+            );
+        } else if !amazon_s3 && name == "YINYANG_S3_SESSION_TOKEN" {
+            continue;
+        } else if std::env::var_os(name).is_none() {
             panic!("{name} is unset; Direct acceptance must fail rather than skip");
         }
     }
+}
+
+enum FixtureRaw {
+    Http(RawS3),
+    Amazon(AwsS3),
 }
 
 pub struct Fixture {
     pub temp: tempfile::TempDir,
     pub root: String,
     bucket: String,
-    raw: RawS3,
+    raw: FixtureRaw,
+}
+
+pub struct RunningCommand {
+    child: Option<Child>,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+    description: String,
+}
+
+impl RunningCommand {
+    pub fn spawn(mut command: Command) -> Self {
+        let description = describe_command(&command);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn command ({description}): {error}"));
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        Self {
+            child: Some(child),
+            stdout: Some(thread::spawn(move || read_captured(stdout))),
+            stderr: Some(thread::spawn(move || read_captured(stderr))),
+            description,
+        }
+    }
+
+    pub fn kill(&mut self) {
+        self.child
+            .as_mut()
+            .expect("running command is live")
+            .kill()
+            .expect("kill running command");
+    }
+
+    pub fn wait(mut self, timeout: Duration) -> Captured {
+        let child = self.child.as_mut().expect("running command is live");
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait().expect("wait for running command") {
+                Some(status) => break status,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                None => {
+                    let _ = child.kill();
+                    let status = child.wait().expect("wait after killing timed-out command");
+                    let stdout = self.stdout.take().unwrap().join().unwrap_or_default();
+                    let stderr = self.stderr.take().unwrap().join().unwrap_or_default();
+                    panic!(
+                        "command timed out after {timeout:?} with {status} ({}):\nstdout:\n{}\nstderr:\n{}",
+                        self.description,
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            }
+        };
+        self.child.take();
+        Captured {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap_or_default(),
+            stderr: self.stderr.take().unwrap().join().unwrap_or_default(),
+        }
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Fixture {
@@ -85,8 +188,12 @@ impl Fixture {
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         );
-        let raw_base = RawS3::from_env();
-        let raw = raw_base.with_bucket(bucket.clone());
+        let raw = if direct_test_storage_profile() == "amazon-s3" {
+            FixtureRaw::Amazon(AwsS3::new(bucket.clone()))
+        } else {
+            let raw_base = RawS3::from_env();
+            FixtureRaw::Http(raw_base.with_bucket(bucket.clone()))
+        };
         Self {
             temp,
             root,
@@ -109,26 +216,45 @@ impl Fixture {
 
     pub fn write_raw(&self, key: &str, bytes: &[u8]) {
         let key = self.full_key(key);
-        self.raw.put(&key, bytes);
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.put(&key, bytes),
+            FixtureRaw::Amazon(raw) => raw.raw_put(&key, bytes),
+        }
         assert_eq!(
-            self.raw.get(&key).as_deref(),
+            self.raw_get_storage_key(&key).as_deref(),
             Some(bytes),
             "raw S3 did not preserve the requested key {key:?}"
         );
     }
 
     pub fn delete_raw(&self, key: &str) {
-        self.raw.delete(&self.full_key(key));
+        let key = self.full_key(key);
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.delete(&key),
+            FixtureRaw::Amazon(raw) => raw.raw_delete(&key),
+        }
     }
 
     pub fn raw_get(&self, key: &str) -> Option<Vec<u8>> {
-        self.raw.get(&self.full_key(key))
+        self.raw_get_storage_key(&self.full_key(key))
+    }
+
+    pub fn wait_raw_bytes(&self, key: &str, expected: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        let mut observed = None;
+        wait_until(timeout, &format!("raw Direct bytes for {key:?}"), || {
+            observed = self.raw_get(key);
+            observed.as_deref() == Some(expected)
+        });
+        observed
     }
 
     pub fn inventory(&self) -> Inventory {
         let prefix = format!("{}/", self.root);
-        self.raw
-            .inventory(&prefix)
+        let inventory = match &self.raw {
+            FixtureRaw::Http(raw) => raw.inventory(&prefix),
+            FixtureRaw::Amazon(raw) => raw.raw_inventory(&prefix),
+        };
+        inventory
             .into_iter()
             .map(|(key, object)| {
                 let key = key
@@ -153,7 +279,7 @@ impl Fixture {
             "access": "mount",
             "frontend": frontend,
             "publication": "object",
-            "storage_profile": "minio",
+            "storage_profile": direct_test_storage_profile(),
         });
         if let Some(read_only) = read_only {
             config["read_only"] = Value::Bool(read_only);
@@ -166,6 +292,26 @@ impl Fixture {
                     .to_owned(),
             );
         }
+        self.config_document(name, config)
+    }
+
+    pub fn writable_config(&self, name: &str, frontend: &str, staging: &Path) -> PathBuf {
+        self.config_document(
+            name,
+            json!({
+                "name": name,
+                "model": "direct",
+                "access": "mount",
+                "frontend": frontend,
+                "publication": "object",
+                "storage_profile": direct_test_storage_profile(),
+                "read_only": false,
+                "staging": staging,
+            }),
+        )
+    }
+
+    pub fn config_document(&self, name: &str, config: Value) -> PathBuf {
         let path = self.path(&format!("{name}.json"));
         fs::write(
             &path,
@@ -178,9 +324,15 @@ impl Fixture {
     pub fn yy_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
         command.args(args);
-        for name in STORAGE_ENV {
+        let amazon_s3 = direct_test_storage_profile() == "amazon-s3";
+        for name in STORAGE_ENV_WITH_SESSION {
             let value = if name == "YINYANG_S3_BUCKET" {
                 self.bucket.clone()
+            } else if amazon_s3 && name == "YINYANG_S3_ENDPOINT" {
+                command.env_remove(name);
+                continue;
+            } else if !amazon_s3 && name == "YINYANG_S3_SESSION_TOKEN" {
+                continue;
             } else {
                 std::env::var(name)
                     .unwrap_or_else(|_| panic!("{name} is required for Direct acceptance"))
@@ -188,7 +340,7 @@ impl Fixture {
             command.env(name, value);
         }
         command.env("YINYANG_S3_ROOT", &self.root);
-        command.env("YINYANG_STORAGE_PROFILE", "minio");
+        command.env("YINYANG_STORAGE_PROFILE", direct_test_storage_profile());
         command
     }
 
@@ -203,19 +355,51 @@ impl Fixture {
     }
 
     pub fn spawn_mount(&self, config: &Path, mountpoint: &Path, _frontend: &str) -> Mounted {
-        let command = self.yy_command(&[
+        let command = self.mount_command(config, mountpoint);
+        Mounted::spawn(command, mountpoint)
+    }
+
+    pub fn spawn_writable_mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
+        let command = self.mount_command(config, mountpoint);
+        Mounted::spawn_writable(command, mountpoint)
+    }
+
+    pub fn mount_command(&self, config: &Path, mountpoint: &Path) -> Command {
+        self.yy_command(&[
             "--volume",
             config.to_str().expect("Direct config path is UTF-8"),
             "mount",
             mountpoint
                 .to_str()
                 .expect("Direct mountpoint path is UTF-8"),
-        ]);
-        Mounted::spawn(command, mountpoint)
+        ])
     }
 
-    fn full_key(&self, key: &str) -> String {
+    pub fn raw_object(&self, key: &str) -> Option<crate::raw_s3::RawObject> {
+        let full_key = self.full_key(key);
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.inventory(&full_key).remove(&full_key),
+            FixtureRaw::Amazon(raw) => raw.raw_object(&full_key),
+        }
+    }
+
+    pub fn full_key(&self, key: &str) -> String {
         format!("{}/{key}", self.root)
+    }
+
+    fn raw_get_storage_key(&self, key: &str) -> Option<Vec<u8>> {
+        match &self.raw {
+            FixtureRaw::Http(raw) => raw.get(key),
+            FixtureRaw::Amazon(raw) => raw.raw_get(key),
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let FixtureRaw::Amazon(raw) = &self.raw {
+            raw.raw_cleanup(&self.root);
+        }
     }
 }
 
@@ -227,7 +411,15 @@ pub struct Mounted {
 }
 
 impl Mounted {
-    pub fn spawn(mut command: Command, mountpoint: &Path) -> Self {
+    pub fn spawn(command: Command, mountpoint: &Path) -> Self {
+        Self::spawn_with_policy(command, mountpoint, true)
+    }
+
+    pub fn spawn_writable(command: Command, mountpoint: &Path) -> Self {
+        Self::spawn_with_policy(command, mountpoint, false)
+    }
+
+    fn spawn_with_policy(mut command: Command, mountpoint: &Path, read_only: bool) -> Self {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
             .spawn()
@@ -243,7 +435,7 @@ impl Mounted {
             logs,
             readers: vec![stdout, stderr],
         };
-        mounted.wait_visible(Duration::from_secs(30));
+        mounted.wait_visible(Duration::from_secs(30), read_only);
         mounted
     }
     pub fn mountpoint(&self) -> &Path {
@@ -258,7 +450,7 @@ impl Mounted {
         String::from_utf8_lossy(&self.logs.lock().expect("mount log lock")).into_owned()
     }
 
-    fn wait_visible(&mut self, timeout: Duration) {
+    fn wait_visible(&mut self, timeout: Duration, read_only: bool) {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some((filesystem, options)) = mount_info(&self.mountpoint) {
@@ -266,9 +458,10 @@ impl Mounted {
                     filesystem, "fuse.yinyang",
                     "Direct mount must expose the YinYang FUSE filesystem type"
                 );
-                assert!(
-                    options.split(',').any(|option| option == "ro"),
-                    "default Direct mount must include the kernel ro option: {options}"
+                let kernel_ro = options.split(',').any(|option| option == "ro");
+                assert_eq!(
+                    kernel_ro, read_only,
+                    "Direct mount policy does not match the kernel mount options: {options}"
                 );
                 return;
             }
@@ -299,12 +492,25 @@ impl Mounted {
         kill(self.pid(), Signal::SIGHUP).expect("send SIGHUP to Direct mount");
     }
 
-    pub fn refresh_and_wait(&self, timeout: Duration) {
-        let completed = self.logs().matches("yy: fuse refresh: done").count();
+    pub fn refresh_and_wait(&self, timeout: Duration) -> String {
+        const COMPLETION: &str = "yy: fuse refresh: done (";
+        let before = self.logs().matches(COMPLETION).count();
         self.refresh();
-        wait_until(timeout, "the Direct refresh to complete", || {
-            self.logs().matches("yy: fuse refresh: done").count() > completed
+        wait_until(timeout, "a completed Direct SIGHUP completion line", || {
+            self.logs().matches(COMPLETION).count() > before
         });
+        let logs = self.logs();
+        let completion = logs
+            .lines()
+            .filter(|line| line.contains(COMPLETION))
+            .nth(before)
+            .unwrap_or_else(|| panic!("missing Direct refresh completion line:\n{logs}"))
+            .to_owned();
+        assert!(
+            completion.contains("errors=0"),
+            "Direct refresh did not invalidate every known entry: {completion}"
+        );
+        completion
     }
 
     pub fn wait_for_log(&self, needle: &str, timeout: Duration) {
@@ -328,6 +534,18 @@ impl Mounted {
     pub fn terminate(mut self) {
         kill(self.pid(), Signal::SIGTERM).expect("send SIGTERM to Direct mount");
         self.wait(Duration::from_secs(30));
+        self.join_readers();
+    }
+
+    pub fn crash(mut self) {
+        kill(self.pid(), Signal::SIGKILL).expect("send SIGKILL to Direct mount");
+        let child = self.child.as_mut().expect("mount process is live");
+        let status = child.wait().expect("wait for crashed Direct mount");
+        self.child.take();
+        assert!(
+            !status.success(),
+            "SIGKILLed Direct mount unexpectedly exited successfully"
+        );
         self.join_readers();
     }
 
@@ -508,6 +726,20 @@ fn read_request_line(stream: &mut std::net::TcpStream) -> String {
         .into_owned()
 }
 
+fn describe_command(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn read_captured(mut reader: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = reader.read_to_end(&mut bytes);
+    bytes
+}
+
 impl Drop for RequestCounter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -525,6 +757,69 @@ pub fn wait_until(timeout: Duration, context: &str, mut condition: impl FnMut() 
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+pub fn local_paths(root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path)
+            .unwrap_or_else(|error| panic!("read test directory {}: {error}", path.display()))
+        {
+            let entry = entry.expect("read test directory entry");
+            let path = entry.path();
+            paths.push(
+                path.strip_prefix(root)
+                    .expect("test path is below root")
+                    .display()
+                    .to_string(),
+            );
+            if entry.file_type().expect("test path type").is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+pub fn effective_capabilities(document: &[u8]) -> std::collections::BTreeSet<String> {
+    let value: Value = serde_json::from_slice(document).expect("capabilities JSON");
+    value["effective"]
+        .as_array()
+        .expect("effective capability array")
+        .iter()
+        .map(|value| value.as_str().expect("capability name").to_owned())
+        .collect()
+}
+
+pub fn payload(length: usize, seed: u8) -> Vec<u8> {
+    let mut value = Vec::with_capacity(length);
+    let mut state = u64::from(seed) | 1;
+    while value.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        value.extend_from_slice(&state.to_le_bytes());
+    }
+    value.truncate(length);
+    value
+}
+
+pub fn read_fully_at(file: &fs::File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let mut output = vec![0_u8; length];
+    let mut read = 0;
+    while read < output.len() {
+        let count = file.read_at(&mut output[read..], offset + read as u64)?;
+        if count == 0 {
+            output.truncate(read);
+            break;
+        }
+        read += count;
+    }
+    Ok(output)
 }
 
 pub fn path_text(path: &Path) -> &str {

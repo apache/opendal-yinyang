@@ -34,7 +34,9 @@ environment:
     AWS_CLI_BIN (optional, defaults to aws)
 
 argument:
-    optional test-name filter beginning with direct_amazon_s3_
+    optional test-name filter beginning with direct_amazon_s3_, or
+    --conditional-entrypoints for the existing writable remount and finite
+    Direct Sync entrypoint smoke
 
 The helper removes every inherited YINYANG_* and AWS endpoint setting before
 starting the tests. It never prints, writes or places credentials in command
@@ -46,9 +48,15 @@ import os
 import shutil
 import subprocess
 import sys
+from glob import glob
+from hashlib import sha256
 
 
 CREDENTIAL_NAMES = ("AccessKeyId", "SecretAccessKey", "SessionToken")
+ENTRYPOINT_TESTS = (
+    "writable::direct_write_mount_publishes_whole_objects_and_persists_remount",
+    "sync::direct_sync_finite_reconciliation_tracks_both_authorities",
+)
 
 
 def credentials_from_stdin() -> dict[str, str]:
@@ -73,8 +81,10 @@ def main() -> int:
     credentials = credentials_from_stdin()
     if len(sys.argv) > 2:
         raise SystemExit("at most one Direct test-name filter is accepted")
-    test_filter = sys.argv[1] if len(sys.argv) == 2 else "direct_amazon_s3_"
-    if not test_filter.startswith("direct_amazon_s3_"):
+    argument = sys.argv[1] if len(sys.argv) == 2 else "direct_amazon_s3_"
+    entrypoint_smoke = argument == "--conditional-entrypoints"
+    test_filter = argument if not entrypoint_smoke else None
+    if test_filter is not None and not test_filter.startswith("direct_amazon_s3_"):
         raise SystemExit("Direct test-name filter must begin with direct_amazon_s3_")
     unversioned = os.environ.get("YINYANG_DIRECT_UNVERSIONED_BUCKET")
     versioned = os.environ.get("YINYANG_DIRECT_VERSIONED_BUCKET")
@@ -123,9 +133,19 @@ def main() -> int:
             "YINYANG_S3_ACCESS_KEY_ID": credentials["AccessKeyId"],
             "YINYANG_S3_SECRET_ACCESS_KEY": credentials["SecretAccessKey"],
             "YINYANG_S3_SESSION_TOKEN": credentials["SessionToken"],
+            "YINYANG_QUALIFICATION_REGION": region,
             "YINYANG_STORAGE_PROFILE": "amazon-s3",
+            "AWS_CLI_BIN": aws_cli,
         }
     )
+    if entrypoint_smoke:
+        inherited.update(
+            {
+                "YINYANG_S3_BUCKET": unversioned,
+                "YINYANG_S3_REGION": region,
+                "YINYANG_DIRECT_TEST_STORAGE_PROFILE": "amazon-s3",
+            }
+        )
 
     source = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], text=True
@@ -134,11 +154,13 @@ def main() -> int:
         "real Amazon S3 Direct qualification: "
         f"source={source} region={region} "
         f"unversioned={unversioned} versioned={versioned} "
-        f"aws_cli={aws_cli} aws_version={aws_version}",
+        f"aws_cli={aws_cli} aws_version={aws_version} "
+        f"mode={'entrypoints' if entrypoint_smoke else 'qualification'}",
         flush=True,
     )
-    completed = subprocess.run(
-        [
+    tests = ENTRYPOINT_TESTS if entrypoint_smoke else (test_filter,)
+    for test in tests:
+        command = [
             "cargo",
             "test",
             "--locked",
@@ -146,24 +168,51 @@ def main() -> int:
             "yinyang",
             "--test",
             "linux_direct",
-            test_filter,
+            test,
             "--",
             "--ignored",
             "--nocapture",
             "--test-threads=1",
-        ],
-        env=inherited,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    output = completed.stdout
-    for value in credentials.values():
-        output = output.replace(value, "<redacted>")
-    print(output, end="", flush=True)
-    return completed.returncode
+        ]
+        if entrypoint_smoke:
+            command.insert(-3, "--exact")
+        completed = subprocess.run(
+            command,
+            env=inherited,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        output = completed.stdout
+        for value in credentials.values():
+            output = output.replace(value, "<redacted>")
+        print(output, end="", flush=True)
+        if completed.returncode != 0:
+            return completed.returncode
+
+    target = os.environ.get("CARGO_TARGET_DIR", "target")
+    yy = os.path.join(target, "debug", "yy")
+    if os.path.isfile(yy):
+        print(f"yy sha256={file_sha256(yy)}", flush=True)
+    candidates = [
+        path
+        for path in glob(os.path.join(target, "debug", "deps", "linux_direct-*"))
+        if os.path.isfile(path) and os.access(path, os.X_OK)
+    ]
+    if candidates:
+        newest = max(candidates, key=os.path.getmtime)
+        print(f"linux_direct sha256={file_sha256(newest)}", flush=True)
+    return 0
+
+
+def file_sha256(path: str) -> str:
+    digest = sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":
