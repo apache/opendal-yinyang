@@ -943,11 +943,12 @@ fn run_incremental_matrix(
         io: open_io,
         network: open_network,
     } = open;
+    let open_get_body_bytes = open_network.get_response_body_bytes;
     if expectation == IncrementalExpectation::Required {
         assert!(
-            open_network.get_response_body_bytes < size as u64 / 2,
+            open_get_body_bytes < size as u64 / 2,
             "open materialized {} bytes of a {size}-byte file; this is consistent with a full-file fallback",
-            open_network.get_response_body_bytes
+            open_get_body_bytes
         );
     }
     recorder.record(
@@ -964,10 +965,7 @@ fn run_incremental_matrix(
         space_snapshot(fixture, None, None, Some(&staging)),
         vec![
             "writable descriptor opened successfully".to_owned(),
-            format!(
-                "get_response_body_bytes={}",
-                open_network.get_response_body_bytes
-            ),
+            format!("get_response_body_bytes={open_get_body_bytes}"),
             format!("full_file_bytes={size}"),
         ],
     );
