@@ -367,7 +367,18 @@ fn linux_cost_benchmark() {
     let source_sha = std::env::var("YINYANG_COST_SOURCE_SHA")
         .expect("set YINYANG_COST_SOURCE_SHA to the exact tested source commit");
     let source_dirty = std::env::var("YINYANG_COST_SOURCE_DIRTY").as_deref() == Ok("1");
-    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let compiled_binary = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let binary_path = std::env::var_os("YY_UPGRADE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| compiled_binary.clone());
+    let binary_blake3 = blake3_file(&binary_path);
+    if binary_path != compiled_binary {
+        assert_eq!(
+            binary_blake3,
+            blake3_file(&compiled_binary),
+            "YY_UPGRADE_BIN selects different bytes from the compiled benchmark binary"
+        );
+    }
     let storage_backend = std::env::var("YINYANG_COST_STORAGE_LABEL").unwrap_or_else(|_| {
         if std::env::var("YINYANG_S3_ENDPOINT")
             .is_ok_and(|endpoint| endpoint.starts_with("https://"))
@@ -405,7 +416,7 @@ fn linux_cost_benchmark() {
         incremental_expectation: incremental_expectation.as_str().to_owned(),
         source_sha,
         source_dirty,
-        binary_blake3: blake3_file(&binary_path),
+        binary_blake3,
         binary_path: binary_path.display().to_string(),
         host: host_identity(),
         rustc: command_line("rustc", &["--version"]),
