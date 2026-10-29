@@ -139,6 +139,9 @@ pub struct ObjectFs {
     data: DataStore,
     filesystem: NodeId,
     root: NodeId,
+    // Clones share a fair local publication gate; separate authorities retain
+    // CAS contention with one another.
+    commit_gate: Arc<tokio::sync::Mutex<()>>,
 }
 type HeadWire = ([u8; 8], u8, [u8; 16], [u8; 16], RevisionWire, RefWire);
 struct Head {
@@ -215,6 +218,7 @@ impl ObjectFs {
             operator,
             filesystem: head.filesystem,
             root: head.root,
+            commit_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         let snapshot = fs
             .load(head.reference, head.revision, Some(head.etag))
@@ -315,6 +319,7 @@ impl ObjectFs {
     /// Deterministic input order; rejected speculative members are not reported
     /// until the preceding accepted members become authoritative.
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        let _guard = self.commit_gate.lock().await;
         match self.commit_batch_inner(requests).await {
             Err(error) if error.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())

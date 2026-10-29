@@ -71,6 +71,13 @@ only after successful publication. CAS misses revalidate the original plan,
 without reuploading content or executing a callback. Eight failed publication
 opportunities return `Retryable`, with a final indexed receipt check.
 Transient failures before publication also return `Retryable`.
+Clones of one `ObjectFs` share a fair FIFO gate around the complete local
+observe, build and head-publication loop. This prevents disjoint commits from
+invalidating one another's observed head or consuming the bounded CAS retries
+within one client. Preparation and read-only observations do not take the gate.
+Separately opened `ObjectFs` clients do not share it and retain cross-client CAS
+contention. Cancellation releases the gate while preserving the existing
+uncertainty rules; the commit loop never reacquires it reentrantly.
 
 An ambiguous head replacement remains `Unknown` while its old conditional
 token might still succeed. A fresh observed token fences that attempt; retries
