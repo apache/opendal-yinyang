@@ -25,8 +25,8 @@ usage() {
 Usage: tools/linux/package-release.sh --output-dir DIR
 
 Build yy from a clean Ubuntu 24.04 x86_64 working tree, package the local
-qualification artifact, and write SHA256SUMS. This command does not sign,
-tag, publish, or upload the artifact.
+qualification artifact, and write its adjacent SHA-256 sidecar. This command
+does not sign, tag, publish, or upload the artifact.
 EOF
 }
 
@@ -96,6 +96,7 @@ version=$(
 release="${version}+${source_short}"
 name="yinyang-${version}-ubuntu-24.04-x86_64-${source_short}"
 archive="$output_dir/$name.tar.gz"
+archive_name=$(basename "$archive")
 
 mkdir -p "$output_dir"
 if [[ -e "$archive" || -e "$archive.sha256" ]]; then
@@ -126,6 +127,10 @@ install -d -m 0755 \
 install -m 0755 "$yy" "$tree/bin/yy"
 install -m 0644 LICENSE NOTICE "$tree/"
 install -m 0644 deploy/linux/environment.example "$tree/share/yinyang/"
+install -m 0755 \
+  tools/linux/install-release.sh \
+  tools/linux/verify-release.sh \
+  "$tree/share/yinyang/"
 install -m 0644 deploy/linux/yinyang-serve.service \
   deploy/linux/yinyang-mount@.service \
   deploy/linux/yinyang-sync@.service \
@@ -136,6 +141,7 @@ install -m 0644 \
   docs/linux-operating-envelope.md \
   docs/linux-backup-recovery.md \
   docs/linux-compatibility-acceptance.md \
+  docs/linux-trial-distribution.md \
   "$tree/share/doc/yinyang/"
 
 binary_sha256=$(sha256sum "$tree/bin/yy" | awk '{print $1}')
@@ -154,6 +160,24 @@ rustc_version=$(rustc --version)
   printf 'rustc=%s\n' "$rustc_version"
 } >"$tree/BUILD-MANIFEST"
 
+cat >"$tree/PREREQUISITES" <<EOF
+schema=yinyang-linux-release-prerequisites.v1
+release=$release
+source_commit=$source_sha
+target=ubuntu-24.04-x86_64
+host=Ubuntu 24.04 x86_64
+apt_packages=ca-certificates fuse3
+optional_apt_packages=sqlite3
+service_manager=systemd user manager only for the supplied unit templates
+storage=an operator-supplied supported S3 endpoint and credentials
+state_location=configuration, staging and metadata stay outside the release prefix
+cargo_required=false
+rustc_required=false
+git_required=false
+python_required=false
+note=This local trial artifact is not a signed Apache Software Foundation release.
+EOF
+
 cat >"$tree/INSTALL" <<EOF
 Apache OpenDAL YinYang local qualification artifact
 
@@ -162,23 +186,30 @@ Source:  $source_sha
 Binary:  $binary_sha256
 
 This artifact is not a signed ASF release. Verify the adjacent SHA-256 file
-before use, then extract it outside the installation prefix.
+before use, then extract it outside the installation prefix. Read
+PREREQUISITES and share/doc/yinyang/linux-trial-distribution.md first.
 
-Install into a new immutable release directory:
+Verify and install into a new immutable release directory:
 
   set -eu
   umask 077
+  archive=/absolute/path/to/$archive_name
   YY_ROOT="\$HOME/.local/lib/yinyang"
-  YY_RELEASE="$release"
-  install -d -m 0700 "\$YY_ROOT/\$YY_RELEASE/bin"
-  install -m 0755 "$name/bin/yy" "\$YY_ROOT/\$YY_RELEASE/bin/yy"
-  ln -s "\$YY_RELEASE" "\$YY_ROOT/.current.new"
-  mv -Tf "\$YY_ROOT/.current.new" "\$YY_ROOT/current"
+  extract=\$(mktemp -d)
+  tar -xzf "\$archive" -C "\$extract"
+  installer="\$extract/$name/share/yinyang/install-release.sh"
+  "\$installer" install --archive "\$archive" --prefix "\$YY_ROOT"
 
-Stop every yy service before changing current. Preserve the configuration and
-state directories. Start the existing user units only after the new current
-target, binary SHA-256, doctor output and retained volume state have been
-verified. Read share/doc/yinyang/linux-operations.md for the full workflow and
+Stop every yy service before activation. Preserve the configuration, staging,
+Sync and metadata state directories. Then activate and verify:
+
+  "\$installer" activate --prefix "\$YY_ROOT" --release "$release" --quiesced
+
+Start the existing user units only after the new current target, binary SHA-256,
+doctor output and retained volume state have been verified. The installer never
+starts, stops or restarts units. Read
+share/doc/yinyang/linux-operations.md and
+share/doc/yinyang/linux-trial-distribution.md for the full workflow and
 supported transition boundary.
 EOF
 
@@ -195,15 +226,11 @@ EOF
 )
 
 archive_sha256=$(sha256sum "$archive" | awk '{print $1}')
-printf '%s  %s\n' "$archive_sha256" "$(basename "$archive")" >"$archive.sha256"
+printf '%s  %s\n' "$archive_sha256" "$archive_name" >"$archive.sha256"
 
-verify=$(mktemp -d)
-trap 'rm -rf "$staging" "$verify"' EXIT
-tar -xzf "$archive" -C "$verify"
-(
-  cd "$verify/$name"
-  sha256sum -c <(printf '%s  bin/yy\n' "$binary_sha256")
-)
+tools/linux/verify-release.sh \
+  --archive "$archive" \
+  --source-commit "$source_sha"
 
 printf 'archive=%s\n' "$archive"
 printf 'archive_sha256=%s\n' "$archive_sha256"
