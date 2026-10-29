@@ -710,4 +710,20 @@ mod admission_tests {
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
         server.abort();
     }
+
+    #[tokio::test]
+    async fn unknown_delta_revision_is_rejected_before_payload_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let edit = ContentEdit::new(0..1, b"x").unwrap();
+        let error = service
+            .prepare_overwrite_version(Revision::from_bytes([0; 24]), NodeId::generate(), &[edit])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+    }
 }
