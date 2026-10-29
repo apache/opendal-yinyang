@@ -389,7 +389,8 @@ pub async fn plan_managed_retention(
     requested_pins: &[Revision],
 ) -> Result<ManagedRetentionPlan> {
     if keep_last == Some(0) {
-        return Err(Error::invalid(
+        return Err(Error::new(
+            ErrorKind::Invalid,
             "plan managed retention",
             "keep-last must be at least one",
         ));
@@ -668,7 +669,7 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
                         reasons.insert("staging_frozen");
                     }
                     if let Some(commit) = handle.frozen_commit_id {
-                        frozen_commits.insert(identity_hex(commit));
+                        frozen_commits.insert(commit_hex(commit));
                     }
                     let mut conflict = handle.conflict;
                     let mut unknown = false;
@@ -710,7 +711,7 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
                     .saturating_add(status.errors.len() as u64);
                 for error in status.errors {
                     if let Some(commit) = error.error.commit_id() {
-                        frozen_commits.insert(identity_hex(commit));
+                        frozen_commits.insert(commit_hex(commit));
                     }
                     if let Some(revision) = handle_revisions.get(&error.handle) {
                         let reason = match error.error.kind() {
@@ -771,7 +772,8 @@ async fn measure_snapshot(snapshot: &Snapshot) -> Result<MeasuredSnapshot> {
     let mut seen = BTreeSet::new();
     while let Some(directory) = pending.pop() {
         if !seen.insert(directory) {
-            return Err(Error::invalid(
+            return Err(Error::new(
+                ErrorKind::Invalid,
                 "measure managed space",
                 "namespace contains a duplicate or cyclic node identity",
             ));
@@ -782,7 +784,8 @@ async fn measure_snapshot(snapshot: &Snapshot) -> Result<MeasuredSnapshot> {
             let page = snapshot.scan(directory, token.as_ref(), SCAN_LIMIT).await?;
             for entry in page.entries {
                 let node = snapshot.node(entry.node_id).await?.ok_or_else(|| {
-                    Error::invalid(
+                    Error::new(
+                        ErrorKind::Invalid,
                         "measure managed space",
                         "directory item disappeared from the pinned snapshot",
                     )
@@ -1160,6 +1163,14 @@ fn identity_hex(identity: NodeId) -> String {
         .collect()
 }
 
+fn commit_hex(commit: yinyang_core::CommitId) -> String {
+    bytes_hex(commit.as_bytes())
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1230,15 +1241,8 @@ mod tests {
         )]);
         let reasons = revisions
             .into_iter()
-            .map(|revision| {
-                selection_reasons(
-                    revision,
-                    revision(4),
-                    true,
-                    &keep_last,
-                    &requested,
-                    &protected,
-                )
+            .map(|value| {
+                selection_reasons(value, revision(4), true, &keep_last, &requested, &protected)
             })
             .collect::<Vec<_>>();
         assert_eq!(
