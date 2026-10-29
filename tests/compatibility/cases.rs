@@ -323,7 +323,8 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
     storage.copy_fixture("service", "metadata.db", &database);
     let current = current_binary();
     let legacy = legacy_binary();
-    let staging = storage.path("service-staging");
+    let current_staging = storage.path("service-staging-current");
+    let legacy_staging = storage.path("service-staging-legacy");
 
     let service = super::runtime::Service::start(&storage, &current, &database);
     let config = storage.path("service-current.json");
@@ -331,7 +332,7 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
         &config,
         "compat-service",
         "mount",
-        &staging,
+        &current_staging,
         "service",
         Some(service.address),
     );
@@ -435,7 +436,7 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
         &legacy_config,
         "compat-service",
         "mount",
-        &staging,
+        &legacy_staging,
         "service",
         Some(service.address),
     );
@@ -469,6 +470,23 @@ fn compatibility_fd1338c_service_cross_both_binaries() {
         );
         bytes.success_or("fd1338c service read");
         assert_eq!(sha256(&bytes.stdout), expected, "service bytes for {path}");
+    }
+    for (staging, expected_profile) in [
+        (&current_staging, "yinyang-stage-3"),
+        (&legacy_staging, "yinyang-stage-2"),
+    ] {
+        let profile: String = rusqlite::Connection::open(staging.join("staging.db"))
+            .unwrap()
+            .query_row(
+                "SELECT profile FROM authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            profile, expected_profile,
+            "service compatibility staging profile"
+        );
     }
     service.stop();
 }

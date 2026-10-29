@@ -31,6 +31,9 @@ them:
 - `fd1338c` processes read current state whose profile is unchanged; current
   stage-3 file staging is a one-way upgrade, and the legacy binary rejects it
   without changing authoritative bytes;
+- the shared service SQLite authority remains two-way compatible; each binary
+  uses its own client staging directory while cross-binary service tests keep
+  the same metadata database and verify the resulting bytes;
 - unknown or malformed persistent profiles are rejected at their format
   boundary while the authoritative main databases, any existing WAL or
   journal bytes, logical rows, retained content and recovery state remain
