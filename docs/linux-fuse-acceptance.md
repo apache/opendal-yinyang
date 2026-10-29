@@ -66,6 +66,15 @@ cargo x test-linux-fuse --read-only-range
   520-entry bulk directory that crosses the adapter's 512-entry readdir page.
 - Basic writable I/O: create, write, remote `fsync` verified through an
   independent authority, append, truncate, and multiple descriptors on one file.
+- Incremental descriptor contract: a 256 KiB file is updated across a 64 KiB
+  verification-unit boundary, through a second descriptor opened before the
+  first publication, by append, by shrink and zero extension, and at an
+  EOF-crossing write. Path truncate performs both shrink and extension. Every
+  successful publication is checked through the independent authority; path
+  and descriptor lengths, uid, gid and the managed `0644` mode stay coherent,
+  including on an older active reader. Reads at exact EOF, beyond EOF,
+  zero-length reads, and a read crossing EOF must return the correct empty or
+  partial result. A remount returns the exact final bytes.
 - Append flag toggling: one descriptor opened with `O_APPEND`, then cleared and
   restored via `fcntl(F_SETFL)`, must overwrite at an explicit offset while
   cleared and append only while restored; both remote results are verified.
@@ -129,6 +138,20 @@ cargo x test-linux-fuse --read-only-range
   independent authority sees the delayed completion and the daemon remains
   usable and unmounts normally. This verifies the adapter's ignored
   interrupt/delayed completion behavior, not real cancellation.
+- Space and retention observation: the in-process contracts behind `space
+  report --json` and `space retention plan --keep-last 1 --json` run while a
+  dirty descriptor remains open. A helper subprocess is deliberately excluded
+  because exec-time close of a FUSE descriptor can issue `FLUSH` and publish
+  pending work. The test requires unchanged volume config, remote object
+  identities, staging database/WAL bytes, pending/frozen generations, and a
+  live mount, then proves the same descriptor still publishes after
+  observation. A second service scenario gates an fsync at the frozen
+  publication boundary and requires both library paths to count and protect
+  the frozen handle without releasing or publishing it. A separate clean-mount
+  test exercises the actual CLI spellings and versioned JSON documents. Report
+  assertions require `deletion_authorized=false`, `reclaimable_bytes=null`,
+  non-atomic inventory disclosure, and unknown noncurrent-version and
+  external-pin states.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits

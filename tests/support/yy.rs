@@ -37,7 +37,13 @@ pub fn binary() -> &'static Path {
                 "YY_UPGRADE_BIN must name a release yy binary: {}",
                 selected.display()
             );
-            eprintln!("yy acceptance binary: {}", selected.display());
+            let bytes = std::fs::read(&selected)
+                .unwrap_or_else(|error| panic!("read {}: {error}", selected.display()));
+            eprintln!(
+                "yy acceptance binary: {} blake3={}",
+                selected.display(),
+                blake3::hash(&bytes).to_hex()
+            );
             selected
         })
         .as_path()

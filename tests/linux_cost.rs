@@ -25,6 +25,7 @@
 //! Loopback counting proxies in front of Silo and the metadata service supply
 //! distinct request, connection, and byte counts without production hooks.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -46,7 +47,7 @@ use fixture::{Fixture, Publication, SyncPaths};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v4";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v5";
 const CHUNK: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -65,6 +66,7 @@ enum Workload {
     Full,
     ReadOnlyRange,
     RepeatedRandom,
+    Incremental,
 }
 
 impl Workload {
@@ -73,6 +75,22 @@ impl Workload {
             Self::Full => "full",
             Self::ReadOnlyRange => "read-only-range",
             Self::RepeatedRandom => "repeated-random",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncrementalExpectation {
+    Baseline,
+    Required,
+}
+
+impl IncrementalExpectation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Required => "required",
         }
     }
 }
@@ -146,6 +164,7 @@ struct RunContext {
     network_source: String,
     range_cache_policy: String,
     expect_range_reuse: bool,
+    incremental_expectation: String,
     source_sha: String,
     source_dirty: bool,
     binary_path: String,
@@ -306,9 +325,18 @@ fn linux_cost_benchmark() {
         Ok("full") | Err(_) => Workload::Full,
         Ok("read-only-range") => Workload::ReadOnlyRange,
         Ok("repeated-random") => Workload::RepeatedRandom,
+        Ok("incremental") => Workload::Incremental,
         value => panic!(
-            "YINYANG_COST_WORKLOAD must be full, read-only-range, or repeated-random, got {value:?}"
+            "YINYANG_COST_WORKLOAD must be full, read-only-range, repeated-random, or incremental, got {value:?}"
         ),
+    };
+    let incremental_expectation = match std::env::var("YINYANG_COST_INCREMENTAL_EXPECT").as_deref()
+    {
+        Ok("required") => IncrementalExpectation::Required,
+        Ok("baseline") | Err(_) => IncrementalExpectation::Baseline,
+        value => {
+            panic!("YINYANG_COST_INCREMENTAL_EXPECT must be baseline or required, got {value:?}")
+        }
     };
     let publication_filter = match std::env::var("YINYANG_COST_PUBLICATION").as_deref() {
         Ok("all") | Err(_) => PublicationFilter::All,
@@ -316,10 +344,12 @@ fn linux_cost_benchmark() {
         Ok("service") => PublicationFilter::Service,
         value => panic!("YINYANG_COST_PUBLICATION must be all, object, or service, got {value:?}"),
     };
-    if matches!(workload, Workload::ReadOnlyRange | Workload::RepeatedRandom)
-        && profile != Profile::Full
+    if matches!(
+        workload,
+        Workload::ReadOnlyRange | Workload::RepeatedRandom | Workload::Incremental
+    ) && profile != Profile::Full
     {
-        panic!("range workloads require YINYANG_COST_PROFILE=full");
+        panic!("range and incremental workloads require YINYANG_COST_PROFILE=full");
     }
     if matches!(workload, Workload::Full)
         && matches!(profile, Profile::Early)
@@ -337,7 +367,18 @@ fn linux_cost_benchmark() {
     let source_sha = std::env::var("YINYANG_COST_SOURCE_SHA")
         .expect("set YINYANG_COST_SOURCE_SHA to the exact tested source commit");
     let source_dirty = std::env::var("YINYANG_COST_SOURCE_DIRTY").as_deref() == Ok("1");
-    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let compiled_binary = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let binary_path = std::env::var_os("YY_UPGRADE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| compiled_binary.clone());
+    let binary_blake3 = blake3_file(&binary_path);
+    if binary_path != compiled_binary {
+        assert_eq!(
+            binary_blake3,
+            blake3_file(&compiled_binary),
+            "YY_UPGRADE_BIN selects different bytes from the compiled benchmark binary"
+        );
+    }
     let storage_backend = std::env::var("YINYANG_COST_STORAGE_LABEL").unwrap_or_else(|_| {
         if std::env::var("YINYANG_S3_ENDPOINT")
             .is_ok_and(|endpoint| endpoint.starts_with("https://"))
@@ -351,7 +392,8 @@ fn linux_cost_benchmark() {
         "OpenDAL released MetricsLayer in the measured yy process; HTTP request count and body bytes only"
             .to_owned()
     } else {
-        "loopback HTTP/1 parser; request and response bytes include headers".to_owned()
+        "loopback HTTP/1 parser; total request/response bytes include headers, and GET/PUT body bytes are tracked separately"
+            .to_owned()
     };
     let metadata_transport = if workload == Workload::RepeatedRandom {
         "object authority directly over HTTPS; no metadata service".to_owned()
@@ -371,9 +413,10 @@ fn linux_cost_benchmark() {
         network_source,
         range_cache_policy,
         expect_range_reuse,
+        incremental_expectation: incremental_expectation.as_str().to_owned(),
         source_sha,
         source_dirty,
-        binary_blake3: blake3_file(&binary_path),
+        binary_blake3,
         binary_path: binary_path.display().to_string(),
         host: host_identity(),
         rustc: command_line("rustc", &["--version"]),
@@ -430,12 +473,28 @@ fn linux_cost_benchmark() {
         (Profile::Full, PublicationFilter::Object) => &[Publication::Object],
         (Profile::Full, PublicationFilter::Service) => &[Publication::Service],
     };
+    if matches!(workload, Workload::Incremental) {
+        for &publication in publications {
+            run_incremental_matrix(
+                &context,
+                &proxy,
+                publication,
+                Scale::Medium,
+                incremental_expectation,
+                &mut recorder,
+            );
+        }
+        recorder.finish();
+        return;
+    }
     let scales: &[Scale] = match (workload, profile) {
         (Workload::ReadOnlyRange, _) | (Workload::Full, Profile::Full) => {
             &[Scale::Small, Scale::Medium]
         }
         (Workload::Full, Profile::Early) => &[Scale::Small],
-        (Workload::RepeatedRandom, _) => unreachable!("repeated-random returns above"),
+        (Workload::RepeatedRandom | Workload::Incremental, _) => {
+            unreachable!("specialized workloads return above")
+        }
     };
     if matches!(workload, Workload::ReadOnlyRange) {
         for &publication in publications {
@@ -830,6 +889,246 @@ fn run_fuse_matrix(
         vec![],
         space_snapshot(fixture, None, None, Some(&staging)),
         vec!["restarted mount served the original range bytes".to_owned()],
+    );
+    restarted.unmount();
+}
+
+fn run_incremental_matrix(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    scale: Scale,
+    expectation: IncrementalExpectation,
+    recorder: &mut Recorder,
+) {
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
+    let size = scale.file_size();
+    let mut expected = payload(size, 0x3c);
+    fixture.remote_create_file("incremental.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        fixture,
+        &format!("incremental-{}-{}", publication.as_str(), scale.as_str()),
+        false,
+    );
+    fs::create_dir(&mountpoint).expect("create incremental benchmark mountpoint");
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    let base_dataset = Dataset {
+        kind: "single_large_file_incremental".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: Some(RANGE_BYTES as u64),
+        writers: Some(1),
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
+    };
+    recorder.record(
+        context,
+        "fuse_incremental_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["writable mount type=fuse.yinyang".to_owned()],
+    );
+
+    let path = mountpoint.join("incremental.bin");
+    let open = measure_mount_operation(&meter, mounted.pid(), || {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open incremental benchmark file")
+    });
+    let Measurement {
+        value: writer,
+        latency_ms: open_latency_ms,
+        io: open_io,
+        network: open_network,
+    } = open;
+    let open_get_body_bytes = open_network.get_response_body_bytes;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            open_get_body_bytes < size as u64 / 2,
+            "open materialized {} bytes of a {size}-byte file; this is consistent with a full-file fallback",
+            open_get_body_bytes
+        );
+    }
+    recorder.record(
+        context,
+        "fuse_incremental_open_materialization",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "open completed before a write or fsync; GET body bytes are HTTP entity bytes, excluding headers",
+        vec![open_latency_ms],
+        open_io,
+        open_network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "writable descriptor opened successfully".to_owned(),
+            format!("get_response_body_bytes={open_get_body_bytes}"),
+            format!("full_file_bytes={size}"),
+        ],
+    );
+
+    let unit_center =
+        (size as u64 / 2 / BLOCK_BYTES as u64) * BLOCK_BYTES as u64 + BLOCK_BYTES as u64 / 4;
+    let boundary_offset =
+        size as u64 - 2 * BLOCK_BYTES as u64 + BLOCK_BYTES as u64 - RANGE_BYTES as u64 / 2;
+    let updates = [
+        ("unit_center", unit_center, RANGE_BYTES, 0x91_u8),
+        ("unit_boundary", boundary_offset, RANGE_BYTES * 2, 0xa7_u8),
+        (
+            "eof_tail",
+            size as u64 - RANGE_BYTES as u64,
+            RANGE_BYTES,
+            0xb9_u8,
+        ),
+    ];
+    for (label, offset, length, seed) in updates {
+        let value = payload(length, seed);
+        expected[offset as usize..offset as usize + length].copy_from_slice(&value);
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            write_all_at(&writer, &value, offset);
+            writer
+                .sync_all()
+                .expect("fsync incremental benchmark overwrite");
+        });
+        assert_eq!(
+            remote_file_bytes(fixture, "incremental.bin"),
+            expected,
+            "{label}: remote bytes after incremental fsync"
+        );
+        assert!(
+            measured.network.put > 0,
+            "{label}: a successful fsync must publish at least one PUT"
+        );
+        let put_body_bytes = measured.network.put_request_body_bytes;
+        let get_body_bytes = measured.network.get_response_body_bytes;
+        if expectation == IncrementalExpectation::Required {
+            assert!(
+                put_body_bytes < size as u64 / 2,
+                "{label}: PUT request bodies were {put_body_bytes} bytes for a {length}-byte overwrite in a {size}-byte file; this is consistent with full-file fallback"
+            );
+            assert!(
+                get_body_bytes < size as u64 / 2,
+                "{label}: fsync preparation read {get_body_bytes} bytes for a {length}-byte overwrite in a {size}-byte file; service traffic did not hide a full-file fallback"
+            );
+        }
+        recorder.record(
+            context,
+            &format!("fuse_incremental_{label}"),
+            publication,
+            scale,
+            Dataset {
+                range_bytes: Some(length as u64),
+                read_pattern: Some(format!(
+                    "one {length}-byte overwrite at offset {offset}, followed by fsync"
+                )),
+                working_set_bytes: Some(length as u64),
+                ..base_dataset.clone()
+            },
+            "pwrite was accepted and fsync returned before the remote byte check; PUT body bytes are HTTP entity bytes, excluding headers",
+            vec![measured.latency_ms],
+            measured.io,
+            measured.network,
+            vec![],
+            space_snapshot(fixture, None, None, Some(&staging)),
+            vec![
+                "complete remote bytes matched the expected file".to_owned(),
+                format!("put_request_body_bytes={put_body_bytes}"),
+                format!("get_response_body_bytes={get_body_bytes}"),
+                format!("full_file_bytes={size}"),
+            ],
+        );
+    }
+
+    let unchanged_fsync = measure_mount_operation(&meter, mounted.pid(), || {
+        writer
+            .sync_all()
+            .expect("fsync an unchanged incremental descriptor");
+    });
+    assert_eq!(
+        unchanged_fsync.network.put, 0,
+        "an unchanged fsync must not upload another file version"
+    );
+    recorder.record(
+        context,
+        "fuse_incremental_unchanged_fsync",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "the descriptor was opened before measurement; only an unchanged fsync is timed",
+        vec![unchanged_fsync.latency_ms],
+        unchanged_fsync.io,
+        unchanged_fsync.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["unchanged fsync emitted no backend PUT".to_owned()],
+    );
+    drop(writer);
+    mounted.unmount();
+
+    let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_incremental_restart_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before the replacement yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["replacement writable mount type=fuse.yinyang".to_owned()],
+    );
+    let verify_offset = size as u64 - 2 * BLOCK_BYTES as u64;
+    let verify_length = 2 * BLOCK_BYTES;
+    let restart = measure_mount_operation(&meter, restarted.pid(), || {
+        let file = File::open(&path).expect("open incremental file after mount restart");
+        let mut value = vec![0_u8; verify_length];
+        read_exact_at(&file, &mut value, verify_offset);
+        drop(file);
+        value
+    });
+    assert_eq!(
+        restart.value,
+        expected[verify_offset as usize..verify_offset as usize + verify_length],
+        "restart did not preserve the boundary and EOF sparse overwrites"
+    );
+    recorder.record(
+        context,
+        "fuse_incremental_restart_boundary_eof_read",
+        publication,
+        scale,
+        Dataset {
+            range_bytes: Some(verify_length as u64),
+            read_pattern: Some(
+                "one read covering the boundary-crossing update and EOF update after restart"
+                    .to_owned(),
+            ),
+            working_set_bytes: Some(verify_length as u64),
+            ..base_dataset
+        },
+        "open and read complete after restart; bytes cover the boundary-crossing and EOF updates",
+        vec![restart.latency_ms],
+        restart.io,
+        restart.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["restarted mount returned the exact incremental bytes".to_owned()],
     );
     restarted.unmount();
 }
@@ -2365,6 +2664,8 @@ struct NetworkSnapshot {
     post: u64,
     delete: u64,
     other: u64,
+    get_response_body_bytes: u64,
+    put_request_body_bytes: u64,
     service_connections: u64,
     service_request_bytes: u64,
     service_response_bytes: u64,
@@ -2383,6 +2684,12 @@ impl NetworkSnapshot {
             post: self.post.saturating_sub(before.post),
             delete: self.delete.saturating_sub(before.delete),
             other: self.other.saturating_sub(before.other),
+            get_response_body_bytes: self
+                .get_response_body_bytes
+                .saturating_sub(before.get_response_body_bytes),
+            put_request_body_bytes: self
+                .put_request_body_bytes
+                .saturating_sub(before.put_request_body_bytes),
             service_connections: self
                 .service_connections
                 .saturating_sub(before.service_connections),
@@ -2406,6 +2713,12 @@ impl NetworkSnapshot {
         self.post = self.post.saturating_add(other.post);
         self.delete = self.delete.saturating_add(other.delete);
         self.other = self.other.saturating_add(other.other);
+        self.get_response_body_bytes = self
+            .get_response_body_bytes
+            .saturating_add(other.get_response_body_bytes);
+        self.put_request_body_bytes = self
+            .put_request_body_bytes
+            .saturating_add(other.put_request_body_bytes);
         self.service_connections = self
             .service_connections
             .saturating_add(other.service_connections);
@@ -2430,6 +2743,8 @@ struct ProxyCounters {
     post: AtomicU64,
     delete: AtomicU64,
     other: AtomicU64,
+    get_response_body_bytes: AtomicU64,
+    put_request_body_bytes: AtomicU64,
 }
 
 struct CountingProxy {
@@ -2487,6 +2802,11 @@ impl CountingProxy {
             post: self.counters.post.load(Ordering::Relaxed),
             delete: self.counters.delete.load(Ordering::Relaxed),
             other: self.counters.other.load(Ordering::Relaxed),
+            get_response_body_bytes: self
+                .counters
+                .get_response_body_bytes
+                .load(Ordering::Relaxed),
+            put_request_body_bytes: self.counters.put_request_body_bytes.load(Ordering::Relaxed),
             service_connections: 0,
             service_request_bytes: 0,
             service_response_bytes: 0,
@@ -2653,23 +2973,33 @@ fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<Proxy
     else {
         return;
     };
+    let methods = Arc::new(Mutex::new(VecDeque::new()));
     let request_counters = counters.clone();
-    let request =
-        thread::spawn(move || pump(&mut client_read, &mut server_write, &request_counters, true));
-    let response =
-        thread::spawn(move || pump(&mut server_read, &mut client_write, &counters, false));
+    let request_methods = methods.clone();
+    let request = thread::spawn(move || {
+        pump_request(
+            &mut client_read,
+            &mut server_write,
+            &request_counters,
+            &request_methods,
+        )
+    });
+    let response = thread::spawn(move || {
+        pump_response(&mut server_read, &mut client_write, &counters, &methods)
+    });
     let _ = request.join();
     let _ = response.join();
     let _ = client.shutdown(Shutdown::Both);
 }
 
-fn pump(reader: &mut TcpStream, writer: &mut TcpStream, counters: &ProxyCounters, direction: bool) {
+fn pump_request(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    counters: &ProxyCounters,
+    methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+) {
     let mut buffer = vec![0_u8; CHUNK];
-    let mut scanner = if direction {
-        Some(RequestScanner::default())
-    } else {
-        None
-    };
+    let mut scanner = RequestScanner::default();
     loop {
         let count = match reader.read(&mut buffer) {
             Ok(0) => break,
@@ -2677,24 +3007,51 @@ fn pump(reader: &mut TcpStream, writer: &mut TcpStream, counters: &ProxyCounters
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        if direction {
-            counters
-                .request_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
-            scanner
-                .as_mut()
-                .expect("request scanner")
-                .scan(&buffer[..count], counters);
-        } else {
-            counters
-                .response_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
+        counters
+            .request_bytes
+            .fetch_add(count as u64, Ordering::Relaxed);
+        scanner.scan(&buffer[..count], counters, methods);
         if writer.write_all(&buffer[..count]).is_err() {
             break;
         }
     }
     let _ = writer.shutdown(Shutdown::Write);
+}
+
+fn pump_response(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    counters: &ProxyCounters,
+    methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+) {
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut scanner = ResponseScanner::new(methods.clone());
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        counters
+            .response_bytes
+            .fetch_add(count as u64, Ordering::Relaxed);
+        scanner.scan(&buffer[..count], counters);
+        if writer.write_all(&buffer[..count]).is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown(Shutdown::Write);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpMethod {
+    Get,
+    Head,
+    Put,
+    Post,
+    Delete,
+    Other,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2715,16 +3072,27 @@ struct RequestScanner {
     line: Vec<u8>,
     content_length: Option<u64>,
     chunked: bool,
+    method: Option<HttpMethod>,
 }
 
 impl RequestScanner {
-    fn scan(&mut self, bytes: &[u8], counters: &ProxyCounters) {
+    fn scan(
+        &mut self,
+        bytes: &[u8],
+        counters: &ProxyCounters,
+        methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+    ) {
         let mut offset = 0;
         while offset < bytes.len() {
             match self.state {
                 ScanState::Body(remaining) | ScanState::ChunkData(remaining) => {
                     let count = remaining.min((bytes.len() - offset) as u64) as usize;
                     offset += count;
+                    if self.method == Some(HttpMethod::Put) {
+                        counters
+                            .put_request_body_bytes
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                    }
                     if count as u64 == remaining {
                         self.state = if matches!(self.state, ScanState::Body(_)) {
                             ScanState::RequestLine
@@ -2763,7 +3131,7 @@ impl RequestScanner {
                         self.line.extend_from_slice(&bytes[offset..end]);
                         let line = std::mem::take(&mut self.line);
                         let line = line.strip_suffix(b"\r").unwrap_or(&line);
-                        self.process_line(line, counters);
+                        self.process_line(line, counters, methods);
                         offset = end + 1;
                     } else {
                         self.line.extend_from_slice(&bytes[offset..]);
@@ -2778,10 +3146,23 @@ impl RequestScanner {
         }
     }
 
-    fn process_line(&mut self, line: &[u8], counters: &ProxyCounters) {
+    fn process_line(
+        &mut self,
+        line: &[u8],
+        counters: &ProxyCounters,
+        methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+    ) {
         match self.state {
             ScanState::RequestLine => {
-                count_request_line(line, counters);
+                if let Some(method) = count_request_line(line, counters) {
+                    self.method = Some(method);
+                    methods
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push_back(method);
+                } else {
+                    self.method = None;
+                }
                 self.content_length = None;
                 self.chunked = false;
                 self.state = ScanState::Headers;
@@ -2826,20 +3207,20 @@ impl RequestScanner {
     }
 }
 
-fn count_request_line(line: &[u8], counters: &ProxyCounters) {
+fn count_request_line(line: &[u8], counters: &ProxyCounters) -> Option<HttpMethod> {
     if !line.windows(8).any(|window| window == b" HTTP/1.") {
-        return;
+        return None;
     }
-    let counter = if line.starts_with(b"GET ") {
-        &counters.get
+    let (method, counter) = if line.starts_with(b"GET ") {
+        (HttpMethod::Get, &counters.get)
     } else if line.starts_with(b"HEAD ") {
-        &counters.head
+        (HttpMethod::Head, &counters.head)
     } else if line.starts_with(b"PUT ") {
-        &counters.put
+        (HttpMethod::Put, &counters.put)
     } else if line.starts_with(b"POST ") {
-        &counters.post
+        (HttpMethod::Post, &counters.post)
     } else if line.starts_with(b"DELETE ") {
-        &counters.delete
+        (HttpMethod::Delete, &counters.delete)
     } else if [
         b"OPTIONS ".as_slice(),
         b"PATCH ".as_slice(),
@@ -2849,12 +3230,215 @@ fn count_request_line(line: &[u8], counters: &ProxyCounters) {
     .iter()
     .any(|method| line.starts_with(method))
     {
-        &counters.other
+        (HttpMethod::Other, &counters.other)
     } else {
-        return;
+        return None;
     };
     counter.fetch_add(1, Ordering::Relaxed);
     counters.requests.fetch_add(1, Ordering::Relaxed);
+    Some(method)
+}
+
+#[derive(Clone, Copy, Default)]
+enum ResponseState {
+    #[default]
+    StatusLine,
+    Headers,
+    Body(u64),
+    ChunkSize,
+    ChunkData(u64),
+    ChunkCrlf(u8),
+    Trailers,
+    UntilClose,
+}
+
+struct ResponseScanner {
+    state: ResponseState,
+    line: Vec<u8>,
+    content_length: Option<u64>,
+    chunked: bool,
+    status: Option<u16>,
+    method: Option<HttpMethod>,
+    methods: Arc<Mutex<VecDeque<HttpMethod>>>,
+}
+
+impl ResponseScanner {
+    fn new(methods: Arc<Mutex<VecDeque<HttpMethod>>>) -> Self {
+        Self {
+            state: ResponseState::StatusLine,
+            line: Vec::new(),
+            content_length: None,
+            chunked: false,
+            status: None,
+            method: None,
+            methods,
+        }
+    }
+
+    fn scan(&mut self, bytes: &[u8], counters: &ProxyCounters) {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match self.state {
+                ResponseState::Body(remaining) | ResponseState::ChunkData(remaining) => {
+                    let count = remaining.min((bytes.len() - offset) as u64) as usize;
+                    self.count_body(count, counters);
+                    offset += count;
+                    if count as u64 == remaining {
+                        self.state = if matches!(self.state, ResponseState::Body(_)) {
+                            self.reset_response();
+                            ResponseState::StatusLine
+                        } else {
+                            ResponseState::ChunkCrlf(2)
+                        };
+                    } else {
+                        self.state = match self.state {
+                            ResponseState::Body(_) => ResponseState::Body(remaining - count as u64),
+                            ResponseState::ChunkData(_) => {
+                                ResponseState::ChunkData(remaining - count as u64)
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                ResponseState::ChunkCrlf(remaining) => {
+                    let count = usize::from(remaining).min(bytes.len() - offset);
+                    offset += count;
+                    let remaining = remaining - count as u8;
+                    self.state = if remaining == 0 {
+                        ResponseState::ChunkSize
+                    } else {
+                        ResponseState::ChunkCrlf(remaining)
+                    };
+                }
+                ResponseState::UntilClose => {
+                    let count = bytes.len() - offset;
+                    self.count_body(count, counters);
+                    offset = bytes.len();
+                }
+                ResponseState::StatusLine
+                | ResponseState::Headers
+                | ResponseState::ChunkSize
+                | ResponseState::Trailers => {
+                    let end = bytes[offset..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map(|position| offset + position);
+                    if let Some(end) = end {
+                        self.line.extend_from_slice(&bytes[offset..end]);
+                        let line = std::mem::take(&mut self.line);
+                        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                        self.process_line(line);
+                        offset = end + 1;
+                    } else {
+                        self.line.extend_from_slice(&bytes[offset..]);
+                        offset = bytes.len();
+                        if self.line.len() > 16 * 1024 {
+                            self.line.clear();
+                            self.state = ResponseState::StatusLine;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_line(&mut self, line: &[u8]) {
+        match self.state {
+            ResponseState::StatusLine => {
+                if let Some(status) = parse_response_status(line)
+                    && status >= 200
+                {
+                    self.status = Some(status);
+                    self.method = self
+                        .methods
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front();
+                }
+                self.content_length = None;
+                self.chunked = false;
+                self.state = ResponseState::Headers;
+            }
+            ResponseState::Headers if line.is_empty() => {
+                let status = self.status.unwrap_or_default();
+                let body_forbidden = status < 200
+                    || status == 204
+                    || status == 304
+                    || self.method == Some(HttpMethod::Head);
+                self.state = if body_forbidden {
+                    self.reset_response();
+                    ResponseState::StatusLine
+                } else if self.chunked {
+                    ResponseState::ChunkSize
+                } else if let Some(length) = self.content_length {
+                    if length == 0 {
+                        self.reset_response();
+                        ResponseState::StatusLine
+                    } else {
+                        ResponseState::Body(length)
+                    }
+                } else {
+                    ResponseState::UntilClose
+                };
+            }
+            ResponseState::Headers => {
+                let header = String::from_utf8_lossy(line).to_ascii_lowercase();
+                if let Some(value) = header.strip_prefix("content-length:") {
+                    self.content_length = value.trim().parse().ok();
+                } else if header.starts_with("transfer-encoding:") && header.contains("chunked") {
+                    self.chunked = true;
+                }
+            }
+            ResponseState::ChunkSize => {
+                let size = std::str::from_utf8(line)
+                    .ok()
+                    .and_then(|line| line.split(';').next())
+                    .and_then(|size| u64::from_str_radix(size.trim(), 16).ok())
+                    .unwrap_or_else(|| panic!("invalid HTTP chunk size in benchmark response"));
+                self.state = if size == 0 {
+                    ResponseState::Trailers
+                } else {
+                    ResponseState::ChunkData(size)
+                };
+            }
+            ResponseState::Trailers if line.is_empty() => {
+                self.reset_response();
+                self.state = ResponseState::StatusLine;
+            }
+            ResponseState::Trailers => {}
+            ResponseState::Body(_)
+            | ResponseState::ChunkData(_)
+            | ResponseState::ChunkCrlf(_)
+            | ResponseState::UntilClose => {
+                unreachable!("fixed-width response states do not process lines")
+            }
+        }
+    }
+
+    fn count_body(&self, count: usize, counters: &ProxyCounters) {
+        if self.method == Some(HttpMethod::Get) {
+            counters
+                .get_response_body_bytes
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn reset_response(&mut self) {
+        self.status = None;
+        self.method = None;
+        self.content_length = None;
+        self.chunked = false;
+    }
+}
+
+fn parse_response_status(line: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(line).ok()?;
+    let status = if let Some(status) = line.strip_prefix("HTTP/1.1 ") {
+        status
+    } else {
+        line.strip_prefix("HTTP/1.0 ")?
+    };
+    status.get(..3)?.parse().ok()
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -2989,6 +3573,8 @@ struct NetworkPerSample {
     s3_requests: f64,
     s3_request_bytes: f64,
     s3_response_bytes: f64,
+    get_response_body_bytes: f64,
+    put_request_body_bytes: f64,
     service_connections: f64,
     service_request_bytes: f64,
     service_response_bytes: f64,
@@ -3002,6 +3588,8 @@ impl NetworkPerSample {
             s3_requests: network.requests as f64 / samples,
             s3_request_bytes: network.request_bytes as f64 / samples,
             s3_response_bytes: network.response_bytes as f64 / samples,
+            get_response_body_bytes: network.get_response_body_bytes as f64 / samples,
+            put_request_body_bytes: network.put_request_body_bytes as f64 / samples,
             service_connections: network.service_connections as f64 / samples,
             service_request_bytes: network.service_request_bytes as f64 / samples,
             service_response_bytes: network.service_response_bytes as f64 / samples,
@@ -3054,6 +3642,7 @@ struct CostRecord {
     metadata_transport: String,
     network_source: String,
     cache_policy: String,
+    incremental_expectation: String,
     dataset: Dataset,
     completion: String,
     iterations: usize,
@@ -3099,6 +3688,7 @@ impl Recorder {
                 network_source: context.network_source.clone(),
                 range_cache_policy: context.range_cache_policy.clone(),
                 expect_range_reuse: context.expect_range_reuse,
+                incremental_expectation: context.incremental_expectation.clone(),
                 source_sha: context.source_sha.clone(),
                 source_dirty: context.source_dirty,
                 binary_path: context.binary_path.clone(),
@@ -3155,6 +3745,7 @@ impl Recorder {
             metadata_transport: context.metadata_transport.clone(),
             network_source: context.network_source.clone(),
             cache_policy: cache_policy(context, scenario),
+            incremental_expectation: context.incremental_expectation.clone(),
             dataset,
             completion: completion.to_owned(),
             iterations: latencies.len(),
@@ -3176,7 +3767,7 @@ impl Recorder {
             .expect("terminate benchmark JSONL record");
         self.output.flush().expect("flush benchmark JSONL output");
         println!(
-            "linux-cost: {} publication={} scale={} samples={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
+            "linux-cost: {} publication={} scale={} samples={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} get_response_body_bytes={} put_request_body_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
             record.scenario,
             record.publication,
             record.scale,
@@ -3185,6 +3776,8 @@ impl Recorder {
             record.network.requests,
             record.network.request_bytes,
             record.network.response_bytes,
+            record.network.get_response_body_bytes,
+            record.network.put_request_body_bytes,
             record.network.service_connections,
             record.network.service_request_bytes,
             record.network.service_response_bytes,
@@ -3225,6 +3818,7 @@ impl Recorder {
             metadata_transport: context.metadata_transport.clone(),
             network_source: context.network_source.clone(),
             cache_policy: cache_policy(context, scenario),
+            incremental_expectation: context.incremental_expectation.clone(),
             dataset: Dataset {
                 kind: "not_run".to_owned(),
                 files: 0,
@@ -3278,7 +3872,7 @@ impl Recorder {
         let mut markdown = String::new();
         markdown.push_str("# Linux cost baseline\n\n");
         markdown.push_str(&format!(
-            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Workload: `{}`\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
+            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Workload: `{}`\n- Incremental expectation: `{}`\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
             self.context.source_sha,
             self.context.source_dirty,
             self.context.binary_path,
@@ -3286,6 +3880,7 @@ impl Recorder {
             self.context.host,
             self.context.rustc,
             self.context.workload.as_str(),
+            self.context.incremental_expectation,
             match self.context.profile {
                 Profile::Early => "early",
                 Profile::Full => "full",
@@ -3295,15 +3890,15 @@ impl Recorder {
             unsupported,
         ));
         markdown.push_str(
-            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
+            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | GET response body MiB total/sample | PUT request body MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
         );
         markdown.push_str(
-            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for record in &self.records {
             if !record.supported {
                 markdown.push_str(&format!(
-                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - |\n",
+                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - | - | - |\n",
                     record.scenario,
                     record.workload,
                     record.volume_mode,
@@ -3318,7 +3913,7 @@ impl Recorder {
             }
             let network = &record.network_per_sample;
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
                 record.scenario,
                 record.workload,
                 record.volume_mode,
@@ -3333,6 +3928,10 @@ impl Recorder {
                 network.s3_request_bytes / 1024.0 / 1024.0,
                 record.network.response_bytes as f64 / 1024.0 / 1024.0,
                 network.s3_response_bytes / 1024.0 / 1024.0,
+                record.network.get_response_body_bytes as f64 / 1024.0 / 1024.0,
+                network.get_response_body_bytes / 1024.0 / 1024.0,
+                record.network.put_request_body_bytes as f64 / 1024.0 / 1024.0,
+                network.put_request_body_bytes / 1024.0 / 1024.0,
                 record.network.service_connections,
                 network.service_connections,
                 record.network.service_request_bytes as f64 / 1024.0,
@@ -3411,12 +4010,15 @@ fn path_str(path: &Path) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyCounters, RequestScanner};
+    use super::{HttpMethod, ProxyCounters, RequestScanner, ResponseScanner};
+    use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn request_scanner_skips_content_length_and_chunked_bodies() {
         let counters = ProxyCounters::default();
+        let methods = Arc::new(Mutex::new(VecDeque::new()));
         let body = b"PUT /not-a-request HTTP/1.1\r\n\r\n";
         let mut wire = format!(
             "PUT /object HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
@@ -3431,12 +4033,35 @@ mod tests {
         );
         let mut scanner = RequestScanner::default();
         for byte in wire {
-            scanner.scan(&[byte], &counters);
+            scanner.scan(&[byte], &counters, &methods);
         }
         assert_eq!(counters.requests.load(Ordering::Relaxed), 3);
         assert_eq!(counters.put.load(Ordering::Relaxed), 1);
         assert_eq!(counters.post.load(Ordering::Relaxed), 1);
         assert_eq!(counters.head.load(Ordering::Relaxed), 1);
         assert_eq!(counters.get.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counters.put_request_body_bytes.load(Ordering::Relaxed),
+            body.len() as u64
+        );
+    }
+
+    #[test]
+    fn response_scanner_counts_get_body_bytes() {
+        let counters = ProxyCounters::default();
+        let methods = Arc::new(Mutex::new(VecDeque::from([
+            HttpMethod::Get,
+            HttpMethod::Put,
+            HttpMethod::Head,
+        ])));
+        let mut scanner = ResponseScanner::new(methods);
+        let wire = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nbody\
+              HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nput\
+              HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n";
+        for byte in wire {
+            scanner.scan(&[*byte], &counters);
+        }
+        assert_eq!(counters.get_response_body_bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(counters.put.load(Ordering::Relaxed), 0);
     }
 }
