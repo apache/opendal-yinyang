@@ -365,6 +365,10 @@ fn assert_space_report(document: &Value, staging: &Path) {
         "space report inspected a different staging directory: {document}"
     );
     assert_eq!(
+        document["staging"]["binding"]["state"], "verified",
+        "space report did not bind staging to the observed filesystem: {document}"
+    );
+    assert_eq!(
         document["deletion_authorized"],
         Value::Bool(false),
         "space report must not authorize deletion"
@@ -417,6 +421,10 @@ fn assert_retention_plan(document: &Value) {
     assert!(
         document["reclaimable_bytes"].is_null(),
         "retention planning must not estimate reclaimable bytes"
+    );
+    assert_eq!(
+        document["protection"]["staging"]["binding"]["state"], "verified",
+        "retention plan did not bind staging to the observed filesystem: {document}"
     );
     assert_limit_mentions(document, "shared pack", "retention plan");
     assert_eq!(document["policy"]["mode"], "bounded");
