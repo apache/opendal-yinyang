@@ -21,8 +21,9 @@ use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tokio::io::AsyncReadExt;
+use yinyang::direct::{DirectRuntime, DirectRuntimeInspectionState};
 use yinyang::runtime::{Runtime, RuntimeStatus};
-use yinyang::volume::{Model, Volume, VolumeConfig};
+use yinyang::volume::{Access, Model, Volume, VolumeConfig};
 
 #[derive(Subcommand)]
 pub enum FileCommand {
@@ -148,7 +149,50 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
             config.name, config.model, config.access, config.frontend, config.read_only
         );
         if config.model == Model::Direct {
-            println!("local staging: not used by Direct");
+            let mut local_error = None;
+            if config.read_only {
+                println!("local staging: not used by read-only Direct");
+            } else if config.access == Access::Sync {
+                println!(
+                    "direct sync state: inspect with `yy --volume {} sync status --json`",
+                    path.display()
+                );
+            } else {
+                match DirectRuntime::inspect(&config.staging, None) {
+                    Ok(inspection) => match inspection.state {
+                        DirectRuntimeInspectionState::Missing => {
+                            println!("direct local state: missing; nothing has been initialized")
+                        }
+                        DirectRuntimeInspectionState::Uninitialized => println!(
+                            "direct local state: uninitialized; staging contains no runtime database"
+                        ),
+                        DirectRuntimeInspectionState::Ready => println!(
+                            "direct local state: profile={} objects(clean={} staged={} pending={} conflict={} unknown={} failed={} discarded={}) mutations(staged={} dispatching={} applied={} conflict={} unknown={} destination-applied={} source-cleanup={} failed={} source-dispatching={})",
+                            inspection.profile.as_deref().unwrap_or("unknown"),
+                            inspection.objects.clean,
+                            inspection.objects.staged,
+                            inspection.objects.pending,
+                            inspection.objects.conflict,
+                            inspection.objects.unknown,
+                            inspection.objects.failed,
+                            inspection.objects.discarded,
+                            inspection.mutations.staged,
+                            inspection.mutations.dispatching,
+                            inspection.mutations.applied,
+                            inspection.mutations.conflict,
+                            inspection.mutations.unknown,
+                            inspection.mutations.destination_applied,
+                            inspection.mutations.pending_source_cleanup,
+                            inspection.mutations.failed,
+                            inspection.mutations.source_dispatching
+                        ),
+                    },
+                    Err(error) => {
+                        println!("direct local state: unavailable ({error})");
+                        local_error = Some(error.to_string());
+                    }
+                }
+            }
             match operator() {
                 Ok(operator) => match yinyang::volume::direct_namespace(&config, operator) {
                     Ok(namespace) => match namespace.observe().await {
@@ -168,7 +212,10 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
                 },
                 Err(error) => println!("direct namespace: unavailable ({error})"),
             }
-            return Ok(ExitCode::SUCCESS);
+            return match local_error {
+                Some(error) => Err(error.into()),
+                None => Ok(ExitCode::SUCCESS),
+            };
         }
         if config.staging.join("staging.db").exists() {
             status(Runtime::inspect(&config.staging).await?);

@@ -21,6 +21,45 @@ use std::collections::BTreeSet;
 use support::TestBackend;
 use yinyang::core::{BackendProfile, Fs};
 use yinyang::volume::*;
+
+fn direct_operator(backend: &TestBackend, conditional_delete: bool) -> opendal::Operator {
+    backend
+        .operator()
+        .layer(opendal::layers::CapabilityOverrideLayer::new(
+            move |mut capability| {
+                capability.stat = true;
+                capability.read = true;
+                capability.list = true;
+                capability.list_with_recursive = true;
+                capability.read_with_version = true;
+                capability.read_with_if_match = true;
+                capability.write = true;
+                capability.write_can_multi = true;
+                capability.write_can_empty = true;
+                capability.write_with_if_match = true;
+                capability.write_with_if_not_exists = true;
+                capability.delete = conditional_delete;
+                capability.delete_with_if_match = conditional_delete;
+                capability
+            },
+        ))
+}
+
+fn direct_config(staging: std::path::PathBuf) -> VolumeConfig {
+    VolumeConfig {
+        name: "objects".into(),
+        model: Model::Direct,
+        access: Access::Mount,
+        frontend: Frontend::Fuse,
+        publication: Publication::Object,
+        storage_profile: StorageProfile::Minio,
+        staging,
+        read_only: false,
+        require: BTreeSet::new(),
+        service_address: None,
+    }
+}
+
 fn config(path: std::path::PathBuf) -> VolumeConfig {
     VolumeConfig {
         name: "test".into(),
@@ -184,6 +223,95 @@ fn direct_defaults_to_read_only_and_does_not_require_staging() {
     let error = direct.validate(&backend.operator()).unwrap_err();
     assert!(error.to_string().contains("direct admission"));
     assert!(!error.to_string().contains("local staging"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_writable_admission_requires_staging_and_conditional_primitives() {
+    let backend = TestBackend::default();
+    let temp = tempfile::tempdir().unwrap();
+    let writable = direct_config(temp.path().join("direct-state"));
+
+    let missing_staging = VolumeConfig {
+        staging: std::path::PathBuf::new(),
+        ..writable.clone()
+    };
+    assert!(missing_staging.validate(&backend.operator()).is_err());
+
+    let read_only_with_staging = VolumeConfig {
+        read_only: true,
+        ..writable.clone()
+    };
+    assert!(
+        read_only_with_staging
+            .validate(&direct_operator(&backend, true))
+            .is_err()
+    );
+
+    let library = VolumeConfig {
+        frontend: Frontend::Library,
+        ..writable.clone()
+    };
+    assert!(library.validate(&direct_operator(&backend, true)).is_err());
+
+    let operator = direct_operator(&backend, false);
+    let caps = writable.validate(&operator).unwrap();
+    let expected: CapabilitySet = [
+        Capability::Read,
+        Capability::List,
+        Capability::Write,
+        Capability::Append,
+        Capability::Truncate,
+        Capability::PinnedReads,
+        Capability::RemoteFsync,
+        Capability::RecoverableStaging,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(caps.effective, expected);
+    for unsupported in [
+        Capability::StableIdentity,
+        Capability::AtomicRename,
+        Capability::RetainedUnlinkRead,
+    ] {
+        assert!(!caps.effective.contains(&unsupported));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_sync_requires_conditional_delete_and_library_admission() {
+    let backend = TestBackend::default();
+    let temp = tempfile::tempdir().unwrap();
+    let sync = VolumeConfig {
+        access: Access::Sync,
+        frontend: Frontend::Library,
+        ..direct_config(temp.path().join("direct-sync-state"))
+    };
+
+    let caps = sync.validate(&direct_operator(&backend, true)).unwrap();
+    assert!(caps.effective.contains(&Capability::Write));
+    assert!(!caps.effective.contains(&Capability::AtomicRename));
+    assert!(!caps.effective.contains(&Capability::StableIdentity));
+
+    assert!(
+        sync.validate(&direct_operator(&backend, false)).is_err(),
+        "Direct Sync must reject a backend without conditional delete"
+    );
+    let read_only = VolumeConfig {
+        read_only: true,
+        ..sync.clone()
+    };
+    assert!(
+        read_only
+            .validate(&direct_operator(&backend, true))
+            .is_err()
+    );
+    let fuse = VolumeConfig {
+        frontend: Frontend::Fuse,
+        ..sync
+    };
+    assert!(fuse.validate(&direct_operator(&backend, true)).is_err());
 }
 #[tokio::test]
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {

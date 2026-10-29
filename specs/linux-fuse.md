@@ -1,7 +1,8 @@
 # Linux FUSE frontend
 
-**Status: experimental Managed and read-only Direct mounts; protocol transport
-is the `fuser` 0.17 binding, not a YinYang FUSE implementation.**
+**Status: experimental Managed and Direct mounts; Direct remains read-only
+unless writable access is explicitly configured with local staging. Protocol
+transport is the `fuser` 0.17 binding, not a YinYang FUSE implementation.**
 
 The Linux frontend mounts one Managed volume through the kernel FUSE ABI with
 `yy --volume CONFIG mount MOUNTPOINT` and keeps the process in the foreground.
@@ -14,7 +15,9 @@ remote storage, and the macOS bridge crate is not part of the Linux path.
 
 The volume configuration must declare `access = "mount"` and
 `frontend = "fuse"`. Managed accepts read-only and writable policies and
-object or service publication. Direct accepts read-only object publication.
+object or service publication. Direct accepts read-only object publication by
+default and writable object publication only when `read_only=false` and a
+staging path are explicitly configured.
 Both use the admission rules in [`volume-capabilities.md`](volume-capabilities.md);
 Direct's mapping, pin and error contract is in [`direct.md`](direct.md). The
 frontend is rejected entirely on non-Linux targets.
@@ -30,14 +33,23 @@ Managed startup order:
 5. observe the latest remote snapshot and verify the root is a directory;
 6. handshake with the kernel as `fuse.yinyang` and serve requests.
 
-Direct startup validates the complete configuration, creates no staging or
-Managed authority, performs one read-only recursive object observation, and
-then hands the accepted snapshot to the kernel. Recursive LIST is not an atomic
-multi-page namespace transaction. LOOKUP and path GETATTR reuse the accepted
-snapshot; SIGHUP replaces it. Direct inode identity includes the accepted
-object version or ETag, size and whole-second mtime, so a later observation of
-replaced content receives a new inode and an old descriptor keeps the accepted
-attributes and pinned ranges. The complete behavior is in
+Read-only Direct startup validates the complete configuration, creates no
+staging or Managed authority, performs one read-only recursive object
+observation, and then hands the accepted snapshot to the kernel. Recursive LIST
+is not an atomic multi-page namespace transaction. Writable Direct validates
+the same admission and additionally binds the existing staging directory to
+the selected storage namespace before loading retained objects. It then
+observes the remote namespace and serves durable local-only, dirty, conflict
+and Unknown object states as an overlay. Opening or recovering a writable
+Direct mount does not create YinYang Managed metadata.
+
+LOOKUP and path GETATTR reuse the latest accepted snapshot plus that overlay.
+SIGHUP replaces the remote snapshot without rebasing open descriptors. Direct
+inode identity includes the accepted object version or ETag, size and
+whole-second mtime, so a later observation of replaced content receives a new
+inode and an old descriptor keeps its accepted attributes and pinned ranges.
+Pending local identities remain stable until they acquire a new remote
+observation. The complete Direct storage contract is in
 [`direct.md`](direct.md).
 
 Step 4 is the read-only dirty-data boundary. Recovered clean observations are
@@ -84,6 +96,12 @@ mounting user's uid/gid, size from the content descriptor or a fixed directory
 size, and revision-derived timestamps are synthesized. `getxattr`,
 `listxattr`, `readlink`, links and special nodes return explicit unsupported
 errors.
+
+Direct has no persisted executable bit: writable Direct files remain `0644`
+and directories remain `0755`. Writable Direct uses a zero attribute TTL and
+explicit invalidation after publication so a dirty length cannot remain cached
+after remote replacement. A pending overlay entry supplies its stable local
+identity, length and state until a later remote observation resolves it.
 
 `open` validates the access mode and rejects cached directories with `EISDIR`.
 The reply opens with `FOPEN_DIRECT_IO`, so the kernel does not cache file pages.
@@ -183,6 +201,51 @@ An external content change therefore produces Conflict rather than rebasing
 old staged bytes onto new content. Ownership, timestamps and other mode bits
 are not persisted.
 
+### Direct writable callbacks
+
+A writable Direct mount uses the storage-bound whole-object runtime in
+[`direct.md`](direct.md). Files are synthesized as `0644` and directories as
+`0755`; chmod, ownership, timestamps and other metadata remain unsupported.
+Opening a file for writing materializes the pinned object into durable local
+staging. All descriptors for one raw object key share that staged generation,
+so a read-only descriptor observes the same dirty bytes and length as a writer.
+READ never switches to a newer remote version while either descriptor is open.
+
+`CREATE` publishes only a local empty object into the namespace overlay. A
+writable descriptor publishes it on flush/fsync/close; a descriptor opened
+without write access publishes the empty object before CREATE returns so its
+creation does not depend on a later writer. `O_TRUNC` stages zero bytes before
+OPEN returns. Each `WRITE` re-reads the kernel-supplied flags, so `F_SETFL`
+changes `O_APPEND` for later requests and `O_SYNC`/`O_DSYNC` publish before the
+write is acknowledged. Empty writes are no-ops.
+
+For Direct, FLUSH and FSYNC are the publication boundary: they freeze the
+current bytes and conditionally publish that exact generation. A successful
+write response records the response pin; a later external replacement is not
+silently adopted. Conflict leaves the local bytes and an `ESTALE` result;
+ambiguous completion remains Unknown and returns `EIO`; unsupported conditional
+publication returns `EOPNOTSUPP`. RELEASE only drops the in-process reference,
+never publishes, and never discards retained bytes. A failed publication is
+retryable through the shared runtime, and restart restores the same dirty,
+conflict or Unknown generation.
+
+`SETATTR` size with an open writable handle stages a truncate for that handle's
+later flush. Size without a handle opens the current object, stages the
+truncate, publishes it and returns only after the conditional result is known.
+Mode-only, ownership, standalone timestamp and unsupported combination
+requests fail with `EOPNOTSUPP`.
+
+`UNLINK` uses the runtime's conditional object deletion; it never falls back to
+an unconditional delete. File rename follows the runtime's non-atomic
+safe-save sequence: conditionally publish the destination, then conditionally
+delete the source. A failure after destination publication retains the
+destination and source and reports `EIO` with PendingSourceCleanup/Unknown
+rather than claiming atomic rename. `RENAME_NOREPLACE` is supported; `RENAME_EXCHANGE`,
+`RENAME_WHITEOUT`, directory rename and directory creation/removal are
+unsupported with explicit errors. A normal editor write-in-place save works;
+write-temp-then-rename is supported only through this safe-save sequence, not
+as a cross-object atomic guarantee.
+
 ## Explicit refresh
 
 `SIGHUP` triggers one explicit refresh; this is a manual invalidation entry
@@ -194,6 +257,9 @@ latest snapshot once and then:
   including zero-reference read-only range observations, so the next open
   observes or materializes the current remote revision; nodes with live
   references or retained state are left pinned (`Busy`);
+- for writable Direct, reloads durable pending object and mutation status and
+  keeps those names ahead of the new remote snapshot; open descriptors remain
+  attached to their existing local generation;
 - invalidates known inode attributes with `inval_inode(ino, -1, 0)` and
   replied dentries with `inval_entry(parent, name)` through the fuser
   `Notifier`. Only dentries this adapter actually replied to the kernel are
@@ -214,6 +280,28 @@ may finish inside that window. A `NotFound` notification result is expected
 (the kernel already dropped the entry or inode) and is counted separately, so
 only explicit connection-ended errors (`ENODEV`, `ENOTCONN`, `EPIPE`,
 `ECONNRESET`, `ESHUTDOWN`) stop the batch before it would otherwise finish.
+
+Namespace callbacks do not issue synchronous `inval_entry` notifications before
+replying. The kernel already updates the dentry involved in CREATE, UNLINK or
+RENAME; a reverse entry invalidation from inside that request can deadlock while
+the kernel holds the related parent lock. Callback-side refresh updates only the
+adapter snapshot and pending overlay. Metadata-only inode invalidation and
+dentry invalidation remain confined to the explicit SIGHUP path, outside a
+related mutation request.
+
+An `unlink` or `rename` precondition conflict does not install a refreshed
+remote snapshot and returns `EAGAIN`, not `ESTALE`. Linux namei automatically
+retries `ESTALE` once inside the same syscall; a concurrent global refresh
+could make that retry use the external source or destination pin as a new
+intent. `EAGAIN` prevents that implicit retry and leaves the decision to the
+caller.
+
+The pending Conflict observation remains visible, and the failed callback does
+not install a refreshed snapshot. A caller can explicitly refresh with `SIGHUP`
+and then issue a new operation. Any later caller-owned request is a new intent
+and may observe a later accepted global snapshot, including one advanced by an
+unrelated successful mutation. Lookup or handle failures that cannot revalidate
+identity continue to report `ESTALE`.
 
 Stable `yy: fuse refresh:` log lines report the observed revision, the
 reclaimed/active node counts, and the native notification counts at
@@ -273,16 +361,21 @@ hanging. Forced termination is a crash-equivalent recovery boundary, not a
 graceful unmount: the staging lease is released by the OS and the next start
 recovers local state through the normal crash-recovery path. Request tasks are
 detached and owned by the CLI runtime; their unanswered replies are dropped on
-the closing channel. In-flight tasks hold their `Arc<Mount>` for that window;
-there is no mid-session cancellation signal.
+the closing channel. In-flight tasks hold the mount's shared filesystem state
+for that window; there is no mid-session cancellation signal.
 
 ## Boundaries and known limits
 
-- A writable-volume open materializes the complete file through the shared
-  Mount staging contract. A read-only whole-volume open pins immutable metadata
-  and reads only authenticated intersecting content ranges. Neither path claims
-  mmap coherence, and `FOPEN_DIRECT_IO` does not provide page-cache-backed mmap
-  behavior.
+- A writable Managed or Direct open materializes the complete file through its
+  shared staging contract. A read-only whole-volume open pins immutable
+  metadata and reads only authenticated intersecting content ranges. Neither
+  path claims mmap coherence, and `FOPEN_DIRECT_IO` does not provide
+  page-cache-backed mmap behavior.
+- Direct does not claim Managed stable identity, retained unlink reads,
+  Managed receipts, cross-object transactions, or atomic rename. External
+  replacement changes the next remote inode; open descriptors never rebase.
+  Direct directories are synthesized from object key prefixes, so MKDIR/RMDIR
+  and directory rename are outside the writable contract.
 - Hard links, symlinks, mknod, xattrs, ioctl, poll, fallocate and capacity
   accounting are not implemented and return explicit `EOPNOTSUPP`/`ENOSYS`.
 - The frontend does not negotiate `FUSE_POSIX_LOCKS` or `FLOCK_LOCKS`, and its

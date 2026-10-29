@@ -259,17 +259,15 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
     let rejected = run_timeout(rejected_command, Duration::from_secs(30));
     assert!(
         !rejected.status.success(),
-        "Direct writable admission must fail before mounting"
+        "writable Direct without staging must fail before mounting"
     );
     let diagnostic = rejected.text().to_ascii_lowercase();
     assert!(
-        diagnostic.contains("read-only")
-            || diagnostic.contains("read_only")
-            || diagnostic.contains("unimplemented"),
-        "Direct writable rejection did not identify its admission boundary:\n{}",
+        diagnostic.contains("staging"),
+        "writable Direct staging rejection did not identify its admission boundary:\n{}",
         rejected.text()
     );
-    requests.assert_no_requests("Direct writable mount");
+    requests.assert_no_requests("writable Direct mount without staging");
     assert_eq!(
         fixture.inventory(),
         initial_inventory,
