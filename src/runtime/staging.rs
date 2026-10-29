@@ -16,16 +16,18 @@
 // under the License.
 
 //! Durable local write staging. SQLite keeps each acknowledged write and its
-//! generation atomic; chunks bound memory independently of the file length.
+//! generation atomic; exact dirty ranges overlay an authenticated base.
 use super::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::fs::File;
+use std::ops::Range;
 use tokio::sync::Mutex;
 
 pub(super) const CHUNK: u64 = 64 * 1024;
 const PROFILE_V1: &str = "yinyang-stage-1";
 const PROFILE_V2: &str = "yinyang-stage-2";
+const PROFILE_V3: &str = "yinyang-stage-3";
 const SCHEMA_V1: &[schema::TableColumns<'static>] = &[
     ("authority", &["singleton", "profile", "filesystem"]),
     ("handles", &["id", "record"]),
@@ -38,12 +40,25 @@ const SCHEMA_V2: &[schema::TableColumns<'static>] = &[
     ("chunks", &["handle", "position", "data"]),
     ("errors", &["sequence", "handle", "message", "failure"]),
 ];
+const SCHEMA_V3: &[schema::TableColumns<'static>] = &[
+    ("authority", &["singleton", "profile", "filesystem"]),
+    ("bases", &["handle", "descriptor", "prefix"]),
+    ("handles", &["id", "record", "failure"]),
+    ("chunks", &["handle", "position", "data"]),
+    ("errors", &["sequence", "handle", "message", "failure"]),
+    ("segments", &["handle", "position", "data"]),
+];
 
-const CREATE_SCHEMA_V2: &str = "
+const CREATE_SCHEMA_V3: &str = "
     CREATE TABLE authority(
       singleton INTEGER PRIMARY KEY CHECK(singleton=1),
       profile TEXT NOT NULL,
       filesystem BLOB NOT NULL
+    );
+    CREATE TABLE bases(
+      handle BLOB PRIMARY KEY,
+      descriptor BLOB NOT NULL,
+      prefix INTEGER NOT NULL
     );
     CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB NOT NULL, failure BLOB);
     CREATE TABLE chunks(
@@ -57,6 +72,24 @@ const CREATE_SCHEMA_V2: &str = "
       handle BLOB NOT NULL,
       message TEXT NOT NULL,
       failure BLOB
+    );
+    CREATE TABLE segments(
+      handle BLOB NOT NULL,
+      position INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY(handle,position)
+    );";
+const CREATE_SPARSE_TABLES: &str = "
+    CREATE TABLE bases(
+      handle BLOB PRIMARY KEY,
+      descriptor BLOB NOT NULL,
+      prefix INTEGER NOT NULL
+    );
+    CREATE TABLE segments(
+      handle BLOB NOT NULL,
+      position INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY(handle,position)
     );";
 
 #[derive(Clone, BorshSerialize, BorshDeserialize)]
@@ -99,6 +132,15 @@ impl Record {
                 .map(|(_, commit, _)| commit),
         }
     }
+}
+#[derive(Clone)]
+pub(super) struct Base {
+    pub descriptor: Vec<u8>,
+    pub prefix: u64,
+}
+pub(super) struct StagedRead {
+    pub bytes: Vec<u8>,
+    pub base: Vec<Range<u64>>,
 }
 #[derive(Clone)]
 pub(super) struct Stage {
@@ -168,6 +210,7 @@ fn validate_schema(c: &Connection, profile: &str) -> Result<()> {
     let expected = match profile {
         PROFILE_V1 => SCHEMA_V1,
         PROFILE_V2 => SCHEMA_V2,
+        PROFILE_V3 => SCHEMA_V3,
         _ => {
             return Err(Error::State(
                 ErrorKind::Unsupported,
@@ -237,6 +280,73 @@ fn put_chunk(c: &Connection, id: [u8; 16], index: u64, bytes: &[u8]) -> Result<(
     .map_err(local)?;
     Ok(())
 }
+fn base(c: &Connection, id: [u8; 16]) -> Result<Option<Base>> {
+    let (descriptor, prefix): (Vec<u8>, i64) = match c
+        .query_row(
+            "SELECT descriptor,prefix FROM bases WHERE handle=?1",
+            params![id.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(local)?
+    {
+        Some(base) => base,
+        None => return Ok(None),
+    };
+    let prefix = u64::try_from(prefix).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e))?;
+    ContentDescriptor::from_bytes(&descriptor)?;
+    Ok(Some(Base { descriptor, prefix }))
+}
+fn put_base(c: &Connection, id: [u8; 16], descriptor: &[u8], prefix: u64) -> Result<()> {
+    let descriptor = ContentDescriptor::from_bytes(descriptor)?;
+    if prefix > descriptor.content_id().length() {
+        return Err(Error::State(
+            ErrorKind::Corrupt,
+            "staging base prefix exceeds content length",
+        ));
+    }
+    c.execute(
+        "INSERT OR REPLACE INTO bases(handle,descriptor,prefix) VALUES(?1,?2,?3)",
+        params![
+            id.as_slice(),
+            descriptor.to_bytes(),
+            i64::try_from(prefix).map_err(local)?
+        ],
+    )
+    .map_err(local)?;
+    Ok(())
+}
+fn put_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let end = segment_end(position, bytes)?;
+    let chunk_start = position - position % CHUNK;
+    if end > chunk_start + CHUNK {
+        return Err(Error::State(
+            ErrorKind::Invalid,
+            "staging segment crosses a chunk boundary",
+        ));
+    }
+    c.execute(
+        "INSERT OR REPLACE INTO segments(handle,position,data) VALUES(?1,?2,?3)",
+        params![
+            id.as_slice(),
+            i64::try_from(position).map_err(local)?,
+            bytes
+        ],
+    )
+    .map_err(local)?;
+    Ok(())
+}
+fn delete_segment(c: &Connection, id: [u8; 16], position: u64) -> Result<()> {
+    c.execute(
+        "DELETE FROM segments WHERE handle=?1 AND position=?2",
+        params![id.as_slice(), i64::try_from(position).map_err(local)?],
+    )
+    .map_err(local)?;
+    Ok(())
+}
 fn records(c: &Connection) -> Result<Vec<Record>> {
     // Inspect must also work before an older staging database is opened/upgraded.
     let sql = if has_failure(c, "handles")? {
@@ -294,6 +404,340 @@ fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
     })
     .collect()
 }
+fn validate_state(c: &Connection, profile: &str) -> Result<()> {
+    let _ = records(c)?;
+    let _ = errors(c)?;
+    if profile != PROFILE_V3 {
+        return Ok(());
+    }
+    let handles = {
+        let mut query = c.prepare("SELECT id,record FROM handles").map_err(local)?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(local)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(local)?;
+        let mut result = BTreeMap::new();
+        for (id, bytes) in rows {
+            if id.len() != 16 {
+                return Err(Error::State(
+                    ErrorKind::Corrupt,
+                    "staging handle id is malformed",
+                ));
+            }
+            let record = decode(&bytes)?;
+            if record.id.as_slice() != id.as_slice() || record.length > i64::MAX as u64 {
+                return Err(Error::State(
+                    ErrorKind::Corrupt,
+                    "staging handle identity or length is invalid",
+                ));
+            }
+            result.insert(id, record);
+        }
+        result
+    };
+    let filesystem: Vec<u8> = c
+        .query_row(
+            "SELECT filesystem FROM authority WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(local)?;
+    let bases = {
+        let mut query = c
+            .prepare("SELECT handle,descriptor,prefix FROM bases ORDER BY handle")
+            .map_err(local)?;
+        query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(local)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(local)?
+    };
+    let mut sparse = BTreeMap::<Vec<u8>, (u64, u64)>::new();
+    for (handle, descriptor, prefix) in bases {
+        let handle: [u8; 16] = handle
+            .try_into()
+            .map_err(|_| Error::State(ErrorKind::Corrupt, "staging base handle is malformed"))?;
+        let descriptor = ContentDescriptor::from_bytes(&descriptor)?;
+        if descriptor.filesystem().as_bytes() != filesystem.as_slice() {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base belongs to a different filesystem",
+            ));
+        }
+        let prefix = positioned(prefix)?;
+        if prefix > descriptor.content_id().length() {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base prefix exceeds content length",
+            ));
+        }
+        let Some(record) = handles.get(handle.as_slice()) else {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base has no handle",
+            ));
+        };
+        if !record.ready {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base belongs to an incomplete handle",
+            ));
+        }
+        if prefix > record.length {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base prefix exceeds handle length",
+            ));
+        }
+        let materialized = c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE handle=?1)",
+                params![handle.as_slice()],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(local)?;
+        if materialized {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "sparse handle also has materialized chunks",
+            ));
+        }
+        sparse.insert(handle.to_vec(), (prefix, record.length));
+    }
+
+    let segments = {
+        let mut query = c
+            .prepare(
+                "SELECT handle,position,length(data) FROM segments
+                 ORDER BY handle,position",
+            )
+            .map_err(local)?;
+        query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(local)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(local)?
+    };
+    let mut previous = BTreeMap::<Vec<u8>, u64>::new();
+    for (handle, position, length) in segments {
+        let Some((_, handle_length)) = sparse.get(&handle) else {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging segment has no sparse base",
+            ));
+        };
+        let data_length = positioned(length)?;
+        if data_length == 0 {
+            return Err(Error::State(ErrorKind::Corrupt, "staging segment is empty"));
+        }
+        let position = positioned(position)?;
+        let end = position.checked_add(data_length).ok_or(Error::State(
+            ErrorKind::Corrupt,
+            "staging segment length overflows",
+        ))?;
+        let chunk_start = position - position % CHUNK;
+        if end > chunk_start + CHUNK {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging segment crosses a chunk boundary",
+            ));
+        }
+        if end > *handle_length {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging segment exceeds handle length",
+            ));
+        }
+        if let Some(previous_end) = previous.insert(handle, end)
+            && previous_end > position
+        {
+            return Err(Error::State(ErrorKind::Corrupt, "staging segments overlap"));
+        }
+    }
+    Ok(())
+}
+fn positioned(position: i64) -> Result<u64> {
+    u64::try_from(position).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e))
+}
+fn segment_end(position: u64, data: &[u8]) -> Result<u64> {
+    position.checked_add(data.len() as u64).ok_or(Error::State(
+        ErrorKind::Corrupt,
+        "staging segment length overflows",
+    ))
+}
+fn read_sparse(
+    c: &Connection,
+    id: [u8; 16],
+    offset: u64,
+    requested_end: u64,
+    base: Base,
+) -> Result<StagedRead> {
+    let mut bytes = vec![0; (requested_end - offset) as usize];
+    let rows = {
+        let mut query = c
+            .prepare(
+                "SELECT position,data FROM segments
+                 WHERE handle=?1 AND position<?2 AND position+length(data)>?3
+                 ORDER BY position",
+            )
+            .map_err(local)?;
+        query
+            .query_map(
+                params![
+                    id.as_slice(),
+                    i64::try_from(requested_end).map_err(local)?,
+                    i64::try_from(offset).map_err(local)?
+                ],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(local)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(local)?
+    };
+
+    let mut local = Vec::with_capacity(rows.len());
+    for (position, data) in rows {
+        let start = positioned(position)?;
+        let row_end = segment_end(start, &data)?;
+        let copy_start = start.max(offset);
+        let copy_end = row_end.min(requested_end);
+        if copy_start >= copy_end {
+            continue;
+        }
+        let source_start = (copy_start - start) as usize;
+        let source_end = (copy_end - start) as usize;
+        let destination_start = (copy_start - offset) as usize;
+        let destination_end = (copy_end - offset) as usize;
+        bytes[destination_start..destination_end].copy_from_slice(&data[source_start..source_end]);
+        local.push(copy_start..copy_end);
+    }
+
+    let base_end = requested_end.min(base.prefix);
+    let mut holes = Vec::new();
+    let mut cursor = offset;
+    for span in local {
+        let span_start = span.start.min(base_end);
+        if cursor < span_start {
+            holes.push(cursor..span_start);
+        }
+        cursor = cursor.max(span.end);
+    }
+    if cursor < base_end {
+        holes.push(cursor..base_end);
+    }
+    holes.retain(|range| !range.is_empty());
+    Ok(StagedRead { bytes, base: holes })
+}
+fn write_sparse(c: &Connection, id: [u8; 16], offset: u64, bytes: &[u8]) -> Result<()> {
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::State(ErrorKind::TooLarge, "file length overflows"))?;
+    let mut chunk_start = offset - offset % CHUNK;
+    while chunk_start < end {
+        let part_start = offset.max(chunk_start);
+        let part_end = end.min(chunk_start + CHUNK);
+        let source_start = (part_start - offset) as usize;
+        let source_end = (part_end - offset) as usize;
+        write_sparse_chunk(c, id, part_start, &bytes[source_start..source_end])?;
+        chunk_start += CHUNK;
+    }
+    Ok(())
+}
+fn write_sparse_chunk(c: &Connection, id: [u8; 16], offset: u64, bytes: &[u8]) -> Result<()> {
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::State(ErrorKind::TooLarge, "file length overflows"))?;
+    let rows = {
+        let mut query = c
+            .prepare(
+                "SELECT position,data FROM segments
+                 WHERE handle=?1 AND position<?2 AND position+length(data)>?3
+                 ORDER BY position",
+            )
+            .map_err(local)?;
+        query
+            .query_map(
+                params![
+                    id.as_slice(),
+                    i64::try_from(end).map_err(local)?,
+                    i64::try_from(offset).map_err(local)?
+                ],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(local)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(local)?
+    };
+
+    for (position, data) in rows {
+        let start = positioned(position)?;
+        let row_end = segment_end(start, &data)?;
+        delete_segment(c, id, start)?;
+        if start < offset {
+            put_segment(c, id, start, &data[..(offset - start) as usize])?;
+        }
+        if row_end > end {
+            put_segment(c, id, end, &data[(end - start) as usize..])?;
+        }
+    }
+    coalesce_segment(c, id, offset, bytes)
+}
+fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -> Result<()> {
+    let mut start = position;
+    let mut data = bytes.to_vec();
+    let chunk_start = position - position % CHUNK;
+    let previous: Option<(i64, Vec<u8>)> = c
+        .query_row(
+            "SELECT position,data FROM segments
+             WHERE handle=?1 AND position<?2 ORDER BY position DESC LIMIT 1",
+            params![id.as_slice(), i64::try_from(position).map_err(local)?],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(local)?;
+    if let Some((previous_position, previous_data)) = previous {
+        let previous_position = positioned(previous_position)?;
+        if segment_end(previous_position, &previous_data)? == position
+            && previous_position / CHUNK == position / CHUNK
+        {
+            delete_segment(c, id, previous_position)?;
+            start = previous_position;
+            data = previous_data.into_iter().chain(data).collect();
+        }
+    }
+    let end = segment_end(start, &data)?;
+    let next: Option<Vec<u8>> = c
+        .query_row(
+            "SELECT data FROM segments WHERE handle=?1 AND position=?2",
+            params![id.as_slice(), i64::try_from(end).map_err(local)?],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(local)?;
+    if let Some(next) = next
+        && end < chunk_start + CHUNK
+    {
+        delete_segment(c, id, end)?;
+        data.extend(next);
+    }
+    put_segment(c, id, start, &data)?;
+    Ok(())
+}
 impl Stage {
     pub async fn validate(path: PathBuf, fs: NodeId) -> Result<()> {
         tokio::task::spawn_blocking(move || {
@@ -304,9 +748,8 @@ impl Stage {
             .map_err(local)?;
             c.busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(local)?;
-            validate_profile(&c, Some(fs))?;
-            let _ = records(&c)?;
-            let _ = errors(&c)?;
+            let profile = validate_profile(&c, Some(fs))?;
+            validate_state(&c, &profile)?;
             Ok(())
         })
         .await
@@ -322,7 +765,8 @@ impl Stage {
             .map_err(local)?;
             c.busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(local)?;
-            validate_profile(&c, None)?;
+            let profile = validate_profile(&c, None)?;
+            validate_state(&c, &profile)?;
             Ok(RuntimeStatus {
                 handles: records(&c)?.iter().map(Record::status).collect(),
                 errors: errors(&c)?,
@@ -344,7 +788,10 @@ impl Stage {
                 c.busy_timeout(std::time::Duration::from_secs(1))
                     .map_err(local)?;
                 if !schema::matches(&c, &[]).map_err(local)? {
-                    validate_profile(&c, Some(fs))?;
+                    let profile = validate_profile(&c, Some(fs))?;
+                    if profile == PROFILE_V3 {
+                        validate_state(&c, &profile)?;
+                    }
                 }
             }
             let lock = std::fs::OpenOptions::new()
@@ -375,8 +822,8 @@ impl Stage {
             c.busy_timeout(std::time::Duration::from_secs(1))
                 .map_err(local)?;
             // Revalidate after taking the process lease. A writer that finished
-            // between preflight and locking may have performed the supported
-            // stage-1 to stage-2 upgrade; accept the resulting known profile.
+            // between preflight and locking may have performed a supported
+            // upgrade; accept the resulting known profile.
             let profile = if exists && !schema::matches(&c, &[]).map_err(local)? {
                 Some(validate_profile(&c, Some(fs))?)
             } else {
@@ -385,10 +832,10 @@ impl Stage {
             let tx = c.transaction().map_err(local)?;
             match profile.as_deref() {
                 None => {
-                    tx.execute_batch(CREATE_SCHEMA_V2).map_err(local)?;
+                    tx.execute_batch(CREATE_SCHEMA_V3).map_err(local)?;
                     tx.execute(
                         "INSERT INTO authority VALUES(1,?1,?2)",
-                        params![PROFILE_V2, fs.as_bytes().as_slice()],
+                        params![PROFILE_V3, fs.as_bytes().as_slice()],
                     )
                     .map_err(local)?;
                 }
@@ -397,18 +844,34 @@ impl Stage {
                     let _ = errors(&tx)?;
                     tx.execute_batch(
                         "ALTER TABLE handles ADD COLUMN failure BLOB;
-                         ALTER TABLE errors ADD COLUMN failure BLOB;
-                         UPDATE authority SET profile='yinyang-stage-2' WHERE singleton=1;",
+                         ALTER TABLE errors ADD COLUMN failure BLOB;",
+                    )
+                    .map_err(local)?;
+                    tx.execute_batch(CREATE_SPARSE_TABLES).map_err(local)?;
+                    tx.execute(
+                        "UPDATE authority SET profile=?1 WHERE singleton=1",
+                        [PROFILE_V3],
                     )
                     .map_err(local)?;
                 }
                 Some(PROFILE_V2) => {
                     let _ = records(&tx)?;
                     let _ = errors(&tx)?;
+                    tx.execute_batch(CREATE_SPARSE_TABLES).map_err(local)?;
+                    tx.execute(
+                        "UPDATE authority SET profile=?1 WHERE singleton=1",
+                        [PROFILE_V3],
+                    )
+                    .map_err(local)?;
+                }
+                Some(PROFILE_V3) => {
+                    let _ = records(&tx)?;
+                    let _ = errors(&tx)?;
                 }
                 Some(_) => unreachable!("profile validation rejected unsupported state"),
             }
-            validate_profile(&tx, Some(fs))?;
+            let profile = validate_profile(&tx, Some(fs))?;
+            validate_state(&tx, &profile)?;
             // Incomplete opens have never been exposed or accepted application writes.
             let all = {
                 let mut q = tx.prepare("SELECT record FROM handles").map_err(local)?;
@@ -422,6 +885,16 @@ impl Stage {
                 if !r.ready {
                     tx.execute(
                         "DELETE FROM chunks WHERE handle=?1",
+                        params![r.id.as_slice()],
+                    )
+                    .map_err(local)?;
+                    tx.execute(
+                        "DELETE FROM segments WHERE handle=?1",
+                        params![r.id.as_slice()],
+                    )
+                    .map_err(local)?;
+                    tx.execute(
+                        "DELETE FROM bases WHERE handle=?1",
                         params![r.id.as_slice()],
                     )
                     .map_err(local)?;
@@ -458,13 +931,99 @@ impl Stage {
     pub async fn save(&self, r: Record) -> Result<()> {
         self.call(move |c| save(c, &r)).await
     }
-    pub async fn initial_chunk(&self, id: [u8; 16], index: u64, bytes: Vec<u8>) -> Result<()> {
-        self.call(move |c| put_chunk(c, id, index, &bytes)).await
+    pub async fn base(&self, id: [u8; 16]) -> Result<Option<Base>> {
+        self.call(move |c| base(c, id)).await
     }
-    pub async fn read(&self, id: [u8; 16], offset: u64, length: usize) -> Result<Vec<u8>> {
+    pub async fn segment_ranges(&self, id: [u8; 16]) -> Result<Vec<(u64, u64)>> {
+        self.call(move |c| {
+            let mut query = c
+                .prepare(
+                    "SELECT position,length(data) FROM segments
+                     WHERE handle=?1 ORDER BY position",
+                )
+                .map_err(local)?;
+            query
+                .query_map(params![id.as_slice()], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(local)?
+                .map(|row| {
+                    let (position, length) = row.map_err(local)?;
+                    Ok((positioned(position)?, positioned(length)?))
+                })
+                .collect()
+        })
+        .await
+    }
+    pub async fn segments(&self, id: [u8; 16]) -> Result<Vec<(u64, Vec<u8>)>> {
+        self.call(move |c| {
+            let mut query = c
+                .prepare(
+                    "SELECT position,data FROM segments
+                     WHERE handle=?1 ORDER BY position",
+                )
+                .map_err(local)?;
+            query
+                .query_map(params![id.as_slice()], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(local)?
+                .map(|row| {
+                    let (position, data) = row.map_err(local)?;
+                    Ok((positioned(position)?, data))
+                })
+                .collect()
+        })
+        .await
+    }
+    pub async fn bind_base(&self, id: [u8; 16], descriptor: Vec<u8>, prefix: u64) -> Result<()> {
+        self.call(move |c| {
+            let tx = c.transaction().map_err(local)?;
+            let mut r = record(&tx, id)?;
+            if r.ready {
+                return Err(Error::State(ErrorKind::Busy, "handle is already ready"));
+            }
+            put_base(&tx, id, &descriptor, prefix)?;
+            r.ready = true;
+            save(&tx, &r)?;
+            tx.commit().map_err(local)?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn complete_base(&self, r: Record, descriptor: Vec<u8>) -> Result<()> {
+        self.call(move |c| {
+            let tx = c.transaction().map_err(local)?;
+            put_base(&tx, r.id, &descriptor, r.length)?;
+            tx.execute(
+                "DELETE FROM chunks WHERE handle=?1",
+                params![r.id.as_slice()],
+            )
+            .map_err(local)?;
+            tx.execute(
+                "DELETE FROM segments WHERE handle=?1",
+                params![r.id.as_slice()],
+            )
+            .map_err(local)?;
+            save(&tx, &r)?;
+            tx.commit().map_err(local)?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn read(&self, id: [u8; 16], offset: u64, length: usize) -> Result<StagedRead> {
         self.call(move |c| {
             let r = record(c, id)?;
             let end = offset.saturating_add(length as u64).min(r.length);
+            if offset >= end {
+                return Ok(StagedRead {
+                    bytes: Vec::new(),
+                    base: Vec::new(),
+                });
+            }
+            if let Some(base) = base(c, id)? {
+                return read_sparse(c, id, offset, end, base);
+            }
             let mut result = Vec::new();
             let mut position = offset;
             while position < end {
@@ -476,7 +1035,10 @@ impl Stage {
                 result.extend_from_slice(&bytes[start..start + size]);
                 position += size as u64;
             }
-            Ok(result)
+            Ok(StagedRead {
+                bytes: result,
+                base: Vec::new(),
+            })
         })
         .await
     }
@@ -493,17 +1055,21 @@ impl Stage {
             if bytes.is_empty() {
                 return Ok(offset);
             }
-            let mut position = offset;
-            while position < end {
-                let index = position / CHUNK;
-                let mut block = chunk(&tx, id, index)?;
-                block.resize(CHUNK as usize, 0);
-                let start = (position % CHUNK) as usize;
-                let size = (end - position).min(CHUNK - start as u64) as usize;
-                let source = (position - offset) as usize;
-                block[start..start + size].copy_from_slice(&bytes[source..source + size]);
-                put_chunk(&tx, id, index, &block)?;
-                position += size as u64;
+            if base(&tx, id)?.is_some() {
+                write_sparse(&tx, id, offset, &bytes)?;
+            } else {
+                let mut position = offset;
+                while position < end {
+                    let index = position / CHUNK;
+                    let mut block = chunk(&tx, id, index)?;
+                    block.resize(CHUNK as usize, 0);
+                    let start = (position % CHUNK) as usize;
+                    let size = (end - position).min(CHUNK - start as u64) as usize;
+                    let source = (position - offset) as usize;
+                    block[start..start + size].copy_from_slice(&bytes[source..source + size]);
+                    put_chunk(&tx, id, index, &block)?;
+                    position += size as u64;
+                }
             }
             r.length = r.length.max(end);
             r.local = r
@@ -533,7 +1099,36 @@ impl Stage {
             if length == r.length && !replacement {
                 return Ok(());
             }
-            if length < r.length {
+            if base(&tx, id)?.is_some() {
+                if length < r.length {
+                    tx.execute(
+                        "DELETE FROM segments WHERE handle=?1 AND position>=?2",
+                        params![id.as_slice(), i64::try_from(length).map_err(local)?],
+                    )
+                    .map_err(local)?;
+                    let crossing: Option<(i64, Vec<u8>)> = tx
+                        .query_row(
+                            "SELECT position,data FROM segments
+                             WHERE handle=?1 AND position<?2
+                             ORDER BY position DESC LIMIT 1",
+                            params![id.as_slice(), i64::try_from(length).map_err(local)?],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(local)?;
+                    if let Some((position, data)) = crossing {
+                        let position = positioned(position)?;
+                        if segment_end(position, &data)? > length {
+                            put_segment(&tx, id, position, &data[..(length - position) as usize])?;
+                        }
+                    }
+                    tx.execute(
+                        "UPDATE bases SET prefix=MIN(prefix,?2) WHERE handle=?1",
+                        params![id.as_slice(), i64::try_from(length).map_err(local)?],
+                    )
+                    .map_err(local)?;
+                }
+            } else if length < r.length {
                 tx.execute(
                     "DELETE FROM chunks WHERE handle=?1 AND position>=?2",
                     params![id.as_slice(), length.div_ceil(CHUNK) as i64],
@@ -581,6 +1176,13 @@ impl Stage {
         self.call(move |c| {
             let tx = c.transaction().map_err(local)?;
             tx.execute("DELETE FROM chunks WHERE handle=?1", params![id.as_slice()])
+                .map_err(local)?;
+            tx.execute(
+                "DELETE FROM segments WHERE handle=?1",
+                params![id.as_slice()],
+            )
+            .map_err(local)?;
+            tx.execute("DELETE FROM bases WHERE handle=?1", params![id.as_slice()])
                 .map_err(local)?;
             tx.execute("DELETE FROM handles WHERE id=?1", params![id.as_slice()])
                 .map_err(local)?;
@@ -918,7 +1520,7 @@ mod tests {
         let stage = Stage::open(temp.path().to_owned(), fs).await.unwrap();
         let r = stage.load(id).await.unwrap();
         assert_eq!(borsh::to_vec(&r).unwrap(), bytes);
-        assert_eq!(stage.read(id, 0, 10).await.unwrap(), b"abc");
+        assert_eq!(stage.read(id, 0, 10).await.unwrap().bytes, b"abc");
         let commit = CommitId::generate();
         stage
             .failure(id, Failure::capture(&Error::Unknown(commit)))
@@ -934,7 +1536,7 @@ mod tests {
             Some(commit)
         );
         assert_eq!(stage.load(id).await.unwrap().plan, Some(vec![1, 2, 3]));
-        assert_eq!(stage.read(id, 0, 3).await.unwrap(), b"abc");
+        assert_eq!(stage.read(id, 0, 3).await.unwrap().bytes, b"abc");
         assert_eq!(
             Stage::inspect(path).await.unwrap().handles[0]
                 .error
@@ -943,6 +1545,174 @@ mod tests {
                 .kind(),
             ErrorKind::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn stage_two_chunks_remain_full_materialization_after_upgrade() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        let fs = raw_database(&path, PROFILE_V2, true);
+        let id = [17_u8; 16];
+        let record = Record {
+            id,
+            node: [18_u8; 16],
+            base: [19_u8; 24],
+            length: 16,
+            local: 1,
+            remote: 0,
+            writable: true,
+            ready: true,
+            plan: None,
+            conflict: false,
+            error: None,
+            failure: None,
+        };
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute(
+                "INSERT INTO handles(id,record,failure) VALUES(?1,?2,NULL)",
+                params![id.as_slice(), borsh::to_vec(&record).unwrap()],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO chunks VALUES(?1,0,?2)",
+                params![id.as_slice(), b"old-materialized".as_slice()],
+            )
+            .unwrap();
+        }
+
+        let stage = Stage::open(temp.path().to_owned(), fs).await.unwrap();
+        let read = stage.read(id, 0, 32).await.unwrap();
+        assert_eq!(read.bytes, b"old-materialized");
+        assert!(read.base.is_empty());
+        assert!(stage.base(id).await.unwrap().is_none());
+        let profile: String = stage
+            .db
+            .lock()
+            .await
+            .query_row(
+                "SELECT profile FROM authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(profile, PROFILE_V3);
+    }
+
+    #[tokio::test]
+    async fn sparse_segments_overlay_only_dirty_bytes_and_keep_shrunk_extension_zero() {
+        let backend = crate::support::TestBackend::default();
+        let authority =
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap();
+        let base = b"0123456789abcdef";
+        let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let stage = Stage::open(temp.path().to_owned(), authority.filesystem())
+            .await
+            .unwrap();
+        let id = [21_u8; 16];
+        let record = Record {
+            id,
+            node: *yinyang_core::NodeId::generate().as_bytes(),
+            base: [7; 24],
+            length: base.len() as u64,
+            local: 0,
+            remote: 0,
+            writable: true,
+            ready: false,
+            plan: None,
+            conflict: false,
+            error: None,
+            failure: None,
+        };
+        stage.save(record).await.unwrap();
+        stage
+            .bind_base(id, prepared.descriptor().to_bytes(), base.len() as u64)
+            .await
+            .unwrap();
+
+        stage.write(id, Some(4), b"WXYZ".to_vec()).await.unwrap();
+        let read = stage.read(id, 0, 12).await.unwrap();
+        assert_eq!(&read.bytes[..4], &[0; 4]);
+        assert_eq!(&read.bytes[4..8], b"WXYZ");
+        assert_eq!(&read.bytes[8..], &[0; 4]);
+        assert_eq!(read.base, [0..4, 8..12]);
+        let segments = stage.segments(id).await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0], (4, b"WXYZ".to_vec()));
+
+        stage.truncate(id, 6).await.unwrap();
+        stage.truncate(id, 12).await.unwrap();
+        let read = stage.read(id, 0, 12).await.unwrap();
+        assert_eq!(&read.bytes[..4], &[0; 4]);
+        assert_eq!(&read.bytes[4..6], b"WX");
+        assert_eq!(&read.bytes[6..], &[0; 6]);
+        assert_eq!(read.base.len(), 1);
+        assert_eq!(read.base[0], 0..4);
+    }
+
+    #[tokio::test]
+    async fn sequential_sparse_writes_keep_rows_within_verification_chunks() {
+        let backend = crate::support::TestBackend::default();
+        let authority =
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap();
+        let length = CHUNK * 3;
+        let base = vec![0_u8; length as usize];
+        let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let stage = Stage::open(temp.path().to_owned(), authority.filesystem())
+            .await
+            .unwrap();
+        let id = [22_u8; 16];
+        stage
+            .save(Record {
+                id,
+                node: *NodeId::generate().as_bytes(),
+                base: [8; 24],
+                length,
+                local: 0,
+                remote: 0,
+                writable: true,
+                ready: false,
+                plan: None,
+                conflict: false,
+                error: None,
+                failure: None,
+            })
+            .await
+            .unwrap();
+        stage
+            .bind_base(id, prepared.descriptor().to_bytes(), length)
+            .await
+            .unwrap();
+
+        for offset in (0..CHUNK * 2).step_by(4096) {
+            stage
+                .write(id, Some(offset), vec![0x5a; 4096])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            stage.segment_ranges(id).await.unwrap(),
+            [(0, CHUNK), (CHUNK, CHUNK)]
+        );
+        let read = stage.read(id, CHUNK - 8, 16).await.unwrap();
+        assert_eq!(read.bytes, [0x5a; 16]);
+        assert!(read.base.is_empty());
+
+        stage.truncate(id, CHUNK + 123).await.unwrap();
+        stage.truncate(id, length).await.unwrap();
+        assert_eq!(
+            stage.segment_ranges(id).await.unwrap(),
+            [(0, CHUNK), (CHUNK, 123)]
+        );
+        let read = stage.read(id, CHUNK + 120, 16).await.unwrap();
+        assert_eq!(&read.bytes[..3], &[0x5a; 3]);
+        assert_eq!(&read.bytes[3..], &[0; 13]);
     }
 
     #[test]

@@ -137,12 +137,13 @@ observation instead of continuing to report the finished operation's version.
 For writable volumes, both writable descriptors and read-only descriptors take
 one reference on the node's shared staged version through `Mount::open_node`.
 This keeps a reader on the same accepted dirty view as other descriptors.
-Reads return staged bytes, and `getattr` with an open handle reports the staged
-record's length, so `fstat` and read bytes always describe the same version
-even when the remote side changed. Release and fresh-open rules retain the
-staged-node behavior: only the last clean reference is reclaimed, and a
-references-zero result left by an interrupted operation is reclaimed before a
-later open materializes current remote content.
+Reads overlay exact staged ranges on the node's pinned authenticated base, and
+`getattr` with an open handle reports the staged record's length, so `fstat` and
+read bytes always describe the same version even when the remote side changed.
+Release and fresh-open rules retain the staged-node behavior: only the last
+clean reference is reclaimed, and a references-zero result left by an
+interrupted operation is reclaimed before a later open captures current remote
+metadata.
 
 A clean node is only reclaimed when its last adapter reference is released. If
 an interrupted read still shares the node, reclaim reports busy and the pinned
@@ -157,7 +158,8 @@ while Busy retains all still-pinned or dirty/frozen/error state.
 
 ## Writable callbacks
 
-`write` stages bytes in the shared per-NodeId Mount handle. Each request
+`write` stages only the exact replaced byte ranges in the shared per-NodeId
+Mount handle. Each request
 evaluates the file flags supplied by the kernel. `fcntl(F_SETFL)` can toggle
 `O_APPEND` for later writes. `O_SYNC`/`O_DSYNC` are set at open or carried as
 per-request IOCB sync markers; `F_SETFL` does not toggle them. An append
@@ -366,11 +368,12 @@ for that window; there is no mid-session cancellation signal.
 
 ## Boundaries and known limits
 
-- A writable Managed or Direct open materializes the complete file through its
-  shared staging contract. A read-only whole-volume open pins immutable
-  metadata and reads only authenticated intersecting content ranges. Neither
-  path claims mmap coherence, and `FOPEN_DIRECT_IO` does not provide
-  page-cache-backed mmap behavior.
+- A writable Managed open pins the selected authenticated base and stages only
+  exact dirty ranges; untouched reads fetch authenticated intersecting base
+  ranges. A writable Direct open materializes its raw object. A read-only
+  whole-volume open pins immutable metadata and reads only authenticated
+  intersecting content ranges. None of these paths claims mmap coherence, and
+  `FOPEN_DIRECT_IO` does not provide page-cache-backed mmap behavior.
 - Direct does not claim Managed stable identity, retained unlink reads,
   Managed receipts, cross-object transactions, or atomic rename. External
   replacement changes the next remote inode; open descriptors never rebase.
@@ -385,9 +388,10 @@ for that window; there is no mid-session cancellation signal.
   claimed. A writable mount must not claim that locking is rejected outright,
   because the kernel may return success for its own local lock manager.
 - Node cache lookup and open-gate registration share a short-lived node-map
-  critical section. First materialization or range pinning is serialized per
-  NodeId by that gate; neither lock is held across remote observation or
-  staging I/O, and different nodes initialize independently.
+  critical section. First Managed base capture, Direct materialization, or
+  range pinning is serialized per NodeId by that gate; neither lock is held
+  across remote observation or staging I/O, and different nodes initialize
+  independently.
 - The session `Notifier` serves explicit `SIGHUP` refresh invalidation and the
   pre-open inode attribute invalidation required by read-only range opens.
   There is no automatic external-change watch.
