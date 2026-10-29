@@ -59,6 +59,22 @@ range offsets, proxy chain, and read-only policy. Results from the earlier
 writable FUSE fixtures are not an equivalent control because the writable path
 also exercises publication-capable staging.
 
+Run the matched writable incremental workload for both authorities:
+
+```shell
+cargo x bench-linux-cost \
+  --workload incremental \
+  --incremental-expect baseline \
+  --output target/linux-cost/incremental-baseline.jsonl
+```
+
+Use the same command with `--incremental-expect required` on an implementation
+that must avoid full-file fallback for same-length updates. Required mode fails
+if writable open materializes more than half of the 32 MiB file, or if any
+same-length overwrite plus fsync reads or writes more than half of the file
+through S3. Both proxies stay outside the measured process, so service RPC
+aggregation cannot hide storage GET or PUT work.
+
 The `early` profile runs the small object-authority Sync, FUSE, concurrent-writer,
 and one-shot transfer scenarios. The `full` profile adds the service authority,
 the medium scale, and the explicit service-authority one-shot boundary. The
@@ -116,6 +132,16 @@ without a proxy or TLS termination. Its exact source/binary identities,
 per-batch accounting, memory tradeoff, negative cases, and raw evidence are in
 [`linux-verified-range-reuse.md`](linux-verified-range-reuse.md).
 
+The `incremental` workload uses one 32 MiB writable FUSE file and both object
+and service publication. It measures writable open separately from three
+same-length overwrites: one inside a verification unit, one crossing a 64 KiB
+unit boundary, and one at EOF. Each overwrite is followed by fsync and an
+independent exact-byte check. It also records unchanged fsync, remount plus a
+read spanning the final updates, local staging, retained storage, and negative
+tradeoffs in the raw samples. Length-changing append or truncate behavior is
+covered by functional FUSE acceptance and is not included in the same-length
+fallback assertion.
+
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
@@ -141,6 +167,7 @@ Each JSONL record includes:
 - sampled process `rchar`, `wchar`, syscall counts, and block-layer read/write
   bytes from `/proc/<pid>/io`;
 - S3 requests by HTTP method, total request bytes, and total response bytes;
+- S3 GET response-body bytes and PUT request-body bytes, excluding HTTP headers;
 - service TCP connections and raw framed bytes in both directions;
 - batch totals and per-sample network values, where per-sample divides only a
   sequential batch and explicitly notes that concurrent samples overlap;
