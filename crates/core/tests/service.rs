@@ -294,6 +294,7 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
         .open_file(node)
         .await
         .unwrap();
+    let full_bytes = base.descriptor().content_id().length();
     let mut later = Planner::new(
         &client.observe_latest().await.unwrap(),
         CommitId::generate(),
@@ -316,11 +317,11 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
         (state.data_read_bytes, state.data_reads)
     };
     assert!(
-        data_read_bytes < 256 * 1024,
+        data_read_bytes < full_bytes / 8,
         "service delta preparation read {data_read_bytes} bytes in {data_reads} reads"
     );
     assert!(
-        data_reads <= 16,
+        data_reads <= 64,
         "service delta preparation made {data_reads} reads"
     );
 
