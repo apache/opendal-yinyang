@@ -207,6 +207,10 @@ impl FileVersion {
             NodeKind::Directory { .. } => unreachable!("FileVersion requires a file node"),
         }
     }
+    /// Recover readiness for this exact published version without reading payload.
+    pub fn prepared_content(&self) -> Result<PreparedContent> {
+        self.data.published(self.descriptor().clone())
+    }
     /// Return up to EOF. Memory is proportional to returned bytes; use
     /// read_range with a streaming destination for large transfers.
     pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {

@@ -40,6 +40,7 @@ pub use crate::snapshot::{
 };
 use crate::snapshot::{RecordReader, RevisionWire, Rows, Table};
 use futures_util::future::BoxFuture;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 type SnapshotWire = (
@@ -309,6 +310,22 @@ impl ObjectFs {
             .load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
             .await?
             .view())
+    }
+    pub(crate) async fn retained_revisions(&self) -> Result<Vec<Revision>> {
+        let latest = self.observe_state().await?;
+        let rows = latest
+            .history
+            .scan(&self.data, None, &[], None, None, usize::MAX)
+            .await?;
+        let mut revisions = BTreeSet::from([latest.revision]);
+        for (key, value) in rows {
+            let key = key
+                .try_into()
+                .map_err(|_| corrupt("invalid retained revision key"))?;
+            let _: PackedRef = PackedRef::from_wire(decode(&value)?)?;
+            revisions.insert(Revision::from_bytes(key));
+        }
+        Ok(revisions.into_iter().collect())
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self

@@ -175,6 +175,35 @@ impl PreparedContent {
     }
 }
 
+/// One fixed-offset replacement in an authenticated immutable-base update.
+#[derive(Clone, Debug)]
+pub struct ContentEdit<'a> {
+    range: Range<u64>,
+    bytes: &'a [u8],
+}
+
+impl<'a> ContentEdit<'a> {
+    pub fn new(range: Range<u64>, bytes: &'a [u8]) -> Result<Self> {
+        let replacement_length = u64::try_from(bytes.len())
+            .map_err(|_| Error::invalid("define content edit", "length overflows"))?;
+        if range.start > range.end || range.end - range.start != replacement_length {
+            return Err(Error::invalid(
+                "define content edit",
+                "replacement range and byte length differ",
+            ));
+        }
+        Ok(Self { range, bytes })
+    }
+
+    pub fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
 /// Immutable data binding for one filesystem and one storage operator.
 ///
 /// Clones share preparation authority. A separately constructed binding cannot
@@ -417,17 +446,42 @@ impl DataStore {
         range: Range<u64>,
         bytes: &[u8],
     ) -> Result<PreparedContent> {
+        let edit = ContentEdit::new(range, bytes)?;
+        self.overwrite_prepared_ranges(file, &[edit]).await
+    }
+
+    /// Apply bounded, non-overlapping fixed-offset updates to trusted content.
+    ///
+    /// The returned content has the same logical length as `file`. One new
+    /// immutable pack contains all replacement leaves and rebuilt hash paths.
+    pub async fn overwrite_prepared_ranges(
+        &self,
+        file: &PreparedContent,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
         let descriptor = self.accept(file)?;
-        if range.start > range.end
-            || range.end > descriptor.length
-            || range.end - range.start != bytes.len() as u64
-        {
+        if edits.iter().any(|edit| edit.range.end > descriptor.length) {
             return Err(Error::invalid(
                 "overwrite prepared content",
-                "invalid replacement range",
+                "edit exceeds logical length",
             ));
         }
-        if range.is_empty() {
+        let mut edits = edits
+            .iter()
+            .filter(|edit| !edit.range.is_empty())
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| edit.range.start);
+        let mut previous_end = None;
+        for edit in &edits {
+            if previous_end.is_some_and(|end| edit.range.start < end) {
+                return Err(Error::invalid(
+                    "overwrite prepared content",
+                    "edits overlap",
+                ));
+            }
+            previous_end = Some(edit.range.end);
+        }
+        if edits.is_empty() {
             return Ok(file.clone());
         }
         let mut pack = Pack::new(self).await?;
@@ -437,8 +491,7 @@ impl DataStore {
                 0,
                 leaves(descriptor.length),
                 descriptor.length,
-                &range,
-                bytes,
+                &edits,
                 &mut pack,
             )
             .await;
@@ -463,8 +516,7 @@ impl DataStore {
         start: u64,
         count: u64,
         length: u64,
-        range: &Range<u64>,
-        replacement: &[u8],
+        edits: &[&ContentEdit<'_>],
         pack: &mut Pack,
     ) -> Result<Child> {
         let offset = start * BLOCK_BYTES as u64;
@@ -473,7 +525,10 @@ impl DataStore {
             .and_then(|n| n.checked_mul(BLOCK_BYTES as u64))
             .unwrap_or(u64::MAX)
             .min(length);
-        if range.end <= offset || range.start >= subtree_end {
+        let first = edits.partition_point(|edit| edit.range.end <= offset);
+        let end = edits.partition_point(|edit| edit.range.start < subtree_end);
+        let edits = &edits[first..end];
+        if edits.is_empty() {
             return Ok(child.clone());
         }
         match self.node(child, start, count, None).await? {
@@ -482,32 +537,26 @@ impl DataStore {
                     .unit(&reference, child.hash, start, length, None)
                     .await?
                     .to_vec();
-                let begin = range.start.max(offset);
-                let end = range.end.min(subtree_end);
-                bytes[(begin - offset) as usize..(end - offset) as usize].copy_from_slice(
-                    &replacement[(begin - range.start) as usize..(end - range.start) as usize],
-                );
+                for edit in edits {
+                    let begin = edit.range.start.max(offset);
+                    let end = edit.range.end.min(subtree_end);
+                    bytes[(begin - offset) as usize..(end - offset) as usize].copy_from_slice(
+                        &edit.bytes[(begin - edit.range.start) as usize
+                            ..(end - edit.range.start) as usize],
+                    );
+                }
                 pack.leaf(start, &bytes).await
             }
             HashNode::Branch(left, right) => {
                 let left_count = split(count);
-                let left = Box::pin(self.patch(
-                    &left,
-                    start,
-                    left_count,
-                    length,
-                    range,
-                    replacement,
-                    pack,
-                ))
-                .await?;
+                let left =
+                    Box::pin(self.patch(&left, start, left_count, length, edits, pack)).await?;
                 let right = Box::pin(self.patch(
                     &right,
                     start + left_count,
                     count - left_count,
                     length,
-                    range,
-                    replacement,
+                    edits,
                     pack,
                 ))
                 .await?;
@@ -1077,6 +1126,8 @@ mod tests {
             .as_str(),
             "4a9449de9b3ed735f25145e7ec1dbf209b8b698092e29a7f476215dcd1c8ced3"
         );
+        assert!(ContentEdit::new(2..1, b"x").is_err());
+        assert!(ContentEdit::new(0..2, b"x").is_err());
     }
 
     #[tokio::test]
@@ -1154,6 +1205,70 @@ mod tests {
             store.import(file.descriptor()).await.unwrap_err().kind(),
             crate::ErrorKind::Corrupt,
             "import must independently verify storage rather than promote cached reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_bounded_edits_reuse_the_trusted_base_and_reject_overlap() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let bytes = (0..BLOCK_BYTES * 64 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+        let edits = [
+            ContentEdit::new(3..7, b"abcd").unwrap(),
+            ContentEdit::new(BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3, b"01234").unwrap(),
+            ContentEdit::new(bytes.len() as u64 - 2..bytes.len() as u64, b"xy").unwrap(),
+        ];
+
+        backend.state.lock().unwrap().data_read_bytes = 0;
+        let patched = store
+            .overwrite_prepared_ranges(&file, &edits)
+            .await
+            .unwrap();
+        assert!(
+            backend.state.lock().unwrap().data_read_bytes < (BLOCK_BYTES * 8) as u64,
+            "multiple small edits must not read the complete base"
+        );
+        let mut expected = bytes.clone();
+        for (range, replacement) in [
+            (3..7, b"abcd".as_slice()),
+            (
+                BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3,
+                b"01234".as_slice(),
+            ),
+            (bytes.len() as u64 - 2..bytes.len() as u64, b"xy".as_slice()),
+        ] {
+            expected[range.start as usize..range.end as usize].copy_from_slice(replacement);
+        }
+        let complete = store.prepare(&mut expected.as_slice()).await.unwrap();
+        assert_eq!(patched.content_id(), complete.content_id());
+
+        backend.state.lock().unwrap().data_reads = 0;
+        let overlap = [
+            ContentEdit::new(1..4, b"abc").unwrap(),
+            ContentEdit::new(3..5, b"de").unwrap(),
+        ];
+        assert_eq!(
+            store
+                .overwrite_prepared_ranges(&file, &overlap)
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Invalid
+        );
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+        let past_end =
+            ContentEdit::new(bytes.len() as u64 + 1..bytes.len() as u64 + 1, b"").unwrap();
+        assert_eq!(
+            store
+                .overwrite_prepared_ranges(&file, &[past_end])
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Invalid
         );
     }
 
