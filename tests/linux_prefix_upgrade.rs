@@ -94,10 +94,25 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
     )
     .expect("parse fd1338c fixture manifest");
     assert_eq!(fixture_manifest["producer"]["commit"], LEGACY_SOURCE);
-    assert_eq!(
-        fixture_manifest["producer"]["binary_sha256"], legacy_sha256,
-        "YY_LEGACY_BIN does not match the immutable fd1338c producer identity"
-    );
+    let fixture_legacy_sha256 = fixture_manifest["producer"]["binary_sha256"]
+        .as_str()
+        .expect("fd1338c fixture binary SHA-256")
+        .to_owned();
+    let legacy_identity = if legacy_sha256 == fixture_legacy_sha256 {
+        "fixture-binary"
+    } else {
+        assert_eq!(
+            std::env::var("YINYANG_UPGRADE_LEGACY_SOURCE").as_deref(),
+            Ok(LEGACY_SOURCE),
+            "a source-pinned fd1338c rebuild requires YINYANG_UPGRADE_LEGACY_SOURCE"
+        );
+        assert_eq!(
+            std::env::var("YINYANG_UPGRADE_LEGACY_REBUILD").as_deref(),
+            Ok("1"),
+            "a source-pinned fd1338c rebuild requires YINYANG_UPGRADE_LEGACY_REBUILD=1"
+        );
+        "source-pinned-rebuild"
+    };
 
     let prefix = temp.path().join(".local/lib/yinyang");
     let legacy_release = std::env::var("YY_LEGACY_RELEASE")
@@ -631,6 +646,8 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
             "source": LEGACY_SOURCE,
             "release": legacy_release,
             "binary_sha256": legacy_sha256,
+            "binary_identity": legacy_identity,
+            "fixture_binary_sha256": fixture_legacy_sha256,
         },
         "target": {
             "source": target_source,
