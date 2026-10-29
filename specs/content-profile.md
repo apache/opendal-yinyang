@@ -145,6 +145,35 @@ use a prepared handle and read only affected old units; shared subtrees retain
 their previous readiness evidence. A serialized descriptor must first be
 imported, not promoted through a no-op update.
 
+`FileVersion::prepared_content` recovers readiness for an exact selected
+published file version without reading payload. `ContentEdit` describes one
+fixed-offset replacement whose range length equals its bytes.
+`Authority::prepare_overwrite` accepts that exact `FileVersion` plus a set of
+edits, and rejects an edit outside the logical length, overlapping edits, or a
+base from another data binding. The object and embedded-service bindings apply
+all edits in one new immutable pack while reusing unaffected subtrees.
+`DataStore::overwrite_prepared` remains the single-edit form of the same trusted
+operation.
+
+The authenticated loopback service does not turn a returned descriptor into
+local evidence by importing the complete file. Its fallible preparation request
+names the exact retained revision, NodeId, and bounded edits. The service
+reopens that published version from its own metadata authority, applies the
+edits through its data binding, verifies the new pack, records the resulting
+descriptor as durably ready, and only then returns it. An unknown or unretained
+revision, missing or non-file NodeId, and wrong service binding are rejected
+before payload reads. A retained older revision remains a valid base; its
+original file predicates determine whether later publication succeeds. The
+authenticated client may use the returned descriptor as service-issued
+readiness, but cannot reinterpret cached read bytes or an arbitrary serialized
+descriptor as preparation evidence.
+
+The delta operation is same-length only. Append, truncate, hole extension, and
+any replacement whose final logical length differs use complete-source
+preparation. Choosing the exact selected base does not rebase a frozen
+transaction and does not weaken its original predicates: publication still
+returns Conflict when the selected file state no longer matches.
+
 The storage backend must provide durable immutable writes and subsequent read
 visibility. External mutation/deletion is outside the contract. This in-process
 evidence is not an authentication protocol for an untrusted remote caller.

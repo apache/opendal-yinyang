@@ -217,6 +217,17 @@ must authenticate or independently validate evidence crossing its process or
 trust boundary; an opaque handle safe inside one process is not sufficient for
 an untrusted remote caller.
 
+For a same-length fixed-offset update, the caller selects the exact published
+`FileVersion` rather than re-observing latest. The binding authenticates the
+affected index nodes and data units, writes replacement leaves and rebuilt hash
+paths to a new immutable pack, and reuses unaffected published extents under
+their existing readiness evidence. It does not scan all unchanged bytes. A
+cross-binding base, out-of-bounds or overlapping edit, or corrupt affected
+proof returns no prepared content. Append, truncate, and other length-changing
+updates continue through complete-source preparation. Selecting an old base
+does not rebase a frozen transaction; original predicates still decide whether
+publication succeeds.
+
 Data, hashes, and metadata may be prepared concurrently or packed together when
 dependencies allow. Only publication waits for the complete transitive set of
 referenced bytes to be ready. An incomplete or ambiguous upload produces no

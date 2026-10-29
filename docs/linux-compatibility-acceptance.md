@@ -28,7 +28,9 @@ them:
   boundary to create frozen directory, Mount and Sync requests; current
   processes reopen and retry the original CommitId/digest/bytes while newer
   local work remains a separate pending edit;
-- `fd1338c` processes read state written by the current binary;
+- `fd1338c` processes read current state whose profile is unchanged; current
+  stage-3 file staging is a one-way upgrade, and the legacy binary rejects it
+  without changing authoritative bytes;
 - unknown or malformed persistent profiles are rejected at their format
   boundary while the authoritative main databases, any existing WAL or
   journal bytes, logical rows, retained content and recovery state remain

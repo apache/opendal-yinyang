@@ -99,6 +99,23 @@ fn compatibility_fd1338c_object_stage_and_journal_cross_both_binaries() {
     let handle = fixture["stage_pending"]["handle"]
         .as_str()
         .expect("pending handle");
+    let legacy_read = storage.run(
+        &legacy,
+        &[
+            "--volume",
+            stage_config.to_str().unwrap(),
+            "file",
+            "read",
+            handle,
+            "--length",
+            "4096",
+        ],
+    );
+    legacy_read.success_or("fd1338c reader on its pending staging");
+    assert_eq!(
+        sha256(&legacy_read.stdout),
+        fixture["stage_pending"]["bytes_sha256"].as_str().unwrap()
+    );
     let current_read = storage.run(
         &current,
         &[
@@ -126,7 +143,13 @@ fn compatibility_fd1338c_object_stage_and_journal_cross_both_binaries() {
         "fd1338c pending state was not retained:\n{}",
         pending_status.text()
     );
-    let legacy_read = storage.run(
+    let databases = [stage.join("staging.db")];
+    let wal = stage.join("staging.db-wal");
+    if wal.try_exists().unwrap() && wal.metadata().unwrap().len() == 0 {
+        fs::remove_file(&wal).unwrap();
+    }
+    let before_legacy_upgrade_rejection = authoritative_tree(&stage, &databases);
+    let legacy_stage_three = storage.run(
         &legacy,
         &[
             "--volume",
@@ -138,8 +161,24 @@ fn compatibility_fd1338c_object_stage_and_journal_cross_both_binaries() {
             "4096",
         ],
     );
-    legacy_read.success_or("fd1338c reader on current pending staging");
-    assert_eq!(legacy_read.stdout, current_read.stdout);
+    assert!(
+        !legacy_stage_three.status.success(),
+        "fd1338c unexpectedly accepted current stage-3 state"
+    );
+    let diagnostic = legacy_stage_three.text().to_ascii_lowercase();
+    assert!(
+        diagnostic.contains("profile")
+            || diagnostic.contains("unsupported")
+            || diagnostic.contains("schema"),
+        "fd1338c did not reject stage-3 at the profile boundary:\n{}",
+        legacy_stage_three.text()
+    );
+    assert_authoritative_state_unchanged(
+        &stage,
+        &before_legacy_upgrade_rejection,
+        &databases,
+        "fd1338c stage-3 rejection",
+    );
     storage
         .run(
             &current,
@@ -152,20 +191,6 @@ fn compatibility_fd1338c_object_stage_and_journal_cross_both_binaries() {
             ],
         )
         .success_or("current publication of fd1338c pending bytes");
-    let after_fsync = storage.run(
-        &legacy,
-        &[
-            "--volume",
-            stage_config.to_str().unwrap(),
-            "file",
-            "read",
-            handle,
-            "--length",
-            "4096",
-        ],
-    );
-    after_fsync.success_or("fd1338c read after current fsync");
-    assert_eq!(after_fsync.stdout, current_read.stdout);
     storage
         .run(
             &current,

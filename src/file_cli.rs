@@ -290,7 +290,7 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
         }
     }
     let Command::File { command } = command else {
-        return Err("with --volume use mount, file, sync, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve".into());
+        return Err("with --volume use mount, file, sync, space, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve".into());
     };
     let volume = Volume::open(config, operator, token).await?;
     let runtime = volume.runtime();
