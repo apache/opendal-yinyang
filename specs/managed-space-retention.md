@@ -128,6 +128,11 @@ read-only replica status does not expose the stored common baseline, so
 unchanged. A failure to open the bound local root marks replica evidence
 unavailable rather than fabricating zero.
 
+The JSON document exposes these joins as `staging.sync` and `staging.replica`.
+Missing files report `missing`; malformed or unknown existing databases report
+`unavailable` with their error and are not repaired. `staging.databases` records
+each observed database role separately.
+
 Directory measurement reports regular-file count and apparent file length. It
 does not follow symbolic links and does not claim allocated disk blocks. The
 directory walk is non-atomic.
@@ -158,6 +163,17 @@ declarative protection evidence, not deletion eligibility. Every revision
 outside a bounded selection remains visible with
 `outside_bounded_policy`; the plan never treats that reason as permission to
 remove data.
+
+Selection reasons are drawn from:
+
+- `current`, `keep_all`, `keep_last`, and `requested_pin`;
+- `staging_pending`, `staging_frozen`, `staging_unknown`,
+  `staging_conflict`, and `staging_failed`;
+- `sync_namespace_pending`, `sync_namespace_unknown`,
+  `sync_namespace_receipt`, `sync_namespace_conflict`,
+  `sync_namespace_retryable`, and `sync_namespace_failed`;
+- `sync_receipt`; and
+- `replica_conflict`.
 
 The plan also reports:
 
