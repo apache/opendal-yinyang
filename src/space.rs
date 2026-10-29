@@ -23,9 +23,7 @@
 
 #[cfg(target_os = "linux")]
 use crate::replica::Replica;
-use crate::runtime::{
-    ErrorKind as RuntimeErrorKind, HandleStatus, Runtime, RuntimeStatus, WritebackError,
-};
+use crate::runtime::{ErrorKind as RuntimeErrorKind, Runtime};
 use crate::sync::{NamespaceState, NamespaceStatus, Sync};
 use opendal::{EntryMode, Operator};
 use serde::Serialize;
