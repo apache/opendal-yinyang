@@ -254,7 +254,7 @@ impl Runtime {
                 "file exceeds staging length limit",
             ));
         }
-        let mut r = Record {
+        let r = Record {
             id: *uuid::Uuid::new_v4().as_bytes(),
             node: *node.as_bytes(),
             base: snapshot.revision().to_bytes(),

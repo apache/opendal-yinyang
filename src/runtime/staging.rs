@@ -299,7 +299,7 @@ fn base(c: &Connection, id: [u8; 16]) -> Result<Option<Base>> {
 }
 fn put_base(c: &Connection, id: [u8; 16], descriptor: &[u8], prefix: u64) -> Result<()> {
     let descriptor = ContentDescriptor::from_bytes(descriptor)?;
-    if prefix > descriptor.length() {
+    if prefix > descriptor.content_id().length() {
         return Err(Error::State(
             ErrorKind::Corrupt,
             "staging base prefix exceeds content length",
@@ -468,7 +468,7 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
             ));
         }
         let prefix = positioned(prefix)?;
-        if prefix > descriptor.length() {
+        if prefix > descriptor.content_id().length() {
             return Err(Error::State(
                 ErrorKind::Corrupt,
                 "staging base prefix exceeds content length",
