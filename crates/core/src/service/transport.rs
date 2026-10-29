@@ -41,6 +41,7 @@ enum Command {
     Scan([u8; 24], u8, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, u32),
     Register(Vec<u8>),
     Commit(Vec<Vec<u8>>),
+    PrepareOverwrite([u8; 24], [u8; 16], Vec<(u64, u64, Vec<u8>)>),
 }
 #[derive(BorshSerialize, BorshDeserialize)]
 enum Response {
@@ -50,6 +51,7 @@ enum Response {
     Registered,
     Outcomes(Vec<(u8, Vec<u8>)>),
     Error(u8, String),
+    Prepared(Vec<u8>),
 }
 fn io(e: std::io::Error) -> Error {
     Error::from_io("metadata RPC", e)
@@ -115,6 +117,21 @@ mod error_tests {
             assert_eq!(tag_kind(tag as u8).unwrap(), kind);
         }
         assert!(tag_kind(255).is_err());
+    }
+
+    #[test]
+    fn appended_overwrite_variants_preserve_existing_wire_tags() {
+        assert_eq!(borsh::to_vec(&Command::Register(vec![])).unwrap()[0], 3);
+        assert_eq!(borsh::to_vec(&Command::Commit(vec![])).unwrap()[0], 4);
+        assert_eq!(
+            borsh::to_vec(&Command::PrepareOverwrite([0; 24], [0; 16], vec![])).unwrap()[0],
+            5
+        );
+        assert_eq!(
+            borsh::to_vec(&Response::Error(0, String::new())).unwrap()[0],
+            5
+        );
+        assert_eq!(borsh::to_vec(&Response::Prepared(vec![])).unwrap()[0], 6);
     }
 }
 async fn read_frame<T: BorshDeserialize>(stream: &mut TcpStream) -> Result<T> {
@@ -253,6 +270,23 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 .register(&ContentDescriptor::from_bytes(&bytes)?)
                 .await?;
             Response::Registered
+        }
+        Command::PrepareOverwrite(revision, node, changes) => {
+            if changes.len() > 4096 {
+                return Err(protocol());
+            }
+            let changes = changes
+                .iter()
+                .map(|(start, end, bytes)| ContentEdit::new(*start..*end, bytes))
+                .collect::<Result<Vec<_>>>()?;
+            let content = service
+                .prepare_overwrite_version(
+                    Revision::from_bytes(revision),
+                    NodeId::from_bytes(node),
+                    &changes,
+                )
+                .await?;
+            Response::Prepared(content.descriptor().to_bytes())
         }
         Command::Commit(plans) => {
             if plans.len() > 4096 {
@@ -393,6 +427,45 @@ impl ServiceClient {
         let content = self.data.prepare(source).await?;
         self.register(&content).await?;
         Ok(content)
+    }
+    pub async fn prepare_overwrite(
+        &self,
+        base: &FileVersion,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        if base.descriptor().filesystem() != self.filesystem {
+            return Err(Error::invalid(
+                "prepare service overwrite",
+                "base belongs to another filesystem",
+            ));
+        }
+        let changes = edits
+            .iter()
+            .map(|edit| {
+                let range = edit.range();
+                (range.start, range.end, edit.bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let response = rpc(
+            self.addr,
+            &self.token,
+            Command::PrepareOverwrite(
+                base.revision().to_bytes(),
+                *base.node().id().as_bytes(),
+                changes,
+            ),
+        )
+        .await?;
+        let Response::Prepared(bytes) = response else {
+            return Err(protocol());
+        };
+        let descriptor = ContentDescriptor::from_bytes(&bytes)?;
+        if descriptor.filesystem() != self.filesystem
+            || descriptor.content_id().length() != base.descriptor().content_id().length()
+        {
+            return Err(protocol());
+        }
+        self.data.published(descriptor)
     }
     pub async fn register(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?;
