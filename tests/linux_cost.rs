@@ -462,6 +462,20 @@ fn linux_cost_benchmark() {
         (Profile::Full, PublicationFilter::Object) => &[Publication::Object],
         (Profile::Full, PublicationFilter::Service) => &[Publication::Service],
     };
+    if matches!(workload, Workload::Incremental) {
+        for &publication in publications {
+            run_incremental_matrix(
+                &context,
+                &proxy,
+                publication,
+                Scale::Medium,
+                incremental_expectation,
+                &mut recorder,
+            );
+        }
+        recorder.finish();
+        return;
+    }
     let scales: &[Scale] = match (workload, profile) {
         (Workload::ReadOnlyRange, _) | (Workload::Full, Profile::Full) => {
             &[Scale::Small, Scale::Medium]
@@ -476,20 +490,6 @@ fn linux_cost_benchmark() {
             for &scale in scales {
                 run_read_only_range_matrix(&context, &proxy, publication, scale, &mut recorder);
             }
-        }
-        recorder.finish();
-        return;
-    }
-    if matches!(workload, Workload::Incremental) {
-        for &publication in publications {
-            run_incremental_matrix(
-                &context,
-                &proxy,
-                publication,
-                Scale::Medium,
-                incremental_expectation,
-                &mut recorder,
-            );
         }
         recorder.finish();
         return;
