@@ -144,6 +144,10 @@ fn compatibility_fd1338c_object_stage_and_journal_cross_both_binaries() {
         pending_status.text()
     );
     let databases = [stage.join("staging.db")];
+    let wal = stage.join("staging.db-wal");
+    if wal.try_exists().unwrap() && wal.metadata().unwrap().len() == 0 {
+        fs::remove_file(&wal).unwrap();
+    }
     let before_legacy_upgrade_rejection = authoritative_tree(&stage, &databases);
     let legacy_stage_three = storage.run(
         &legacy,
