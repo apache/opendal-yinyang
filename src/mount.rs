@@ -105,7 +105,7 @@ impl Mount {
             if !state.pending && !state.frozen && state.error.is_none() {
                 // Clean observations are disposable. This also collects a
                 // replacement materialized before an interrupted refresh.
-                runtime.recover(state.id).await?.abort().await?;
+                runtime.discard_clean(state.id).await?;
                 continue;
             }
             if nodes.contains_key(&state.node) {

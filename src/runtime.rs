@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome, NodeId, Planner, Receipt, Revision, Snapshot,
+    Authority, CommitId, CommitOutcome, ContentDescriptor, FileVersion, NodeId, Planner, Receipt,
+    Revision, Snapshot,
 };
 
 mod staging;
@@ -158,15 +159,44 @@ impl Runtime {
         if !r.ready {
             return Err(Error::Invalid("incomplete open is not recoverable"));
         }
-        self.claim(r.id)
+        let base = self.recover_base(&r).await?;
+        self.claim(r.id, base)
     }
-    fn claim(&self, id: [u8; 16]) -> Result<FileHandle> {
+    pub(crate) async fn discard_clean(&self, id: uuid::Uuid) -> Result<()> {
+        let r = self.inner.stage.load(*id.as_bytes()).await?;
+        if !r.ready || r.local != r.remote || r.plan.is_some() || r.conflict || r.error.is_some() {
+            return Err(Error::State(
+                ErrorKind::Busy,
+                "handle is not a disposable clean observation",
+            ));
+        }
+        self.inner.stage.remove(r.id).await
+    }
+    async fn recover_base(&self, r: &Record) -> Result<Option<FileVersion>> {
+        let Some(stored) = self.inner.stage.base(r.id).await? else {
+            return Ok(None);
+        };
+        let snapshot = self
+            .authority()
+            .observe_revision(Revision::from_bytes(r.base))
+            .await?;
+        let file = snapshot.open_file(NodeId::from_bytes(r.node)).await?;
+        if file.descriptor().to_bytes() != stored.descriptor {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base does not match the retained published version",
+            ));
+        }
+        Ok(Some(file))
+    }
+    fn claim(&self, id: [u8; 16], base: Option<FileVersion>) -> Result<FileHandle> {
         if !self.inner.active.lock().map_err(Error::local)?.insert(id) {
             return Err(Error::State(ErrorKind::Busy, "handle already active"));
         }
         Ok(FileHandle {
             runtime: self.clone(),
             id,
+            base,
             closed: false,
         })
     }
@@ -234,20 +264,11 @@ impl Runtime {
             failure: None,
         };
         self.inner.stage.save(r.clone()).await?;
-        let mut offset = 0;
-        while offset < r.length {
-            let end = (offset + CHUNK).min(r.length);
-            let mut bytes = Vec::new();
-            file.read_range(offset..end, &mut bytes).await?;
-            self.inner
-                .stage
-                .initial_chunk(r.id, offset / CHUNK, bytes)
-                .await?;
-            offset = end;
-        }
-        r.ready = true;
-        self.inner.stage.save(r.clone()).await?;
-        self.claim(r.id)
+        self.inner
+            .stage
+            .bind_base(r.id, file.descriptor().to_bytes(), r.length)
+            .await?;
+        self.claim(r.id, Some(file))
     }
     /// Namespace operations publish explicit transactions. Unknown outcomes carry
     /// an identity and must be resolved through the authority's receipt API.
@@ -423,6 +444,37 @@ fn outcome(outcome: CommitOutcome) -> Result<Receipt> {
         CommitOutcome::Unknown(id) => Err(Error::Unknown(id)),
     }
 }
+async fn read_staged(
+    stage: &Stage,
+    base: Option<&FileVersion>,
+    id: [u8; 16],
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let staged = stage.read(id, offset, length).await?;
+    let mut bytes = staged.bytes;
+    if staged.base.is_empty() {
+        return Ok(bytes);
+    }
+    let base = base.ok_or(Error::State(
+        ErrorKind::Corrupt,
+        "sparse staging has no retained base observation",
+    ))?;
+    for range in staged.base {
+        let mut remote = Vec::new();
+        base.read_range(range.clone(), &mut remote).await?;
+        if remote.len() as u64 != range.end - range.start {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "retained base returned an incomplete staged range",
+            ));
+        }
+        let start = (range.start - offset) as usize;
+        let end = (range.end - offset) as usize;
+        bytes[start..end].copy_from_slice(&remote);
+    }
+    Ok(bytes)
+}
 
 /// Not cloneable: one caller owns each handle's mutation/publication lifecycle.
 /// Dropping a handle releases only its in-process lease, never publishes or
@@ -430,6 +482,7 @@ fn outcome(outcome: CommitOutcome) -> Result<Receipt> {
 pub struct FileHandle {
     runtime: Runtime,
     id: [u8; 16],
+    base: Option<FileVersion>,
     closed: bool,
 }
 impl Drop for FileHandle {
@@ -462,7 +515,14 @@ impl FileHandle {
     }
     pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
         self.live()?;
-        let result = self.runtime.inner.stage.read(self.id, offset, length).await;
+        let result = read_staged(
+            &self.runtime.inner.stage,
+            self.base.as_ref(),
+            self.id,
+            offset,
+            length,
+        )
+        .await;
         self.report(result).await
     }
     pub async fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -527,7 +587,15 @@ impl FileHandle {
             let mut plan = Planner::new(&snapshot, CommitId::generate());
             plan.set_executable(node, executable).await?;
             let receipt = outcome(self.runtime.authority().commit(&plan.finish()?).await?)?;
+            let base = self
+                .runtime
+                .authority()
+                .observe_revision(receipt.cursor.revision)
+                .await?
+                .open_file(node)
+                .await?;
             self.advance_clean_base(receipt.cursor.revision).await?;
+            self.base = Some(base);
             Ok(receipt)
         }
         .await;
@@ -614,11 +682,13 @@ impl FileHandle {
         } else {
             let (mut source, mut sink) = tokio::io::duplex(CHUNK as usize);
             let staged = stage.clone();
+            let base = self.base.clone();
             let (id, length) = (self.id, r.length);
             let producer = tokio::spawn(async move {
                 let mut offset = 0;
                 while offset < length {
-                    let bytes = staged.read(id, offset, CHUNK as usize).await?;
+                    let bytes =
+                        read_staged(&staged, base.as_ref(), id, offset, CHUNK as usize).await?;
                     if bytes.is_empty() {
                         return Err(Error::Invalid("staged data ended early"));
                     }
@@ -655,13 +725,28 @@ impl FileHandle {
             }
             Ok(outcome) => match outcome {
                 CommitOutcome::Committed(receipt) => {
+                    let node = NodeId::from_bytes(r.node);
+                    let base = self
+                        .runtime
+                        .authority()
+                        .observe_revision(receipt.cursor.revision)
+                        .await?
+                        .open_file(node)
+                        .await?;
+                    if base.descriptor().content_id().length() != r.length {
+                        return Err(Error::State(
+                            ErrorKind::Corrupt,
+                            "published base length does not match committed content",
+                        ));
+                    }
                     r.base = receipt.cursor.revision.to_bytes();
                     r.remote = r.local;
                     r.plan = None;
                     r.error = None;
                     r.failure = None;
                     r.conflict = false;
-                    stage.save(r).await?;
+                    stage.complete_base(r, base.descriptor().to_bytes()).await?;
+                    self.base = Some(base);
                     if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
                         errors.remove(&self.id);
                     }
