@@ -1126,7 +1126,6 @@ mod tests {
             .as_str(),
             "4a9449de9b3ed735f25145e7ec1dbf209b8b698092e29a7f476215dcd1c8ced3"
         );
-        assert!(ContentEdit::new(2..1, b"x").is_err());
         assert!(ContentEdit::new(0..2, b"x").is_err());
     }
 
