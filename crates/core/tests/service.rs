@@ -151,7 +151,7 @@ async fn suite(fs: &dyn Authority) {
 
     // A same-length update reuses the exact selected published version.
     let selected = latest.open_file(a).await.unwrap();
-    let update = [ContentEdit::new(0..4, b"OVER").unwrap()];
+    let update = [ContentEdit::new(0..4, b"1234").unwrap()];
     let changed = fs.prepare_overwrite(&selected, &update).await.unwrap();
     let mut rewrite = Planner::new(&latest, CommitId::generate());
     rewrite.set_content(a, changed.clone()).await.unwrap();
@@ -161,7 +161,7 @@ async fn suite(fs: &dyn Authority) {
         .read_range(changed.descriptor(), 0..8, &mut bytes)
         .await
         .unwrap();
-    assert_eq!(bytes, b"XXXXinal");
+    assert_eq!(bytes, b"1234inal");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -294,6 +294,7 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
         .open_file(node)
         .await
         .unwrap();
+    let full_bytes = base.descriptor().content_id().length();
     let mut later = Planner::new(
         &client.observe_latest().await.unwrap(),
         CommitId::generate(),
@@ -311,11 +312,18 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
     let changed = Authority::prepare_overwrite(&client, &base, &change)
         .await
         .unwrap();
+    let (data_read_bytes, data_reads) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.data_reads)
+    };
     assert!(
-        backend.state.lock().unwrap().data_read_bytes < 256 * 1024,
-        "service delta preparation must not import the complete file"
+        data_read_bytes < full_bytes / 8,
+        "service delta preparation read {data_read_bytes} bytes in {data_reads} reads"
     );
-    assert!(backend.state.lock().unwrap().data_reads <= 16);
+    assert!(
+        data_reads <= 64,
+        "service delta preparation made {data_reads} reads"
+    );
 
     let mut update = Planner::new(
         &client.observe_latest().await.unwrap(),

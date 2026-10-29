@@ -64,11 +64,14 @@ A same-length fixed-offset update has a separate trusted path.
 authenticated client does not register or import the whole result. Instead, its
 preparation request names the selected revision, NodeId, and edits; the server
 reopens that exact published base from SQLite metadata and applies the update
-itself. A stale revision or different NodeId fails before content payload reads.
-The request is capped at 4096 edits and the existing 16 MiB RPC frame. A larger
-update or any length-changing write uses complete-source preparation. Unchanged
-published extents retain their existing readiness; this path verifies affected
-proof paths and the newly written pack, not every unchanged extent.
+itself. An unknown or unretained revision, missing or non-file NodeId, or
+different service binding fails before content payload reads. A retained older
+revision is a valid base; its original file predicates determine whether
+publication succeeds. The request is capped at 4096 edits and the existing
+16 MiB RPC frame. A larger update or any length-changing write uses
+complete-source preparation. Unchanged published extents retain their existing
+readiness; this path verifies affected proof paths and the newly written pack,
+not every unchanged extent.
 
 `Transaction::to_bytes` freezes the original observation, identity, predicates,
 and mutations. The experimental Borsh envelope is

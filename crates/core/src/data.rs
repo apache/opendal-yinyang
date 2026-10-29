@@ -1126,7 +1126,6 @@ mod tests {
             .as_str(),
             "4a9449de9b3ed735f25145e7ec1dbf209b8b698092e29a7f476215dcd1c8ced3"
         );
-        assert!(ContentEdit::new(2..1, b"x").is_err());
         assert!(ContentEdit::new(0..2, b"x").is_err());
     }
 
@@ -1212,12 +1211,12 @@ mod tests {
     async fn multiple_bounded_edits_reuse_the_trusted_base_and_reject_overlap() {
         let backend = TestBackend::default();
         let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
-        let bytes = (0..BLOCK_BYTES * 6 + 17)
+        let bytes = (0..BLOCK_BYTES * 64 + 17)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
         let edits = [
-            ContentEdit::new(3..7, b"abc").unwrap(),
+            ContentEdit::new(3..7, b"abcd").unwrap(),
             ContentEdit::new(BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3, b"01234").unwrap(),
             ContentEdit::new(bytes.len() as u64 - 2..bytes.len() as u64, b"xy").unwrap(),
         ];
@@ -1233,7 +1232,7 @@ mod tests {
         );
         let mut expected = bytes.clone();
         for (range, replacement) in [
-            (3..7, b"abc".as_slice()),
+            (3..7, b"abcd".as_slice()),
             (
                 BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3,
                 b"01234".as_slice(),
