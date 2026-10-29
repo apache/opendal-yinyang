@@ -183,8 +183,9 @@ fn print_report(report: &ManagedSpaceReport) {
         );
     }
     println!(
-        "local staging: {:?} at {} ({} handles, {} staged bytes)",
+        "local staging: {:?} binding {:?} at {} ({} handles, {} staged bytes)",
         report.staging.state,
+        report.staging.binding.state,
         report.staging.path,
         report.staging.handles.total,
         report.staging.handles.handle_bytes
@@ -282,7 +283,8 @@ fn print_plan(plan: &ManagedRetentionPlan) {
         );
     }
     println!(
-        "protected staging: pending {} frozen {} conflict {} unknown {} failed {} ledger-errors {}",
+        "protected staging: binding {:?} pending {} frozen {} conflict {} unknown {} failed {} ledger-errors {}",
+        plan.protection.staging.binding.state,
         plan.protection.staging.pending,
         plan.protection.staging.frozen,
         plan.protection.staging.conflict,

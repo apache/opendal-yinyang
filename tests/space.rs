@@ -28,7 +28,9 @@ use yinyang::core::{
     Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
-use yinyang::space::{StagingState, inspect_local_staging, plan_managed_retention};
+use yinyang::space::{
+    StagingBindingState, StagingState, inspect_bound_local_staging, plan_managed_retention,
+};
 use yinyang::sync::Sync;
 
 #[derive(Debug)]
@@ -121,9 +123,10 @@ async fn namespace_only_unknown_protects_baseline_without_content_handle() {
     let content_database = state.join("content").join("staging.db");
     let sync_before = std::fs::read(&sync_database).unwrap();
     let content_before = std::fs::read(&content_database).unwrap();
-    let inspection = inspect_local_staging(&state).await;
+    let inspection = inspect_bound_local_staging(&state, authority.filesystem()).await;
 
     assert_eq!(inspection.state, StagingState::Available);
+    assert_eq!(inspection.binding.state, StagingBindingState::Verified);
     assert!(inspection.errors.is_empty());
     assert_eq!(inspection.sync.state, StagingState::Available);
     assert_eq!(inspection.sync.namespace_intents, 1);
@@ -143,6 +146,40 @@ async fn namespace_only_unknown_protects_baseline_without_content_handle() {
     assert!(protected.reasons.contains(&"sync_namespace_unknown"));
     assert_eq!(std::fs::read(&sync_database).unwrap(), sync_before);
     assert_eq!(std::fs::read(&content_database).unwrap(), content_before);
+}
+
+#[tokio::test]
+async fn foreign_staging_is_unavailable_and_not_attributed() {
+    let source_backend = TestBackend::default();
+    let source = Fs::create(source_backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let source: Arc<dyn Authority> = Arc::new(source);
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    let sync = Sync::open(source.clone(), &state).await.unwrap();
+    let baseline = source.observe_latest().await.unwrap();
+    sync.stage_create_directory(source.root(), "foreign", baseline.revision())
+        .await
+        .unwrap();
+    drop(sync);
+
+    let target_backend = TestBackend::default();
+    let target = Fs::create(target_backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    assert_ne!(source.filesystem(), target.filesystem());
+    let sync_database = state.join("sync.db");
+    let before = std::fs::read(&sync_database).unwrap();
+    let inspection = inspect_bound_local_staging(&state, target.filesystem()).await;
+
+    assert_eq!(inspection.state, StagingState::Unavailable);
+    assert_eq!(inspection.binding.state, StagingBindingState::Unavailable);
+    assert!(inspection.binding.error.is_some());
+    assert_eq!(inspection.handles.total, 0);
+    assert_eq!(inspection.sync.namespace_intents, 0);
+    assert!(inspection.protected_revisions.is_empty());
+    assert_eq!(std::fs::read(&sync_database).unwrap(), before);
 }
 
 #[tokio::test]
@@ -177,6 +214,10 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
     assert!(!plan.deletion_authorized);
     assert_eq!(plan.reclaimable_bytes, None);
     assert_eq!(plan.protection.staging.state, StagingState::Missing);
+    assert_eq!(
+        plan.protection.staging.binding.state,
+        StagingBindingState::Verified
+    );
     assert!(!staging.exists());
     let selected = plan
         .revisions

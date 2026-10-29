@@ -42,8 +42,9 @@ pub use directory::{
     restore_directory_revision,
 };
 pub use space::{
-    ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, Unresolved, inspect_local_staging,
-    inspect_managed_space, plan_managed_retention,
+    ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, Unresolved,
+    inspect_bound_local_staging, inspect_local_staging, inspect_managed_space,
+    plan_managed_retention,
 };
 pub use yinyang_core as core;
 

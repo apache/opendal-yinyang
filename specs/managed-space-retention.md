@@ -133,6 +133,31 @@ Missing files report `missing`; malformed or unknown existing databases report
 `unavailable` with their error and are not repaired. `staging.databases` records
 each observed database role separately.
 
+Volume-bound `space report` and `space retention plan` call
+`inspect_bound_local_staging` with the observed authority filesystem. Existing
+read-only binding validators are reused before any local evidence is
+attributed:
+
+- `Runtime::validate_staging` validates mount staging and standalone Sync
+  content staging;
+- `Sync::validate_restore` validates the Sync journal and its content staging;
+  and
+- `Replica::inspect` supplies the replica's bound filesystem.
+
+`staging.binding.state` is `verified` after every present component validates
+for the observed authority filesystem. If any component is foreign, malformed,
+or cannot be verified, the state is `unavailable`, the binding error is
+reported, and all handles, namespace intents, artifacts, commit identities, and
+protected revisions from that staging path are withheld. Foreign work must not
+protect revisions for the configured volume.
+
+The standalone library function `inspect_local_staging` remains usable for
+offline evidence without an authority. It labels
+`staging.binding.state: "unbound"` and must not be interpreted as volume-bound
+attribution. Binding validation itself is read-only and does not acquire a
+runtime lease, initialize a database, migrate a profile, recover work, or
+contact storage.
+
 Directory measurement reports regular-file count and apparent file length. It
 does not follow symbolic links and does not claim allocated disk blocks. The
 directory walk is non-atomic.

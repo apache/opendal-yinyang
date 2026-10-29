@@ -139,6 +139,7 @@ pub enum ListingConsistency {
 pub struct StagingSpace {
     pub path: String,
     pub state: StagingState,
+    pub binding: StagingBinding,
     pub directory: Option<DirectoryUsage>,
     pub databases: Vec<StagingDatabase>,
     pub handles: StagingHandles,
@@ -149,6 +150,47 @@ pub struct StagingSpace {
     pub errors: Vec<String>,
     #[serde(skip)]
     protected: BTreeMap<Revision, BTreeSet<&'static str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StagingBinding {
+    pub state: StagingBindingState,
+    pub expected_filesystem: Option<String>,
+    pub error: Option<String>,
+}
+
+impl StagingBinding {
+    fn unbound() -> Self {
+        Self {
+            state: StagingBindingState::Unbound,
+            expected_filesystem: None,
+            error: None,
+        }
+    }
+
+    fn verified(filesystem: NodeId) -> Self {
+        Self {
+            state: StagingBindingState::Verified,
+            expected_filesystem: Some(identity_hex(filesystem)),
+            error: None,
+        }
+    }
+
+    fn unavailable(filesystem: NodeId, error: String) -> Self {
+        Self {
+            state: StagingBindingState::Unavailable,
+            expected_filesystem: Some(identity_hex(filesystem)),
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingBindingState {
+    Unbound,
+    Verified,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -315,6 +357,7 @@ pub struct RetentionProtection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StagingProtection {
     pub state: StagingState,
+    pub binding: StagingBinding,
     pub pending: u64,
     pub frozen: u64,
     pub conflict: u64,
@@ -402,7 +445,7 @@ pub async fn inspect_managed_space(
     let mut unresolved = Vec::new();
     let retained = inspect_retained(authority, &snapshot, &mut unresolved).await;
     let physical = inspect_physical(authority, operator, &snapshot).await;
-    let staging = inspect_local_staging(staging).await;
+    let staging = inspect_bound_local_staging(staging, authority.filesystem()).await;
     for error in &staging.errors {
         unresolved.push(Unresolved {
             subject: "local-staging".to_owned(),
@@ -468,7 +511,7 @@ pub async fn plan_managed_retention(
         ));
     }
     let latest = authority.observe_latest().await?;
-    let staging = inspect_local_staging(staging).await;
+    let staging = inspect_bound_local_staging(staging, authority.filesystem()).await;
     let mut unresolved = staging
         .errors
         .iter()
@@ -635,6 +678,7 @@ pub async fn plan_managed_retention(
             current_revision: revision_hex(latest.revision()),
             staging: StagingProtection {
                 state: staging.state,
+                binding: staging.binding.clone(),
                 pending: staging.handles.pending,
                 frozen: staging.handles.frozen,
                 conflict: staging.handles.conflict,
@@ -704,6 +748,134 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
     content.replica = replica.evidence;
     content.state = staging_state(&content.databases, &content.errors, content.state);
     content
+}
+
+/// Inspect local evidence only after existing read-only validators prove every
+/// present component belongs to the expected filesystem. Foreign or
+/// unverifiable state is reported as unavailable with no handles, namespace
+/// intents, or protected revisions attributed to the current volume.
+pub async fn inspect_bound_local_staging(staging: &Path, filesystem: NodeId) -> StagingSpace {
+    match validate_local_staging_binding(staging, filesystem).await {
+        Ok(()) => {
+            let mut inspection = inspect_local_staging(staging).await;
+            inspection.binding = StagingBinding::verified(filesystem);
+            inspection
+        }
+        Err(error) => unavailable_staging(staging, filesystem, error).await,
+    }
+}
+
+async fn validate_local_staging_binding(
+    staging: &Path,
+    filesystem: NodeId,
+) -> std::result::Result<(), String> {
+    let mount = staging.join("staging.db");
+    if path_exists(&mount)? {
+        Runtime::validate_staging(staging, filesystem)
+            .await
+            .map_err(|error| {
+                format!(
+                    "validate mount staging binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+    }
+
+    let sync = staging.join("sync.db");
+    let content = staging.join("content");
+    if path_exists(&sync)? {
+        Sync::validate_restore(staging, filesystem)
+            .await
+            .map_err(|error| {
+                format!(
+                    "validate Sync binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+    } else if path_exists(&content.join("staging.db"))? {
+        Runtime::validate_staging(&content, filesystem)
+            .await
+            .map_err(|error| {
+                format!(
+                    "validate Sync content staging binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+    }
+
+    let replica = staging.join("replica.db");
+    if path_exists(&replica)? {
+        #[cfg(target_os = "linux")]
+        {
+            let status = Replica::inspect(staging).map_err(|error| {
+                format!(
+                    "validate replica binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+            if status.filesystem != filesystem {
+                return Err(format!(
+                    "replica filesystem {} does not match volume filesystem {}",
+                    identity_hex(status.filesystem),
+                    identity_hex(filesystem)
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(
+                "replica binding cannot be verified on this platform; foreign state is not attributed"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> std::result::Result<bool, String> {
+    path.try_exists()
+        .map_err(|error| format!("inspect local state {}: {error}", path.display()))
+}
+
+async fn unavailable_staging(
+    staging: &Path,
+    filesystem: NodeId,
+    binding_error: String,
+) -> StagingSpace {
+    let directory = match measure_directory(staging).await {
+        Ok(usage) => Some(usage),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return StagingSpace {
+                path: display_path(staging),
+                state: StagingState::Unavailable,
+                binding: StagingBinding::unavailable(filesystem, binding_error.clone()),
+                directory: None,
+                databases: Vec::new(),
+                handles: StagingHandles::default(),
+                sync: SyncEvidence::missing(),
+                replica: ReplicaEvidence::missing(),
+                protected_revisions: Vec::new(),
+                frozen_commits: Vec::new(),
+                errors: vec![binding_error],
+                protected: BTreeMap::new(),
+            };
+        }
+    };
+    StagingSpace {
+        path: display_path(staging),
+        state: StagingState::Unavailable,
+        binding: StagingBinding::unavailable(filesystem, binding_error.clone()),
+        directory,
+        databases: Vec::new(),
+        handles: StagingHandles::default(),
+        sync: SyncEvidence::missing(),
+        replica: ReplicaEvidence::missing(),
+        protected_revisions: Vec::new(),
+        frozen_commits: Vec::new(),
+        errors: vec![binding_error],
+        protected: BTreeMap::new(),
+    }
 }
 
 struct SyncInspection {
@@ -995,6 +1167,7 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
             } else {
                 StagingState::Missing
             },
+            binding: StagingBinding::unbound(),
             directory,
             databases: Vec::new(),
             handles: StagingHandles::default(),
@@ -1127,6 +1300,7 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
     StagingSpace {
         path: display_path(staging),
         state,
+        binding: StagingBinding::unbound(),
         directory,
         databases,
         handles,
