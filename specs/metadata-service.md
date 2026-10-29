@@ -57,6 +57,19 @@ readiness. Publication and restart use that persisted evidence; they do not
 download the file again. Credentials and prefix isolation must prevent external
 writers from mutating immutable published content, as in object mode.
 
+A same-length fixed-offset update has a separate trusted path.
+`Authority::prepare_overwrite` takes an exact `FileVersion` and bounded
+`ContentEdit` ranges. The embedded service applies the edits through its
+`DataStore`, verifies the new pack, and records durable readiness. The
+authenticated client does not register or import the whole result. Instead, its
+preparation request names the selected revision, NodeId, and edits; the server
+reopens that exact published base from SQLite metadata and applies the update
+itself. A stale revision or different NodeId fails before content payload reads.
+The request is capped at 4096 edits and the existing 16 MiB RPC frame. A larger
+update or any length-changing write uses complete-source preparation. Unchanged
+published extents retain their existing readiness; this path verifies affected
+proof paths and the newly written pack, not every unchanged extent.
+
 `Transaction::to_bytes` freezes the original observation, identity, predicates,
 and mutations. The experimental Borsh envelope is
 `(YYPLAN01, filesystem[16], commit_id[16], base_revision[24], digest[32], conditions, mutations)`.
@@ -88,17 +101,25 @@ A future remote deployment requires a separately specified secure transport.
 Each TCP connection carries one request/response. Frames are a big-endian u32
 length followed by Borsh, bounded to 16 MiB. Request fields are protocol version
 1, token string, and a tagged command. Commands observe latest/specific
-revision, read/scan records at a revision, register content, or commit frozen
-requests. Responses carry observations, records, readiness, typed outcomes, or
-typed errors. Maximum batch size is 4096; scans request at most 4097 records.
-The server handles at most 32 active connections, each with a 60-second timeout.
-This wire profile is experimental and is not a stable interoperability promise.
+revision, read/scan records at a revision, register content, prepare a
+same-length overwrite from an exact published revision and NodeId, or commit
+frozen requests. Responses carry observations, records, readiness, prepared
+descriptors, typed outcomes, or typed errors. Maximum commit batch size and
+overwrite edit count are 4096; scans request at most 4097 records. The server
+handles at most 32 active connections, each with a 60-second timeout. This wire
+profile is experimental and is not a stable interoperability promise.
 
 Protocol version 1 is the only supported request version. The server checks the
 token first, then returns `Unsupported` for a validly authenticated unknown
 version before dispatching or decoding a command against storage. Clients and
 servers that implement different versions fail explicitly rather than
 negotiating down or sharing an authority.
+
+New command and response variants are appended to the version 1 tagged enums so
+existing variant tags do not change. Older servers do not understand the
+appended overwrite command and therefore require a matching server binary for
+this path. Existing register/observe/read/scan/commit traffic retains its prior
+encoding.
 
 Error responses retain the existing tag order: Invalid=0, Corrupt=1,
 NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional

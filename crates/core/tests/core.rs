@@ -18,7 +18,7 @@
 mod support;
 use std::sync::Arc;
 use support::*;
-use yinyang_core::{CommitId, ErrorKind, NodeId};
+use yinyang_core::{Authority, CommitId, ContentEdit, ErrorKind, NodeId};
 
 use yinyang_core::namespace::NodeKind as IndexedKind;
 use yinyang_core::object::{BackendProfile, ObjectFs, Outcome};
@@ -231,6 +231,26 @@ async fn object_snapshot_reuses_authenticated_index_reads() {
 }
 
 #[tokio::test]
+async fn retained_revisions_are_sorted_deduplicated_and_metadata_authenticated() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut expected =
+        std::collections::BTreeSet::from([fs.observe_latest().await.unwrap().revision()]);
+    for index in 0..4 {
+        let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        plan.create_directory(fs.root(), &format!("revision-{index}"))
+            .await
+            .unwrap();
+        let receipt = committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+        expected.insert(receipt.cursor.revision);
+    }
+    assert_eq!(
+        fs.retained_revisions().await.unwrap(),
+        expected.into_iter().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions() {
     let backend = TestBackend::default();
     let fs = object_fs(&backend).await;
@@ -290,6 +310,78 @@ async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions
         backend.state.lock().unwrap().data_reads > 0,
         "a fresh logical version must not reuse the previous version's ranges"
     );
+}
+
+#[tokio::test]
+async fn exact_published_overwrite_rejects_cross_binding_and_affected_corruption() {
+    use yinyang_core::data::BLOCK_BYTES;
+
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let bytes = (0..BLOCK_BYTES * 8 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
+    let mut create = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let node = create
+        .create_file(fs.root(), "file", prepared, false)
+        .await
+        .unwrap();
+    let receipt = committed(fs.commit(&create.finish().unwrap()).await.unwrap());
+    let base = fs
+        .observe_revision(receipt.cursor.revision)
+        .await
+        .unwrap()
+        .open_file(node)
+        .await
+        .unwrap();
+
+    // Advancing latest does not redirect preparation to a freshly observed base.
+    let mut unrelated = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    unrelated
+        .create_directory(fs.root(), "later")
+        .await
+        .unwrap();
+    committed(fs.commit(&unrelated.finish().unwrap()).await.unwrap());
+
+    let range = BLOCK_BYTES as u64 - 3..BLOCK_BYTES as u64 + 5;
+    let edits = [ContentEdit::new(range.clone(), b"selected").unwrap()];
+    let reopened = ObjectFs::open(backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    backend.state.lock().unwrap().data_reads = 0;
+    assert_eq!(
+        reopened
+            .prepare_overwrite(&base, &edits)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Invalid
+    );
+    assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+    let changed = fs.prepare_overwrite(&base, &edits).await.unwrap();
+    let mut output = Vec::new();
+    fs.data()
+        .read_range(changed.descriptor(), range, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, b"selected");
+
+    for object in backend.state.lock().unwrap().objects.values_mut() {
+        if let Some(first) = object.bytes.first_mut() {
+            *first ^= 1;
+        }
+    }
+    backend.state.lock().unwrap().data_reads = 0;
+    assert_eq!(
+        fs.prepare_overwrite(&base, &edits)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+    assert!(backend.state.lock().unwrap().data_reads > 0);
 }
 
 #[tokio::test]
