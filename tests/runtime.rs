@@ -879,18 +879,20 @@ async fn sparse_runtime(
         state.written_bytes = 0;
     }
     file.fsync().await.unwrap();
-    let state = backend.state.lock().unwrap();
+    let (read_bytes, written_bytes) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.written_bytes)
+    };
     assert!(
-        state.data_read_bytes < BASE_BYTES as u64 / 2,
+        read_bytes < BASE_BYTES as u64 / 2,
         "same-length sparse fsync read the whole base: {} bytes",
-        state.data_read_bytes
+        read_bytes
     );
     assert!(
-        state.written_bytes < BASE_BYTES as u64 / 2,
+        written_bytes < BASE_BYTES as u64 / 2,
         "same-length sparse fsync uploaded the whole file: {} bytes",
-        state.written_bytes
+        written_bytes
     );
-    drop(state);
     assert_eq!(
         runtime
             .authority()
