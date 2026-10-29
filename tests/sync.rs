@@ -1058,6 +1058,14 @@ async fn legacy_staging_and_sync_upgrade_preserves_unknown_identity_and_newer_ed
 
     {
         let staging = rusqlite::Connection::open(state.join("content/staging.db")).unwrap();
+        // Convert the sparse test handle to the full-chunks representation the
+        // legacy binary produced before simulating a stage-1 database.
+        staging
+            .execute(
+                "INSERT INTO chunks(handle,position,data) VALUES(?1,0,?2)",
+                rusqlite::params![edit.as_bytes().as_slice(), original.as_slice()],
+            )
+            .unwrap();
         staging
             .execute_batch(
                 "ALTER TABLE handles DROP COLUMN failure;
