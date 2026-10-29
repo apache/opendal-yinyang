@@ -6,12 +6,14 @@ uses a real `/dev/fuse` mount or the Managed Sync CLI. One-shot
 `yy publish`/`yy restore` scenarios use the object authority because that is the
 only authority supported by those commands.
 
-The benchmark uses isolated Silo (S3-compatible) settings, a unique remote root,
-and a new staging directory. A loopback HTTP counting proxy sits between YinYang
-and Silo. It parses HTTP/1 request framing before counting request methods, and
-counts request and response bytes without instrumenting production code. The
-proxy accepts connections without polling and disables Nagle on both relay
-sockets so collector delay does not dominate small range and proof requests.
+The default full and read-only matrices use isolated Silo (S3-compatible)
+settings, a unique remote root, and a new staging directory. A loopback HTTP
+counting proxy sits between YinYang and Silo. It parses HTTP/1 request framing
+before counting request methods, and counts request and response bytes without
+instrumenting production code. The proxy accepts connections without polling
+and disables Nagle on both relay sockets so collector delay does not dominate
+small range and proof requests. The real Amazon S3 repeated/random workload
+instead uses the benchmark-only in-process telemetry described below.
 
 Service publication uses a second transparent TCP proxy in front of the metadata
 service. The current transport creates one loopback TCP connection for each RPC,
@@ -104,6 +106,16 @@ must determine whether those reads still fetch remote units or proofs.
 The bounded 2026-10-27 matched result is recorded in
 [`linux-range-cost-results.md`](linux-range-cost-results.md).
 
+The `repeated-random` workload measures one Managed object authority through a
+read-only FUSE mount against a direct Amazon S3 HTTPS endpoint. It adds
+same-offset repetition, an 8 MiB hot working set, over-capacity random access,
+restart, forced eviction, and replacement with an old descriptor. The optional
+`benchmark-telemetry` feature installs the released OpenDAL MetricsLayer in the
+measured `yy` process, so request counts and HTTP body bytes are collected
+without a proxy or TLS termination. Its exact source/binary identities,
+per-batch accounting, memory tradeoff, negative cases, and raw evidence are in
+[`linux-verified-range-reuse.md`](linux-verified-range-reuse.md).
+
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
@@ -161,7 +173,9 @@ Linux benchmark.
 ## Limits
 
 The benchmark does not claim production capacity, cross-host performance, or a
-performance regression threshold. It measures one isolated loopback Silo on the
-recorded host. It does not replace the functional Linux acceptance suites. Do
-not commit generated datasets or large build artifacts; retain only bounded
-evidence and reusable tooling in the repository.
+performance regression threshold. Default matrices measure one isolated
+loopback Silo on the recorded host; the repeated/random report records its
+separate real Amazon S3 region, host and sampling limits. These measurements do
+not replace the functional Linux acceptance suites. Do not commit generated
+datasets or large build artifacts; retain only bounded evidence and reusable
+tooling in the repository.

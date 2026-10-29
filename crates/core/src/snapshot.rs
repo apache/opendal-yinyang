@@ -226,7 +226,7 @@ impl FileVersion {
         destination: &mut (impl AsyncWrite + Unpin),
     ) -> Result<()> {
         self.data
-            .read_range(self.descriptor(), range, destination)
+            .read_range_cached(self.descriptor(), range, destination)
             .await
     }
 }

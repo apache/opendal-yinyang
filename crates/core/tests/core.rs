@@ -194,6 +194,68 @@ async fn object_snapshot_reuses_authenticated_index_reads() {
 }
 
 #[tokio::test]
+async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let bytes = (0..65_536 * 3 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
+    let snapshot = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let id = plan
+        .create_file(fs.root(), "ranges", prepared, false)
+        .await
+        .unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+
+    let snapshot = fs.observe_latest().await.unwrap();
+    let first = snapshot.open_file(id).await.unwrap();
+    let second = snapshot.open_file(id).await.unwrap();
+    let range = 65_525..65_539;
+    backend.state.lock().unwrap().data_reads = 0;
+    let mut output = Vec::new();
+    first.read_range(range.clone(), &mut output).await.unwrap();
+    assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+    assert!(backend.state.lock().unwrap().data_reads > 0);
+
+    backend.state.lock().unwrap().data_reads = 0;
+    output.clear();
+    second.read_range(range.clone(), &mut output).await.unwrap();
+    assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+    assert_eq!(
+        backend.state.lock().unwrap().data_reads,
+        0,
+        "separate descriptors for one immutable version may reuse verified ranges"
+    );
+
+    let replacement = vec![0x5a; 65_536 * 3];
+    let prepared = fs
+        .data()
+        .prepare(&mut replacement.as_slice())
+        .await
+        .unwrap();
+    let latest = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&latest, CommitId::generate());
+    plan.set_content(id, prepared).await.unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+
+    let fresh = fs.observe_latest().await.unwrap();
+    let file = fresh.open_file(id).await.unwrap();
+    backend.state.lock().unwrap().data_reads = 0;
+    output.clear();
+    file.read_range(range.clone(), &mut output).await.unwrap();
+    assert_eq!(
+        output,
+        replacement[range.start as usize..range.end as usize]
+    );
+    assert!(
+        backend.state.lock().unwrap().data_reads > 0,
+        "a fresh logical version must not reuse the previous version's ranges"
+    );
+}
+
+#[tokio::test]
 async fn indexed_deep_paths_names_and_invalid_profiles() {
     use yinyang_core::namespace::name_key;
     for name in [
