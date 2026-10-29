@@ -1057,13 +1057,21 @@ async fn legacy_staging_and_sync_upgrade_preserves_unknown_identity_and_newer_ed
     drop(sync);
 
     {
+        let journal = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+        let handle: Vec<u8> = journal
+            .query_row(
+                "SELECT handle FROM edits WHERE id=?1",
+                [edit.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         let staging = rusqlite::Connection::open(state.join("content/staging.db")).unwrap();
         // Convert the sparse test handle to the full-chunks representation the
         // legacy binary produced before simulating a stage-1 database.
         staging
             .execute(
                 "INSERT INTO chunks(handle,position,data) VALUES(?1,0,?2)",
-                rusqlite::params![edit.as_bytes().as_slice(), original.as_slice()],
+                rusqlite::params![handle, original.as_slice()],
             )
             .unwrap();
         staging
@@ -1075,7 +1083,6 @@ async fn legacy_staging_and_sync_upgrade_preserves_unknown_identity_and_newer_ed
                  UPDATE authority SET profile='yinyang-stage-1' WHERE singleton=1;",
             )
             .unwrap();
-        let journal = rusqlite::Connection::open(state.join("sync.db")).unwrap();
         journal
             .execute_batch(
                 "DROP TABLE namespaces;
