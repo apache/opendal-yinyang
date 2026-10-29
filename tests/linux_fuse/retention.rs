@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use yinyang::runtime::Runtime as YinYangRuntime;
 
 const UNIT_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -105,6 +106,7 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
     gate.wait_ready(Duration::from_secs(30));
     let frozen = fixture.wait_for_frozen(&config);
     println!("space observation reached frozen staging:\n{frozen}");
+    assert_pending_staging(&staging, true);
     assert_eq!(
         fixture.remote_read(&library, "space.bin", original.len()),
         original,
@@ -228,6 +230,7 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
     dirty
         .write_all(&dirty_bytes)
         .expect("write a dirty full descriptor view without fsync");
+    assert_pending_staging(&staging, false);
     assert_eq!(
         fixture.remote_read(&library, "space.bin", original.len()),
         original,
@@ -514,6 +517,25 @@ fn parse_schema(output: &[u8], expected: &str) -> Value {
         "unexpected space JSON schema: {document}"
     );
     document
+}
+
+fn assert_pending_staging(staging: &Path, frozen: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build staging inspection runtime");
+    let status = runtime
+        .block_on(YinYangRuntime::inspect(staging))
+        .expect("inspect live staging without taking its writer lease");
+    let handle = status
+        .handles
+        .iter()
+        .find(|handle| handle.pending)
+        .unwrap_or_else(|| panic!("staging has no pending handle: {status:#?}"));
+    assert_eq!(
+        handle.frozen, frozen,
+        "unexpected frozen state: {status:#?}"
+    );
 }
 
 #[derive(Debug, Eq, PartialEq)]
