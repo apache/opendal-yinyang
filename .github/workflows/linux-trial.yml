@@ -49,7 +49,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TRIAL_ROOT: ${{ runner.temp }}/yinyang-trial
   YINYANG_S3_BUCKET: yinyang-test
   YINYANG_S3_ENDPOINT: http://127.0.0.1:9000
   YINYANG_S3_REGION: us-east-1
@@ -70,6 +69,9 @@ jobs:
       - name: Prepare trial evidence
         run: |
           set -euo pipefail
+          TRIAL_ROOT="$RUNNER_TEMP/yinyang-trial"
+          printf 'TRIAL_ROOT=%s\n' "$TRIAL_ROOT" >>"$GITHUB_ENV"
+          export TRIAL_ROOT
           sudo apt-get update
           sudo apt-get install --yes fuse3 sqlite3
           mkdir -p "$TRIAL_ROOT/artifacts" "$TRIAL_ROOT/evidence"
