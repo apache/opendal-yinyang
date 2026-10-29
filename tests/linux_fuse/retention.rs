@@ -399,6 +399,7 @@ fn assert_space_report(document: &Value, staging: &Path) {
             .is_some_and(|value| !value.is_empty()),
         "space report must state the physical accounting boundary"
     );
+    assert_limit_mentions(document, "share", "space report");
     assert_dirty_handle_count(&document["staging"]["handles"], "space report");
 }
 
@@ -417,6 +418,7 @@ fn assert_retention_plan(document: &Value) {
         document["reclaimable_bytes"].is_null(),
         "retention planning must not estimate reclaimable bytes"
     );
+    assert_limit_mentions(document, "shared pack", "retention plan");
     assert_eq!(document["policy"]["mode"], "bounded");
     assert_eq!(document["policy"]["keep_last"], 1);
     assert_eq!(
@@ -478,6 +480,19 @@ fn assert_dirty_handle_count(staging: &Value, context: &str) {
     assert!(
         count >= 1,
         "{context} did not observe an active dirty handle: {staging}"
+    );
+}
+
+fn assert_limit_mentions(document: &Value, needle: &str, context: &str) {
+    assert!(
+        document["limits"]
+            .as_array()
+            .is_some_and(|limits| limits.iter().any(|limit| {
+                limit
+                    .as_str()
+                    .is_some_and(|limit| limit.to_ascii_lowercase().contains(needle))
+            })),
+        "{context} did not disclose the shared physical-pack boundary: {document}"
     );
 }
 
