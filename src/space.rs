@@ -447,6 +447,15 @@ pub async fn plan_managed_retention(
                 detail: revision_hex(*revision),
             });
         }
+        for revision in staging.protected.keys() {
+            if !retained_set.contains(revision) {
+                unresolved.push(Unresolved {
+                    subject: "local-staging-pin".to_owned(),
+                    state: "not_retained".to_owned(),
+                    detail: revision_hex(*revision),
+                });
+            }
+        }
     }
 
     let bounded = keep_last.is_some() || !requested_pins.is_empty();
@@ -574,8 +583,9 @@ pub async fn plan_managed_retention(
     })
 }
 
-/// Inspect existing Managed staging databases without creating a directory,
-/// database, WAL, runtime lease, or recovery action.
+/// Inspect existing Managed staging databases without creating a directory or
+/// database, acquiring a runtime lease, migrating state, or recovering records.
+/// Known SQLite read-only behavior may create or update derived WAL/SHM files.
 pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
     let mut errors = Vec::new();
     let directory = match measure_directory(staging).await {
@@ -1253,6 +1263,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_empty_staging_is_not_initialized() {
+        let root = tempdir().unwrap();
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let inspection = inspect_local_staging(&staging).await;
+        assert_eq!(inspection.state, StagingState::NotInitialized);
+        assert!(inspection.databases.is_empty());
+        assert!(!staging.join("staging.db").exists());
+        assert!(!staging.join("runtime.lock").exists());
+    }
+
+    #[tokio::test]
+    async fn malformed_staging_is_reported_without_creating_a_lease() {
+        let root = tempdir().unwrap();
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let database = staging.join("staging.db");
+        std::fs::write(&database, b"not a sqlite database").unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let inspection = inspect_local_staging(&staging).await;
+        assert_eq!(inspection.state, StagingState::Unavailable);
+        assert!(!inspection.errors.is_empty());
+        assert!(!staging.join("runtime.lock").exists());
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn unknown_staging_profile_is_rejected_without_rewriting_the_database() {
         let root = tempdir().unwrap();
         let staging = root.path().join("staging");
@@ -1276,6 +1313,7 @@ mod tests {
         assert!(inspection.errors.iter().any(|error| {
             error.contains("unknown staging profile") || error.contains("unsupported profile")
         }));
+        assert!(!staging.join("runtime.lock").exists());
         assert_eq!(std::fs::read(&database).unwrap(), before);
     }
 }

@@ -229,6 +229,11 @@ fn print_plan(plan: &ManagedRetentionPlan) {
         plan.revisions.len(),
         plan.state
     );
+    if plan.retained_revision_count.is_none() {
+        println!(
+            "retained revision index: unavailable; the plan does not infer that observed history is empty"
+        );
+    }
     for revision in &plan.revisions {
         println!(
             "revision {}: {} [{}]",

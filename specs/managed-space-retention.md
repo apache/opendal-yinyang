@@ -39,9 +39,10 @@ does not:
 
 Appropriate `retained_revisions` support is authority-specific. The object
 authority returns metadata-authenticated revisions from its existing history
-index. An authority without a revision index reports retained-revision
+index. The built-in metadata service and service client do not expose a
+retained-revision enumeration operation, so they report retained-revision
 discovery as unavailable. The implementation does not infer history from local
-staging or physical objects.
+staging, current physical objects, or service absence.
 
 Opening a known SQLite database read-only may create an empty WAL file or
 create/update derived `-shm` coordination files. Those files are observations,
