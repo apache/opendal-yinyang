@@ -1,6 +1,7 @@
 # Linux operating envelope
 
-**Status: harness prepared; final-target evidence pending.**
+**Status: passed for the exact final source and Amazon S3 combination below.
+Sampling gaps and result boundaries remain explicit.**
 
 This page records one finite, bounded operating-envelope sample for an installed
 `yy` build. It is not a capacity rating, service-level objective, long-running
@@ -55,9 +56,18 @@ The expected-byte oracle advances after every successful `pwrite` segment, not
 only after the following `fsync`. Partial writes therefore remain represented
 in the local and remote byte assertions. `pwrite` failures and `fsync` failures
 are counted separately; a file remains durability-unknown until a later
-successful fsync covers its dirty bytes. Three consecutive write or fsync
-failures abort the phase; otherwise any unresolved uncertainty makes the run
-fail after the byte assertions are evaluated and recorded.
+successful fsync covers its dirty bytes. After a failed `fsync`, the workload
+retries the same descriptor with bounded backoff for
+`--fsync-retry-seconds` (default 30 seconds) without issuing a new `pwrite`.
+The retry counts and first operation errors are retained in the phase report.
+The run fails when the retry deadline expires; three consecutive `pwrite`
+failures also abort the phase. Otherwise any unresolved uncertainty makes the
+run fail after the byte assertions are evaluated and recorded.
+
+After the workload joins, the phase report retains a per-file length and
+SHA-256 manifest derived from the in-memory expected buffers. It is labeled
+`pwrite-acknowledged expected bytes`; it is not a claim of remote equality
+while fsync or publication is still uncertain.
 
 File counts, dimensions, concurrency, sampling period and duration are bounded
 inputs, not extrapolated capacity. A run that exceeds the bounded interval or
@@ -95,6 +105,43 @@ The workload does not establish:
 - behavior after the tested duration or outside the exact backend and host;
 - stable release, cryptographic signing or support for arbitrary upgrades.
 
+## Operational acknowledgment
+
+A recovered fsync can still leave a durable error-ledger entry. Doctor remains
+`action_required` until an operator explicitly acknowledges the reviewed
+entries with `yy --volume CONFIG file acknowledge-errors THROUGH`. This removes
+ledger rows through the observed sequence; it does not resolve pending data,
+frozen requests, conflicts, failed handles, or uncertain durability.
+
+The harness first stops and releases the mount, verifies independently restored
+bytes, samples remote history, and checks SQLite integrity. It then captures
+the complete raw `yy --volume CONFIG status` output, retry counters and parsed
+handle/ledger counts. It will not acknowledge any entry unless all of the
+following hold:
+
+- pwrite and reader errors are zero;
+- each phase has `fsync_retry_attempts == fsync_errors`,
+  `fsync_retry_successes <= fsync_retry_attempts`, and retry successes are
+  positive exactly when fsync errors are positive; no file remains uncertain;
+- fatal lists are empty and both unmounts report a clean release;
+- pending, frozen, conflict and failed-handle counts are zero;
+- every retained ledger row is persisted, has a positive sequence, and is
+  present in the complete ordered status capture.
+
+When retained rows exist, `completion.acknowledgment` records the exact
+acknowledgment command, the selected `through` sequence, its result, and
+complete post-acknowledgment status. The post-status pending, frozen, conflict,
+failed-handle and ledger counts must all be zero before the harness accepts
+doctor. Doctor must subsequently return `status=pass`; a nonzero exit or
+non-pass status still fails the run and retains the raw error.
+
+Invoking this harness authorizes its guarded acknowledgment only on the
+isolated, fresh test state that the harness created. Raw status and error
+evidence remains in the report. Existing or other non-test volumes require
+explicit operator review and are outside this workflow. Acknowledgment is not
+an error suppressor: failed or diagnostic staging remains unchanged and must
+never be acknowledged merely to make a later health check green.
+
 ## Reproduce
 
 Build or install the selected binary on Linux. The credential wrapper reads one
@@ -130,64 +177,98 @@ latency benchmarks, native acceptance mounts and other S3 workloads can
 contaminate p50/p95 values and request timing even when final bytes remain
 correct.
 
-## Current evidence
+## Final integrated evidence
 
-The operating-envelope harness has passed a 90-second real Amazon S3 smoke at
-source `79506c0684c47b37bc93364eaa7192d65a770ede` with binary SHA-256
-`b4985f099f1aff9447a2990f2ec3bdc8945237732eb8985a576f7666147cd979`.
-It used the dedicated `yinyang-direct-q-35b90fdf-versioned` bucket in
-`us-east-2` and the 24-file/256 KiB default dataset. The two workload phases
-ran for 48.156 and 48.552 seconds; final version-list verification added time,
-so this is not presented as a 90-second wall-clock result.
+### Final source
 
-The smoke reached the following bounded observations:
+The final integrated source is
+`17361970d1722ea3d60c5381bbb5323d11818184`. Its default Ubuntu 24.04
+x86_64 archive is
+`yinyang-0.0.24-ubuntu-24.04-x86_64-17361970d172.tar.gz` with SHA-256
+`ca339b309f0132b2a21bd685fd9cab75d5d5e982059344bba06e77f523dcffb4`.
+The archive's `bin/yy` SHA-256 is
+`a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c`.
 
-- peak sampled Mount RSS and high-water RSS: 27,070,464 bytes;
-- peak Mount staging allocation: 10,608,640 bytes;
-- peak observed open descriptors: 21;
-- two clean unmounts and one successful remount;
-- final latest-state restore: 24 files, 6,291,456 bytes;
-- final S3 history: 3,558 object versions, 0 delete markers, 41,388,760 stored
-  bytes across 4 version-list pages;
-- 48 successful fsync-write operations in each phase, with no writer/reader
-  errors;
-- `doctor` passed and the retained SQLite `staging.db` integrity check reported
-  `ok`.
+AWS repository gates passed at this source: `cargo x lint`, `cargo x check`,
+`cargo x test`, `cargo x licenses`, and Rust 1.91.0 locked all-target check.
+The accepted Core115 native proof at
+`b630ef2` covers Managed FUSE 27 tests, operations 1, Managed Sync 12,
+compatibility 8, recovery 4, and Direct 30 passed plus 8 filtered tests.
+The subsequent A revision changed only the doctor remediation text in
+`operations_cli.rs`; later harness/procedure and Python test-loader changes did
+not alter native contracts. Those native workloads were not repeated at
+`1736197`.
 
-An earlier 90-second run at source `7fd4d87602f3aa98b53dca31eeca9bf6d8ce2f3e`
-reported a same-length mismatch for `file-0015.bin` during the first-phase
-restore. The original JSON did not retain per-operation error counters, so that
-historical event is not proven. Source review identified an oracle defect:
-the expected bytes were updated only after `fsync`, although a successful
-`pwrite` had already acknowledged bytes and a failed fsync could later be
-published by close/flush. A local tmp-file fault injection reproduced the
-result: the old oracle rejected the actual successful pwrite bytes, while the
-updated oracle matched them and reported `fsync_errors=1` and
-`uncertain_files=[0]`.
+The installed-prefix upgrade
+`o-pin-1736197-upgrade` passed against the immutable
+`fd1338c2f924a90e9da752b9158e748d1d3acaf4` producer. It retained a
+`74,192`-byte service WAL with SHA-256
+`c5c186dba36d6b2fc866243f46541bf7c1f2a108f065164686c67b5cf122ad60`,
+then converged target file bytes, Sync, service, receipt and doctor state.
 
-The harness now advances expected bytes per successful pwrite segment, records
-pwrite and fsync failures separately, and fails a run after byte assertions if
-durability remains uncertain. The earlier 795 repeat passed with the enhanced
-verification, but the historical mismatch is not counted as a proven product
-defect. The final integrated soak must still retain the full byte assertions
-and resolve any observed durability uncertainty.
+### Final operating envelope
 
-Request count is unavailable for this smoke because no compatible
-process-scoped counter was supplied; the report keeps that field explicit
-rather than inferring it from local I/O. The raw JSON is retained outside the
-repository at
-`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/O-envelope-smoke-79506c0.json`.
+Run `o-pin-1736197-envelope-45m-r2` completed with runner exit `0` and report
+status `pass`. It used the 24-file/256 KiB dataset, four range writers, two
+range readers, the default intervals, and the dedicated
+`yinyang-direct-q-35b90fdf-versioned` bucket in `us-east-2`.
 
-A separate installed-prefix run at the same source upgraded the
-`fd1338c` producer to the target release binary, preserved a 74,192-byte
-service WAL before target startup, and passed target file, Sync, service,
-receipt and `doctor` checks. Its digest is recorded in
-`/Users/xuanwo/Code/experiments/yinyang/linux-next-2026-10-28/O-upgrade-79506c0.json`.
-That run is preparatory evidence for the operations harness; it does not
-qualify the final integrated implementation.
+| phase | planned | actual | writer ops | reader ops | pwrite/fsync/retry errors | uncertain |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| steady-state-one | 1350s | 1409.689s | 1345 | 3011 | 0 / 0 / 0 | none |
+| steady-state-two | 1350s | 1728.775s | 1484 | 3469 | 0 / 0 / 0 | none |
 
-The local Ubuntu 24.04 archive built from the same source has SHA-256
-`4368831f2bd3b9729caaaed511312749e9f98100a3d22a733a339222a9da159c`; the
-archive's binary hash matches the smoke target. No final 45-minute
-operating-envelope run has been made against the integrated
-P/W/M/S candidate yet.
+The phase durations total `3138.464s`; the full report spans `3285.049s`.
+Synchronous history collection and the final checks explain why neither is a
+45-minute wall-clock claim. Resource sampling produced 243 rows rather than a
+nominal five-second count of 540. The first phase retained 172 rows with a
+maximum gap of `209.392s`; the second retained 71 rows with a maximum gap of
+`441.46s`. These are sampled observations and lower bounds, not continuous
+telemetry.
+
+Both phases had empty `fatal` and `uncertain_files` lists.
+`durability.status=known` with zero pwrite and fsync errors. The pre-doctor
+status showed `pending=0 frozen=0 conflicts=0 failed=0 ledger-errors=0`; no
+ledger acknowledgment command was needed or invoked. `doctor` passed, the
+retained `staging.db` integrity check returned `ok`, both unmounts were clean,
+and the 24-file/6,291,456-byte restores matched at the midpoint and final
+check. The final paginated history contained 36,124 versions, zero delete
+markers and 840,781,692 stored bytes across 37 pages. Peak sampled RSS/HWM was
+35,586,048 bytes, peak staging allocation was 10,665,984 bytes, and peak open
+descriptors was 22.
+
+Exact Amazon S3 request count remains unavailable because the TLS path is
+outside the plain-HTTP counting proxy and no compatible process-scoped counter
+was supplied. The report does not infer requests from connections or verifier
+calls.
+
+Public raw evidence:
+
+- [accepted operating-envelope JSON](benchmarks/linux-envelope-amazon-s3-2026-10-28-1736197.json),
+  SHA-256
+  `858a7dd40e3662b536bef7206ead861ee6261580ef18d2b2893fc01a4d089c0e`;
+- [installed-upgrade JSON](benchmarks/linux-prefix-upgrade-2026-10-28-1736197.json),
+  SHA-256
+  `403bbcddbd6aac3cb5f6c1a5eae42d8b04b7720f7305b72a670ca7b56ff6b656`;
+- [release build manifest](benchmarks/linux-release-manifest-2026-10-28-1736197.txt),
+  SHA-256
+  `d34e92efe67ac3e9b52d5574f5889c49e6c2b29e4fabe1b44b3fcda95343d37c`.
+
+The archive is prepared for this qualification but is not published as a
+release artifact.
+
+### Earlier smoke and failure evidence
+
+Earlier 90-second smoke runs are historical, not final proof. One exposed an
+oracle defect where expected bytes advanced only after `fsync`; the harness now
+advances the oracle after every successful `pwrite` segment and records fsync
+uncertainty separately. Their raw files remain private development evidence and
+are not used to support the final claims above.
+
+The pre-fix 45-minute run at source `455842b` failed before midpoint when an
+fsync retry deadline expired. The bounded `de86d1c` diagnostic classified the
+observed terminal retry as CAS exhaustion rather than folded storage error, but
+its runner exited `1` because doctor reported `ledger-errors=1`. These pre-fix
+states motivated the accepted same-client serialization fix and guarded
+acknowledgment procedure; they are not part of the final source, and the
+diagnostic database was not acknowledged.

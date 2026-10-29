@@ -54,6 +54,9 @@ jobs:
       - name: Check targets
         run: cargo x check
 
+      - name: Run operating-envelope policy injection
+        run: python3 tests/linux_operating_envelope_fault_test.py
+
   msrv:
     name: MSRV
     runs-on: ubuntu-24.04

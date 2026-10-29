@@ -65,6 +65,10 @@ SECRET_NAMES = (
 )
 PAGE_BYTES = 4096
 POLL_SECONDS = 0.05
+MAX_FIRST_ERRORS = 16
+FSYNC_RETRY_SECONDS = 30.0
+FSYNC_RETRY_INTERVAL = 0.5
+FSYNC_RETRY_MAX_INTERVAL = 5.0
 
 
 class EnvelopeError(RuntimeError):
@@ -272,6 +276,76 @@ class Completed:
     returncode: int
 
 
+def file_status_snapshot(stdout: str) -> dict[str, Any]:
+    declared_handles = None
+    handles = []
+    errors = []
+    failed = 0
+    for line in stdout.splitlines():
+        if line.startswith("local handles: "):
+            if declared_handles is not None:
+                raise EnvelopeError("status reported local handles more than once")
+            declared_handles = int(line.removeprefix("local handles: "))
+        elif line.startswith("handle: "):
+            fields = line.split()
+            if (
+                len(fields) != 14
+                or fields[8] != "pending:"
+                or fields[10] != "frozen:"
+                or fields[12] != "conflict:"
+            ):
+                raise EnvelopeError(f"unrecognized handle status line: {line}")
+            pending = fields[9]
+            frozen = fields[11]
+            conflict = fields[13]
+            if pending not in {"true", "false"}:
+                raise EnvelopeError(f"invalid pending state: {pending}")
+            if frozen not in {"true", "false"}:
+                raise EnvelopeError(f"invalid frozen state: {frozen}")
+            if conflict not in {"true", "false"}:
+                raise EnvelopeError(f"invalid conflict state: {conflict}")
+            handles.append(
+                {
+                    "pending": pending == "true",
+                    "frozen": frozen == "true",
+                    "conflict": conflict == "true",
+                }
+            )
+        elif line.startswith("handle error: "):
+            failed += 1
+        elif line.startswith("error "):
+            fields = line.split(maxsplit=6)
+            if len(fields) < 6 or fields[2] != "handle" or fields[4] != "persisted":
+                raise EnvelopeError(f"unrecognized ledger status line: {line}")
+            persisted = fields[5]
+            if persisted not in {"true:", "false:"}:
+                raise EnvelopeError(f"invalid persisted state: {persisted}")
+            errors.append(
+                {
+                    "sequence": int(fields[1]),
+                    "handle": fields[3],
+                    "persisted": persisted == "true:",
+                }
+            )
+    if declared_handles is None or declared_handles != len(handles):
+        raise EnvelopeError(
+            "status local handle count does not match printed handle records"
+        )
+    if failed > len(handles):
+        raise EnvelopeError("status printed more handle errors than handles")
+    sequences = [error["sequence"] for error in errors]
+    return {
+        "local_handles": declared_handles,
+        "pending": sum(handle["pending"] for handle in handles),
+        "frozen": sum(handle["frozen"] for handle in handles),
+        "conflicts": sum(handle["conflict"] for handle in handles),
+        "failed": failed,
+        "ledger_errors": len(errors),
+        "sequences": sequences,
+        "errors": errors,
+    }
+
+
 class MountProcess:
     def __init__(
         self,
@@ -408,6 +482,8 @@ class Workload:
         write_interval: float,
         read_interval: float,
         seed: int,
+        fsync_retry_seconds: float = FSYNC_RETRY_SECONDS,
+        fsync_retry_interval: float = FSYNC_RETRY_INTERVAL,
     ) -> None:
         self.mountpoint = mountpoint
         self.expected = expected
@@ -416,6 +492,8 @@ class Workload:
         self.write_interval = write_interval
         self.read_interval = read_interval
         self.seed = seed
+        self.fsync_retry_seconds = fsync_retry_seconds
+        self.fsync_retry_interval = fsync_retry_interval
         self.stop = threading.Event()
         self.threads: list[threading.Thread] = []
         self.lock = threading.Lock()
@@ -426,8 +504,13 @@ class Workload:
         self.uncertain_files: set[int] = set()
         self.read_errors = 0
         self.fatal: list[str] = []
+        self.first_errors: list[dict[str, Any]] = []
+        self.started_at: float | None = None
+        self.fsync_retry_attempts = 0
+        self.fsync_retry_successes = 0
 
     def start(self) -> None:
+        self.started_at = time.monotonic()
         for worker in range(self.writers):
             thread = threading.Thread(
                 target=self.writer,
@@ -477,6 +560,7 @@ class Workload:
                         written += count
                         view = view[count:]
                 except OSError as error:
+                    self.record_first_error("pwrite", index, error)
                     with self.lock:
                         self.pwrite_errors += 1
                         self.uncertain_files.add(index)
@@ -485,18 +569,11 @@ class Workload:
                         self.fatal.append(f"three consecutive writes failed: {error}")
                         self.stop.set()
                 else:
-                    try:
-                        os.fsync(descriptors[index])
-                    except OSError as error:
-                        with self.lock:
-                            self.fsync_errors += 1
-                            self.uncertain_files.add(index)
-                        failures += 1
-                        if failures >= 3:
-                            self.fatal.append(
-                                f"three consecutive fsync writes failed: {error}"
-                            )
-                            self.stop.set()
+                    if not self.fsync_with_retry(descriptors[index], index):
+                        self.fatal.append(
+                            f"fsync retry deadline expired for file-{index:04d}.bin"
+                        )
+                        self.stop.set()
                     else:
                         with self.lock:
                             self.write_latencies.append(
@@ -507,6 +584,7 @@ class Workload:
                 elapsed = time.monotonic() - started
                 self.stop.wait(max(0.0, self.write_interval - elapsed))
         except OSError as error:
+            self.record_first_error("open", None, error)
             self.fatal.append(f"writer {worker} failed outside an operation: {error}")
             self.stop.set()
         finally:
@@ -539,6 +617,7 @@ class Workload:
                     self.read_latencies.append((time.monotonic() - started) * 1000)
                 failures = 0
             except OSError as error:
+                self.record_first_error("read", index, error)
                 with self.lock:
                     self.read_errors += 1
                 failures += 1
@@ -548,14 +627,71 @@ class Workload:
             elapsed = time.monotonic() - started
             self.stop.wait(max(0.0, self.read_interval - elapsed))
 
+    def fsync_with_retry(self, descriptor: int, index: int) -> bool:
+        try:
+            os.fsync(descriptor)
+            return True
+        except OSError as error:
+            self.record_first_error("fsync", index, error)
+            with self.lock:
+                self.fsync_errors += 1
+                self.uncertain_files.add(index)
+
+        deadline = time.monotonic() + self.fsync_retry_seconds
+        interval = self.fsync_retry_interval
+        # Drain an already-dispatched fsync even if the phase ends normally.
+        # A normal phase stop must not turn a recoverable in-flight publication
+        # into an artificial deadline failure.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
+            if time.monotonic() >= deadline:
+                break
+            with self.lock:
+                self.fsync_retry_attempts += 1
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                self.record_first_error("fsync-retry", index, error)
+                with self.lock:
+                    self.fsync_errors += 1
+                    self.uncertain_files.add(index)
+                interval = min(interval * 2, FSYNC_RETRY_MAX_INTERVAL)
+                continue
+            with self.lock:
+                self.fsync_retry_successes += 1
+                self.uncertain_files.discard(index)
+            return True
+        return False
+
+    def record_first_error(
+        self, operation: str, index: int | None, error: OSError
+    ) -> None:
+        with self.lock:
+            if len(self.first_errors) >= MAX_FIRST_ERRORS:
+                return
+            self.first_errors.append(
+                {
+                    "operation": operation,
+                    "file": None if index is None else f"file-{index:04d}.bin",
+                    "errno": error.errno,
+                    "message": str(error),
+                    "elapsed_seconds": (
+                        None
+                        if self.started_at is None
+                        else round(time.monotonic() - self.started_at, 3)
+                    ),
+                }
+            )
+
     def finish(self) -> dict[str, Any]:
         self.stop.set()
         for thread in self.threads:
             thread.join(timeout=self.write_interval + self.read_interval + 30)
         if any(thread.is_alive() for thread in self.threads):
             raise EnvelopeError("workload thread did not stop within its bounded timeout")
-        if self.fatal:
-            raise EnvelopeError("; ".join(self.fatal))
         write_errors = self.pwrite_errors + self.fsync_errors
         writers = {
             **latency_summary(self.write_latencies, write_errors),
@@ -565,9 +701,15 @@ class Workload:
             "fsync_each_write": True,
             "pwrite_errors": self.pwrite_errors,
             "fsync_errors": self.fsync_errors,
+            "fsync_retry_attempts": self.fsync_retry_attempts,
+            "fsync_retry_successes": self.fsync_retry_successes,
+            "fsync_retry_seconds": self.fsync_retry_seconds,
+            "fsync_retry_interval": self.fsync_retry_interval,
             "uncertain_files": sorted(self.uncertain_files),
         }
         return {
+            "fatal": list(self.fatal),
+            "first_errors": self.first_errors,
             "writers": writers,
             "readers": {
                 **latency_summary(self.read_latencies, self.read_errors),
@@ -915,6 +1057,8 @@ class Harness:
             write_interval=self.args.write_interval,
             read_interval=self.args.read_interval,
             seed=self.args.seed,
+            fsync_retry_seconds=self.args.fsync_retry_seconds,
+            fsync_retry_interval=self.args.fsync_retry_interval,
         )
         phase_started = time.monotonic()
         phase_deadline = phase_started + duration
@@ -941,9 +1085,26 @@ class Harness:
                 )
         finally:
             summary = workload.finish()
+            summary["pwrite_acknowledged_expected"] = {
+                "basis": "pwrite-acknowledged expected bytes; fsync uncertainty is separate",
+                "files": [
+                    {
+                        "file": f"file-{index:04d}.bin",
+                        "length": len(bytes_),
+                        "sha256": bytes_sha256(bytes_),
+                    }
+                    for index, bytes_ in enumerate(expected)
+                ],
+            }
+            summary["planned_seconds"] = duration
+            summary["actual_seconds"] = round(time.monotonic() - phase_started, 3)
+            summary["phase_started_report_elapsed_seconds"] = round(
+                phase_started - self.report_started, 3
+            )
+            self.report.setdefault("phases", {})[name] = summary
             self.sample(time.monotonic() - self.report_started, f"{name}-final")
-        summary["planned_seconds"] = duration
-        summary["actual_seconds"] = round(time.monotonic() - phase_started, 3)
+        if summary["fatal"]:
+            raise EnvelopeError("; ".join(summary["fatal"]))
         return summary
 
     def verify_bytes(self, label: str, expected: list[bytearray]) -> dict[str, Any]:
@@ -1091,26 +1252,11 @@ class Harness:
         }
         self.report["phase"] = "steady-state-two"
         second = self.run_phase("steady-state-two", second_duration, expected)
-        self.verify_mount_bytes(expected)
-        self.report["phase"] = "final-stop"
-        stopped_two = self.mount.stop(self.redact)
-        final_verify = self.verify_bytes("final", expected)
-        final_history = self.remote_history(time.monotonic() - self.report_started)
-        integrity = self.sqlite_integrity()
-        doctor = self.doctor()
-        self.finalize_statistics()
         self.report["phases"] = {
             "steady-state-one": first,
             "steady-state-two": second,
         }
-        self.report["completion"] = {
-            "clean_unmounts": [stopped_one, stopped_two],
-            "restart_restore": first_verify,
-            "final_restore": final_verify,
-            "final_remote_history": final_history,
-            "sqlite": integrity,
-            "doctor": doctor,
-        }
+        self.finalize_statistics()
         self.report["request_accounting"] = self.request_accounting
         uncertain_files = sorted(
             set(first["writers"]["uncertain_files"])
@@ -1128,12 +1274,180 @@ class Harness:
                 + second["writers"]["fsync_errors"]
             ),
         }
-        if uncertain_files:
-            self.report["status"] = "fail"
+        self.verify_mount_bytes(expected)
+        self.report["phase"] = "final-stop"
+        stopped_two = self.mount.stop(self.redact)
+        completion = {
+            "clean_unmounts": [stopped_one, stopped_two],
+            "restart_restore": first_verify,
+        }
+        self.report["completion"] = completion
+        final_verify = self.verify_bytes("final", expected)
+        completion["final_restore"] = final_verify
+        completion["final_remote_history"] = self.remote_history(
+            time.monotonic() - self.report_started
+        )
+        completion["sqlite"] = self.sqlite_integrity()
+        retry_counts = {
+            "pwrite_errors": self.report["durability"]["pwrite_errors"],
+            "reader_errors": first["readers"]["errors"] + second["readers"]["errors"],
+            "fsync_errors": self.report["durability"]["fsync_errors"],
+            "fsync_retry_attempts": (
+                first["writers"]["fsync_retry_attempts"]
+                + second["writers"]["fsync_retry_attempts"]
+            ),
+            "fsync_retry_successes": (
+                first["writers"]["fsync_retry_successes"]
+                + second["writers"]["fsync_retry_successes"]
+            ),
+            "uncertain_files": uncertain_files,
+            "fatal": [*first["fatal"], *second["fatal"]],
+            "clean_unmounts": [stopped_one, stopped_two],
+            "phases": [
+                {
+                    "name": name,
+                    "fsync_errors": phase["writers"]["fsync_errors"],
+                    "fsync_retry_attempts": phase["writers"][
+                        "fsync_retry_attempts"
+                    ],
+                    "fsync_retry_successes": phase["writers"][
+                        "fsync_retry_successes"
+                    ],
+                }
+                for name, phase in (
+                    ("steady-state-one", first),
+                    ("steady-state-two", second),
+                )
+            ],
+        }
+        status_command = [
+            str(self.yy),
+            "--volume",
+            str(self.config),
+            "status",
+        ]
+        pre_status = self.yy_run(status_command[1:], timeout=180, check=False)
+        acknowledgment = {
+            "policy": (
+                "acknowledge only persisted ledger entries after every fsync "
+                "recovered and all byte, SQLite, and handle-state checks pass"
+            ),
+            "retry": retry_counts,
+            "pre_status": {
+                "command": status_command,
+                "returncode": pre_status.returncode,
+                "stdout": pre_status.stdout,
+                "stderr": pre_status.stderr,
+            },
+            "through": None,
+            "command": None,
+        }
+        completion["acknowledgment"] = acknowledgment
+        unsafe = []
+        if retry_counts["pwrite_errors"]:
+            unsafe.append(f"pwrite_errors={retry_counts['pwrite_errors']}")
+        if retry_counts["reader_errors"]:
+            unsafe.append(f"reader_errors={retry_counts['reader_errors']}")
+        if retry_counts["fatal"]:
+            unsafe.append("fatal is not empty")
+        if retry_counts["uncertain_files"]:
+            unsafe.append(f"uncertain_files={retry_counts['uncertain_files']}")
+        for phase in retry_counts["phases"]:
+            errors = phase["fsync_errors"]
+            attempts = phase["fsync_retry_attempts"]
+            successes = phase["fsync_retry_successes"]
+            if attempts != errors:
+                unsafe.append(
+                    f"{phase['name']} fsync retry attempts={attempts} errors={errors}"
+                )
+            if successes > attempts:
+                unsafe.append(
+                    f"{phase['name']} fsync retry successes={successes} "
+                    f"attempts={attempts}"
+                )
+            if (successes > 0) != (errors > 0):
+                unsafe.append(
+                    f"{phase['name']} fsync retry successes={successes} errors={errors}"
+                )
+        for unmount in retry_counts["clean_unmounts"]:
+            if not unmount.get("stopped") or unmount.get("returncode") != 0:
+                unsafe.append("mount did not stop cleanly")
+                break
+        if pre_status.returncode != 0:
+            unsafe.append(f"pre-acknowledgment status exit={pre_status.returncode}")
+            pre_snapshot = None
+        else:
+            pre_snapshot = file_status_snapshot(pre_status.stdout)
+            acknowledgment["pre_status"]["counts"] = pre_snapshot
+            for name in ("pending", "frozen", "conflicts", "failed"):
+                if pre_snapshot[name]:
+                    unsafe.append(f"pre-acknowledgment {name}={pre_snapshot[name]}")
+            sequences = pre_snapshot["sequences"]
+            if sequences != sorted(set(sequences)):
+                unsafe.append("ledger sequences are not unique and ordered")
+            if any(sequence <= 0 for sequence in sequences):
+                unsafe.append("ledger contains a non-persisted sequence")
+            if any(not error["persisted"] for error in pre_snapshot["errors"]):
+                unsafe.append("ledger contains an unpersisted error")
+        if unsafe:
             raise EnvelopeError(
-                "pwrite/fsync failures left uncertain durability for files "
-                f"{uncertain_files}; byte assertions completed but the run is not accepted"
+                "acknowledgment safety gate failed: " + "; ".join(unsafe)
             )
+        if pre_snapshot["ledger_errors"]:
+            through = pre_snapshot["sequences"][-1]
+            acknowledge_command = [
+                str(self.yy),
+                "--volume",
+                str(self.config),
+                "file",
+                "acknowledge-errors",
+                str(through),
+            ]
+            acknowledged = self.yy_run(
+                acknowledge_command[1:], timeout=180, check=False
+            )
+            acknowledgment["through"] = through
+            acknowledgment["command"] = acknowledge_command
+            acknowledgment["result"] = {
+                "returncode": acknowledged.returncode,
+                "stdout": acknowledged.stdout,
+                "stderr": acknowledged.stderr,
+            }
+            post_status = self.yy_run(status_command[1:], timeout=180, check=False)
+            acknowledgment["post_status"] = {
+                "command": status_command,
+                "returncode": post_status.returncode,
+                "stdout": post_status.stdout,
+                "stderr": post_status.stderr,
+            }
+            if acknowledged.returncode != 0:
+                unsafe.append(
+                    f"acknowledge-errors exit={acknowledged.returncode}"
+                )
+            if post_status.returncode != 0:
+                unsafe.append(
+                    f"post-acknowledgment status exit={post_status.returncode}"
+                )
+            else:
+                post_snapshot = file_status_snapshot(post_status.stdout)
+                acknowledgment["post_status"]["counts"] = post_snapshot
+                for name in (
+                    "pending",
+                    "frozen",
+                    "conflicts",
+                    "failed",
+                    "ledger_errors",
+                ):
+                    if post_snapshot[name]:
+                        unsafe.append(f"post-acknowledgment {name}={post_snapshot[name]}")
+            if unsafe:
+                raise EnvelopeError(
+                    "acknowledgment did not converge: " + "; ".join(unsafe)
+                )
+        doctor = self.doctor()
+        completion["doctor"] = doctor
+        if doctor.get("status") != "pass":
+            raise EnvelopeError(f"doctor status is {doctor.get('status')!r}")
         self.report["status"] = "pass"
         self.report["phase"] = "complete"
         self.report["ended_at"] = utc_now()
@@ -1182,6 +1496,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "readers": args.readers,
             "write_interval_seconds": args.write_interval,
             "read_interval_seconds": args.read_interval,
+            "fsync_retry_seconds": args.fsync_retry_seconds,
+            "fsync_retry_interval": args.fsync_retry_interval,
             "restart_at_fraction": 0.5,
         },
         "limits": [
@@ -1234,6 +1550,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--readers", type=int, default=2)
     parser.add_argument("--write-interval", type=float, default=2.0)
     parser.add_argument("--read-interval", type=float, default=0.5)
+    parser.add_argument("--fsync-retry-seconds", type=float, default=30.0)
+    parser.add_argument("--fsync-retry-interval", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=20261028)
     parser.add_argument(
         "--request-accounting",
@@ -1255,6 +1573,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--readers cannot be negative")
     if args.write_interval <= 0 or args.read_interval <= 0:
         parser.error("write and read intervals must be positive")
+    if args.fsync_retry_seconds <= 0 or args.fsync_retry_interval <= 0:
+        parser.error("fsync retry window and interval must be positive")
+    if args.fsync_retry_interval > FSYNC_RETRY_MAX_INTERVAL:
+        parser.error("--fsync-retry-interval exceeds the bounded maximum")
     if Path(args.output).exists():
         parser.error("--output already exists; preserve prior evidence and choose a new path")
     return args
