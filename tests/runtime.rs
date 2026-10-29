@@ -88,6 +88,63 @@ impl Authority for PausingAuthority {
     }
 }
 
+struct FailingRevisionAuthority {
+    inner: Arc<dyn Authority>,
+    fail_revision: AtomicBool,
+}
+impl FailingRevisionAuthority {
+    fn new(inner: Arc<dyn Authority>) -> Self {
+        Self {
+            inner,
+            fail_revision: AtomicBool::new(false),
+        }
+    }
+}
+impl std::fmt::Debug for FailingRevisionAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailingRevisionAuthority")
+            .finish_non_exhaustive()
+    }
+}
+impl Authority for FailingRevisionAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+    fn observe_latest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_latest()
+    }
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        if self.fail_revision.load(Ordering::SeqCst) {
+            Box::pin(async {
+                Err(yinyang::core::Error::new(
+                    yinyang::core::ErrorKind::Storage,
+                    "observe revision",
+                    "injected lazy base authentication failure",
+                ))
+            })
+        } else {
+            self.inner.observe_revision(revision)
+        }
+    }
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
+        self.inner.commit_batch(requests)
+    }
+}
+
 async fn exercise(
     authority: Arc<dyn Authority>,
     path: &std::path::Path,
@@ -618,6 +675,71 @@ async fn file_operations_share_object_and_service_contract() {
 }
 
 #[tokio::test]
+async fn recovered_sparse_reads_authenticate_the_base_lazily() {
+    const BLOCK: usize = 64 * 1024;
+
+    let backend = TestBackend::default();
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let fault = Arc::new(FailingRevisionAuthority::new(inner));
+    let authority: Arc<dyn Authority> = fault.clone();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    let base = vec![0x11; BLOCK * 2];
+    let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let node = plan
+        .create_file(authority.root(), "lazy", prepared, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        authority.commit(&plan.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+
+    let mut file = runtime.open_node(node, true).await.unwrap();
+    file.write(100, b"LOCAL").await.unwrap();
+    let handle = file.release().unwrap();
+    fault.fail_revision.store(true, Ordering::SeqCst);
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    assert_eq!(recovered.read(100, 5).await.unwrap(), b"LOCAL");
+    assert!(
+        recovered
+            .read((BLOCK * 2) as u64 + 1, 8)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        recovered.read(0, 1).await.unwrap_err().kind(),
+        ErrorKind::Storage
+    );
+    assert!(recovered.status().await.unwrap().error.is_some());
+    recovered.acknowledge_error().await.unwrap();
+
+    fault.fail_revision.store(false, Ordering::SeqCst);
+    recovered.fsync().await.unwrap().unwrap();
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(100, 5)
+            .await
+            .unwrap(),
+        b"LOCAL"
+    );
+    recovered.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn durable_staging_reopens_and_preserves_concurrent_generation_conflict() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
@@ -833,29 +955,6 @@ async fn sparse_runtime(
             .unwrap(),
         zero_extended
     );
-
-    let mut recovered = runtime.open_node(node, true).await.unwrap();
-    recovered.write(5000, b"LOCAL").await.unwrap();
-    let handle = recovered.release().unwrap();
-    backend.state.lock().unwrap().offline = true;
-    let mut recovered = runtime.recover(handle).await.unwrap();
-    assert_eq!(recovered.read(5000, 5).await.unwrap(), b"LOCAL");
-    assert!(
-        recovered
-            .read(BASE_BYTES as u64 + 5, 8)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        recovered.read(0, 1).await.unwrap_err().kind(),
-        ErrorKind::Storage
-    );
-    assert!(recovered.status().await.unwrap().error.is_some());
-    recovered.acknowledge_error().await.unwrap();
-    backend.state.lock().unwrap().offline = false;
-    recovered.fsync().await.unwrap().unwrap();
-    recovered.close().await.unwrap();
 }
 
 #[tokio::test]
