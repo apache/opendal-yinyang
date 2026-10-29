@@ -1581,7 +1581,7 @@ mod tests {
         let record = Record {
             id,
             node: *yinyang_core::NodeId::generate().as_bytes(),
-            base: Revision::new(7).to_bytes(),
+            base: [7; 24],
             length: base.len() as u64,
             local: 0,
             remote: 0,
