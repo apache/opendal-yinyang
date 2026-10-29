@@ -1212,12 +1212,12 @@ mod tests {
     async fn multiple_bounded_edits_reuse_the_trusted_base_and_reject_overlap() {
         let backend = TestBackend::default();
         let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
-        let bytes = (0..BLOCK_BYTES * 6 + 17)
+        let bytes = (0..BLOCK_BYTES * 64 + 17)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
         let edits = [
-            ContentEdit::new(3..7, b"abc").unwrap(),
+            ContentEdit::new(3..7, b"abcd").unwrap(),
             ContentEdit::new(BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3, b"01234").unwrap(),
             ContentEdit::new(bytes.len() as u64 - 2..bytes.len() as u64, b"xy").unwrap(),
         ];
@@ -1233,7 +1233,7 @@ mod tests {
         );
         let mut expected = bytes.clone();
         for (range, replacement) in [
-            (3..7, b"abc".as_slice()),
+            (3..7, b"abcd".as_slice()),
             (
                 BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3,
                 b"01234".as_slice(),
