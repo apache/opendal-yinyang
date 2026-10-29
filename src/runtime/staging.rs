@@ -1649,7 +1649,8 @@ mod tests {
         assert_eq!(&read.bytes[..4], &[0; 4]);
         assert_eq!(&read.bytes[4..6], b"WX");
         assert_eq!(&read.bytes[6..], &[0; 6]);
-        assert_eq!(read.base, [0..4]);
+        assert_eq!(read.base.len(), 1);
+        assert_eq!(read.base[0], 0..4);
     }
 
     #[tokio::test]
