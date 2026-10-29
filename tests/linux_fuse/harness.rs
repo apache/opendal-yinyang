@@ -179,6 +179,13 @@ pub struct Fixture {
     last_service_address: Option<SocketAddr>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteObjectIdentity {
+    pub path: String,
+    pub length: u64,
+    pub etag: Option<String>,
+}
+
 impl Fixture {
     pub fn new(publication: Publication) -> Self {
         require_fuse();
@@ -829,6 +836,33 @@ impl Fixture {
                 .await
                 .expect("read through in-process authority")
         })
+    }
+
+    /// Lists the complete configured storage prefix for read-only
+    /// non-mutation assertions. This includes authority metadata objects.
+    pub fn remote_object_identities(&self) -> Vec<RemoteObjectIdentity> {
+        let operator = self.operator();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build remote identity runtime");
+        let mut objects = runtime.block_on(async move {
+            operator
+                .list_with("")
+                .recursive(true)
+                .await
+                .expect("list remote object identities")
+                .into_iter()
+                .filter(|entry| entry.metadata().is_file())
+                .map(|entry| RemoteObjectIdentity {
+                    path: entry.path().to_owned(),
+                    length: entry.metadata().content_length(),
+                    etag: entry.metadata().etag().map(str::to_owned),
+                })
+                .collect::<Vec<_>>()
+        });
+        objects.sort_by(|left, right| left.path.cmp(&right.path));
+        objects
     }
 
     fn in_process_authority(&self) -> Arc<dyn Authority> {
