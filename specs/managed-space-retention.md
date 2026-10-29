@@ -99,7 +99,9 @@ quiescence.
 Local staging uses only existing paths:
 
 - `<staging>/staging.db` denotes managed mount or file-runtime staging;
-- `<staging>/content/staging.db` denotes Managed Sync content staging.
+- `<staging>/sync.db` denotes the Managed Sync namespace and content journal;
+- `<staging>/content/staging.db` denotes Managed Sync content staging; and
+- `<staging>/replica.db` denotes the Linux ordinary-directory replica.
 
 An absent staging database remains absent. A present database is inspected
 through the existing read-only runtime inspection API. The report exposes
@@ -107,6 +109,54 @@ validity, pending/frozen/conflict/Unknown/failed handle counts, staged handle
 lengths, ledger error count, frozen commit identities, and the recorded remote
 base revisions. Handle lengths are local staged logical lengths, not directory
 allocation.
+
+When `sync.db` exists, the existing `Sync::inspect` API joins content-edit
+records and namespace intents without taking the writer lease. Namespace
+evidence includes baseline revision, original CommitId, operation state
+(`prepared`, `unknown`, `committed`, `conflict`, `retryable`, or `failed`), and
+receipt revision when committed. A namespace-only pending or Unknown intent can
+therefore protect its baseline even when no content handle exists. Content
+handles already counted from content staging are not counted again from this
+join.
+
+When `replica.db` exists on Linux, the existing read-only `Replica::inspect`
+API reports incomplete installs, retained artifacts, exportability, and
+conflicts. Conflict-recorded remote revisions are protected. The current public
+read-only replica status does not expose the stored common baseline, so
+`baseline_coverage` is explicitly
+`unobserved_by_public_read_only_inspection`; it is not reported as absent or
+unchanged. A failure to open the bound local root marks replica evidence
+unavailable rather than fabricating zero.
+
+The JSON document exposes these joins as `staging.sync` and `staging.replica`.
+Missing files report `missing`; malformed or unknown existing databases report
+`unavailable` with their error and are not repaired. `staging.databases` records
+each observed database role separately.
+
+Volume-bound `space report` and `space retention plan` call
+`inspect_bound_local_staging` with the observed authority filesystem. Existing
+read-only binding validators are reused before any local evidence is
+attributed:
+
+- `Runtime::validate_staging` validates mount staging and standalone Sync
+  content staging;
+- `Sync::validate_restore` validates the Sync journal and its content staging;
+  and
+- `Replica::inspect` supplies the replica's bound filesystem.
+
+`staging.binding.state` is `verified` after every present component validates
+for the observed authority filesystem. If any component is foreign, malformed,
+or cannot be verified, the state is `unavailable`, the binding error is
+reported, and all handles, namespace intents, artifacts, commit identities, and
+protected revisions from that staging path are withheld. Foreign work must not
+protect revisions for the configured volume.
+
+The standalone library function `inspect_local_staging` remains usable for
+offline evidence without an authority. It labels
+`staging.binding.state: "unbound"` and must not be interpreted as volume-bound
+attribution. Binding validation itself is read-only and does not acquire a
+runtime lease, initialize a database, migrate a profile, recover work, or
+contact storage.
 
 Directory measurement reports regular-file count and apparent file length. It
 does not follow symbolic links and does not claim allocated disk blocks. The
@@ -123,7 +173,10 @@ The selected set is the union of:
   requested;
 - every requested revision that is present in the retained list; and
 - remote base revisions recorded by existing pending, frozen, conflict,
-  Unknown, or failed staging handles.
+  Unknown, or failed staging handles;
+- baselines recorded by Managed Sync namespace intents, including
+  namespace-only intents without a content handle; and
+- receipt revisions recorded by committed Managed Sync namespace intents.
 
 A requested revision absent from a successfully observed retained list is
 reported as `not_retained` and makes the plan partial. If the authority cannot
@@ -136,10 +189,25 @@ outside a bounded selection remains visible with
 `outside_bounded_policy`; the plan never treats that reason as permission to
 remove data.
 
+Selection reasons are drawn from:
+
+- `current`, `keep_all`, `keep_last`, and `requested_pin`;
+- `staging_pending`, `staging_frozen`, `staging_unknown`,
+  `staging_conflict`, and `staging_failed`;
+- `sync_namespace_pending`, `sync_namespace_unknown`,
+  `sync_namespace_receipt`, `sync_namespace_conflict`,
+  `sync_namespace_retryable`, and `sync_namespace_failed`;
+- `sync_receipt`; and
+- `replica_conflict`.
+
 The plan also reports:
 
 - receipt evidence counted from the latest snapshot's retained change records;
 - staging pending/frozen/conflict/Unknown/failed evidence;
+- Managed Sync prepared/Unknown/committed/conflict/retryable/failed namespace
+  evidence;
+- replica pending installs, retained artifacts, and conflicts, with the
+  explicit baseline-coverage limitation; and
 - frozen commit identities;
 - `backup_evidence: "not_observed"`;
 - `external_readers: "unknown"`;

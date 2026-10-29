@@ -183,8 +183,9 @@ fn print_report(report: &ManagedSpaceReport) {
         );
     }
     println!(
-        "local staging: {:?} at {} ({} handles, {} staged bytes)",
+        "local staging: {:?} binding {:?} at {} ({} handles, {} staged bytes)",
         report.staging.state,
+        report.staging.binding.state,
         report.staging.path,
         report.staging.handles.total,
         report.staging.handles.handle_bytes
@@ -195,6 +196,41 @@ fn print_report(report: &ManagedSpaceReport) {
             directory.regular_files, directory.apparent_bytes, directory.symlinks_skipped
         );
     }
+    println!(
+        "managed sync: {:?} ({} content edits, {} namespace intents: prepared {} unknown {} committed {} conflict {} retryable {} failed {})",
+        report.staging.sync.state,
+        report.staging.sync.content_edits,
+        report.staging.sync.namespace_intents,
+        report.staging.sync.namespace_prepared,
+        report.staging.sync.namespace_unknown,
+        report.staging.sync.namespace_committed,
+        report.staging.sync.namespace_conflict,
+        report.staging.sync.namespace_retryable,
+        report.staging.sync.namespace_failed
+    );
+    println!(
+        "replica: {:?} pending-installs {} artifacts {} conflicts {}; baseline {}",
+        report.staging.replica.state,
+        report
+            .staging
+            .replica
+            .pending_installs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        report
+            .staging
+            .replica
+            .artifacts
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        report
+            .staging
+            .replica
+            .conflicts
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        report.staging.replica.baseline_coverage
+    );
     for unresolved in &report.unresolved {
         println!(
             "unresolved {} ({}): {}",
@@ -247,13 +283,46 @@ fn print_plan(plan: &ManagedRetentionPlan) {
         );
     }
     println!(
-        "protected staging: pending {} frozen {} conflict {} unknown {} failed {} ledger-errors {}",
+        "protected staging: binding {:?} pending {} frozen {} conflict {} unknown {} failed {} ledger-errors {}",
+        plan.protection.staging.binding.state,
         plan.protection.staging.pending,
         plan.protection.staging.frozen,
         plan.protection.staging.conflict,
         plan.protection.staging.unknown,
         plan.protection.staging.failed,
         plan.protection.staging.ledger_errors
+    );
+    println!(
+        "protected sync evidence: namespace intents {} (prepared {} unknown {} committed {} conflict {} retryable {} failed {})",
+        plan.protection.staging.sync.namespace_intents,
+        plan.protection.staging.sync.namespace_prepared,
+        plan.protection.staging.sync.namespace_unknown,
+        plan.protection.staging.sync.namespace_committed,
+        plan.protection.staging.sync.namespace_conflict,
+        plan.protection.staging.sync.namespace_retryable,
+        plan.protection.staging.sync.namespace_failed
+    );
+    println!(
+        "replica evidence: pending-installs {} artifacts {} conflicts {}; baseline {}",
+        plan.protection
+            .staging
+            .replica
+            .pending_installs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.protection
+            .staging
+            .replica
+            .artifacts
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.protection
+            .staging
+            .replica
+            .conflicts
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.protection.staging.replica.baseline_coverage
     );
     println!(
         "receipt evidence: {:?} ({} records / {} revisions)",

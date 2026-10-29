@@ -187,6 +187,20 @@ jobs:
             --evidence "$TRIAL_ROOT/evidence" \
             2>&1 | tee "$TRIAL_ROOT/evidence/archive-smoke.log"
 
+      - name: Run installed archive Mount and finite Sync acceptance
+        run: |
+          set -euo pipefail
+          yy_sha256=$(sha256sum "$TRIAL_YY" | awk '{print $1}')
+          {
+            printf 'schema=yinyang-linux-trial-operations-binary.v1\n'
+            printf 'source_commit=%s\n' "$GITHUB_SHA"
+            printf 'binary=%s\n' "$TRIAL_YY"
+            printf 'yy_sha256=%s\n' "$yy_sha256"
+          } | tee "$TRIAL_ROOT/evidence/operations-binary.txt"
+          export YY_UPGRADE_BIN="$TRIAL_YY"
+          cargo x test-linux-operations \
+            2>&1 | tee "$TRIAL_ROOT/evidence/operations.log"
+
       - name: Run retained-state recovery acceptance
         run: |
           set -euo pipefail

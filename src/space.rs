@@ -21,7 +21,10 @@
 //! metadata, current backend objects, and existing local staging state without
 //! opening a writer, acquiring a runtime lease, or migrating local databases.
 
+#[cfg(target_os = "linux")]
+use crate::replica::Replica;
 use crate::runtime::{ErrorKind as RuntimeErrorKind, Runtime};
+use crate::sync::{NamespaceState, NamespaceStatus, Sync};
 use opendal::{EntryMode, Operator};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -136,14 +139,58 @@ pub enum ListingConsistency {
 pub struct StagingSpace {
     pub path: String,
     pub state: StagingState,
+    pub binding: StagingBinding,
     pub directory: Option<DirectoryUsage>,
     pub databases: Vec<StagingDatabase>,
     pub handles: StagingHandles,
+    pub sync: SyncEvidence,
+    pub replica: ReplicaEvidence,
     pub protected_revisions: Vec<ProtectedRevision>,
     pub frozen_commits: Vec<String>,
     pub errors: Vec<String>,
     #[serde(skip)]
     protected: BTreeMap<Revision, BTreeSet<&'static str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StagingBinding {
+    pub state: StagingBindingState,
+    pub expected_filesystem: Option<String>,
+    pub error: Option<String>,
+}
+
+impl StagingBinding {
+    fn unbound() -> Self {
+        Self {
+            state: StagingBindingState::Unbound,
+            expected_filesystem: None,
+            error: None,
+        }
+    }
+
+    fn verified(filesystem: NodeId) -> Self {
+        Self {
+            state: StagingBindingState::Verified,
+            expected_filesystem: Some(identity_hex(filesystem)),
+            error: None,
+        }
+    }
+
+    fn unavailable(filesystem: NodeId, error: String) -> Self {
+        Self {
+            state: StagingBindingState::Unavailable,
+            expected_filesystem: Some(identity_hex(filesystem)),
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingBindingState {
+    Unbound,
+    Verified,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -183,6 +230,71 @@ pub struct StagingHandles {
     pub unknown: u64,
     pub failed: u64,
     pub ledger_errors: u64,
+    pub namespace_intents: u64,
+    pub namespace_prepared: u64,
+    pub namespace_unknown: u64,
+    pub namespace_committed: u64,
+    pub namespace_conflict: u64,
+    pub namespace_retryable: u64,
+    pub namespace_failed: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncEvidence {
+    pub state: StagingState,
+    pub content_edits: u64,
+    pub namespace_intents: u64,
+    pub namespace_prepared: u64,
+    pub namespace_unknown: u64,
+    pub namespace_committed: u64,
+    pub namespace_conflict: u64,
+    pub namespace_retryable: u64,
+    pub namespace_failed: u64,
+    pub commit_ids: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl SyncEvidence {
+    fn missing() -> Self {
+        Self {
+            state: StagingState::Missing,
+            content_edits: 0,
+            namespace_intents: 0,
+            namespace_prepared: 0,
+            namespace_unknown: 0,
+            namespace_committed: 0,
+            namespace_conflict: 0,
+            namespace_retryable: 0,
+            namespace_failed: 0,
+            commit_ids: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplicaEvidence {
+    pub state: StagingState,
+    pub pending_installs: Option<u64>,
+    pub artifacts: Option<u64>,
+    pub exportable_artifacts: Option<u64>,
+    pub conflicts: Option<u64>,
+    pub baseline_coverage: &'static str,
+    pub error: Option<String>,
+}
+
+impl ReplicaEvidence {
+    fn missing() -> Self {
+        Self {
+            state: StagingState::Missing,
+            pending_installs: None,
+            artifacts: None,
+            exportable_artifacts: None,
+            conflicts: None,
+            baseline_coverage: "not_observed",
+            error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -245,12 +357,15 @@ pub struct RetentionProtection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StagingProtection {
     pub state: StagingState,
+    pub binding: StagingBinding,
     pub pending: u64,
     pub frozen: u64,
     pub conflict: u64,
     pub unknown: u64,
     pub failed: u64,
     pub ledger_errors: u64,
+    pub sync: SyncEvidence,
+    pub replica: ReplicaEvidence,
     pub revisions: Vec<ProtectedRevision>,
 }
 
@@ -330,7 +445,7 @@ pub async fn inspect_managed_space(
     let mut unresolved = Vec::new();
     let retained = inspect_retained(authority, &snapshot, &mut unresolved).await;
     let physical = inspect_physical(authority, operator, &snapshot).await;
-    let staging = inspect_local_staging(staging).await;
+    let staging = inspect_bound_local_staging(staging, authority.filesystem()).await;
     for error in &staging.errors {
         unresolved.push(Unresolved {
             subject: "local-staging".to_owned(),
@@ -396,7 +511,7 @@ pub async fn plan_managed_retention(
         ));
     }
     let latest = authority.observe_latest().await?;
-    let staging = inspect_local_staging(staging).await;
+    let staging = inspect_bound_local_staging(staging, authority.filesystem()).await;
     let mut unresolved = staging
         .errors
         .iter()
@@ -563,12 +678,15 @@ pub async fn plan_managed_retention(
             current_revision: revision_hex(latest.revision()),
             staging: StagingProtection {
                 state: staging.state,
+                binding: staging.binding.clone(),
                 pending: staging.handles.pending,
                 frozen: staging.handles.frozen,
                 conflict: staging.handles.conflict,
                 unknown: staging.handles.unknown,
                 failed: staging.handles.failed,
                 ledger_errors: staging.handles.ledger_errors,
+                sync: staging.sync.clone(),
+                replica: staging.replica.clone(),
                 revisions: staging.protected_revisions.clone(),
             },
             receipts,
@@ -584,10 +702,437 @@ pub async fn plan_managed_retention(
     })
 }
 
-/// Inspect existing Managed staging databases without creating a directory or
-/// database, acquiring a runtime lease, migrating state, or recovering records.
-/// Known SQLite read-only behavior may create or update derived WAL/SHM files.
+/// Inspect existing Managed content, Sync, and replica evidence without creating
+/// a directory or database, acquiring a runtime lease, migrating state, or
+/// recovering records. Known SQLite read-only behavior may create or update
+/// derived WAL/SHM files.
 pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
+    let mut content = inspect_local_content_staging(staging).await;
+    let sync = inspect_sync_evidence(staging).await;
+    let replica = inspect_replica_evidence(staging).await;
+
+    merge_protected(&mut content.protected, &sync.protected);
+    merge_protected(&mut content.protected, &replica.protected);
+    content
+        .frozen_commits
+        .extend(sync.frozen_commits.iter().cloned());
+    content.frozen_commits.sort();
+    content.frozen_commits.dedup();
+    content.handles.namespace_intents = sync.evidence.namespace_intents;
+    content.handles.namespace_prepared = sync.evidence.namespace_prepared;
+    content.handles.namespace_unknown = sync.evidence.namespace_unknown;
+    content.handles.namespace_committed = sync.evidence.namespace_committed;
+    content.handles.namespace_conflict = sync.evidence.namespace_conflict;
+    content.handles.namespace_retryable = sync.evidence.namespace_retryable;
+    content.handles.namespace_failed = sync.evidence.namespace_failed;
+    push_unique(&mut content.errors, sync.evidence.error.clone());
+    push_unique(&mut content.errors, replica.evidence.error.clone());
+    if sync.evidence.state != StagingState::Missing {
+        content.databases.push(StagingDatabase {
+            kind: "sync-journal",
+            path: display_path(&staging.join("sync.db")),
+            state: measurement_state(sync.evidence.state),
+            error: sync.evidence.error.clone(),
+        });
+    }
+    if replica.evidence.state != StagingState::Missing {
+        content.databases.push(StagingDatabase {
+            kind: "replica",
+            path: display_path(&staging.join("replica.db")),
+            state: measurement_state(replica.evidence.state),
+            error: replica.evidence.error.clone(),
+        });
+    }
+    content.protected_revisions = protected_revisions(&content.protected);
+    content.sync = sync.evidence;
+    content.replica = replica.evidence;
+    content.state = staging_state(&content.databases, &content.errors, content.state);
+    content
+}
+
+/// Inspect local evidence only after existing read-only validators prove every
+/// present component belongs to the expected filesystem. Foreign or
+/// unverifiable state is reported as unavailable with no handles, namespace
+/// intents, or protected revisions attributed to the current volume.
+pub async fn inspect_bound_local_staging(staging: &Path, filesystem: NodeId) -> StagingSpace {
+    match validate_local_staging_binding(staging, filesystem).await {
+        Ok(()) => {
+            let mut inspection = inspect_local_staging(staging).await;
+            inspection.binding = StagingBinding::verified(filesystem);
+            inspection
+        }
+        Err(error) => unavailable_staging(staging, filesystem, error).await,
+    }
+}
+
+async fn validate_local_staging_binding(
+    staging: &Path,
+    filesystem: NodeId,
+) -> std::result::Result<(), String> {
+    let mount = staging.join("staging.db");
+    if path_exists(&mount)? {
+        Runtime::validate_staging(staging, filesystem)
+            .await
+            .map_err(|error| {
+                format!(
+                    "validate mount staging binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+    }
+
+    let sync = staging.join("sync.db");
+    let content = staging.join("content");
+    if path_exists(&sync)? {
+        Sync::validate_restore(staging, filesystem)
+            .await
+            .map_err(|error| {
+                format!(
+                    "validate Sync binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+    } else if path_exists(&content.join("staging.db"))? {
+        Runtime::validate_staging(&content, filesystem)
+            .await
+            .map_err(|error| {
+                format!(
+                    "validate Sync content staging binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+    }
+
+    let replica = staging.join("replica.db");
+    if path_exists(&replica)? {
+        #[cfg(target_os = "linux")]
+        {
+            let status = Replica::inspect(staging).map_err(|error| {
+                format!(
+                    "validate replica binding for filesystem {}: {error}",
+                    identity_hex(filesystem)
+                )
+            })?;
+            if status.filesystem != filesystem {
+                return Err(format!(
+                    "replica filesystem {} does not match volume filesystem {}",
+                    identity_hex(status.filesystem),
+                    identity_hex(filesystem)
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(
+                "replica binding cannot be verified on this platform; foreign state is not attributed"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn path_exists(path: &Path) -> std::result::Result<bool, String> {
+    path.try_exists()
+        .map_err(|error| format!("inspect local state {}: {error}", path.display()))
+}
+
+async fn unavailable_staging(
+    staging: &Path,
+    filesystem: NodeId,
+    binding_error: String,
+) -> StagingSpace {
+    let directory = match measure_directory(staging).await {
+        Ok(usage) => Some(usage),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(directory_error) => {
+            let error = format!(
+                "{binding_error}; measure {}: {directory_error}",
+                staging.display()
+            );
+            return StagingSpace {
+                path: display_path(staging),
+                state: StagingState::Unavailable,
+                binding: StagingBinding::unavailable(filesystem, error.clone()),
+                directory: None,
+                databases: Vec::new(),
+                handles: StagingHandles::default(),
+                sync: SyncEvidence::missing(),
+                replica: ReplicaEvidence::missing(),
+                protected_revisions: Vec::new(),
+                frozen_commits: Vec::new(),
+                errors: vec![error],
+                protected: BTreeMap::new(),
+            };
+        }
+    };
+    StagingSpace {
+        path: display_path(staging),
+        state: StagingState::Unavailable,
+        binding: StagingBinding::unavailable(filesystem, binding_error.clone()),
+        directory,
+        databases: Vec::new(),
+        handles: StagingHandles::default(),
+        sync: SyncEvidence::missing(),
+        replica: ReplicaEvidence::missing(),
+        protected_revisions: Vec::new(),
+        frozen_commits: Vec::new(),
+        errors: vec![binding_error],
+        protected: BTreeMap::new(),
+    }
+}
+
+struct SyncInspection {
+    evidence: SyncEvidence,
+    protected: BTreeMap<Revision, BTreeSet<&'static str>>,
+    frozen_commits: BTreeSet<String>,
+}
+
+struct ReplicaInspection {
+    evidence: ReplicaEvidence,
+    protected: BTreeMap<Revision, BTreeSet<&'static str>>,
+}
+
+async fn inspect_sync_evidence(staging: &Path) -> SyncInspection {
+    let database = staging.join("sync.db");
+    let mut inspection = SyncInspection {
+        evidence: SyncEvidence::missing(),
+        protected: BTreeMap::new(),
+        frozen_commits: BTreeSet::new(),
+    };
+    match database.try_exists() {
+        Ok(false) => return inspection,
+        Err(error) => {
+            inspection.evidence.state = StagingState::Unavailable;
+            inspection.evidence.error = Some(format!(
+                "inspect sync journal {}: {error}",
+                database.display()
+            ));
+            return inspection;
+        }
+        Ok(true) => {}
+    }
+    match Sync::inspect(staging).await {
+        Ok(sync) => {
+            inspection.evidence.state = StagingState::Available;
+            inspection.evidence.content_edits = sync.content.len() as u64;
+            let mut commit_ids = BTreeSet::new();
+            for status in sync.namespace {
+                absorb_namespace(
+                    status,
+                    &mut inspection.evidence,
+                    &mut inspection.protected,
+                    &mut commit_ids,
+                    &mut inspection.frozen_commits,
+                );
+            }
+            inspection.evidence.commit_ids = commit_ids.into_iter().collect();
+        }
+        Err(error) => {
+            inspection.evidence.state = StagingState::Unavailable;
+            inspection.evidence.error = Some(error.to_string());
+        }
+    }
+    inspection
+}
+
+async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
+    let database = staging.join("replica.db");
+    let mut inspection = ReplicaInspection {
+        evidence: ReplicaEvidence::missing(),
+        protected: BTreeMap::new(),
+    };
+    match database.try_exists() {
+        Ok(false) => return inspection,
+        Err(error) => {
+            inspection.evidence.state = StagingState::Unavailable;
+            inspection.evidence.baseline_coverage = "unavailable";
+            inspection.evidence.error = Some(format!(
+                "inspect replica state {}: {error}",
+                database.display()
+            ));
+            return inspection;
+        }
+        Ok(true) => {}
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match Replica::inspect(staging) {
+            Ok(status) => {
+                let pending = u64::try_from(status.pending_installs).unwrap_or(u64::MAX);
+                inspection.evidence = ReplicaEvidence {
+                    state: StagingState::Partial,
+                    pending_installs: Some(pending),
+                    artifacts: Some(status.artifacts.len() as u64),
+                    exportable_artifacts: Some(
+                        status
+                            .artifacts
+                            .iter()
+                            .filter(|artifact| artifact.exportable)
+                            .count() as u64,
+                    ),
+                    conflicts: Some(status.conflicts.len() as u64),
+                    baseline_coverage: "unobserved_by_public_read_only_inspection",
+                    error: None,
+                };
+                if pending > 0 {
+                    inspection.evidence.error = Some(format!(
+                        "replica has {pending} pending installs; retained artifacts and conflicts are observable, but replica baseline coverage is unobserved"
+                    ));
+                }
+                for conflict in status.conflicts {
+                    if let Some(revision) = conflict.remote_revision {
+                        inspection
+                            .protected
+                            .entry(Revision::from_bytes(revision))
+                            .or_default()
+                            .insert("replica_conflict");
+                    }
+                }
+            }
+            Err(error) => {
+                inspection.evidence.state = StagingState::Unavailable;
+                inspection.evidence.baseline_coverage = "unavailable";
+                inspection.evidence.error = Some(error.to_string());
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        inspection.evidence.state = StagingState::Unavailable;
+        inspection.evidence.baseline_coverage = "unavailable";
+        inspection.evidence.error = Some(
+            "replica read-only inspection is available only on Linux; baseline and retained artifact coverage is unobserved"
+                .to_owned(),
+        );
+    }
+    inspection
+}
+
+fn absorb_namespace(
+    status: NamespaceStatus,
+    evidence: &mut SyncEvidence,
+    protected: &mut BTreeMap<Revision, BTreeSet<&'static str>>,
+    commit_ids: &mut BTreeSet<String>,
+    frozen_commits: &mut BTreeSet<String>,
+) {
+    evidence.namespace_intents = evidence.namespace_intents.saturating_add(1);
+    commit_ids.insert(commit_hex(status.intent.commit_id));
+    let reason = match &status.state {
+        NamespaceState::Prepared => {
+            evidence.namespace_prepared = evidence.namespace_prepared.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.intent.commit_id));
+            "sync_namespace_pending"
+        }
+        NamespaceState::Unknown => {
+            evidence.namespace_unknown = evidence.namespace_unknown.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.intent.commit_id));
+            "sync_namespace_unknown"
+        }
+        NamespaceState::Committed(receipt) => {
+            evidence.namespace_committed = evidence.namespace_committed.saturating_add(1);
+            protected
+                .entry(receipt.cursor.revision)
+                .or_default()
+                .insert("sync_receipt");
+            "sync_namespace_receipt"
+        }
+        NamespaceState::Conflict => {
+            evidence.namespace_conflict = evidence.namespace_conflict.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.intent.commit_id));
+            "sync_namespace_conflict"
+        }
+        NamespaceState::Retryable => {
+            evidence.namespace_retryable = evidence.namespace_retryable.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.intent.commit_id));
+            "sync_namespace_retryable"
+        }
+        NamespaceState::Failed => {
+            evidence.namespace_failed = evidence.namespace_failed.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.intent.commit_id));
+            "sync_namespace_failed"
+        }
+    };
+    protected
+        .entry(status.intent.baseline)
+        .or_default()
+        .insert(reason);
+    if let Some(commit) = status.failure.and_then(|failure| failure.commit_id()) {
+        commit_ids.insert(commit_hex(commit));
+        frozen_commits.insert(commit_hex(commit));
+    }
+}
+
+fn merge_protected(
+    destination: &mut BTreeMap<Revision, BTreeSet<&'static str>>,
+    source: &BTreeMap<Revision, BTreeSet<&'static str>>,
+) {
+    for (revision, reasons) in source {
+        destination
+            .entry(*revision)
+            .or_default()
+            .extend(reasons.iter().copied());
+    }
+}
+
+fn protected_revisions(
+    protected: &BTreeMap<Revision, BTreeSet<&'static str>>,
+) -> Vec<ProtectedRevision> {
+    protected
+        .iter()
+        .map(|(revision, reasons)| ProtectedRevision {
+            revision: revision_hex(*revision),
+            reasons: reasons.iter().copied().collect(),
+        })
+        .collect()
+}
+
+fn push_unique(errors: &mut Vec<String>, error: Option<String>) {
+    if let Some(error) = error
+        && !errors.contains(&error)
+    {
+        errors.push(error);
+    }
+}
+
+fn measurement_state(state: StagingState) -> MeasurementState {
+    match state {
+        StagingState::Missing | StagingState::Unavailable => MeasurementState::Unavailable,
+        StagingState::NotInitialized | StagingState::Partial => MeasurementState::Partial,
+        StagingState::Available => MeasurementState::Available,
+    }
+}
+
+fn staging_state(
+    databases: &[StagingDatabase],
+    errors: &[String],
+    fallback: StagingState,
+) -> StagingState {
+    if databases.is_empty() {
+        return fallback;
+    }
+    let available = databases
+        .iter()
+        .any(|database| database.state == MeasurementState::Available);
+    let partial = databases
+        .iter()
+        .any(|database| database.state == MeasurementState::Partial);
+    let unavailable = databases
+        .iter()
+        .any(|database| database.state == MeasurementState::Unavailable);
+    if !available && !partial {
+        StagingState::Unavailable
+    } else if unavailable || partial || !errors.is_empty() {
+        StagingState::Partial
+    } else {
+        StagingState::Available
+    }
+}
+
+/// Inspect existing Managed content staging databases without creating a
+/// directory or database, acquiring a runtime lease, migrating state, or
+/// recovering records.
+async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
     let mut errors = Vec::new();
     let directory = match measure_directory(staging).await {
         Ok(usage) => Some(usage),
@@ -626,9 +1171,12 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
             } else {
                 StagingState::Missing
             },
+            binding: StagingBinding::unbound(),
             directory,
             databases: Vec::new(),
             handles: StagingHandles::default(),
+            sync: SyncEvidence::missing(),
+            replica: ReplicaEvidence::missing(),
             protected_revisions: Vec::new(),
             frozen_commits: Vec::new(),
             errors,
@@ -756,9 +1304,12 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
     StagingSpace {
         path: display_path(staging),
         state,
+        binding: StagingBinding::unbound(),
         directory,
         databases,
         handles,
+        sync: SyncEvidence::missing(),
+        replica: ReplicaEvidence::missing(),
         protected_revisions,
         frozen_commits: frozen_commits.into_iter().collect(),
         errors,
@@ -1182,6 +1733,7 @@ fn space_limits() -> Vec<String> {
         "Recursive listing returns current object keys only and is not atomic; noncurrent backend versions are unknown.",
         "Each visible pack object key is counted once even when multiple files or revisions share its extents.",
         "External readers, untracked revision pins, other staging directories, backup packages, and quiescence are not discoverable by this inspection.",
+        "Standalone inspect_local_staging is unbound; volume-bound report and retention planning require verified local filesystem attribution.",
         "Direct namespace objects are excluded; this module inspects only Managed authority metadata and Managed local staging.",
         "SQLite read-only inspection may create or update derived shared-memory or empty WAL files; authoritative database and existing WAL bytes are not migrated or modified by this code.",
     ]
