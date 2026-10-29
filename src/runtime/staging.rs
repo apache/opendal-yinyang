@@ -402,6 +402,34 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
     if profile != PROFILE_V3 {
         return Ok(());
     }
+    let handles = {
+        let mut query = c.prepare("SELECT id,record FROM handles").map_err(local)?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(local)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(local)?;
+        let mut result = BTreeMap::new();
+        for (id, bytes) in rows {
+            if id.len() != 16 {
+                return Err(Error::State(
+                    ErrorKind::Corrupt,
+                    "staging handle id is malformed",
+                ));
+            }
+            let record = decode(&bytes)?;
+            if record.id.as_slice() != id.as_slice() || record.length > i64::MAX as u64 {
+                return Err(Error::State(
+                    ErrorKind::Corrupt,
+                    "staging handle identity or length is invalid",
+                ));
+            }
+            result.insert(id, record);
+        }
+        result
+    };
     let filesystem: Vec<u8> = c
         .query_row(
             "SELECT filesystem FROM authority WHERE singleton=1",
@@ -425,7 +453,7 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(local)?
     };
-    let mut sparse = BTreeMap::<Vec<u8>, u64>::new();
+    let mut sparse = BTreeMap::<Vec<u8>, (u64, u64)>::new();
     for (handle, descriptor, prefix) in bases {
         let handle: [u8; 16] = handle
             .try_into()
@@ -446,17 +474,22 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
                 "staging base prefix exceeds content length",
             ));
         }
-        let exists = c
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM handles WHERE id=?1)",
-                params![handle.as_slice()],
-                |r| r.get::<_, bool>(0),
-            )
-            .map_err(local)?;
-        if !exists {
+        let Some(record) = handles.get(handle.as_slice()) else {
             return Err(Error::State(
                 ErrorKind::Corrupt,
                 "staging base has no handle",
+            ));
+        };
+        if !record.ready {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base belongs to an incomplete handle",
+            ));
+        }
+        if prefix > record.length {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging base prefix exceeds handle length",
             ));
         }
         let materialized = c
@@ -472,7 +505,7 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
                 "sparse handle also has materialized chunks",
             ));
         }
-        sparse.insert(handle.to_vec(), prefix);
+        sparse.insert(handle.to_vec(), (prefix, record.length));
     }
 
     let segments = {
@@ -496,17 +529,23 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
     };
     let mut previous = BTreeMap::<Vec<u8>, u64>::new();
     for (handle, position, data) in segments {
-        if !sparse.contains_key(&handle) {
+        let Some((_, length)) = sparse.get(&handle) else {
             return Err(Error::State(
                 ErrorKind::Corrupt,
                 "staging segment has no sparse base",
             ));
-        }
+        };
         if data.is_empty() {
             return Err(Error::State(ErrorKind::Corrupt, "staging segment is empty"));
         }
         let position = positioned(position)?;
         let end = segment_end(position, &data)?;
+        if end > *length {
+            return Err(Error::State(
+                ErrorKind::Corrupt,
+                "staging segment exceeds handle length",
+            ));
+        }
         if let Some(previous_end) = previous.insert(handle, end)
             && previous_end > position
         {
@@ -712,7 +751,10 @@ impl Stage {
                 c.busy_timeout(std::time::Duration::from_secs(1))
                     .map_err(local)?;
                 if !schema::matches(&c, &[]).map_err(local)? {
-                    validate_profile(&c, Some(fs))?;
+                    let profile = validate_profile(&c, Some(fs))?;
+                    if profile == PROFILE_V3 {
+                        validate_state(&c, &profile)?;
+                    }
                 }
             }
             let lock = std::fs::OpenOptions::new()
@@ -854,6 +896,27 @@ impl Stage {
     }
     pub async fn base(&self, id: [u8; 16]) -> Result<Option<Base>> {
         self.call(move |c| base(c, id)).await
+    }
+    pub async fn segment_ranges(&self, id: [u8; 16]) -> Result<Vec<(u64, u64)>> {
+        self.call(move |c| {
+            let mut query = c
+                .prepare(
+                    "SELECT position,length(data) FROM segments
+                     WHERE handle=?1 ORDER BY position",
+                )
+                .map_err(local)?;
+            query
+                .query_map(params![id.as_slice()], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(local)?
+                .map(|row| {
+                    let (position, length) = row.map_err(local)?;
+                    Ok((positioned(position)?, positioned(length)?))
+                })
+                .collect()
+        })
+        .await
     }
     pub async fn segments(&self, id: [u8; 16]) -> Result<Vec<(u64, Vec<u8>)>> {
         self.call(move |c| {

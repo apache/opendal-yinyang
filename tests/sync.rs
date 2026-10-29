@@ -1062,6 +1062,8 @@ async fn legacy_staging_and_sync_upgrade_preserves_unknown_identity_and_newer_ed
             .execute_batch(
                 "ALTER TABLE handles DROP COLUMN failure;
                  ALTER TABLE errors DROP COLUMN failure;
+                 DROP TABLE bases;
+                 DROP TABLE segments;
                  UPDATE authority SET profile='yinyang-stage-1' WHERE singleton=1;",
             )
             .unwrap();

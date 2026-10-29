@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome, ContentDescriptor, FileVersion, NodeId, Planner, Receipt,
-    Revision, Snapshot,
+    Authority, CommitId, CommitOutcome, ContentDescriptor, ContentEdit, FileVersion, NodeId,
+    Planner, PreparedContent, Receipt, Revision, Snapshot,
 };
 
 mod staging;
@@ -32,6 +32,11 @@ pub(crate) mod schema;
 
 mod error;
 pub use error::{Error, ErrorKind, Failure, Result};
+
+// Leave room for the authenticated service request around the encoded edits.
+const OVERWRITE_ENCODED_MAX: u64 = 16 * 1024 * 1024 - 2048;
+const OVERWRITE_EDITS_MAX: usize = 4096;
+const EDIT_WIRE_OVERHEAD: u64 = 24;
 
 /// Local and remote positions are distinct; a local write is not a remote receipt.
 #[derive(Clone, Debug)]
@@ -664,6 +669,86 @@ impl FileHandle {
         let result = self.publish().await;
         self.report(result).await
     }
+    async fn prepare_publication(&self, r: &Record) -> Result<PreparedContent> {
+        let stage = &self.runtime.inner.stage;
+        if let Some(base) = &self.base
+            && r.length == base.descriptor().content_id().length()
+            && let Some(stored) = stage.base(self.id).await?
+            && stored.prefix == r.length
+        {
+            let ranges = stage.segment_ranges(self.id).await?;
+            let mut ends = Vec::with_capacity(ranges.len());
+            let mut encoded = 0_u64;
+            for (position, length) in &ranges {
+                let end = position.checked_add(*length).ok_or(Error::State(
+                    ErrorKind::Corrupt,
+                    "staged segment length overflows",
+                ))?;
+                if end > r.length {
+                    return Err(Error::State(
+                        ErrorKind::Corrupt,
+                        "staged segment exceeds file length",
+                    ));
+                }
+                ends.push(end);
+                encoded = encoded
+                    .checked_add(*length + EDIT_WIRE_OVERHEAD)
+                    .ok_or(Error::State(
+                        ErrorKind::TooLarge,
+                        "staged edit size overflows",
+                    ))?;
+            }
+            if ranges.len() <= OVERWRITE_EDITS_MAX && encoded <= OVERWRITE_ENCODED_MAX {
+                let runs = stage.segments(self.id).await?;
+                if runs.len() != ranges.len()
+                    || runs.iter().zip(&ranges).any(
+                        |((position, bytes), (expected_position, expected_length))| {
+                            position != expected_position || bytes.len() as u64 != *expected_length
+                        },
+                    )
+                {
+                    return Err(Error::State(
+                        ErrorKind::Corrupt,
+                        "staged segments changed while preparing publication",
+                    ));
+                }
+                let edits = runs
+                    .iter()
+                    .zip(ends)
+                    .map(|((position, bytes), end)| ContentEdit::new(*position..end, bytes))
+                    .collect::<yinyang_core::Result<Vec<_>>>()?;
+                return self
+                    .runtime
+                    .authority()
+                    .prepare_overwrite(base, &edits)
+                    .await
+                    .map_err(Error::from);
+            }
+        }
+
+        let (mut source, mut sink) = tokio::io::duplex(CHUNK as usize);
+        let staged = stage.clone();
+        let base = self.base.clone();
+        let (id, length) = (self.id, r.length);
+        let producer = tokio::spawn(async move {
+            let mut offset = 0;
+            while offset < length {
+                let bytes = read_staged(&staged, base.as_ref(), id, offset, CHUNK as usize).await?;
+                if bytes.is_empty() {
+                    return Err(Error::Invalid("staged data ended early"));
+                }
+                sink.write_all(&bytes).await.map_err(Error::local)?;
+                offset += bytes.len() as u64;
+            }
+            Ok::<_, Error>(())
+        });
+        let prepared = self.runtime.authority().prepare(&mut source).await;
+        drop(source);
+        let produced = producer.await.map_err(Error::local)?;
+        let prepared = prepared?;
+        produced?;
+        Ok(prepared)
+    }
     async fn publish(&mut self) -> Result<Option<Receipt>> {
         let stage = &self.runtime.inner.stage;
         let mut r = stage.load(self.id).await?;
@@ -680,28 +765,7 @@ impl FileHandle {
         let request = if let Some(bytes) = &r.plan {
             self.runtime.authority().restore_transaction(bytes).await?
         } else {
-            let (mut source, mut sink) = tokio::io::duplex(CHUNK as usize);
-            let staged = stage.clone();
-            let base = self.base.clone();
-            let (id, length) = (self.id, r.length);
-            let producer = tokio::spawn(async move {
-                let mut offset = 0;
-                while offset < length {
-                    let bytes =
-                        read_staged(&staged, base.as_ref(), id, offset, CHUNK as usize).await?;
-                    if bytes.is_empty() {
-                        return Err(Error::Invalid("staged data ended early"));
-                    }
-                    sink.write_all(&bytes).await.map_err(Error::local)?;
-                    offset += bytes.len() as u64;
-                }
-                Ok::<_, Error>(())
-            });
-            let prepared = self.runtime.authority().prepare(&mut source).await;
-            drop(source);
-            let produced = producer.await.map_err(Error::local)?;
-            let prepared = prepared?;
-            produced?;
+            let prepared = self.prepare_publication(&r).await?;
             let snapshot = self
                 .runtime
                 .authority()

@@ -155,6 +155,7 @@ async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend
     completion_and_errors(&runtime, backend).await;
     version_reads(&runtime, backend).await;
     replace_rename(&runtime).await;
+    sparse_runtime(&runtime, backend, path).await;
 }
 
 async fn replace_rename(runtime: &Runtime) {
@@ -649,6 +650,151 @@ async fn durable_staging_reopens_and_preserves_concurrent_generation_conflict() 
     assert!(matches!(file.fsync().await, Err(Error::Conflict)));
     assert_eq!(file.read(65544, 8).await.unwrap(), b"retained");
     file.abort().await.unwrap();
+}
+
+async fn sparse_runtime(runtime: &Runtime, backend: &TestBackend, staging: &std::path::Path) {
+    const BASE_BYTES: usize = 1024 * 1024;
+    let bytes: Vec<u8> = (0..BASE_BYTES).map(|index| (index % 251) as u8).collect();
+    let prepared = runtime
+        .authority()
+        .prepare(&mut bytes.as_slice())
+        .await
+        .unwrap();
+    let snapshot = runtime.authority().observe_latest().await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let node = plan
+        .create_file(runtime.authority().root(), "sparse", prepared, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .authority()
+            .commit(&plan.finish().unwrap())
+            .await
+            .unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+    }
+    let mut file = runtime.open_node(node, true).await.unwrap();
+    assert!(
+        backend.state.lock().unwrap().data_read_bytes < 65536,
+        "opening a large Managed file downloaded its payload"
+    );
+    let database = rusqlite::Connection::open_with_flags(
+        staging.join("staging.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    let id = *file.id().as_bytes();
+    let counts = |table: &str| -> i64 {
+        database
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE handle=?1"),
+                [id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(counts("bases"), 1);
+    assert_eq!(counts("chunks"), 0);
+    assert_eq!(counts("segments"), 0);
+
+    file.write(1000, b"WXYZ").await.unwrap();
+    let segments: Vec<(i64, i64)> = {
+        let mut query = database
+            .prepare("SELECT position,length(data) FROM segments WHERE handle=?1")
+            .unwrap();
+        query
+            .query_map([id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(segments, [(1000, 4)]);
+    let mut expected = bytes.clone();
+    expected[1000..1004].copy_from_slice(b"WXYZ");
+    assert_eq!(file.read(996, 16).await.unwrap(), expected[996..1012]);
+
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    file.fsync().await.unwrap();
+    let state = backend.state.lock().unwrap();
+    assert!(
+        state.data_read_bytes < BASE_BYTES as u64 / 2,
+        "same-length sparse fsync read the whole base: {} bytes",
+        state.data_read_bytes
+    );
+    assert!(
+        state.written_bytes < BASE_BYTES as u64 / 2,
+        "same-length sparse fsync uploaded the whole file: {} bytes",
+        state.written_bytes
+    );
+    drop(state);
+    assert_eq!(
+        runtime
+            .authority()
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(996, 16)
+            .await
+            .unwrap(),
+        expected[996..1012]
+    );
+
+    let mut newer = runtime.open_node(node, true).await.unwrap();
+    file.write(2000, b"FROZ").await.unwrap();
+    newer.write(3000, b"NEW!").await.unwrap();
+    backend.state.lock().unwrap().delay_next_head = true;
+    let Err(Error::Unknown(commit)) = file.fsync().await else {
+        panic!("expected sparse publication outcome to be unknown");
+    };
+    assert_eq!(file.status().await.unwrap().frozen_commit_id, Some(commit));
+    assert!(file.write(0, b"blocked").await.is_err());
+    assert_eq!(file.fsync().await.unwrap().unwrap().commit_id, commit);
+    assert!(matches!(newer.fsync().await, Err(Error::Conflict)));
+    let mut newer_expected = expected.clone();
+    newer_expected[3000..3004].copy_from_slice(b"NEW!");
+    assert_eq!(
+        newer.read(2996, 8).await.unwrap(),
+        newer_expected[2996..3004]
+    );
+    newer.abort().await.unwrap();
+
+    file.truncate(700).await.unwrap();
+    file.truncate(BASE_BYTES as u64).await.unwrap();
+    let handle = file.release().unwrap();
+    let mut file = runtime.recover(handle).await.unwrap();
+    assert_eq!(file.read(700, 12).await.unwrap(), &[0; 12]);
+    file.close().await.unwrap();
+    let mut zero_extended = expected[..700].to_vec();
+    zero_extended.resize(BASE_BYTES, 0);
+    assert_eq!(
+        runtime
+            .authority()
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, BASE_BYTES)
+            .await
+            .unwrap(),
+        zero_extended
+    );
 }
 
 #[tokio::test]

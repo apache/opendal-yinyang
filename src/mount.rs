@@ -102,7 +102,7 @@ impl Mount {
         };
         let mut nodes = BTreeMap::new();
         for state in runtime.recoverable().await? {
-            if !state.pending && !state.frozen && state.error.is_none() {
+            if !state.pending && !state.frozen && !state.conflict && state.error.is_none() {
                 // Clean observations are disposable. This also collects a
                 // replacement materialized before an interrupted refresh.
                 runtime.discard_clean(state.id).await?;
