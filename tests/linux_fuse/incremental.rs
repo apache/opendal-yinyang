@@ -138,13 +138,21 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     assert_eof_reads(&early_reader, &expected);
 
     let path_shrunk = 2 * UNIT_BYTES + 31;
-    truncate(path.as_path(), path_shrunk as u64).expect("path truncate shrink");
+    truncate(
+        path.as_path(),
+        i64::try_from(path_shrunk).expect("path shrink fits off_t"),
+    )
+    .expect("path truncate shrink");
     expected.truncate(path_shrunk);
     assert_remote(fixture, &library, &expected, "path shrink");
     assert_attributes(&path, expected.len() as u64);
 
     let path_extended = path_shrunk + RANGE_BYTES;
-    truncate(path.as_path(), path_extended as u64).expect("path truncate zero extension");
+    truncate(
+        path.as_path(),
+        i64::try_from(path_extended).expect("path extension fits off_t"),
+    )
+    .expect("path truncate zero extension");
     expected.resize(path_extended, 0);
     assert_remote(fixture, &library, &expected, "path zero extension");
     assert_attributes(&path, expected.len() as u64);

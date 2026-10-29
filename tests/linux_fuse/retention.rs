@@ -79,7 +79,9 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
         .write(true)
         .open(mounted.mountpoint().join("space.bin"))
         .expect("open frozen space descriptor");
-    let flags = fcntl(&dirty, FcntlArg::F_GETFD).expect("read frozen descriptor flags");
+    let flags = FdFlag::from_bits_truncate(
+        fcntl(&dirty, FcntlArg::F_GETFD).expect("read frozen descriptor flags"),
+    );
     assert!(
         flags.contains(FdFlag::FD_CLOEXEC),
         "the frozen dirty descriptor must be close-on-exec before observation commands"
@@ -209,7 +211,9 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
         .write(true)
         .open(mounted.mountpoint().join("space.bin"))
         .expect("open dirty FUSE descriptor");
-    let flags = fcntl(&dirty, FcntlArg::F_GETFD).expect("read descriptor close-on-exec flag");
+    let flags = FdFlag::from_bits_truncate(
+        fcntl(&dirty, FcntlArg::F_GETFD).expect("read descriptor close-on-exec flag"),
+    );
     assert!(
         flags.contains(FdFlag::FD_CLOEXEC),
         "the dirty descriptor must be close-on-exec before spawning observation commands"
