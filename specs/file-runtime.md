@@ -53,6 +53,10 @@ SQLite transaction. Reads are relative to the handle's pinned base plus exact
 local dirty ranges; another open observes a fresh version. Handles are not
 automatically rebased onto concurrent writes. Recovering a sparse handle
 requires the authority to retain and return that exact revision and descriptor.
+Recovery and status do not contact that authority. A read covered entirely by
+local dirty ranges or returning no bytes does not authenticate the base; a read
+that needs untouched ranges authenticates it lazily, and any failure follows the
+normal retained-handle error path.
 
 A handle is uniquely leased in a runtime and is not cloneable. Its UUID can be
 recovered after drop or process restart. Rename does not change its node

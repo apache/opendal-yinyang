@@ -833,6 +833,29 @@ async fn sparse_runtime(
             .unwrap(),
         zero_extended
     );
+
+    let mut recovered = runtime.open_node(node, true).await.unwrap();
+    recovered.write(5000, b"LOCAL").await.unwrap();
+    let handle = recovered.release().unwrap();
+    backend.state.lock().unwrap().offline = true;
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    assert_eq!(recovered.read(5000, 5).await.unwrap(), b"LOCAL");
+    assert!(
+        recovered
+            .read(BASE_BYTES as u64 + 5, 8)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        recovered.read(0, 1).await.unwrap_err().kind(),
+        ErrorKind::Storage
+    );
+    assert!(recovered.status().await.unwrap().error.is_some());
+    recovered.acknowledge_error().await.unwrap();
+    backend.state.lock().unwrap().offline = false;
+    recovered.fsync().await.unwrap().unwrap();
+    recovered.close().await.unwrap();
 }
 
 #[tokio::test]

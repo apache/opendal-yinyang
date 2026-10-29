@@ -28,7 +28,7 @@ use yinyang_core::{
 };
 
 mod staging;
-use staging::{CHUNK, Record, Stage};
+use staging::{CHUNK, Record, Stage, StagedRead};
 pub(crate) mod schema;
 
 mod error;
@@ -460,6 +460,13 @@ async fn read_staged(
     length: usize,
 ) -> Result<Vec<u8>> {
     let staged = stage.read(id, offset, length).await?;
+    merge_staged_base(staged, base, offset).await
+}
+async fn merge_staged_base(
+    staged: StagedRead,
+    base: Option<&FileVersion>,
+    offset: u64,
+) -> Result<Vec<u8>> {
     let mut bytes = staged.bytes;
     if staged.base.is_empty() {
         return Ok(bytes);
@@ -564,14 +571,19 @@ impl FileHandle {
     }
     pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
         self.live()?;
-        let base = self.base_file().await?;
-        let result = read_staged(
-            &self.runtime.inner.stage,
-            base.as_ref(),
-            self.id,
-            offset,
-            length,
-        )
+        let result = async {
+            let staged = self
+                .runtime
+                .inner
+                .stage
+                .read(self.id, offset, length)
+                .await?;
+            if staged.base.is_empty() {
+                return Ok(staged.bytes);
+            }
+            let base = self.base_file().await?;
+            merge_staged_base(staged, base.as_ref(), offset).await
+        }
         .await;
         self.report(result).await
     }
