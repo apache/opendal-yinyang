@@ -458,9 +458,7 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
         let handle: [u8; 16] = handle
             .try_into()
             .map_err(|_| Error::State(ErrorKind::Corrupt, "staging base handle is malformed"))?;
-        let descriptor = ContentDescriptor::from_bytes(&descriptor).map_err(|error| {
-            Error::local_kind(ErrorKind::Corrupt, format!("decode staging base: {error}"))
-        })?;
+        let descriptor = ContentDescriptor::from_bytes(&descriptor)?;
         if descriptor.filesystem().as_bytes() != filesystem.as_slice() {
             return Err(Error::State(
                 ErrorKind::Corrupt,
@@ -511,7 +509,7 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
     let segments = {
         let mut query = c
             .prepare(
-                "SELECT handle,position,data FROM segments
+                "SELECT handle,position,length(data) FROM segments
                  ORDER BY handle,position",
             )
             .map_err(local)?;
@@ -520,7 +518,7 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?,
                     r.get::<_, i64>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, i64>(2)?,
                 ))
             })
             .map_err(local)?
@@ -528,19 +526,23 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
             .map_err(local)?
     };
     let mut previous = BTreeMap::<Vec<u8>, u64>::new();
-    for (handle, position, data) in segments {
-        let Some((_, length)) = sparse.get(&handle) else {
+    for (handle, position, length) in segments {
+        let Some((_, handle_length)) = sparse.get(&handle) else {
             return Err(Error::State(
                 ErrorKind::Corrupt,
                 "staging segment has no sparse base",
             ));
         };
-        if data.is_empty() {
+        let data_length = positioned(length)?;
+        if data_length == 0 {
             return Err(Error::State(ErrorKind::Corrupt, "staging segment is empty"));
         }
         let position = positioned(position)?;
-        let end = segment_end(position, &data)?;
-        if end > *length {
+        let end = position.checked_add(data_length).ok_or(Error::State(
+            ErrorKind::Corrupt,
+            "staging segment length overflows",
+        ))?;
+        if end > *handle_length {
             return Err(Error::State(
                 ErrorKind::Corrupt,
                 "staging segment exceeds handle length",

@@ -592,15 +592,7 @@ impl FileHandle {
             let mut plan = Planner::new(&snapshot, CommitId::generate());
             plan.set_executable(node, executable).await?;
             let receipt = outcome(self.runtime.authority().commit(&plan.finish()?).await?)?;
-            let base = self
-                .runtime
-                .authority()
-                .observe_revision(receipt.cursor.revision)
-                .await?
-                .open_file(node)
-                .await?;
             self.advance_clean_base(receipt.cursor.revision).await?;
-            self.base = Some(base);
             Ok(receipt)
         }
         .await;
@@ -698,7 +690,10 @@ impl FileHandle {
                         "staged edit size overflows",
                     ))?;
             }
-            if ranges.len() <= OVERWRITE_EDITS_MAX && encoded <= OVERWRITE_ENCODED_MAX {
+            if !ranges.is_empty()
+                && ranges.len() <= OVERWRITE_EDITS_MAX
+                && encoded <= OVERWRITE_ENCODED_MAX
+            {
                 let runs = stage.segments(self.id).await?;
                 if runs.len() != ranges.len()
                     || runs.iter().zip(&ranges).any(
