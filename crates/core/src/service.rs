@@ -21,11 +21,11 @@
 use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
 use crate::namespace::{Node, NodeKind, decode, encode};
 use crate::snapshot::{
-    ChangeRecord, Cursor, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
+    ChangeRecord, Cursor, FileVersion, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
 };
 use crate::{
-    ContentDescriptor, DataStore, Error, ErrorKind, NodeId, PreparedContent, Result, Revision,
-    Transaction,
+    ContentDescriptor, ContentEdit, DataStore, Error, ErrorKind, NodeId, PreparedContent, Result,
+    Revision, Transaction,
 };
 use futures_util::future::BoxFuture;
 use opendal::Operator;
@@ -406,6 +406,46 @@ impl MetadataService {
         self.remember(&content).await?;
         Ok(content)
     }
+    /// Prepare a same-length update from a published file version selected by
+    /// the caller. Reauthentication prevents a caller-supplied base descriptor
+    /// from becoming preparation authority.
+    pub async fn prepare_overwrite(
+        &self,
+        base: &FileVersion,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let snapshot = self.observe_revision(base.revision()).await?;
+        let selected = snapshot.open_file(base.node().id()).await?;
+        if selected.descriptor() != base.descriptor() {
+            return Err(Error::invalid(
+                "prepare metadata overwrite",
+                "selected base is not in the referenced revision",
+            ));
+        }
+        self.prepare_overwrite_from_version(&selected, edits).await
+    }
+    pub(crate) async fn prepare_overwrite_version(
+        &self,
+        revision: Revision,
+        node: NodeId,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let snapshot = self.observe_revision(revision).await?;
+        let base = snapshot.open_file(node).await?;
+        self.prepare_overwrite_from_version(&base, edits).await
+    }
+    async fn prepare_overwrite_from_version(
+        &self,
+        base: &FileVersion,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let content = self
+            .data
+            .overwrite_prepared_ranges(&base.prepared_content()?, edits)
+            .await?;
+        self.remember(&content).await?;
+        Ok(content)
+    }
     pub(crate) async fn remember(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?.to_bytes();
         let db = connect(&self.path, false).await?;
@@ -669,5 +709,21 @@ mod admission_tests {
         assert_eq!(service.observe_latest().await.unwrap().revision(), before);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_delta_revision_is_rejected_before_payload_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let edit = ContentEdit::new(0..1, b"x").unwrap();
+        let error = service
+            .prepare_overwrite_version(Revision::from_bytes([0; 24]), NodeId::generate(), &[edit])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
     }
 }

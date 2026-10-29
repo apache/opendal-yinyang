@@ -17,7 +17,10 @@
 
 //! Shared publication interface; access runtimes do not select physical metadata.
 use crate::object::{ObjectFs, Outcome};
-use crate::{DataStore, NodeId, PreparedContent, Result, Revision, Snapshot, Transaction};
+use crate::{
+    ContentEdit, DataStore, FileVersion, NodeId, PreparedContent, Result, Revision, Snapshot,
+    Transaction,
+};
 use futures_util::future::BoxFuture;
 use tokio::io::AsyncRead;
 
@@ -27,6 +30,18 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     fn root(&self) -> NodeId;
     fn observe_latest(&self) -> BoxFuture<'_, Result<Snapshot>>;
     fn observe_revision(&self, revision: Revision) -> BoxFuture<'_, Result<Snapshot>>;
+    /// List metadata-authenticated revisions retained by this authority.
+    ///
+    /// The default keeps backends without a revision index explicit rather
+    /// than inferring history from content or local staging.
+    fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
+        Box::pin(async {
+            Err(crate::Error::unsupported(
+                "list retained revisions",
+                "authority does not expose a revision index",
+            ))
+        })
+    }
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
@@ -43,6 +58,23 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     ) -> BoxFuture<'a, Result<PreparedContent>> {
         Box::pin(async move {
             let content = self.data().prepare(&mut source).await?;
+            self.register(&content).await?;
+            Ok(content)
+        })
+    }
+    /// Prepare a same-length update from one exact published file version.
+    ///
+    /// The base is the metadata-authenticated version selected by the caller,
+    /// not a newly observed latest revision. Length-changing writes must use
+    /// `prepare` instead.
+    fn prepare_overwrite<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        edits: &'a [ContentEdit<'a>],
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(async move {
+            let base = base.prepared_content()?;
+            let content = self.data().overwrite_prepared_ranges(&base, edits).await?;
             self.register(&content).await?;
             Ok(content)
         })
@@ -83,6 +115,9 @@ impl Authority for ObjectFs {
     fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
         Box::pin(self.observe_revision(r))
     }
+    fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
+        Box::pin(self.retained_revisions())
+    }
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
@@ -115,6 +150,13 @@ impl Authority for crate::service::MetadataService {
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.remember(content))
     }
+    fn prepare_overwrite<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        edits: &'a [ContentEdit<'a>],
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(self.prepare_overwrite(base, edits))
+    }
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(self.restore_transaction(bytes))
     }
@@ -143,6 +185,13 @@ impl Authority for crate::service::ServiceClient {
     }
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.register(content))
+    }
+    fn prepare_overwrite<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        edits: &'a [ContentEdit<'a>],
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(self.prepare_overwrite(base, edits))
     }
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(self.restore_transaction(bytes))

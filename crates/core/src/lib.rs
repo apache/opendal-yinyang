@@ -30,7 +30,7 @@ pub mod service;
 mod snapshot;
 pub mod transaction;
 
-pub use data::{ContentDescriptor, ContentId, DataStore, PreparedContent};
+pub use data::{ContentDescriptor, ContentEdit, ContentId, DataStore, PreparedContent};
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{CommitId, NodeId};
 pub use namespace::{DirectoryEntry, Link, Node, NodeKind};
