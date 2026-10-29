@@ -27,9 +27,12 @@ The separate trial-distribution workflow uses the verifier and installer
 packaged inside the archive. Its installed archive smoke, isolated recovery and
 installed-prefix upgrade use the produced `bin/yy`; `YY_UPGRADE_BIN` is the
 shared native-acceptance selector and falls back to the Cargo test binary only
-when unset. The workflow records the source and selected binary SHA-256 before
-recovery, and the archive-target upgrade supplies the
-pending/frozen/Unknown/receipt/WAL recovery evidence for the produced binary.
+when unset. The installed-operations entrypoint also copies that selected binary
+into its clean prefix and exercises a real writable `fuse.yinyang` mount,
+remount and finite Sync for both publication authorities. The workflow records
+the source and selected binary SHA-256 before those runs, and the archive-target
+upgrade supplies the pending/frozen/Unknown/receipt/WAL recovery evidence for
+the produced binary.
 
 Run only the first-layer read-only FUSE scenarios when isolating frontend
 changes:

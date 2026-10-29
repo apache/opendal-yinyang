@@ -122,6 +122,8 @@ The fresh-runner workflow must:
 - install the actual archive and perform only explicit quiesced activation;
 - exercise installed diagnostics and recovery through the real packaged binary,
   using the shared native-acceptance binary selector and recording its SHA-256;
+- exercise the existing installed-operations foreground writable Mount, remount
+  and finite Sync entrypoint with the same packaged binary and selector;
 - build the pinned legacy producer and run the existing installed-prefix
   upgrade with the archive's target binary;
 - retain pending, frozen, Unknown, receipts, Sync and service-WAL evidence;
