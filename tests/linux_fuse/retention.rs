@@ -17,13 +17,18 @@
 
 //! Observation-only space and retention acceptance during dirty FUSE work.
 
-use crate::harness::{Fixture, Frontend, Publication, RemoteObjectIdentity, mount_fs_type};
+use crate::harness::{
+    Fixture, Frontend, Publication, RemoteObjectIdentity, ServiceGate, mount_fs_type,
+};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const UNIT_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -35,6 +40,143 @@ fn fuse_space_and_retention_are_observational_during_dirty_work_both_publication
     for publication in [Publication::Object, Publication::Service] {
         space_and_retention_are_observational(&Fixture::new(publication));
     }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_space_and_retention_preserve_frozen_service_work() {
+    let fixture = Fixture::new(Publication::Service);
+    let library = fixture.volume_config("lib-space-frozen", Frontend::Library, false);
+    let original = payload(FILE_BYTES, 0x37);
+    fixture.library_seed(&library, "space.bin", &original);
+    let staging = fixture.temp.path().join("stage-space-frozen");
+    let gate = ServiceGate::new(staging.clone(), fixture.service_address());
+    let config = fixture.volume_config_with_service(
+        "stage-space-frozen",
+        Frontend::Fuse,
+        false,
+        Some(gate.address()),
+    );
+    let observation_config = fixture
+        .temp
+        .path()
+        .join("stage-space-frozen-observation.json");
+    let mut observation: Value =
+        serde_json::from_slice(&fs::read(&config).expect("read gated frozen config"))
+            .expect("parse gated frozen config");
+    observation["service_address"] = Value::String(fixture.service_address().to_string());
+    fs::write(
+        &observation_config,
+        serde_json::to_vec_pretty(&observation).expect("serialize frozen observation config"),
+    )
+    .expect("write frozen observation config");
+    let mountpoint = fixture.temp.path().join("mnt-space-frozen");
+    fs::create_dir(&mountpoint).expect("create frozen space mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+
+    let mut dirty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mounted.mountpoint().join("space.bin"))
+        .expect("open frozen space descriptor");
+    let flags = fcntl(&dirty, FcntlArg::F_GETFD).expect("read frozen descriptor flags");
+    assert!(
+        flags.contains(FdFlag::FD_CLOEXEC),
+        "the frozen dirty descriptor must be close-on-exec before observation commands"
+    );
+    let mut dirty_bytes = original.clone();
+    let offset = UNIT_BYTES - RANGE_BYTES / 2;
+    let update = payload(RANGE_BYTES, 0x71);
+    dirty_bytes[offset..offset + update.len()].copy_from_slice(&update);
+    dirty
+        .seek(SeekFrom::Start(0))
+        .expect("rewind frozen descriptor");
+    dirty
+        .write_all(&dirty_bytes)
+        .expect("write frozen descriptor without fsync");
+
+    let in_flight = dirty.try_clone().expect("duplicate frozen descriptor");
+    let (sender, receiver) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let _ = sender.send(in_flight.sync_all());
+    });
+    gate.wait_ready(Duration::from_secs(30));
+    let frozen = fixture.wait_for_frozen(&config);
+    println!("space observation reached frozen staging:\n{frozen}");
+    assert_eq!(
+        fixture.remote_read(&library, "space.bin", original.len()),
+        original,
+        "a frozen publication must not expose dirty bytes while observation runs"
+    );
+
+    let config_before =
+        fs::read(&observation_config).expect("read frozen volume config before observation");
+    let remote_before = fixture.remote_object_identities();
+    let staging_before = tree_identity(&staging);
+    let report = fixture.yy(&[
+        "--volume",
+        observation_config
+            .to_str()
+            .expect("UTF-8 frozen volume config"),
+        "space",
+        "report",
+        "--json",
+    ]);
+    report.success_or("space report during frozen FUSE work");
+    assert_space_report(&report.stdout);
+    assert_frozen_report(&report.stdout);
+    assert_no_effects(
+        &fixture,
+        &library,
+        &observation_config,
+        &staging,
+        &original,
+        &config_before,
+        &remote_before,
+        &staging_before,
+        &mut mounted,
+    );
+
+    let plan = fixture.yy(&[
+        "--volume",
+        observation_config
+            .to_str()
+            .expect("UTF-8 frozen volume config"),
+        "space",
+        "retention",
+        "plan",
+        "--keep-last",
+        "1",
+        "--json",
+    ]);
+    plan.success_or("retention plan during frozen FUSE work");
+    assert_retention_plan(&plan.stdout);
+    assert_frozen_plan(&plan.stdout);
+    assert_no_effects(
+        &fixture,
+        &library,
+        &observation_config,
+        &staging,
+        &original,
+        &config_before,
+        &remote_before,
+        &staging_before,
+        &mut mounted,
+    );
+
+    gate.release();
+    receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("frozen fsync did not return after gate release")
+        .expect("frozen fsync failed after gate release");
+    caller.join().expect("frozen fsync caller panicked");
+    assert_eq!(
+        fixture.remote_read(&library, "space.bin", dirty_bytes.len()),
+        dirty_bytes,
+        "observation changed or discarded the frozen request"
+    );
+    drop(dirty);
+    mounted.unmount();
 }
 
 fn space_and_retention_are_observational(fixture: &Fixture) {
@@ -111,7 +253,8 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
         "--json",
     ]);
     report.success_or("space report during dirty FUSE work");
-    assert_schema(&report.stdout, "yinyang.managed-space.report.v1");
+    assert_space_report(&report.stdout);
+    assert_pending_report(&report.stdout);
     assert_no_effects(
         fixture,
         &library,
@@ -135,7 +278,8 @@ fn space_and_retention_are_observational(fixture: &Fixture) {
         "--json",
     ]);
     plan.success_or("retention plan during dirty FUSE work");
-    assert_schema(&plan.stdout, "yinyang.managed-retention.plan.v1");
+    assert_retention_plan(&plan.stdout);
+    assert_pending_plan(&plan.stdout);
     assert_no_effects(
         fixture,
         &library,
@@ -205,7 +349,159 @@ fn assert_no_effects(
     );
 }
 
-fn assert_schema(output: &[u8], expected: &str) {
+fn assert_space_report(output: &[u8]) {
+    let document = parse_schema(output, "yinyang.managed-space.report.v1");
+    assert_eq!(
+        document["deletion_authorized"],
+        Value::Bool(false),
+        "space report must not authorize deletion"
+    );
+    assert!(
+        document["reclaimable_bytes"].is_null(),
+        "space report must not estimate reclaimable bytes"
+    );
+    assert_eq!(
+        document["measurement"]["non_atomic_inventory"],
+        Value::Bool(true),
+        "space report must disclose that recursive listing is not atomic"
+    );
+    assert_eq!(
+        document["measurement"]["noncurrent_versions"],
+        Value::String("unknown".to_owned()),
+        "space report must not infer unknown backend versions"
+    );
+    assert_eq!(
+        document["measurement"]["external_pins"],
+        Value::String("unknown".to_owned()),
+        "space report must not infer external readers or untracked pins"
+    );
+    assert_eq!(
+        document["physical"]["noncurrent_versions"],
+        Value::String("unknown".to_owned()),
+        "physical accounting must preserve the noncurrent-version boundary"
+    );
+    assert!(
+        document["physical"]["accounting"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "space report must state the physical accounting boundary"
+    );
+    assert_dirty_handle_count(&document["staging"]["handles"], "space report");
+}
+
+fn assert_retention_plan(output: &[u8]) {
+    let document = parse_schema(output, "yinyang.managed-retention.plan.v1");
+    assert_eq!(
+        document["deletion_authorized"],
+        Value::Bool(false),
+        "retention planning must not authorize deletion"
+    );
+    assert!(
+        document["reclaimable_bytes"].is_null(),
+        "retention planning must not estimate reclaimable bytes"
+    );
+    assert_eq!(document["policy"]["mode"], "bounded");
+    assert_eq!(document["policy"]["keep_last"], 1);
+    assert_eq!(
+        document["protection"]["external_readers"], "unknown",
+        "retention plan must preserve the external-reader boundary"
+    );
+    assert_eq!(
+        document["protection"]["untracked_pins"], "unknown",
+        "retention plan must preserve the untracked-pin boundary"
+    );
+    assert_dirty_handle_count(&document["protection"]["staging"], "retention plan");
+    let current = document["protection"]["current_revision"]
+        .as_str()
+        .expect("retention plan current revision");
+    let current_decision = document["revisions"]
+        .as_array()
+        .expect("retention plan revisions")
+        .iter()
+        .find(|revision| revision["revision"] == current)
+        .expect("current revision in retention decisions");
+    assert_eq!(current_decision["selected"], true);
+    let reasons = current_decision["reasons"]
+        .as_array()
+        .expect("current revision reasons");
+    assert!(
+        reasons.contains(&Value::String("current".to_owned()))
+            && reasons.iter().any(|reason| {
+                reason
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("staging_"))
+            }),
+        "retention plan did not protect both the current revision and dirty staging base: {document}"
+    );
+}
+
+fn assert_pending_report(output: &[u8]) {
+    let document: Value = serde_json::from_slice(output).expect("pending space report JSON");
+    assert!(
+        document["staging"]["handles"]["pending"]
+            .as_u64()
+            .is_some_and(|pending| pending >= 1),
+        "space report did not count the pending handle: {document}"
+    );
+}
+
+fn assert_pending_plan(output: &[u8]) {
+    let document: Value = serde_json::from_slice(output).expect("pending retention plan JSON");
+    assert!(
+        document["protection"]["staging"]["pending"]
+            .as_u64()
+            .is_some_and(|pending| pending >= 1),
+        "retention plan did not protect the pending handle: {document}"
+    );
+}
+
+fn assert_dirty_handle_count(staging: &Value, context: &str) {
+    let count = ["pending", "frozen", "conflict", "unknown", "failed"]
+        .into_iter()
+        .filter_map(|state| staging[state].as_u64())
+        .fold(0_u64, u64::saturating_add);
+    assert!(
+        count >= 1,
+        "{context} did not observe an active dirty handle: {staging}"
+    );
+}
+
+fn assert_frozen_report(output: &[u8]) {
+    let document: Value = serde_json::from_slice(output).expect("frozen space report JSON");
+    assert!(
+        document["staging"]["handles"]["frozen"]
+            .as_u64()
+            .is_some_and(|frozen| frozen >= 1),
+        "space report did not count the frozen handle: {document}"
+    );
+}
+
+fn assert_frozen_plan(output: &[u8]) {
+    let document: Value = serde_json::from_slice(output).expect("frozen retention plan JSON");
+    assert!(
+        document["protection"]["staging"]["frozen"]
+            .as_u64()
+            .is_some_and(|frozen| frozen >= 1),
+        "retention plan did not protect the frozen handle: {document}"
+    );
+    let current = document["protection"]["current_revision"]
+        .as_str()
+        .expect("frozen retention current revision");
+    let current_decision = document["revisions"]
+        .as_array()
+        .expect("frozen retention revisions")
+        .iter()
+        .find(|revision| revision["revision"] == current)
+        .expect("frozen current revision decision");
+    assert!(
+        current_decision["reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.contains(&Value::String("staging_frozen".to_owned()))),
+        "retention plan did not name the frozen base: {document}"
+    );
+}
+
+fn parse_schema(output: &[u8], expected: &str) -> Value {
     let document: Value =
         serde_json::from_slice(output).expect("space command returned valid JSON");
     assert_eq!(
@@ -213,6 +509,7 @@ fn assert_schema(output: &[u8], expected: &str) {
         Some(expected),
         "unexpected space JSON schema: {document}"
     );
+    document
 }
 
 #[derive(Debug, Eq, PartialEq)]

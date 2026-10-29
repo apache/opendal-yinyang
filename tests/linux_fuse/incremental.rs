@@ -20,7 +20,7 @@
 use crate::harness::{Fixture, Frontend, Publication};
 use nix::unistd::{getegid, geteuid, truncate};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
@@ -66,6 +66,11 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
         .write(true)
         .open(&path)
         .expect("open first sparse writer");
+    let mut second_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open second sparse writer before the first publication");
 
     let first_offset = UNIT_BYTES - RANGE_BYTES / 2;
     let first = payload(RANGE_BYTES, 0x51);
@@ -78,11 +83,6 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     assert_range(&early_reader, first_offset, &first);
     assert_attributes(&path, expected.len() as u64);
 
-    let mut second_writer = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .expect("open independent sparse writer");
     let second_offset = 2 * UNIT_BYTES + 5;
     let second = payload(RANGE_BYTES + 11, 0x63);
     overwrite_expected(&mut expected, second_offset, &second);
@@ -103,6 +103,7 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     expected.extend_from_slice(&appended);
     assert_remote(fixture, &library, &expected, "append fsync");
     assert_range(&early_reader, expected.len() - appended.len(), &appended);
+    assert_attributes_from(&early_reader, expected.len() as u64);
 
     let shrunk = 3 * UNIT_BYTES + 23;
     first_writer
@@ -112,6 +113,7 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     expected.truncate(shrunk);
     assert_remote(fixture, &library, &expected, "descriptor shrink fsync");
     assert_attributes(&path, expected.len() as u64);
+    assert_attributes_from(&early_reader, expected.len() as u64);
 
     let extended = 3 * UNIT_BYTES + 2 * RANGE_BYTES + 9;
     first_writer
@@ -120,6 +122,7 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     first_writer.sync_all().expect("fsync zero extension");
     expected.resize(extended, 0);
     assert_remote(fixture, &library, &expected, "descriptor extension fsync");
+    assert_attributes_from(&early_reader, expected.len() as u64);
 
     let eof_offset = extended - 4;
     let eof_write = payload(17, 0x87);
@@ -130,6 +133,9 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
         .expect("fsync an overwrite that crosses the staged EOF");
     assert_remote(fixture, &library, &expected, "EOF-growing fsync");
     assert_range(&early_reader, eof_offset, &eof_write);
+    assert_attributes_from(&early_reader, expected.len() as u64);
+    assert_eof_reads(&first_writer, &expected);
+    assert_eof_reads(&early_reader, &expected);
 
     let path_shrunk = 2 * UNIT_BYTES + 31;
     truncate(path.as_path(), path_shrunk as u64).expect("path truncate shrink");
@@ -203,6 +209,43 @@ fn assert_range(file: &File, offset: usize, expected: &[u8]) {
     let mut actual = vec![0_u8; expected.len()];
     read_exact_at(file, &mut actual, offset as u64);
     assert_eq!(actual, expected, "active descriptor range at {offset}");
+}
+
+fn assert_eof_reads(file: &File, expected: &[u8]) {
+    let eof = expected.len() as u64;
+    let mut buffer = [0xcc_u8; 32];
+    assert_eq!(
+        file.read_at(&mut buffer, eof).expect("pread at exact EOF"),
+        0,
+        "a read at exact EOF must return zero bytes"
+    );
+    assert_eq!(
+        file.read_at(&mut buffer, eof + RANGE_BYTES as u64)
+            .expect("pread beyond EOF"),
+        0,
+        "a read beyond EOF must return zero bytes"
+    );
+    assert_eq!(
+        file.read_at(&mut [], 0).expect("zero-length pread"),
+        0,
+        "a zero-length read must return zero bytes"
+    );
+    assert_eq!(
+        file.read_at(&mut [], eof + RANGE_BYTES as u64)
+            .expect("zero-length pread beyond EOF"),
+        0,
+        "a zero-length read beyond EOF must return zero bytes"
+    );
+    let mut crossing = [0xcc_u8; 8];
+    let count = file
+        .read_at(&mut crossing, eof - 4)
+        .expect("pread crossing EOF");
+    assert_eq!(count, 4, "a read crossing EOF must stop at EOF");
+    assert_eq!(
+        &crossing[..count],
+        &expected[expected.len() - 4..],
+        "a read crossing EOF returned incorrect final bytes"
+    );
 }
 
 fn overwrite_expected(expected: &mut Vec<u8>, offset: usize, value: &[u8]) {
