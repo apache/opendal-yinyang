@@ -33,7 +33,7 @@ them:
   without changing authoritative bytes;
 - the shared service SQLite authority remains two-way compatible; each binary
   uses its own client staging directory while cross-binary service tests keep
-  the same metadata database and verify the resulting bytes and receipts;
+  the same metadata database and verify the resulting bytes;
 - unknown or malformed persistent profiles are rejected at their format
   boundary while the authoritative main databases, any existing WAL or
   journal bytes, logical rows, retained content and recovery state remain
