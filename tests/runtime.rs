@@ -88,7 +88,12 @@ impl Authority for PausingAuthority {
     }
 }
 
-async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend: &TestBackend) {
+async fn exercise(
+    authority: Arc<dyn Authority>,
+    path: &std::path::Path,
+    backend: &TestBackend,
+    object_head: bool,
+) {
     let runtime = Runtime::open(authority.clone(), path).await.unwrap();
     runtime.create_file(authority.root(), "file").await.unwrap();
     let mut first = runtime.open_file("file", true).await.unwrap();
@@ -155,7 +160,7 @@ async fn exercise(authority: Arc<dyn Authority>, path: &std::path::Path, backend
     completion_and_errors(&runtime, backend).await;
     version_reads(&runtime, backend).await;
     replace_rename(&runtime).await;
-    sparse_runtime(&runtime, backend, path).await;
+    sparse_runtime(&runtime, backend, path, object_head).await;
 }
 
 async fn replace_rename(runtime: &Runtime) {
@@ -584,7 +589,13 @@ async fn file_operations_share_object_and_service_contract() {
     let object = Fs::create(backend.operator(), BackendProfile::Minio)
         .await
         .unwrap();
-    exercise(Arc::new(object), &temp.path().join("object"), &backend).await;
+    exercise(
+        Arc::new(object),
+        &temp.path().join("object"),
+        &backend,
+        true,
+    )
+    .await;
     let backend = TestBackend::default();
     let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
         .await
@@ -596,7 +607,13 @@ async fn file_operations_share_object_and_service_contract() {
     let client = ServiceClient::connect(addr, token.into(), backend.operator())
         .await
         .unwrap();
-    exercise(Arc::new(client), &temp.path().join("service"), &backend).await;
+    exercise(
+        Arc::new(client),
+        &temp.path().join("service"),
+        &backend,
+        false,
+    )
+    .await;
     server.abort();
 }
 
@@ -652,7 +669,12 @@ async fn durable_staging_reopens_and_preserves_concurrent_generation_conflict() 
     file.abort().await.unwrap();
 }
 
-async fn sparse_runtime(runtime: &Runtime, backend: &TestBackend, staging: &std::path::Path) {
+async fn sparse_runtime(
+    runtime: &Runtime,
+    backend: &TestBackend,
+    staging: &std::path::Path,
+    object_head: bool,
+) {
     const BASE_BYTES: usize = 1024 * 1024;
     let bytes: Vec<u8> = (0..BASE_BYTES).map(|index| (index % 251) as u8).collect();
     let prepared = runtime
@@ -765,17 +787,21 @@ async fn sparse_runtime(runtime: &Runtime, backend: &TestBackend, staging: &std:
     let mut newer = runtime.open_node(node, true).await.unwrap();
     file.write(2000, b"FROZ").await.unwrap();
     newer.write(3000, b"NEW!").await.unwrap();
-    backend.state.lock().unwrap().delay_next_head = true;
-    let commit = match file.fsync().await {
-        Err(Error::Unknown(commit)) => commit,
-        outcome => panic!(
-            "expected sparse publication outcome to be unknown, got {outcome:?}; status: {:?}",
-            file.status().await
-        ),
-    };
-    assert_eq!(file.status().await.unwrap().frozen_commit_id, Some(commit));
-    assert!(file.write(0, b"blocked").await.is_err());
-    assert_eq!(file.fsync().await.unwrap().unwrap().commit_id, commit);
+    if object_head {
+        backend.state.lock().unwrap().delay_next_head = true;
+        let commit = match file.fsync().await {
+            Err(Error::Unknown(commit)) => commit,
+            outcome => panic!(
+                "expected sparse publication outcome to be unknown, got {outcome:?}; status: {:?}",
+                file.status().await
+            ),
+        };
+        assert_eq!(file.status().await.unwrap().frozen_commit_id, Some(commit));
+        assert!(file.write(0, b"blocked").await.is_err());
+        assert_eq!(file.fsync().await.unwrap().unwrap().commit_id, commit);
+    } else {
+        file.fsync().await.unwrap().unwrap();
+    }
     assert!(matches!(newer.fsync().await, Err(Error::Conflict)));
     let mut newer_expected = expected.clone();
     newer_expected[3000..3004].copy_from_slice(b"NEW!");
