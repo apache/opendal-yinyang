@@ -93,7 +93,7 @@ done
 [[ -f $archive ]] || fail "archive is not a file: $archive"
 [[ -x $verifier ]] || fail "verifier is not executable: $verifier"
 [[ -x $installer ]] || fail "installer is not executable: $installer"
-for command in awk cp ln mktemp readlink rm sed sha256sum; do
+for command in awk cp ln mkdir mktemp readlink rm sed sha256sum unlink; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
 
@@ -119,6 +119,13 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 prefix="$work/prefix"
+
+mkdir -p "$prefix"
+ln -s missing-release "$prefix/$release"
+if "$installer" install --archive "$archive" --prefix "$prefix" >/dev/null 2>&1; then
+  fail "installer followed a dangling release symlink"
+fi
+unlink "$prefix/$release"
 
 install_output=$("$installer" install --archive "$archive" --prefix "$prefix")
 printf '%s\n' "$install_output"

@@ -236,7 +236,7 @@ case "$operation" in
     [[ -n $installed_release && -n $artifact_root ]] ||
       die "verify-release.sh did not report the artifact identity"
     final="$prefix/$installed_release"
-    [[ ! -e $final ]] ||
+    [[ ! -e $final && ! -L $final ]] ||
       die "refusing to overwrite existing release directory: $final"
 
     staging=$(mktemp -d "$prefix/.install.XXXXXX")
