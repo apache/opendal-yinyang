@@ -845,11 +845,15 @@ async fn unavailable_staging(
     let directory = match measure_directory(staging).await {
         Ok(usage) => Some(usage),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
+        Err(directory_error) => {
+            let error = format!(
+                "{binding_error}; measure {}: {directory_error}",
+                staging.display()
+            );
             return StagingSpace {
                 path: display_path(staging),
                 state: StagingState::Unavailable,
-                binding: StagingBinding::unavailable(filesystem, binding_error.clone()),
+                binding: StagingBinding::unavailable(filesystem, error.clone()),
                 directory: None,
                 databases: Vec::new(),
                 handles: StagingHandles::default(),
@@ -857,7 +861,7 @@ async fn unavailable_staging(
                 replica: ReplicaEvidence::missing(),
                 protected_revisions: Vec::new(),
                 frozen_commits: Vec::new(),
-                errors: vec![binding_error],
+                errors: vec![error],
                 protected: BTreeMap::new(),
             };
         }
@@ -1729,6 +1733,7 @@ fn space_limits() -> Vec<String> {
         "Recursive listing returns current object keys only and is not atomic; noncurrent backend versions are unknown.",
         "Each visible pack object key is counted once even when multiple files or revisions share its extents.",
         "External readers, untracked revision pins, other staging directories, backup packages, and quiescence are not discoverable by this inspection.",
+        "Standalone inspect_local_staging is unbound; volume-bound report and retention planning require verified local filesystem attribution.",
         "Direct namespace objects are excluded; this module inspects only Managed authority metadata and Managed local staging.",
         "SQLite read-only inspection may create or update derived shared-memory or empty WAL files; authoritative database and existing WAL bytes are not migrated or modified by this code.",
     ]
