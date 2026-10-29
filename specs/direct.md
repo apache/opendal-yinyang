@@ -1,12 +1,15 @@
-# Read-only Direct volumes
+# Direct volumes
 
-**Status: experimental S3-compatible library and Linux FUSE support.**
+**Status: experimental S3-compatible read-only library/Linux FUSE support and
+conditional mutation library runtime.**
 
 A Direct volume keeps the configured storage namespace authoritative. It lists
 and reads existing objects without creating YinYang metadata, Managed NodeIds,
-content proofs, staging databases, transactions or local runtime state. This
-specification defines the read-only Direct contract. Writable Direct volumes and
-Direct Sync remain unimplemented.
+content proofs, transactions or Managed identities. This specification defines
+the read-only observation and FUSE contract. The separate
+[Direct mutation runtime](direct-mutations.md) defines conditional publication,
+retained local generations and safe-save namespace mutation. Writable FUSE
+admission and Direct Sync remain separate integration work.
 
 ## Configuration and admission
 
@@ -55,10 +58,12 @@ that omission. A namespace with a returned file-prefix collision still rejects;
 the unqualified case is the backend that never returns the hidden key name to
 the mount layer.
 
-Direct publishes the `read`, `list`, and `pinned-reads` capabilities only. It
-does not claim Managed `stable-identity`: replacement changes the file inode.
-It does not claim `retained-unlink-read`; retained reads after deletion depend
-on backend version history and are not a portable Direct guarantee.
+The read-only frontend publishes the `read`, `list`, and `pinned-reads`
+capabilities only. It does not claim Managed `stable-identity`: replacement
+changes the file inode. It does not claim `retained-unlink-read`; retained reads
+after deletion depend on backend version history and are not a portable Direct
+guarantee. Writable admission requires the native primitive intersection
+documented in the mutation runtime specification.
 
 ## Reversible key mapping
 
@@ -155,10 +160,12 @@ timestamps and pinned ranges. A new LOOKUP after `SIGHUP` resolves the new
 inode, so kernel attribute caching cannot rebase the old descriptor to the new
 object.
 
-## Read-only behavior
+## Read-only frontend behavior
 
-The library exposes observation, lookup, enumeration and file open/read only.
-It exposes no namespace or content mutation method.
+`DirectNamespace` and `DirectSnapshot` expose observation, lookup, enumeration
+and file open/read only. `DirectMutation` and the explicitly constructed
+`DirectRuntime` are separate mutation APIs; constructing the read-only
+namespace does not create staging state or grant writes.
 
 The FUSE mount uses the kernel `ro` option. Writable or truncating opens,
 CREATE, MKDIR, MKNOD, UNLINK, RMDIR, RENAME, LINK, SYMLINK, SETATTR, WRITE and
@@ -213,6 +220,8 @@ staging database, metadata database, publication lease or remote object.
 - The current version rejects empty components; it does not define an
   additional mapping that changes path depth.
 - Direct does not provide rename-stable identity, hard links, symlinks, xattrs,
-  distributed locks, cross-client transactions, version browsing, garbage
-  collection or write conflict resolution.
-- Writability, Direct Sync and non-Linux Direct FUSE remain future work.
+  distributed locks, cross-client or cross-object transactions, version
+  browsing, automatic garbage collection or Managed receipts.
+- Writable FUSE admission, Direct Sync, non-Linux Direct FUSE and filesystem
+  directory atomicity remain future integration work. The mutation library's
+  file rename is explicitly non-atomic safe-save.
