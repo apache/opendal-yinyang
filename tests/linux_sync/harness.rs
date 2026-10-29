@@ -41,6 +41,9 @@ use yinyang::core::{
     Result as CoreResult, Snapshot,
 };
 
+#[path = "../support/yy.rs"]
+mod yy;
+
 const STORAGE_VARIABLES: [&str; 5] = [
     "YINYANG_S3_BUCKET",
     "YINYANG_S3_ENDPOINT",
@@ -598,7 +601,7 @@ impl Fixture {
     }
 
     pub fn yy_command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
+        let mut command = Command::new(yy::binary());
         command.args(args);
         for (name, value) in self.storage_env() {
             command.env(name, value);
