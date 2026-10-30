@@ -55,7 +55,7 @@ These checks require infrastructure that hosted CI does not provide:
 | `cargo x bench-linux-cost --workload read-only-range` | matched source identities, release binary, isolated S3, `/dev/fuse` | bounded FUSE range latency, requests, payload and staging |
 | `cargo test --test linux_prefix_upgrade` | isolated Silo, exact `fd1338c` and final-target binaries, `sqlite3` | stopped versioned-prefix replacement with pending/Unknown state, receipts and service WAL recovery |
 | `tests/linux_operating_envelope_real_s3.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `sqlite3`, scoped AWS CLI | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
-| `tests/linux_stage3_real_s3.py` | one unversioned Amazon S3 bucket, installed archive binary, temporary role over stdin, `/dev/fuse` | one small Managed object: append, truncate, zero extension, shrink/extend, clean remount, exact bytes and `space report`, followed by exact-prefix cleanup |
+| `tests/linux_stage3_real_s3.py` | one unversioned Amazon S3 bucket, installed archive binary, temporary role over stdin, `/dev/fuse` | one bounded multi-leaf Managed object: append, truncate, zero extension, shrink/extend, clean remount, independent remote restores, `space report`, `doctor` and exact-prefix cleanup |
 
 The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
 `fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and

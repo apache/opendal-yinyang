@@ -34,9 +34,10 @@ environment:
     YINYANG_STAGE3_REAL_S3_OUTPUT (optional JSON evidence path)
     AWS_CLI_BIN (optional, defaults to aws)
 
-The workload is bounded to one small object authority and one FUSE file. It
-checks append, truncate, zero extension, shrink-then-extend, clean remount,
-installed `space report`, and exact prefix cleanup.
+The workload is bounded to one object authority and one multi-leaf FUSE file.
+It checks append, truncate, zero extension, shrink-then-extend, clean remount,
+independent remote restores at the append and final stages, installed
+`space report` and `doctor`, and exact-prefix cleanup.
 """
 
 from __future__ import annotations
@@ -91,8 +92,8 @@ def credentials_from_stdin() -> dict[str, str]:
     return values
 
 
-def payload(length: int) -> bytes:
-    return bytes((index * 17 + index // 251) % 256 for index in range(length))
+def payload(length: int, seed: int) -> bytes:
+    return bytes((seed + index * 17 + index // 251) % 256 for index in range(length))
 
 
 def write_all(descriptor: int, data: bytes) -> None:
@@ -111,6 +112,10 @@ class Trial:
         if not self.bucket:
             raise EnvelopeError("YINYANG_QUALIFICATION_BUCKET is required")
         self.region = os.environ.get("YINYANG_QUALIFICATION_REGION", "us-east-2")
+        try:
+            self.seed = int(os.environ.get("YINYANG_STAGE3_SEED", "9014"))
+        except ValueError as error:
+            raise EnvelopeError("YINYANG_STAGE3_SEED must be an integer") from error
         self.yy = Path(os.environ.get("YINYANG_STAGE3_TARGET_YY", ""))
         if not self.yy.is_file():
             raise EnvelopeError(
@@ -155,6 +160,7 @@ class Trial:
             "status": "running",
             "started_at": utc_now(),
             "source_checkout": self.source,
+            "seed": self.seed,
             "target": {
                 "binary": str(self.yy),
                 "binary_sha256": binary_sha256(self.yy),
@@ -400,10 +406,37 @@ class Trial:
                 f"{context} bytes differ: expected {len(expected)}, got {len(actual)}"
             )
 
+    def restore_remote(self, expected: bytes, label: str) -> dict[str, Any]:
+        destination = self.work / f"restore-{label}-{uuid.uuid4().hex}"
+        self.yy_run(["restore", str(destination)], timeout=300)
+        actual = (destination / "stage3.bin").read_bytes()
+        if actual != expected:
+            raise EnvelopeError(
+                f"{label} remote restore differs: expected {len(expected)}, got {len(actual)}"
+            )
+        return {
+            "label": label,
+            "length": len(actual),
+            "sha256": bytes_sha256(actual),
+        }
+
+    def doctor(self) -> dict[str, Any]:
+        completed = self.yy_run(
+            ["--volume", str(self.config), "doctor", "--json"], timeout=180
+        )
+        document = json.loads(completed.stdout)
+        if document.get("schema") != "yinyang.operational-health.v1":
+            raise EnvelopeError(
+                f"unexpected doctor schema: {document.get('schema')}"
+            )
+        if document.get("status") != "pass":
+            raise EnvelopeError(f"installed target doctor did not pass: {document}")
+        return {"schema": document["schema"], "status": document["status"]}
+
     def exercise_mount(self) -> dict[str, Any]:
         self.mount.start(self.redact)
         path = self.mountpoint / "stage3.bin"
-        expected = payload(INITIAL_BYTES)
+        expected = payload(INITIAL_BYTES, self.seed)
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
             view = memoryview(expected)
@@ -415,14 +448,22 @@ class Trial:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        self.assert_mount_bytes(expected, "initial close")
 
         with path.open("ab", buffering=0) as stream:
-            stream.write(APPEND_BYTES)
+            written = stream.write(APPEND_BYTES)
+            if written != len(APPEND_BYTES):
+                raise EnvelopeError(
+                    f"short FUSE append write: expected {len(APPEND_BYTES)}, got {written}"
+                )
             os.fsync(stream.fileno())
         expected += APPEND_BYTES
+        self.assert_mount_bytes(expected, "append after close")
+        append_restore = self.restore_remote(expected, "append")
 
         os.truncate(path, len(expected) + ZERO_EXTEND_BYTES)
         expected += b"\0" * ZERO_EXTEND_BYTES
+        self.assert_mount_bytes(expected, "zero extension")
 
         descriptor = os.open(path, os.O_RDWR)
         try:
@@ -436,6 +477,7 @@ class Trial:
         clean_unmount = self.mount.stop(self.redact)
         return {
             "expected": expected,
+            "append_restore": append_restore,
             "first_clean_unmount": clean_unmount,
         }
 
@@ -443,7 +485,12 @@ class Trial:
         self.mount.start(self.redact)
         self.assert_mount_bytes(expected, "remount before append")
         with (self.mountpoint / "stage3.bin").open("ab", buffering=0) as stream:
-            stream.write(REMOUNT_APPEND_BYTES)
+            written = stream.write(REMOUNT_APPEND_BYTES)
+            if written != len(REMOUNT_APPEND_BYTES):
+                raise EnvelopeError(
+                    "short remount append write: "
+                    f"expected {len(REMOUNT_APPEND_BYTES)}, got {written}"
+                )
             os.fsync(stream.fileno())
         expected += REMOUNT_APPEND_BYTES
         self.assert_mount_bytes(expected, "remount after append")
@@ -470,11 +517,42 @@ class Trial:
                 "space report logical live measurements differ from the FUSE bytes: "
                 f"{live}"
             )
+        retained = document["logical"]["retained"]
+        physical = document["physical"]
+        reachability = physical["reachability"]
         return {
             "schema": document["schema"],
             "observed_revision": document["observed_revision"],
-            "logical_live_files": live["files"],
-            "logical_live_file_bytes": live["file_bytes"],
+            "seed": self.seed,
+            "logical_live": {
+                "files": live["files"],
+                "file_bytes": live["file_bytes"],
+                "unique_content_count": live["unique_content_count"],
+                "unique_content_bytes": live["unique_content_bytes"],
+            },
+            "logical_retained": {
+                "state": retained["state"],
+                "revision_count": retained["revision_count"],
+                "observed_revisions": len(retained["observed_revisions"]),
+                "observed_file_bytes": retained["observed_file_bytes"],
+                "observed_unique_content_bytes": retained[
+                    "observed_unique_content_bytes"
+                ],
+            },
+            "physical": {
+                "state": physical["state"],
+                "visible_objects": physical["visible_objects"],
+                "visible_bytes": physical["visible_bytes"],
+                "head": physical["head"],
+                "packs": physical["packs"],
+                "noncurrent_versions": physical["noncurrent_versions"],
+                "reachability_state": reachability["state"],
+                "retained_revisions": reachability["retained_revisions"],
+                "content_extent_references": reachability[
+                    "content_extent_references"
+                ],
+                "shared_packs": reachability["shared_packs"],
+            },
             "deletion_authorized": document["deletion_authorized"],
             "reclaimable_bytes": document["reclaimable_bytes"],
         }
@@ -554,6 +632,8 @@ class Trial:
         final_bytes = remount["expected"]
         report = self.space_report(len(final_bytes))
         remount_unmount = self.mount.stop(self.redact)
+        final_restore = self.restore_remote(final_bytes, "final")
+        doctor = self.doctor()
         cleanup = self.cleanup_remote()
         self.report.update(
             {
@@ -569,6 +649,7 @@ class Trial:
                     "remount_append_bytes": len(REMOUNT_APPEND_BYTES),
                     "final_length": len(final_bytes),
                     "final_sha256": bytes_sha256(final_bytes),
+                    "seed": self.seed,
                     "operations": [
                         "initial-write",
                         "append",
@@ -583,11 +664,14 @@ class Trial:
                 },
                 "remount": {
                     "first_clean_unmount": first["first_clean_unmount"],
+                    "append_restore": first["append_restore"],
                     "restored_exact_bytes": True,
                     "space_report_while_mounted": True,
                     "final_clean_unmount": remount_unmount,
+                    "final_restore": final_restore,
                 },
                 "space": report,
+                "doctor": doctor,
                 "cleanup": cleanup,
             }
         )
