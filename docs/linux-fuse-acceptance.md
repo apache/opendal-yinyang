@@ -115,9 +115,13 @@ cargo x test-linux-fuse --read-only-range
 - Unsupported operations: symlink and hard link return an explicit OS error
   instead of advertising POSIX links.
 - External changes and dirty refresh: a descriptor opened before an external
-  grow/shrink keeps its pinned size, EOF and pread results, a fresh reopen
-  reflects the authoritative size, and a dirty descriptor keeps its staged
-  bytes while `fsync` reports failure instead of silently rebasing.
+  grow/shrink keeps its pinned size, EOF and pread results, and a dirty
+  descriptor keeps its staged bytes while `fsync` reports failure instead of
+  silently rebasing. Linux may dispatch ordinary FUSE RELEASE in the
+  background, so the fresh-open assertion waits until the staged writable
+  handles have actually left the no-lease runtime status; it does not treat
+  close returning as RELEASE dispatch. That fresh open then reflects the
+  authoritative size.
 - Concurrent mounts: two live `yy mount` processes on separate staging
   directories publish distinct files concurrently under a barrier, then read
   across each other's mounts.
