@@ -1220,9 +1220,10 @@ fn manifest_files(root: &Path) -> Vec<Value> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files);
     files.sort_by(|left, right| {
-        left.as_str()
+        left["path"]
+            .as_str()
             .expect("manifest path")
-            .cmp(right.as_str().expect("manifest path"))
+            .cmp(right["path"].as_str().expect("manifest path"))
     });
     files
 }
