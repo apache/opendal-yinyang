@@ -322,10 +322,11 @@ impl Inner {
         guard(&self.files).get(&fh.0).cloned()
     }
 
-    /// Remove one kernel handle and release its Mount reference on the FUSE
-    /// dispatch thread. This must complete before the next OPEN can be
-    /// scheduled so a request observed after RELEASE cannot reuse the retired
-    /// clean version. Reclamation remains asynchronous after this detach.
+    /// Remove one kernel handle from the routing table on the FUSE dispatch
+    /// thread. With no request task still holding a cloned handle, this also
+    /// releases the Mount reference before the completion future is scheduled.
+    /// A request task that already cloned the handle retains its existing
+    /// Busy pin until that operation finishes. Reclamation remains asynchronous.
     fn detach_file(&self, fh: FileHandle) -> Option<(NodeId, bool)> {
         let removed = guard(&self.files).remove(&fh.0)?;
         let node = removed.node;
@@ -593,13 +594,14 @@ impl Inner {
         if let Err(errno) = self.reclaim_clean_state(id).await {
             return reply.error(errno);
         }
-        if let Err(errno) = self.invalidate_before_open(ino).await {
-            return reply.error(errno);
-        }
         match self.mount.open_node(id, writable).await {
             Ok(file) => {
                 if truncate && let Err(error) = file.truncate(0).await {
                     return reply.error(runtime_errno(&error));
+                }
+                if let Err(errno) = self.invalidate_before_open(ino).await {
+                    drop(file);
+                    return reply.error(errno);
                 }
                 let fh = self.next_handle();
                 guard(&self.files).insert(
@@ -1640,7 +1642,12 @@ impl Filesystem for FuseFrontend {
         let Some((node, read_only)) = inner.detach_file(fh) else {
             return reply.ok();
         };
-        inner.spawn(async move { inner.complete_release(ino, node, read_only, reply).await });
+        let completion = inner.clone();
+        inner.spawn(async move {
+            completion
+                .complete_release(ino, node, read_only, reply)
+                .await
+        });
     }
 
     fn fallocate(
@@ -1772,6 +1779,44 @@ mod tests {
         let latest = authority.observe_latest().await.unwrap();
         let attr = inner.snapshot_attr(&latest, id).await.unwrap();
         assert_eq!(attr.size, 6);
+    }
+
+    #[tokio::test]
+    async fn release_detach_preserves_active_request_busy_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let mount = Mount::open(authority.clone(), temp.path(), false)
+            .await
+            .unwrap();
+        let (id, _) = mount
+            .namespace()
+            .create_file_with_node(authority.root(), "file", false)
+            .await
+            .unwrap();
+        let file = mount.open_node(id, false).await.unwrap();
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
+        let fh = FileHandle(1);
+        guard(&inner.files).insert(
+            fh.0,
+            Arc::new(OpenFile {
+                node: id,
+                source: OpenSource::Staged(file),
+                writable: false,
+            }),
+        );
+        let request = inner.open_file(fh).unwrap();
+
+        assert_eq!(inner.detach_file(fh), Some((id, false)));
+        let error = inner.mount.reclaim(id).await.unwrap_err();
+        assert_eq!(error.kind(), crate::runtime::ErrorKind::Busy);
+
+        drop(request);
+        inner.mount.reclaim(id).await.unwrap();
     }
 
     #[tokio::test]
