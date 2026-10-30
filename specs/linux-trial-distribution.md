@@ -90,7 +90,13 @@ restore instead.
 The supported cross-version evidence remains an exact producer/target pair.
 `linux_prefix_upgrade` qualifies `fd1338c` against the selected target archive
 binary while preserving pending, frozen, Unknown, receipt and service-WAL
-state. Equal package versions do not create broader compatibility.
+state. `linux_stage3_upgrade` qualifies the immutable `546f419` stage-3 corpus
+against the selected target archive: sparse base and segment visibility,
+pending publication, the original frozen and Unknown CommitIds/digests, and
+reopening a copied service database with its non-empty WAL. The corpus producer
+is the accepted `546f419` trial archive binary rather than a current-writer
+synthetic downgrade. Equal package versions or an equal source tree do not
+create broader compatibility.
 
 ## Read-only accounting and retention
 
@@ -126,6 +132,8 @@ The fresh-runner workflow must:
   and finite Sync entrypoint with the same packaged binary and selector;
 - build the pinned legacy producer and run the existing installed-prefix
   upgrade with the archive's target binary;
+- run the immutable genuine stage-3 fixture upgrade with the same installed
+  target binary and record its target and fixture identities separately;
 - retain pending, frozen, Unknown, receipts, Sync and service-WAL evidence;
 - upload these files only as normal short-lived Actions evidence.
 

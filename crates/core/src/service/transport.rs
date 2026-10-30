@@ -43,6 +43,7 @@ enum Command {
     Commit(Vec<Vec<u8>>),
     PrepareOverwrite([u8; 24], [u8; 16], Vec<(u64, u64, Vec<u8>)>),
     PrepareUpdate([u8; 24], [u8; 16], u64, u64, Vec<(u64, u64, Vec<u8>)>),
+    History(Option<[u8; 24]>, u32),
 }
 #[derive(BorshSerialize, BorshDeserialize)]
 enum Response {
@@ -53,6 +54,7 @@ enum Response {
     Outcomes(Vec<(u8, Vec<u8>)>),
     Error(u8, String),
     Prepared(Vec<u8>),
+    Revisions(Vec<[u8; 24]>, Option<[u8; 24]>),
 }
 fn io(e: std::io::Error) -> Error {
     Error::from_io("metadata RPC", e)
@@ -132,11 +134,16 @@ mod error_tests {
             borsh::to_vec(&Command::PrepareUpdate([0; 24], [0; 16], 0, 0, vec![])).unwrap()[0],
             6
         );
+        assert_eq!(borsh::to_vec(&Command::History(None, 1)).unwrap()[0], 7);
         assert_eq!(
             borsh::to_vec(&Response::Error(0, String::new())).unwrap()[0],
             5
         );
         assert_eq!(borsh::to_vec(&Response::Prepared(vec![])).unwrap()[0], 6);
+        assert_eq!(
+            borsh::to_vec(&Response::Revisions(vec![], None)).unwrap()[0],
+            7
+        );
     }
 }
 async fn read_frame<T: BorshDeserialize>(stream: &mut TcpStream) -> Result<T> {
@@ -324,6 +331,18 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 .await?;
             Response::Prepared(content.descriptor().to_bytes())
         }
+        Command::History(after, limit) => {
+            if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+                return Err(protocol());
+            }
+            let page = service
+                .retained_revisions_page(after.map(Revision::from_bytes), limit)
+                .await?;
+            Response::Revisions(
+                page.revisions.into_iter().map(Revision::to_bytes).collect(),
+                page.next.map(Revision::to_bytes),
+            )
+        }
         Command::Commit(plans) => {
             if plans.len() > 4096 {
                 return Err(protocol());
@@ -458,6 +477,46 @@ impl ServiceClient {
     }
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         self.observe(Some(revision)).await
+    }
+    pub async fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> Result<RevisionPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(Error::unsupported(
+                "list retained revisions",
+                format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
+            ));
+        }
+        let Response::Revisions(revisions, next) = rpc(
+            self.addr,
+            &self.token,
+            Command::History(after.map(Revision::to_bytes), limit),
+        )
+        .await?
+        else {
+            return Err(protocol());
+        };
+        if revisions.len() > limit as usize {
+            return Err(protocol());
+        }
+        let revisions = revisions
+            .into_iter()
+            .map(Revision::from_bytes)
+            .collect::<Vec<_>>();
+        if revisions.windows(2).any(|window| window[0] >= window[1])
+            || after.is_some_and(|cursor| revisions.iter().any(|revision| *revision <= cursor))
+        {
+            return Err(protocol());
+        }
+        let next = next.map(Revision::from_bytes);
+        if let Some(next) = next
+            && (revisions.len() != limit as usize || Some(next) != revisions.last().copied())
+        {
+            return Err(protocol());
+        }
+        Ok(RevisionPage { revisions, next })
     }
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
         let content = self.data.prepare(source).await?;

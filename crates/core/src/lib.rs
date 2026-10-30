@@ -26,10 +26,12 @@ mod identity;
 mod index;
 pub mod namespace;
 pub mod object;
+pub mod reachability;
 pub mod service;
 mod snapshot;
 pub mod transaction;
 
+pub use authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
 pub use data::{ContentDescriptor, ContentEdit, ContentId, DataStore, PreparedContent};
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{CommitId, NodeId};

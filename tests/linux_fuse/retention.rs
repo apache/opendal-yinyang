@@ -68,7 +68,7 @@ fn fuse_space_cli_emits_versioned_documents_both_publications() {
         ]);
         report.success_or("space report CLI");
         let report: Value = serde_json::from_slice(&report.stdout).expect("space report CLI JSON");
-        assert_eq!(report["schema"], "yinyang.managed-space.report.v1");
+        assert_eq!(report["schema"], "yinyang.managed-space.report.v2");
         assert_eq!(report["deletion_authorized"], false);
         assert!(report["reclaimable_bytes"].is_null());
 
@@ -84,7 +84,7 @@ fn fuse_space_cli_emits_versioned_documents_both_publications() {
         ]);
         plan.success_or("space retention plan CLI");
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("retention plan CLI JSON");
-        assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v1");
+        assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v2");
         assert_eq!(plan["deletion_authorized"], false);
         assert!(plan["reclaimable_bytes"].is_null());
         mounted.unmount();
@@ -356,7 +356,7 @@ fn assert_no_effects(
 fn assert_space_report(document: &Value, staging: &Path) {
     assert_eq!(
         document.get("schema").and_then(Value::as_str),
-        Some("yinyang.managed-space.report.v1"),
+        Some("yinyang.managed-space.report.v2"),
         "unexpected space JSON schema: {document}"
     );
     assert_eq!(
@@ -403,6 +403,46 @@ fn assert_space_report(document: &Value, staging: &Path) {
             .is_some_and(|value| !value.is_empty()),
         "space report must state the physical accounting boundary"
     );
+    assert_eq!(
+        document["measurement"]["referenced_extents"],
+        "authenticated_index_references_without_payload_reads",
+        "space report must distinguish authenticated references from payload reads: {document}"
+    );
+    assert_eq!(
+        document["physical"]["reachability"]["state"], "available",
+        "space report did not complete the observed physical root traversal: {document}"
+    );
+    assert!(
+        document["physical"]["reachability"]["retained_revisions"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "space report did not enumerate retained authority history: {document}"
+    );
+    assert!(
+        document["physical"]["reachability"]["content_extent_references"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "space report found no content extents for a non-empty file: {document}"
+    );
+    assert_eq!(
+        document["physical"]["coverage"]["payload_verification"],
+        "content_index_authenticated_payload_not_read",
+        "space report claimed payload scrub coverage: {document}"
+    );
+    assert!(
+        document["physical"]["coverage"]["visible_uncovered_bytes"].is_u64(),
+        "space report must report total visible uncovered bytes: {document}"
+    );
+    assert_eq!(
+        document["physical"]["root_external"]["state"], "available",
+        "stable complete roots must permit root-relative pack classification: {document}"
+    );
+    assert!(
+        document["physical"]["root_external"]["treatment"]
+            .as_str()
+            .is_some_and(|value| value.contains("observed-root-relative")),
+        "zero-reference packs must remain root-relative, not global orphans: {document}"
+    );
     assert_limit_mentions(document, "share", "space report");
     assert_dirty_handle_count(&document["staging"]["handles"], "space report");
 }
@@ -410,7 +450,7 @@ fn assert_space_report(document: &Value, staging: &Path) {
 fn assert_retention_plan(document: &Value) {
     assert_eq!(
         document.get("schema").and_then(Value::as_str),
-        Some("yinyang.managed-retention.plan.v1"),
+        Some("yinyang.managed-retention.plan.v2"),
         "unexpected retention JSON schema: {document}"
     );
     assert_eq!(
@@ -429,6 +469,10 @@ fn assert_retention_plan(document: &Value) {
     assert_limit_mentions(document, "shared pack", "retention plan");
     assert_eq!(document["policy"]["mode"], "bounded");
     assert_eq!(document["policy"]["keep_last"], 1);
+    assert_eq!(
+        document["policy"]["published_history"], "retained_by_default",
+        "bounded retention must not logically expire published history: {document}"
+    );
     assert_eq!(
         document["protection"]["external_readers"], "unknown",
         "retention plan must preserve the external-reader boundary"

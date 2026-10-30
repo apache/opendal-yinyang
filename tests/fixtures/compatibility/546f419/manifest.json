@@ -1,0 +1,402 @@
+{
+  "files": [
+    {
+      "length": 2172,
+      "path": "expected.json",
+      "sha256": "81bea4be67c4154e23d8ab8cbae28e5e32066e6f9802b95bf5f405646b563f36"
+    },
+    {
+      "length": 253952,
+      "path": "frozen/staging/staging.db",
+      "sha256": "8e2bcb97e8a98fc6b5cf7b74fbf3a07d4ff69934ddf0df39b88e7cf6efa1c0c9"
+    },
+    {
+      "length": 8272,
+      "path": "frozen/staging/staging.db-wal",
+      "sha256": "53ca32b5b3f0d44f9b33a7f85081fc2379d62f5db30d0b8877675d4df8d14fec"
+    },
+    {
+      "length": 157,
+      "path": "frozen/storage/.yinyang/head",
+      "sha256": "cc59d91d2665f09871a971ce23d65f42e241604b9209388cf9b9836b758ccdb6"
+    },
+    {
+      "length": 369,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/0321b59f09f647d99d5591411f75d571",
+      "sha256": "5de3175b4c48654c4e7b08db4de8c86ff88e59b7c6039433cdc445f41379459a"
+    },
+    {
+      "length": 198,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/0773c2d5a0534647922ea8bb4494c059",
+      "sha256": "c7682ca036f29be285a3d02e91c85718e79f1da8606bef68324b3aaf57e2eced"
+    },
+    {
+      "length": 320,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/0a59eab6ec894c138b2c0c97de5cd984",
+      "sha256": "f3c864ff2f6b46ac329c83c78537f5cf016e43d90746425d48f26f996eedabe8"
+    },
+    {
+      "length": 65991,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/155beb1772d14a808c8d3d40d5e7f8ef",
+      "sha256": "b6ef7de507cbe79eaca14df722ce94f37750e49e85c30bedee4cd40fc655a7b9"
+    },
+    {
+      "length": 200855,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/1726861ef3db467bb17fe7eb3841cd88",
+      "sha256": "5f823b09e9650d34bebc464deee109829177914391e9ec2f4c461158029621a5"
+    },
+    {
+      "length": 199,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/2e00d99108454e579fd412e3c6c5b46d",
+      "sha256": "1092c8f48f3b80ba9a81bf5b7db7bcd643481bb1569cc7485c158b1964567d4e"
+    },
+    {
+      "length": 292,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/3e1ef94cd4454aa89d5370f7b16e218c",
+      "sha256": "c8ecf24cc1fa954645a953fc6e460172b1992bea9068ade0f7df141db6d89594"
+    },
+    {
+      "length": 290,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/409343fa4ff941bf8ab673d4f491fa72",
+      "sha256": "3fc815b43c2684e25d7fb333dca28b7a6235a636a9885570d52c365c569c2670"
+    },
+    {
+      "length": 129,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/6ca7edb8246b4930ba6656d782cbfe31",
+      "sha256": "a9dbcada0935082a2a3f9171cdf2914582fdc5a66945c873e0e88d7369c7d01e"
+    },
+    {
+      "length": 316,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/6cc51c033a3e482793a5b98c5e94fb9a",
+      "sha256": "170b881ac1ea8ca17d4e866cc2aecef89b9cf55be4fc306737ffbbdc7d93f99c"
+    },
+    {
+      "length": 290,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/72f3eba4c86a4ebc8251b6a0b7f2636f",
+      "sha256": "16124e4782ea1e07e70fe7777135e2d0aded1a2bd9ef0ae3609eac37ea326377"
+    },
+    {
+      "length": 74,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/7e2a87794f1e4699977b6c25943a7b22",
+      "sha256": "da050299160a33301e649d6409247f096085ad84d98ff3ac0930080e04913734"
+    },
+    {
+      "length": 743,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/7ffbf2306f684da09e2b9ff6909643a8",
+      "sha256": "63f7c7240737e76c2284ce3da617c1fd40f5e255debd1aef3a7c3022bcee9731"
+    },
+    {
+      "length": 114,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/8102267f6af74383ba823265492339d1",
+      "sha256": "4030e7fee3743500ebc378ec0ed4ee5e52526e04a6f9ea4637da1699f0a10644"
+    },
+    {
+      "length": 215,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/887fe92d98e34d00bcb1aae291b3f857",
+      "sha256": "a1df5d4b8d3e59f08b93af7c8e046c1ede9dbfffcf26fda4858e008255ee7eff"
+    },
+    {
+      "length": 369,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/916bc78e30bf4227856ba75a101e4b75",
+      "sha256": "6e8d969074e40b39eb6bb4d6cada0ffe26be40c00529f2773fd488a46ddb2579"
+    },
+    {
+      "length": 369,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/93240952bee74691a40b5ae705876630",
+      "sha256": "733a612d2a98a60d04c347da4c68c4c52b0c05fa60c1cf2ffbdfb2f4189a4477"
+    },
+    {
+      "length": 106,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/a605d9581858495c99e84f8e126f5e6e",
+      "sha256": "ab6d5b0a3ac493501aa17d041e24697949dc2ced59d55fd8e4d5244debeda449"
+    },
+    {
+      "length": 1258,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/d31e89641f684636bb9bf880a1bb62da",
+      "sha256": "aacb57a811e7ed3b922f9ced3378c041e730575a08169cf7d26dae859d585d79"
+    },
+    {
+      "length": 73,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/e417e72ebb42409d8d2318cd6ade5055",
+      "sha256": "8735bdbfb7af4b430a484518d9bd85484139fe9d9b1bfeccbbc494f3bf754106"
+    },
+    {
+      "length": 198,
+      "path": "frozen/storage/.yinyang/v2/c8ee2af7217f4180b13399f142ad3be0/packs/f588b73de902494a96e7a90d25a35a47",
+      "sha256": "f3efdbdaaebfde52b70a72764ec343c71c4c8376b0ab0c3a06515e61d0e71c9b"
+    },
+    {
+      "length": 218,
+      "path": "frozen/volume.json",
+      "sha256": "1ed557d87819d2dc2502abe85995abb6d75d5a547abe622d668ebf8ff79419cc"
+    },
+    {
+      "length": 253952,
+      "path": "object/staging/staging.db",
+      "sha256": "bb85569625a5f4e50ffc6e4d7a291de059a6ebf184f837163ce8c69b9683c726"
+    },
+    {
+      "length": 157,
+      "path": "object/storage/.yinyang/head",
+      "sha256": "dafa47e728f3f0a49b486cc94660eca92246b0395701317ac2b74d4fe0120ef9"
+    },
+    {
+      "length": 198,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/0dc1a74e826749d78158712eb67e7e59",
+      "sha256": "0c57c835699fc5f80bfe43e2ed3d2b129725262184bc73d70620c4ec8f0f20ff"
+    },
+    {
+      "length": 743,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/2de97958a2764fdfbb0c3864ea87383a",
+      "sha256": "475d150840c9c6706b55acc655b21f22b724a731126cd97907f41ae6c472e1ef"
+    },
+    {
+      "length": 215,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/3635110641a341dd8d1421a64b55f79b",
+      "sha256": "c18f022b74f31adca624a463935742b82cd4f4ed33c4d1069a92ce2c58760840"
+    },
+    {
+      "length": 199,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/69f863a5e90f4dbebda31d063c25ba54",
+      "sha256": "c8de8f4119cd9aedb2ddb493f78e4938a58e83fced5d0a82c39760fd76765412"
+    },
+    {
+      "length": 290,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/80b5c05b09a64690ac480fe7241fad8a",
+      "sha256": "0b1a2166c69ea1ef3d4d4a69ffa0f80314f6af8712e60628670184202af8d936"
+    },
+    {
+      "length": 369,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/8a4cbf3c16b5407f8789251728f61bf8",
+      "sha256": "3d3086b30f996dc74ecc4b8d55b267f84a35ef1bcac3639e8ec604cbd1eb45fd"
+    },
+    {
+      "length": 74,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/94eb9a7b088f45e18e1414d9ac494540",
+      "sha256": "b1ac4da63c72131001c6ad8a1db89578667e3ff4f13aa57d8864f05befccac15"
+    },
+    {
+      "length": 200855,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/962b37a3436c4a05b01978fbe4399393",
+      "sha256": "8e3f1060a05410dc81b875109694c0fa0db0e8a4d8a38b9a736e07af7f3b18fa"
+    },
+    {
+      "length": 198,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/9c0b0753cc374b63b435d6a47c25bef1",
+      "sha256": "202647aa2caa35b8402c17ffc5fb56d2fe666cdd891d6369ef7f455cc0ad0222"
+    },
+    {
+      "length": 106,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/c278fab93d7a4099a76da027a793d036",
+      "sha256": "12edf7101177cc59e6bd75a9bb83928ad06c61883c27fece045702d63f3cc71c"
+    },
+    {
+      "length": 114,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/c2b1516e555e4cbb8a2151dde2c516fe",
+      "sha256": "29210c239dda7ca4a171fd5485553b6139351cb16e0152a78d2ef4da0c6a96ea"
+    },
+    {
+      "length": 73,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/c5adef26e30748a489b0328f7a7220b4",
+      "sha256": "56dfa38025fc5120081a0f1dc4257b0856bfe9bd51ffee354d6ec7cec4a16226"
+    },
+    {
+      "length": 320,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/cf127fef84804f8882ebf2688adc544a",
+      "sha256": "2ce8c8a11b7c062a7262c60d1949c876d10f5123c289d9b34cb246ff0da09c95"
+    },
+    {
+      "length": 369,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/dfb6f00e0ce940ff9ae83dca1eaf3969",
+      "sha256": "57bc69a5409421294654bd5f07a34b2efd4b4a417bb48687f4c2866ea2702117"
+    },
+    {
+      "length": 129,
+      "path": "object/storage/.yinyang/v2/6f16015db7fc4463995ec43743f34fea/packs/ec15db4986974b0f951477a48e7dbac2",
+      "sha256": "d833e751b82b29db2545897480c7f1f83b7faacccd75df2e123c42c3d6177f70"
+    },
+    {
+      "length": 218,
+      "path": "object/volume.json",
+      "sha256": "2b5f5f5dedc5357d13678da5d4e20467db7619a8aa390fb9712b4c18da491605"
+    },
+    {
+      "length": 40960,
+      "path": "service/metadata/metadata.db",
+      "sha256": "7788f98b41e599b5f47ec77640a045907d3a98da658f03e52419ef878256e73f"
+    },
+    {
+      "length": 74192,
+      "path": "service/metadata/metadata.db-wal",
+      "sha256": "ab3aed7b57ed26e2052a728c0311fc7f851f1a99112d7fc52cfc5968e424a736"
+    },
+    {
+      "length": 40,
+      "path": "service/storage/.yinyang/head",
+      "sha256": "4ee90286ebbe5c5301ab1fc612bb9bc2ba9107f8b4e35d695b344ff09406760b"
+    },
+    {
+      "length": 131403,
+      "path": "service/storage/.yinyang/v2/d0d1ce4bc68e45ccb89d5f45c6b9d1ef/packs/d134a4c4d5294e9a86bcc076a2b0e357",
+      "sha256": "3dbc4a1939d4ac4ff08d8f0f442fa674f2833989b39df9b1a114c989a62c644d"
+    },
+    {
+      "length": 267,
+      "path": "service/volume.json",
+      "sha256": "76b98247ccf9f91e8e4f9e79579f792d12d3b1958e547fbd69e1c4fe714fbe4d"
+    },
+    {
+      "length": 253952,
+      "path": "unknown/staging/staging.db",
+      "sha256": "99006ded479b9a50bcec35b40365b8e7510058b2bef023709bc730faa23f8dcd"
+    },
+    {
+      "length": 157,
+      "path": "unknown/storage/.yinyang/head",
+      "sha256": "4c83bc4cc006a18e5b30cd83c2cfa19964cbd89158d03d3a39833c5a45def69a"
+    },
+    {
+      "length": 369,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/0e01233b930940caae629c1096389620",
+      "sha256": "ae8397d4616fb944da185c5b6df99e60c3f0c887c2ff198e63abafb8928a2543"
+    },
+    {
+      "length": 292,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/2c8db6ef68744e3ba76c003d45e2fb9f",
+      "sha256": "79333d594866e61bef49bea9c9c8bc56700be8cc573d61f532591f78755a4b98"
+    },
+    {
+      "length": 743,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/49950eae8824405d9c47a87ac7a63cc0",
+      "sha256": "800b974ffb2f818250c93e7d8fe13d6697ba5642a8a8464aa9bbacdc2a0a02af"
+    },
+    {
+      "length": 198,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/53941554085a4a9aac2a181280c82bb5",
+      "sha256": "e3c05a17c22db7064375af7a570f59657ca8fa5c4a754ef405c3da595696ed5a"
+    },
+    {
+      "length": 74,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/5b7755f721b747c9a574dc0138e0bf06",
+      "sha256": "50cb5ff4ca6dc216c33095fb71309ad8f38facadb6dad17204027088b23b90a6"
+    },
+    {
+      "length": 369,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/67b7ed12da76461ab5f7d90646b483b5",
+      "sha256": "f51bf1af425839d82a00ec8d2de99146399d859f4b67795e2c7a08ff9460523b"
+    },
+    {
+      "length": 65991,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/6d79a5241bf84f1080506d23f3aabfea",
+      "sha256": "9bb46c0938bd8039fa5667f3db8852a8fe7872895ee97a6b83eca63575dd289b"
+    },
+    {
+      "length": 73,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/718e69f80ce444938fd09e9da4495628",
+      "sha256": "de616f478a586d6c46cca7fd0753ccff6562aeefbc1c6661935edbf2c01b889b"
+    },
+    {
+      "length": 316,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/7a3044487d2e4b66b09c82912e95b2bf",
+      "sha256": "3d0345517993503495fc05d696053b1ea7b22473ef4cf0d1485fe86f5c6d0130"
+    },
+    {
+      "length": 320,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/7b37c1f553de4cd4afe0022eeab733df",
+      "sha256": "ee9b4932dead22239263313f5f7a6609ae73a9be22b2548d6095e1a9665b3e90"
+    },
+    {
+      "length": 114,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/86df2b7b68304a71a9a94dfb209f24fb",
+      "sha256": "cfab116007fae8fffef64b87f11495e47e53fe34364ae6320af7d79a81bdf3d1"
+    },
+    {
+      "length": 106,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/988f1fdca5fe419aa1a56331310bfd7d",
+      "sha256": "a9fdd38dc4418382c90a54e9bc7fb2160046a316787444a10301ce77820e29b0"
+    },
+    {
+      "length": 200855,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/9d1fd8d9a6b84d00a7d645061752b6fa",
+      "sha256": "2104b71e2c82b5926e549ff43054a3ae3aa30cc80f3e5ac09f3a4fe4c38256d5"
+    },
+    {
+      "length": 290,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/aed0a6f830b548eda33d48b2814fc115",
+      "sha256": "041fc3c04c49ed6ca0e661b1d0e5b39b90f14cb3a97efa161d0596431bfef8b1"
+    },
+    {
+      "length": 129,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/b5da943e46f34a56b8c133121d1e341e",
+      "sha256": "59e7ff285dcc876515d1c615becf1bf44e7a6104f78f45accb59cc1e646fc21d"
+    },
+    {
+      "length": 1258,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/ce78560344744235ba54d7d3ffb9b0eb",
+      "sha256": "684d1a785e8b189ebd1a99c0818e7b9c3496ceb95f52b81410e1e816c9133c0a"
+    },
+    {
+      "length": 198,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/d4c6613562114bf9bcb8ab12a35cd834",
+      "sha256": "9e389f8db56bc2f1db50d4e03d4bee1c5d9119d85b4cb90f31ed536ae4df8163"
+    },
+    {
+      "length": 290,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/ef01c83477954e18bb0363b91a56ebd4",
+      "sha256": "051e28fc8363d07cc32676bd3b8d758ae8918e228a4d8a84002f4cf982a0f289"
+    },
+    {
+      "length": 215,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/f41447bcf76d4e8296222660871657ea",
+      "sha256": "5cd7cb8aeb76ef607716b7eee5f7a6a0dcad52e48a55b4d6dcf582528a3ae1b4"
+    },
+    {
+      "length": 199,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/fe110d5c27a34113b45d517925b61854",
+      "sha256": "1e1654896796cd568bded07db4de3a9d0005f38202f86ec31db773772c164594"
+    },
+    {
+      "length": 369,
+      "path": "unknown/storage/.yinyang/v2/677e9cecd9a640789ae186dd94614b55/packs/ff3eae31199f42158039a1fd668f53e1",
+      "sha256": "279bee5dea97c33280b75a307aac04f47a0b634c6c14496fe22933ef6f6b66eb"
+    },
+    {
+      "length": 219,
+      "path": "unknown/volume.json",
+      "sha256": "43158e79d1f56c7228f30d40cf29bcb3e465a759e33204a1b1ddd239ef8af6ef"
+    }
+  ],
+  "fixture": {
+    "frozen": {
+      "commit": "66417794-8e01-48d6-8d0f-cca60d4d87aa",
+      "request_digest": "a52622f12fa31dea554ce9aaeb76415231eb9ee530248590cade1f1f1855f021"
+    },
+    "object": {
+      "base": "base.txt",
+      "clean_handle": "dae9d125-3cbd-435d-95c2-319ce4d3c5c9",
+      "sparse_handle": "17f64bdf-0595-4190-8d4e-c2735be31930"
+    },
+    "service": {
+      "database": "metadata/metadata.db",
+      "path": "service.txt",
+      "wal": "metadata/metadata.db-wal"
+    },
+    "unknown": {
+      "commit": "8c7c146d-a790-4c5d-babe-035cf9b02e8e",
+      "request_digest": "debc60ff8cef6fb59e17a132e055f354dfc626503d55c90004d9a6758beb5643"
+    }
+  },
+  "producer": {
+    "binary_identity": "trial-archive",
+    "binary_sha256": "dce3c6e1b8e4d5682f7e90cc6376686dac6c0d9be005ad67388279519a8696e6",
+    "commit": "546f419f9158e156f9a561822f3cb3f307222584",
+    "release": "0.0.24+546f419f9158",
+    "tree": "ba7c7f2c3bbebd16c01891bc2361d9d36217d503",
+    "trial_archive": {
+      "binary_sha256": "dce3c6e1b8e4d5682f7e90cc6376686dac6c0d9be005ad67388279519a8696e6",
+      "name": "yinyang-0.0.24-ubuntu-24.04-x86_64-546f419f9158.tar.gz",
+      "sha256": "771c94a5d5063ab2d61ac7a9896abfd2430d55baeb478bc9b3f97ae187790453"
+    }
+  },
+  "schema": "yinyang.compatibility.stage3-fixture.v1"
+}
