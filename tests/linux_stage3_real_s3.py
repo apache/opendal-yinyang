@@ -65,8 +65,8 @@ from linux_operating_envelope import (  # noqa: E402
 
 CREDENTIAL_NAMES = ("AccessKeyId", "SecretAccessKey", "SessionToken")
 SCHEMA = "yinyang.linux-stage3-real-s3-trial.v1"
-INITIAL_BYTES = 80 * 1024
-APPEND_BYTES = b"stage3-real-s3-append----"
+INITIAL_BYTES = 8 * 1024 * 1024 + 17
+APPEND_BYTES = b"stage3-real-s3-append".ljust(4 * 1024, b".")
 ZERO_EXTEND_BYTES = 32 * 1024
 SHRINK_BYTES = 4096
 EXTEND_BYTES = 64 * 1024 + 4096
