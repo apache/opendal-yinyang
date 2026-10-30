@@ -448,12 +448,12 @@ pub(crate) async fn inspect_object_state(
     }
     let mut descriptors = HashSet::new();
     let mut pending = VecDeque::new();
-    let mut seen_descriptors = BTreeSet::new();
+    let mut seen_descriptors = BTreeMap::new();
     let mut seen_roots = BTreeSet::new();
-    let mut seen_pages = HashSet::new();
+    let mut seen_pages: [HashSet<PackedRef>; 5] = Default::default();
     let cache = IndexCache::default();
     let mut observed_snapshots = 0_u64;
-    seen_descriptors.insert(state.reference().clone());
+    seen_descriptors.insert(state.reference().clone(), state.revision());
     inspection
         .add_reference(PhysicalReferenceKind::SnapshotDescriptor, state.reference())
         .expect("record a valid snapshot reference");
@@ -477,11 +477,20 @@ pub(crate) async fn inspect_object_state(
     .await;
 
     while let Some((revision, reference)) = pending.pop_front() {
-        if !seen_descriptors.insert(reference.clone()) {
-            continue;
+        match descriptor_revisit(&seen_descriptors, &reference, revision) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => {
+                inspection.issue(
+                    &error,
+                    format!("snapshot-descriptor:{}", hex(&revision.to_bytes())),
+                );
+                continue;
+            }
         }
         match state.load_retained(revision, &reference).await {
             Ok(retained) => {
+                seen_descriptors.insert(reference.clone(), revision);
                 inspection
                     .add_reference(PhysicalReferenceKind::SnapshotDescriptor, &reference)
                     .expect("record a valid snapshot reference");
@@ -522,7 +531,7 @@ async fn inspect_object_roots(
     descriptors: &mut HashSet<ContentDescriptor>,
     pending: &mut VecDeque<(Revision, PackedRef)>,
     seen_roots: &mut BTreeSet<(ObjectTable, PackedRef)>,
-    seen_pages: &mut HashSet<PackedRef>,
+    seen_pages: &mut [HashSet<PackedRef>; 5],
     cache: &IndexCache,
 ) {
     for (table, index) in roots {
@@ -541,7 +550,12 @@ async fn inspect_object_roots(
             descriptors_pending: pending,
         };
         if let Err(error) = index
-            .inspect(state.data(), Some(cache), seen_pages, &mut visitor)
+            .inspect(
+                state.data(),
+                Some(cache),
+                &mut seen_pages[table as usize],
+                &mut visitor,
+            )
             .await
         {
             visitor.inspection.issue(
@@ -625,12 +639,19 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
             }
             ObjectTable::History => match <[u8; 24]>::try_from(key) {
                 Ok(revision) => {
-                    decode::<RefWire>(bytes)
-                        .and_then(PackedRef::from_wire)
-                        .map(|reference| {
-                            self.descriptors_pending
-                                .push_back((Revision::from_bytes(revision), reference));
-                        })
+                    let revision = Revision::from_bytes(revision);
+                    if revision > self.revision {
+                        Err(Error::corrupt(
+                            "inspect physical roots",
+                            "history key exceeds its containing snapshot revision",
+                        ))
+                    } else {
+                        decode::<RefWire>(bytes)
+                            .and_then(PackedRef::from_wire)
+                            .map(|reference| {
+                                self.descriptors_pending.push_back((revision, reference));
+                            })
+                    }
                 }
                 Err(_) => Err(Error::corrupt(
                     "inspect physical roots",
@@ -647,6 +668,25 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
 
 fn metadata_subject(table: ObjectTable, key: &[u8]) -> String {
     format!("metadata:{}:{}", table as u8, hex(key))
+}
+
+fn descriptor_revisit(
+    seen: &BTreeMap<PackedRef, Revision>,
+    reference: &PackedRef,
+    revision: Revision,
+) -> Result<bool> {
+    match seen.get(reference) {
+        Some(previous) if *previous == revision => Ok(false),
+        Some(previous) => Err(Error::corrupt(
+            "inspect physical roots",
+            format!(
+                "snapshot descriptor is retained under conflicting revisions {} and {}",
+                hex(&(*previous).to_bytes()),
+                hex(&revision.to_bytes())
+            ),
+        )),
+        None => Ok(true),
+    }
 }
 
 fn insert_interval(intervals: &mut BTreeMap<u64, u64>, start: u64, end: u64) {
@@ -680,6 +720,10 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn revision(byte: u8) -> Revision {
+        Revision::from_bytes([byte; 24])
+    }
+
     #[test]
     fn overlapping_coverage_is_counted_once_per_pack() {
         let mut inspection = PhysicalInspection::default();
@@ -705,5 +749,46 @@ mod tests {
         assert_eq!(packs[0].references, 3);
         assert_eq!(packs[0].intervals, vec![(0, 96), (128, 160)]);
         assert_eq!(packs[0].covered_bytes, 128);
+    }
+
+    #[test]
+    fn one_descriptor_reference_cannot_name_two_revisions() {
+        let reference = PackedRef {
+            object: [1; 16],
+            offset: 0,
+            length: 4,
+            digest: [2; 32],
+        };
+        let seen = BTreeMap::from([(reference.clone(), revision(1))]);
+        assert!(!descriptor_revisit(&seen, &reference, revision(1)).unwrap());
+        let error = descriptor_revisit(&seen, &reference, revision(2)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
+        assert!(error.to_string().contains("conflicting revisions"));
+    }
+
+    #[test]
+    fn history_values_must_not_exceed_their_containing_revision() {
+        let reference = PackedRef {
+            object: [1; 16],
+            offset: 0,
+            length: 4,
+            digest: [2; 32],
+        };
+        let bytes = crate::namespace::encode(&reference.wire()).unwrap();
+        let mut inspection = PhysicalInspection::default();
+        let mut descriptors = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut visitor = ObjectMetadataVisitor {
+            table: ObjectTable::History,
+            revision: revision(1),
+            filesystem: NodeId::from_bytes([3; 16]),
+            inspection: &mut inspection,
+            descriptors: &mut descriptors,
+            descriptors_pending: &mut pending,
+        };
+        visitor.value(None, &[2; 24], &bytes);
+        assert!(pending.is_empty());
+        assert_eq!(inspection.issues().len(), 1);
+        assert_eq!(inspection.issues()[0].kind, ErrorKind::Corrupt);
     }
 }
