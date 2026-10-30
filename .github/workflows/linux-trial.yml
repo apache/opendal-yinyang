@@ -34,10 +34,12 @@ on:
       - "tests/linux_fuse/harness.rs"
       - "tests/linux_operations.rs"
       - "tests/linux_prefix_upgrade.rs"
+      - "tests/linux_stage3_upgrade.rs"
       - "tests/linux_sync/harness.rs"
       - "tests/linux_trial_archive.sh"
       - "tests/linux_trial_distribution.sh"
       - "tests/support/**"
+      - "tests/fixtures/compatibility/546f419/**"
       - "tools/linux/**"
   workflow_dispatch:
 
@@ -255,6 +257,23 @@ jobs:
             --nocapture \
             --test-threads=1 \
             2>&1 | tee "$TRIAL_ROOT/evidence/upgrade.log"
+
+      - name: Run genuine stage-3 fixture upgrade with the archive target
+        run: |
+          set -euo pipefail
+          export YY_UPGRADE_BIN="$TRIAL_YY"
+          export YY_UPGRADE_RELEASE="$TRIAL_RELEASE"
+          export YINYANG_UPGRADE_SOURCE="$GITHUB_SHA"
+          export YINYANG_STAGE3_EVIDENCE="$TRIAL_ROOT/evidence/stage3-upgrade.json"
+          cargo test \
+            -p yinyang \
+            --test linux_stage3_upgrade \
+            installed_stage3_upgrade_preserves_sparse_segments_and_service_wal \
+            -- \
+            --ignored \
+            --nocapture \
+            --test-threads=1 \
+            2>&1 | tee "$TRIAL_ROOT/evidence/stage3-upgrade.log"
 
       - name: Upload trial evidence
         if: always()

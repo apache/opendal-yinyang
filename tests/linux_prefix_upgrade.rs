@@ -25,25 +25,27 @@ mod raw_s3;
 #[path = "support/s3_gate.rs"]
 #[allow(dead_code)]
 mod s3_gate;
+#[path = "support/upgrade.rs"]
+#[allow(dead_code)]
+mod upgrade;
 
 use borsh::BorshDeserialize;
-use raw_s3::RawS3;
 use s3_gate::{CommitAction, S3Gate};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Instant;
+use upgrade::{
+    RemoteCleanup, ServiceProcess, Storage, assert_no_installed_writer, assert_receipt,
+    assert_sqlite_integrity, assert_storage_inventory_complete_when_empty, current_yy_command,
+    field, handle_line, install_release, open_handle, output_text, parse_file_commit, path_text,
+    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file, sqlite_wal_reader,
+    switch_current, target_source, text, transaction_identity, volume_command, volume_file_command,
+    wait_gate_or_child_exit, write_config, write_optional_evidence,
+};
 
 const LEGACY_SOURCE: &str = "fd1338c2f924a90e9da752b9158e748d1d3acaf4";
-const SERVICE_TOKEN: &str = "installed-upgrade-service-token-with-at-least-32-bytes";
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
 const BASE_BYTES: &[u8] = b"fd1338c installed base bytes\n";
 const FROZEN_BYTES: &[u8] = b"fd1338c frozen upgrade bytes\n";
 const PENDING_BYTES: &[u8] = b"fd1338c pending upgrade bytes\n";
@@ -71,7 +73,7 @@ struct StageRecord {
 #[test]
 #[ignore = "requires isolated S3, YY_LEGACY_BIN, and a selected YY_UPGRADE_BIN"]
 fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
-    require_environment();
+    require_environment(&["YY_LEGACY_BIN"], "installed-prefix upgrade");
     let started = Instant::now();
     let temp = tempfile::tempdir().expect("create installed-upgrade directory");
     let legacy_source =
@@ -136,7 +138,7 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
         Path::new(&legacy_release)
     );
 
-    let storage = Storage::new();
+    let storage = Storage::new("installed-prefix upgrade");
     let object_root = storage.root("upgrade-object");
     let sync_root = storage.root("upgrade-sync");
     let service_root = storage.root("upgrade-service");
@@ -680,399 +682,11 @@ fn installed_prefix_upgrade_preserves_retained_work_and_service_wal() {
             "doctor": doctor["status"],
         },
     });
-    write_optional_evidence(&evidence);
+    write_optional_evidence("YINYANG_UPGRADE_EVIDENCE", &evidence);
     println!(
         "linux-prefix-upgrade: {}",
         serde_json::to_string(&evidence).unwrap()
     );
-}
-
-fn require_environment() {
-    for name in [
-        "YY_LEGACY_BIN",
-        "YINYANG_S3_BUCKET",
-        "YINYANG_S3_ENDPOINT",
-        "YINYANG_S3_REGION",
-        "YINYANG_S3_ACCESS_KEY_ID",
-        "YINYANG_S3_SECRET_ACCESS_KEY",
-    ] {
-        assert!(
-            std::env::var_os(name).is_some(),
-            "{name} is unset; installed-prefix upgrade fails hard instead of skipping"
-        );
-    }
-    assert_eq!(
-        std::env::var("YINYANG_STORAGE_PROFILE").as_deref(),
-        Ok("minio"),
-        "installed-prefix upgrade uses the isolated Silo qualification storage"
-    );
-    assert!(
-        std::env::var("YINYANG_S3_ENDPOINT")
-            .expect("isolated S3 endpoint")
-            .starts_with("http://"),
-        "installed-prefix fault injection requires the plain-HTTP Silo endpoint"
-    );
-}
-
-fn target_source() -> String {
-    if let Ok(source) = std::env::var("YINYANG_UPGRADE_SOURCE") {
-        return source;
-    }
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run git rev-parse for upgrade target");
-    assert!(
-        output.status.success(),
-        "git rev-parse HEAD failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("target source is UTF-8")
-        .trim()
-        .to_owned()
-}
-
-struct Storage {
-    raw: RawS3,
-    variables: Vec<(&'static str, String)>,
-}
-
-impl Storage {
-    fn new() -> Self {
-        let mut variables = Vec::new();
-        for name in [
-            "YINYANG_S3_BUCKET",
-            "YINYANG_S3_ENDPOINT",
-            "YINYANG_S3_REGION",
-            "YINYANG_S3_ACCESS_KEY_ID",
-            "YINYANG_S3_SECRET_ACCESS_KEY",
-        ] {
-            variables.push((
-                name,
-                std::env::var(name)
-                    .unwrap_or_else(|_| panic!("{name} is required for upgrade acceptance")),
-            ));
-        }
-        Self {
-            raw: RawS3::from_env(),
-            variables,
-        }
-    }
-
-    fn root(&self, label: &str) -> String {
-        format!(
-            "linux-prefix-upgrade/{label}-{}",
-            uuid::Uuid::new_v4().simple()
-        )
-    }
-
-    fn apply(&self, command: &mut Command, root: &str, token: Option<&str>) {
-        for (name, value) in std::env::vars_os() {
-            if !name.to_string_lossy().starts_with("YINYANG_") {
-                command.env(name, value);
-            }
-        }
-        for (name, value) in &self.variables {
-            command.env(name, value);
-        }
-        command
-            .env("YINYANG_STORAGE_PROFILE", "minio")
-            .env("YINYANG_S3_ROOT", root)
-            .env("YINYANG_SERVICE_TOKEN", token.unwrap_or(SERVICE_TOKEN));
-    }
-}
-
-struct RemoteCleanup {
-    roots: Vec<String>,
-}
-
-impl RemoteCleanup {
-    fn new(roots: Vec<String>) -> Self {
-        Self { roots }
-    }
-
-    fn cleanup(&mut self) {
-        let raw = RawS3::from_env();
-        for root in self.roots.drain(..) {
-            for _ in 0..3 {
-                let keys = raw
-                    .inventory(&format!("{root}/"))
-                    .into_keys()
-                    .collect::<Vec<_>>();
-                if keys.is_empty() {
-                    break;
-                }
-                for key in keys {
-                    raw.delete(&key);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for RemoteCleanup {
-    fn drop(&mut self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cleanup()));
-    }
-}
-
-struct ServiceProcess {
-    child: Option<Child>,
-    stderr: Option<thread::JoinHandle<Vec<u8>>>,
-    address: std::net::SocketAddr,
-}
-
-impl ServiceProcess {
-    fn start(yy: &Path, storage: &Storage, root: &str, database: &Path) -> Self {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve service test port");
-        let address = listener.local_addr().expect("reserve service address");
-        drop(listener);
-        Self::start_at(yy, storage, root, database, address)
-    }
-
-    fn start_at(
-        yy: &Path,
-        storage: &Storage,
-        root: &str,
-        database: &Path,
-        address: std::net::SocketAddr,
-    ) -> Self {
-        let mut command = current_yy_command(yy, storage, root);
-        command
-            .args([
-                "serve",
-                "--database",
-                path_text(database),
-                "--listen",
-                &address.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn installed metadata service");
-        let stdout = child.stdout.take().expect("service stdout");
-        let stderr = child.stderr.take().expect("service stderr");
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            let result = reader.read_line(&mut line);
-            let _ = sender.send((result, line));
-            let mut rest = Vec::new();
-            let _ = reader.read_to_end(&mut rest);
-        });
-        let stderr = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = BufReader::new(stderr).read_to_end(&mut bytes);
-            bytes
-        });
-        let (read, line) = receiver
-            .recv_timeout(Duration::from_secs(60))
-            .expect("metadata service readiness timeout");
-        read.expect("read metadata service readiness");
-        let address = match line
-            .trim()
-            .strip_prefix("metadata service listening on ")
-            .and_then(|value| value.parse().ok())
-        {
-            Some(address) => address,
-            None => {
-                let _ = child.kill();
-                let status = child.wait().expect("wait for failed metadata service");
-                let stderr = stderr.join().unwrap_or_default();
-                panic!(
-                    "unexpected metadata service readiness {line:?} with {status}:\n{}",
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-        };
-        Self {
-            child: Some(child),
-            stderr: Some(stderr),
-            address,
-        }
-    }
-
-    fn kill_without_cleanup(mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.kill().expect("kill metadata service");
-            let _ = child.wait();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
-        }
-    }
-
-    fn stop(mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.kill().expect("stop metadata service");
-            child.wait().expect("wait for metadata service");
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
-        }
-    }
-}
-
-impl Drop for ServiceProcess {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
-        }
-    }
-}
-
-fn current_yy_command(yy: &Path, storage: &Storage, root: &str) -> Command {
-    let mut command = Command::new(yy);
-    storage.apply(&mut command, root, None);
-    command
-}
-
-fn volume_command(
-    yy: &Path,
-    storage: &Storage,
-    root: &str,
-    config: &Path,
-    token: Option<&str>,
-) -> Command {
-    let mut command = Command::new(yy);
-    storage.apply(&mut command, root, token);
-    command.args(["--volume", path_text(config)]);
-    command
-}
-
-fn volume_file_command(yy: &Path, storage: &Storage, root: &str, config: &Path) -> Command {
-    let mut command = volume_command(yy, storage, root, config, None);
-    command.arg("file");
-    command
-}
-
-fn run_file_ok(yy: &Path, storage: &Storage, root: &str, config: &Path, args: &[&str]) -> Output {
-    run_ok(
-        volume_file_command(yy, storage, root, config).args(args),
-        &format!("installed yy file {args:?}"),
-    )
-}
-
-fn run_ok(command: &mut Command, context: &str) -> Output {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn installed yy");
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
-    loop {
-        if child.try_wait().expect("poll installed yy").is_some() {
-            let output = child
-                .wait_with_output()
-                .expect("collect installed yy output");
-            assert!(
-                output.status.success(),
-                "{context} failed with {}:\n{}",
-                output.status,
-                output_text(&output)
-            );
-            return output;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("collect timed-out installed yy output");
-            panic!(
-                "{context} timed out after {PROCESS_TIMEOUT:?}:\n{}",
-                output_text(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn wait_gate_or_child_exit(gate: &S3Gate, child: &mut Child, context: &str) {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        if gate.wait_intercepted_timeout(Duration::from_millis(100)) {
-            return;
-        }
-        if let Some(status) = child.try_wait().expect("poll gated child") {
-            let mut stdout = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)
-                    .expect("read gated child stdout");
-            }
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                pipe.read_to_end(&mut stderr)
-                    .expect("read gated child stderr");
-            }
-            let output = Output {
-                status,
-                stdout,
-                stderr,
-            };
-            panic!(
-                "{context} exited before the S3 gate intercepted its commit:\n{}",
-                output_text(&output)
-            );
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{context} did not reach the S3 gate within 90s"
-        );
-    }
-}
-
-fn write_config(
-    path: &Path,
-    name: &str,
-    access: &str,
-    staging: &Path,
-    publication: &str,
-    service: Option<&str>,
-) {
-    let mut document = json!({
-        "name": name,
-        "model": "managed",
-        "access": access,
-        "frontend": "library",
-        "publication": publication,
-        "storage_profile": "minio",
-        "staging": staging,
-        "read_only": false,
-        "require": [],
-    });
-    if let Some(service) = service {
-        document["service_address"] = Value::String(service.to_owned());
-    }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&document).expect("serialize volume"),
-    )
-    .expect("write installed-upgrade volume");
-}
-
-fn open_handle(
-    yy: &Path,
-    storage: &Storage,
-    root: &str,
-    config: &Path,
-    path: &str,
-    write: bool,
-) -> String {
-    let mut command = volume_file_command(yy, storage, root, config);
-    command.args(["open", path]);
-    if write {
-        command.arg("--write");
-    }
-    let output = run_ok(&mut command, &format!("open installed file {path}"));
-    parse_handle(&output.stdout)
 }
 
 fn write_handle(
@@ -1099,24 +713,6 @@ fn write_handle(
         config,
         &["truncate", handle, &bytes.len().to_string()],
     );
-}
-
-fn read_handle(yy: &Path, storage: &Storage, root: &str, config: &Path, handle: &str) -> Output {
-    run_file_ok(yy, storage, root, config, &["read", handle])
-}
-
-fn parse_handle(stdout: &[u8]) -> String {
-    String::from_utf8(stdout.to_vec())
-        .expect("file handle is UTF-8")
-        .trim()
-        .to_owned()
-}
-
-fn handle_line<'a>(status: &'a str, handle: &str) -> &'a str {
-    status
-        .lines()
-        .find(|line| line.starts_with(&format!("handle: {handle} ")))
-        .unwrap_or_else(|| panic!("handle {handle} is missing from status:\n{status}"))
 }
 
 fn stage_identity(database: &Path, handle: &str) -> (String, String) {
@@ -1160,49 +756,6 @@ fn staging_unknown_identity(database: &Path) -> (String, String) {
     plans.pop().expect("frozen Sync request")
 }
 
-fn transaction_identity(plan: &[u8]) -> (String, String) {
-    let (_, commit, digest) =
-        yinyang_core::Transaction::inspect_identity(plan).expect("inspect frozen transaction");
-    (
-        uuid::Uuid::from_bytes(*commit.as_bytes()).to_string(),
-        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
-    )
-}
-
-fn parse_file_commit(stdout: &[u8]) -> String {
-    String::from_utf8(stdout.to_vec())
-        .expect("file fsync output is UTF-8")
-        .trim()
-        .strip_prefix("committed: ")
-        .and_then(|line| line.split(" revision: ").next())
-        .expect("file fsync commit")
-        .to_owned()
-}
-
-fn receipt(yy: &Path, storage: &Storage, root: &str, commit: &str) -> BTreeMap<String, String> {
-    let output = run_ok(
-        current_yy_command(yy, storage, root).args(["receipt", commit]),
-        "query retained receipt",
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_once(": "))
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect()
-}
-
-fn assert_receipt(yy: &Path, storage: &Storage, root: &str, commit: &str, digest: &str) {
-    let receipt = receipt(yy, storage, root, commit);
-    assert_eq!(field(&receipt, "commit"), commit);
-    assert_eq!(field(&receipt, "request digest"), digest);
-}
-
-fn field<'a>(values: &'a BTreeMap<String, String>, name: &str) -> &'a str {
-    values
-        .get(name)
-        .unwrap_or_else(|| panic!("missing {name:?} in receipt fields {values:?}"))
-}
-
 fn sync_status(yy: &Path, storage: &Storage, root: &str, config: &Path) -> Value {
     let output = run_ok(
         volume_command(yy, storage, root, config, None).args(["sync", "status", "--json"]),
@@ -1218,142 +771,4 @@ fn sync_entry<'a>(status: &'a Value, path: &str) -> &'a Value {
         .iter()
         .find(|entry| entry["path"] == path)
         .unwrap_or_else(|| panic!("Sync entry {path:?} is missing:\n{status:#}"))
-}
-
-fn assert_sqlite_integrity(database: &Path) {
-    let connection =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open service database read-only");
-    let result: String = connection
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .expect("run service SQLite integrity_check");
-    assert_eq!(result, "ok", "service database integrity failure");
-}
-
-fn sqlite_wal_reader(database: &Path) -> (rusqlite::Connection, String) {
-    let connection =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open service database read-only");
-    let journal_mode = connection
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .expect("read service SQLite journal mode");
-    assert_eq!(
-        journal_mode, "wal",
-        "fd1338c service authority did not use WAL mode"
-    );
-    connection
-        .execute_batch("BEGIN")
-        .expect("begin service WAL read snapshot");
-    let _: i64 = connection
-        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
-        .expect("establish service WAL read snapshot");
-    (connection, journal_mode)
-}
-
-fn assert_no_installed_writer(prefix: &Path, work: &Path) {
-    let output = Command::new("pgrep")
-        .args(["-f", path_text(prefix)])
-        .output()
-        .expect("run pgrep for installed prefix");
-    if output.status.success() {
-        let processes = String::from_utf8_lossy(&output.stdout);
-        let allowed = processes
-            .lines()
-            .all(|pid| !Path::new(&format!("/proc/{pid}/cwd")).exists());
-        assert!(
-            allowed,
-            "an installed yy writer remains before the current switch:\n{processes}"
-        );
-    }
-    assert!(
-        work.exists(),
-        "upgrade work directory disappeared before the current switch"
-    );
-}
-
-fn assert_storage_inventory_complete_when_empty(storage: &Storage, root: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut inventory = storage.raw.inventory(&format!("{root}/"));
-    while !inventory.is_empty() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(200));
-        inventory = storage.raw.inventory(&format!("{root}/"));
-    }
-    assert!(
-        inventory.is_empty(),
-        "remote cleanup did not remove every key below {root}: {:?}",
-        inventory.keys().collect::<Vec<_>>()
-    );
-}
-
-fn install_release(prefix: &Path, release: &str, source: &Path) -> PathBuf {
-    assert!(
-        !release.contains('/') && !release.contains(".."),
-        "release directory must be one safe path component"
-    );
-    let directory = prefix.join(release);
-    let bin = directory.join("bin");
-    fs::create_dir_all(&bin).expect("create versioned release directory");
-    let destination = bin.join("yy");
-    fs::copy(source, &destination).expect("install release binary");
-    let mut permissions = fs::metadata(&destination)
-        .expect("release binary metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&destination, permissions).expect("set release binary mode");
-    destination
-}
-
-fn switch_current(prefix: &Path, release: &str) {
-    let temporary = prefix.join(".current.new");
-    let current = prefix.join("current");
-    if temporary.exists() {
-        fs::remove_file(&temporary).expect("remove abandoned current staging link");
-    }
-    std::os::unix::fs::symlink(release, &temporary).expect("create current staging link");
-    fs::rename(&temporary, &current).expect("atomically replace current symlink");
-}
-
-fn sha256_file(path: &Path) -> String {
-    Sha256::digest(fs::read(path).expect("read binary for SHA-256"))
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn text(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn output_text(output: &Output) -> String {
-    format!(
-        "status: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
-fn path_text(path: &Path) -> &str {
-    path.to_str().expect("acceptance path is UTF-8")
-}
-
-fn write_optional_evidence(evidence: &Value) {
-    let Some(path) = std::env::var_os("YINYANG_UPGRADE_EVIDENCE").map(PathBuf::from) else {
-        return;
-    };
-    let parent = path.parent().expect("evidence path has a parent");
-    fs::create_dir_all(parent).expect("create upgrade evidence directory");
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("upgrade-evidence"),
-        std::process::id()
-    ));
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(evidence).expect("serialize upgrade evidence"),
-    )
-    .expect("write temporary upgrade evidence");
-    fs::rename(temporary, path).expect("atomically publish upgrade evidence");
 }

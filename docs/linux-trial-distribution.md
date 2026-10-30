@@ -141,6 +141,22 @@ the selected target archive binary. It exercises retained pending, frozen and
 Unknown requests, original receipts, finite Sync convergence and a non-empty
 service WAL.
 
+`linux_stage3_upgrade` separately qualifies the immutable `546f419` stage-3
+corpus against the same selected target archive. The corpus was produced by the
+accepted `546f419` trial archive binary and contains a genuine sparse pending
+handle, a request dropped before commit, a committed request whose response was
+lost, and a service metadata database copied with its non-empty WAL. The target
+must preserve sparse bytes, publish pending work, retry the original frozen and
+Unknown CommitIds/digests, resolve the lost receipt identity, reopen the service
+WAL and pass `doctor`. The producer binary and target binary hashes are recorded
+separately; the source tree being equal to a later main commit does not rename
+the producer.
+
+The actual installed-target stage-3 and bounded Amazon S3 record is
+[`linux-stage3-trial-results.md`](linux-stage3-trial-results.md). It records
+the exact archive, installed binary and later script-only qualification source
+separately.
+
 The installer intentionally has no rollback or downgrade command. Once a newer
 binary has opened or written configuration, staging, Sync or service state, do
 not relaunch an older binary against that state. An older release directory
@@ -191,10 +207,11 @@ immutable installation, explicit quiesced activation and installed diagnostics,
 and runs recovery.
 
 The same workflow installs the pinned `fd1338c` producer and runs
-`linux_prefix_upgrade` with the archive's installed target binary. It uploads
-the archive, checksum, manifest, exact binary hash, verifier output and upgrade
-JSON as ordinary short-lived Actions evidence. The upload is not a release
-publication.
+`linux_prefix_upgrade` with the archive's installed target binary. It then runs
+the immutable stage-3 fixture upgrade with that installed binary. It uploads
+the archive, checksum, manifest, exact binary hash, verifier output, upgrade
+JSON and separate stage-3 JSON as ordinary short-lived Actions evidence. The
+upload is not a release publication.
 
 Hosted CI does not manufacture a systemd user session. It verifies the packaged
 unit inventory; the actual user-manager lifecycle remains an explicit
