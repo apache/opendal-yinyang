@@ -219,8 +219,8 @@ impl PhysicalInspection {
 /// Inspect references from the supplied latest snapshot and the authority's
 /// retained revision set. Authorities with opaque metadata override this hook
 /// when their physical representation needs additional roots.
-pub(crate) async fn inspect_authority(
-    authority: &dyn Authority,
+pub(crate) async fn inspect_authority<A: Authority + ?Sized>(
+    authority: &A,
     snapshot: &Snapshot,
 ) -> PhysicalInspection {
     let mut inspection = inspect_snapshot(snapshot).await;
@@ -231,8 +231,8 @@ pub(crate) async fn inspect_authority(
     inspection
 }
 
-async fn collect_retained_revision_count(
-    authority: &dyn Authority,
+async fn collect_retained_revision_count<A: Authority + ?Sized>(
+    authority: &A,
     latest: Revision,
 ) -> Result<u64> {
     let mut after = None;
@@ -295,7 +295,7 @@ async fn inspect_snapshot(snapshot: &Snapshot) -> PhysicalInspection {
     let mut descriptors = HashSet::new();
     inspect_namespace(snapshot, &mut inspection, &mut descriptors).await;
     inspect_changes(snapshot, &mut inspection, &mut descriptors).await;
-    inspect_content_descriptors(snapshot.data(), descriptors, &mut inspection).await;
+    inspect_content_descriptors(&snapshot.data, descriptors, &mut inspection).await;
     inspection
 }
 
@@ -452,7 +452,7 @@ pub(crate) async fn inspect_object_state(
     let mut seen_descriptors = BTreeSet::new();
     let mut seen_roots = BTreeSet::new();
     let mut seen_pages = HashSet::new();
-    let mut cache = IndexCache::default();
+    let cache = IndexCache::default();
     let mut observed_snapshots = 0_u64;
     seen_descriptors.insert(state.reference().clone());
     inspection
@@ -576,7 +576,7 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                 .expect("record a valid metadata value reference");
         }
         let result = match self.table {
-            ObjectTable::Nodes => decode::<Node>(bytes, self.filesystem)
+            ObjectTable::Nodes => Node::decode(bytes, self.filesystem)
                 .map(|node| {
                     if node.id().as_bytes().as_slice() != key {
                         return Err(Error::corrupt(
@@ -624,17 +624,20 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                     Ok(())
                 })
             }
-            ObjectTable::History => {
-                let revision: [u8; 24] = key.try_into().map_err(|_| {
-                    Error::corrupt("inspect physical roots", "invalid retained revision key")
-                })?;
-                decode::<RefWire>(bytes)
-                    .and_then(PackedRef::from_wire)
-                    .map(|reference| {
-                        self.descriptors_pending
-                            .push_back((Revision::from_bytes(revision), reference));
-                    })
-            }
+            ObjectTable::History => match <[u8; 24]>::try_from(key) {
+                Ok(revision) => {
+                    decode::<RefWire>(bytes)
+                        .and_then(PackedRef::from_wire)
+                        .map(|reference| {
+                            self.descriptors_pending
+                                .push_back((Revision::from_bytes(revision), reference));
+                        })
+                }
+                Err(_) => Err(Error::corrupt(
+                    "inspect physical roots",
+                    "invalid retained revision key",
+                )),
+            },
         };
         if let Err(error) = result {
             self.inspection
@@ -643,7 +646,7 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
     }
 }
 
-fn metadata_subject(table: Table, key: &[u8]) -> String {
+fn metadata_subject(table: ObjectTable, key: &[u8]) -> String {
     format!("metadata:{}:{}", table as u8, hex(key))
 }
 

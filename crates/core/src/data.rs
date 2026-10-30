@@ -1075,7 +1075,7 @@ impl DataStore {
         &self,
         descriptor: &ContentDescriptor,
         seen: &mut HashSet<PackedRef>,
-        visit: &mut dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()>,
+        visit: &mut (dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()> + Send),
     ) -> Result<()> {
         self.check(descriptor)?;
         let Some(root) = &descriptor.root else {
@@ -1099,7 +1099,7 @@ impl DataStore {
         count: u64,
         length: u64,
         seen: &'a mut HashSet<PackedRef>,
-        visit: &'a mut dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()>,
+        visit: &'a mut (dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()> + Send),
     ) -> futures_util::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let node = self.node(child, start, count, None).await?;

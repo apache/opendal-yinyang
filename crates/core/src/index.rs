@@ -37,7 +37,7 @@ type Wire = ([u8; 8], u8, Vec<(Vec<u8>, Vec<u8>, Option<RefWire>)>);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index(pub(crate) Option<PackedRef>);
 
-pub(crate) trait MetadataVisitor {
+pub(crate) trait MetadataVisitor: Send {
     fn page(&mut self, reference: &PackedRef);
     fn value(&mut self, reference: Option<&PackedRef>, key: &[u8], bytes: &[u8]);
 }

@@ -368,6 +368,7 @@ impl ObjectFs {
             ));
         }
         let latest = self.observe_state().await?;
+        let after_key = after.map(|revision| revision.to_bytes());
         let rows = latest
             .history
             .scan(
@@ -375,7 +376,7 @@ impl ObjectFs {
                 None,
                 &[],
                 None,
-                after.map(|revision| revision.to_bytes()).as_deref(),
+                after_key.as_deref(),
                 limit as usize + 1,
             )
             .await?;
