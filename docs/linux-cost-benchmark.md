@@ -93,7 +93,7 @@ extensions, two shrink-then-extend rounds, unchanged fsync, and remount plus
 tail reads. Every scenario keeps two latency samples, and complete remote
 bytes are verified outside each measured interval. Required mode fails if
 writable open, preparation, or publication transfers at least half of the file
-through S3, or if allocated mount staging is at least half of the file. UUID
+through S3, or if allocated mount staging is at least half of the file. JSONL
 records retain `useful_bytes` per sample, raw latency samples, GET/PUT request
 and body counts, service RPC counts, staging series, retained storage series,
 and the negative unchanged-fsync observation.

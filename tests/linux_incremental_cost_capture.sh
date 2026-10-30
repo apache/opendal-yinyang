@@ -156,6 +156,24 @@ with open(path, encoding="utf-8") as source:
             raise SystemExit("benchmark record reports a dirty source")
         if record.get("publication") not in {"object", "service"}:
             raise SystemExit(f"unexpected publication: {record.get('publication')!r}")
+        useful_bytes = record.get("useful_bytes")
+        if not isinstance(useful_bytes, int) or useful_bytes < 0:
+            raise SystemExit(f"unexpected useful_bytes: {useful_bytes!r}")
+        if expected_workload == "length-changing":
+            scenarios = {
+                "fuse_length_changing_open_shared_descriptor",
+                "fuse_length_changing_small_append",
+                "fuse_length_changing_boundary_append",
+                "fuse_length_changing_truncate",
+                "fuse_length_changing_zero_extension",
+                "fuse_length_changing_shrink_then_extend",
+                "fuse_length_changing_unchanged_fsync",
+                "fuse_length_changing_restart_tail_read",
+            }
+            if record.get("scenario") in scenarios and record.get("iterations", 0) < 2:
+                raise SystemExit(
+                    f"{record.get('scenario')} did not retain multiple samples"
+                )
         records.append(record)
 
 if not records:
