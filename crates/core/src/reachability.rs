@@ -183,7 +183,7 @@ impl PhysicalInspection {
             .collect()
     }
 
-    fn add_reference(&mut self, kind: PhysicalReferenceKind, reference: &PackedRef) -> Result<()> {
+    fn add_reference(&mut self, kind: PhysicalReferenceKind, reference: &PackedRef) {
         self.references.insert(PhysicalReference {
             kind,
             object: reference.object,
@@ -191,7 +191,6 @@ impl PhysicalInspection {
             length: reference.length,
             digest: reference.digest,
         });
-        Ok(())
     }
 
     fn add_descriptor(&mut self, descriptor: ContentDescriptor) {
@@ -421,7 +420,8 @@ async fn inspect_content_descriptors(
                     ContentReferenceKind::Index => PhysicalReferenceKind::ContentIndex,
                     ContentReferenceKind::Payload => PhysicalReferenceKind::ContentExtent,
                 };
-                inspection.add_reference(kind, reference)
+                inspection.add_reference(kind, reference);
+                Ok(())
             })
             .await;
         if let Err(error) = result {
@@ -454,9 +454,7 @@ pub(crate) async fn inspect_object_state(
     let cache = IndexCache::default();
     let mut observed_snapshots = 0_u64;
     seen_descriptors.insert(state.reference().clone(), state.revision());
-    inspection
-        .add_reference(PhysicalReferenceKind::SnapshotDescriptor, state.reference())
-        .expect("record a valid snapshot reference");
+    inspection.add_reference(PhysicalReferenceKind::SnapshotDescriptor, state.reference());
     observed_snapshots = observed_snapshots.saturating_add(1);
     inspect_object_roots(
         &state,
@@ -491,9 +489,7 @@ pub(crate) async fn inspect_object_state(
         match state.load_retained(revision, &reference).await {
             Ok(retained) => {
                 seen_descriptors.insert(reference.clone(), revision);
-                inspection
-                    .add_reference(PhysicalReferenceKind::SnapshotDescriptor, &reference)
-                    .expect("record a valid snapshot reference");
+                inspection.add_reference(PhysicalReferenceKind::SnapshotDescriptor, &reference);
                 observed_snapshots = observed_snapshots.saturating_add(1);
                 inspect_object_roots(
                     &retained,
@@ -578,15 +574,13 @@ struct ObjectMetadataVisitor<'a> {
 impl MetadataVisitor for ObjectMetadataVisitor<'_> {
     fn page(&mut self, reference: &PackedRef) {
         self.inspection
-            .add_reference(PhysicalReferenceKind::MetadataIndex, reference)
-            .expect("record a valid metadata page reference");
+            .add_reference(PhysicalReferenceKind::MetadataIndex, reference);
     }
 
     fn value(&mut self, reference: Option<&PackedRef>, key: &[u8], bytes: &[u8]) {
         if let Some(reference) = reference {
             self.inspection
-                .add_reference(PhysicalReferenceKind::MetadataValue, reference)
-                .expect("record a valid metadata value reference");
+                .add_reference(PhysicalReferenceKind::MetadataValue, reference);
         }
         let result = match self.table {
             ObjectTable::Nodes => Node::decode(bytes, self.filesystem)
@@ -732,17 +726,15 @@ mod tests {
             (PhysicalReferenceKind::ContentExtent, 32, 64),
             (PhysicalReferenceKind::MetadataIndex, 128, 32),
         ] {
-            inspection
-                .add_reference(
-                    kind,
-                    &PackedRef {
-                        object: [1; 16],
-                        offset,
-                        length,
-                        digest: [2; 32],
-                    },
-                )
-                .unwrap();
+            inspection.add_reference(
+                kind,
+                &PackedRef {
+                    object: [1; 16],
+                    offset,
+                    length,
+                    digest: [2; 32],
+                },
+            );
         }
         let packs = inspection.packs();
         assert_eq!(packs.len(), 1);

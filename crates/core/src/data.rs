@@ -449,7 +449,7 @@ impl DataStore {
 
     async fn read_subtree(
         &self,
-        child: &'a Child,
+        child: &Child,
         start: u64,
         count: u64,
         length: u64,
@@ -1095,7 +1095,7 @@ impl DataStore {
 
     fn inspect_content_subtree<'a>(
         &'a self,
-        child: &Child,
+        child: &'a Child,
         start: u64,
         count: u64,
         length: u64,
