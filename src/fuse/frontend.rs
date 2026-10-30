@@ -322,6 +322,18 @@ impl Inner {
         guard(&self.files).get(&fh.0).cloned()
     }
 
+    /// Remove one kernel handle and release its Mount reference on the FUSE
+    /// dispatch thread. This must complete before the next OPEN can be
+    /// scheduled so a request observed after RELEASE cannot reuse the retired
+    /// clean version. Reclamation remains asynchronous after this detach.
+    fn detach_file(&self, fh: FileHandle) -> Option<(NodeId, bool)> {
+        let removed = guard(&self.files).remove(&fh.0)?;
+        let node = removed.node;
+        let read_only = matches!(&removed.source, OpenSource::ReadOnly(_));
+        drop(removed);
+        Some((node, read_only))
+    }
+
     fn dir_cursor(&self, fh: FileHandle) -> Option<Arc<AsyncMutex<DirCursor>>> {
         guard(&self.dirs).get(&fh.0).cloned()
     }
@@ -334,10 +346,11 @@ impl Inner {
             .map_err(|e| core_errno(&e))
     }
 
-    /// Clear cached attributes before a read-only open can expose a new
-    /// immutable version through the same inode. Without this notification the
-    /// kernel can combine fresh READ bytes with a pre-transition cached length.
-    async fn invalidate_before_read_only_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
+    /// Clear cached attributes before an open can expose a different immutable
+    /// version or staged length through the same inode. Without this
+    /// notification the kernel can combine fresh READ bytes with a
+    /// pre-transition cached length.
+    async fn invalidate_before_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
         let Some(notifier) = guard(&self.notifier).clone() else {
             eprintln!(
                 "yy: fuse open: inode {} invalidation requested before notifier installation",
@@ -560,7 +573,7 @@ impl Inner {
             }
             return match self.mount.open_read_only_node(id).await {
                 Ok(file) => {
-                    if let Err(errno) = self.invalidate_before_read_only_open(ino).await {
+                    if let Err(errno) = self.invalidate_before_open(ino).await {
                         return reply.error(errno);
                     }
                     let fh = self.next_handle();
@@ -578,6 +591,9 @@ impl Inner {
             };
         }
         if let Err(errno) = self.reclaim_clean_state(id).await {
+            return reply.error(errno);
+        }
+        if let Err(errno) = self.invalidate_before_open(ino).await {
             return reply.error(errno);
         }
         match self.mount.open_node(id, writable).await {
@@ -1016,13 +1032,13 @@ impl Inner {
         }
     }
 
-    async fn release(&self, ino: INodeNo, fh: FileHandle, reply: ReplyEmpty) {
-        let Some(removed) = guard(&self.files).remove(&fh.0) else {
-            return reply.ok();
-        };
-        let node = removed.node;
-        let read_only = matches!(&removed.source, OpenSource::ReadOnly(_));
-        drop(removed);
+    async fn complete_release(
+        &self,
+        ino: INodeNo,
+        node: NodeId,
+        read_only: bool,
+        reply: ReplyEmpty,
+    ) {
         // Reclaim only the last clean reference so the next open observes the
         // current remote revision. A busy result means an interrupted read
         // still shares the node; that pinned version stays coherent and is
@@ -1621,8 +1637,10 @@ impl Filesystem for FuseFrontend {
         reply: ReplyEmpty,
     ) {
         let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.release(ino, fh, reply).await });
+        let Some((node, read_only)) = inner.detach_file(fh) else {
+            return reply.ok();
+        };
+        inner.spawn(async move { inner.complete_release(ino, node, read_only, reply).await });
     }
 
     fn fallocate(
