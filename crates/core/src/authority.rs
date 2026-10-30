@@ -17,12 +17,26 @@
 
 //! Shared publication interface; access runtimes do not select physical metadata.
 use crate::object::{ObjectFs, Outcome};
+use crate::reachability::PhysicalInspection;
 use crate::{
     ContentEdit, DataStore, FileVersion, NodeId, PreparedContent, Result, Revision, Snapshot,
     Transaction,
 };
 use futures_util::future::BoxFuture;
+use std::collections::BTreeSet;
 use tokio::io::AsyncRead;
+
+/// Maximum number of retained revisions returned by one authority request.
+pub const RETAINED_REVISIONS_PAGE_MAX: u32 = 256;
+
+/// One strictly ordered page from an authority's retained revision index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionPage {
+    /// Revisions returned by this request.
+    pub revisions: Vec<Revision>,
+    /// Exclusive continuation for the next page.
+    pub next: Option<Revision>,
+}
 
 pub trait Authority: std::fmt::Debug + Send + Sync {
     fn data(&self) -> &DataStore;
@@ -34,13 +48,72 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     ///
     /// The default keeps backends without a revision index explicit rather
     /// than inferring history from content or local staging.
-    fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
+    fn retained_revisions_page(
+        &self,
+        _after: Option<Revision>,
+        _limit: u32,
+    ) -> BoxFuture<'_, Result<RevisionPage>> {
         Box::pin(async {
             Err(crate::Error::unsupported(
                 "list retained revisions",
                 "authority does not expose a revision index",
             ))
         })
+    }
+    /// List every retained revision using bounded authority pages.
+    fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
+        Box::pin(async move {
+            let mut after = None;
+            let mut revisions = Vec::new();
+            let mut seen = BTreeSet::new();
+            loop {
+                let page = self
+                    .retained_revisions_page(after, RETAINED_REVISIONS_PAGE_MAX)
+                    .await?;
+                if page.revisions.is_empty() {
+                    if page.next.is_some() {
+                        return Err(crate::Error::new(
+                            crate::ErrorKind::Corrupt,
+                            "list retained revisions",
+                            "authority returned an empty non-terminal page",
+                        ));
+                    }
+                    break;
+                }
+                for revision in page.revisions {
+                    if after.is_some_and(|cursor| revision <= cursor) || !seen.insert(revision) {
+                        return Err(crate::Error::new(
+                            crate::ErrorKind::Corrupt,
+                            "list retained revisions",
+                            "authority page is not strictly ordered",
+                        ));
+                    }
+                    revisions.push(revision);
+                }
+                let last = revisions.last().copied();
+                match page.next {
+                    Some(next)
+                        if after.is_none_or(|cursor| next > cursor) && last == Some(next) =>
+                    {
+                        after = Some(next);
+                    }
+                    Some(_) => {
+                        return Err(crate::Error::new(
+                            crate::ErrorKind::Corrupt,
+                            "list retained revisions",
+                            "authority continuation does not advance",
+                        ));
+                    }
+                    None => break,
+                }
+            }
+            Ok(revisions)
+        })
+    }
+    /// Traverse authenticated physical references reachable from this
+    /// authority's observed metadata roots without reading leaf payloads.
+    fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
+        Box::pin(crate::reachability::inspect_authority(self, snapshot))
     }
     fn commit_batch<'a>(
         &'a self,
@@ -139,8 +212,26 @@ impl Authority for ObjectFs {
     fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
         Box::pin(self.observe_revision(r))
     }
-    fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
-        Box::pin(self.retained_revisions())
+    fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<RevisionPage>> {
+        Box::pin(self.retained_revisions_page(after, limit))
+    }
+    fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
+        Box::pin(async move {
+            match self.observe_state().await {
+                Ok(state) => {
+                    crate::reachability::inspect_object_state(snapshot.revision(), state).await
+                }
+                Err(error) => {
+                    let mut inspection = PhysicalInspection::default();
+                    inspection.issue(&error, "object-history");
+                    inspection
+                }
+            }
+        })
     }
     fn commit_batch<'a>(
         &'a self,
@@ -164,6 +255,13 @@ impl Authority for crate::service::MetadataService {
     }
     fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
         Box::pin(self.observe_revision(r))
+    }
+    fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<RevisionPage>> {
+        Box::pin(self.retained_revisions_page(after, limit))
     }
     fn commit_batch<'a>(
         &'a self,
@@ -209,6 +307,13 @@ impl Authority for crate::service::ServiceClient {
     }
     fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
         Box::pin(self.observe_revision(r))
+    }
+    fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<RevisionPage>> {
+        Box::pin(self.retained_revisions_page(after, limit))
     }
     fn commit_batch<'a>(
         &'a self,
