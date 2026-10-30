@@ -23,11 +23,12 @@ usage() {
   cat <<'EOF'
 Usage: tests/linux_incremental_cost_capture.sh \
   --expected-source SHA \
+  [--workload incremental|length-changing] \
   --expect baseline|required \
   --label LABEL \
   --output-dir DIR
 
-Run the incremental Linux cost workload from the current clean checkout and
+Run a writable incremental Linux cost workload from the current clean checkout and
 preserve its exact release yy binary, hashes, source identity and raw collector
 records under DIR. Invoke this script through the shared Linux validation runner
 so the copy is made while the build lock is still held.
@@ -40,6 +41,7 @@ fail() {
 }
 
 expected_source=
+workload=incremental
 expectation=
 label=
 output_dir=
@@ -51,6 +53,14 @@ while (($#)); do
         exit 2
       }
       expected_source=$2
+      shift 2
+      ;;
+    --workload)
+      (($# >= 2)) || {
+        usage >&2
+        exit 2
+      }
+      workload=$2
       shift 2
       ;;
     --expect)
@@ -96,6 +106,8 @@ done
 [[ $expected_source =~ ^[0-9a-f]{40}$ ]] ||
   fail "expected source must be a full lowercase SHA"
 [[ $label =~ ^[a-z0-9-]+$ ]] || fail "label must be lowercase letters, digits and hyphens"
+[[ $workload == incremental || $workload == length-changing ]] ||
+  fail "workload must be incremental or length-changing"
 [[ $expectation == baseline || $expectation == required ]] ||
   fail "expectation must be baseline or required"
 
@@ -116,26 +128,27 @@ for path in "$jsonl" "$summary" "$binary" "$manifest"; do
   [[ ! -e $path ]] || fail "refusing to overwrite evidence: $path"
 done
 
-printf 'source=%s expectation=%s label=%s\n' "$source_sha" "$expectation" "$label"
+printf 'source=%s workload=%s expectation=%s label=%s\n' \
+  "$source_sha" "$workload" "$expectation" "$label"
 cargo x bench-linux-cost \
-  --workload incremental \
+  --workload "$workload" \
   --incremental-expect "$expectation" \
   --publication all \
   --output "$jsonl"
 
 readarray -t identity < <(
-  python3 - "$jsonl" "$source_sha" <<'PY'
+python3 - "$jsonl" "$source_sha" "$workload" <<'PY'
 import json
 import sys
 
-path, expected_source = sys.argv[1:]
+path, expected_source, expected_workload = sys.argv[1:]
 records = []
 with open(path, encoding="utf-8") as source:
     for line in source:
         record = json.loads(line)
-        if record.get("schema") != "yinyang.linux-cost.v5":
+        if record.get("schema") != "yinyang.linux-cost.v6":
             raise SystemExit(f"unexpected schema: {record.get('schema')!r}")
-        if record.get("workload") != "incremental":
+        if record.get("workload") != expected_workload:
             raise SystemExit(f"unexpected workload: {record.get('workload')!r}")
         if record.get("source_sha") != expected_source:
             raise SystemExit(f"unexpected source: {record.get('source_sha')!r}")
@@ -143,10 +156,43 @@ with open(path, encoding="utf-8") as source:
             raise SystemExit("benchmark record reports a dirty source")
         if record.get("publication") not in {"object", "service"}:
             raise SystemExit(f"unexpected publication: {record.get('publication')!r}")
+        useful_bytes = record.get("useful_bytes")
+        if not isinstance(useful_bytes, int) or useful_bytes < 0:
+            raise SystemExit(f"unexpected useful_bytes: {useful_bytes!r}")
+        if expected_workload == "length-changing":
+            scenarios = {
+                "fuse_length_changing_small_append",
+                "fuse_length_changing_boundary_append",
+                "fuse_length_changing_truncate",
+                "fuse_length_changing_zero_extension",
+                "fuse_length_changing_shrink_then_extend",
+                "fuse_length_changing_unchanged_fsync",
+                "fuse_length_changing_restart_tail_read",
+            }
+            if record.get("scenario") in scenarios and record.get("iterations", 0) < 2:
+                raise SystemExit(
+                    f"{record.get('scenario')} did not retain multiple samples"
+                )
         records.append(record)
 
 if not records:
     raise SystemExit("benchmark wrote no records")
+if expected_workload == "length-changing":
+    required = {
+        "fuse_length_changing_open_shared_reader",
+        "fuse_length_changing_open_writer",
+        "fuse_length_changing_small_append",
+        "fuse_length_changing_boundary_append",
+        "fuse_length_changing_truncate",
+        "fuse_length_changing_zero_extension",
+        "fuse_length_changing_shrink_then_extend",
+        "fuse_length_changing_unchanged_fsync",
+        "fuse_length_changing_restart_tail_read",
+    }
+    seen = {record.get("scenario") for record in records}
+    missing = sorted(required - seen)
+    if missing:
+        raise SystemExit(f"length-changing workload is missing records: {missing}")
 binary_paths = {record.get("binary_path") for record in records}
 binary_hashes = {record.get("binary_blake3") for record in records}
 if len(binary_paths) != 1 or len(binary_hashes) != 1:
@@ -176,6 +222,7 @@ measured_binary=$(sha256sum "$benchmark_binary" | awk '{print $1}')
   printf 'schema=yinyang-linux-incremental-binary.v1\n'
   printf 'label=%s\n' "$label"
   printf 'source_sha=%s\n' "$source_sha"
+  printf 'workload=%s\n' "$workload"
   printf 'expectation=%s\n' "$expectation"
   printf 'measured_path=%s\n' "$benchmark_binary"
   printf 'preserved_path=%s\n' "$binary"

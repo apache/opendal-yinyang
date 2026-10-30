@@ -75,6 +75,17 @@ cargo x test-linux-fuse --read-only-range
   including on an older active reader. Reads at exact EOF, beyond EOF,
   zero-length reads, and a read crossing EOF must return the correct empty or
   partial result. A remount returns the exact final bytes.
+- Length-changing descriptor contract: a 32 MiB file is updated through one
+  shared read-only descriptor and one append descriptor. Small appends, appends
+  crossing 64 KiB verification-unit boundaries (which also change the content
+  tree shape), descriptor shrink, zero extension, and shrink-then-extend are
+  each published and checked through the independent authority. Both active
+  descriptors and path stat observe the same staged length at every step,
+  removed bytes read as zero after extension, allocated staging stays below
+  a small bound, and a remount returns the exact final bytes and zeros.
+- Length-changing dirty recovery: an un-fsynced zero extension plus tail write
+  survives daemon SIGKILL and remount for both authorities, and a new process
+  publishes the exact staged bytes to the independent authority.
 - Append flag toggling: one descriptor opened with `O_APPEND`, then cleared and
   restored via `fcntl(F_SETFL)`, must overwrite at an explicit offset while
   cleared and append only while restored; both remote results are verified.
@@ -136,6 +147,12 @@ cargo x test-linux-fuse --read-only-range
   `frozen: true`. Killing the mount daemon then interrupts that pending
   publication, the authority is untouched, and a reopened mount replays the
   frozen request and publishes the staged bytes.
+- Frozen length-changing identity: the service gate now reports the exact
+  locally saved `CommitId` when it blocks. After daemon interruption the same
+  identity must remain in staging, and a reopened mount converges by the
+  original frozen request regardless of whether gate release already committed
+  it to the authority. The suite accepts either committed or uncommitted remote
+  state after release and never asserts a partial result.
 - Delayed completion with client interruption: a separate Python client opens
   and writes through `stdin`/`stdout` barriers, the gate blocks the frozen
   commit connection, and the client is SIGKILLed. After gate release the

@@ -75,6 +75,32 @@ same-length overwrite plus fsync reads or writes more than half of the file
 through S3. Both proxies stay outside the measured process, so service RPC
 aggregation cannot hide storage GET or PUT work.
 
+Run the matched length-changing workload for both authorities:
+
+```shell
+cargo x bench-linux-cost \
+  --workload length-changing \
+  --incremental-expect baseline \
+  --output target/linux-cost/length-changing-baseline.jsonl
+```
+
+Use the same command with `--incremental-expect required` on an implementation
+that must avoid complete-source fallback for length-changing writes. The
+workload uses one 32 MiB file, a shared read-only descriptor and an active
+append descriptor, two 4 KiB appends, two 68 KiB appends that each cross an
+existing 64 KiB verification-unit boundary, two 4 KiB truncates, two 4 KiB zero
+extensions, two shrink-then-extend rounds, unchanged fsync, and remount plus
+tail reads. Operation scenarios keep two latency samples; the read-only and
+writable descriptor opens are separate one-sample scenarios and are never
+merged into one p50/p95 distribution. Two samples are descriptive only; the
+summary p50/p95 is not a stable performance claim. Complete remote bytes are
+verified outside each measured interval. Required mode fails if
+writable open, preparation, or publication transfers at least half of the file
+through S3, or if allocated mount staging is at least half of the file. JSONL
+records retain `useful_bytes` per sample, raw latency samples, GET/PUT request
+and body counts, service RPC counts, staging series, retained storage series,
+and the negative unchanged-fsync observation.
+
 The `early` profile runs the small object-authority Sync, FUSE, concurrent-writer,
 and one-shot transfer scenarios. The `full` profile adds the service authority,
 the medium scale, and the explicit service-authority one-shot boundary. The
@@ -144,6 +170,16 @@ fallback assertion.
 
 The accepted matched result and raw 16-row evidence are in
 [`linux-incremental-write-results.md`](linux-incremental-write-results.md).
+
+The `length-changing` workload records schema `yinyang.linux-cost.v6`, which
+adds `useful_bytes` to every row; it is the same collector shape for the
+matched baseline and optimized runs. The complete-source fallback in the
+baseline is expected to read and publish most of the file for each length
+change, while `required` mode rejects that behavior.
+
+The accepted matched result, binary identities, per-operation traffic, staging
+tradeoff, and negative observations are in
+[`linux-length-changing-write-results.md`](linux-length-changing-write-results.md).
 
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
