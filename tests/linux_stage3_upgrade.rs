@@ -773,19 +773,25 @@ fn installed_stage3_upgrade_preserves_sparse_segments_and_service_wal() {
         expected["service"]["path"].as_str().expect("service path"),
         false,
     );
+    let service_bytes = read_handle(
+        &target,
+        &storage,
+        &service.root,
+        &service.config,
+        &service_handle,
+    )
+    .stdout;
     assert_eq!(
-        read_handle(
-            &target,
-            &storage,
-            &service.root,
-            &service.config,
-            &service_handle,
-        )
-        .stdout
-        .len() as u64,
+        service_bytes.len() as u64,
         expected["service"]["length"]
             .as_u64()
             .expect("service fixture length")
+    );
+    assert_eq!(
+        sha256(&service_bytes),
+        expected["service"]["sha256"]
+            .as_str()
+            .expect("service fixture SHA-256")
     );
     run_file_ok(
         &target,
