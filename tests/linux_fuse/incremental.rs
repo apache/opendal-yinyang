@@ -235,7 +235,7 @@ fn length_changing_shared_descriptors_and_remount(fixture: &Fixture) {
     let path = mounted.mountpoint().join("length-changing.bin");
 
     let shared_reader = File::open(&path).expect("open shared read-only descriptor");
-    let mut writer = OpenOptions::new()
+    let writer = OpenOptions::new()
         .read(true)
         .write(true)
         .append(true)
@@ -411,7 +411,7 @@ fn length_changing_dirty_recovery(fixture: &Fixture) {
     let mut mounted = fixture.mount(&config, &mountpoint);
     let path = mounted.mountpoint().join("length-recovery.bin");
     let reader = File::open(&path).expect("open recovery reader");
-    let mut writer = OpenOptions::new()
+    let writer = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
