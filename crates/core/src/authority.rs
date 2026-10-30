@@ -138,8 +138,9 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     /// Prepare a same-length update from one exact published file version.
     ///
     /// The base is the metadata-authenticated version selected by the caller,
-    /// not a newly observed latest revision. Length-changing writes must use
-    /// `prepare` instead.
+    /// not a newly observed latest revision. Length-changing writes use
+    /// `prepare_update` when their generated work stays within the bounded
+    /// update budget.
     fn prepare_overwrite<'a>(
         &'a self,
         base: &'a FileVersion,
@@ -148,6 +149,29 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
         Box::pin(async move {
             let base = base.prepared_content()?;
             let content = self.data().overwrite_prepared_ranges(&base, edits).await?;
+            self.register(&content).await?;
+            Ok(content)
+        })
+    }
+    /// Prepare a length-changing update from one exact published file version.
+    ///
+    /// The output retains base bytes below `preserved_prefix`, zero-fills to
+    /// `final_length`, then overlays the bounded edits. Base bytes beyond the
+    /// preserved prefix are never reused. Length changes that exceed caller
+    /// resource bounds must use the explicit streaming `prepare` fallback.
+    fn prepare_update<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &'a [ContentEdit<'a>],
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(async move {
+            let base = base.prepared_content()?;
+            let content = self
+                .data()
+                .update_prepared(&base, preserved_prefix, final_length, edits)
+                .await?;
             self.register(&content).await?;
             Ok(content)
         })
@@ -255,6 +279,15 @@ impl Authority for crate::service::MetadataService {
     ) -> BoxFuture<'a, Result<PreparedContent>> {
         Box::pin(self.prepare_overwrite(base, edits))
     }
+    fn prepare_update<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &'a [ContentEdit<'a>],
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(self.prepare_update(base, preserved_prefix, final_length, edits))
+    }
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(self.restore_transaction(bytes))
     }
@@ -290,6 +323,15 @@ impl Authority for crate::service::ServiceClient {
         edits: &'a [ContentEdit<'a>],
     ) -> BoxFuture<'a, Result<PreparedContent>> {
         Box::pin(self.prepare_overwrite(base, edits))
+    }
+    fn prepare_update<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &'a [ContentEdit<'a>],
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(self.prepare_update(base, preserved_prefix, final_length, edits))
     }
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(self.restore_transaction(bytes))

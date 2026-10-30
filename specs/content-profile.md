@@ -155,24 +155,50 @@ all edits in one new immutable pack while reusing unaffected subtrees.
 `DataStore::overwrite_prepared` remains the single-edit form of the same trusted
 operation.
 
+`Authority::prepare_update` extends the trusted base operation to a final
+length. Its inputs are the exact published base, `preserved_prefix`,
+`final_length`, and bounded non-overlapping `ContentEdit` values.
+`preserved_prefix` must not exceed either the base or final logical length. The
+output starts with `base[0..preserved_prefix]`, zero-fills
+`[preserved_prefix..final_length)`, and then overlays the edits. An edit must
+lie inside the final length and has the same byte length as its range. Base
+bytes at or beyond the preserved prefix never reappear, including when a
+truncated file is extended later. Edits may explicitly provide bytes in the
+zero-filled suffix. The resulting canonical identity is identical to preparing
+the complete logical stream with the same bytes.
+
+The implementation may reuse an old subtree only when its start position, leaf
+count, and final leaf lengths still match the new tree. A partial boundary
+leaf, changed final length, or intersecting edit is rebuilt from its
+authenticated old unit and new bytes. Unaffected subtrees retain their existing
+references and readiness. Zero-filled suffix units are materialized as actual
+immutable data, so canonical proofs remain verifiable without a hole
+representation.
+
+`MAX_UPDATE_EDITS` is 4096 non-empty edits. `MAX_UPDATE_UNITS` is 4096
+verification units. `DataStore::update_prepared` rejects a larger update before
+calling the storage backend, and `update_is_bounded` exposes the same
+conservative rule for callers. The unit count covers new zero units, partial
+boundary units, and all units touched by edits; generated branch nodes are
+bounded by the same changed-unit budget. A larger zero extension or edit set
+uses the explicit complete-source `prepare` fallback rather than converting an
+update failure into a different request.
+
 The authenticated loopback service does not turn a returned descriptor into
 local evidence by importing the complete file. Its fallible preparation request
-names the exact retained revision, NodeId, and bounded edits. The service
-reopens that published version from its own metadata authority, applies the
-edits through its data binding, verifies the new pack, records the resulting
-descriptor as durably ready, and only then returns it. An unknown or unretained
-revision, missing or non-file NodeId, and wrong service binding are rejected
-before payload reads. A retained older revision remains a valid base; its
-original file predicates determine whether later publication succeeds. The
-authenticated client may use the returned descriptor as service-issued
-readiness, but cannot reinterpret cached read bytes or an arbitrary serialized
-descriptor as preparation evidence.
-
-The delta operation is same-length only. Append, truncate, hole extension, and
-any replacement whose final logical length differs use complete-source
-preparation. Choosing the exact selected base does not rebase a frozen
-transaction and does not weaken its original predicates: publication still
-returns Conflict when the selected file state no longer matches.
+names the exact retained revision, NodeId, preserved prefix, final length, and
+bounded edits. The service reopens that published version from its own metadata
+authority, applies the update through its data binding, verifies the new pack,
+records the resulting descriptor as durably ready, and only then returns it. An
+unknown or unretained revision, missing or non-file NodeId, and wrong service
+binding are rejected before payload reads. A retained older revision remains a
+valid base; its original file predicates determine whether later publication
+succeeds. The authenticated client may use the returned descriptor as
+service-issued readiness, but cannot reinterpret cached read bytes or an
+arbitrary serialized descriptor as preparation evidence. Choosing the exact
+selected base does not rebase a frozen transaction and does not weaken its
+original predicates: publication still returns Conflict when the selected file
+state no longer matches.
 
 The storage backend must provide durable immutable writes and subsequent read
 visibility. External mutation/deletion is outside the contract. This in-process

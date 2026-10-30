@@ -42,6 +42,7 @@ enum Command {
     Register(Vec<u8>),
     Commit(Vec<Vec<u8>>),
     PrepareOverwrite([u8; 24], [u8; 16], Vec<(u64, u64, Vec<u8>)>),
+    PrepareUpdate([u8; 24], [u8; 16], u64, u64, Vec<(u64, u64, Vec<u8>)>),
 }
 #[derive(BorshSerialize, BorshDeserialize)]
 enum Response {
@@ -126,6 +127,10 @@ mod error_tests {
         assert_eq!(
             borsh::to_vec(&Command::PrepareOverwrite([0; 24], [0; 16], vec![])).unwrap()[0],
             5
+        );
+        assert_eq!(
+            borsh::to_vec(&Command::PrepareUpdate([0; 24], [0; 16], 0, 0, vec![])).unwrap()[0],
+            6
         );
         assert_eq!(
             borsh::to_vec(&Response::Error(0, String::new())).unwrap()[0],
@@ -283,6 +288,37 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 .prepare_overwrite_version(
                     Revision::from_bytes(revision),
                     NodeId::from_bytes(node),
+                    &changes,
+                )
+                .await?;
+            Response::Prepared(content.descriptor().to_bytes())
+        }
+        Command::PrepareUpdate(revision, node, preserved_prefix, final_length, changes) => {
+            if changes.len() > 4096 {
+                return Err(protocol());
+            }
+            if preserved_prefix > final_length {
+                return Err(Error::invalid(
+                    "metadata RPC",
+                    "preserved prefix exceeds final length",
+                ));
+            }
+            let changes = changes
+                .iter()
+                .map(|(start, end, bytes)| ContentEdit::new(*start..*end, bytes))
+                .collect::<Result<Vec<_>>>()?;
+            if !crate::data::update_is_bounded(preserved_prefix, final_length, &changes) {
+                return Err(Error::unsupported(
+                    "metadata RPC",
+                    "update exceeds bounded work budget",
+                ));
+            }
+            let content = service
+                .prepare_update_version(
+                    Revision::from_bytes(revision),
+                    NodeId::from_bytes(node),
+                    preserved_prefix,
+                    final_length,
                     &changes,
                 )
                 .await?;
@@ -462,6 +498,49 @@ impl ServiceClient {
         let descriptor = ContentDescriptor::from_bytes(&bytes)?;
         if descriptor.filesystem() != self.filesystem
             || descriptor.content_id().length() != base.descriptor().content_id().length()
+        {
+            return Err(protocol());
+        }
+        self.data.published(descriptor)
+    }
+    pub async fn prepare_update(
+        &self,
+        base: &FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        if base.descriptor().filesystem() != self.filesystem {
+            return Err(Error::invalid(
+                "prepare service update",
+                "base belongs to another filesystem",
+            ));
+        }
+        let changes = edits
+            .iter()
+            .map(|edit| {
+                let range = edit.range();
+                (range.start, range.end, edit.bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let response = rpc(
+            self.addr,
+            &self.token,
+            Command::PrepareUpdate(
+                base.revision().to_bytes(),
+                *base.node().id().as_bytes(),
+                preserved_prefix,
+                final_length,
+                changes,
+            ),
+        )
+        .await?;
+        let Response::Prepared(bytes) = response else {
+            return Err(protocol());
+        };
+        let descriptor = ContentDescriptor::from_bytes(&bytes)?;
+        if descriptor.filesystem() != self.filesystem
+            || descriptor.content_id().length() != final_length
         {
             return Err(protocol());
         }

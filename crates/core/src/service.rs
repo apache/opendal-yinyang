@@ -536,6 +536,59 @@ impl MetadataService {
         self.remember(&content).await?;
         Ok(content)
     }
+    /// Prepare a length-changing update from a published file version selected
+    /// by the caller. Reauthentication prevents a caller-supplied base
+    /// descriptor from becoming preparation authority.
+    pub async fn prepare_update(
+        &self,
+        base: &FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let snapshot = self.observe_revision(base.revision()).await?;
+        let selected = snapshot.open_file(base.node().id()).await?;
+        if selected.descriptor() != base.descriptor() {
+            return Err(Error::invalid(
+                "prepare metadata update",
+                "selected base is not in the referenced revision",
+            ));
+        }
+        self.prepare_update_from_version(&selected, preserved_prefix, final_length, edits)
+            .await
+    }
+    pub(crate) async fn prepare_update_version(
+        &self,
+        revision: Revision,
+        node: NodeId,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let snapshot = self.observe_revision(revision).await?;
+        let base = snapshot.open_file(node).await?;
+        self.prepare_update_from_version(&base, preserved_prefix, final_length, edits)
+            .await
+    }
+    async fn prepare_update_from_version(
+        &self,
+        base: &FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let content = self
+            .data
+            .update_prepared(
+                &base.prepared_content()?,
+                preserved_prefix,
+                final_length,
+                edits,
+            )
+            .await?;
+        self.remember(&content).await?;
+        Ok(content)
+    }
     pub(crate) async fn remember(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?.to_bytes();
         let db = connect(&self.path, false).await?;
@@ -811,6 +864,21 @@ mod admission_tests {
         let edit = ContentEdit::new(0..1, b"x").unwrap();
         let error = service
             .prepare_overwrite_version(Revision::from_bytes([0; 24]), NodeId::generate(), &[edit])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_update_revision_is_rejected_before_payload_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let error = service
+            .prepare_update_version(Revision::from_bytes([0; 24]), NodeId::generate(), 0, 1, &[])
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
