@@ -222,10 +222,10 @@ pub fn update_work_units(
         return None;
     }
     let mut units = leaves(final_length).saturating_sub(leaves(preserved_prefix));
-    if preserved_prefix != 0 && preserved_prefix % BLOCK_BYTES as u64 != 0 {
+    if preserved_prefix != 0 && !preserved_prefix.is_multiple_of(BLOCK_BYTES as u64) {
         units = units.saturating_add(1);
     }
-    if final_length != 0 && final_length % BLOCK_BYTES as u64 != 0 {
+    if final_length != 0 && !final_length.is_multiple_of(BLOCK_BYTES as u64) {
         units = units.saturating_add(1);
     }
     let mut nonempty = edits
@@ -2036,10 +2036,11 @@ mod tests {
                 .kind(),
             crate::ErrorKind::Unsupported
         );
-        let state = backend.state.lock().unwrap();
-        assert_eq!(state.data_reads, 0);
-        assert_eq!(state.written_bytes, 0);
-        drop(state);
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.data_reads, 0);
+            assert_eq!(state.written_bytes, 0);
+        }
 
         let impostor = DataStore::new(backend.operator(), filesystem).unwrap();
         assert_eq!(

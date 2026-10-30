@@ -376,10 +376,11 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
             .kind(),
         ErrorKind::Unsupported
     );
-    let state = backend.state.lock().unwrap();
-    assert_eq!(state.data_reads, 0);
-    assert_eq!(state.written_bytes, 0);
-    drop(state);
+    {
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.data_reads, 0);
+        assert_eq!(state.written_bytes, 0);
+    }
 
     let mut later = Planner::new(
         &client.observe_latest().await.unwrap(),
