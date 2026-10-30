@@ -86,14 +86,20 @@ YINYANG_QUALIFICATION_REGION="us-east-2" \
 YINYANG_STAGE3_TARGET_YY="$prefix/current/bin/yy" \
 YY_UPGRADE_RELEASE="<installed-release>" \
 YINYANG_STAGE3_REAL_S3_OUTPUT="/var/tmp/stage3-real-s3.json" \
-python3 tests/linux_stage3_real_s3.py
+experiments/linux-devbox/run-validation-mbx.sh \
+  stage3-real-s3 \
+  env -u YINYANG_S3_ENDPOINT python3 tests/linux_stage3_real_s3.py
 ```
 
 The helper removes inherited `YINYANG_*` and AWS endpoint overrides, uses the
 `amazon-s3` storage profile without an endpoint override, keeps a unique
 `stage3-real-s3/` prefix, and deletes only that prefix with the scoped AWS CLI.
 It does not test the Silo fault gate or repeat the sustained operating-envelope
-matrix.
+matrix. The outer runner establishes the isolated Silo environment; the inner
+`env -u YINYANG_S3_ENDPOINT` removes only that inherited endpoint before the
+real Amazon S3 child starts. The target provenance is read back from the
+installed release's `BUILD-MANIFEST`; the evidence records archive source,
+release and `yy` SHA-256 separately from the script checkout source.
 
 The explicit real-Amazon-S3 Direct record is
 [`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md). It qualifies only the

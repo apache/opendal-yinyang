@@ -126,6 +126,7 @@ class Trial:
         self.source = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip()
+        self.archive_manifest = self.read_archive_manifest()
         self.work = Path(
             tempfile.mkdtemp(prefix="yinyang-stage3-real-s3-", dir="/var/tmp")
         )
@@ -153,11 +154,17 @@ class Trial:
             "schema": SCHEMA,
             "status": "running",
             "started_at": utc_now(),
-            "source": self.source,
+            "source_checkout": self.source,
             "target": {
                 "binary": str(self.yy),
                 "binary_sha256": binary_sha256(self.yy),
-                "release": self.release,
+                "release": self.archive_manifest["release"],
+                "archive_source_commit": self.archive_manifest["source_commit"],
+                "archive_yy_sha256": self.archive_manifest["yy_sha256"],
+                "provenance": "installed-archive-build-manifest",
+                "source_matches_checkout": (
+                    self.archive_manifest["source_commit"] == self.source
+                ),
             },
             "backend": {
                 "profile": "amazon-s3",
@@ -172,6 +179,44 @@ class Trial:
                 "kernel": platform.release(),
             },
         }
+
+    def read_archive_manifest(self) -> dict[str, str]:
+        release_dir = self.yy.resolve().parent.parent
+        manifest_path = release_dir / "BUILD-MANIFEST"
+        if not manifest_path.is_file():
+            raise EnvelopeError(
+                "YINYANG_STAGE3_TARGET_YY must be inside an installed archive "
+                "release with BUILD-MANIFEST"
+            )
+        fields = {}
+        for line in manifest_path.read_text().splitlines():
+            name, separator, value = line.partition("=")
+            if separator:
+                fields[name] = value
+        for name in (
+            "schema",
+            "version",
+            "release",
+            "source_commit",
+            "target",
+            "yy_sha256",
+        ):
+            if not fields.get(name):
+                raise EnvelopeError(f"BUILD-MANIFEST is missing {name}")
+        if fields["schema"] != "yinyang-linux-release-artifact.v1":
+            raise EnvelopeError(
+                f"unexpected BUILD-MANIFEST schema: {fields['schema']}"
+            )
+        actual_sha256 = binary_sha256(self.yy)
+        if fields["yy_sha256"] != actual_sha256:
+            raise EnvelopeError(
+                "installed archive binary SHA-256 differs from BUILD-MANIFEST"
+            )
+        if self.release and self.release != fields["release"]:
+            raise EnvelopeError(
+                "YY_UPGRADE_RELEASE differs from the installed BUILD-MANIFEST release"
+            )
+        return fields
 
     def redact(self, text: str) -> str:
         output = text
@@ -544,8 +589,16 @@ class Trial:
         self.publish_report()
         return self.report
 
-    def close(self) -> None:
+    def close(self, success: bool) -> None:
         self.mount.force_unmount()
+        if not success:
+            print(
+                "stage-3 real-S3 failure evidence retained: "
+                f"work={self.work} remote_prefix=s3://{self.bucket}/{self.root}/",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
         try:
             if self.aws_cli and shutil.which(self.aws_cli):
                 self.cleanup_remote()
@@ -557,9 +610,11 @@ class Trial:
 def main() -> int:
     credentials = credentials_from_stdin()
     trial = Trial(credentials)
+    success = False
     try:
         report = trial.execute()
         print(json.dumps(report, sort_keys=True), flush=True)
+        success = True
         return 0
     except Exception as error:
         trial.report.update(
@@ -568,6 +623,10 @@ def main() -> int:
                 "finished_at": utc_now(),
                 "elapsed_seconds": round(time.monotonic() - trial.started, 3),
                 "error": trial.redact(str(error)),
+                "retained": {
+                    "work": str(trial.work),
+                    "remote_prefix": f"s3://{trial.bucket}/{trial.root}/",
+                },
             }
         )
         try:
@@ -577,7 +636,7 @@ def main() -> int:
         print(trial.redact(str(error)), file=sys.stderr, flush=True)
         return 1
     finally:
-        trial.close()
+        trial.close(success)
 
 
 if __name__ == "__main__":
