@@ -17,7 +17,7 @@
 
 //! Canonical, range-verifiable content and process-local preparation evidence.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -703,6 +703,83 @@ impl DataStore {
         Ok(bytes)
     }
 
+    /// Authenticate the content tree without reading leaf payload bytes.
+    ///
+    /// Branch and leaf-index nodes are downloaded with their declared bound and
+    /// checksum. Leaf payload references are reported as coverage evidence, not
+    /// as proof that their bytes were read.
+    pub(crate) async fn inspect_content_references(
+        &self,
+        descriptor: &ContentDescriptor,
+        seen: &mut HashSet<PackedRef>,
+        visit: &mut dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()>,
+    ) -> Result<()> {
+        self.check(descriptor)?;
+        let Some(root) = &descriptor.root else {
+            return Ok(());
+        };
+        self.inspect_content_subtree(
+            root,
+            0,
+            leaves(descriptor.length),
+            descriptor.length,
+            seen,
+            visit,
+        )
+        .await
+    }
+
+    fn inspect_content_subtree<'a>(
+        &'a self,
+        child: &Child,
+        start: u64,
+        count: u64,
+        length: u64,
+        seen: &'a mut HashSet<PackedRef>,
+        visit: &'a mut dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()>,
+    ) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let node = self.node(child, start, count, None).await?;
+            visit(ContentReferenceKind::Index, &child.reference)?;
+            match node {
+                HashNode::Leaf(reference) => {
+                    let offset = start
+                        .checked_mul(BLOCK_BYTES as u64)
+                        .ok_or_else(|| corrupt("content position overflows"))?;
+                    let expected = length
+                        .checked_sub(offset)
+                        .ok_or_else(|| corrupt("content leaf starts beyond its length"))?
+                        .min(BLOCK_BYTES as u64);
+                    if u64::from(reference.length) != expected {
+                        return Err(corrupt(
+                            "leaf extent length disagrees with its logical unit",
+                        ));
+                    }
+                    visit(ContentReferenceKind::Payload, &reference)
+                }
+                HashNode::Branch(left, right) => {
+                    if !seen.insert(child.reference.clone()) {
+                        return Ok(());
+                    }
+                    let left_count = split(count);
+                    self.inspect_content_subtree(&left, start, left_count, length, seen, visit)
+                        .await?;
+                    self.inspect_content_subtree(
+                        &right,
+                        start
+                            .checked_add(left_count)
+                            .ok_or_else(|| corrupt("content position overflows"))?,
+                        count - left_count,
+                        length,
+                        seen,
+                        visit,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+
     fn key(&self, object: [u8; 16]) -> String {
         format!(
             ".yinyang/v2/{}/packs/{}",
@@ -712,7 +789,13 @@ impl DataStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContentReferenceKind {
+    Index,
+    Payload,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PackedRef {
     pub(crate) object: [u8; 16],
     pub(crate) offset: u64,
@@ -1127,6 +1210,39 @@ mod tests {
             "4a9449de9b3ed735f25145e7ec1dbf209b8b698092e29a7f476215dcd1c8ced3"
         );
         assert!(ContentEdit::new(0..2, b"x").is_err());
+    }
+
+    #[tokio::test]
+    async fn reachability_rejects_a_leaf_extent_with_the_wrong_unit_length() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let root = store
+            .put_metadata(
+                &HashNode::Leaf(PackedRef {
+                    object: [9; 16],
+                    offset: 0,
+                    length: 2,
+                    digest: [3; 32],
+                })
+                .bytes()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let descriptor = ContentDescriptor {
+            filesystem: store.filesystem,
+            length: 1,
+            root: Some(Child {
+                hash: [7; 32],
+                reference: root,
+            }),
+        };
+        let error = store
+            .inspect_content_references(&descriptor, &mut HashSet::new(), &mut |_, _| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Corrupt);
+        assert!(error.to_string().contains("length"));
     }
 
     #[tokio::test]

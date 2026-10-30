@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
 use crate::compatibility::{OBJECT_HEAD_MAGIC, OBJECT_SNAPSHOT_MAGIC, SERVICE_BINDING_MAGIC};
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::index::{Index, IndexCache};
@@ -40,7 +41,6 @@ pub use crate::snapshot::{
 };
 use crate::snapshot::{RecordReader, RevisionWire, Rows, Table};
 use futures_util::future::BoxFuture;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 type SnapshotWire = (
@@ -51,13 +51,13 @@ type SnapshotWire = (
     [Option<RefWire>; 5],
 );
 #[derive(Clone, Debug)]
-struct ObjectState {
-    pub(crate) data: DataStore,
-    pub(crate) filesystem: NodeId,
-    pub(crate) root: NodeId,
-    pub(crate) revision: Revision,
-    pub(crate) nodes: Index,
-    pub(crate) entries: Index,
+pub(crate) struct ObjectState {
+    data: DataStore,
+    filesystem: NodeId,
+    root: NodeId,
+    revision: Revision,
+    nodes: Index,
+    entries: Index,
     receipts: Index,
     changes: Index,
     history: Index,
@@ -103,6 +103,69 @@ impl ObjectState {
             ))?)
             .await?;
         Ok(())
+    }
+
+    pub(crate) fn data(&self) -> &DataStore {
+        &self.data
+    }
+
+    pub(crate) const fn filesystem(&self) -> NodeId {
+        self.filesystem
+    }
+
+    pub(crate) const fn root(&self) -> NodeId {
+        self.root
+    }
+
+    pub(crate) const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    pub(crate) const fn nodes(&self) -> &Index {
+        &self.nodes
+    }
+
+    pub(crate) const fn entries(&self) -> &Index {
+        &self.entries
+    }
+
+    pub(crate) const fn receipts(&self) -> &Index {
+        &self.receipts
+    }
+
+    pub(crate) const fn changes(&self) -> &Index {
+        &self.changes
+    }
+
+    pub(crate) const fn history(&self) -> &Index {
+        &self.history
+    }
+
+    pub(crate) const fn reference(&self) -> &PackedRef {
+        &self.reference
+    }
+
+    pub(crate) async fn load_retained(
+        &self,
+        revision: Revision,
+        reference: &PackedRef,
+    ) -> Result<Self> {
+        let [nodes, entries, receipts, changes, history] =
+            read_snapshot_roots(&self.data, reference, revision, self.filesystem, self.root)
+                .await?;
+        Ok(Self {
+            data: self.data.clone(),
+            filesystem: self.filesystem,
+            root: self.root,
+            revision,
+            nodes,
+            entries,
+            receipts,
+            changes,
+            history,
+            reference: reference.clone(),
+            etag: None,
+        })
     }
 }
 
@@ -239,7 +302,7 @@ impl ObjectFs {
     pub async fn observe_latest(&self) -> Result<Snapshot> {
         Ok(self.observe_state().await?.view())
     }
-    async fn observe_state(&self) -> Result<ObjectState> {
+    pub(crate) async fn observe_state(&self) -> Result<ObjectState> {
         let head = read_head(&self.operator)
             .await?
             .ok_or_else(|| corrupt("published head disappeared"))?;
@@ -255,37 +318,19 @@ impl ObjectFs {
         revision: Revision,
         etag: Option<String>,
     ) -> Result<ObjectState> {
-        let bytes = self.data.read_extent(&reference, 4096).await?;
-        if bytes.len() < OBJECT_SNAPSHOT_MAGIC.len() {
-            return Err(corrupt("truncated snapshot descriptor"));
-        }
-        if bytes[..OBJECT_SNAPSHOT_MAGIC.len()] != OBJECT_SNAPSHOT_MAGIC {
-            return Err(Error::unsupported(
-                "open snapshot",
-                "unknown snapshot profile",
-            ));
-        }
-        let (magic, fs, root, rev, roots): SnapshotWire = decode(&bytes)?;
-        if magic != OBJECT_SNAPSHOT_MAGIC
-            || fs != *self.filesystem.as_bytes()
-            || root != *self.root.as_bytes()
-            || Revision::from_wire(rev) != revision
-        {
-            return Err(corrupt("snapshot envelope disagrees with authority"));
-        }
-        let mut roots = roots
-            .into_iter()
-            .map(|r| r.map(PackedRef::from_wire).transpose().map(Index));
+        let [nodes, entries, receipts, changes, history] =
+            read_snapshot_roots(&self.data, &reference, revision, self.filesystem, self.root)
+                .await?;
         Ok(ObjectState {
             data: self.data.clone(),
             filesystem: self.filesystem,
             root: self.root,
             revision,
-            nodes: roots.next().unwrap()?,
-            entries: roots.next().unwrap()?,
-            receipts: roots.next().unwrap()?,
-            changes: roots.next().unwrap()?,
-            history: roots.next().unwrap()?,
+            nodes,
+            entries,
+            receipts,
+            changes,
+            history,
             reference,
             etag,
         })
@@ -311,21 +356,57 @@ impl ObjectFs {
             .await?
             .view())
     }
-    pub(crate) async fn retained_revisions(&self) -> Result<Vec<Revision>> {
+    pub(crate) async fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> Result<RevisionPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(Error::unsupported(
+                "list retained revisions",
+                format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
+            ));
+        }
         let latest = self.observe_state().await?;
         let rows = latest
             .history
-            .scan(&self.data, None, &[], None, None, usize::MAX)
+            .scan(
+                &self.data,
+                None,
+                &[],
+                None,
+                after.map(|revision| revision.to_bytes()).as_deref(),
+                limit as usize + 1,
+            )
             .await?;
-        let mut revisions = BTreeSet::from([latest.revision]);
+        let mut revisions = Vec::new();
         for (key, value) in rows {
             let key = key
                 .try_into()
                 .map_err(|_| corrupt("invalid retained revision key"))?;
             let _: PackedRef = PackedRef::from_wire(decode(&value)?)?;
-            revisions.insert(Revision::from_bytes(key));
+            revisions.push(Revision::from_bytes(key));
         }
-        Ok(revisions.into_iter().collect())
+        if revisions.len() > limit as usize {
+            revisions.truncate(limit as usize);
+            let next = revisions.last().copied();
+            return Ok(RevisionPage { revisions, next });
+        }
+        if after < Some(latest.revision) {
+            revisions.push(latest.revision);
+        }
+        if revisions.len() > limit as usize {
+            revisions.truncate(limit as usize);
+            let next = revisions.last().copied();
+            return Ok(RevisionPage { revisions, next });
+        }
+        if revisions.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(corrupt("retained revisions are not strictly ordered"));
+        }
+        Ok(RevisionPage {
+            revisions,
+            next: None,
+        })
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
@@ -471,6 +552,43 @@ impl ObjectFs {
         }
         Ok(outcomes)
     }
+}
+
+async fn read_snapshot_roots(
+    data: &DataStore,
+    reference: &PackedRef,
+    revision: Revision,
+    filesystem: NodeId,
+    root: NodeId,
+) -> Result<[Index; 5]> {
+    let bytes = data.read_extent(reference, 4096).await?;
+    if bytes.len() < OBJECT_SNAPSHOT_MAGIC.len() {
+        return Err(corrupt("truncated snapshot descriptor"));
+    }
+    if bytes[..OBJECT_SNAPSHOT_MAGIC.len()] != OBJECT_SNAPSHOT_MAGIC {
+        return Err(Error::unsupported(
+            "open snapshot",
+            "unknown snapshot profile",
+        ));
+    }
+    let (magic, fs, encoded_root, rev, roots): SnapshotWire = decode(&bytes)?;
+    if magic != OBJECT_SNAPSHOT_MAGIC
+        || fs != *filesystem.as_bytes()
+        || encoded_root != *root.as_bytes()
+        || Revision::from_wire(rev) != revision
+    {
+        return Err(corrupt("snapshot envelope disagrees with authority"));
+    }
+    let mut roots = roots
+        .into_iter()
+        .map(|entry| entry.map(PackedRef::from_wire).transpose().map(Index));
+    Ok([
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+    ])
 }
 fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()> {
     let info = operator.info();

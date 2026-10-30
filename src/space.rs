@@ -29,10 +29,11 @@ use opendal::{EntryMode, Operator};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use yinyang_core::reachability::{PhysicalInspection, PhysicalReferenceKind};
 use yinyang_core::{Authority, Error, ErrorKind, NodeId, NodeKind, Result, Revision, Snapshot};
 
-pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v1";
-pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v1";
+pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v2";
+pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v2";
 
 const HEAD_KEY: &str = ".yinyang/head";
 const PACK_ROOT: &str = ".yinyang/v2";
@@ -118,6 +119,10 @@ pub struct PhysicalSpace {
     pub listing_consistency: ListingConsistency,
     pub noncurrent_versions: &'static str,
     pub accounting: &'static str,
+    pub reachability: PhysicalReachability,
+    pub coverage: PhysicalCoverage,
+    pub root_external: ObservedRootExternal,
+    pub issues: Vec<PhysicalIssueReport>,
     pub error: Option<String>,
 }
 
@@ -125,6 +130,49 @@ pub struct PhysicalSpace {
 pub struct PhysicalObject {
     pub objects: u64,
     pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PhysicalReachability {
+    pub state: MeasurementState,
+    pub retained_revisions: Option<u64>,
+    pub snapshot_descriptors: u64,
+    pub metadata_index_references: u64,
+    pub metadata_value_references: u64,
+    pub content_descriptors: u64,
+    pub content_index_references: u64,
+    pub content_extent_references: u64,
+    pub packs_with_references: u64,
+    pub shared_packs: u64,
+    pub issues: u64,
+    pub issues_omitted: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PhysicalCoverage {
+    pub observed_referenced_bytes: u64,
+    pub visible_referenced_bytes: Option<u64>,
+    pub visible_uncovered_bytes: Option<u64>,
+    pub fully_referenced_visible_packs: Option<u64>,
+    pub partially_referenced_visible_packs: Option<u64>,
+    pub missing_reference_packs: u64,
+    pub truncated_reference_packs: u64,
+    pub payload_verification: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ObservedRootExternal {
+    pub state: MeasurementState,
+    pub packs: Option<u64>,
+    pub bytes: Option<u64>,
+    pub treatment: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PhysicalIssueReport {
+    pub subject: String,
+    pub state: &'static str,
+    pub detail: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -324,6 +372,7 @@ pub struct RetentionPolicyReport {
     pub mode: &'static str,
     pub keep_last: Option<u64>,
     pub requested_pins: Vec<RequestedPin>,
+    pub published_history: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -445,6 +494,13 @@ pub async fn inspect_managed_space(
     let mut unresolved = Vec::new();
     let retained = inspect_retained(authority, &snapshot, &mut unresolved).await;
     let physical = inspect_physical(authority, operator, &snapshot).await;
+    for issue in &physical.issues {
+        unresolved.push(Unresolved {
+            subject: issue.subject.clone(),
+            state: issue.state.to_owned(),
+            detail: issue.detail.clone(),
+        });
+    }
     let staging = inspect_bound_local_staging(staging, authority.filesystem()).await;
     for error in &staging.errors {
         unresolved.push(Unresolved {
@@ -475,7 +531,7 @@ pub async fn inspect_managed_space(
             logical_live: "latest_authority_snapshot",
             logical_retained: "authority_retained_revision_metadata",
             physical_objects: "recursive_current_object_listing",
-            referenced_extents: "unavailable",
+            referenced_extents: "authenticated_index_references_without_payload_reads",
             local_staging: "existing_database_read_only_plus_directory_metadata",
             noncurrent_versions: "unknown",
             external_pins: "unknown",
@@ -671,6 +727,7 @@ pub async fn plan_managed_retention(
             mode: if bounded { "bounded" } else { "keep_all" },
             keep_last,
             requested_pins: requested,
+            published_history: "retained_by_default",
         },
         retained_revision_count,
         revisions: decisions,
@@ -1481,6 +1538,17 @@ async fn inspect_physical(
         "{PACK_ROOT}/{}/packs/",
         uuid::Uuid::from_bytes(*authority.filesystem().as_bytes()).simple()
     );
+    let reachability = authority.inspect_physical(latest).await;
+    let pack_usage = reachability.packs();
+    let mut issues = reachability
+        .issues()
+        .iter()
+        .map(|issue| PhysicalIssueReport {
+            subject: issue.subject.clone(),
+            state: physical_issue_state(issue.kind),
+            detail: issue.detail.clone(),
+        })
+        .collect::<Vec<_>>();
     let mut errors = Vec::new();
     let head = match operator.stat(HEAD_KEY).await {
         Ok(metadata) if !metadata.is_dir() => Some(PhysicalObject {
@@ -1496,6 +1564,8 @@ async fn inspect_physical(
             None
         }
     };
+    let mut pack_sizes = BTreeMap::<[u8; 16], u64>::new();
+    let mut unrecognized_visible_objects = 0_u64;
     let packs = match operator.list_with(prefix.as_str()).recursive(true).await {
         Ok(entries) => {
             let mut objects = 0_u64;
@@ -1514,6 +1584,17 @@ async fn inspect_physical(
                 }
                 objects = objects.saturating_add(1);
                 bytes = bytes.saturating_add(metadata.content_length());
+                if let Some(object) = pack_object_id(entry.path(), &prefix) {
+                    pack_sizes.insert(object, metadata.content_length());
+                } else {
+                    unrecognized_visible_objects = unrecognized_visible_objects.saturating_add(1);
+                    push_physical_issue(
+                        &mut issues,
+                        format!("visible-pack:{}", entry.path()),
+                        "visible pack key is not a UUID object below the Managed pack root"
+                            .to_owned(),
+                    );
+                }
             }
             Some(PhysicalObject { objects, bytes })
         }
@@ -1544,18 +1625,100 @@ async fn inspect_physical(
         ),
         _ => (None, None),
     };
-    PhysicalSpace {
-        state: if head.is_some() && packs.is_some() && after_revision.is_some() {
-            if consistency == ListingConsistency::StableHead {
-                MeasurementState::Available
-            } else {
-                MeasurementState::Partial
+    let mut observed_referenced_bytes = 0_u64;
+    let mut visible_referenced_bytes = 0_u64;
+    let mut visible_uncovered_bytes = 0_u64;
+    let mut fully_referenced = 0_u64;
+    let mut partially_referenced = 0_u64;
+    let mut missing_reference_packs = 0_u64;
+    let mut truncated_reference_packs = 0_u64;
+    for usage in &pack_usage {
+        observed_referenced_bytes = observed_referenced_bytes.saturating_add(usage.covered_bytes);
+        if packs.is_none() {
+            continue;
+        }
+        let Some(size) = pack_sizes.get(&usage.object).copied() else {
+            missing_reference_packs = missing_reference_packs.saturating_add(1);
+            push_physical_issue(
+                &mut issues,
+                format!(
+                    "referenced-pack:{}",
+                    uuid::Uuid::from_bytes(usage.object).simple()
+                ),
+                "authenticated references name a pack absent from the current-key listing"
+                    .to_owned(),
+            );
+            continue;
+        };
+        let mut covered = 0_u64;
+        let mut truncated = false;
+        for (start, end) in &usage.intervals {
+            if *start >= size {
+                truncated = true;
+                continue;
             }
-        } else if head.is_some() || packs.is_some() {
-            MeasurementState::Partial
-        } else {
-            MeasurementState::Unavailable
-        },
+            if *end > size {
+                truncated = true;
+            }
+            let visible_start = *start;
+            let visible_end = (*end).min(size);
+            covered = covered.saturating_add(visible_end.saturating_sub(visible_start));
+        }
+        if truncated {
+            truncated_reference_packs = truncated_reference_packs.saturating_add(1);
+            push_physical_issue(
+                &mut issues,
+                format!(
+                    "referenced-pack:{}",
+                    uuid::Uuid::from_bytes(usage.object).simple()
+                ),
+                "an authenticated extent exceeds the visible pack length".to_owned(),
+            );
+        }
+        visible_referenced_bytes = visible_referenced_bytes.saturating_add(covered);
+        visible_uncovered_bytes =
+            visible_uncovered_bytes.saturating_add(size.saturating_sub(covered));
+        if covered == size {
+            fully_referenced = fully_referenced.saturating_add(1);
+        } else if covered > 0 {
+            partially_referenced = partially_referenced.saturating_add(1);
+        }
+    }
+    let listing_complete = head.is_some()
+        && packs.is_some()
+        && after_revision.is_some()
+        && consistency == ListingConsistency::StableHead;
+    let root_relative_complete = listing_complete
+        && reachability.is_complete()
+        && missing_reference_packs == 0
+        && truncated_reference_packs == 0
+        && unrecognized_visible_objects == 0;
+    let unreferenced = if root_relative_complete {
+        pack_sizes
+            .keys()
+            .filter(|object| !pack_usage.iter().any(|usage| usage.object == **object))
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let unreferenced_bytes = unreferenced
+        .iter()
+        .filter_map(|object| pack_sizes.get(object))
+        .fold(0_u64, |total, bytes| total.saturating_add(*bytes));
+    let coverage_complete = listing_complete
+        && missing_reference_packs == 0
+        && truncated_reference_packs == 0
+        && unrecognized_visible_objects == 0;
+    let state = if reachability.is_complete() && coverage_complete {
+        MeasurementState::Available
+    } else if head.is_some() || packs.is_some() || !reachability.references().is_empty() {
+        MeasurementState::Partial
+    } else {
+        MeasurementState::Unavailable
+    };
+    PhysicalSpace {
+        state,
         head,
         packs,
         visible_objects,
@@ -1564,9 +1727,98 @@ async fn inspect_physical(
         after_revision,
         listing_consistency: consistency,
         noncurrent_versions: "unknown",
-        accounting: "unique_current_object_key",
+        accounting: "authenticated_reference_union_against_current_object_keys",
+        reachability: PhysicalReachability {
+            state: if reachability.is_complete() && listing_complete {
+                MeasurementState::Available
+            } else {
+                MeasurementState::Partial
+            },
+            retained_revisions: reachability.retained_revisions(),
+            snapshot_descriptors: reachability
+                .reference_count(PhysicalReferenceKind::SnapshotDescriptor),
+            metadata_index_references: reachability
+                .reference_count(PhysicalReferenceKind::MetadataIndex),
+            metadata_value_references: reachability
+                .reference_count(PhysicalReferenceKind::MetadataValue),
+            content_descriptors: reachability.content_descriptor_count(),
+            content_index_references: reachability
+                .reference_count(PhysicalReferenceKind::ContentIndex),
+            content_extent_references: reachability
+                .reference_count(PhysicalReferenceKind::ContentExtent),
+            packs_with_references: pack_usage.len().try_into().unwrap_or(u64::MAX),
+            shared_packs: pack_usage
+                .iter()
+                .filter(|usage| usage.references > 1)
+                .count()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            issues: issues.len().try_into().unwrap_or(u64::MAX),
+            issues_omitted: reachability.issues_omitted(),
+        },
+        coverage: PhysicalCoverage {
+            observed_referenced_bytes,
+            visible_referenced_bytes: packs.as_ref().map(|_| visible_referenced_bytes),
+            visible_uncovered_bytes: packs.as_ref().map(|_| visible_uncovered_bytes),
+            fully_referenced_visible_packs: packs.as_ref().map(|_| fully_referenced),
+            partially_referenced_visible_packs: packs.as_ref().map(|_| partially_referenced),
+            missing_reference_packs,
+            truncated_reference_packs,
+            payload_verification: "content_index_authenticated_payload_not_read",
+        },
+        root_external: ObservedRootExternal {
+            state: if root_relative_complete {
+                MeasurementState::Available
+            } else {
+                MeasurementState::Partial
+            },
+            packs: root_relative_complete
+                .then_some(unreferenced.len().try_into().unwrap_or(u64::MAX)),
+            bytes: root_relative_complete.then_some(unreferenced_bytes),
+            treatment: "observed-root-relative only; not an orphan or deletion-eligibility claim",
+        },
+        issues,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
     }
+}
+
+fn pack_object_id(path: &str, prefix: &str) -> Option<[u8; 16]> {
+    let name = path.strip_prefix(prefix)?;
+    if name.contains('/') {
+        return None;
+    }
+    uuid::Uuid::parse_str(name)
+        .ok()
+        .map(|uuid| *uuid.as_bytes())
+}
+
+fn physical_issue_state(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "missing",
+        ErrorKind::Corrupt => "corrupt",
+        ErrorKind::Invalid | ErrorKind::InvalidName => "invalid",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::Storage | ErrorKind::Io | ErrorKind::PermissionDenied => "unavailable",
+        ErrorKind::AlreadyExists
+        | ErrorKind::NotDirectory
+        | ErrorKind::IsDirectory
+        | ErrorKind::NotEmpty => "invalid",
+    }
+}
+
+fn push_physical_issue(issues: &mut Vec<PhysicalIssueReport>, subject: String, detail: String) {
+    if issues.len() >= 256
+        || issues
+            .iter()
+            .any(|issue| issue.subject == subject && issue.detail == detail)
+    {
+        return;
+    }
+    issues.push(PhysicalIssueReport {
+        subject,
+        state: "unavailable",
+        detail,
+    });
 }
 
 async fn inspect_receipts(
@@ -1729,9 +1981,9 @@ fn display_path(path: &Path) -> String {
 fn space_limits() -> Vec<String> {
     [
         "Logical file bytes are not physical allocated bytes; index pages, metadata, orphan packs, backend overhead, and local files are separate measurements.",
-        "Referenced physical extents are not enumerated, so the report does not attribute object bytes to individual files or revisions.",
+        "Referenced extents are authenticated index references, not payload reads; a root-relative unreferenced pack is not an orphan or a deletion-eligibility claim.",
         "Recursive listing returns current object keys only and is not atomic; noncurrent backend versions are unknown.",
-        "Each visible pack object key is counted once even when multiple files or revisions share its extents.",
+        "Referenced byte coverage is a union over authenticated extents per visible pack; uncovered bytes are not reclaimed and may belong to unobserved/unknown readers.",
         "External readers, untracked revision pins, other staging directories, backup packages, and quiescence are not discoverable by this inspection.",
         "Standalone inspect_local_staging is unbound; volume-bound report and retention planning require verified local filesystem attribution.",
         "Direct namespace objects are excluded; this module inspects only Managed authority metadata and Managed local staging.",
@@ -1749,6 +2001,7 @@ fn retention_limits() -> Vec<String> {
         "Noncurrent backend versions and shared pack extents remain unknown; no reclaimable-byte estimate is produced.",
         "Receipt records are namespace evidence, not a physical cleanup authorization.",
         "Quiescence is not observed; planning does not stop writers, readers, mounts, Sync processes, or backup activity.",
+        "Published history and receipts are retained by default; keep-last changes only the declarative selection, never removes retained revisions.",
         "Direct namespace objects are excluded.",
     ]
     .into_iter()

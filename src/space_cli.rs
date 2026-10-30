@@ -168,8 +168,11 @@ fn print_report(report: &ManagedSpaceReport) {
     }
     match (&report.physical.packs, &report.physical.head) {
         (Some(packs), Some(head)) => println!(
-            "physical current objects: {} packs / {} bytes plus head {} bytes; noncurrent versions unknown",
-            packs.objects, packs.bytes, head.bytes
+            "physical current objects: {} packs / {} bytes plus head {} bytes; {} referenced coverage bytes; noncurrent versions unknown",
+            packs.objects,
+            packs.bytes,
+            head.bytes,
+            report.physical.coverage.observed_referenced_bytes
         ),
         _ => println!(
             "physical current objects: {}; noncurrent versions unknown",
@@ -181,6 +184,45 @@ fn print_report(report: &ManagedSpaceReport) {
             "physical listing consistency: {:?}",
             report.physical.listing_consistency
         );
+    }
+    println!(
+        "physical reachability: {:?}; {} retained revisions, {} snapshots, {} metadata pages, {} metadata values, {} content indexes, {} content extents, {} shared packs",
+        report.physical.reachability.state,
+        report
+            .physical
+            .reachability
+            .retained_revisions
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        report.physical.reachability.snapshot_descriptors,
+        report.physical.reachability.metadata_index_references,
+        report.physical.reachability.metadata_value_references,
+        report.physical.reachability.content_index_references,
+        report.physical.reachability.content_extent_references,
+        report.physical.reachability.shared_packs
+    );
+    match (
+        report.physical.coverage.visible_referenced_bytes,
+        report.physical.coverage.visible_uncovered_bytes,
+    ) {
+        (Some(referenced), Some(uncovered)) => println!(
+            "physical visible coverage: {} referenced bytes; {} uncovered bytes (not reclaimable)",
+            referenced, uncovered
+        ),
+        _ => println!("physical visible coverage: unavailable"),
+    }
+    match (
+        report.physical.root_external.state,
+        report.physical.root_external.packs,
+        report.physical.root_external.bytes,
+    ) {
+        (MeasurementState::Available, Some(packs), Some(bytes)) => println!(
+            "observed-root-external visible packs: {} / {} bytes; relative to observed roots only",
+            packs, bytes
+        ),
+        _ => println!(
+            "observed-root-external visible packs: partial or unavailable; no orphan claim"
+        ),
     }
     println!(
         "local staging: {:?} binding {:?} at {} ({} handles, {} staged bytes)",
@@ -255,6 +297,7 @@ fn print_plan(plan: &ManagedRetentionPlan) {
             .unwrap_or_else(|| "not-set".to_owned()),
         plan.policy.requested_pins.len()
     );
+    println!("published history: {}", plan.policy.published_history);
     let selected = plan
         .revisions
         .iter()
