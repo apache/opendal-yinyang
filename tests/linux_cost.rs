@@ -1209,61 +1209,71 @@ fn run_length_changing_matrix(
     );
 
     let path = mountpoint.join("length-changing.bin");
-    let mut open_batch = OperationBatch::default();
-    let mut shared_reader = None;
-    let mut writer = None;
-    for sample in 0..2 {
-        let measured = measure_mount_operation(&meter, mounted.pid(), || {
-            if sample == 0 {
-                File::open(&path).expect("open shared length-changing reader")
-            } else {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .append(true)
-                    .open(&path)
-                    .expect("open length-changing writer")
-            }
-        });
-        if sample == 0 {
-            shared_reader = Some(measured.value);
-        } else {
-            writer = Some(measured.value);
-        }
-        open_batch.push(Measurement {
-            value: (),
-            latency_ms: measured.latency_ms,
-            io: measured.io,
-            network: measured.network,
-        });
-    }
-    let mut writer = writer.expect("writer opened during the measured batch");
-    let shared_reader = shared_reader.expect("shared reader opened during the measured batch");
+    let reader_measured = measure_mount_operation(&meter, mounted.pid(), || {
+        File::open(&path).expect("open shared length-changing reader")
+    });
+    let shared_reader = reader_measured.value;
     if expectation == IncrementalExpectation::Required {
-        let samples = open_batch.latencies.len() as u64;
         assert!(
-            open_batch.network.get_response_body_bytes < size as u64 / 2 * samples,
-            "writable open and shared reader read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
-            open_batch.network.get_response_body_bytes
+            reader_measured.network.get_response_body_bytes < size as u64 / 2,
+            "shared reader open read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
+            reader_measured.network.get_response_body_bytes
         );
     }
-    assert_required_staging(context, &staging, size, "writable open");
+    assert_required_staging(context, &staging, size, "shared reader open");
     recorder.record(
         context,
-        "fuse_length_changing_open_shared_descriptor",
+        "fuse_length_changing_open_shared_reader",
         publication,
         scale,
         Dataset {
-            read_pattern: Some(
-                "one read-only descriptor followed by one writable append descriptor".to_owned(),
-            ),
+            read_pattern: Some("one read-only descriptor open before any write".to_owned()),
             working_set_bytes: Some(0),
             ..base_dataset.clone()
         },
-        "both descriptors opened before any write; GET body bytes are HTTP entity bytes",
-        open_batch.latencies,
-        open_batch.io,
-        open_batch.network,
+        "the read-only descriptor opened before any write; GET body bytes are HTTP entity bytes",
+        vec![reader_measured.latency_ms],
+        reader_measured.io,
+        reader_measured.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "read-only descriptor shares the eventual writable node generation".to_owned(),
+            format!("logical_bytes={}", expected.len()),
+        ],
+    );
+
+    let writer_measured = measure_mount_operation(&meter, mounted.pid(), || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&path)
+            .expect("open length-changing writer")
+    });
+    let mut writer = writer_measured.value;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            writer_measured.network.get_response_body_bytes < size as u64 / 2,
+            "writable append open read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
+            writer_measured.network.get_response_body_bytes
+        );
+    }
+    assert_required_staging(context, &staging, size, "writable append open");
+    recorder.record(
+        context,
+        "fuse_length_changing_open_writer",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("one writable append descriptor open before any write".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the writable append descriptor opened before any write; GET body bytes are HTTP entity bytes",
+        vec![writer_measured.latency_ms],
+        writer_measured.io,
+        writer_measured.network,
         vec![],
         space_snapshot(fixture, None, None, Some(&staging)),
         vec![

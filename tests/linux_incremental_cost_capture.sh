@@ -23,7 +23,7 @@ usage() {
   cat <<'EOF'
 Usage: tests/linux_incremental_cost_capture.sh \
   --expected-source SHA \
-  --workload incremental|length-changing \
+  [--workload incremental|length-changing] \
   --expect baseline|required \
   --label LABEL \
   --output-dir DIR
@@ -41,7 +41,7 @@ fail() {
 }
 
 expected_source=
-workload=
+workload=incremental
 expectation=
 label=
 output_dir=
@@ -99,7 +99,7 @@ while (($#)); do
   esac
 done
 
-[[ -n $expected_source && -n $workload && -n $expectation && -n $label && -n $output_dir ]] || {
+[[ -n $expected_source && -n $expectation && -n $label && -n $output_dir ]] || {
   usage >&2
   exit 2
 }
@@ -161,7 +161,6 @@ with open(path, encoding="utf-8") as source:
             raise SystemExit(f"unexpected useful_bytes: {useful_bytes!r}")
         if expected_workload == "length-changing":
             scenarios = {
-                "fuse_length_changing_open_shared_descriptor",
                 "fuse_length_changing_small_append",
                 "fuse_length_changing_boundary_append",
                 "fuse_length_changing_truncate",
@@ -178,6 +177,22 @@ with open(path, encoding="utf-8") as source:
 
 if not records:
     raise SystemExit("benchmark wrote no records")
+if expected_workload == "length-changing":
+    required = {
+        "fuse_length_changing_open_shared_reader",
+        "fuse_length_changing_open_writer",
+        "fuse_length_changing_small_append",
+        "fuse_length_changing_boundary_append",
+        "fuse_length_changing_truncate",
+        "fuse_length_changing_zero_extension",
+        "fuse_length_changing_shrink_then_extend",
+        "fuse_length_changing_unchanged_fsync",
+        "fuse_length_changing_restart_tail_read",
+    }
+    seen = {record.get("scenario") for record in records}
+    missing = sorted(required - seen)
+    if missing:
+        raise SystemExit(f"length-changing workload is missing records: {missing}")
 binary_paths = {record.get("binary_path") for record in records}
 binary_hashes = {record.get("binary_blake3") for record in records}
 if len(binary_paths) != 1 or len(binary_hashes) != 1:

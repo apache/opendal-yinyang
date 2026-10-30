@@ -90,8 +90,11 @@ workload uses one 32 MiB file, a shared read-only descriptor and an active
 append descriptor, two 4 KiB appends, two 68 KiB appends that each cross an
 existing 64 KiB verification-unit boundary, two 4 KiB truncates, two 4 KiB zero
 extensions, two shrink-then-extend rounds, unchanged fsync, and remount plus
-tail reads. Every scenario keeps two latency samples, and complete remote
-bytes are verified outside each measured interval. Required mode fails if
+tail reads. Operation scenarios keep two latency samples; the read-only and
+writable descriptor opens are separate one-sample scenarios and are never
+merged into one p50/p95 distribution. Two samples are descriptive only; the
+summary p50/p95 is not a stable performance claim. Complete remote bytes are
+verified outside each measured interval. Required mode fails if
 writable open, preparation, or publication transfers at least half of the file
 through S3, or if allocated mount staging is at least half of the file. JSONL
 records retain `useful_bytes` per sample, raw latency samples, GET/PUT request
