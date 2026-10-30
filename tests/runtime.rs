@@ -18,16 +18,124 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{future::Future, pin::Pin};
 use support::TestBackend;
 use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
-    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, Fs, NodeId, Planner, Revision,
-    Snapshot, Transaction,
+    Authority, BackendProfile, CommitId, CommitOutcome, ContentEdit, DataStore, FileVersion, Fs,
+    NodeId, Planner, PreparedContent, Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{Error, ErrorKind, Runtime};
+
+#[derive(Default)]
+struct PrepareCalls {
+    stream: AtomicUsize,
+    overwrite: AtomicUsize,
+    update: AtomicUsize,
+}
+
+impl PrepareCalls {
+    fn reset(&self) {
+        self.stream.store(0, Ordering::SeqCst);
+        self.overwrite.store(0, Ordering::SeqCst);
+        self.update.store(0, Ordering::SeqCst);
+    }
+}
+
+struct RecordingAuthority {
+    inner: Arc<dyn Authority>,
+    calls: Arc<PrepareCalls>,
+}
+
+impl RecordingAuthority {
+    fn new(inner: Arc<dyn Authority>, calls: Arc<PrepareCalls>) -> Self {
+        Self { inner, calls }
+    }
+}
+
+impl std::fmt::Debug for RecordingAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingAuthority").finish_non_exhaustive()
+    }
+}
+
+impl Authority for RecordingAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+
+    fn observe_latest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_latest()
+    }
+
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.inner.observe_revision(revision)
+    }
+
+    fn retained_revisions(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<Revision>>> + Send + '_>> {
+        self.inner.retained_revisions()
+    }
+
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
+        self.inner.commit_batch(requests)
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        source: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<PreparedContent>> + Send + 'a>> {
+        self.calls.stream.fetch_add(1, Ordering::SeqCst);
+        self.inner.prepare(source)
+    }
+
+    fn prepare_overwrite<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        edits: &'a [ContentEdit<'a>],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<PreparedContent>> + Send + 'a>> {
+        self.calls.overwrite.fetch_add(1, Ordering::SeqCst);
+        self.inner.prepare_overwrite(base, edits)
+    }
+
+    fn prepare_update<'a>(
+        &'a self,
+        base: &'a FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &'a [ContentEdit<'a>],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<PreparedContent>> + Send + 'a>> {
+        self.calls.update.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .prepare_update(base, preserved_prefix, final_length, edits)
+    }
+
+    fn restore_transaction<'a>(
+        &'a self,
+        bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Transaction>> + Send + 'a>> {
+        self.inner.restore_transaction(bytes)
+    }
+}
 
 struct PausingAuthority {
     inner: Arc<dyn Authority>,
@@ -908,6 +1016,43 @@ async fn sparse_runtime(
         expected[996..1012]
     );
 
+    // Appending must extend the published version without streaming the base.
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    assert_eq!(file.append(b"TAIL").await.unwrap(), BASE_BYTES as u64);
+    file.fsync().await.unwrap();
+    let (read_bytes, written_bytes) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.written_bytes)
+    };
+    assert!(
+        read_bytes < BASE_BYTES as u64 / 8,
+        "bounded append read the base: {read_bytes} bytes"
+    );
+    assert!(
+        written_bytes < BASE_BYTES as u64 / 2,
+        "bounded append uploaded the whole file: {written_bytes} bytes"
+    );
+    expected.extend_from_slice(b"TAIL");
+    assert_eq!(
+        runtime
+            .authority()
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(BASE_BYTES as u64 - 8, 12)
+            .await
+            .unwrap(),
+        expected[BASE_BYTES - 8..]
+    );
+
     let mut newer = runtime.open_node(node, true).await.unwrap();
     file.write(2000, b"FROZ").await.unwrap();
     newer.write(3000, b"NEW!").await.unwrap();
@@ -957,6 +1102,277 @@ async fn sparse_runtime(
             .unwrap(),
         zero_extended
     );
+
+    // Extending a published version by a few bytes only materializes the
+    // extension units rather than streaming the complete file.
+    let mut extended = runtime.open_node(node, true).await.unwrap();
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    extended.truncate(BASE_BYTES as u64 + 64).await.unwrap();
+    extended.fsync().await.unwrap();
+    let (read_bytes, written_bytes) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.written_bytes)
+    };
+    assert!(
+        read_bytes < BASE_BYTES as u64 / 8,
+        "bounded zero extension read the base: {read_bytes} bytes"
+    );
+    assert!(
+        written_bytes < BASE_BYTES as u64 / 2,
+        "bounded zero extension uploaded the whole file: {written_bytes} bytes"
+    );
+    let latest = runtime
+        .authority()
+        .observe_latest()
+        .await
+        .unwrap()
+        .open_file(node)
+        .await
+        .unwrap();
+    assert_eq!(latest.read(BASE_BYTES as u64, 64).await.unwrap(), [0; 64]);
+    drop(latest);
+    extended.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
+    const BASE_BYTES: usize = 4 * 1024 * 1024;
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let calls = Arc::new(PrepareCalls::default());
+    let authority: Arc<dyn Authority> = Arc::new(RecordingAuthority::new(inner, calls.clone()));
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    let mut bytes: Vec<u8> = (0..BASE_BYTES).map(|index| (index % 251) as u8).collect();
+    let prepared = authority.prepare(&mut bytes.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let node = plan
+        .create_file(authority.root(), "file", prepared, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        authority.commit(&plan.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+    calls.reset();
+
+    let mut file = runtime.open_node(node, true).await.unwrap();
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    file.write(1000, b"WXYZ").await.unwrap();
+    file.fsync().await.unwrap();
+    assert_eq!(calls.overwrite.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.update.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
+    let (read_bytes, written_bytes) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.written_bytes)
+    };
+    assert!(
+        read_bytes < BASE_BYTES as u64 / 8,
+        "same-length overwrite read the base: {read_bytes} bytes"
+    );
+    assert!(
+        written_bytes < BASE_BYTES as u64 / 2,
+        "same-length overwrite uploaded the whole file: {written_bytes} bytes"
+    );
+    bytes[1000..1004].copy_from_slice(b"WXYZ");
+
+    let mut stale = runtime.open_node(node, true).await.unwrap();
+    calls.reset();
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    assert_eq!(file.append(b"TAIL").await.unwrap(), BASE_BYTES as u64);
+    file.fsync().await.unwrap();
+    assert_eq!(calls.update.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.overwrite.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
+    let (read_bytes, written_bytes) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.written_bytes)
+    };
+    assert!(
+        read_bytes < BASE_BYTES as u64 / 8,
+        "bounded append read the base: {read_bytes} bytes"
+    );
+    assert!(
+        written_bytes < BASE_BYTES as u64 / 2,
+        "bounded append uploaded the whole file: {written_bytes} bytes"
+    );
+    bytes.extend_from_slice(b"TAIL");
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(BASE_BYTES as u64 - 8, 16)
+            .await
+            .unwrap(),
+        bytes[BASE_BYTES - 8..]
+    );
+
+    stale.write(0, b"STALE").await.unwrap();
+    assert!(matches!(stale.fsync().await, Err(Error::Conflict)));
+    assert_eq!(stale.read(0, 5).await.unwrap(), b"STALE");
+    stale.abort().await.unwrap();
+
+    file.truncate(700).await.unwrap();
+    file.truncate(1024 * 1024).await.unwrap();
+    let id = file.release().unwrap();
+    drop(runtime);
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    let mut file = runtime.recover(id).await.unwrap();
+    assert_eq!(file.read(700, 8).await.unwrap(), [0; 8]);
+    calls.reset();
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    file.fsync().await.unwrap();
+    assert_eq!(calls.update.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
+    let mut expected = bytes[..700].to_vec();
+    expected.resize(1024 * 1024, 0);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+
+    let mut extended = runtime.open_node(node, true).await.unwrap();
+    calls.reset();
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.data_read_bytes = 0;
+        state.data_reads = 0;
+        state.written_bytes = 0;
+    }
+    extended.truncate(1024 * 1024 + 4).await.unwrap();
+    extended.fsync().await.unwrap();
+    assert_eq!(calls.update.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
+    let (read_bytes, written_bytes) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.written_bytes)
+    };
+    assert!(
+        read_bytes < BASE_BYTES as u64 / 8,
+        "bounded zero extension read the base: {read_bytes} bytes"
+    );
+    assert!(
+        written_bytes < BASE_BYTES as u64 / 2,
+        "bounded zero extension uploaded the whole file: {written_bytes} bytes"
+    );
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(1024 * 1024, 4)
+            .await
+            .unwrap(),
+        [0; 4]
+    );
+
+    calls.reset();
+    extended.append(b"LOST").await.unwrap();
+    backend.state.lock().unwrap().delay_next_head = true;
+    let Err(Error::Unknown(commit)) = extended.fsync().await else {
+        panic!("expected a frozen append publication");
+    };
+    assert_eq!(calls.update.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        extended.status().await.unwrap().frozen_commit_id,
+        Some(commit)
+    );
+    assert!(extended.write(0, b"blocked").await.is_err());
+    let receipt = extended.fsync().await.unwrap().unwrap();
+    assert_eq!(receipt.commit_id, commit);
+    assert_eq!(calls.update.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(1024 * 1024, 8)
+            .await
+            .unwrap(),
+        b"\0\0\0\0LOST"
+    );
+    extended.close().await.unwrap();
+
+    // A single write whose encoded edits exceed the existing wire budget must
+    // keep the explicit streaming fallback.
+    calls.reset();
+    let base = vec![0x11_u8; 1024];
+    let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let large = plan
+        .create_file(authority.root(), "large-edit", prepared, false)
+        .await
+        .unwrap();
+    authority.commit(&plan.finish().unwrap()).await.unwrap();
+    calls.reset();
+    let mut file = runtime.open_node(large, true).await.unwrap();
+    let data = vec![0xAB_u8; 16 * 1024 * 1024];
+    file.write(0, &data).await.unwrap();
+    file.fsync().await.unwrap();
+    assert_eq!(calls.stream.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.update.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.overwrite.load(Ordering::SeqCst), 0);
+    let latest = authority
+        .observe_latest()
+        .await
+        .unwrap()
+        .open_file(large)
+        .await
+        .unwrap();
+    assert_eq!(latest.read(0, 4).await.unwrap(), [0xAB; 4]);
+    assert_eq!(
+        latest.read(data.len() as u64 - 4, 4).await.unwrap(),
+        [0xAB; 4]
+    );
+    drop(latest);
+    file.close().await.unwrap();
 }
 
 #[tokio::test]
