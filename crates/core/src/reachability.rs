@@ -25,7 +25,6 @@ use crate::object::ObjectState;
 use crate::snapshot::{ChangeRecord, Receipt, Revision, Snapshot};
 use crate::{Error, ErrorKind, NodeId, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::sync::Arc;
 
 const SCAN_PAGE: usize = 4096;
 const MAX_ISSUES: usize = 256;

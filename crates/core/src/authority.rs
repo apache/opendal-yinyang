@@ -112,7 +112,7 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     }
     /// Traverse authenticated physical references reachable from this
     /// authority's observed metadata roots without reading leaf payloads.
-    fn inspect_physical(&self, snapshot: &Snapshot) -> BoxFuture<'_, PhysicalInspection> {
+    fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
         Box::pin(crate::reachability::inspect_authority(self, snapshot))
     }
     fn commit_batch<'a>(
@@ -219,7 +219,7 @@ impl Authority for ObjectFs {
     ) -> BoxFuture<'_, Result<RevisionPage>> {
         Box::pin(self.retained_revisions_page(after, limit))
     }
-    fn inspect_physical(&self, snapshot: &Snapshot) -> BoxFuture<'_, PhysicalInspection> {
+    fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
         Box::pin(async move {
             match self.observe_state().await {
                 Ok(state) => {
