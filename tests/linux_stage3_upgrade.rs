@@ -45,8 +45,8 @@ use std::time::Instant;
 use upgrade::{
     PROCESS_TIMEOUT, RemoteCleanup, ServiceProcess, Storage, assert_receipt,
     assert_sqlite_integrity, field, handle_line, open_handle, parse_file_commit, path_text,
-    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file,
-    sqlite_journal_mode, target_source, transaction_identity, volume_command, volume_file_command,
+    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file, sqlite_wal_reader,
+    target_source, transaction_identity, volume_command, volume_file_command,
     wait_gate_or_child_exit, wal_path, write_config, write_optional_evidence,
 };
 
@@ -325,6 +325,7 @@ fn generate_stage3_fixture_from_546f419() {
     )
     .expect("create service metadata directory");
     let service = ServiceProcess::start(&producer, &storage, &service_root, &service_database);
+    let (service_wal_reader, service_journal_mode) = sqlite_wal_reader(&service_database);
     let service_config = work.path().join("service-volume.json");
     write_config(
         &service_config,
@@ -380,7 +381,6 @@ fn generate_stage3_fixture_from_546f419() {
         wal_bytes > 0,
         "service WAL must be non-empty before the kill"
     );
-    let service_journal_mode = sqlite_journal_mode(&service_database);
     service.kill_without_cleanup();
     assert!(service_wal.metadata().expect("service WAL metadata").len() > 0);
 
@@ -397,6 +397,7 @@ fn generate_stage3_fixture_from_546f419() {
         &service_database,
         &fixture.join("service/metadata/metadata.db"),
     );
+    drop(service_wal_reader);
     write_service_config(&fixture.join("service/volume.json"), &service_config);
 
     let expected = json!({

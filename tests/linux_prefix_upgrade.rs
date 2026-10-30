@@ -40,8 +40,8 @@ use upgrade::{
     RemoteCleanup, ServiceProcess, Storage, assert_no_installed_writer, assert_receipt,
     assert_sqlite_integrity, assert_storage_inventory_complete_when_empty, current_yy_command,
     field, handle_line, install_release, open_handle, output_text, parse_file_commit, path_text,
-    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file, switch_current,
-    target_source, text, transaction_identity, volume_command, volume_file_command,
+    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file, sqlite_wal_reader,
+    switch_current, target_source, text, transaction_identity, volume_command, volume_file_command,
     wait_gate_or_child_exit, write_config, write_optional_evidence,
 };
 
@@ -771,24 +771,4 @@ fn sync_entry<'a>(status: &'a Value, path: &str) -> &'a Value {
         .iter()
         .find(|entry| entry["path"] == path)
         .unwrap_or_else(|| panic!("Sync entry {path:?} is missing:\n{status:#}"))
-}
-
-fn sqlite_wal_reader(database: &Path) -> (rusqlite::Connection, String) {
-    let connection =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open service database read-only");
-    let journal_mode = connection
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .expect("read service SQLite journal mode");
-    assert_eq!(
-        journal_mode, "wal",
-        "fd1338c service authority did not use WAL mode"
-    );
-    connection
-        .execute_batch("BEGIN")
-        .expect("begin service WAL read snapshot");
-    let _: i64 = connection
-        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
-        .expect("establish service WAL read snapshot");
-    (connection, journal_mode)
 }

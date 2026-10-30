@@ -617,6 +617,26 @@ pub fn sqlite_journal_mode(database: &Path) -> String {
         .expect("read SQLite journal mode")
 }
 
+pub fn sqlite_wal_reader(database: &Path) -> (rusqlite::Connection, String) {
+    let connection =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open service database read-only");
+    let journal_mode = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read service SQLite journal mode");
+    assert_eq!(
+        journal_mode, "wal",
+        "the service authority did not use WAL mode"
+    );
+    connection
+        .execute_batch("BEGIN")
+        .expect("begin service WAL read snapshot");
+    let _: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+        .expect("establish service WAL read snapshot");
+    (connection, journal_mode)
+}
+
 pub fn assert_sqlite_integrity(database: &Path) {
     let connection =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
