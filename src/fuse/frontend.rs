@@ -1782,7 +1782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_detach_preserves_active_request_busy_pin() {
+    async fn release_detach_drops_last_mount_ref_and_preserves_inflight_pin() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
         let authority: Arc<dyn Authority> = Arc::new(
@@ -1801,6 +1801,19 @@ mod tests {
         let file = mount.open_node(id, false).await.unwrap();
         let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
         let fh = FileHandle(1);
+        guard(&inner.files).insert(
+            fh.0,
+            Arc::new(OpenFile {
+                node: id,
+                source: OpenSource::Staged(file),
+                writable: false,
+            }),
+        );
+        assert_eq!(inner.detach_file(fh), Some((id, false)));
+        inner.mount.reclaim(id).await.unwrap();
+
+        let file = inner.mount.open_node(id, false).await.unwrap();
+        let fh = FileHandle(2);
         guard(&inner.files).insert(
             fh.0,
             Arc::new(OpenFile {
