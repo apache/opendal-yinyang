@@ -1151,13 +1151,13 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
     calls.reset();
 
     let mut file = runtime.open_node(node, true).await.unwrap();
-    reset_backend_counters(backend);
+    reset_backend_counters(&backend);
     file.write(1000, b"WXYZ").await.unwrap();
     file.fsync().await.unwrap();
     assert_eq!(calls.overwrite.load(Ordering::SeqCst), 1);
     assert_eq!(calls.update.load(Ordering::SeqCst), 0);
     assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
-    let (read_bytes, written_bytes) = backend_counters(backend);
+    let (read_bytes, written_bytes) = backend_counters(&backend);
     assert!(
         read_bytes < BASE_BYTES as u64 / 8,
         "same-length overwrite read the base: {read_bytes} bytes"
@@ -1170,13 +1170,13 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
 
     let mut stale = runtime.open_node(node, true).await.unwrap();
     calls.reset();
-    reset_backend_counters(backend);
+    reset_backend_counters(&backend);
     assert_eq!(file.append(b"TAIL").await.unwrap(), BASE_BYTES as u64);
     file.fsync().await.unwrap();
     assert_eq!(calls.update.load(Ordering::SeqCst), 1);
     assert_eq!(calls.overwrite.load(Ordering::SeqCst), 0);
     assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
-    let (read_bytes, written_bytes) = backend_counters(backend);
+    let (read_bytes, written_bytes) = backend_counters(&backend);
     assert!(
         read_bytes < BASE_BYTES as u64 / 8,
         "bounded append read the base: {read_bytes} bytes"
@@ -1214,7 +1214,7 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
     let mut file = runtime.recover(id).await.unwrap();
     assert_eq!(file.read(700, 8).await.unwrap(), [0; 8]);
     calls.reset();
-    reset_backend_counters(backend);
+    reset_backend_counters(&backend);
     file.fsync().await.unwrap();
     assert_eq!(calls.update.load(Ordering::SeqCst), 1);
     assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
@@ -1236,12 +1236,12 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
 
     let mut extended = runtime.open_node(node, true).await.unwrap();
     calls.reset();
-    reset_backend_counters(backend);
+    reset_backend_counters(&backend);
     extended.truncate(1024 * 1024 + 4).await.unwrap();
     extended.fsync().await.unwrap();
     assert_eq!(calls.update.load(Ordering::SeqCst), 1);
     assert_eq!(calls.stream.load(Ordering::SeqCst), 0);
-    let (read_bytes, written_bytes) = backend_counters(backend);
+    let (read_bytes, written_bytes) = backend_counters(&backend);
     assert!(
         read_bytes < BASE_BYTES as u64 / 8,
         "bounded zero extension read the base: {read_bytes} bytes"
