@@ -763,20 +763,23 @@ fn installed_stage3_upgrade_preserves_sparse_segments_and_service_wal() {
         expected["service"]["path"].as_str().expect("service path"),
         false,
     );
-    let service_bytes = read_handle(
+    let service_length = expected["service"]["length"]
+        .as_u64()
+        .expect("service fixture length");
+    let service_bytes = run_file_ok(
         &target,
         &storage,
         &service.root,
         &service.config,
-        &service_handle,
+        &[
+            "read",
+            &service_handle,
+            "--length",
+            &service_length.to_string(),
+        ],
     )
     .stdout;
-    assert_eq!(
-        service_bytes.len() as u64,
-        expected["service"]["length"]
-            .as_u64()
-            .expect("service fixture length")
-    );
+    assert_eq!(service_bytes.len() as u64, service_length);
     assert_eq!(
         sha256(&service_bytes),
         expected["service"]["sha256"]
@@ -1052,15 +1055,17 @@ fn assert_handle_bytes(
     context: &str,
 ) {
     let handle = expected["handle"].as_str().expect("fixture handle");
+    let length = expected["length"].as_u64().expect("fixture length");
     let output = run_ok(
-        volume_file_command(binary, storage, root, config).args(["read", handle]),
+        volume_file_command(binary, storage, root, config).args([
+            "read",
+            handle,
+            "--length",
+            &length.to_string(),
+        ]),
         context,
     );
-    assert_eq!(
-        output.stdout.len() as u64,
-        expected["length"].as_u64().expect("fixture length"),
-        "{context} length"
-    );
+    assert_eq!(output.stdout.len() as u64, length, "{context} length");
     assert_eq!(
         sha256(&output.stdout),
         expected["sha256"].as_str().expect("fixture SHA-256"),
