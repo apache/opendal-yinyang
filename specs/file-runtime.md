@@ -138,15 +138,15 @@ pinned `FileVersion`. The fast path is limited to 4096 edits and 16 MiB of
 encoded edit payload so memory and the authenticated service frame stay
 bounded.
 
-A sparse handle can also publish a length-changing update without streaming the
-complete file. Publication calls `Authority::prepare_update` with the exact
-pinned base, the durably valid base prefix, the final local length, and the same
-ordered dirty segments. The result retains base bytes below that prefix, reads
-zeros up to the final length, then applies the edits. Append, truncate,
-zero-extension, and shrink-then-extend therefore never resurrect bytes beyond
-the preserved prefix. The same 4096-edit and 16 MiB encoded-wire limits apply,
-and the authority's shared bounded-work rule caps the verification units the
-update may generate. If either bound is exceeded, the handle uses the explicit
+A sparse handle can also publish an append, truncation, zero-extension, or
+shrink-then-extend result without streaming the complete file. Publication
+calls `Authority::prepare_update` with the exact pinned base, the durably valid
+base prefix, the final local length, and the same ordered dirty segments. The
+result retains base bytes below that prefix, zero-fills through the final
+length, then applies the edits. Base bytes beyond the preserved prefix are
+never resurrected. The same 4096-edit and 16 MiB encoded-wire limits apply, and
+the authority's shared bounded-work rule caps the verification units the update
+may generate. If either bound is exceeded, the handle uses the explicit
 streaming `Authority::prepare` path. A preparation error is never converted
 into that fallback, so a corrupt, foreign or uncertain update cannot acquire a
 different request identity. Handles without a sparse `bases` row keep
