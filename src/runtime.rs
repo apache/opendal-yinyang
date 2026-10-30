@@ -718,14 +718,23 @@ impl FileHandle {
         let result = self.publish().await;
         self.report(result).await
     }
+    /// Choose the bounded update path from durable local state before asking
+    /// the authority to prepare anything. An error from either trusted update
+    /// preparation is returned to the caller and never retried as a different
+    /// streaming request.
     async fn prepare_publication(&self, r: &Record) -> Result<PreparedContent> {
         let stage = &self.runtime.inner.stage;
         let base = self.base_file().await?;
         if let Some(base) = &base
-            && r.length == base.descriptor().content_id().length()
             && let Some(stored) = stage.base(self.id).await?
-            && stored.prefix == r.length
         {
+            let base_length = base.descriptor().content_id().length();
+            if stored.prefix > base_length || stored.prefix > r.length {
+                return Err(Error::State(
+                    ErrorKind::Corrupt,
+                    "staged base prefix exceeds file or base length",
+                ));
+            }
             let ranges = stage.segment_ranges(self.id).await?;
             let mut ends = Vec::with_capacity(ranges.len());
             let mut encoded = 0_u64;
@@ -734,7 +743,7 @@ impl FileHandle {
                     ErrorKind::Corrupt,
                     "staged segment length overflows",
                 ))?;
-                if end > r.length {
+                if *length == 0 || end > r.length {
                     return Err(Error::State(
                         ErrorKind::Corrupt,
                         "staged segment exceeds file length",
@@ -748,10 +757,7 @@ impl FileHandle {
                         "staged edit size overflows",
                     ))?;
             }
-            if !ranges.is_empty()
-                && ranges.len() <= OVERWRITE_EDITS_MAX
-                && encoded <= OVERWRITE_ENCODED_MAX
-            {
+            if ranges.len() <= OVERWRITE_EDITS_MAX && encoded <= OVERWRITE_ENCODED_MAX {
                 let runs = stage.segments(self.id).await?;
                 if runs.len() != ranges.len()
                     || runs.iter().zip(&ranges).any(
@@ -767,15 +773,26 @@ impl FileHandle {
                 }
                 let edits = runs
                     .iter()
-                    .zip(ends)
-                    .map(|((position, bytes), end)| ContentEdit::new(*position..end, bytes))
+                    .zip(&ends)
+                    .map(|((position, bytes), end)| ContentEdit::new(*position..*end, bytes))
                     .collect::<yinyang_core::Result<Vec<_>>>()?;
-                return self
-                    .runtime
-                    .authority()
-                    .prepare_overwrite(base, &edits)
-                    .await
-                    .map_err(Error::from);
+                if r.length == base_length && stored.prefix == r.length {
+                    if !edits.is_empty() {
+                        return self
+                            .runtime
+                            .authority()
+                            .prepare_overwrite(base, &edits)
+                            .await
+                            .map_err(Error::from);
+                    }
+                } else if yinyang_core::data::update_is_bounded(stored.prefix, r.length, &edits) {
+                    return self
+                        .runtime
+                        .authority()
+                        .prepare_update(base, stored.prefix, r.length, &edits)
+                        .await
+                        .map_err(Error::from);
+                }
             }
         }
 

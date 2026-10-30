@@ -136,8 +136,21 @@ publication turns ordered local dirty segments into fixed-offset
 `ContentEdit` values and calls `Authority::prepare_overwrite` against the exact
 pinned `FileVersion`. The fast path is limited to 4096 edits and 16 MiB of
 encoded edit payload so memory and the authenticated service frame stay
-bounded. Append, truncate, shrink-then-extend, larger update sets, and
-length-changing writes use the existing streaming `Authority::prepare` path.
+bounded.
+
+A sparse handle can also publish an append, truncation, zero-extension, or
+shrink-then-extend result without streaming the complete file. Publication
+calls `Authority::prepare_update` with the exact pinned base, the durably valid
+base prefix, the final local length, and the same ordered dirty segments. The
+result retains base bytes below that prefix, zero-fills through the final
+length, then applies the edits. Base bytes beyond the preserved prefix are
+never resurrected. The same 4096-edit and 16 MiB encoded-wire limits apply, and
+the authority's shared bounded-work rule caps the verification units the update
+may generate. If either bound is exceeded, the handle uses the explicit
+streaming `Authority::prepare` path. A preparation error is never converted
+into that fallback, so a corrupt, foreign or uncertain update cannot acquire a
+different request identity. Handles without a sparse `bases` row keep
+full-chunks reads and streaming publication.
 
 Publication then plans a conditional content update against the original base
 revision and saves the exact frozen transaction before dispatch. While frozen,
@@ -278,11 +291,13 @@ See [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
 The file-operation tests exercise public Runtime/FileHandle methods against
 object and authenticated service authorities. They cover exact sparse segments,
 multi-fd reads, append, cross-chunk truncation/extension, shrink-then-extend
-zeroing, pinned visibility, rename/unlink, conflicting writers, failed
-uploads/close, frozen unknown requests, and reopening staging. They also cover
-explicit reference release without publication, typed errors through both
-authorities, retained Unknown identity, stage-1/2 upgrades with pending data and
-frozen requests, and unchanged full-chunks semantics for old records.
+zeroing, bounded length-changing update selection, oversized streaming
+fallback, frozen replay without another preparation, pinned visibility,
+rename/unlink, conflicting writers, failed uploads/close, frozen unknown
+requests, and reopening staging. They also cover explicit reference release
+without publication, typed errors through both authorities, retained Unknown
+identity, stage-1/2 upgrades with pending data and frozen requests, and
+unchanged full-chunks semantics for old records.
 Range-reader tests verify bounded payload I/O and corruption rejection without
 staging.
 Production power-loss testing, multi-host capacity benchmarks, OS-specific
