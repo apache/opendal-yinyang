@@ -75,6 +75,23 @@ The service connection counts for the five length-changing operations remained
 12, 12, 16, 16, and 20 in both runs. The reduction occurred in backend S3
 traffic rather than in a lower number of authenticated metadata RPCs.
 
+## FUSE RELEASE lifecycle follow-up
+
+The first PR124 CI run exposed an independent FUSE acceptance ordering failure:
+an immediate fresh open after descriptor close read the old 4-byte pinned
+version. Linux dispatches ordinary FUSE RELEASE work in the background, so
+close returning does not prove the adapter received RELEASE.
+
+The lifecycle fix removes a released kernel handle from the FUSE routing map
+on the dispatch thread before scheduling clean reclamation. A request task that
+already cloned the handle retains the documented Busy pin. Writable OPEN sends
+the same inode attribute invalidation as read-only OPEN only after selecting
+the Mount handle and applying `O_TRUNC`, before inserting the handle or
+replying. The acceptance scenario waits for the no-lease runtime status to show
+that staged writable handles were actually reclaimed before asserting the
+fresh version. It does not treat close returning as RELEASE dispatch and does
+not weaken the content assertion.
+
 ## Space and negative observations
 
 | Observation | Baseline | Optimized |
