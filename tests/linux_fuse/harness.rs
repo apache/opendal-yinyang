@@ -375,15 +375,32 @@ impl Fixture {
         }
     }
 
-    /// Wait until the mount's RELEASE callbacks have reclaimed every clean
-    /// handle. Linux dispatches ordinary FUSE RELEASE work in the background,
-    /// so close returning does not prove the callback reached this process.
-    pub fn wait_for_no_handles(&self, config: &Path) -> String {
+    /// Capture the staging handles currently owned by this mount.
+    pub fn active_handle_ids(&self, config: &Path) -> Vec<uuid::Uuid> {
+        let staging = self.staging_path(config);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build status runtime");
+        runtime
+            .block_on(YinYangRuntime::inspect(&staging))
+            .expect("inspect staging without the runtime lease")
+            .handles
+            .into_iter()
+            .map(|handle| handle.id)
+            .collect()
+    }
+
+    /// Wait until the selected handles have been reclaimed by dispatch-visible
+    /// RELEASE callbacks. Other retained, dirty or live handles do not confuse
+    /// this boundary.
+    pub fn wait_for_handles_retired(&self, config: &Path, handles: &[uuid::Uuid]) -> String {
+        assert!(
+            !handles.is_empty(),
+            "release ordering requires at least one active handle"
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
-        let staging = self
-            .temp
-            .path()
-            .join(config.file_stem().expect("volume config has a file stem"));
+        let staging = self.staging_path(config);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -393,16 +410,26 @@ impl Fixture {
                 .block_on(YinYangRuntime::inspect(&staging))
                 .expect("inspect staging without the runtime lease");
             let text = format!("{status:#?}");
-            if status.handles.is_empty() {
+            if !status
+                .handles
+                .iter()
+                .any(|handle| handles.contains(&handle.id))
+            {
                 return text;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "FUSE release callbacks did not reclaim all clean handles within 30s; last yy status:\n{text}"
+                    "FUSE RELEASE callbacks did not reclaim the selected handles within 30s; selected={handles:?}, last yy status:\n{text}"
                 );
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn staging_path(&self, config: &Path) -> PathBuf {
+        self.temp
+            .path()
+            .join(config.file_stem().expect("volume config has a file stem"))
     }
 
     /// Writes a strict volume config and returns its path. Rewriting the same
