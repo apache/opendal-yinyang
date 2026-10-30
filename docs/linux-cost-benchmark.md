@@ -177,6 +177,10 @@ matched baseline and optimized runs. The complete-source fallback in the
 baseline is expected to read and publish most of the file for each length
 change, while `required` mode rejects that behavior.
 
+The accepted matched result, binary identities, per-operation traffic, staging
+tradeoff, and negative observations are in
+[`linux-length-changing-write-results.md`](linux-length-changing-write-results.md).
+
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
 materialized staging file and publishes a new complete content version. These
