@@ -849,6 +849,7 @@ fn external_changes(fixture: &Fixture) {
         "pread past the old EOF must not leak bytes from the externally grown file"
     );
     drop(old);
+    fixture.wait_for_no_handles(&config);
     let mut fresh = File::open(mounted.mountpoint().join("external.txt"))
         .expect("reopen externally grown file on the live mount");
     let mut fresh_bytes = Vec::new();
@@ -927,6 +928,7 @@ fn external_changes(fixture: &Fixture) {
     );
     assert_eq!(&tail, b"89");
     drop(old_shrink);
+    fixture.wait_for_no_handles(&config);
     let mut fresh_shrink = File::open(reopen.mountpoint().join("shrink.txt"))
         .expect("reopen externally shrunk file on the live mount");
     let mut fresh_shrink_bytes = Vec::new();
@@ -1013,6 +1015,7 @@ fn fresh_open_after_release(fixture: &Fixture) {
             "release-order pinned descriptor",
         );
         drop(old);
+        fixture.wait_for_no_handles(&config);
 
         let mut fresh = File::open(&path).expect("open release-order file after close");
         let mut after = Vec::new();
