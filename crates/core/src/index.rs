@@ -665,13 +665,18 @@ mod tests {
     async fn duplicate_child_reference_is_revalidated_for_each_separator() {
         let backend = TestBackend::default();
         let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
-        let child = Page::Leaf(vec![(b"a".to_vec(), Value::Inline(vec![1]))])
-            .write(&store)
-            .await
-            .unwrap();
+        let entries = (0_u8..16)
+            .map(|index| {
+                (
+                    format!("key-{index:02}").into_bytes(),
+                    Value::Inline(vec![index]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let child = Page::Leaf(entries).write(&store).await.unwrap();
         let root = Page::Branch(
             1,
-            vec![(b"a".to_vec(), child.clone()), (b"b".to_vec(), child)],
+            vec![(b"key-15".to_vec(), child.clone()), (b"zz".to_vec(), child)],
         )
         .write(&store)
         .await
