@@ -308,6 +308,13 @@ impl Authority for crate::service::ServiceClient {
     fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
         Box::pin(self.observe_revision(r))
     }
+    fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<RevisionPage>> {
+        Box::pin(self.retained_revisions_page(after, limit))
+    }
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
