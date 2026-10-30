@@ -650,7 +650,7 @@ pub fn text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn output_text(output: &Output) -> String {
+pub fn output_text(output: &Output) -> String {
     format!(
         "status: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,

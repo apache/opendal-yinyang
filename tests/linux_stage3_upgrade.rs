@@ -20,12 +20,14 @@
 #![cfg(target_os = "linux")]
 
 #[path = "support/process.rs"]
+#[allow(dead_code)]
 mod process;
 #[path = "support/raw_s3.rs"]
 mod raw_s3;
 #[path = "support/s3_gate.rs"]
 mod s3_gate;
 #[path = "support/upgrade.rs"]
+#[allow(dead_code)]
 mod upgrade;
 
 use borsh::BorshDeserialize;

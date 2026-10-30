@@ -26,6 +26,7 @@ mod raw_s3;
 #[allow(dead_code)]
 mod s3_gate;
 #[path = "support/upgrade.rs"]
+#[allow(dead_code)]
 mod upgrade;
 
 use borsh::BorshDeserialize;
@@ -33,15 +34,15 @@ use s3_gate::{CommitAction, S3Gate};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Instant;
 use upgrade::{
     RemoteCleanup, ServiceProcess, Storage, assert_no_installed_writer, assert_receipt,
     assert_sqlite_integrity, assert_storage_inventory_complete_when_empty, current_yy_command,
-    field, handle_line, install_release, open_handle, parse_file_commit, path_text, read_handle,
-    receipt, require_environment, run_file_ok, run_ok, sha256_file, switch_current, target_source,
-    text, transaction_identity, volume_command, volume_file_command, wait_gate_or_child_exit,
-    write_config, write_optional_evidence,
+    field, handle_line, install_release, open_handle, output_text, parse_file_commit, path_text,
+    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file, switch_current,
+    target_source, text, transaction_identity, volume_command, volume_file_command,
+    wait_gate_or_child_exit, write_config, write_optional_evidence,
 };
 
 const LEGACY_SOURCE: &str = "fd1338c2f924a90e9da752b9158e748d1d3acaf4";
