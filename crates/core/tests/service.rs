@@ -170,7 +170,7 @@ async fn suite(fs: &dyn Authority) {
         ContentEdit::new(2..6, b"CDEF").unwrap(),
         ContentEdit::new(9..13, b"tail").unwrap(),
     ];
-    let extended = Authority::prepare_update(&fs, &selected, 4, 13, &length_edits)
+    let extended = Authority::prepare_update(fs, &selected, 4, 13, &length_edits)
         .await
         .unwrap();
     let expected = b"12CDEF\0\0\0tail";
