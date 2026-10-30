@@ -148,7 +148,7 @@ fn generate_stage3_fixture_from_546f419() {
     let storage = Storage::new();
     let mut cleanup = RemoteCleanup::new();
 
-    let mut object = create_authority(&storage, &producer, work.path(), &mut cleanup, "object", 11);
+    let object = create_authority(&storage, &producer, work.path(), &mut cleanup, "object", 11);
     let clean_handle = open_handle(
         &producer,
         &storage,
@@ -236,7 +236,7 @@ fn generate_stage3_fixture_from_546f419() {
     splice(&mut pending_bytes, 149_990, b"zero-extended-tail");
     assert_eq!(pending_bytes.len(), PENDING_LENGTH);
 
-    let mut frozen = create_authority(&storage, &producer, work.path(), &mut cleanup, "frozen", 23);
+    let frozen = create_authority(&storage, &producer, work.path(), &mut cleanup, "frozen", 23);
     let frozen_handle = open_handle(
         &producer,
         &storage,
@@ -264,7 +264,7 @@ fn generate_stage3_fixture_from_546f419() {
     let mut frozen_bytes = frozen.base_bytes.clone();
     splice(&mut frozen_bytes, 4096, b"frozen-request-before-commit");
 
-    let mut unknown = create_authority(
+    let unknown = create_authority(
         &storage,
         &producer,
         work.path(),
@@ -328,7 +328,7 @@ fn generate_stage3_fixture_from_546f419() {
             .expect("service metadata database parent"),
     )
     .expect("create service metadata directory");
-    let mut service = ServiceProcess::start(&producer, &storage, &service_root, &service_database);
+    let service = ServiceProcess::start(&producer, &storage, &service_root, &service_database);
     let service_config = work.path().join("service-volume.json");
     write_config(
         &service_config,
@@ -1986,11 +1986,13 @@ impl ServiceProcess {
             .recv_timeout(Duration::from_secs(60))
             .expect("stage-3 metadata service readiness timeout");
         read.expect("read stage-3 metadata service readiness");
-        let actual = line
+        let actual = match line
             .trim()
             .strip_prefix("metadata service listening on ")
             .and_then(|value| value.parse::<SocketAddr>().ok())
-            .unwrap_or_else(|| {
+        {
+            Some(address) => address,
+            None => {
                 let _ = child.kill();
                 let status = child.wait().expect("wait for failed stage-3 service");
                 let stderr = stderr.join().unwrap_or_default();
@@ -1998,7 +2000,8 @@ impl ServiceProcess {
                     "unexpected stage-3 metadata service readiness {line:?} with {status}:\n{}",
                     String::from_utf8_lossy(&stderr)
                 );
-            });
+            }
+        };
         Self {
             child: Some(child),
             stderr: Some(stderr),
