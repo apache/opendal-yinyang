@@ -105,7 +105,7 @@ transitions. The current repository accepts this bounded matrix:
 
 | Local state | Current identifiers | Existing transition boundary |
 | --- | --- | --- |
-| File staging | `yinyang-stage-1`, `yinyang-stage-2`, `yinyang-stage-3` | Exact stage-1/2 schemas upgrade transactionally to stage-3; old handles retain full-chunks semantics and read-only inspection accepts all three. |
+| File staging | `yinyang-stage-1`, `yinyang-stage-2`, `yinyang-stage-3` | Exact stage-1/2 schemas upgrade transactionally to stage-3; stage-3 bases/segments carry same-length and bounded length-changing publication without a new profile; old handles retain full-chunks semantics and read-only inspection accepts all three. |
 | Sync journal | `yinyang-sync-1`, `yinyang-sync-2` | Exact sync-1 schema upgrades once to sync-2 in a SQLite transaction; read-only inspection accepts both. |
 | Directory publication | `yinyang-directory-1` | The exact schema is read; there is no journal schema migration. Retained intents remain replayable. |
 | Directory replica | `yinyang-directory-replica-1` | Known base schemas and additive columns upgrade transactionally; required/unknown shapes are rejected. |
