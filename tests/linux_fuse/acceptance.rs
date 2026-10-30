@@ -966,6 +966,79 @@ fn external_changes(fixture: &Fixture) {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_external_growth_fresh_open_after_release_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        fresh_open_after_release(&Fixture::new(publication));
+    }
+}
+
+fn fresh_open_after_release(fixture: &Fixture) {
+    let suffix = fixture.publication().as_str();
+    let library = fixture.volume_config(
+        &format!("lib-release-order-{suffix}"),
+        Frontend::Library,
+        false,
+    );
+    let mut expected = b"release-order-initial".to_vec();
+    fixture.library_seed(&library, "release-order.txt", &expected);
+    let config = fixture.volume_config(
+        &format!("stage-release-order-{suffix}"),
+        Frontend::Fuse,
+        false,
+    );
+    let mountpoint = fixture
+        .temp
+        .path()
+        .join(format!("mnt-release-order-{suffix}"));
+    fs::create_dir(&mountpoint).expect("create release-order mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("release-order.txt");
+
+    for round in 0..32 {
+        let mut old = File::open(&path).expect("open release-order descriptor");
+        let mut before = Vec::new();
+        old.read_to_end(&mut before)
+            .expect("read release-order descriptor");
+        assert_eq!(
+            before, expected,
+            "round {round}: descriptor did not observe the preceding fresh open"
+        );
+
+        let next = format!("release-order-{round:02}-{}", "x".repeat(5 + round % 11)).into_bytes();
+        fixture.remote_write(&library, "release-order.txt", &next);
+        assert_staged_size(
+            &path,
+            &old,
+            expected.len() as u64,
+            "release-order pinned descriptor",
+        );
+        drop(old);
+
+        let mut fresh = File::open(&path).expect("open release-order file after close");
+        let mut after = Vec::new();
+        fresh
+            .read_to_end(&mut after)
+            .expect("read release-order file after close");
+        assert_eq!(
+            after, next,
+            "round {round}: fresh open reused the retired pinned version"
+        );
+        assert_eq!(
+            fresh
+                .metadata()
+                .expect("fstat release-order fresh open")
+                .len(),
+            next.len() as u64,
+            "round {round}: fresh open retained stale cached attributes"
+        );
+        drop(fresh);
+        expected = next;
+    }
+    mounted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
 fn fuse_sighup_refreshes_namespace_without_rebasing_old_fd_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         for read_only in [false, true] {
