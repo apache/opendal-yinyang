@@ -25,22 +25,28 @@ mod process;
 mod raw_s3;
 #[path = "support/s3_gate.rs"]
 mod s3_gate;
+#[path = "support/upgrade.rs"]
+mod upgrade;
 
 use borsh::BorshDeserialize;
-use process::{Captured, run_timeout};
+use process::run_timeout;
 use raw_s3::RawS3;
 use s3_gate::{CommitAction, S3Gate};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Instant;
+use upgrade::{
+    PROCESS_TIMEOUT, RemoteCleanup, ServiceProcess, Storage, assert_receipt,
+    assert_sqlite_integrity, field, handle_line, open_handle, parse_file_commit, path_text,
+    read_handle, receipt, require_environment, run_file_ok, run_ok, sha256_file,
+    sqlite_journal_mode, target_source, transaction_identity, volume_command, volume_file_command,
+    wait_gate_or_child_exit, wal_path, write_config, write_optional_evidence,
+};
 
 const PRODUCER_SOURCE: &str = "546f419f9158e156f9a561822f3cb3f307222584";
 const PRODUCER_TREE: &str = "ba7c7f2c3bbebd16c01891bc2361d9d36217d503";
@@ -53,8 +59,6 @@ const PRODUCER_ARCHIVE_BINARY_SHA256: &str =
 const FIXTURE_SCHEMA: &str = "yinyang.compatibility.stage3-fixture.v1";
 const EXPECTED_SCHEMA: &str = "yinyang.compatibility.stage3-expected.v1";
 const UPGRADE_SCHEMA: &str = "yinyang.linux-stage3-upgrade.v1";
-const SERVICE_TOKEN: &str = "stage3-fixture-service-token-with-at-least-32-bytes";
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
 const BASE_LENGTH: usize = 200_000;
 const PENDING_LENGTH: usize = 150_008;
 const SERVICE_LENGTH: usize = 131_072;
@@ -82,12 +86,6 @@ struct Authority {
     staging: PathBuf,
     base_bytes: Vec<u8>,
     base_revision: String,
-}
-
-struct ServiceProcess {
-    child: Option<Child>,
-    stderr: Option<thread::JoinHandle<Vec<u8>>>,
-    address: SocketAddr,
 }
 
 #[test]
@@ -119,7 +117,7 @@ fn generate_stage3_fixture_from_546f419() {
         "fixture output already exists and must not be replaced: {}",
         output.display()
     );
-    require_s3_environment();
+    require_environment(&[], "stage-3 compatibility");
 
     let producer_sha = sha256_file(&producer);
     let binary_identity = if producer_sha == PRODUCER_ARCHIVE_BINARY_SHA256 {
@@ -145,8 +143,8 @@ fn generate_stage3_fixture_from_546f419() {
         .tempdir_in(output_parent)
         .expect("create staged fixture output");
     let work = tempfile::tempdir().expect("create stage-3 fixture work directory");
-    let storage = Storage::new();
-    let mut cleanup = RemoteCleanup::new();
+    let storage = Storage::new("stage-3 compatibility");
+    let mut cleanup = RemoteCleanup::new(Vec::new());
 
     let object = create_authority(&storage, &producer, work.path(), &mut cleanup, "object", 11);
     let clean_handle = open_handle(
@@ -318,7 +316,7 @@ fn generate_stage3_fixture_from_546f419() {
 
     let service_root = storage.root("service");
     run_ok(
-        &mut storage.command(&producer, &["create"], &service_root, Some(SERVICE_TOKEN)),
+        &mut storage.command(&producer, &["create"], &service_root, None),
         "create stage-3 service authority",
     );
     let service_database = work.path().join("service/metadata.db");
@@ -509,7 +507,10 @@ fn generate_stage3_fixture_from_546f419() {
 #[test]
 #[ignore = "requires isolated S3 and YY_UPGRADE_BIN naming the installed target archive binary"]
 fn installed_stage3_upgrade_preserves_sparse_segments_and_service_wal() {
-    require_s3_environment();
+    require_environment(
+        &["YY_UPGRADE_BIN", "YY_UPGRADE_RELEASE"],
+        "installed stage-3 upgrade",
+    );
     let target = PathBuf::from(
         std::env::var_os("YY_UPGRADE_BIN")
             .expect("YY_UPGRADE_BIN must name the installed target binary"),
@@ -526,8 +527,8 @@ fn installed_stage3_upgrade_preserves_sparse_segments_and_service_wal() {
     let fixture = verify_fixture(&root).expect("verify stage-3 compatibility fixture");
     let expected: Value = read_json(&root.join("expected.json"));
     let temp = tempfile::tempdir().expect("create installed stage-3 upgrade directory");
-    let storage = Storage::new();
-    let mut cleanup = RemoteCleanup::new();
+    let storage = Storage::new("installed stage-3 upgrade");
+    let mut cleanup = RemoteCleanup::new(Vec::new());
 
     let object = materialize_component(
         &storage,
@@ -870,7 +871,7 @@ fn installed_stage3_upgrade_preserves_sparse_segments_and_service_wal() {
             "doctor": doctor["status"],
         },
     });
-    write_optional_evidence(&evidence);
+    write_optional_evidence("YINYANG_STAGE3_EVIDENCE", &evidence);
     println!(
         "linux-stage3-upgrade: {}",
         serde_json::to_string(&evidence).expect("serialize stage-3 evidence")
@@ -1103,58 +1104,6 @@ fn lose_commit_response(binary: &Path, storage: &Storage, root: &str, config: &P
     drop(gate);
 }
 
-fn wait_gate_or_child_exit(gate: &S3Gate, child: &mut Child, context: &str) {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        if gate.wait_intercepted_timeout(Duration::from_millis(100)) {
-            return;
-        }
-        if let Some(status) = child.try_wait().expect("poll stage-3 gated child") {
-            let mut stdout = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)
-                    .expect("read stage-3 gated stdout");
-            }
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                pipe.read_to_end(&mut stderr)
-                    .expect("read stage-3 gated stderr");
-            }
-            panic!(
-                "{context} exited before the S3 gate intercepted its commit: {status}\n\
-                 stdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            );
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{context} did not reach the S3 gate within 90s"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn open_handle(
-    binary: &Path,
-    storage: &Storage,
-    root: &str,
-    config: &Path,
-    path: &str,
-    write: bool,
-) -> String {
-    let mut command = volume_file_command(binary, storage, root, config);
-    command.args(["open", path]);
-    if write {
-        command.arg("--write");
-    }
-    let output = run_ok(&mut command, &format!("open stage-3 file {path}"));
-    String::from_utf8(output.stdout)
-        .expect("stage-3 file handle is UTF-8")
-        .trim()
-        .to_owned()
-}
-
 fn write_bytes(
     binary: &Path,
     storage: &Storage,
@@ -1217,29 +1166,12 @@ fn truncate_handle(
     );
 }
 
-fn read_handle(
-    binary: &Path,
-    storage: &Storage,
-    root: &str,
-    config: &Path,
-    handle: &str,
-) -> Captured {
-    run_file_ok(binary, storage, root, config, &["read", handle])
-}
-
 fn status(binary: &Path, storage: &Storage, root: &str, config: &Path) -> String {
     let output = run_ok(
         volume_command(binary, storage, root, config, None).args(["status"]),
         "inspect stage-3 volume",
     );
     String::from_utf8(output.stdout).expect("stage-3 status is UTF-8")
-}
-
-fn handle_line<'a>(status: &'a str, handle: &str) -> &'a str {
-    status
-        .lines()
-        .find(|line| line.starts_with(&format!("handle: {handle} ")))
-        .unwrap_or_else(|| panic!("handle {handle} is missing from status:\n{status}"))
 }
 
 fn stage_identity(database: &Path, handle: &str) -> (String, String) {
@@ -1256,12 +1188,7 @@ fn stage_identity(database: &Path, handle: &str) -> (String, String) {
         .expect("read frozen stage-3 handle record");
     let record: StageRecord = borsh::from_slice(&bytes).expect("decode stage-3 handle record");
     let plan = record.plan.expect("handle must retain a frozen request");
-    let (_, commit, digest) =
-        yinyang_core::Transaction::inspect_identity(&plan).expect("inspect frozen transaction");
-    (
-        uuid::Uuid::from_bytes(*commit.as_bytes()).to_string(),
-        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
-    )
+    transaction_identity(&plan)
 }
 
 fn stage_segment_ranges(database: &Path, handle: &str) -> Vec<(u64, u64)> {
@@ -1282,65 +1209,6 @@ fn stage_segment_ranges(database: &Path, handle: &str) -> Vec<(u64, u64)> {
         .expect("query stage-3 segments")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("read stage-3 segments")
-}
-
-fn parse_file_commit(stdout: &[u8]) -> String {
-    String::from_utf8(stdout.to_vec())
-        .expect("file fsync output is UTF-8")
-        .trim()
-        .strip_prefix("committed: ")
-        .and_then(|line| line.split(" revision: ").next())
-        .expect("file fsync commit")
-        .to_owned()
-}
-
-fn receipt(binary: &Path, storage: &Storage, root: &str, commit: &str) -> BTreeMap<String, String> {
-    let output = run_ok(
-        &mut storage.command(binary, &["receipt", commit], root, None),
-        "query stage-3 receipt",
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_once(": "))
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect()
-}
-
-fn assert_receipt(binary: &Path, storage: &Storage, root: &str, commit: &str, digest: &str) {
-    let receipt = receipt(binary, storage, root, commit);
-    assert_eq!(field(&receipt, "commit"), commit);
-    assert_eq!(field(&receipt, "request digest"), digest);
-}
-
-fn field<'a>(values: &'a BTreeMap<String, String>, name: &str) -> &'a str {
-    values
-        .get(name)
-        .unwrap_or_else(|| panic!("missing {name:?} in receipt fields {values:?}"))
-}
-
-fn write_config(
-    path: &Path,
-    name: &str,
-    access: &str,
-    staging: &Path,
-    publication: &str,
-    service: Option<&str>,
-) {
-    let mut document = json!({
-        "name": name,
-        "model": "managed",
-        "access": access,
-        "frontend": "library",
-        "publication": publication,
-        "storage_profile": "minio",
-        "staging": staging,
-        "read_only": false,
-        "require": [],
-    });
-    if let Some(service) = service {
-        document["service_address"] = Value::String(service.to_owned());
-    }
-    write_json(path, &document);
 }
 
 fn write_service_config(path: &Path, source: &Path, fixture: &Path) {
@@ -1608,29 +1476,6 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
-fn wal_path(database: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-wal", database.display()))
-}
-
-fn sqlite_journal_mode(database: &Path) -> String {
-    let connection =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open service fixture database read-only");
-    connection
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .expect("read service fixture journal mode")
-}
-
-fn assert_sqlite_integrity(database: &Path) {
-    let connection =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open target service database read-only");
-    let result: String = connection
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .expect("run target service SQLite integrity_check");
-    assert_eq!(result, "ok");
-}
-
 fn pattern(length: usize, seed: u8) -> Vec<u8> {
     (0..length)
         .map(|index| seed.wrapping_add((index % 251) as u8))
@@ -1647,10 +1492,6 @@ fn sha256(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn sha256_file(path: &Path) -> String {
-    sha256(&fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())))
 }
 
 fn read_json(path: &Path) -> Value {
@@ -1692,352 +1533,4 @@ fn fixture_readme() -> &'static str {
      \n\
      `manifest.json` hashes every other file with SHA-256. `.gitattributes` keeps\n\
      the fixture bytes exact on every checkout platform.\n"
-}
-
-fn target_source() -> String {
-    if let Ok(source) = std::env::var("YINYANG_UPGRADE_SOURCE") {
-        return source;
-    }
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run git rev-parse for stage-3 target");
-    assert!(
-        output.status.success(),
-        "git rev-parse HEAD failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("stage-3 target source is UTF-8")
-        .trim()
-        .to_owned()
-}
-
-fn write_optional_evidence(value: &Value) {
-    let Some(path) = std::env::var_os("YINYANG_STAGE3_EVIDENCE").map(PathBuf::from) else {
-        return;
-    };
-    let temporary = path.with_extension("json.tmp");
-    write_json(&temporary, value);
-    fs::rename(&temporary, &path).unwrap_or_else(|error| {
-        panic!(
-            "atomically publish stage-3 evidence {}: {error}",
-            path.display()
-        )
-    });
-}
-
-fn require_s3_environment() {
-    for name in [
-        "YINYANG_S3_BUCKET",
-        "YINYANG_S3_ENDPOINT",
-        "YINYANG_S3_REGION",
-        "YINYANG_S3_ACCESS_KEY_ID",
-        "YINYANG_S3_SECRET_ACCESS_KEY",
-    ] {
-        assert!(
-            std::env::var_os(name).is_some(),
-            "{name} is unset; stage-3 compatibility fails hard instead of skipping"
-        );
-    }
-    assert_eq!(
-        std::env::var("YINYANG_STORAGE_PROFILE").as_deref(),
-        Ok("minio"),
-        "stage-3 fixture qualification uses isolated Silo storage"
-    );
-    assert!(
-        std::env::var("YINYANG_S3_ENDPOINT")
-            .expect("isolated S3 endpoint")
-            .starts_with("http://"),
-        "stage-3 fault injection requires the plain-HTTP Silo endpoint"
-    );
-}
-
-fn path_text(path: &Path) -> &str {
-    path.to_str().expect("stage-3 path is UTF-8")
-}
-
-fn volume_command(
-    binary: &Path,
-    storage: &Storage,
-    root: &str,
-    config: &Path,
-    token: Option<&str>,
-) -> Command {
-    let mut command = storage.command(binary, &[], root, token);
-    command.args(["--volume", path_text(config)]);
-    command
-}
-
-fn volume_file_command(binary: &Path, storage: &Storage, root: &str, config: &Path) -> Command {
-    let mut command = volume_command(binary, storage, root, config, None);
-    command.arg("file");
-    command
-}
-
-fn run_file_ok(
-    binary: &Path,
-    storage: &Storage,
-    root: &str,
-    config: &Path,
-    args: &[&str],
-) -> Captured {
-    run_ok(
-        volume_file_command(binary, storage, root, config).args(args),
-        &format!("installed stage-3 file {args:?}"),
-    )
-}
-
-fn run_ok(command: &mut Command, context: &str) -> Captured {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|error| panic!("{context}: spawn: {error}"));
-    let stdout = child.stdout.take().expect("stage-3 stdout");
-    let stderr = child.stderr.take().expect("stage-3 stderr");
-    let stdout = thread::spawn(move || read_all(stdout));
-    let stderr = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let status = child.wait().expect("wait after stage-3 timeout");
-                let stdout = stdout.join().unwrap_or_default();
-                let stderr = stderr.join().unwrap_or_default();
-                panic!(
-                    "{context} timed out after {PROCESS_TIMEOUT:?}: {status}\n\
-                     stdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{context}: wait: {error}");
-            }
-        }
-    };
-    let captured = Captured {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-    };
-    captured.success_or(context);
-    captured
-}
-
-fn read_all(mut reader: impl Read) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
-    bytes
-}
-
-struct Storage {
-    raw: RawS3,
-    variables: Vec<(&'static str, String)>,
-}
-
-impl Storage {
-    fn new() -> Self {
-        let mut variables = Vec::new();
-        for name in [
-            "YINYANG_S3_BUCKET",
-            "YINYANG_S3_ENDPOINT",
-            "YINYANG_S3_REGION",
-            "YINYANG_S3_ACCESS_KEY_ID",
-            "YINYANG_S3_SECRET_ACCESS_KEY",
-        ] {
-            variables.push((
-                name,
-                std::env::var(name)
-                    .unwrap_or_else(|_| panic!("{name} is required for stage-3 acceptance")),
-            ));
-        }
-        Self {
-            raw: RawS3::from_env(),
-            variables,
-        }
-    }
-
-    fn root(&self, label: &str) -> String {
-        format!(
-            "linux-stage3-upgrade/{label}-{}",
-            uuid::Uuid::new_v4().simple()
-        )
-    }
-
-    fn command(&self, binary: &Path, args: &[&str], root: &str, token: Option<&str>) -> Command {
-        let mut command = Command::new(binary);
-        for (name, value) in std::env::vars_os() {
-            if !name.to_string_lossy().starts_with("YINYANG_") {
-                command.env(name, value);
-            }
-        }
-        for (name, value) in &self.variables {
-            command.env(name, value);
-        }
-        command
-            .env("YINYANG_STORAGE_PROFILE", "minio")
-            .env("YINYANG_S3_ROOT", root)
-            .env("YINYANG_SERVICE_TOKEN", token.unwrap_or(SERVICE_TOKEN))
-            .args(args);
-        command
-    }
-}
-
-struct RemoteCleanup {
-    roots: Vec<String>,
-}
-
-impl RemoteCleanup {
-    fn new() -> Self {
-        Self { roots: Vec::new() }
-    }
-
-    fn add(&mut self, root: String) {
-        self.roots.push(root);
-    }
-
-    fn cleanup(&mut self) {
-        let raw = RawS3::from_env();
-        for root in self.roots.drain(..) {
-            for _ in 0..3 {
-                let keys = raw
-                    .inventory(&format!("{root}/"))
-                    .into_keys()
-                    .collect::<Vec<_>>();
-                if keys.is_empty() {
-                    break;
-                }
-                for key in keys {
-                    raw.delete(&key);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for RemoteCleanup {
-    fn drop(&mut self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cleanup()));
-    }
-}
-
-impl ServiceProcess {
-    fn start(binary: &Path, storage: &Storage, root: &str, database: &Path) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("reserve stage-3 metadata service port");
-        let address = listener
-            .local_addr()
-            .expect("stage-3 metadata service address");
-        drop(listener);
-        Self::start_at(binary, storage, root, database, address)
-    }
-
-    fn start_at(
-        binary: &Path,
-        storage: &Storage,
-        root: &str,
-        database: &Path,
-        address: SocketAddr,
-    ) -> Self {
-        let mut command = storage.command(
-            binary,
-            &[
-                "serve",
-                "--database",
-                path_text(database),
-                "--listen",
-                &address.to_string(),
-            ],
-            root,
-            Some(SERVICE_TOKEN),
-        );
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn stage-3 metadata service");
-        let stdout = child.stdout.take().expect("service stdout");
-        let stderr = child.stderr.take().expect("service stderr");
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            let result = reader.read_line(&mut line);
-            let _ = sender.send((result, line));
-            let mut rest = Vec::new();
-            let _ = reader.read_to_end(&mut rest);
-        });
-        let stderr = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = BufReader::new(stderr).read_to_end(&mut bytes);
-            bytes
-        });
-        let (read, line) = receiver
-            .recv_timeout(Duration::from_secs(60))
-            .expect("stage-3 metadata service readiness timeout");
-        read.expect("read stage-3 metadata service readiness");
-        let actual = match line
-            .trim()
-            .strip_prefix("metadata service listening on ")
-            .and_then(|value| value.parse::<SocketAddr>().ok())
-        {
-            Some(address) => address,
-            None => {
-                let _ = child.kill();
-                let status = child.wait().expect("wait for failed stage-3 service");
-                let stderr = stderr.join().unwrap_or_default();
-                panic!(
-                    "unexpected stage-3 metadata service readiness {line:?} with {status}:\n{}",
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-        };
-        Self {
-            child: Some(child),
-            stderr: Some(stderr),
-            address: actual,
-        }
-    }
-
-    fn kill_without_cleanup(mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.kill().expect("kill stage-3 metadata service");
-            let _ = child.wait();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
-        }
-    }
-
-    fn stop(mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
-        }
-    }
-}
-
-impl Drop for ServiceProcess {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(stderr) = self.stderr.take() {
-            let _ = stderr.join();
-        }
-    }
 }
