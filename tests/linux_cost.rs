@@ -1246,7 +1246,6 @@ fn run_length_changing_matrix(
     let writer_measured = measure_mount_operation(&meter, mounted.pid(), || {
         OpenOptions::new()
             .read(true)
-            .write(true)
             .append(true)
             .open(&path)
             .expect("open length-changing writer")

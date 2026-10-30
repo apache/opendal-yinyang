@@ -237,7 +237,6 @@ fn length_changing_shared_descriptors_and_remount(fixture: &Fixture) {
     let shared_reader = File::open(&path).expect("open shared read-only descriptor");
     let mut writer = OpenOptions::new()
         .read(true)
-        .write(true)
         .append(true)
         .open(&path)
         .expect("open append descriptor");
