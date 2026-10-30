@@ -1489,17 +1489,17 @@ fn run_length_changing_matrix(
             writer
                 .set_len(extended as u64)
                 .expect("extend after shrink");
-            let mut removed = vec![0xff_u8; 2 * RANGE_BYTES];
-            read_exact_at(&shared_reader, &mut removed, shrunk as u64);
-            assert!(
-                removed.iter().all(|byte| *byte == 0),
-                "shrink-then-extend resurrected bytes below the shortened EOF"
-            );
             writer.sync_all().expect("fsync shrink-then-extend");
         });
         shrink_extend_batch.push(measured);
         expected.truncate(shrunk);
         expected.resize(extended, 0);
+        let mut removed = vec![0xff_u8; 2 * RANGE_BYTES];
+        read_exact_at(&shared_reader, &mut removed, shrunk as u64);
+        assert!(
+            removed.iter().all(|byte| *byte == 0),
+            "shrink-then-extend resurrected bytes below the shortened EOF"
+        );
         assert_shared_length_and_remote(
             fixture,
             &path,
