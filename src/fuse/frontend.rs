@@ -322,6 +322,19 @@ impl Inner {
         guard(&self.files).get(&fh.0).cloned()
     }
 
+    /// Remove one kernel handle from the routing table on the FUSE dispatch
+    /// thread. With no request task still holding a cloned handle, this also
+    /// releases the Mount reference before the completion future is scheduled.
+    /// A request task that already cloned the handle retains its existing
+    /// Busy pin until that operation finishes. Reclamation remains asynchronous.
+    fn detach_file(&self, fh: FileHandle) -> Option<(NodeId, bool)> {
+        let removed = guard(&self.files).remove(&fh.0)?;
+        let node = removed.node;
+        let read_only = matches!(&removed.source, OpenSource::ReadOnly(_));
+        drop(removed);
+        Some((node, read_only))
+    }
+
     fn dir_cursor(&self, fh: FileHandle) -> Option<Arc<AsyncMutex<DirCursor>>> {
         guard(&self.dirs).get(&fh.0).cloned()
     }
@@ -334,10 +347,11 @@ impl Inner {
             .map_err(|e| core_errno(&e))
     }
 
-    /// Clear cached attributes before a read-only open can expose a new
-    /// immutable version through the same inode. Without this notification the
-    /// kernel can combine fresh READ bytes with a pre-transition cached length.
-    async fn invalidate_before_read_only_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
+    /// Clear cached attributes before an open can expose a different immutable
+    /// version or staged length through the same inode. Without this
+    /// notification the kernel can combine fresh READ bytes with a
+    /// pre-transition cached length.
+    async fn invalidate_before_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
         let Some(notifier) = guard(&self.notifier).clone() else {
             eprintln!(
                 "yy: fuse open: inode {} invalidation requested before notifier installation",
@@ -560,7 +574,7 @@ impl Inner {
             }
             return match self.mount.open_read_only_node(id).await {
                 Ok(file) => {
-                    if let Err(errno) = self.invalidate_before_read_only_open(ino).await {
+                    if let Err(errno) = self.invalidate_before_open(ino).await {
                         return reply.error(errno);
                     }
                     let fh = self.next_handle();
@@ -584,6 +598,10 @@ impl Inner {
             Ok(file) => {
                 if truncate && let Err(error) = file.truncate(0).await {
                     return reply.error(runtime_errno(&error));
+                }
+                if let Err(errno) = self.invalidate_before_open(ino).await {
+                    drop(file);
+                    return reply.error(errno);
                 }
                 let fh = self.next_handle();
                 guard(&self.files).insert(
@@ -1016,13 +1034,13 @@ impl Inner {
         }
     }
 
-    async fn release(&self, ino: INodeNo, fh: FileHandle, reply: ReplyEmpty) {
-        let Some(removed) = guard(&self.files).remove(&fh.0) else {
-            return reply.ok();
-        };
-        let node = removed.node;
-        let read_only = matches!(&removed.source, OpenSource::ReadOnly(_));
-        drop(removed);
+    async fn complete_release(
+        &self,
+        ino: INodeNo,
+        node: NodeId,
+        read_only: bool,
+        reply: ReplyEmpty,
+    ) {
         // Reclaim only the last clean reference so the next open observes the
         // current remote revision. A busy result means an interrupted read
         // still shares the node; that pinned version stays coherent and is
@@ -1621,8 +1639,15 @@ impl Filesystem for FuseFrontend {
         reply: ReplyEmpty,
     ) {
         let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.release(ino, fh, reply).await });
+        let Some((node, read_only)) = inner.detach_file(fh) else {
+            return reply.ok();
+        };
+        let completion = inner.clone();
+        inner.spawn(async move {
+            completion
+                .complete_release(ino, node, read_only, reply)
+                .await
+        });
     }
 
     fn fallocate(
@@ -1754,6 +1779,57 @@ mod tests {
         let latest = authority.observe_latest().await.unwrap();
         let attr = inner.snapshot_attr(&latest, id).await.unwrap();
         assert_eq!(attr.size, 6);
+    }
+
+    #[tokio::test]
+    async fn release_detach_drops_last_mount_ref_and_preserves_inflight_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let mount = Mount::open(authority.clone(), temp.path(), false)
+            .await
+            .unwrap();
+        let (id, _) = mount
+            .namespace()
+            .create_file_with_node(authority.root(), "file", false)
+            .await
+            .unwrap();
+        let file = mount.open_node(id, false).await.unwrap();
+        let inner = Inner::with_read_only(mount, tokio::runtime::Handle::current(), false);
+        let fh = FileHandle(1);
+        guard(&inner.files).insert(
+            fh.0,
+            Arc::new(OpenFile {
+                node: id,
+                source: OpenSource::Staged(file),
+                writable: false,
+            }),
+        );
+        assert_eq!(inner.detach_file(fh), Some((id, false)));
+        inner.mount.reclaim(id).await.unwrap();
+
+        let file = inner.mount.open_node(id, false).await.unwrap();
+        let fh = FileHandle(2);
+        guard(&inner.files).insert(
+            fh.0,
+            Arc::new(OpenFile {
+                node: id,
+                source: OpenSource::Staged(file),
+                writable: false,
+            }),
+        );
+        let request = inner.open_file(fh).unwrap();
+
+        assert_eq!(inner.detach_file(fh), Some((id, false)));
+        let error = inner.mount.reclaim(id).await.unwrap_err();
+        assert_eq!(error.kind(), crate::runtime::ErrorKind::Busy);
+
+        drop(request);
+        inner.mount.reclaim(id).await.unwrap();
     }
 
     #[tokio::test]

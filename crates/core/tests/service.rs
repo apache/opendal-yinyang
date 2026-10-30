@@ -162,6 +162,26 @@ async fn suite(fs: &dyn Authority) {
         .await
         .unwrap();
     assert_eq!(bytes, b"1234inal");
+
+    // A length-changing update preserves only the explicit base prefix.
+    let latest = fs.observe_latest().await.unwrap();
+    let selected = latest.open_file(a).await.unwrap();
+    let length_edits = [
+        ContentEdit::new(2..6, b"CDEF").unwrap(),
+        ContentEdit::new(9..13, b"tail").unwrap(),
+    ];
+    let extended = Authority::prepare_update(fs, &selected, 4, 13, &length_edits)
+        .await
+        .unwrap();
+    let expected = b"12CDEF\0\0\0tail";
+    let canonical = fs.data().prepare(&mut expected.as_slice()).await.unwrap();
+    assert_eq!(extended.content_id(), canonical.content_id());
+    let mut bytes = Vec::new();
+    fs.data()
+        .read_range(extended.descriptor(), 0..13, &mut bytes)
+        .await
+        .unwrap();
+    assert_eq!(bytes, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -259,8 +279,59 @@ async fn authenticated_service_protocol_and_restart() {
     assert!(backend.state.lock().unwrap().fail_after_head_write);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_revision_history_is_paginated_through_the_service_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    for name in ["one", "two", "three"] {
+        let mut plan = Planner::new(
+            &service.observe_latest().await.unwrap(),
+            CommitId::generate(),
+        );
+        plan.create_directory(service.root(), name).await.unwrap();
+        committed(service.commit(&plan.finish().unwrap()).await.unwrap());
+    }
+    let expected = service.retained_revisions().await.unwrap();
+    assert_eq!(expected.len(), 4);
+
+    let token = "test-only-service-token-32-bytes-long";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, service.clone(), token.into()));
+    let client = ServiceClient::connect(addr, token.into(), backend.operator())
+        .await
+        .unwrap();
+
+    let first = client.retained_revisions_page(None, 2).await.unwrap();
+    assert_eq!(first.revisions, expected[..2]);
+    let cursor = first
+        .next
+        .expect("two of four revisions have a continuation");
+    let second = client
+        .retained_revisions_page(Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.revisions, expected[2..]);
+    assert_eq!(second.next, None);
+    assert_eq!(
+        client
+            .retained_revisions_page(None, 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
+    use yinyang_core::data::{BLOCK_BYTES, MAX_UPDATE_UNITS};
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("metadata.db");
     let backend = TestBackend::default();
@@ -295,6 +366,22 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
         .await
         .unwrap();
     let full_bytes = base.descriptor().content_id().length();
+    backend.state.lock().unwrap().data_reads = 0;
+    backend.state.lock().unwrap().written_bytes = 0;
+    assert_eq!(
+        client
+            .prepare_update(&base, 0, (MAX_UPDATE_UNITS + 1) * BLOCK_BYTES as u64, &[],)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    {
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.data_reads, 0);
+        assert_eq!(state.written_bytes, 0);
+    }
+
     let mut later = Planner::new(
         &client.observe_latest().await.unwrap(),
         CommitId::generate(),
@@ -359,11 +446,11 @@ async fn service_rejects_unregistered_content_and_missing_guards() {
             .await
             .unwrap(),
     );
-    assert_eq!(
-        service.retained_revisions().await.unwrap_err().kind(),
-        ErrorKind::Unsupported
-    );
     let snapshot = service.observe_latest().await.unwrap();
+    assert_eq!(
+        service.retained_revisions().await.unwrap(),
+        vec![snapshot.revision()]
+    );
     let content = service
         .data()
         .prepare(&mut b"unregistered".as_slice())

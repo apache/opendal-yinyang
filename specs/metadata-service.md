@@ -50,6 +50,13 @@ An unknown marker profile is `Unsupported`; malformed `YYSERV01` bytes are
 frozen-request restoration. `Snapshot`, `Planner`, `Transaction`, receipts,
 changes, and revision/scan tokens are shared with object mode.
 
+`Authority::retained_revisions_page` enumerates the durable revision table in
+strict token order. A page is limited to 256 revisions and uses the last
+returned revision as its exclusive continuation. Embedded inspection opens the
+existing SQLite database read-only with `query_only` enabled; it does not
+migrate, recover, take the writer transaction, or infer retained revisions from
+content packs. `ServiceClient` exposes the same bounded page contract.
+
 In-process preparation carries trusted `DataStore` evidence and records
 readiness durably. A client uploads through OpenDAL, then registers its content
 descriptor. The service fully verifies an untrusted descriptor before recording
@@ -57,21 +64,28 @@ readiness. Publication and restart use that persisted evidence; they do not
 download the file again. Credentials and prefix isolation must prevent external
 writers from mutating immutable published content, as in object mode.
 
-A same-length fixed-offset update has a separate trusted path.
-`Authority::prepare_overwrite` takes an exact `FileVersion` and bounded
-`ContentEdit` ranges. The embedded service applies the edits through its
-`DataStore`, verifies the new pack, and records durable readiness. The
-authenticated client does not register or import the whole result. Instead, its
-preparation request names the selected revision, NodeId, and edits; the server
-reopens that exact published base from SQLite metadata and applies the update
-itself. An unknown or unretained revision, missing or non-file NodeId, or
-different service binding fails before content payload reads. A retained older
-revision is a valid base; its original file predicates determine whether
-publication succeeds. The request is capped at 4096 edits and the existing
-16 MiB RPC frame. A larger update or any length-changing write uses
-complete-source preparation. Unchanged published extents retain their existing
-readiness; this path verifies affected proof paths and the newly written pack,
-not every unchanged extent.
+Trusted fixed-offset updates have a separate path. `Authority::prepare_overwrite`
+accepts an exact `FileVersion` and bounded `ContentEdit` ranges with unchanged
+logical length. `Authority::prepare_update` additionally accepts a preserved
+base prefix and final length; it retains only base bytes below that prefix,
+zero-fills the gap to the final length, and overlays the bounded edits. The
+embedded service applies either operation through its `DataStore`, verifies the
+new pack, and records durable readiness. The authenticated client does not
+register or import the whole result. Instead, its preparation request names the
+selected revision, NodeId, operation parameters, and edits; the server reopens
+that exact published base from SQLite metadata and applies the update itself.
+An unknown or unretained revision, missing or non-file NodeId, or different
+service binding fails before content payload reads. A retained older revision
+is a valid base; its original file predicates determine whether publication
+succeeds.
+
+The request is capped at 4096 edits and the existing 16 MiB RPC frame.
+`prepare_update` additionally rejects a final length whose generated zero and
+affected-unit work exceeds the shared 4096-unit budget before payload reads.
+Callers use `update_is_bounded` with the same rule before selecting the
+complete-source preparation fallback. Unchanged published extents retain their
+existing readiness; this path verifies affected proof paths and the newly
+written pack, not every unchanged extent.
 
 `Transaction::to_bytes` freezes the original observation, identity, predicates,
 and mutations. The experimental Borsh envelope is
@@ -104,13 +118,16 @@ A future remote deployment requires a separately specified secure transport.
 Each TCP connection carries one request/response. Frames are a big-endian u32
 length followed by Borsh, bounded to 16 MiB. Request fields are protocol version
 1, token string, and a tagged command. Commands observe latest/specific
-revision, read/scan records at a revision, register content, prepare a
-same-length overwrite from an exact published revision and NodeId, or commit
-frozen requests. Responses carry observations, records, readiness, prepared
-descriptors, typed outcomes, or typed errors. Maximum commit batch size and
-overwrite edit count are 4096; scans request at most 4097 records. The server
-handles at most 32 active connections, each with a 60-second timeout. This wire
-profile is experimental and is not a stable interoperability promise.
+revision, read/scan records at a revision, register content, prepare same-length
+or length-changing trusted updates from an exact published revision and NodeId,
+enumerate retained revisions, or commit frozen requests. Responses carry
+observations, records, readiness, prepared descriptors, typed outcomes,
+bounded revision pages, or typed errors. Maximum commit batch size, overwrite
+edit count, update edit count, and update generated-unit count are 4096; scans
+request at most 4097 records; history requests return at most 256 revisions.
+The server handles at most 32 active connections, each with a 60-second
+timeout. This wire profile is experimental and is not a stable interoperability
+promise.
 
 Protocol version 1 is the only supported request version. The server checks the
 token first, then returns `Unsupported` for a validly authenticated unknown
@@ -119,10 +136,11 @@ servers that implement different versions fail explicitly rather than
 negotiating down or sharing an authority.
 
 New command and response variants are appended to the version 1 tagged enums so
-existing variant tags do not change. Older servers do not understand the
-appended overwrite command and therefore require a matching server binary for
-this path. Existing register/observe/read/scan/commit traffic retains its prior
-encoding.
+existing variant tags do not change. The retained-history command and response
+follow the overwrite and update variants. Older servers do not understand the
+appended overwrite, update, or history commands and therefore require a
+matching server binary for these paths. Existing
+register/observe/read/scan/commit traffic retains its prior encoding.
 
 Error responses retain the existing tag order: Invalid=0, Corrupt=1,
 NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional

@@ -23,13 +23,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
+use yinyang::core::transaction::Planner;
 use yinyang::core::{
-    Authority, BackendProfile, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs, NodeId,
-    Revision, Snapshot, Transaction,
+    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs,
+    NodeId, Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
-    StagingBindingState, StagingState, inspect_bound_local_staging, plan_managed_retention,
+    MeasurementState, StagingBindingState, StagingState, inspect_bound_local_staging,
+    inspect_managed_space, plan_managed_retention,
 };
 use yinyang::sync::Sync;
 
@@ -210,6 +212,7 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
         .unwrap();
 
     assert_eq!(plan.policy.mode, "bounded");
+    assert_eq!(plan.policy.published_history, "retained_by_default");
     assert_eq!(plan.retained_revision_count, Some(3));
     assert!(!plan.deletion_authorized);
     assert_eq!(plan.reclaimable_bytes, None);
@@ -238,6 +241,53 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
             && !revision.selected
             && revision.reasons == ["outside_bounded_policy"]
     }));
+}
+
+#[tokio::test]
+async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let content = authority
+        .data()
+        .prepare(&mut b"reachable content".as_slice())
+        .await
+        .unwrap();
+    let mut plan = Planner::new(
+        &authority.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    plan.create_file(authority.root(), "file", content, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        authority.commit(&plan.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("absent");
+    let report = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
+        .await
+        .unwrap();
+    assert_eq!(report.schema, "yinyang.managed-space.report.v2");
+    assert!(!report.deletion_authorized);
+    assert_eq!(report.reclaimable_bytes, None);
+    assert_eq!(report.physical.state, MeasurementState::Partial);
+    assert!(report.physical.reachability.snapshot_descriptors >= 2);
+    assert!(report.physical.reachability.metadata_index_references > 0);
+    assert!(report.physical.reachability.content_extent_references > 0);
+    assert_eq!(
+        report.physical.coverage.payload_verification,
+        "content_index_authenticated_payload_not_read"
+    );
+    assert_eq!(
+        report.physical.root_external.state,
+        MeasurementState::Partial
+    );
+    assert_eq!(report.physical.root_external.packs, None);
 }
 
 fn hex(revision: Revision) -> String {

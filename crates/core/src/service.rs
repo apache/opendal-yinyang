@@ -18,6 +18,7 @@
 //! Durable single-authority metadata, independent of object-store head CAS.
 //! SQLite files must reside on a local filesystem that honors sync and locking.
 
+use crate::authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
 use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
 use crate::namespace::{Node, NodeKind, decode, encode};
 use crate::snapshot::{
@@ -216,6 +217,26 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
     .await
     .map_err(|e| Error::new(ErrorKind::Storage, "open metadata worker", e.to_string()))?
 }
+
+async fn connect_read_only(path: &Path) -> Result<Db> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(sql)?;
+        conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
+        conn.execute_batch("PRAGMA query_only=ON;").map_err(sql)?;
+        if !inspect_schema(&conn)? {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "open metadata authority",
+                "database is missing or uninitialized",
+            ));
+        }
+        Ok(Arc::new(Mutex::new(conn)))
+    })
+    .await
+    .map_err(|e| Error::new(ErrorKind::Storage, "open metadata worker", e.to_string()))?
+}
 fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
     let (profile, fs, root, revision): (String, Vec<u8>, Vec<u8>, Vec<u8>) = conn
         .query_row(
@@ -400,6 +421,75 @@ impl MetadataService {
         .await?;
         Ok(self.snapshot(db, revision))
     }
+    /// Read a bounded page from the durable retained revision index without
+    /// changing journal mode, taking the writer transaction, or recovering.
+    pub async fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> Result<RevisionPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(Error::unsupported(
+                "list retained revisions",
+                format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
+            ));
+        }
+        let db = connect_read_only(&self.path).await?;
+        let after = after.map(Revision::to_bytes);
+        let mut revisions = db_call(&db, move |conn| {
+            let limit = i64::from(limit) + 1;
+            let mut rows = Vec::new();
+            if let Some(after) = after.as_ref() {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT token,sequence FROM revisions
+                         WHERE token>?1 ORDER BY token LIMIT ?2",
+                    )
+                    .map_err(sql)?;
+                let values = statement
+                    .query_map(params![after.as_slice(), limit], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(sql)?;
+                for value in values {
+                    rows.push(value.map_err(sql)?);
+                }
+            } else {
+                let mut statement = conn
+                    .prepare("SELECT token,sequence FROM revisions ORDER BY token LIMIT ?1")
+                    .map_err(sql)?;
+                let values = statement
+                    .query_map(params![limit], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(sql)?;
+                for value in values {
+                    rows.push(value.map_err(sql)?);
+                }
+            }
+            rows.into_iter()
+                .map(|(token, sequence)| {
+                    let revision = Revision::from_bytes(fixed(token)?);
+                    if sequence < 0 || revision.sequence != sequence as u64 {
+                        return Err(corrupt_schema(
+                            "retained revision token disagrees with its sequence",
+                        ));
+                    }
+                    Ok(revision)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .await?;
+        let more = revisions.len() > limit as usize;
+        revisions.truncate(limit as usize);
+        if revisions.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(corrupt_schema(
+                "retained revisions are not strictly ordered",
+            ));
+        }
+        let next = more.then(|| *revisions.last().expect("a nonempty page has a cursor"));
+        Ok(RevisionPage { revisions, next })
+    }
     /// In-process preparation already carries this service's trusted evidence.
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
         let content = self.data.prepare(source).await?;
@@ -442,6 +532,59 @@ impl MetadataService {
         let content = self
             .data
             .overwrite_prepared_ranges(&base.prepared_content()?, edits)
+            .await?;
+        self.remember(&content).await?;
+        Ok(content)
+    }
+    /// Prepare a length-changing update from a published file version selected
+    /// by the caller. Reauthentication prevents a caller-supplied base
+    /// descriptor from becoming preparation authority.
+    pub async fn prepare_update(
+        &self,
+        base: &FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let snapshot = self.observe_revision(base.revision()).await?;
+        let selected = snapshot.open_file(base.node().id()).await?;
+        if selected.descriptor() != base.descriptor() {
+            return Err(Error::invalid(
+                "prepare metadata update",
+                "selected base is not in the referenced revision",
+            ));
+        }
+        self.prepare_update_from_version(&selected, preserved_prefix, final_length, edits)
+            .await
+    }
+    pub(crate) async fn prepare_update_version(
+        &self,
+        revision: Revision,
+        node: NodeId,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let snapshot = self.observe_revision(revision).await?;
+        let base = snapshot.open_file(node).await?;
+        self.prepare_update_from_version(&base, preserved_prefix, final_length, edits)
+            .await
+    }
+    async fn prepare_update_from_version(
+        &self,
+        base: &FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let content = self
+            .data
+            .update_prepared(
+                &base.prepared_content()?,
+                preserved_prefix,
+                final_length,
+                edits,
+            )
             .await?;
         self.remember(&content).await?;
         Ok(content)
@@ -721,6 +864,21 @@ mod admission_tests {
         let edit = ContentEdit::new(0..1, b"x").unwrap();
         let error = service
             .prepare_overwrite_version(Revision::from_bytes([0; 24]), NodeId::generate(), &[edit])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_update_revision_is_rejected_before_payload_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let error = service
+            .prepare_update_version(Revision::from_bytes([0; 24]), NodeId::generate(), 0, 1, &[])
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);

@@ -18,8 +18,8 @@ yy --volume CONFIG space retention plan [--keep-last N] [--keep REVISION]... [--
 volumes and their namespace objects are rejected before authority connection.
 The command is observation-only even when the volume configuration is writable.
 
-`space report --json` emits `yinyang.managed-space.report.v1`. `space retention
-plan --json` emits `yinyang.managed-retention.plan.v1`. Revisions are 24-byte
+`space report --json` emits `yinyang.managed-space.report.v2`. `space retention
+plan --json` emits `yinyang.managed-retention.plan.v2`. Revisions are 24-byte
 hexadecimal strings, filesystem identities are 16-byte hexadecimal strings,
 and enum values are `snake_case`. Unknown values are `null`; optional evidence
 is not represented by fabricated zeroes.
@@ -39,9 +39,10 @@ does not:
 
 Appropriate `retained_revisions` support is authority-specific. The object
 authority returns metadata-authenticated revisions from its existing history
-index. The built-in metadata service and service client do not expose a
-retained-revision enumeration operation, so they report retained-revision
-discovery as unavailable. The implementation does not infer history from local
+index. The metadata service and authenticated service client enumerate the
+durable revision table with bounded pages of at most 256 revisions. Embedded
+service reads use a read-only SQLite connection; client pages remain inside the
+existing 16 MiB RPC frame. The implementation does not infer history from local
 staging, current physical objects, or service absence.
 
 Opening a known SQLite database read-only may create an empty WAL file or
@@ -78,11 +79,43 @@ files, revisions, index pages, or extents refer to it. The byte count includes
 visible pack objects that may be metadata pages or orphaned preparation output;
 it is not a sum of logical file lengths.
 
-This implementation does not publicly enumerate every physical extent
-referenced by a snapshot. Therefore it cannot attribute pack bytes to a
-revision, prove that a pack is unreferenced, or calculate reclaimable bytes.
-`referenced_extents` is reported as unavailable and `reclaimable_bytes` is
-`null`.
+The report traverses authenticated physical references reachable from the
+observed authority roots:
+
+- object snapshots and retained snapshot descriptors;
+- every retained metadata B+ tree page and external value, including nodes,
+  directory entries, receipts, ordered changes, and the retained-history index;
+- every content hash-index node referenced by a published or historical
+  `ContentDescriptor`; and
+- content leaf extents as coverage references without downloading their
+  payloads.
+
+Only index and metadata pages are read and checksum-verified. Leaf payload
+extents are never fetched during reachability, so traversal proves index
+reachability and reference coverage, not payload scrub integrity. A missing,
+corrupt, foreign, or context-conflicting reference keeps the physical
+measurement partial; a partial traversal is never promoted to complete.
+
+`referenced_extents` is therefore
+`authenticated_index_references_without_payload_reads`. The report still
+cannot calculate reclaimable bytes: `reclaimable_bytes` is `null`.
+
+Physical coverage reports:
+
+- `observed_referenced_bytes`, the union of authenticated extent intervals,
+  including references to packs absent from the current-key listing;
+- `visible_referenced_bytes`, that union intersected with each visible pack's
+  current object length;
+- `visible_uncovered_bytes`, every visible pack byte minus
+  `visible_referenced_bytes`, including visible packs with zero references;
+- `fully_referenced_visible_packs` and
+  `partially_referenced_visible_packs`; and
+- separate missing and truncated reference-pack counts.
+
+`visible_uncovered_bytes` is not reclaimable. Packs with zero references are
+separately reported under `root_external` only when the root set is complete
+and the current-key listing is stable. That result is relative to the observed
+root set: it is not an orphan claim and never authorizes deletion.
 
 The object inventory is a recursive current-key listing, not an atomic
 snapshot. The report observes latest revision before and after inventory. A
@@ -166,6 +199,9 @@ directory walk is non-atomic.
 
 Retention defaults to `keep_all`. Supplying `--keep-last N` and/or one or more
 `--keep REVISION` values selects the bounded policy. `N` must be at least one.
+Every plan reports `published_history: "retained_by_default"`. Bounded
+selection does not delete, expire, or hide retained revisions, receipts, or
+their metadata roots.
 The selected set is the union of:
 
 - the latest observed revision;
@@ -233,7 +269,8 @@ The JSON documents preserve these distinctions:
 - `logical.live` is one latest immutable observation;
 - `logical.retained` is authority revision metadata and may be partial or
   unavailable;
-- `physical` is a non-atomic current-object listing;
+- `physical` contains a non-atomic current-object listing and the authenticated
+  reference/coverage traversal;
 - `staging` is read-only local evidence from configured existing paths;
 - `unresolved` identifies evidence that could not be observed; and
 - `limits` records accounting and authorization boundaries.
@@ -262,3 +299,6 @@ compaction, repacking, a persistent remote pin registry, background scheduling,
 or a release-supported storage reclamation promise. It does not inspect Direct
 namespaces. It does not make SQLite sidecar files byte-identical or infer
 noncurrent backend versions that the configured backend does not return.
+Reachability does not scrub content payloads, and a complete observed root set
+does not prove global orphanhood, external-reader absence, or deletion
+eligibility.

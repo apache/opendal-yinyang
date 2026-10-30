@@ -115,9 +115,13 @@ cargo x test-linux-fuse --read-only-range
 - Unsupported operations: symlink and hard link return an explicit OS error
   instead of advertising POSIX links.
 - External changes and dirty refresh: a descriptor opened before an external
-  grow/shrink keeps its pinned size, EOF and pread results, a fresh reopen
-  reflects the authoritative size, and a dirty descriptor keeps its staged
-  bytes while `fsync` reports failure instead of silently rebasing.
+  grow/shrink keeps its pinned size, EOF and pread results, and a dirty
+  descriptor keeps its staged bytes while `fsync` reports failure instead of
+  silently rebasing. Linux may dispatch ordinary FUSE RELEASE in the
+  background, so the fresh-open assertion waits until the staged writable
+  handles have actually left the no-lease runtime status; it does not treat
+  close returning as RELEASE dispatch. That fresh open then reflects the
+  authoritative size.
 - Concurrent mounts: two live `yy mount` processes on separate staging
   directories publish distinct files concurrently under a barrier, then read
   across each other's mounts.
@@ -151,7 +155,11 @@ cargo x test-linux-fuse --read-only-range
   test exercises the actual CLI spellings and versioned JSON documents. Report
   assertions require `deletion_authorized=false`, `reclaimable_bytes=null`,
   non-atomic inventory disclosure, and unknown noncurrent-version and
-  external-pin states.
+  external-pin states. They also require complete authenticated root traversal,
+  at least one observed content extent, explicit payload-not-read coverage,
+  root-relative zero-reference pack classification, and retained service
+  history. Retention plans must state that published history remains retained
+  by default under a bounded selection.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits
