@@ -375,30 +375,10 @@ impl Fixture {
         }
     }
 
-    /// Capture the staging handles currently owned by this mount.
-    pub fn active_handle_ids(&self, config: &Path) -> Vec<uuid::Uuid> {
-        let staging = self.staging_path(config);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build status runtime");
-        runtime
-            .block_on(YinYangRuntime::inspect(&staging))
-            .expect("inspect staging without the runtime lease")
-            .handles
-            .into_iter()
-            .map(|handle| handle.id)
-            .collect()
-    }
-
-    /// Wait until the selected handles have been reclaimed by dispatch-visible
-    /// RELEASE callbacks. Other retained, dirty or live handles do not confuse
-    /// this boundary.
-    pub fn wait_for_handles_retired(&self, config: &Path, handles: &[uuid::Uuid]) -> String {
-        assert!(
-            !handles.is_empty(),
-            "release ordering requires at least one active handle"
-        );
+    /// Wait until dispatch-visible FUSE RELEASE callbacks have reclaimed every
+    /// staged writable handle. Whole-volume read-only mounts keep observations
+    /// outside Runtime staging and do not use this helper.
+    pub fn wait_for_no_staged_handles(&self, config: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(30);
         let staging = self.staging_path(config);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -410,16 +390,12 @@ impl Fixture {
                 .block_on(YinYangRuntime::inspect(&staging))
                 .expect("inspect staging without the runtime lease");
             let text = format!("{status:#?}");
-            if !status
-                .handles
-                .iter()
-                .any(|handle| handles.contains(&handle.id))
-            {
+            if status.handles.is_empty() {
                 return text;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "FUSE RELEASE callbacks did not reclaim the selected handles within 30s; selected={handles:?}, last yy status:\n{text}"
+                    "FUSE RELEASE callbacks did not reclaim all staged writable handles within 30s; last yy status:\n{text}"
                 );
             }
             thread::sleep(Duration::from_millis(100));

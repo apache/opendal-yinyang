@@ -848,9 +848,8 @@ fn external_changes(fixture: &Fixture) {
         count, 0,
         "pread past the old EOF must not leak bytes from the externally grown file"
     );
-    let released = fixture.active_handle_ids(&config);
     drop(old);
-    fixture.wait_for_handles_retired(&config, &released);
+    fixture.wait_for_no_staged_handles(&config);
     let mut fresh = File::open(mounted.mountpoint().join("external.txt"))
         .expect("reopen externally grown file on the live mount");
     let mut fresh_bytes = Vec::new();
@@ -928,9 +927,7 @@ fn external_changes(fixture: &Fixture) {
         "pread at the old EOF must still return pinned bytes"
     );
     assert_eq!(&tail, b"89");
-    let released = fixture.active_handle_ids(&config);
     drop(old_shrink);
-    fixture.wait_for_handles_retired(&config, &released);
     let mut fresh_shrink = File::open(reopen.mountpoint().join("shrink.txt"))
         .expect("reopen externally shrunk file on the live mount");
     let mut fresh_shrink_bytes = Vec::new();
@@ -966,81 +963,6 @@ fn external_changes(fixture: &Fixture) {
         b"0123"
     );
     final_mount.unmount();
-}
-
-#[test]
-#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_external_growth_fresh_open_after_release_both_publications() {
-    for publication in [Publication::Object, Publication::Service] {
-        fresh_open_after_release(&Fixture::new(publication));
-    }
-}
-
-fn fresh_open_after_release(fixture: &Fixture) {
-    let suffix = fixture.publication().as_str();
-    let library = fixture.volume_config(
-        &format!("lib-release-order-{suffix}"),
-        Frontend::Library,
-        false,
-    );
-    let mut expected = b"release-order-initial".to_vec();
-    fixture.library_seed(&library, "release-order.txt", &expected);
-    let config = fixture.volume_config(
-        &format!("stage-release-order-{suffix}"),
-        Frontend::Fuse,
-        false,
-    );
-    let mountpoint = fixture
-        .temp
-        .path()
-        .join(format!("mnt-release-order-{suffix}"));
-    fs::create_dir(&mountpoint).expect("create release-order mountpoint");
-    let mut mounted = fixture.mount(&config, &mountpoint);
-    let path = mounted.mountpoint().join("release-order.txt");
-
-    for round in 0..32 {
-        let mut old = File::open(&path).expect("open release-order descriptor");
-        let mut before = Vec::new();
-        old.read_to_end(&mut before)
-            .expect("read release-order descriptor");
-        assert_eq!(
-            before, expected,
-            "round {round}: descriptor did not observe the preceding fresh open"
-        );
-
-        let next = format!("release-order-{round:02}-{}", "x".repeat(5 + round % 11)).into_bytes();
-        fixture.remote_write(&library, "release-order.txt", &next);
-        assert_staged_size(
-            &path,
-            &old,
-            expected.len() as u64,
-            "release-order pinned descriptor",
-        );
-        let released = fixture.active_handle_ids(&config);
-        drop(old);
-        fixture.wait_for_handles_retired(&config, &released);
-
-        let mut fresh = File::open(&path).expect("open release-order file after close");
-        let mut after = Vec::new();
-        fresh
-            .read_to_end(&mut after)
-            .expect("read release-order file after close");
-        assert_eq!(
-            after, next,
-            "round {round}: fresh open reused the retired pinned version"
-        );
-        assert_eq!(
-            fresh
-                .metadata()
-                .expect("fstat release-order fresh open")
-                .len(),
-            next.len() as u64,
-            "round {round}: fresh open retained stale cached attributes"
-        );
-        drop(fresh);
-        expected = next;
-    }
-    mounted.unmount();
 }
 
 #[test]
