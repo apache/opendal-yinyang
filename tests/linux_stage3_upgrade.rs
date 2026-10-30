@@ -307,7 +307,7 @@ fn generate_stage3_fixture_from_546f419() {
     assert!(handle_line(&frozen_status, &frozen_handle).contains("frozen: true"));
     let unknown_status = status(&producer, &storage, &unknown.root, &unknown.config);
     assert!(handle_line(&unknown_status, &unknown_handle).contains("frozen: true"));
-    assert!(handle_line(&unknown_status, &unknown_handle).contains("handle error:"));
+    assert!(unknown_status.contains("handle error:"));
 
     let (frozen_commit, frozen_digest) =
         stage_identity(&frozen.staging.join("staging.db"), &frozen_handle);
@@ -566,12 +566,9 @@ fn installed_stage3_upgrade_preserves_sparse_segments_and_service_wal() {
         true,
         true,
     );
-    assert_handle_state(
-        &unknown_status(&target, &storage, &unknown),
-        &expected["unknown"],
-        true,
-        true,
-    );
+    let unknown_status = unknown_status(&target, &storage, &unknown);
+    assert_handle_state(&unknown_status, &expected["unknown"], true, true);
+    assert!(unknown_status.contains("handle error:"));
 
     assert_handle_bytes(
         &target,
