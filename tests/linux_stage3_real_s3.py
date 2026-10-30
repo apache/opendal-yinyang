@@ -161,6 +161,7 @@ class Trial:
                 "release": self.archive_manifest["release"],
                 "archive_source_commit": self.archive_manifest["source_commit"],
                 "archive_yy_sha256": self.archive_manifest["yy_sha256"],
+                "archive_target": self.archive_manifest["target"],
                 "provenance": "installed-archive-build-manifest",
                 "source_matches_checkout": (
                     self.archive_manifest["source_commit"] == self.source
@@ -206,6 +207,10 @@ class Trial:
         if fields["schema"] != "yinyang-linux-release-artifact.v1":
             raise EnvelopeError(
                 f"unexpected BUILD-MANIFEST schema: {fields['schema']}"
+            )
+        if fields["target"] != "ubuntu-24.04-x86_64":
+            raise EnvelopeError(
+                f"unexpected BUILD-MANIFEST target: {fields['target']}"
             )
         actual_sha256 = binary_sha256(self.yy)
         if fields["yy_sha256"] != actual_sha256:

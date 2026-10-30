@@ -96,9 +96,48 @@ fn stage3_fixture_manifest_is_immutable() {
     let manifest = verify_fixture(&root).expect("verify stage-3 compatibility fixture");
     assert_eq!(manifest["schema"], FIXTURE_SCHEMA);
     assert_eq!(manifest["producer"]["commit"], PRODUCER_SOURCE);
+    assert_eq!(manifest["producer"]["tree"], PRODUCER_TREE);
+    assert_eq!(manifest["producer"]["release"], PRODUCER_RELEASE);
+    assert_eq!(manifest["producer"]["binary_identity"], "trial-archive");
     assert_eq!(
         producer_binary_sha(&manifest),
         PRODUCER_ARCHIVE_BINARY_SHA256
+    );
+    assert_eq!(
+        manifest["producer"]["trial_archive"]["name"],
+        PRODUCER_ARCHIVE
+    );
+    assert_eq!(
+        manifest["producer"]["trial_archive"]["sha256"],
+        PRODUCER_ARCHIVE_SHA256
+    );
+    assert_eq!(
+        manifest["producer"]["trial_archive"]["binary_sha256"],
+        PRODUCER_ARCHIVE_BINARY_SHA256
+    );
+    let expected: Value = read_json(&root.join("expected.json"));
+    assert_eq!(expected["schema"], EXPECTED_SCHEMA);
+    assert_eq!(
+        expected["object"]["clean"]["handle"],
+        manifest["fixture"]["object"]["clean_handle"]
+    );
+    assert_eq!(
+        expected["object"]["sparse"]["handle"],
+        manifest["fixture"]["object"]["sparse_handle"]
+    );
+    assert_eq!(
+        expected["frozen"]["commit"],
+        manifest["fixture"]["frozen"]["commit"]
+    );
+    assert_eq!(
+        expected["unknown"]["commit"],
+        manifest["fixture"]["unknown"]["commit"]
+    );
+    assert!(
+        expected["service"]["wal_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "stage-3 fixture must retain a non-empty service WAL"
     );
 }
 
