@@ -317,10 +317,6 @@ fn generate_stage3_fixture_from_546f419() {
     assert!(segment_ranges.len() >= 4, "{segment_ranges:?}");
 
     let service_root = storage.root("service");
-    run_ok(
-        &mut storage.command(&producer, &["create"], &service_root, None),
-        "create stage-3 service authority",
-    );
     let service_database = work.path().join("service/metadata.db");
     fs::create_dir_all(
         service_database
