@@ -1329,8 +1329,8 @@ fn interrupt_pending_fsync(
         let _ = sender.send(in_flight.sync_all());
     });
     gate.wait_ready(Duration::from_secs(30));
-    let frozen = fixture.wait_for_frozen(config);
-    println!("fsync reached the frozen publication boundary:\n{frozen}");
+    let (commit, frozen) = fixture.wait_for_frozen(config);
+    println!("fsync saved frozen commit {commit:?} at the publication boundary:\n{frozen}");
     match interrupt {
         Interrupt::Kill => mounted.kill_daemon_only(),
         Interrupt::Terminate => {
@@ -1431,8 +1431,8 @@ fn fuse_delayed_completion_survives_client_interruption_service() {
         .write_all(b"FSYNC\n")
         .expect("send fsync command");
     gate.wait_ready(Duration::from_secs(30));
-    let frozen = fixture.wait_for_frozen(&config);
-    println!("delayed fsync reached the frozen publication boundary:\n{frozen}");
+    let (commit, frozen) = fixture.wait_for_frozen(&config);
+    println!("delayed fsync saved frozen commit {commit:?} at the publication boundary:\n{frozen}");
     client.kill().expect("SIGKILL the blocked client");
     gate.release();
     let _ = wait_child(&mut client, Duration::from_secs(30));

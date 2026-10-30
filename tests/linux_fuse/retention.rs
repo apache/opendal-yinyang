@@ -139,8 +139,8 @@ fn fuse_space_and_retention_preserve_frozen_service_work() {
         let _ = sender.send(in_flight.sync_all());
     });
     gate.wait_ready(Duration::from_secs(30));
-    let frozen = fixture.wait_for_frozen(&config);
-    println!("space observation reached frozen staging:\n{frozen}");
+    let (commit, frozen) = fixture.wait_for_frozen(&config);
+    println!("space observation reached saved frozen commit {commit:?}:\n{frozen}");
     assert_pending_staging(&staging, true);
     assert_eq!(
         fixture.remote_read(&library, "space.bin", original.len()),

@@ -17,16 +17,21 @@
 
 //! Incremental write acceptance through real Linux FUSE descriptors.
 
-use crate::harness::{Fixture, Frontend, Publication, directory_bytes};
+use crate::harness::{Fixture, Frontend, Publication, ServiceGate, directory_bytes};
 use nix::unistd::{getegid, geteuid, truncate};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const UNIT_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
 const INITIAL_BYTES: usize = 8 * UNIT_BYTES + 3 * RANGE_BYTES + 73;
+const LARGE_INITIAL_BYTES: usize = 32 * 1024 * 1024;
+const LARGE_STAGING_LIMIT: u64 = 2 * 1024 * 1024;
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
@@ -195,6 +200,423 @@ fn sparse_units_eof_and_descriptor_contract(fixture: &Fixture) {
     restarted.unmount();
 }
 
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_length_changing_shared_descriptors_and_remount_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        length_changing_shared_descriptors_and_remount(&Fixture::new(publication));
+    }
+}
+
+fn length_changing_shared_descriptors_and_remount(fixture: &Fixture) {
+    let suffix = fixture.publication().as_str();
+    let library = fixture.volume_config(
+        &format!("lib-length-changing-{suffix}"),
+        Frontend::Library,
+        false,
+    );
+    let mut expected = payload(LARGE_INITIAL_BYTES, 0x37);
+    fixture.library_seed(&library, "length-changing.bin", &expected);
+    let config = fixture.volume_config(
+        &format!("stage-length-changing-{suffix}"),
+        Frontend::Fuse,
+        false,
+    );
+    let staging = fixture
+        .temp
+        .path()
+        .join(format!("stage-length-changing-{suffix}"));
+    let mountpoint = fixture
+        .temp
+        .path()
+        .join(format!("mnt-length-changing-{suffix}"));
+    fs::create_dir(&mountpoint).expect("create length-changing mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("length-changing.bin");
+
+    let shared_reader = File::open(&path).expect("open shared read-only descriptor");
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .append(true)
+        .open(&path)
+        .expect("open append descriptor");
+    assert_staging_below(&staging, LARGE_STAGING_LIMIT, "length-changing open");
+    assert_length_contract(
+        fixture,
+        &library,
+        "length-changing.bin",
+        &path,
+        &writer,
+        &shared_reader,
+        &expected,
+        "length-changing open",
+    );
+
+    for sample in 0..2 {
+        let value = payload(RANGE_BYTES, 0x49 + sample as u8);
+        let offset = expected.len();
+        writer.write_all(&value).expect("small append through FUSE");
+        writer.sync_all().expect("fsync small append");
+        expected.extend_from_slice(&value);
+        assert_range(&shared_reader, offset, &value);
+        assert_length_contract(
+            fixture,
+            &library,
+            "length-changing.bin",
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "small append",
+        );
+    }
+    assert_staging_below(&staging, LARGE_STAGING_LIMIT, "small append");
+
+    for sample in 0..2 {
+        let value = payload(UNIT_BYTES + RANGE_BYTES, 0x59 + sample as u8);
+        let offset = expected.len();
+        writer
+            .write_all(&value)
+            .expect("append across a verification-unit boundary");
+        writer.sync_all().expect("fsync boundary-crossing append");
+        expected.extend_from_slice(&value);
+        assert_range(&shared_reader, offset, &value);
+        assert_length_contract(
+            fixture,
+            &library,
+            "length-changing.bin",
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "boundary append",
+        );
+    }
+    assert_staging_below(&staging, LARGE_STAGING_LIMIT, "boundary append");
+
+    let shrunk = expected.len() - RANGE_BYTES;
+    writer
+        .set_len(shrunk as u64)
+        .expect("shrink through the active descriptor");
+    writer.sync_all().expect("fsync descriptor shrink");
+    expected.truncate(shrunk);
+    assert_length_contract(
+        fixture,
+        &library,
+        "length-changing.bin",
+        &path,
+        &writer,
+        &shared_reader,
+        &expected,
+        "descriptor shrink",
+    );
+
+    let zero_extended = expected.len() + 2 * RANGE_BYTES;
+    writer
+        .set_len(zero_extended as u64)
+        .expect("zero-extend through the active descriptor");
+    writer.sync_all().expect("fsync zero extension");
+    expected.resize(zero_extended, 0);
+    assert_range(&shared_reader, shrunk, &vec![0; 2 * RANGE_BYTES]);
+    assert_length_contract(
+        fixture,
+        &library,
+        "length-changing.bin",
+        &path,
+        &writer,
+        &shared_reader,
+        &expected,
+        "descriptor zero extension",
+    );
+
+    let shrink_extend_shrunk = expected.len() - RANGE_BYTES;
+    let shrink_extend_extended = expected.len() + RANGE_BYTES;
+    writer
+        .set_len(shrink_extend_shrunk as u64)
+        .expect("shrink before extension");
+    writer
+        .set_len(shrink_extend_extended as u64)
+        .expect("zero-extend after shrink");
+    writer.sync_all().expect("fsync shrink-then-extend");
+    expected.truncate(shrink_extend_shrunk);
+    expected.resize(shrink_extend_extended, 0);
+    assert_range(
+        &shared_reader,
+        shrink_extend_shrunk,
+        &vec![0; 2 * RANGE_BYTES],
+    );
+    assert_length_contract(
+        fixture,
+        &library,
+        "length-changing.bin",
+        &path,
+        &writer,
+        &shared_reader,
+        &expected,
+        "descriptor shrink-then-extend",
+    );
+    assert_staging_below(&staging, LARGE_STAGING_LIMIT, "length-changing final");
+
+    drop(writer);
+    drop(shared_reader);
+    mounted.unmount();
+
+    let restarted_mountpoint = fixture
+        .temp
+        .path()
+        .join(format!("mnt-length-changing-restart-{suffix}"));
+    fs::create_dir(&restarted_mountpoint).expect("create length-changing restart mountpoint");
+    let mut restarted = fixture.mount(&config, &restarted_mountpoint);
+    let restarted_path = restarted.mountpoint().join("length-changing.bin");
+    assert_eq!(
+        fs::read(&restarted_path).expect("read final length-changing file after remount"),
+        expected,
+        "remount did not preserve the final length-changing bytes and zeros"
+    );
+    restarted.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_length_changing_dirty_recovery_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        length_changing_dirty_recovery(&Fixture::new(publication));
+    }
+}
+
+fn length_changing_dirty_recovery(fixture: &Fixture) {
+    let suffix = fixture.publication().as_str();
+    let library = fixture.volume_config(
+        &format!("lib-length-recovery-{suffix}"),
+        Frontend::Library,
+        false,
+    );
+    let mut expected = payload(UNIT_BYTES + 123, 0x6b);
+    fixture.library_seed(&library, "length-recovery.bin", &expected);
+    let config = fixture.volume_config(
+        &format!("stage-length-recovery-{suffix}"),
+        Frontend::Fuse,
+        false,
+    );
+    let staging = fixture
+        .temp
+        .path()
+        .join(format!("stage-length-recovery-{suffix}"));
+    let mountpoint = fixture
+        .temp
+        .path()
+        .join(format!("mnt-length-recovery-{suffix}"));
+    fs::create_dir(&mountpoint).expect("create length recovery mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("length-recovery.bin");
+    let reader = File::open(&path).expect("open recovery reader");
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open recovery writer");
+
+    let extended = 2 * UNIT_BYTES + RANGE_BYTES;
+    writer
+        .set_len(extended as u64)
+        .expect("stage dirty zero extension");
+    expected.resize(extended, 0);
+    let tail_offset = extended - 37;
+    let tail = payload(37, 0x7d);
+    write_all_at(&writer, &tail, tail_offset as u64);
+    expected[tail_offset..].copy_from_slice(&tail);
+    assert_shared_lengths(
+        &path,
+        &writer,
+        &reader,
+        &expected,
+        "dirty length-changing recovery staging",
+    );
+    assert!(
+        fixture.remote_read(&library, "length-recovery.bin", expected.len()) != expected,
+        "dirty staged length changes must not be visible through the independent authority before publish"
+    );
+    assert_staging_below(&staging, LARGE_STAGING_LIMIT, "dirty recovery staging");
+
+    mounted.kill_daemon_only();
+    drop(writer);
+    drop(reader);
+    mounted.cleanup_after_kill();
+
+    let reopened_mountpoint = fixture
+        .temp
+        .path()
+        .join(format!("mnt-length-recovery-reopen-{suffix}"));
+    fs::create_dir(&reopened_mountpoint).expect("create reopened length recovery mountpoint");
+    let mut reopened = fixture.mount(&config, &reopened_mountpoint);
+    let reopened_path = reopened.mountpoint().join("length-recovery.bin");
+    assert_eq!(
+        fs::read(&reopened_path).expect("read recovered length-changing staging"),
+        expected,
+        "remount did not recover the exact dirty length-changing bytes"
+    );
+    let publish = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&reopened_path)
+        .expect("open recovered length-changing handle for publication");
+    publish
+        .sync_all()
+        .expect("recovered length-changing handle publishes");
+    drop(publish);
+    assert_remote_named(
+        fixture,
+        &library,
+        "length-recovery.bin",
+        &expected,
+        "recovered length-changing publish",
+    );
+    reopened.unmount();
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_length_changing_frozen_request_preserves_commit_service() {
+    let fixture = Fixture::new(Publication::Service);
+    let library = fixture.volume_config("lib-length-frozen", Frontend::Library, false);
+    let mut expected = payload(UNIT_BYTES + 123, 0x8f);
+    let initial = expected.clone();
+    fixture.library_seed(&library, "length-frozen.bin", &expected);
+    let staging = fixture.temp.path().join("stage-length-frozen");
+    let gate = ServiceGate::new(staging.clone(), fixture.service_address());
+    let config = fixture.volume_config_with_service(
+        "stage-length-frozen",
+        Frontend::Fuse,
+        false,
+        Some(gate.address()),
+    );
+    let mountpoint = fixture.temp.path().join("mnt-length-frozen");
+    fs::create_dir(&mountpoint).expect("create frozen length mountpoint");
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let path = mounted.mountpoint().join("length-frozen.bin");
+    let mut writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open frozen length-changing writer");
+
+    let extended = 2 * UNIT_BYTES + RANGE_BYTES;
+    writer
+        .set_len(extended as u64)
+        .expect("stage length change before frozen publication");
+    expected.resize(extended, 0);
+    let tail_offset = extended - 61;
+    let tail = payload(61, 0xa1);
+    write_all_at(&writer, &tail, tail_offset as u64);
+    expected[tail_offset..].copy_from_slice(&tail);
+
+    let in_flight = writer.try_clone().expect("duplicate frozen writer");
+    let (sender, receiver) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let _ = sender.send(in_flight.sync_all());
+    });
+    let gate_commit = gate.wait_ready(Duration::from_secs(30));
+    let (saved_commit, frozen) = fixture.wait_for_frozen(&config);
+    assert_eq!(
+        gate_commit, saved_commit,
+        "the service gate blocked a different commit than the locally saved frozen request"
+    );
+    println!("length-changing fsync saved frozen commit {saved_commit:?}:\n{frozen}");
+
+    mounted.kill_daemon_only();
+    gate.release();
+    let outcome = receiver
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|error| {
+            panic!("frozen length-changing fsync did not return after daemon exit: {error}")
+        });
+    caller
+        .join()
+        .expect("frozen length-changing caller panicked");
+    assert!(
+        outcome.is_err(),
+        "interrupting the mount daemon must not report remote durability"
+    );
+    drop(writer);
+    mounted.cleanup_after_kill();
+
+    let post_release = fixture.remote_read(&library, "length-frozen.bin", extended);
+    assert!(
+        post_release == initial || post_release == expected,
+        "gate release left a partial remote file: {} bytes",
+        post_release.len()
+    );
+
+    let (frozen_after_kill, status) = fixture.wait_for_frozen(&config);
+    assert_eq!(
+        frozen_after_kill, saved_commit,
+        "staging recovery changed the saved frozen identity"
+    );
+    println!("recovered frozen length-changing commit {saved_commit:?}:\n{status}");
+
+    let reopened_mountpoint = fixture.temp.path().join("mnt-length-frozen-reopen");
+    fs::create_dir(&reopened_mountpoint).expect("create frozen length reopen mountpoint");
+    let mut reopened = fixture.mount(&config, &reopened_mountpoint);
+    assert_eq!(
+        fs::read(reopened.mountpoint().join("length-frozen.bin"))
+            .expect("read recovered frozen length file"),
+        expected,
+        "recovery did not expose the exact staged length-changing file"
+    );
+    let publish = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(reopened.mountpoint().join("length-frozen.bin"))
+        .expect("open recovered frozen length handle");
+    publish
+        .sync_all()
+        .expect("recovered frozen length request converges");
+    drop(publish);
+    assert_remote_named(
+        &fixture,
+        &library,
+        "length-frozen.bin",
+        &expected,
+        "recovered frozen length request",
+    );
+    assert_eq!(
+        fixture.frozen_commit(&config),
+        None,
+        "successful convergence left a frozen handle in staging"
+    );
+    reopened.unmount();
+}
+
+fn assert_length_contract(
+    fixture: &Fixture,
+    library: &Path,
+    remote_name: &str,
+    path: &Path,
+    writer: &File,
+    reader: &File,
+    expected: &[u8],
+    phase: &str,
+) {
+    assert_shared_lengths(path, writer, reader, expected, phase);
+    assert_remote_named(fixture, library, remote_name, expected, phase);
+}
+
+fn assert_shared_lengths(path: &Path, writer: &File, reader: &File, expected: &[u8], phase: &str) {
+    let length = expected.len() as u64;
+    assert_eq!(
+        writer.metadata().expect("fstat length writer").len(),
+        length,
+        "{phase}: writer length"
+    );
+    assert_eq!(
+        reader.metadata().expect("fstat length reader").len(),
+        length,
+        "{phase}: shared reader length"
+    );
+    assert_attributes(path, length);
+}
+
 fn assert_attributes(path: &Path, length: u64) {
     let metadata =
         fs::metadata(path).unwrap_or_else(|error| panic!("stat {}: {error}", path.display()));
@@ -222,8 +644,18 @@ fn assert_attributes_from(file: &File, length: u64) {
 }
 
 fn assert_remote(fixture: &Fixture, library: &Path, expected: &[u8], phase: &str) {
+    assert_remote_named(fixture, library, "incremental.bin", expected, phase);
+}
+
+fn assert_remote_named(
+    fixture: &Fixture,
+    library: &Path,
+    name: &str,
+    expected: &[u8],
+    phase: &str,
+) {
     assert_eq!(
-        fixture.remote_read(library, "incremental.bin", expected.len()),
+        fixture.remote_read(library, name, expected.len()),
         expected,
         "{phase}: independent authority bytes"
     );
@@ -273,10 +705,14 @@ fn assert_eof_reads(file: &File, expected: &[u8]) {
 }
 
 fn assert_staging_bounded(staging: &Path, phase: &str) {
+    assert_staging_below(staging, INITIAL_BYTES as u64, phase);
+}
+
+fn assert_staging_below(staging: &Path, limit: u64, phase: &str) {
     let bytes = directory_bytes(staging);
     assert!(
-        bytes < INITIAL_BYTES as u64,
-        "{phase}: staging allocated {bytes} bytes for a {INITIAL_BYTES}-byte file; a complete local copy is still present"
+        bytes < limit,
+        "{phase}: staging allocated {bytes} bytes, at or above the {limit}-byte materialization bound"
     );
 }
 
