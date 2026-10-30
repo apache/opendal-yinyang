@@ -1,0 +1,202 @@
+{
+  "backend": {
+    "bucket": "yinyang-linux-growth-20261030193437",
+    "profile": "amazon-s3",
+    "region": "us-east-2",
+    "storage_root": "stage3-real-s3/1280555b952f49dfbac7de90c03ab251",
+    "versioning": "not-required-unverified"
+  },
+  "cleanup": {
+    "listed_keys": 40,
+    "remaining_keys": 0
+  },
+  "doctor": {
+    "schema": "yinyang.operational-health.v1",
+    "status": "pass"
+  },
+  "elapsed_seconds": 78.522,
+  "finished_at": "2026-10-30T20:55:27.237332+00:00",
+  "host": {
+    "kernel": "7.0.0-1014-aws",
+    "machine": "x86_64",
+    "platform": "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39"
+  },
+  "remount": {
+    "append_restore": {
+      "label": "append",
+      "length": 8392721,
+      "sha256": "1820b8c78a65fb317cd676b3cd6b0fa1745d0c35d6f3dc9415c9dfd26a8127a5"
+    },
+    "final_clean_unmount": {
+      "returncode": 0,
+      "stopped": true
+    },
+    "final_restore": {
+      "label": "final",
+      "length": 69648,
+      "sha256": "be197b7ec41dd17a58d4f8605492e0de1517b529276ab793482d05062fa2c917"
+    },
+    "first_clean_unmount": {
+      "returncode": 0,
+      "stopped": true
+    },
+    "restored_exact_bytes": true,
+    "space_report_while_mounted": true
+  },
+  "schema": "yinyang.linux-stage3-real-s3-trial.v1",
+  "seed": 9014,
+  "source_checkout": "b6ae40c4b88523eda5a503e971db016ad1d99dab",
+  "space": {
+    "comparison": {
+      "deletion_authorized": false,
+      "logical_live_file_bytes": {
+        "after": 69648,
+        "before": 8388625,
+        "delta": -8318977
+      },
+      "noncurrent_versions": "unknown",
+      "reclaimable_bytes": null,
+      "retained_observed_file_bytes": {
+        "after": 25346115,
+        "before": 8388625,
+        "delta": 16957490
+      },
+      "retained_observed_revisions": {
+        "after": 7,
+        "before": 3,
+        "delta": 4
+      },
+      "retained_observed_unique_content_bytes": {
+        "after": 25346115,
+        "before": 8388625,
+        "delta": 16957490
+      },
+      "retained_revisions": {
+        "after": 7,
+        "before": 3,
+        "delta": 4
+      },
+      "seed": 9014,
+      "visible_bytes": {
+        "after": 8555956,
+        "before": 8425675,
+        "delta": 130281
+      },
+      "visible_objects": {
+        "after": 40,
+        "before": 16,
+        "delta": 24
+      }
+    },
+    "final": {
+      "deletion_authorized": false,
+      "logical_live": {
+        "file_bytes": 69648,
+        "files": 1,
+        "unique_content_bytes": 69648,
+        "unique_content_count": 1
+      },
+      "logical_retained": {
+        "observed_file_bytes": 25346115,
+        "observed_revisions": 7,
+        "observed_unique_content_bytes": 25346115,
+        "revision_count": 7,
+        "state": "available"
+      },
+      "observed_revision": "000000000000000607b68c4fdf1d41e4b23c189fbd9937d9",
+      "physical": {
+        "content_extent_references": 134,
+        "head": {
+          "bytes": 157,
+          "objects": 1
+        },
+        "noncurrent_versions": "unknown",
+        "packs": {
+          "bytes": 8555799,
+          "objects": 39
+        },
+        "reachability_state": "available",
+        "retained_revisions": 7,
+        "shared_packs": 5,
+        "state": "available",
+        "visible_bytes": 8555956,
+        "visible_objects": 40
+      },
+      "reclaimable_bytes": null,
+      "schema": "yinyang.managed-space.report.v2",
+      "seed": 9014
+    },
+    "initial": {
+      "deletion_authorized": false,
+      "logical_live": {
+        "file_bytes": 8388625,
+        "files": 1,
+        "unique_content_bytes": 8388625,
+        "unique_content_count": 1
+      },
+      "logical_retained": {
+        "observed_file_bytes": 8388625,
+        "observed_revisions": 3,
+        "observed_unique_content_bytes": 8388625,
+        "revision_count": 3,
+        "state": "available"
+      },
+      "observed_revision": "0000000000000002c0db60252dbf43d9ad6da8893b2b98dc",
+      "physical": {
+        "content_extent_references": 129,
+        "head": {
+          "bytes": 157,
+          "objects": 1
+        },
+        "noncurrent_versions": "unknown",
+        "packs": {
+          "bytes": 8425518,
+          "objects": 15
+        },
+        "reachability_state": "available",
+        "retained_revisions": 3,
+        "shared_packs": 1,
+        "state": "available",
+        "visible_bytes": 8425675,
+        "visible_objects": 16
+      },
+      "reclaimable_bytes": null,
+      "schema": "yinyang.managed-space.report.v2",
+      "seed": 9014
+    }
+  },
+  "started_at": "2026-10-30T20:54:08.715527+00:00",
+  "status": "pass",
+  "target": {
+    "archive_source_commit": "9014fbe9532727ba2e281394e26561eeb0e5825e",
+    "archive_target": "ubuntu-24.04-x86_64",
+    "archive_yy_sha256": "bdfe412dc7351e478ed65bb74bf410c42614e468108f19fc0a27dc452ff9a923",
+    "binary": "/home/ubuntu/yinyang-stage3-install/9014fbe/prefix/current/bin/yy",
+    "binary_sha256": "bdfe412dc7351e478ed65bb74bf410c42614e468108f19fc0a27dc452ff9a923",
+    "provenance": "installed-archive-build-manifest",
+    "release": "0.0.24+9014fbe95327",
+    "source_matches_checkout": false
+  },
+  "workload": {
+    "append_bytes": 4096,
+    "final_length": 69648,
+    "final_sha256": "be197b7ec41dd17a58d4f8605492e0de1517b529276ab793482d05062fa2c917",
+    "initial_bytes": 8388625,
+    "operations": [
+      "initial-write",
+      "append",
+      "zero-extend",
+      "shrink-extend",
+      "clean-unmount",
+      "remount-byte-verification",
+      "remount-append",
+      "space-report-while-mounted",
+      "clean-unmount"
+    ],
+    "remount_append_bytes": 16,
+    "seed": 9014,
+    "shrink_bytes": 4096,
+    "shrink_extend_bytes": 69632,
+    "zero_extend_bytes": 32768
+  }
+}

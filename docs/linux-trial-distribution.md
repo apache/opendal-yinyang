@@ -152,6 +152,11 @@ WAL and pass `doctor`. The producer binary and target binary hashes are recorded
 separately; the source tree being equal to a later main commit does not rename
 the producer.
 
+The actual installed-target stage-3 and bounded Amazon S3 record is
+[`linux-stage3-trial-results.md`](linux-stage3-trial-results.md). It records
+the exact archive, installed binary and later script-only qualification source
+separately.
+
 The installer intentionally has no rollback or downgrade command. Once a newer
 binary has opened or written configuration, staging, Sync or service state, do
 not relaunch an older binary against that state. An older release directory

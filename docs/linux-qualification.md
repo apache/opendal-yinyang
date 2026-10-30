@@ -57,6 +57,10 @@ These checks require infrastructure that hosted CI does not provide:
 | `tests/linux_operating_envelope_real_s3.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `sqlite3`, scoped AWS CLI | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
 | `tests/linux_stage3_real_s3.py` | one unversioned Amazon S3 bucket, installed archive binary, temporary role over stdin, `/dev/fuse` | one bounded multi-leaf Managed object: append, truncate, zero extension, shrink/extend, clean remount, independent remote restores, before/final `space report` inventory observation, `doctor` and exact-prefix cleanup |
 
+The actual stage-3 archive/install and Amazon S3 trial is recorded in
+[`linux-stage3-trial-results.md`](linux-stage3-trial-results.md), including the
+separate product-archive and script-only source identities.
+
 The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
 `fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and
 optional `YINYANG_UPGRADE_SOURCE`/`YINYANG_UPGRADE_EVIDENCE` values for the
