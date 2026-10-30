@@ -50,6 +50,13 @@ An unknown marker profile is `Unsupported`; malformed `YYSERV01` bytes are
 frozen-request restoration. `Snapshot`, `Planner`, `Transaction`, receipts,
 changes, and revision/scan tokens are shared with object mode.
 
+`Authority::retained_revisions_page` enumerates the durable revision table in
+strict token order. A page is limited to 256 revisions and uses the last
+returned revision as its exclusive continuation. Embedded inspection opens the
+existing SQLite database read-only with `query_only` enabled; it does not
+migrate, recover, take the writer transaction, or infer retained revisions from
+content packs. `ServiceClient` exposes the same bounded page contract.
+
 In-process preparation carries trusted `DataStore` evidence and records
 readiness durably. A client uploads through OpenDAL, then registers its content
 descriptor. The service fully verifies an untrusted descriptor before recording
@@ -113,12 +120,14 @@ length followed by Borsh, bounded to 16 MiB. Request fields are protocol version
 1, token string, and a tagged command. Commands observe latest/specific
 revision, read/scan records at a revision, register content, prepare same-length
 or length-changing trusted updates from an exact published revision and NodeId,
-or commit frozen requests. Responses carry observations, records, readiness,
-prepared descriptors, typed outcomes, or typed errors. Maximum commit batch
-size, overwrite edit count, update edit count, and update generated-unit count
-are 4096; scans request at most 4097 records. The server handles at most 32
-active connections, each with a 60-second timeout. This wire profile is
-experimental and is not a stable interoperability promise.
+enumerate retained revisions, or commit frozen requests. Responses carry
+observations, records, readiness, prepared descriptors, typed outcomes,
+bounded revision pages, or typed errors. Maximum commit batch size, overwrite
+edit count, update edit count, and update generated-unit count are 4096; scans
+request at most 4097 records; history requests return at most 256 revisions.
+The server handles at most 32 active connections, each with a 60-second
+timeout. This wire profile is experimental and is not a stable interoperability
+promise.
 
 Protocol version 1 is the only supported request version. The server checks the
 token first, then returns `Unsupported` for a validly authenticated unknown
@@ -127,10 +136,11 @@ servers that implement different versions fail explicitly rather than
 negotiating down or sharing an authority.
 
 New command and response variants are appended to the version 1 tagged enums so
-existing variant tags do not change. Older servers do not understand the
-appended overwrite or update commands and therefore require a matching server
-binary for these paths. Existing register/observe/read/scan/commit traffic
-retains its prior encoding.
+existing variant tags do not change. The retained-history command and response
+follow the overwrite and update variants. Older servers do not understand the
+appended overwrite, update, or history commands and therefore require a
+matching server binary for these paths. Existing
+register/observe/read/scan/commit traffic retains its prior encoding.
 
 Error responses retain the existing tag order: Invalid=0, Corrupt=1,
 NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional

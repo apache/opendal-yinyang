@@ -31,7 +31,7 @@ use yinyang::volume::{Model, Volume, VolumeConfig};
 pub enum SpaceCommand {
     /// Report logical, physical-object, and local-staging measurements.
     Report {
-        /// Emit the versioned `yinyang.managed-space.report.v1` document.
+        /// Emit the versioned `yinyang.managed-space.report.v2` document.
         #[arg(long)]
         json: bool,
     },
@@ -52,7 +52,7 @@ pub enum RetentionCommand {
         /// Protect one retained revision; repeat for additional pins.
         #[arg(long = "keep")]
         keep: Vec<RevisionArg>,
-        /// Emit the versioned `yinyang.managed-retention.plan.v1` document.
+        /// Emit the versioned `yinyang.managed-retention.plan.v2` document.
         #[arg(long)]
         json: bool,
     },
