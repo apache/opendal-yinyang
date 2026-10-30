@@ -1676,13 +1676,17 @@ async fn inspect_physical(
             );
         }
         visible_referenced_bytes = visible_referenced_bytes.saturating_add(covered);
-        visible_uncovered_bytes =
-            visible_uncovered_bytes.saturating_add(size.saturating_sub(covered));
         if covered == size {
             fully_referenced = fully_referenced.saturating_add(1);
         } else if covered > 0 {
             partially_referenced = partially_referenced.saturating_add(1);
         }
+    }
+    if packs.is_some() {
+        let visible_bytes = pack_sizes
+            .values()
+            .fold(0_u64, |total, bytes| total.saturating_add(*bytes));
+        visible_uncovered_bytes = visible_bytes.saturating_sub(visible_referenced_bytes);
     }
     let listing_complete = head.is_some()
         && packs.is_some()
@@ -1693,10 +1697,14 @@ async fn inspect_physical(
         && missing_reference_packs == 0
         && truncated_reference_packs == 0
         && unrecognized_visible_objects == 0;
+    let referenced_objects = pack_usage
+        .iter()
+        .map(|usage| usage.object)
+        .collect::<BTreeSet<_>>();
     let unreferenced = if root_relative_complete {
         pack_sizes
             .keys()
-            .filter(|object| !pack_usage.iter().any(|usage| usage.object == **object))
+            .filter(|object| !referenced_objects.contains(*object))
             .copied()
             .collect::<Vec<_>>()
     } else {
