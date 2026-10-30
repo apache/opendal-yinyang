@@ -29,7 +29,7 @@ use opendal::{EntryMode, Operator};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use yinyang_core::reachability::{PhysicalInspection, PhysicalReferenceKind};
+use yinyang_core::reachability::PhysicalReferenceKind;
 use yinyang_core::{Authority, Error, ErrorKind, NodeId, NodeKind, Result, Revision, Snapshot};
 
 pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v2";
@@ -1725,6 +1725,7 @@ async fn inspect_physical(
     } else {
         MeasurementState::Unavailable
     };
+    let coverage_available = packs.is_some();
     PhysicalSpace {
         state,
         head,
@@ -1766,10 +1767,10 @@ async fn inspect_physical(
         },
         coverage: PhysicalCoverage {
             observed_referenced_bytes,
-            visible_referenced_bytes: packs.as_ref().map(|_| visible_referenced_bytes),
-            visible_uncovered_bytes: packs.as_ref().map(|_| visible_uncovered_bytes),
-            fully_referenced_visible_packs: packs.as_ref().map(|_| fully_referenced),
-            partially_referenced_visible_packs: packs.as_ref().map(|_| partially_referenced),
+            visible_referenced_bytes: coverage_available.then_some(visible_referenced_bytes),
+            visible_uncovered_bytes: coverage_available.then_some(visible_uncovered_bytes),
+            fully_referenced_visible_packs: coverage_available.then_some(fully_referenced),
+            partially_referenced_visible_packs: coverage_available.then_some(partially_referenced),
             missing_reference_packs,
             truncated_reference_packs,
             payload_verification: "content_index_authenticated_payload_not_read",
