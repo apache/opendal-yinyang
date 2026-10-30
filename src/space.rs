@@ -1795,9 +1795,11 @@ fn pack_object_id(path: &str, prefix: &str) -> Option<[u8; 16]> {
     if name.contains('/') {
         return None;
     }
-    uuid::Uuid::parse_str(name)
-        .ok()
-        .map(|uuid| *uuid.as_bytes())
+    let uuid = uuid::Uuid::parse_str(name).ok()?;
+    if name != uuid.simple().to_string() {
+        return None;
+    }
+    Some(*uuid.as_bytes())
 }
 
 fn physical_issue_state(kind: ErrorKind) -> &'static str {
@@ -2066,6 +2068,21 @@ mod tests {
                 vec!["keep_last"],
                 vec!["current", "keep_last"],
             ]
+        );
+    }
+
+    #[test]
+    fn pack_identity_requires_the_canonical_simple_uuid_key() {
+        let prefix = ".yinyang/v2/fs/packs/";
+        let canonical = "0123456789abcdef0123456789abcdef";
+        assert!(pack_object_id(&format!("{prefix}{canonical}"), prefix).is_some());
+        assert!(pack_object_id(&format!("{prefix}{}", canonical.to_uppercase()), prefix).is_none());
+        assert!(
+            pack_object_id(
+                &format!("{prefix}01234567-89ab-cdef-0123-456789abcdef"),
+                prefix
+            )
+            .is_none()
         );
     }
 

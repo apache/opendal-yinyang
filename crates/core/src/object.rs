@@ -113,10 +113,6 @@ impl ObjectState {
         self.filesystem
     }
 
-    pub(crate) const fn root(&self) -> NodeId {
-        self.root
-    }
-
     pub(crate) const fn revision(&self) -> Revision {
         self.revision
     }
