@@ -1236,6 +1236,7 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
     assert!(matches!(stale.fsync().await, Err(Error::Conflict)));
     assert_eq!(stale.read(0, 5).await.unwrap(), b"STALE");
     stale.abort().await.unwrap();
+    drop(stale);
 
     file.truncate(700).await.unwrap();
     file.truncate(1024 * 1024).await.unwrap();
