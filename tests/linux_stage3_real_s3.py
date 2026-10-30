@@ -449,6 +449,7 @@ class Trial:
         finally:
             os.close(descriptor)
         self.assert_mount_bytes(expected, "initial close")
+        initial_space = self.space_report(INITIAL_BYTES)
 
         with path.open("ab", buffering=0) as stream:
             written = stream.write(APPEND_BYTES)
@@ -477,6 +478,7 @@ class Trial:
         clean_unmount = self.mount.stop(self.redact)
         return {
             "expected": expected,
+            "initial_space": initial_space,
             "append_restore": append_restore,
             "first_clean_unmount": clean_unmount,
         }
@@ -503,7 +505,7 @@ class Trial:
             ["--volume", str(self.config), "space", "report", "--json"]
         )
         document = json.loads(completed.stdout)
-        if document.get("schema") != "yinyang.managed-space.report.v1":
+        if document.get("schema") != "yinyang.managed-space.report.v2":
             raise EnvelopeError(
                 f"unexpected managed-space report schema: {document.get('schema')}"
             )
@@ -556,6 +558,20 @@ class Trial:
             "deletion_authorized": document["deletion_authorized"],
             "reclaimable_bytes": document["reclaimable_bytes"],
         }
+
+    @staticmethod
+    def space_delta(
+        before: dict[str, Any], after: dict[str, Any], path: tuple[str, ...]
+    ) -> dict[str, Any]:
+        before_value: Any = before
+        after_value: Any = after
+        for segment in path:
+            before_value = before_value.get(segment)
+            after_value = after_value.get(segment)
+        delta = None
+        if isinstance(before_value, int) and isinstance(after_value, int):
+            delta = after_value - before_value
+        return {"before": before_value, "after": after_value, "delta": delta}
 
     def cleanup_remote(self) -> dict[str, Any]:
         prefix = f"{self.root}/"
@@ -630,7 +646,39 @@ class Trial:
         first = self.exercise_mount()
         remount = self.exercise_remount(first["expected"])
         final_bytes = remount["expected"]
-        report = self.space_report(len(final_bytes))
+        final_space = self.space_report(len(final_bytes))
+        initial_space = first["initial_space"]
+        space_comparison = {
+            "seed": self.seed,
+            "visible_objects": self.space_delta(
+                initial_space, final_space, ("physical", "visible_objects")
+            ),
+            "visible_bytes": self.space_delta(
+                initial_space, final_space, ("physical", "visible_bytes")
+            ),
+            "retained_revisions": self.space_delta(
+                initial_space, final_space, ("physical", "retained_revisions")
+            ),
+            "retained_observed_revisions": self.space_delta(
+                initial_space, final_space, ("logical_retained", "observed_revisions")
+            ),
+            "retained_observed_file_bytes": self.space_delta(
+                initial_space,
+                final_space,
+                ("logical_retained", "observed_file_bytes"),
+            ),
+            "retained_observed_unique_content_bytes": self.space_delta(
+                initial_space,
+                final_space,
+                ("logical_retained", "observed_unique_content_bytes"),
+            ),
+            "logical_live_file_bytes": self.space_delta(
+                initial_space, final_space, ("logical_live", "file_bytes")
+            ),
+            "noncurrent_versions": "unknown",
+            "deletion_authorized": False,
+            "reclaimable_bytes": None,
+        }
         remount_unmount = self.mount.stop(self.redact)
         final_restore = self.restore_remote(final_bytes, "final")
         doctor = self.doctor()
@@ -670,7 +718,11 @@ class Trial:
                     "final_clean_unmount": remount_unmount,
                     "final_restore": final_restore,
                 },
-                "space": report,
+                "space": {
+                    "initial": initial_space,
+                    "final": final_space,
+                    "comparison": space_comparison,
+                },
                 "doctor": doctor,
                 "cleanup": cleanup,
             }
