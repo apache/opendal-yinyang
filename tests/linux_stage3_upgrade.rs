@@ -401,11 +401,7 @@ fn generate_stage3_fixture_from_546f419() {
         &service_database,
         &fixture.join("service/metadata/metadata.db"),
     );
-    write_service_config(
-        &fixture.join("service/volume.json"),
-        &service_config,
-        &fixture,
-    );
+    write_service_config(&fixture.join("service/volume.json"), &service_config);
 
     let expected = json!({
         "schema": EXPECTED_SCHEMA,
@@ -1216,14 +1212,9 @@ fn stage_segment_ranges(database: &Path, handle: &str) -> Vec<(u64, u64)> {
         .expect("read stage-3 segments")
 }
 
-fn write_service_config(path: &Path, source: &Path, fixture: &Path) {
+fn write_service_config(path: &Path, source: &Path) {
     let mut config: Value = read_json(source);
-    config["staging"] = Value::String(
-        fixture
-            .join("service/client-placeholder")
-            .display()
-            .to_string(),
-    );
+    config["staging"] = Value::String("client-placeholder".to_owned());
     config["service_address"] = Value::String("127.0.0.1:1".to_owned());
     write_json(path, &config);
 }

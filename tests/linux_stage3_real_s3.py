@@ -397,10 +397,8 @@ class Trial:
             os.fsync(stream.fileno())
         expected += REMOUNT_APPEND_BYTES
         self.assert_mount_bytes(expected, "remount after append")
-        clean_unmount = self.mount.stop(self.redact)
         return {
             "expected": expected,
-            "clean_unmount": clean_unmount,
         }
 
     def space_report(self, expected_length: int) -> dict[str, Any]:
@@ -505,6 +503,7 @@ class Trial:
         remount = self.exercise_remount(first["expected"])
         final_bytes = remount["expected"]
         report = self.space_report(len(final_bytes))
+        remount_unmount = self.mount.stop(self.redact)
         cleanup = self.cleanup_remote()
         self.report.update(
             {
@@ -528,14 +527,15 @@ class Trial:
                         "clean-unmount",
                         "remount-byte-verification",
                         "remount-append",
+                        "space-report-while-mounted",
                         "clean-unmount",
-                        "space-report",
                     ],
                 },
                 "remount": {
                     "first_clean_unmount": first["first_clean_unmount"],
                     "restored_exact_bytes": True,
-                    "final_clean_unmount": remount["clean_unmount"],
+                    "space_report_while_mounted": True,
+                    "final_clean_unmount": remount_unmount,
                 },
                 "space": report,
                 "cleanup": cleanup,

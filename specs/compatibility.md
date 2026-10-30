@@ -135,6 +135,15 @@ no-mutation rejection behavior, but they are not evidence produced by an old
 binary. Actual `fd1338c2` binary cross-read/recovery remains separate
 qualification; no result from these synthetic fixtures expands that boundary.
 
+The immutable `546f419` corpus is separate stage-3 evidence produced by the
+accepted `546f419` trial archive binary. It contains a sparse pending handle, a
+request dropped before commit, a committed request whose response was lost, and
+a service metadata database copied with its non-empty WAL. The installed-target
+acceptance must preserve the exact pending bytes, frozen and Unknown
+CommitIds/digests, service WAL result and target publication behavior. This is
+one exact producer/target pair; it does not turn synthetic stage-1/2 fixtures or
+an equal source tree into broader cross-version support.
+
 ## Conformance evidence
 
 The committed vectors under
