@@ -308,6 +308,7 @@ enum BenchWorkload {
     Full,
     ReadOnlyRange,
     Incremental,
+    LengthChanging,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -332,14 +333,14 @@ struct CommandBenchLinuxCost {
         long,
         value_enum,
         default_value = "full",
-        help = "Select the complete product matrix, the matched read-only range workload, or the writable incremental workload."
+        help = "Select the complete product matrix, the matched read-only range workload, the same-length writable workload, or the length-changing writable workload."
     )]
     workload: BenchWorkload,
     #[arg(
         long,
         value_enum,
         default_value = "baseline",
-        help = "For the incremental workload, record baseline behavior or reject PUT bodies consistent with full-file fallback."
+        help = "For writable incremental workloads, record baseline behavior or reject payload traffic consistent with full-file fallback."
     )]
     incremental_expect: BenchIncrementalExpectation,
     #[arg(
@@ -372,7 +373,9 @@ impl CommandBenchLinuxCost {
             }
         }
         let profile = match self.workload {
-            BenchWorkload::ReadOnlyRange | BenchWorkload::Incremental => "full",
+            BenchWorkload::ReadOnlyRange
+            | BenchWorkload::Incremental
+            | BenchWorkload::LengthChanging => "full",
             BenchWorkload::Full => match self.profile {
                 BenchProfile::Early => "early",
                 BenchProfile::Full => "full",
@@ -387,6 +390,7 @@ impl CommandBenchLinuxCost {
             BenchWorkload::Full => "full",
             BenchWorkload::ReadOnlyRange => "read-only-range",
             BenchWorkload::Incremental => "incremental",
+            BenchWorkload::LengthChanging => "length-changing",
         };
         let incremental_expect = match self.incremental_expect {
             BenchIncrementalExpectation::Baseline => "baseline",
