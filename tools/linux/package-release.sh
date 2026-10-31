@@ -24,9 +24,10 @@ usage() {
   cat <<'EOF'
 Usage: tools/linux/package-release.sh --output-dir DIR
 
-Build yy from a clean Ubuntu 24.04 x86_64 working tree, package the local
-qualification artifact, and write its adjacent SHA-256 sidecar. This command
-does not sign, tag, publish, or upload the artifact.
+Build yy from a clean Ubuntu 24.04 x86_64 working tree. Write the directly
+runnable yy, its checksum, LICENSE, NOTICE and source manifest, then package the
+local qualification archive and its adjacent SHA-256 sidecar. This command does
+not sign, tag, publish, or upload the artifacts.
 EOF
 }
 
@@ -103,6 +104,12 @@ if [[ -e "$archive" || -e "$archive.sha256" ]]; then
   printf 'refusing to overwrite existing artifact: %s\n' "$archive" >&2
   exit 1
 fi
+for artifact in yy yy.sha256 LICENSE NOTICE BUILD-MANIFEST; do
+  if [[ -e "$output_dir/$artifact" ]]; then
+    printf 'refusing to overwrite existing artifact: %s\n' "$output_dir/$artifact" >&2
+    exit 1
+  fi
+done
 
 cargo build --release --locked --bin yy
 
@@ -232,8 +239,25 @@ tools/linux/verify-release.sh \
   --archive "$archive" \
   --source-commit "$source_sha"
 
+install -m 0755 "$tree/bin/yy" "$output_dir/yy"
+printf '%s  yy\n' "$binary_sha256" >"$output_dir/yy.sha256"
+install -m 0644 \
+  "$tree/LICENSE" \
+  "$tree/NOTICE" \
+  "$tree/BUILD-MANIFEST" \
+  "$output_dir/"
+
+(
+  cd "$output_dir"
+  sha256sum --check yy.sha256
+  ./yy --help >/dev/null
+)
+
 printf 'archive=%s\n' "$archive"
 printf 'archive_sha256=%s\n' "$archive_sha256"
+printf 'binary=%s\n' "$output_dir/yy"
+printf 'binary_checksum=%s\n' "$output_dir/yy.sha256"
+printf 'manifest=%s\n' "$output_dir/BUILD-MANIFEST"
 printf 'release=%s\n' "$release"
 printf 'source_commit=%s\n' "$source_sha"
 printf 'yy_sha256=%s\n' "$binary_sha256"

@@ -98,6 +98,26 @@ jobs:
           test -f "$archive.sha256"
           printf 'TRIAL_ARCHIVE=%s\n' "$archive" >>"$GITHUB_ENV"
 
+      - name: Verify downloadable binary
+        run: |
+          set -euo pipefail
+          binary="$TRIAL_ROOT/artifacts/yy"
+          for artifact in yy yy.sha256 LICENSE NOTICE BUILD-MANIFEST; do
+            test -f "$TRIAL_ROOT/artifacts/$artifact"
+          done
+          test -x "$binary"
+          (
+            cd "$TRIAL_ROOT/artifacts"
+            sha256sum --check yy.sha256
+          ) | tee "$TRIAL_ROOT/evidence/downloadable-binary.sha256"
+          "$binary" --help |
+            tee "$TRIAL_ROOT/evidence/downloadable-binary-help.txt"
+          grep -qx "source_commit=$GITHUB_SHA" \
+            "$TRIAL_ROOT/artifacts/BUILD-MANIFEST"
+          grep -qx "yy_sha256=$(sha256sum "$binary" | awk '{print $1}')" \
+            "$TRIAL_ROOT/artifacts/BUILD-MANIFEST"
+          printf 'TRIAL_BINARY=%s\n' "$binary" >>"$GITHUB_ENV"
+
       - name: Verify actual archive and packaged scripts
         run: |
           set -euo pipefail
@@ -274,6 +294,19 @@ jobs:
             --nocapture \
             --test-threads=1 \
             2>&1 | tee "$TRIAL_ROOT/evidence/stage3-upgrade.log"
+
+      - name: Upload directly downloadable yy
+        uses: actions/upload-artifact@v4
+        with:
+          name: yinyang-linux-x86_64
+          path: |
+            ${{ runner.temp }}/yinyang-trial/artifacts/yy
+            ${{ runner.temp }}/yinyang-trial/artifacts/yy.sha256
+            ${{ runner.temp }}/yinyang-trial/artifacts/LICENSE
+            ${{ runner.temp }}/yinyang-trial/artifacts/NOTICE
+            ${{ runner.temp }}/yinyang-trial/artifacts/BUILD-MANIFEST
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload trial evidence
         if: always()
