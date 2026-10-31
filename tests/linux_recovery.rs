@@ -834,6 +834,170 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
+fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
+    let fixture = Fixture::new(Publication::Object);
+    let source = fixture.sync_client("history-source");
+    fs::write(source.directory.join("first.txt"), b"first baseline").unwrap();
+    fixture.sync_run_ok(&source);
+
+    clear_ephemeral_locks(&source.state);
+    let source_state_before = authoritative_tree(&source.state);
+    let remote_before = remote_identities(&fixture.operator());
+    let live = retention_plan(&fixture, &source.config, 1, &[], None);
+    assert_plan_boundaries(&live);
+    let live_baseline = live["protection"]["staging"]["replica"]["baseline"]["revision"]
+        .as_str()
+        .expect("live replica baseline revision")
+        .to_owned();
+    assert_eq!(live_baseline.len(), 48);
+    assert_decision_reason(&live, &live_baseline, "replica_baseline");
+    assert_eq!(
+        authoritative_tree(&source.state),
+        source_state_before,
+        "live retention planning changed authoritative local state"
+    );
+    assert_no_ephemeral_locks(&source.state);
+    assert_eq!(remote_identities(&fixture.operator()), remote_before);
+
+    let backup = fixture.path("history-backup");
+    fixture.yy_ok(&[
+        "--volume",
+        text(&source.config),
+        "sync",
+        "backup",
+        "--output",
+        text(&backup),
+    ]);
+    let backup_before = authoritative_tree(&backup);
+
+    fs::write(source.directory.join("second.txt"), b"second baseline").unwrap();
+    fixture.sync_run_ok(&source);
+    let second = fixture.sync_status(&source);
+    let second_revision = second
+        .remote
+        .revision
+        .as_deref()
+        .expect("second sync remote revision");
+    assert_ne!(second_revision, live_baseline);
+
+    clear_ephemeral_locks(&source.state);
+    let source_state_before_backup_plans = authoritative_tree(&source.state);
+    let remote_before_backup_plans = remote_identities(&fixture.operator());
+    let observer = fixture.sync_paths("history-observer");
+    assert!(!observer.directory.exists());
+    assert!(!observer.state.exists());
+
+    let bounded = retention_plan(&fixture, &observer.config, 1, &[], None);
+    assert_plan_boundaries(&bounded);
+    let prior = plan_decision(&bounded, &live_baseline);
+    assert_eq!(prior["selected"], false);
+    assert_reason_contains(prior, "outside_bounded_policy");
+
+    // The package carries its own root payload. Planning must not reopen or
+    // require the original live root once the package has been written.
+    let moved_root = fixture.path("history-source-root-moved");
+    fs::rename(&source.directory, &moved_root).unwrap();
+
+    let corrupt = fixture.path("history-backup-corrupt");
+    copy_directory(&backup, &corrupt);
+    let manifest = corrupt.join("manifest.bin");
+    let mut bytes = fs::read(&manifest).unwrap();
+    assert!(!bytes.is_empty());
+    bytes[0] ^= 0xff;
+    fs::write(&manifest, bytes).unwrap();
+    let corrupt_before = authoritative_tree(&corrupt);
+
+    let protected = retention_plan(&fixture, &observer.config, 1, &[&backup, &corrupt], None);
+    assert_plan_boundaries(&protected);
+    assert_eq!(protected["state"], "partial");
+    assert_eq!(
+        protected["protection"]["backup_evidence"],
+        "supplied_incomplete"
+    );
+    assert_eq!(protected["protection"]["backups"]["supplied"], 2);
+    assert_eq!(protected["protection"]["backups"]["validated"], 1);
+    let packages = protected["protection"]["backups"]["packages"]
+        .as_array()
+        .expect("backup package evidence");
+    assert_eq!(packages.len(), 2);
+    let valid = package_by_path(packages, &backup);
+    assert_eq!(valid["state"], "validated");
+    assert_eq!(valid["staging"]["binding"]["state"], "verified");
+    assert_eq!(
+        valid["staging"]["replica"]["baseline"]["revision"],
+        live_baseline
+    );
+    let corrupt_package = package_by_path(packages, &corrupt);
+    assert_eq!(corrupt_package["state"], "unavailable");
+    assert!(corrupt_package["staging"].is_null());
+    assert!(
+        corrupt_package["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert_decision_reason(&protected, &live_baseline, "backup_replica_baseline");
+    assert!(
+        protected["unresolved"]
+            .as_array()
+            .is_some_and(|unresolved| {
+                unresolved.iter().any(|entry| {
+                    entry["subject"] == "backup-package" && entry["state"] == "unavailable"
+                })
+            })
+    );
+
+    assert!(!source.directory.exists());
+    assert!(moved_root.exists());
+    assert!(!observer.state.exists());
+    assert_no_ephemeral_locks(&source.state);
+    assert_eq!(
+        authoritative_tree(&source.state),
+        source_state_before_backup_plans,
+        "backup retention planning changed the unrelated live replica state"
+    );
+    assert_eq!(authoritative_tree(&backup), backup_before);
+    assert_eq!(authoritative_tree(&corrupt), corrupt_before);
+    assert_eq!(
+        remote_identities(&fixture.operator()),
+        remote_before_backup_plans
+    );
+
+    let foreign_root = remote_root("history-backup-foreign");
+    fixture
+        .yy_with_env(&["create"], &[("YINYANG_S3_ROOT", &foreign_root)])
+        .success_or("create foreign Managed filesystem");
+    let foreign_operator = operator_for_root(&foreign_root);
+    let foreign_before = remote_identities(&foreign_operator);
+    let foreign = fixture.sync_paths("history-foreign-observer");
+    let foreign_plan = retention_plan(
+        &fixture,
+        &foreign.config,
+        1,
+        &[&backup],
+        Some(&foreign_root),
+    );
+    assert_plan_boundaries(&foreign_plan);
+    assert_eq!(foreign_plan["state"], "partial");
+    assert_eq!(
+        foreign_plan["protection"]["backup_evidence"],
+        "supplied_incomplete"
+    );
+    assert_eq!(foreign_plan["protection"]["backups"]["supplied"], 1);
+    assert_eq!(foreign_plan["protection"]["backups"]["validated"], 0);
+    let package = &foreign_plan["protection"]["backups"]["packages"][0];
+    assert_eq!(package["state"], "foreign");
+    assert!(package["staging"].is_null());
+    assert!(
+        package["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not match volume filesystem"))
+    );
+    assert_eq!(remote_identities(&foreign_operator), foreign_before);
+    remove_prefix(&foreign_operator);
+}
+
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
 fn object_publication_journal_restore_preserves_history_and_unknown() {
     let fixture = Fixture::new(Publication::Object);
     let history = fixture.path("history-source");
@@ -971,6 +1135,188 @@ fn assert_private_directory(path: &Path) {
         "recovery output {} must not expose pending payloads",
         path.display()
     );
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RemoteIdentity {
+    path: String,
+    length: u64,
+    etag: Option<String>,
+}
+
+fn retention_plan(
+    fixture: &Fixture,
+    config: &Path,
+    keep_last: u64,
+    backups: &[&Path],
+    root: Option<&str>,
+) -> serde_json::Value {
+    let mut args = vec![
+        "--volume".to_owned(),
+        text(config).to_owned(),
+        "space".to_owned(),
+        "retention".to_owned(),
+        "plan".to_owned(),
+        "--keep-last".to_owned(),
+        keep_last.to_string(),
+    ];
+    for backup in backups {
+        args.push("--backup".to_owned());
+        args.push(text(backup).to_owned());
+    }
+    args.push("--json".to_owned());
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = match root {
+        Some(root) => fixture.yy_with_env(&args, &[("YINYANG_S3_ROOT", root)]),
+        None => fixture.yy(&args),
+    };
+    output.success_or("space retention plan with history protection");
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse retention plan JSON: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+fn assert_plan_boundaries(plan: &serde_json::Value) {
+    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v3");
+    assert_eq!(plan["deletion_authorized"], false);
+    assert!(plan["reclaimable_bytes"].is_null());
+    assert_eq!(plan["policy"]["published_history"], "retained_by_default");
+}
+
+fn plan_decision<'a>(plan: &'a serde_json::Value, revision: &str) -> &'a serde_json::Value {
+    plan["revisions"]
+        .as_array()
+        .expect("retention plan revisions")
+        .iter()
+        .find(|entry| entry["revision"] == revision)
+        .unwrap_or_else(|| panic!("retention plan has no revision {revision}: {plan}"))
+}
+
+fn assert_decision_reason(plan: &serde_json::Value, revision: &str, reason: &str) {
+    let decision = plan_decision(plan, revision);
+    assert_eq!(
+        decision["selected"], true,
+        "revision {revision} was not selected for {reason}: {plan}"
+    );
+    assert_reason_contains(decision, reason);
+}
+
+fn assert_reason_contains(decision: &serde_json::Value, reason: &str) {
+    assert!(
+        decision["reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|value| value == reason)),
+        "revision decision does not contain {reason}: {decision}"
+    );
+}
+
+fn package_by_path<'a>(packages: &'a [serde_json::Value], path: &Path) -> &'a serde_json::Value {
+    packages
+        .iter()
+        .find(|package| package["path"] == text(path))
+        .unwrap_or_else(|| panic!("backup package {} is absent", path.display()))
+}
+
+fn clear_ephemeral_locks(staging: &Path) {
+    for relative in ["replica.lock", "runtime.lock", "content/runtime.lock"] {
+        match fs::remove_file(staging.join(relative)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove ephemeral lease {relative}: {error}"),
+        }
+    }
+}
+
+fn assert_no_ephemeral_locks(staging: &Path) {
+    for relative in ["replica.lock", "runtime.lock", "content/runtime.lock"] {
+        assert!(
+            !staging.join(relative).exists(),
+            "read-only planning created writer lease {relative} under {}",
+            staging.display()
+        );
+    }
+}
+
+fn authoritative_tree(root: &Path) -> fixture::Tree {
+    let mut tree = local_tree(root).expect("read local state identity");
+    tree.retain(|path, entry| {
+        if path.ends_with("-shm") {
+            return false;
+        }
+        if path.ends_with("-wal")
+            && let fixture::RemoteEntry::File { bytes, .. } = entry
+        {
+            return !bytes.is_empty();
+        }
+        true
+    });
+    tree
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    let metadata = fs::symlink_metadata(source).expect("inspect source directory");
+    assert!(
+        metadata.is_dir(),
+        "{} must be a directory",
+        source.display()
+    );
+    fs::create_dir(destination).expect("create copied directory");
+    fs::set_permissions(destination, metadata.permissions()).expect("copy directory mode");
+    for entry in fs::read_dir(source).expect("read source directory") {
+        let entry = entry.expect("source directory entry");
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source).expect("inspect source entry");
+        if metadata.is_dir() {
+            copy_directory(&source, &destination);
+        } else if metadata.is_file() {
+            fs::copy(&source, &destination).expect("copy backup file");
+            fs::set_permissions(&destination, metadata.permissions()).expect("copy file mode");
+        } else {
+            panic!("backup contains unsupported entry {}", source.display());
+        }
+    }
+}
+
+fn remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
+    let mut identities = runtime().block_on(async {
+        operator
+            .list_with("")
+            .recursive(true)
+            .await
+            .expect("list remote object identities")
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .map(|entry| RemoteIdentity {
+                path: entry.path().to_owned(),
+                length: entry.metadata().content_length(),
+                etag: entry.metadata().etag().map(str::to_owned),
+            })
+            .collect::<Vec<_>>()
+    });
+    identities.sort();
+    identities
+}
+
+fn remove_prefix(operator: &opendal::Operator) {
+    runtime().block_on(async {
+        let entries = operator
+            .list_with("")
+            .recursive(true)
+            .await
+            .expect("list temporary prefix");
+        for entry in entries {
+            if entry.metadata().is_file() {
+                operator
+                    .delete(entry.path())
+                    .await
+                    .expect("delete temporary prefix object");
+            }
+        }
+    });
 }
 
 fn write_sync_config(
