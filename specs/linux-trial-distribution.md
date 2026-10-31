@@ -1,10 +1,32 @@
 # Linux trial distribution contract
 
 **Status: experimental Ubuntu 24.04 x86_64 trial workflow.**
-This specification defines one traceable local archive, verification,
-versioned-prefix installation, stopped activation and non-destructive
-retention-reporting boundary. It does not define an official release, signing,
-ASF vote, tag, external publication or physical reclamation.
+This specification defines one directly runnable trial binary, one traceable
+local archive, verification, versioned-prefix installation, stopped activation
+and non-destructive retention-reporting boundary. It does not define an official
+release, signing, ASF vote, tag or stable external publication. The workflow
+uploads short-lived Actions artifacts, not an ASF release.
+
+## Direct trial binary
+
+The package command writes these files beside the archive:
+
+- `yy`;
+- `yy.sha256`, containing the lowercase binary SHA-256 and the file name `yy`;
+- `LICENSE` and `NOTICE`;
+- `BUILD-MANIFEST`, including the full source commit, target and `yy_sha256`.
+
+A consumer may run `yy` directly after verifying `yy.sha256` and setting the
+execute bit. This path does not require extracting or installing the archive,
+Cargo, Rust, Git or Python. The binary is built only for Ubuntu 24.04 x86_64 and
+carries the same experimental and unsigned status as the archive.
+
+The workflow uploads those five files as the `yinyang-linux-x86_64` Actions
+artifact with a 14-day retention period. GitHub presents the artifact as a ZIP,
+may require an authenticated GitHub session for browser download, and does not
+preserve the executable mode. The workflow creates the artifact only after the
+other trial checks succeed. GitHub is not a stable binary-download authority;
+the checksum detects byte mismatch with the sidecar and is not a signature.
 
 ## Artifact identity
 
@@ -121,8 +143,9 @@ itself authorize deletion.
 
 The fresh-runner workflow must:
 
-- build from a clean checkout and retain the archive, sidecar, manifest, source
-  and binary SHA-256;
+- build from a clean checkout, verify the direct binary checksum and `--help`,
+  and retain the binary, checksum, LICENSE, NOTICE and source manifest;
+- retain the archive, sidecar, manifest, source and binary SHA-256;
 - reject a changed archive checksum and an attempted immutable-directory
   overwrite;
 - install the actual archive and perform only explicit quiesced activation;
@@ -135,7 +158,8 @@ The fresh-runner workflow must:
 - run the immutable genuine stage-3 fixture upgrade with the same installed
   target binary and record its target and fixture identities separately;
 - retain pending, frozen, Unknown, receipts, Sync and service-WAL evidence;
-- upload these files only as normal short-lived Actions evidence.
+- upload the direct binary files and internal evidence only as normal
+  short-lived Actions artifacts.
 
 Hosted CI verifies the packaged unit files but does not create a systemd user
 manager or claim the explicit qualified-host systemd lifecycle. The workflow
