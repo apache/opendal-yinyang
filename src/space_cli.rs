@@ -19,7 +19,7 @@
 
 use crate::RevisionArg;
 use clap::Subcommand;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use yinyang::core::Revision;
 use yinyang::space::{
@@ -31,7 +31,7 @@ use yinyang::volume::{Model, Volume, VolumeConfig};
 pub enum SpaceCommand {
     /// Report logical, physical-object, and local-staging measurements.
     Report {
-        /// Emit the versioned `yinyang.managed-space.report.v2` document.
+        /// Emit the versioned `yinyang.managed-space.report.v3` document.
         #[arg(long)]
         json: bool,
     },
@@ -52,7 +52,10 @@ pub enum RetentionCommand {
         /// Protect one retained revision; repeat for additional pins.
         #[arg(long = "keep")]
         keep: Vec<RevisionArg>,
-        /// Emit the versioned `yinyang.managed-retention.plan.v2` document.
+        /// Protect revisions referenced by an explicit validated backup package.
+        #[arg(long = "backup")]
+        backup: Vec<PathBuf>,
+        /// Emit the versioned `yinyang.managed-retention.plan.v3` document.
         #[arg(long)]
         json: bool,
     },
@@ -99,6 +102,7 @@ pub async fn run(
                 RetentionCommand::Plan {
                     keep_last,
                     keep,
+                    backup,
                     json,
                 },
         } => {
@@ -111,6 +115,7 @@ pub async fn run(
                 &config.staging,
                 keep_last,
                 &pins,
+                &backup,
             )
             .await?;
             if json {
@@ -271,7 +276,14 @@ fn print_report(report: &ManagedSpaceReport) {
             .conflicts
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
-        report.staging.replica.baseline_coverage
+        match &report.staging.replica.baseline {
+            Some(baseline) => format!(
+                "{} (+{} entry revisions)",
+                baseline.revision,
+                baseline.entry_revisions.len()
+            ),
+            None => report.staging.replica.baseline_coverage.to_owned(),
+        }
     );
     for unresolved in &report.unresolved {
         println!(
@@ -365,8 +377,34 @@ fn print_plan(plan: &ManagedRetentionPlan) {
             .conflicts
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
-        plan.protection.staging.replica.baseline_coverage
+        match &plan.protection.staging.replica.baseline {
+            Some(baseline) => format!(
+                "{} (+{} entry revisions)",
+                baseline.revision,
+                baseline.entry_revisions.len()
+            ),
+            None => plan.protection.staging.replica.baseline_coverage.to_owned(),
+        }
     );
+    println!(
+        "backup packages: {} supplied, {} validated ({})",
+        plan.protection.backups.supplied,
+        plan.protection.backups.validated,
+        plan.protection.backup_evidence
+    );
+    for package in &plan.protection.backups.packages {
+        println!(
+            "backup {}: {:?} filesystem {} protected-revisions {}",
+            package.path,
+            package.state,
+            package.filesystem.as_deref().unwrap_or("unknown"),
+            package
+                .staging
+                .as_ref()
+                .map(|staging| staging.revisions.len().to_string())
+                .unwrap_or_else(|| "0".to_owned())
+        );
+    }
     println!(
         "receipt evidence: {:?} ({} records / {} revisions)",
         plan.protection.receipts.state,
@@ -396,6 +434,9 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     }
     println!("deletion authorized: no");
     println!("reclaimable bytes: unknown; selection is not a cleanup estimate");
+    println!(
+        "outside-policy revisions remain readable; --keep is not a persistent pin; no expiry command exists"
+    );
     if plan.protection.staging.state == StagingState::Unavailable {
         println!("local staging evidence is unavailable; do not infer that no pending work exists");
     }

@@ -416,6 +416,8 @@ pub(super) struct BaselineNode {
 
 #[derive(Clone, Debug)]
 pub(super) struct BaselineRecord {
+    /// Global common baseline revision stored in `baseline_meta`.
+    pub revision: Revision,
     pub remote: BTreeMap<String, BaselineNode>,
     pub local: LocalSnapshot,
 }
@@ -1270,6 +1272,7 @@ impl Store {
             }
         }
         Ok(Some(BaselineRecord {
+            revision: Revision::from_bytes(global_revision),
             remote,
             local: LocalSnapshot::from_nodes(local),
         }))

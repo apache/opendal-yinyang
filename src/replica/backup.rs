@@ -40,6 +40,12 @@ const DATABASES: [&str; 3] = [
     "state/content/staging.db",
 ];
 
+/// Read-only binding evidence from one validated backup package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupInspection {
+    pub filesystem: NodeId,
+}
+
 #[derive(BorshSerialize, BorshDeserialize)]
 pub(super) struct BackupManifest {
     magic: [u8; 8],
@@ -623,6 +629,17 @@ impl BackupManifest {
         );
         replica.store_mut().rebind(binding, &identities)
     }
+}
+
+/// Validate an explicit backup package with the existing manifest checksum,
+/// shape, and package validator. Validation is read-only: it never restores,
+/// migrates state, acquires a writer lease, or requires the original local root.
+pub fn inspect_backup_package(backup: &Path) -> Result<BackupInspection> {
+    let manifest = BackupManifest::load(backup)?;
+    manifest.validate_package(backup)?;
+    Ok(BackupInspection {
+        filesystem: manifest.filesystem(),
+    })
 }
 
 fn snapshot(root: &Path) -> Result<LocalSnapshot> {
