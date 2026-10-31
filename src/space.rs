@@ -647,15 +647,16 @@ async fn inspect_backup_package_evidence(
         let package_filesystem = inspection.filesystem;
         let filesystem_hex = identity_hex(package_filesystem);
         if package_filesystem != filesystem {
+            let error = format!(
+                "backup filesystem {filesystem_hex} does not match volume filesystem {}",
+                identity_hex(filesystem)
+            );
             return BackupPackageEvidence {
                 path,
                 state: BackupPackageState::Foreign,
                 filesystem: Some(filesystem_hex),
                 staging: None,
-                error: Some(format!(
-                    "backup filesystem {filesystem_hex} does not match volume filesystem {}",
-                    identity_hex(filesystem)
-                )),
+                error: Some(error),
                 protected: BTreeMap::new(),
             };
         }
