@@ -11,15 +11,16 @@ bytes.
 
 ```text
 yy --volume CONFIG space report [--json]
-yy --volume CONFIG space retention plan [--keep-last N] [--keep REVISION]... [--json]
+yy --volume CONFIG space retention plan \
+  [--keep-last N] [--keep REVISION]... [--backup PATH]... [--json]
 ```
 
 `--volume` is required. The configuration must use `model: managed`; Direct
 volumes and their namespace objects are rejected before authority connection.
 The command is observation-only even when the volume configuration is writable.
 
-`space report --json` emits `yinyang.managed-space.report.v2`. `space retention
-plan --json` emits `yinyang.managed-retention.plan.v2`. Revisions are 24-byte
+`space report --json` emits `yinyang.managed-space.report.v3`. `space retention
+plan --json` emits `yinyang.managed-retention.plan.v3`. Revisions are 24-byte
 hexadecimal strings, filesystem identities are 16-byte hexadecimal strings,
 and enum values are `snake_case`. Unknown values are `null`; optional evidence
 is not represented by fabricated zeroes.
@@ -126,8 +127,9 @@ backend listing into a transactional snapshot.
 Current-key listing does not reveal noncurrent object versions. The report
 always states `noncurrent_versions: "unknown"`; it does not claim a zero total
 or an all-versions total. The same unknown applies to external readers,
-untracked revision pins, other staging directories, backup packages, and
-quiescence.
+untracked revision pins, other staging directories, undisclosed backup
+packages, and quiescence. Explicitly supplied backup packages are only
+observed by `space retention plan --backup`.
 
 Local staging uses only existing paths:
 
@@ -153,13 +155,14 @@ handles already counted from content staging are not counted again from this
 join.
 
 When `replica.db` exists on Linux, the existing read-only `Replica::inspect`
-API reports incomplete installs, retained artifacts, exportability, and
-conflicts. Conflict-recorded remote revisions are protected. The current public
-read-only replica status does not expose the stored common baseline, so
-`baseline_coverage` is explicitly
-`unobserved_by_public_read_only_inspection`; it is not reported as absent or
-unchanged. A failure to open the bound local root marks replica evidence
-unavailable rather than fabricating zero.
+API reports incomplete installs, retained artifacts, exportability, conflicts,
+and the stored common baseline. The baseline evidence contains the global
+baseline revision plus the distinct per-entry remote revisions used as future
+staging predicates. Conflict-recorded and baseline-recorded remote revisions
+are protected with `replica_conflict` and `replica_baseline`. `baseline_coverage`
+is `observed_from_read_only_baseline` when the baseline is readable. A failure
+to open the bound local root marks replica evidence unavailable rather than
+fabricating zero.
 
 The JSON document exposes these joins as `staging.sync` and `staging.replica`.
 Missing files report `missing`; malformed or unknown existing databases report
@@ -202,6 +205,14 @@ Retention defaults to `keep_all`. Supplying `--keep-last N` and/or one or more
 Every plan reports `published_history: "retained_by_default"`. Bounded
 selection does not delete, expire, or hide retained revisions, receipts, or
 their metadata roots.
+
+An explicit `--backup PATH` package is validated read-only with the existing
+backup manifest checksum, shape checks, and package validator. Validation does
+not restore, migrate state, acquire a writer lease, or require the original
+local root to exist. The package filesystem must match the observed volume;
+foreign, corrupt, partial, or unreadable packages are reported and their
+revisions are not attributed to the volume.
+
 The selected set is the union of:
 
 - the latest observed revision;
@@ -212,7 +223,12 @@ The selected set is the union of:
   Unknown, or failed staging handles;
 - baselines recorded by Managed Sync namespace intents, including
   namespace-only intents without a content handle; and
-- receipt revisions recorded by committed Managed Sync namespace intents.
+- receipt revisions recorded by committed Managed Sync namespace intents;
+- global and per-entry remote revisions recorded by the local replica common
+  baseline; and
+- revisions protected by an explicitly supplied backup package: content
+  staging remote bases, namespace intent baselines, committed receipt
+  revisions, replica conflict revisions, and replica baseline revisions.
 
 A requested revision absent from a successfully observed retained list is
 reported as `not_retained` and makes the plan partial. If the authority cannot
@@ -234,7 +250,14 @@ Selection reasons are drawn from:
   `sync_namespace_receipt`, `sync_namespace_conflict`,
   `sync_namespace_retryable`, and `sync_namespace_failed`;
 - `sync_receipt`; and
-- `replica_conflict`.
+- `replica_conflict` and `replica_baseline`; and
+- `backup_staging_pending`, `backup_staging_frozen`, `backup_staging_unknown`,
+  `backup_staging_conflict`, `backup_staging_failed`,
+  `backup_sync_namespace_pending`, `backup_sync_namespace_unknown`,
+  `backup_sync_namespace_receipt`, `backup_sync_namespace_conflict`,
+  `backup_sync_namespace_retryable`, `backup_sync_namespace_failed`,
+  `backup_sync_receipt`, `backup_replica_conflict`, and
+  `backup_replica_baseline`.
 
 The plan also reports:
 
@@ -242,19 +265,29 @@ The plan also reports:
 - staging pending/frozen/conflict/Unknown/failed evidence;
 - Managed Sync prepared/Unknown/committed/conflict/retryable/failed namespace
   evidence;
-- replica pending installs, retained artifacts, and conflicts, with the
-  explicit baseline-coverage limitation; and
+- replica pending installs, retained artifacts, conflicts, and global/per-entry
+  baseline evidence;
+- `backups`, with each supplied package's state (`validated`, `partial`,
+  `foreign`, or `unavailable`), filesystem binding, read-only staging evidence,
+  and protected revisions; and
 - frozen commit identities;
-- `backup_evidence: "not_observed"`;
+- `backup_evidence: "not_supplied"`, `"supplied_validated"`, or
+  `"supplied_incomplete"`;
 - `external_readers: "unknown"`;
 - `untracked_pins: "unknown"`; and
 - `quiescence: "not_observed"`.
 
 Receipt records remain namespace evidence, not a physical cleanup
 authorization. Backup packages are not discovered automatically. A revision
-needed by a backup, external reader, or another unpinned workflow must be
-supplied as an explicit requested pin, and quiescence must be established by
-the operator outside this command.
+needed by an undisclosed backup, external reader, or another unpinned workflow
+must be supplied as an explicit requested pin or via `--backup`, and quiescence
+must be established by the operator outside this command.
+
+`--keep` and `--keep-last` apply only to one invocation; they are not persistent
+pins and do not create a registry. Revisions outside a bounded policy remain
+readable with `outside_bounded_policy`. This contract has no expiry command:
+selection, including `outside_bounded_policy`, never makes a retained revision
+unreadable or indistinguishable from a revision that never existed.
 
 Every plan has `deletion_authorized: false` and `reclaimable_bytes: null`.
 Selecting or excluding a revision does not prove that any extent or object is
@@ -290,15 +323,22 @@ yy --volume notes.json space retention plan \
   --keep-last 2 \
   --keep 00112233445566778899aabbccddeeff0011223344556677 \
   --json
+yy --volume notes.json space retention plan \
+  --backup /backups/notes-2026-11-01 \
+  --json
 ```
 
 ## Limits
 
 This contract does not provide physical garbage collection, deletion,
 compaction, repacking, a persistent remote pin registry, background scheduling,
-or a release-supported storage reclamation promise. It does not inspect Direct
-namespaces. It does not make SQLite sidecar files byte-identical or infer
-noncurrent backend versions that the configured backend does not return.
-Reachability does not scrub content payloads, and a complete observed root set
-does not prove global orphanhood, external-reader absence, or deletion
-eligibility.
+expiry, or a release-supported storage reclamation promise. `--keep` is a
+one-invocation declaration, not a persistent pin. Explicit backup packages are
+validated read-only and do not require the original local root; they remain
+protection evidence, not deletion or expiry authorization. A revision needed
+by an undisclosed backup, external reader, or unpinned workflow must still be
+supplied explicitly. It does not inspect Direct namespaces. It does not make
+SQLite sidecar files byte-identical or infer noncurrent backend versions that
+the configured backend does not return. Reachability does not scrub content
+payloads, and a complete observed root set does not prove global orphanhood,
+external-reader absence, or deletion eligibility.
