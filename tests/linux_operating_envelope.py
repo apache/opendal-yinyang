@@ -266,23 +266,21 @@ def overlap_summary(
     write_intervals: list[tuple[float, float]],
     read_intervals: list[tuple[float, float]],
 ) -> dict[str, Any]:
-    overlaps = []
-    for write_started, write_ended in write_intervals:
-        for read_started, read_ended in read_intervals:
-            started = max(write_started, read_started)
-            ended = min(write_ended, read_ended)
-            if started < ended:
-                overlaps.append((started, ended))
+    write_seconds = merged_interval_seconds(write_intervals)
+    read_seconds = merged_interval_seconds(read_intervals)
+    combined_seconds = merged_interval_seconds(
+        [*write_intervals, *read_intervals]
+    )
     return {
         "max_concurrent_writers": max_concurrency(write_intervals),
         "max_concurrent_readers": max_concurrency(read_intervals),
         "max_concurrent_operations": max_concurrency(
             [*write_intervals, *read_intervals]
         ),
-        "writer_active_seconds": round(merged_interval_seconds(write_intervals), 3),
-        "reader_active_seconds": round(merged_interval_seconds(read_intervals), 3),
+        "writer_active_seconds": round(write_seconds, 3),
+        "reader_active_seconds": round(read_seconds, 3),
         "writer_reader_overlap_seconds": round(
-            merged_interval_seconds(overlaps), 3
+            max(0.0, write_seconds + read_seconds - combined_seconds), 3
         ),
     }
 
@@ -1057,6 +1055,19 @@ class Workload:
                 state.name for state in self.states if state.mutation_active
             ],
         }
+        observed_overlap = overlap_summary(
+            self.write_intervals, self.read_attempt_intervals
+        )
+        observed_overlap["scope"] = (
+            "read attempts, including attempts skipped before or during "
+            "a file mutation"
+        )
+        validated_read_overlap = overlap_summary(
+            self.write_intervals, self.read_validated_intervals
+        )
+        validated_read_overlap["scope"] = (
+            "stable-epoch reads that compared actual bytes with expected bytes"
+        )
         return {
             "fatal": list(self.fatal),
             "first_errors": self.first_errors,
@@ -1089,9 +1100,8 @@ class Workload:
                     else None
                 ),
             },
-            "observed_overlap": overlap_summary(
-                self.write_intervals, self.read_attempt_intervals
-            ),
+            "observed_overlap": observed_overlap,
+            "validated_read_overlap": validated_read_overlap,
         }
 
 

@@ -336,6 +336,12 @@ error 4 handle 00000000-0000-0000-0000-000000000001 persisted true: retryable pu
         self.assertEqual(summary["readers"]["validation_bytes"], module.PAGE_BYTES)
         self.assertEqual(summary["readers"]["concurrent_skips"], 0)
         self.assertEqual(summary["readers"]["validation_mismatches"], 0)
+        self.assertEqual(
+            summary["validated_read_overlap"]["max_concurrent_readers"], 1
+        )
+        self.assertIn(
+            "stable-epoch", summary["validated_read_overlap"]["scope"]
+        )
 
     def test_reader_skips_active_epoch_without_corruption(self) -> None:
         _module, workload = self.make_workload(
@@ -349,6 +355,13 @@ error 4 handle 00000000-0000-0000-0000-000000000001 persisted true: retryable pu
         summary = workload.finish()
         self.assertEqual(summary["readers"]["validated"], 0)
         self.assertGreater(summary["readers"]["concurrent_skips"], 0)
+        self.assertIn(
+            "including attempts skipped",
+            summary["observed_overlap"]["scope"],
+        )
+        self.assertEqual(
+            summary["validated_read_overlap"]["reader_active_seconds"], 0.0
+        )
         self.assertEqual(summary["fatal"], [])
 
     def test_reader_records_short_read_as_valid_concurrent_skip(self) -> None:
