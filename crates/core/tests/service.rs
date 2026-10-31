@@ -162,6 +162,26 @@ async fn suite(fs: &dyn Authority) {
         .await
         .unwrap();
     assert_eq!(bytes, b"1234inal");
+
+    // A length-changing update preserves only the explicit base prefix.
+    let latest = fs.observe_latest().await.unwrap();
+    let selected = latest.open_file(a).await.unwrap();
+    let length_edits = [
+        ContentEdit::new(2..6, b"CDEF").unwrap(),
+        ContentEdit::new(9..13, b"tail").unwrap(),
+    ];
+    let extended = Authority::prepare_update(fs, &selected, 4, 13, &length_edits)
+        .await
+        .unwrap();
+    let expected = b"12CDEF\0\0\0tail";
+    let canonical = fs.data().prepare(&mut expected.as_slice()).await.unwrap();
+    assert_eq!(extended.content_id(), canonical.content_id());
+    let mut bytes = Vec::new();
+    fs.data()
+        .read_range(extended.descriptor(), 0..13, &mut bytes)
+        .await
+        .unwrap();
+    assert_eq!(bytes, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -261,6 +281,8 @@ async fn authenticated_service_protocol_and_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
+    use yinyang_core::data::{BLOCK_BYTES, MAX_UPDATE_UNITS};
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("metadata.db");
     let backend = TestBackend::default();
@@ -295,6 +317,22 @@ async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
         .await
         .unwrap();
     let full_bytes = base.descriptor().content_id().length();
+    backend.state.lock().unwrap().data_reads = 0;
+    backend.state.lock().unwrap().written_bytes = 0;
+    assert_eq!(
+        client
+            .prepare_update(&base, 0, (MAX_UPDATE_UNITS + 1) * BLOCK_BYTES as u64, &[],)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    {
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.data_reads, 0);
+        assert_eq!(state.written_bytes, 0);
+    }
+
     let mut later = Planner::new(
         &client.observe_latest().await.unwrap(),
         CommitId::generate(),
