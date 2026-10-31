@@ -207,7 +207,7 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
     assert_eq!(revisions.len(), 3);
 
     let staging = temp.path().join("absent-staging");
-    let plan = plan_managed_retention(authority.as_ref(), &staging, Some(1), &[revisions[0]])
+    let plan = plan_managed_retention(authority.as_ref(), &staging, Some(1), &[revisions[0]], &[])
         .await
         .unwrap();
 
@@ -272,7 +272,7 @@ async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let report = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
         .await
         .unwrap();
-    assert_eq!(report.schema, "yinyang.managed-space.report.v2");
+    assert_eq!(report.schema, "yinyang.managed-space.report.v3");
     assert!(!report.deletion_authorized);
     assert_eq!(report.reclaimable_bytes, None);
     assert_eq!(report.physical.state, MeasurementState::Partial);
