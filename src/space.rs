@@ -981,7 +981,7 @@ pub async fn plan_managed_retention(
         protection: RetentionProtection {
             current_revision: revision_hex(latest.revision()),
             staging: staging_protection(&staging),
-            backups: backups,
+            backups,
             receipts,
             backup_evidence,
             external_readers: "unknown",
