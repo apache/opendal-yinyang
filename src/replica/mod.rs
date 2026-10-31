@@ -27,6 +27,7 @@ mod error;
 pub(super) mod linux;
 pub(super) mod state;
 
+pub use backup::{BackupInspection, inspect_backup_package};
 pub use directory::{
     BaselineEvidence, BindingEvidence, BindingState, DirectorySync, EntryEvidence, EntryKind,
     EntryState, Inspection, IntentEvidence, IntentOperation, IntentState, LocalEvidence,
@@ -36,5 +37,6 @@ pub use directory::{
 pub use error::{Error, ErrorKind, Result};
 pub use linux::{
     Artifact, ArtifactKind, CapturedContent, Conflict, ContentHash, Identity, InstallOutcome,
-    LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaStatus, scan_path,
+    LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaBaseline, ReplicaProtection,
+    ReplicaStatus, scan_path,
 };

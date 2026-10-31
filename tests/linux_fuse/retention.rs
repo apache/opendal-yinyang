@@ -68,7 +68,7 @@ fn fuse_space_cli_emits_versioned_documents_both_publications() {
         ]);
         report.success_or("space report CLI");
         let report: Value = serde_json::from_slice(&report.stdout).expect("space report CLI JSON");
-        assert_eq!(report["schema"], "yinyang.managed-space.report.v2");
+        assert_eq!(report["schema"], "yinyang.managed-space.report.v3");
         assert_eq!(report["deletion_authorized"], false);
         assert!(report["reclaimable_bytes"].is_null());
 
@@ -84,7 +84,7 @@ fn fuse_space_cli_emits_versioned_documents_both_publications() {
         ]);
         plan.success_or("space retention plan CLI");
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("retention plan CLI JSON");
-        assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v2");
+        assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v3");
         assert_eq!(plan["deletion_authorized"], false);
         assert!(plan["reclaimable_bytes"].is_null());
         mounted.unmount();
@@ -356,7 +356,7 @@ fn assert_no_effects(
 fn assert_space_report(document: &Value, staging: &Path) {
     assert_eq!(
         document.get("schema").and_then(Value::as_str),
-        Some("yinyang.managed-space.report.v2"),
+        Some("yinyang.managed-space.report.v3"),
         "unexpected space JSON schema: {document}"
     );
     assert_eq!(
@@ -450,7 +450,7 @@ fn assert_space_report(document: &Value, staging: &Path) {
 fn assert_retention_plan(document: &Value) {
     assert_eq!(
         document.get("schema").and_then(Value::as_str),
-        Some("yinyang.managed-retention.plan.v2"),
+        Some("yinyang.managed-retention.plan.v3"),
         "unexpected retention JSON schema: {document}"
     );
     assert_eq!(
@@ -628,6 +628,7 @@ fn in_process_retention_plan(fixture: &Fixture, staging: &Path, keep_last: u64) 
             authority.as_ref(),
             staging,
             Some(keep_last),
+            &[],
             &[],
         ))
         .expect("plan managed retention in process");
