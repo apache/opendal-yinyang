@@ -77,6 +77,18 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
     // Stage a pending content edit and namespace intent without publishing it.
     let sync = Sync::open(authority.clone(), &state).await.unwrap();
     let baseline_snapshot = authority.observe_latest().await.unwrap();
+    let seeded = baseline_snapshot
+        .resolve("seed.txt")
+        .await
+        .unwrap()
+        .expect("seeded file");
+    sync.stage(
+        seeded.id(),
+        baseline_snapshot.revision(),
+        &mut &b"replacement seed"[..],
+    )
+    .await
+    .unwrap();
     sync.stage_create_file(
         baseline_snapshot.root(),
         "pending.txt",
