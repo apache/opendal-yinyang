@@ -1,6 +1,6 @@
 - Proposal Name: `stopped_process_expiry`
 - Start Date: 2026-11-01
-- RFC PR: TBD
+- RFC PR: [apache/opendal-yinyang#131](https://github.com/apache/opendal-yinyang/pull/131)
 - Tracking Issue: [apache/opendal-yinyang#78](https://github.com/apache/opendal-yinyang/issues/78)
 
 # Summary
