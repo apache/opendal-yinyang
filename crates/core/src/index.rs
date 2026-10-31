@@ -18,8 +18,8 @@
 use crate::compatibility::OBJECT_INDEX_MAGIC;
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::{Error, Result};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 const MAX: usize = 32;
@@ -36,6 +36,11 @@ type Wire = ([u8; 8], u8, Vec<(Vec<u8>, Vec<u8>, Option<RefWire>)>);
 /// An immutable, authenticated B+ tree. Branch separators are inclusive maxima.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index(pub(crate) Option<PackedRef>);
+
+pub(crate) trait MetadataVisitor: Send {
+    fn page(&mut self, reference: &PackedRef);
+    fn value(&mut self, reference: Option<&PackedRef>, key: &[u8], bytes: &[u8]);
+}
 
 /// Operation-local memoization for one immutable snapshot view.
 ///
@@ -293,6 +298,63 @@ impl Index {
                 }
             }
         }
+    }
+
+    /// Walk every authenticated page and external value in this immutable tree.
+    pub(crate) async fn inspect(
+        &self,
+        store: &DataStore,
+        cache: Option<&IndexCache>,
+        visited: &mut HashSet<PackedRef>,
+        visitor: &mut dyn MetadataVisitor,
+    ) -> Result<()> {
+        let Some(root) = &self.0 else {
+            return Ok(());
+        };
+        let page = Self::page(store, cache, root, true).await?;
+        if !visited.insert(root.clone()) {
+            return Ok(());
+        }
+        Self::inspect_page(store, cache, visited, page, root, visitor).await
+    }
+
+    fn inspect_page<'a>(
+        store: &'a DataStore,
+        cache: Option<&'a IndexCache>,
+        visited: &'a mut HashSet<PackedRef>,
+        page: Page,
+        reference: &'a PackedRef,
+        visitor: &'a mut dyn MetadataVisitor,
+    ) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            visitor.page(reference);
+            match page {
+                Page::Leaf(entries) => {
+                    for (key, value) in entries {
+                        match value {
+                            Value::Inline(bytes) => visitor.value(None, &key, &bytes),
+                            Value::External(reference) => {
+                                let bytes =
+                                    Self::value(store, cache, &Value::External(reference.clone()))
+                                        .await?;
+                                visitor.value(Some(&reference), &key, &bytes);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Page::Branch(level, children) => {
+                    for (key, child) in children {
+                        let page = Self::child(store, cache, level, &key, &child).await?;
+                        if !visited.insert(child.clone()) {
+                            continue;
+                        }
+                        Self::inspect_page(store, cache, visited, page, &child, visitor).await?;
+                    }
+                    Ok(())
+                }
+            }
+        })
     }
     pub(crate) async fn set(
         &mut self,
@@ -598,6 +660,42 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Corrupt);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
     }
+
+    #[tokio::test]
+    async fn duplicate_child_reference_is_revalidated_for_each_separator() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let entries = (0_u8..16)
+            .map(|index| {
+                (
+                    format!("key-{index:02}").into_bytes(),
+                    Value::Inline(vec![index]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let child = Page::Leaf(entries).write(&store).await.unwrap();
+        let root = Page::Branch(
+            1,
+            vec![(b"key-15".to_vec(), child.clone()), (b"zz".to_vec(), child)],
+        )
+        .write(&store)
+        .await
+        .unwrap();
+
+        struct Noop;
+        impl MetadataVisitor for Noop {
+            fn page(&mut self, _: &PackedRef) {}
+            fn value(&mut self, _: Option<&PackedRef>, _: &[u8], _: &[u8]) {}
+        }
+
+        let error = Index(Some(root))
+            .inspect(&store, None, &mut HashSet::new(), &mut Noop)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Corrupt);
+        assert!(error.to_string().contains("separator"));
+    }
+
     #[tokio::test]
     async fn malformed_index_pages_are_rejected() {
         let backend = TestBackend::default();

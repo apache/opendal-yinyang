@@ -155,7 +155,11 @@ cargo x test-linux-fuse --read-only-range
   test exercises the actual CLI spellings and versioned JSON documents. Report
   assertions require `deletion_authorized=false`, `reclaimable_bytes=null`,
   non-atomic inventory disclosure, and unknown noncurrent-version and
-  external-pin states.
+  external-pin states. They also require complete authenticated root traversal,
+  at least one observed content extent, explicit payload-not-read coverage,
+  root-relative zero-reference pack classification, and retained service
+  history. Retention plans must state that published history remains retained
+  by default under a bounded selection.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits
