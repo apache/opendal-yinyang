@@ -26,7 +26,7 @@ use rustix::fs::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use yinyang_core::NodeId;
+use yinyang_core::{NodeId, Revision};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ContentHash([u8; 32]);
@@ -184,6 +184,33 @@ pub struct ReplicaStatus {
     pub pending_installs: usize,
     pub artifacts: Vec<Artifact>,
     pub conflicts: Vec<Conflict>,
+    pub baseline: Option<ReplicaBaseline>,
+}
+
+/// Remote revisions recorded by the local common baseline.
+///
+/// `revision` is the global baseline revision. `entries` contains the distinct
+/// per-entry remote revisions used as future staging predicates, excluding the
+/// global revision itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaBaseline {
+    pub revision: Revision,
+    pub entries: Vec<Revision>,
+}
+
+/// Revision-protection facts readable from a replica state database without
+/// opening the bound local root or revalidating retained artifact bytes.
+///
+/// This supports validated backup packages whose original root may no longer
+/// exist. Use [`Replica::inspect`] for a live local root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaProtection {
+    pub filesystem: NodeId,
+    pub pending_installs: u64,
+    pub artifacts: u64,
+    pub exportable_artifacts: u64,
+    pub conflicts: Vec<Revision>,
+    pub baseline: Option<ReplicaBaseline>,
 }
 
 pub struct Replica {
@@ -196,6 +223,24 @@ pub struct Replica {
     quarantine_fd: OwnedFd,
     _lease: Option<std::fs::File>,
     store: Store,
+}
+
+fn baseline_from_store(store: &Store) -> Result<Option<ReplicaBaseline>> {
+    let Some(baseline) = store.load_baseline()? else {
+        return Ok(None);
+    };
+    let entries = baseline
+        .remote
+        .values()
+        .map(|node| node.revision)
+        .filter(|revision| *revision != baseline.revision)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some(ReplicaBaseline {
+        revision: baseline.revision,
+        entries,
+    }))
 }
 
 impl std::fmt::Debug for Replica {
@@ -475,6 +520,7 @@ impl Replica {
             pending_installs: self.store.incomplete_installs()?.len(),
             artifacts,
             conflicts,
+            baseline: baseline_from_store(&self.store)?,
         })
     }
 
@@ -488,6 +534,38 @@ impl Replica {
     /// recovery, so a bound root stays inspectable while a writer runs.
     pub fn scan_read_only(state: &Path) -> Result<LocalSnapshot> {
         Self::open_read_only(state)?.scan()
+    }
+
+    /// Read revision-protection facts from a replica state database without
+    /// opening the bound local root.
+    ///
+    /// A backup package records its original root path but keeps the root
+    /// payload inside the package. Inspecting protection must therefore not
+    /// require that original path to still exist.
+    pub fn inspect_protection(state: &Path) -> Result<ReplicaProtection> {
+        let store = Store::open_read_only(&state.join("replica.db"))?;
+        let binding = store
+            .binding()?
+            .ok_or_else(|| Error::invalid("sync state is not initialized; run sync init"))?;
+        let artifacts = store.artifacts()?;
+        let exportable = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind != "quarantined-directory")
+            .count();
+        let conflicts = store
+            .conflicts()?
+            .into_iter()
+            .filter_map(|conflict| conflict.remote_revision)
+            .map(Revision::from_bytes)
+            .collect();
+        Ok(ReplicaProtection {
+            filesystem: binding.filesystem,
+            pending_installs: u64::try_from(store.incomplete_installs()?.len()).unwrap_or(u64::MAX),
+            artifacts: u64::try_from(artifacts.len()).unwrap_or(u64::MAX),
+            exportable_artifacts: u64::try_from(exportable).unwrap_or(u64::MAX),
+            conflicts,
+            baseline: baseline_from_store(&store)?,
+        })
     }
 
     pub(crate) fn open_read_only(state: &Path) -> Result<Self> {
@@ -576,6 +654,7 @@ impl Replica {
             pending_installs: self.store.incomplete_installs()?.len(),
             artifacts,
             conflicts,
+            baseline: baseline_from_store(&self.store)?,
         })
     }
 
