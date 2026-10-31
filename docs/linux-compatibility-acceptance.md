@@ -22,6 +22,24 @@ bit-for-bit across build environments; that path must additionally set
 `source-pinned-rebuild` separately from `fixture-binary` rather than claiming
 the recorded producer hash.
 
+The separate `tests/fixtures/compatibility/546f419` corpus is genuine stage-3
+state produced by the accepted `546f419` trial archive binary. It is consumed
+by the installed target with:
+
+```shell
+YY_UPGRADE_BIN=/prefix/current/bin/yy \
+YY_UPGRADE_RELEASE=<installed-release> \
+cargo test --test linux_stage3_upgrade \
+  installed_stage3_upgrade_preserves_sparse_segments_and_service_wal \
+  -- --ignored --nocapture --test-threads=1
+```
+
+This path requires isolated Silo settings. It verifies sparse pending bytes,
+the original frozen and Unknown CommitIds/digests, service database plus
+non-empty WAL reopen, target publication and `doctor`. The generator is not
+used to rewrite the committed fixture. The equal `546f419` and current source
+trees do not relabel the producer binary.
+
 MACOS and Windows runs do not skip a Linux acceptance stage inside a
 purportedly completed Linux run: `test-compatibility` fails before running any
 test when the environment or legacy binary is missing.

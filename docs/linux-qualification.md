@@ -15,7 +15,8 @@ qualification.
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object Mount and finite Sync, loopback service Mount |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
 | `cargo test --test linux_prefix_upgrade` | Ubuntu, isolated Silo, `YY_LEGACY_BIN`, `YY_UPGRADE_BIN`, `sqlite3` | Stopped installed-prefix transition from the `fd1338c` producer to a selected target with retained file, Sync and service state |
-| `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor, recovery, and an archive-target `fd1338c` upgrade |
+| `cargo test --test linux_stage3_upgrade -- --ignored --test-threads=1` | Ubuntu, isolated Silo, immutable `546f419` fixture, installed `YY_UPGRADE_BIN` | Genuine stage-3 sparse bytes, pending/frozen/Unknown identities, service WAL reopen and target publication |
+| `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor, recovery, and archive-target `fd1338c` plus stage-3 upgrades |
 
 GitHub Actions runs the FUSE and installed-CLI checks in the `linux-fuse` job
 after starting isolated Silo. It runs backup and recovery acceptance in the
@@ -54,6 +55,11 @@ These checks require infrastructure that hosted CI does not provide:
 | `cargo x bench-linux-cost --workload read-only-range` | matched source identities, release binary, isolated S3, `/dev/fuse` | bounded FUSE range latency, requests, payload and staging |
 | `cargo test --test linux_prefix_upgrade` | isolated Silo, exact `fd1338c` and final-target binaries, `sqlite3` | stopped versioned-prefix replacement with pending/Unknown state, receipts and service WAL recovery |
 | `tests/linux_operating_envelope_real_s3.py` | dedicated real Amazon S3 versioned bucket, `/dev/fuse`, `sqlite3`, scoped AWS CLI | bounded sustained Mount I/O, sampled RSS/state/history, restart and independent final-byte convergence |
+| `tests/linux_stage3_real_s3.py` | one unversioned Amazon S3 bucket, installed archive binary, temporary role over stdin, `/dev/fuse` | one bounded multi-leaf Managed object: append, truncate, zero extension, shrink/extend, clean remount, independent remote restores, before/final `space report` inventory observation, `doctor` and exact-prefix cleanup |
+
+The actual stage-3 archive/install and Amazon S3 trial is recorded in
+[`linux-stage3-trial-results.md`](linux-stage3-trial-results.md), including the
+separate product-archive and script-only source identities.
 
 The installed-prefix command accepts `YY_LEGACY_BIN` for the immutable
 `fd1338c` producer, `YY_UPGRADE_BIN` for the selected target executable, and
@@ -74,6 +80,30 @@ command evidence.
 The Amazon S3 run qualifies only the bucket, region, endpoint and credential
 mode actually recorded. A loopback Silo run does not imply Amazon S3 behavior,
 and this matrix does not claim another S3-compatible provider.
+
+The bounded installed-target Amazon S3 trial accepts STS credentials only on
+stdin:
+
+```shell
+YINYANG_QUALIFICATION_BUCKET="<unversioned-bucket>" \
+YINYANG_QUALIFICATION_REGION="us-east-2" \
+YINYANG_STAGE3_TARGET_YY="$prefix/current/bin/yy" \
+YY_UPGRADE_RELEASE="<installed-release>" \
+YINYANG_STAGE3_REAL_S3_OUTPUT="/var/tmp/stage3-real-s3.json" \
+experiments/linux-devbox/run-validation-mbx.sh \
+  stage3-real-s3 \
+  env -u YINYANG_S3_ENDPOINT python3 tests/linux_stage3_real_s3.py
+```
+
+The helper removes inherited `YINYANG_*` and AWS endpoint overrides, uses the
+`amazon-s3` storage profile without an endpoint override, keeps a unique
+`stage3-real-s3/` prefix, and deletes only that prefix with the scoped AWS CLI.
+It does not test the Silo fault gate or repeat the sustained operating-envelope
+matrix. The outer runner establishes the isolated Silo environment; the inner
+`env -u YINYANG_S3_ENDPOINT` removes only that inherited endpoint before the
+real Amazon S3 child starts. The target provenance is read back from the
+installed release's `BUILD-MANIFEST`; the evidence records archive source,
+release and `yy` SHA-256 separately from the script checkout source.
 
 The explicit real-Amazon-S3 Direct record is
 [`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md). It qualifies only the
