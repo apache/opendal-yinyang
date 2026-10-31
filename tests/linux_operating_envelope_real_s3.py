@@ -81,7 +81,8 @@ def read_artifact_manifest(yy: Path) -> dict[str, str]:
     )
     if manifest_path is None:
         raise SystemExit(
-            "measured yy must be inside an installed archive with BUILD-MANIFEST"
+            "measured yy must be inside a package/direct artifact with "
+            "BUILD-MANIFEST"
         )
     fields = {}
     for line in manifest_path.read_text().splitlines():
@@ -182,7 +183,7 @@ def main() -> int:
         "--script-source-sha",
         script_source,
         "--artifact-provenance",
-        "installed-archive-BUILD-MANIFEST",
+        "package-BUILD-MANIFEST",
         "--backend-mode",
         "amazon-s3",
         "--backend-label",
