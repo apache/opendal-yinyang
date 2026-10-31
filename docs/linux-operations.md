@@ -5,6 +5,11 @@ systemd user services. It covers object-backed Managed Mount and finite Managed
 Sync, plus the authenticated loopback metadata service for combinations that
 set `publication: "service"`.
 
+For a first trial, download the standalone `yy` binary described in the
+[trial distribution guide](linux-trial-distribution.md). This page covers the
+maintainer installation, configuration and user-service lifecycle around that
+binary.
+
 The supported installation layout is deliberately small:
 
 - `$HOME/.local/lib/yinyang/<version>` contains one immutable binary release;
@@ -107,6 +112,11 @@ installer. The manifest records the package version, release identity, source
 commit, source date, target, Cargo/Rust versions and binary SHA-256. The script
 refuses a dirty worktree and requires Linux x86_64 so the archive cannot silently
 claim a source/build identity it did not test.
+
+The same output directory also contains the directly runnable `yy`,
+`yy.sha256`, `LICENSE`, `NOTICE` and `BUILD-MANIFEST`. The workflow uploads
+those files separately as the consumer trial artifact; the archive remains the
+input for immutable-prefix installation and compatibility qualification.
 
 The script requires Ubuntu 24.04 x86_64, the tested host combination. This
 artifact is local qualification input, not an Apache Software Foundation

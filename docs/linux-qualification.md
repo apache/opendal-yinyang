@@ -16,7 +16,7 @@ qualification.
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
 | `cargo test --test linux_prefix_upgrade` | Ubuntu, isolated Silo, `YY_LEGACY_BIN`, `YY_UPGRADE_BIN`, `sqlite3` | Stopped installed-prefix transition from the `fd1338c` producer to a selected target with retained file, Sync and service state |
 | `cargo test --test linux_stage3_upgrade -- --ignored --test-threads=1` | Ubuntu, isolated Silo, immutable `546f419` fixture, installed `YY_UPGRADE_BIN` | Genuine stage-3 sparse bytes, pending/frozen/Unknown identities, service WAL reopen and target publication |
-| `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor, recovery, and archive-target `fd1338c` plus stage-3 upgrades |
+| `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Direct `yy` checksum/manifest/`--help`, actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor, recovery, and archive-target `fd1338c` plus stage-3 upgrades |
 
 GitHub Actions runs the FUSE and installed-CLI checks in the `linux-fuse` job
 after starting isolated Silo. It runs backup and recovery acceptance in the
@@ -24,7 +24,9 @@ after starting isolated Silo. It runs backup and recovery acceptance in the
 skips the two operations tests that require `/dev/fuse`, so the non-FUSE job
 cannot report an accidental green or fail through a missing device.
 
-The separate trial-distribution workflow uses the verifier and installer
+The separate trial-distribution workflow verifies the standalone `yy`,
+`yy.sha256`, `LICENSE`, `NOTICE` and source manifest before uploading them as a
+short-lived direct-download artifact. It then uses the verifier and installer
 packaged inside the archive. Its installed archive smoke, isolated recovery and
 installed-prefix upgrade use the produced `bin/yy`; `YY_UPGRADE_BIN` is the
 shared native-acceptance selector and falls back to the Cargo test binary only
