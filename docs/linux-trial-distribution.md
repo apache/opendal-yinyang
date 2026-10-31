@@ -1,51 +1,91 @@
 # Linux trial distribution
 
-Status: experimental Ubuntu 24.04 x86_64 trial artifact. This workflow produces
-an inspectable local qualification archive, installs that exact archive into a
-versioned user prefix, and exercises supported stopped-process transitions. It
-does not create an official Apache Software Foundation release, tag, signature
-or externally published artifact.
+Status: experimental Ubuntu 24.04 x86_64 trial artifact. The workflow produces a
+directly runnable `yy` binary for a first trial and a local qualification archive
+for maintainer installation and compatibility checks. Neither artifact is an
+official Apache Software Foundation release, tag or signature.
 
-## Supported trial matrix
+## Download and run yy
 
-The archive target is one named combination:
+Open the
+[Linux trial distribution workflow](https://github.com/apache/opendal-yinyang/actions/workflows/linux-trial.yml).
+Choose a successful run and download its `yinyang-linux-x86_64` artifact.
+GitHub supplies Actions artifacts as ZIP files and requires a signed-in GitHub
+account for browser downloads. The artifact expires after 14 days and is not a
+stable release URL.
 
-- Ubuntu 24.04 x86_64;
-- the local `yy` executable built from the recorded source commit;
-- Managed Mount, finite Managed Sync, operational diagnostics and recovery as
-  qualified in the existing Linux guides;
-- object publication and authenticated single-host loopback service publication;
-- isolated MinIO-compatible Silo for deterministic upgrade/recovery fixtures.
+Extract and verify the binary before running it:
 
-Amazon S3 evidence remains a separate backend record. A Silo run does not
-qualify another endpoint, provider, host, platform, multi-host authority or
-production capacity. Direct modes remain part of the broader Linux matrix, but
-this trial installer does not add a Direct-specific reclamation or migration
-promise.
+```shell
+mkdir -p yinyang-linux-x86_64
+unzip yinyang-linux-x86_64.zip -d yinyang-linux-x86_64
+cd yinyang-linux-x86_64
 
-The archive name and release directory use both the Cargo package version and a
-12-character source suffix. Two binaries with the same package version therefore
-have different release directory names.
+sha256sum --check yy.sha256
+chmod +x yy
+./yy --help
+```
 
-## Prerequisites
+Actions artifact ZIP extraction does not preserve the executable mode, so
+`chmod +x yy` is required. The checksum detects a different `yy` from the
+sidecar in the same artifact; it is not a signature.
 
-Install the packages recorded in the archive's `PREREQUISITES` file. The tested
-base needs:
+The artifact contains:
+
+- `yy`;
+- `yy.sha256`;
+- `LICENSE` and `NOTICE`;
+- `BUILD-MANIFEST`, which records the full source commit, target and
+  `yy_sha256`.
+
+Install `ca-certificates` and `fuse3` before using Managed Mount. Storage
+credentials and an S3-compatible endpoint remain operator-supplied:
 
 ```shell
 sudo apt-get update
 sudo apt-get install --yes ca-certificates fuse3
 ```
 
-`sqlite3` is additionally needed by explicit backup and recovery acceptance.
-A systemd user manager is only needed for the supplied user units. The consumer
-does not need Cargo, Rust, Git, Python or an agent-host build wrapper.
+`doctor` requires an existing strict volume document. It does not create or
+initialize one:
 
-Storage credentials and the service token remain operator-supplied. Keep the
-environment file and all configuration and state outside the immutable release
-prefix.
+```shell
+./yy --volume /absolute/path/to/volume.json doctor --json
+```
 
-## Build the archive
+See [Linux operations](linux-operations.md) for volume configuration, state
+locations and user-service setup. The direct binary does not require Cargo,
+Rust, Git, Python or an installer.
+
+## Supported trial matrix
+
+The artifact target is one named combination:
+
+- Ubuntu 24.04 x86_64;
+- the local `yy` executable built from the recorded source commit;
+- Managed Mount, finite Managed Sync, operational diagnostics and recovery as
+  qualified in the existing Linux guides;
+- object publication and authenticated single-host loopback service publication;
+- isolated MinIO-compatible Silo for deterministic upgrade and recovery
+  fixtures.
+
+Amazon S3 evidence remains a separate backend record. A Silo run does not
+qualify another endpoint, provider, host, platform, multi-host authority or
+production capacity. Direct modes remain part of the broader Linux matrix, but
+this trial does not add a Direct-specific reclamation or migration promise.
+
+## Maintainer archive and installation
+
+The workflow also packages the same binary into an inspectable archive. This
+path remains the maintainer entry point for immutable-prefix installation,
+retained-state recovery and exact cross-version qualification. It is not
+required for a first trial of `yy`.
+
+The archive name and release directory use both the Cargo package version and a
+12-character source suffix. Two binaries with the same package version
+therefore have different release directory names.
+
+### Build the archive
 
 The build must run from a clean Ubuntu 24.04 x86_64 checkout:
 
@@ -56,6 +96,7 @@ tools/linux/package-release.sh --output-dir /var/tmp/yinyang-artifacts
 
 The output directory receives:
 
+- `yy`, `yy.sha256`, `LICENSE`, `NOTICE` and `BUILD-MANIFEST`;
 - `yinyang-<version>-ubuntu-24.04-x86_64-<source>.tar.gz`;
 - the adjacent `.tar.gz.sha256` sidecar.
 
@@ -63,11 +104,11 @@ The archive includes `BUILD-MANIFEST`, `PREREQUISITES`, `INSTALL`, `LICENSE`,
 `NOTICE`, `bin/yy`, the three systemd user-unit templates, the environment
 example, operational documents and the packaged verifier and installer.
 
-The build script refuses a dirty tree and normalizes archive path ordering,
-ownership and modification time. It does not claim bit-for-bit reproducible
-compiler output.
+The build script refuses a dirty tree or existing output files and normalizes
+archive path ordering, ownership and modification time. It does not claim
+bit-for-bit reproducible compiler output.
 
-## Verify the archive
+### Verify the archive
 
 Verification is independent of installation:
 
@@ -86,7 +127,7 @@ The checksum sidecar proves only that the archive matches the sidecar supplied
 with it. It is not a signature and does not establish artifact authenticity or
 an ASF release decision.
 
-## Install and activate
+### Install and activate
 
 Extract the archive outside the installation prefix and use the packaged
 installer:
@@ -129,7 +170,7 @@ Install the supplied unit templates and environment file as described in
 new `current` target, binary SHA-256, `yy doctor` result and retained volume
 state have been verified.
 
-## Upgrade and downgrade boundary
+### Upgrade and downgrade boundary
 
 The only trial upgrade route is a stopped, same-host replacement from one
 immutable release directory to the next. The verified target may reopen state
@@ -201,10 +242,15 @@ backend versions with an exact supported backend contract.
 ## Fresh-runner acceptance
 
 The `.github/workflows/linux-trial.yml` workflow builds on a fresh Ubuntu 24.04
-x86_64 runner, verifies the archive using its packaged scripts, installs the
-actual archive into a versioned prefix, exercises checksum rejection,
-immutable installation, explicit quiesced activation and installed diagnostics,
-and runs recovery.
+x86_64 runner. It verifies the directly downloadable `yy` checksum, manifest
+source identity and `--help`, then uploads the binary, checksum, LICENSE, NOTICE
+and manifest as the `yinyang-linux-x86_64` artifact only after the other trial
+checks succeed.
+
+The workflow separately verifies the archive using its packaged scripts,
+installs the actual archive into a versioned prefix, exercises checksum
+rejection, immutable installation, explicit quiesced activation and installed
+diagnostics, and runs recovery.
 
 The same workflow installs the pinned `fd1338c` producer and runs
 `linux_prefix_upgrade` with the archive's installed target binary. It then runs
