@@ -505,7 +505,7 @@ class Trial:
             ["--volume", str(self.config), "space", "report", "--json"]
         )
         document = json.loads(completed.stdout)
-        if document.get("schema") != "yinyang.managed-space.report.v2":
+        if document.get("schema") != "yinyang.managed-space.report.v3":
             raise EnvelopeError(
                 f"unexpected managed-space report schema: {document.get('schema')}"
             )

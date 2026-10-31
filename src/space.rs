@@ -22,18 +22,18 @@
 //! opening a writer, acquiring a runtime lease, or migrating local databases.
 
 #[cfg(target_os = "linux")]
-use crate::replica::Replica;
+use crate::replica::{Replica, ReplicaBaseline, inspect_backup_package};
 use crate::runtime::{ErrorKind as RuntimeErrorKind, Runtime};
 use crate::sync::{NamespaceState, NamespaceStatus, Sync};
 use opendal::{EntryMode, Operator};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use yinyang_core::reachability::PhysicalReferenceKind;
 use yinyang_core::{Authority, Error, ErrorKind, NodeId, NodeKind, Result, Revision, Snapshot};
 
-pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v2";
-pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v2";
+pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v3";
+pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v3";
 
 const HEAD_KEY: &str = ".yinyang/head";
 const PACK_ROOT: &str = ".yinyang/v2";
@@ -328,6 +328,7 @@ pub struct ReplicaEvidence {
     pub exportable_artifacts: Option<u64>,
     pub conflicts: Option<u64>,
     pub baseline_coverage: &'static str,
+    pub baseline: Option<ReplicaBaselineEvidence>,
     pub error: Option<String>,
 }
 
@@ -340,7 +341,24 @@ impl ReplicaEvidence {
             exportable_artifacts: None,
             conflicts: None,
             baseline_coverage: "not_observed",
+            baseline: None,
             error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplicaBaselineEvidence {
+    pub revision: String,
+    pub entry_revisions: Vec<String>,
+}
+
+impl ReplicaBaselineEvidence {
+    #[cfg(target_os = "linux")]
+    fn from_baseline(baseline: ReplicaBaseline) -> Self {
+        Self {
+            revision: revision_hex(baseline.revision),
+            entry_revisions: baseline.entries.into_iter().map(revision_hex).collect(),
         }
     }
 }
@@ -396,11 +414,39 @@ pub struct RetentionRevision {
 pub struct RetentionProtection {
     pub current_revision: String,
     pub staging: StagingProtection,
+    pub backups: BackupProtection,
     pub receipts: ReceiptEvidence,
     pub backup_evidence: &'static str,
     pub external_readers: &'static str,
     pub untracked_pins: &'static str,
     pub quiescence: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BackupProtection {
+    pub supplied: u64,
+    pub validated: u64,
+    pub packages: Vec<BackupPackageEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupPackageState {
+    Validated,
+    Partial,
+    Foreign,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BackupPackageEvidence {
+    pub path: String,
+    pub state: BackupPackageState,
+    pub filesystem: Option<String>,
+    pub staging: Option<StagingProtection>,
+    pub error: Option<String>,
+    #[serde(skip)]
+    protected: BTreeMap<Revision, BTreeSet<&'static str>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -550,6 +596,158 @@ pub async fn inspect_managed_space(
     })
 }
 
+async fn inspect_backup_packages(
+    backup_packages: &[PathBuf],
+    filesystem: NodeId,
+) -> BackupProtection {
+    let mut packages = Vec::with_capacity(backup_packages.len());
+    for backup in backup_packages {
+        packages.push(inspect_backup_package_evidence(backup, filesystem).await);
+    }
+    let supplied = u64::try_from(packages.len()).unwrap_or(u64::MAX);
+    let validated = u64::try_from(
+        packages
+            .iter()
+            .filter(|package| package.state == BackupPackageState::Validated)
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    BackupProtection {
+        supplied,
+        validated,
+        packages,
+    }
+}
+
+async fn inspect_backup_package_evidence(
+    backup: &Path,
+    filesystem: NodeId,
+) -> BackupPackageEvidence {
+    let path = display_path(backup);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = filesystem;
+        return unavailable_backup(
+            &path,
+            None,
+            "backup package inspection is available only on Linux".to_owned(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let inspection = {
+            let backup = backup.to_owned();
+            tokio::task::spawn_blocking(move || inspect_backup_package(&backup)).await
+        };
+        let inspection = match inspection {
+            Ok(Ok(inspection)) => inspection,
+            Ok(Err(error)) => return unavailable_backup(&path, None, error.to_string()),
+            Err(error) => {
+                return unavailable_backup(&path, None, format!("inspect backup package: {error}"));
+            }
+        };
+        let package_filesystem = inspection.filesystem;
+        let filesystem_hex = identity_hex(package_filesystem);
+        if package_filesystem != filesystem {
+            let error = format!(
+                "backup filesystem {filesystem_hex} does not match volume filesystem {}",
+                identity_hex(filesystem)
+            );
+            return BackupPackageEvidence {
+                path,
+                state: BackupPackageState::Foreign,
+                filesystem: Some(filesystem_hex),
+                staging: None,
+                error: Some(error),
+                protected: BTreeMap::new(),
+            };
+        }
+        let state_directory = backup.join("state");
+        if let Err(error) = Sync::validate_restore(&state_directory, filesystem).await {
+            return unavailable_backup(&path, Some(filesystem_hex), error.to_string());
+        }
+        let mut staging = inspect_package_staging(&state_directory).await;
+        staging.binding = StagingBinding::verified(filesystem);
+        let state = match staging.state {
+            StagingState::Available => BackupPackageState::Validated,
+            StagingState::Partial => BackupPackageState::Partial,
+            StagingState::Missing | StagingState::NotInitialized | StagingState::Unavailable => {
+                BackupPackageState::Unavailable
+            }
+        };
+        let error = (!staging.errors.is_empty()).then(|| staging.errors.join("; "));
+        BackupPackageEvidence {
+            path,
+            state,
+            filesystem: Some(filesystem_hex),
+            staging: Some(staging_protection(&staging)),
+            error,
+            protected: staging.protected,
+        }
+    }
+}
+
+fn unavailable_backup(
+    path: &str,
+    filesystem: Option<String>,
+    error: String,
+) -> BackupPackageEvidence {
+    BackupPackageEvidence {
+        path: path.to_owned(),
+        state: BackupPackageState::Unavailable,
+        filesystem,
+        staging: None,
+        error: Some(error),
+        protected: BTreeMap::new(),
+    }
+}
+
+fn staging_protection(staging: &StagingSpace) -> StagingProtection {
+    StagingProtection {
+        state: staging.state,
+        binding: staging.binding.clone(),
+        pending: staging.handles.pending,
+        frozen: staging.handles.frozen,
+        conflict: staging.handles.conflict,
+        unknown: staging.handles.unknown,
+        failed: staging.handles.failed,
+        ledger_errors: staging.handles.ledger_errors,
+        sync: staging.sync.clone(),
+        replica: staging.replica.clone(),
+        revisions: staging.protected_revisions.clone(),
+    }
+}
+
+fn backup_reason(reason: &'static str) -> &'static str {
+    match reason {
+        "staging_pending" => "backup_staging_pending",
+        "staging_frozen" => "backup_staging_frozen",
+        "staging_unknown" => "backup_staging_unknown",
+        "staging_conflict" => "backup_staging_conflict",
+        "staging_failed" => "backup_staging_failed",
+        "sync_namespace_pending" => "backup_sync_namespace_pending",
+        "sync_namespace_unknown" => "backup_sync_namespace_unknown",
+        "sync_namespace_receipt" => "backup_sync_namespace_receipt",
+        "sync_namespace_conflict" => "backup_sync_namespace_conflict",
+        "sync_namespace_retryable" => "backup_sync_namespace_retryable",
+        "sync_namespace_failed" => "backup_sync_namespace_failed",
+        "sync_receipt" => "backup_sync_receipt",
+        "replica_conflict" => "backup_replica_conflict",
+        "replica_baseline" => "backup_replica_baseline",
+        _ => "backup_unclassified",
+    }
+}
+
+fn backup_evidence_state(backups: &BackupProtection) -> &'static str {
+    if backups.supplied == 0 {
+        "not_supplied"
+    } else if backups.validated == backups.supplied {
+        "supplied_validated"
+    } else {
+        "supplied_incomplete"
+    }
+}
+
 /// Build a bounded declarative retention selection over authoritative retained
 /// revisions. The result never authorizes deletion and never estimates bytes
 /// that physical cleanup could reclaim.
@@ -558,6 +756,7 @@ pub async fn plan_managed_retention(
     staging: &Path,
     keep_last: Option<u64>,
     requested_pins: &[Revision],
+    backup_packages: &[PathBuf],
 ) -> Result<ManagedRetentionPlan> {
     if keep_last == Some(0) {
         return Err(Error::new(
@@ -568,6 +767,7 @@ pub async fn plan_managed_retention(
     }
     let latest = authority.observe_latest().await?;
     let staging = inspect_bound_local_staging(staging, authority.filesystem()).await;
+    let backups = inspect_backup_packages(backup_packages, authority.filesystem()).await;
     let mut unresolved = staging
         .errors
         .iter()
@@ -577,6 +777,29 @@ pub async fn plan_managed_retention(
             detail: detail.clone(),
         })
         .collect::<Vec<_>>();
+    for package in &backups.packages {
+        if package.state == BackupPackageState::Validated {
+            continue;
+        }
+        let state = match package.state {
+            BackupPackageState::Validated => unreachable!(),
+            BackupPackageState::Partial => "partial",
+            BackupPackageState::Foreign => "foreign",
+            BackupPackageState::Unavailable => "unavailable",
+        };
+        unresolved.push(Unresolved {
+            subject: "backup-package".to_owned(),
+            state: state.to_owned(),
+            detail: format!(
+                "{}: {}",
+                package.path,
+                package
+                    .error
+                    .as_deref()
+                    .unwrap_or("package evidence is partial")
+            ),
+        });
+    }
     let (revisions, retained_revision_count, state) = match authority.retained_revisions().await {
         Ok(revisions) => {
             let mut revisions = revisions;
@@ -630,6 +853,27 @@ pub async fn plan_managed_retention(
         }
     }
 
+    let mut backup_protected = BTreeMap::<Revision, BTreeSet<&'static str>>::new();
+    for package in &backups.packages {
+        for (revision, reasons) in &package.protected {
+            let entry = backup_protected.entry(*revision).or_default();
+            for reason in reasons {
+                entry.insert(backup_reason(reason));
+            }
+        }
+    }
+    if retained_revision_count.is_some() {
+        for revision in backup_protected.keys() {
+            if !retained_set.contains(revision) {
+                unresolved.push(Unresolved {
+                    subject: "backup-pin".to_owned(),
+                    state: "not_retained".to_owned(),
+                    detail: revision_hex(*revision),
+                });
+            }
+        }
+    }
+
     let bounded = keep_last.is_some() || !requested_pins.is_empty();
     let keep_last_set = keep_last
         .map(|count| {
@@ -641,7 +885,9 @@ pub async fn plan_managed_retention(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let protected = &staging.protected;
+    let mut protected = staging.protected.clone();
+    merge_protected(&mut protected, &backup_protected);
+    let protected = &protected;
     let mut decisions = Vec::with_capacity(revisions.len());
     for revision in &revisions {
         let reasons = selection_reasons(
@@ -718,6 +964,7 @@ pub async fn plan_managed_retention(
     } else {
         state
     };
+    let backup_evidence = backup_evidence_state(&backups);
     Ok(ManagedRetentionPlan {
         schema: RETENTION_PLAN_SCHEMA,
         filesystem: identity_hex(authority.filesystem()),
@@ -733,21 +980,10 @@ pub async fn plan_managed_retention(
         revisions: decisions,
         protection: RetentionProtection {
             current_revision: revision_hex(latest.revision()),
-            staging: StagingProtection {
-                state: staging.state,
-                binding: staging.binding.clone(),
-                pending: staging.handles.pending,
-                frozen: staging.handles.frozen,
-                conflict: staging.handles.conflict,
-                unknown: staging.handles.unknown,
-                failed: staging.handles.failed,
-                ledger_errors: staging.handles.ledger_errors,
-                sync: staging.sync.clone(),
-                replica: staging.replica.clone(),
-                revisions: staging.protected_revisions.clone(),
-            },
+            staging: staging_protection(&staging),
+            backups,
             receipts,
-            backup_evidence: "not_observed",
+            backup_evidence,
             external_readers: "unknown",
             untracked_pins: "unknown",
             quiescence: "not_observed",
@@ -764,10 +1000,29 @@ pub async fn plan_managed_retention(
 /// recovering records. Known SQLite read-only behavior may create or update
 /// derived WAL/SHM files.
 pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
-    let mut content = inspect_local_content_staging(staging).await;
+    let content = inspect_local_content_staging(staging).await;
     let sync = inspect_sync_evidence(staging).await;
     let replica = inspect_replica_evidence(staging).await;
+    assemble_staging_space(staging, content, sync, replica)
+}
 
+/// Inspect a validated backup package state directory. The package validator
+/// already verified database hashes, the manifest, and the root payload, so
+/// this path reads protection facts without opening the original local root.
+#[cfg(target_os = "linux")]
+async fn inspect_package_staging(staging: &Path) -> StagingSpace {
+    let content = inspect_local_content_staging(staging).await;
+    let sync = inspect_sync_evidence(staging).await;
+    let replica = inspect_replica_protection_evidence(staging).await;
+    assemble_staging_space(staging, content, sync, replica)
+}
+
+fn assemble_staging_space(
+    staging: &Path,
+    mut content: StagingSpace,
+    sync: SyncInspection,
+    replica: ReplicaInspection,
+) -> StagingSpace {
     merge_protected(&mut content.protected, &sync.protected);
     merge_protected(&mut content.protected, &replica.protected);
     content
@@ -1017,8 +1272,13 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
         match Replica::inspect(staging) {
             Ok(status) => {
                 let pending = u64::try_from(status.pending_installs).unwrap_or(u64::MAX);
+                let baseline = status.baseline.clone();
                 inspection.evidence = ReplicaEvidence {
-                    state: StagingState::Partial,
+                    state: if pending > 0 {
+                        StagingState::Partial
+                    } else {
+                        StagingState::Available
+                    },
                     pending_installs: Some(pending),
                     artifacts: Some(status.artifacts.len() as u64),
                     exportable_artifacts: Some(
@@ -1029,13 +1289,30 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
                             .count() as u64,
                     ),
                     conflicts: Some(status.conflicts.len() as u64),
-                    baseline_coverage: "unobserved_by_public_read_only_inspection",
+                    baseline_coverage: "observed_from_read_only_baseline",
+                    baseline: baseline
+                        .as_ref()
+                        .map(|value| ReplicaBaselineEvidence::from_baseline(value.clone())),
                     error: None,
                 };
                 if pending > 0 {
                     inspection.evidence.error = Some(format!(
-                        "replica has {pending} pending installs; retained artifacts and conflicts are observable, but replica baseline coverage is unobserved"
+                        "replica has {pending} pending installs; retained artifacts, conflicts, and baseline revisions are observable"
                     ));
+                }
+                if let Some(baseline) = baseline {
+                    inspection
+                        .protected
+                        .entry(baseline.revision)
+                        .or_default()
+                        .insert("replica_baseline");
+                    for revision in baseline.entries {
+                        inspection
+                            .protected
+                            .entry(revision)
+                            .or_default()
+                            .insert("replica_baseline");
+                    }
                 }
                 for conflict in status.conflicts {
                     if let Some(revision) = conflict.remote_revision {
@@ -1062,6 +1339,86 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
             "replica read-only inspection is available only on Linux; baseline and retained artifact coverage is unobserved"
                 .to_owned(),
         );
+    }
+    inspection
+}
+
+/// Read replica revision-protection facts from validated package state without
+/// opening the recorded original root or revalidating retained artifact bytes.
+#[cfg(target_os = "linux")]
+async fn inspect_replica_protection_evidence(staging: &Path) -> ReplicaInspection {
+    let database = staging.join("replica.db");
+    let mut inspection = ReplicaInspection {
+        evidence: ReplicaEvidence::missing(),
+        protected: BTreeMap::new(),
+    };
+    match database.try_exists() {
+        Ok(false) => return inspection,
+        Err(error) => {
+            inspection.evidence.state = StagingState::Unavailable;
+            inspection.evidence.baseline_coverage = "unavailable";
+            inspection.evidence.error = Some(format!(
+                "inspect replica state {}: {error}",
+                database.display()
+            ));
+            return inspection;
+        }
+        Ok(true) => {}
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match Replica::inspect_protection(staging) {
+            Ok(status) => {
+                let pending = status.pending_installs;
+                inspection.evidence = ReplicaEvidence {
+                    state: if pending > 0 {
+                        StagingState::Partial
+                    } else {
+                        StagingState::Available
+                    },
+                    pending_installs: Some(status.pending_installs),
+                    artifacts: Some(status.artifacts),
+                    exportable_artifacts: Some(status.exportable_artifacts),
+                    conflicts: Some(status.conflicts.len() as u64),
+                    baseline_coverage: "observed_from_read_only_baseline",
+                    baseline: status
+                        .baseline
+                        .as_ref()
+                        .map(|value| ReplicaBaselineEvidence::from_baseline(value.clone())),
+                    error: (pending > 0).then(|| {
+                        format!(
+                            "package replica state has {pending} incomplete installs; protection evidence remains readable"
+                        )
+                    }),
+                };
+                if let Some(baseline) = status.baseline {
+                    inspection
+                        .protected
+                        .entry(baseline.revision)
+                        .or_default()
+                        .insert("replica_baseline");
+                    for revision in baseline.entries {
+                        inspection
+                            .protected
+                            .entry(revision)
+                            .or_default()
+                            .insert("replica_baseline");
+                    }
+                }
+                for revision in status.conflicts {
+                    inspection
+                        .protected
+                        .entry(revision)
+                        .or_default()
+                        .insert("replica_conflict");
+                }
+            }
+            Err(error) => {
+                inspection.evidence.state = StagingState::Unavailable;
+                inspection.evidence.baseline_coverage = "unavailable";
+                inspection.evidence.error = Some(error.to_string());
+            }
+        }
     }
     inspection
 }
@@ -2008,11 +2365,13 @@ fn space_limits() -> Vec<String> {
 fn retention_limits() -> Vec<String> {
     [
         "A selected revision is a declarative protection request, not evidence that any physical object is unreachable or safe to delete.",
-        "External readers, untracked revision pins, other staging directories, and backup packages must be supplied as explicit requested pins.",
+        "External readers, untracked revision pins, other staging directories, and undisclosed backup packages must be supplied as explicit requested pins; supplied backup packages are validated read-only.",
         "Noncurrent backend versions and shared pack extents remain unknown; no reclaimable-byte estimate is produced.",
         "Receipt records are namespace evidence, not a physical cleanup authorization.",
         "Quiescence is not observed; planning does not stop writers, readers, mounts, Sync processes, or backup activity.",
-        "Published history and receipts are retained by default; keep-last changes only the declarative selection, never removes retained revisions.",
+        "Published history and receipts are retained by default; keep-last changes only the declarative selection, never removes or hides retained revisions, and outside_bounded_policy revisions remain readable.",
+        "Keep and keep-last apply only to this invocation; they are not persistent pins.",
+        "No expiry command exists in this contract; expiry and physical deletion are separate future designs.",
         "Direct namespace objects are excluded.",
     ]
     .into_iter()
