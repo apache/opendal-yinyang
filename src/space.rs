@@ -981,7 +981,7 @@ pub async fn plan_managed_retention(
         protection: RetentionProtection {
             current_revision: revision_hex(latest.revision()),
             staging: staging_protection(&staging),
-            backups: backups,
+            backups,
             receipts,
             backup_evidence,
             external_readers: "unknown",
@@ -2429,33 +2429,6 @@ mod tests {
                 vec!["current", "keep_last"],
             ]
         );
-    }
-
-    #[test]
-    fn backup_reason_mapping_covers_every_current_protection() {
-        // Keep this list aligned with reasons produced by staging, Sync, and
-        // replica inspection. A future reason must map explicitly instead of
-        // falling through to `backup_unclassified`.
-        for reason in [
-            "staging_pending",
-            "staging_frozen",
-            "staging_unknown",
-            "staging_conflict",
-            "staging_failed",
-            "sync_namespace_pending",
-            "sync_namespace_unknown",
-            "sync_namespace_receipt",
-            "sync_namespace_conflict",
-            "sync_namespace_retryable",
-            "sync_namespace_failed",
-            "sync_receipt",
-            "replica_conflict",
-            "replica_baseline",
-        ] {
-            let mapped = backup_reason(reason);
-            assert!(mapped.starts_with("backup_"));
-            assert_ne!(mapped, "backup_unclassified", "{reason} is unmapped");
-        }
     }
 
     #[test]

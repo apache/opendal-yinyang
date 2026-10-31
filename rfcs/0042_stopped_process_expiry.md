@@ -39,6 +39,8 @@ observation into a safety claim.
   maintenance.
 - No physical object deletion, pack reclamation, compaction, or GC algorithm.
 - No compatibility promise for an unimplemented command.
+- No decision about whether a committed receipt or its revision may itself
+  expire; that is a separate policy question.
 
 # Proposed Design
 
@@ -63,7 +65,9 @@ for expiry. It includes:
   argument);
 - remote base revisions recorded by pending, frozen, conflict, Unknown, or
   failed staging handles;
-- Managed Sync namespace baselines and committed receipt revisions;
+- Managed Sync namespace baselines, committed receipt revisions under the
+  current retention default, and the original replay metadata for each
+  committed receipt;
 - local replica common baselines, per-entry remote predicate revisions, and
   conflict-recorded revisions;
 - readable dependencies from explicitly supplied backup packages, including
@@ -106,11 +110,18 @@ future implementation RFC.
 
 ## Dependency invariant
 
-Expiry must never invalidate an existing frozen request, retryable or Unknown
-publication identity, committed receipt, Sync namespace baseline, replica
-predicate, or supplied backup dependency. If expiring a candidate would make
-any protected revision unavailable, the operation fails closed and reports the
-dependency relationship.
+Expiry must never invalidate a readable revision that a known frozen request,
+retryable or Unknown publication, local staging handle, Sync namespace intent,
+replica predicate, or supplied backup dependency actually needs. If expiring a
+candidate would make such a revision unavailable, the operation fails closed
+and reports the dependency relationship.
+
+Committed receipt replay metadata, including the original commit identity,
+request digest, and outcome, must remain readable and unmodified so an exact
+replay remains possible. Preserving that metadata is not equivalent to pinning
+the entire snapshot named by every historical receipt. The current
+receipt-retention default is unchanged; which receipt revisions, if any, may
+later expire is a separate decision.
 
 Receipt and Unknown outcomes remain distinct. Expiry cannot turn an Unknown
 publication into a failure or erase the original commit identity.
