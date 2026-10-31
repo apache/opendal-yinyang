@@ -330,8 +330,8 @@ fn fuse_read_only_range_admission_rejects_frozen_service_staging() {
         let _ = sender.send(in_flight.sync_all());
     });
     gate.wait_ready(Duration::from_secs(30));
-    let frozen = fixture.wait_for_frozen(&config);
-    println!("read-only admission observed frozen staging:\n{frozen}");
+    let (commit, frozen) = fixture.wait_for_frozen(&config);
+    println!("read-only admission observed saved frozen commit {commit:?}:\n{frozen}");
     mounted.kill_daemon_only();
     gate.release();
     let outcome = receiver

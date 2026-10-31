@@ -347,9 +347,47 @@ impl Fixture {
     }
 
     /// Polls the existing no-lease status entry until a handle reports the
-    /// frozen publication boundary. A hang is a hard failure, not a skip.
-    pub fn wait_for_frozen(&self, config: &Path) -> String {
+    /// frozen publication identity. A hang is a hard failure, not a skip.
+    pub fn wait_for_frozen(&self, config: &Path) -> (CommitId, String) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some((commit, text)) = self.inspect_frozen(config) {
+                return (commit, text);
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "fsync never saved a frozen publication identity within 30s; last yy status:\n{}",
+                    self.inspect_status(config)
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn frozen_commit(&self, config: &Path) -> Option<CommitId> {
+        self.inspect_frozen(config).map(|(commit, _)| commit)
+    }
+
+    fn inspect_frozen(&self, config: &Path) -> Option<(CommitId, String)> {
+        let (status, text) = self.inspect_status_with_text(config);
+        status
+            .handles
+            .iter()
+            .find_map(|handle| {
+                if handle.frozen {
+                    handle.frozen_commit_id
+                } else {
+                    None
+                }
+            })
+            .map(|commit| (commit, text))
+    }
+
+    fn inspect_status(&self, config: &Path) -> String {
+        self.inspect_status_with_text(config).1
+    }
+
+    fn inspect_status_with_text(&self, config: &Path) -> (yinyang::runtime::RuntimeStatus, String) {
         let staging = self
             .temp
             .path()
@@ -358,21 +396,11 @@ impl Fixture {
             .enable_all()
             .build()
             .expect("build status runtime");
-        loop {
-            let status = runtime
-                .block_on(YinYangRuntime::inspect(&staging))
-                .expect("inspect staging without the runtime lease");
-            let text = format!("{status:#?}");
-            if status.handles.iter().any(|handle| handle.frozen) {
-                return text;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "fsync never reached the frozen publication boundary within 30s; last yy status:\n{text}"
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
+        let status = runtime
+            .block_on(YinYangRuntime::inspect(&staging))
+            .expect("inspect staging without the runtime lease");
+        let text = format!("{status:#?}");
+        (status, text)
     }
 
     /// Wait until dispatch-visible FUSE RELEASE callbacks have reclaimed every
@@ -1282,7 +1310,7 @@ fn read_all_logged(mut reader: impl Read, log: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
 pub struct ServiceGate {
     address: SocketAddr,
     release: Arc<(Mutex<bool>, Condvar)>,
-    ready: mpsc::Receiver<()>,
+    ready: mpsc::Receiver<CommitId>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1327,10 +1355,10 @@ impl ServiceGate {
         self.address
     }
 
-    pub fn wait_ready(&self, timeout: Duration) {
+    pub fn wait_ready(&self, timeout: Duration) -> CommitId {
         self.ready
             .recv_timeout(timeout)
-            .expect("service gate did not observe a frozen commit connection");
+            .expect("service gate did not observe a persisted frozen commit")
     }
 
     pub fn release(&self) {
@@ -1359,20 +1387,31 @@ fn handle_gate_connection(
     staging: PathBuf,
     release: Arc<(Mutex<bool>, Condvar)>,
     ready_sent: Arc<AtomicBool>,
-    sender: mpsc::Sender<()>,
+    sender: mpsc::Sender<CommitId>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build service gate runtime");
-    let frozen = staging.join("staging.db").exists()
-        && runtime
+    let frozen = if staging.join("staging.db").exists() {
+        runtime
             .block_on(YinYangRuntime::inspect(&staging))
             .ok()
-            .is_some_and(|status| status.handles.iter().any(|handle| handle.frozen));
-    if frozen {
+            .and_then(|status| {
+                status.handles.iter().find_map(|handle| {
+                    if handle.frozen {
+                        handle.frozen_commit_id
+                    } else {
+                        None
+                    }
+                })
+            })
+    } else {
+        None
+    };
+    if let Some(commit) = frozen {
         if !ready_sent.swap(true, Ordering::SeqCst) {
-            let _ = sender.send(());
+            let _ = sender.send(commit);
         }
         let (released, condvar) = &*release;
         let mut released = released

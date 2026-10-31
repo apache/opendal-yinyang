@@ -47,7 +47,7 @@ use fixture::{Fixture, Publication, SyncPaths};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v5";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v6";
 const CHUNK: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -67,6 +67,7 @@ enum Workload {
     ReadOnlyRange,
     RepeatedRandom,
     Incremental,
+    LengthChanging,
 }
 
 impl Workload {
@@ -76,6 +77,7 @@ impl Workload {
             Self::ReadOnlyRange => "read-only-range",
             Self::RepeatedRandom => "repeated-random",
             Self::Incremental => "incremental",
+            Self::LengthChanging => "length-changing",
         }
     }
 }
@@ -326,8 +328,9 @@ fn linux_cost_benchmark() {
         Ok("read-only-range") => Workload::ReadOnlyRange,
         Ok("repeated-random") => Workload::RepeatedRandom,
         Ok("incremental") => Workload::Incremental,
+        Ok("length-changing") => Workload::LengthChanging,
         value => panic!(
-            "YINYANG_COST_WORKLOAD must be full, read-only-range, repeated-random, or incremental, got {value:?}"
+            "YINYANG_COST_WORKLOAD must be full, read-only-range, repeated-random, incremental, or length-changing, got {value:?}"
         ),
     };
     let incremental_expectation = match std::env::var("YINYANG_COST_INCREMENTAL_EXPECT").as_deref()
@@ -346,7 +349,10 @@ fn linux_cost_benchmark() {
     };
     if matches!(
         workload,
-        Workload::ReadOnlyRange | Workload::RepeatedRandom | Workload::Incremental
+        Workload::ReadOnlyRange
+            | Workload::RepeatedRandom
+            | Workload::Incremental
+            | Workload::LengthChanging
     ) && profile != Profile::Full
     {
         panic!("range and incremental workloads require YINYANG_COST_PROFILE=full");
@@ -487,12 +493,26 @@ fn linux_cost_benchmark() {
         recorder.finish();
         return;
     }
+    if matches!(workload, Workload::LengthChanging) {
+        for &publication in publications {
+            run_length_changing_matrix(
+                &context,
+                &proxy,
+                publication,
+                Scale::Medium,
+                incremental_expectation,
+                &mut recorder,
+            );
+        }
+        recorder.finish();
+        return;
+    }
     let scales: &[Scale] = match (workload, profile) {
         (Workload::ReadOnlyRange, _) | (Workload::Full, Profile::Full) => {
             &[Scale::Small, Scale::Medium]
         }
         (Workload::Full, Profile::Early) => &[Scale::Small],
-        (Workload::RepeatedRandom | Workload::Incremental, _) => {
+        (Workload::RepeatedRandom | Workload::Incremental | Workload::LengthChanging, _) => {
             unreachable!("specialized workloads return above")
         }
     };
@@ -1131,6 +1151,588 @@ fn run_incremental_matrix(
         vec!["restarted mount returned the exact incremental bytes".to_owned()],
     );
     restarted.unmount();
+}
+
+fn run_length_changing_matrix(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    scale: Scale,
+    expectation: IncrementalExpectation,
+    recorder: &mut Recorder,
+) {
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
+    let size = scale.file_size();
+    let mut expected = payload(size, 0x4d);
+    fixture.remote_create_file("length-changing.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        fixture,
+        &format!(
+            "length-changing-{}-{}",
+            publication.as_str(),
+            scale.as_str()
+        ),
+        false,
+    );
+    fs::create_dir(&mountpoint).expect("create length-changing benchmark mountpoint");
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    let base_dataset = Dataset {
+        kind: "single_large_file_length_changing".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: None,
+        writers: Some(1),
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
+    };
+    recorder.record(
+        context,
+        "fuse_length_changing_mount_ready",
+        publication,
+        scale,
+        Dataset {
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["writable mount type=fuse.yinyang".to_owned()],
+    );
+
+    let path = mountpoint.join("length-changing.bin");
+    let reader_measured = measure_mount_operation(&meter, mounted.pid(), || {
+        File::open(&path).expect("open shared length-changing reader")
+    });
+    let shared_reader = reader_measured.value;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            reader_measured.network.get_response_body_bytes < size as u64 / 2,
+            "shared reader open read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
+            reader_measured.network.get_response_body_bytes
+        );
+    }
+    assert_required_staging(context, &staging, size, "shared reader open");
+    recorder.record(
+        context,
+        "fuse_length_changing_open_shared_reader",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("one read-only descriptor open before any write".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the read-only descriptor opened before any write; GET body bytes are HTTP entity bytes",
+        vec![reader_measured.latency_ms],
+        reader_measured.io,
+        reader_measured.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "read-only descriptor shares the eventual writable node generation".to_owned(),
+            format!("logical_bytes={}", expected.len()),
+        ],
+    );
+
+    let writer_measured = measure_mount_operation(&meter, mounted.pid(), || {
+        OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .expect("open length-changing writer")
+    });
+    let mut writer = writer_measured.value;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            writer_measured.network.get_response_body_bytes < size as u64 / 2,
+            "writable append open read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
+            writer_measured.network.get_response_body_bytes
+        );
+    }
+    assert_required_staging(context, &staging, size, "writable append open");
+    recorder.record(
+        context,
+        "fuse_length_changing_open_writer",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("one writable append descriptor open before any write".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the writable append descriptor opened before any write; GET body bytes are HTTP entity bytes",
+        vec![writer_measured.latency_ms],
+        writer_measured.io,
+        writer_measured.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "read-only and writable descriptors share the same node generation".to_owned(),
+            format!("logical_bytes={}", expected.len()),
+        ],
+    );
+
+    let mut append_batch = OperationBatch::default();
+    for sample in 0..2 {
+        let value = payload(RANGE_BYTES, 0x51 + sample as u8);
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer.write_all(&value).expect("append through FUSE");
+            writer.sync_all().expect("fsync FUSE append");
+        });
+        append_batch.push(measured);
+        expected.extend_from_slice(&value);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "small append",
+        );
+    }
+    assert_length_batch(context, &append_batch, size, RANGE_BYTES, "small append");
+    assert_required_staging(context, &staging, size, "small append");
+    recorder.record(
+        context,
+        "fuse_length_changing_small_append",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some("two 4 KiB O_APPEND writes, each followed by fsync".to_owned()),
+            ..base_dataset.clone()
+        },
+        "each pwrite and fsync returned before complete remote bytes were verified outside the measured interval",
+        append_batch.latencies,
+        append_batch.io,
+        append_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both active descriptors observed each staged length".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut boundary_batch = OperationBatch::default();
+    for sample in 0..2 {
+        let value = payload(BLOCK_BYTES + RANGE_BYTES, 0x61 + sample as u8);
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .write_all(&value)
+                .expect("append across a verification-unit boundary");
+            writer
+                .sync_all()
+                .expect("fsync verification-unit boundary append");
+        });
+        boundary_batch.push(measured);
+        expected.extend_from_slice(&value);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "boundary append",
+        );
+    }
+    assert_length_batch(
+        context,
+        &boundary_batch,
+        size,
+        BLOCK_BYTES + RANGE_BYTES,
+        "boundary append",
+    );
+    assert_required_staging(context, &staging, size, "boundary append");
+    recorder.record(
+        context,
+        "fuse_length_changing_boundary_append",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_large_file_tree_shape_change".to_owned(),
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some((BLOCK_BYTES + RANGE_BYTES) as u64),
+            read_pattern: Some(
+                "two 68 KiB appends, each crossing an existing 64 KiB verification unit; append starts change the content tree shape"
+                    .to_owned(),
+            ),
+            ..base_dataset.clone()
+        },
+        "each append and fsync returned before complete remote bytes were verified outside the measured interval",
+        boundary_batch.latencies,
+        boundary_batch.io,
+        boundary_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "each sample appended past a 64 KiB unit boundary".to_owned(),
+            "the initial 32 MiB power-of-two tree gained a partial and then a complete leaf".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut truncate_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let length = expected.len() - RANGE_BYTES;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .set_len(length as u64)
+                .expect("shrink through an active FUSE descriptor");
+            writer.sync_all().expect("fsync FUSE shrink");
+        });
+        truncate_batch.push(measured);
+        expected.truncate(length);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "descriptor shrink",
+        );
+    }
+    assert_length_batch(
+        context,
+        &truncate_batch,
+        size,
+        RANGE_BYTES,
+        "descriptor shrink",
+    );
+    assert_required_staging(context, &staging, size, "descriptor shrink");
+    recorder.record(
+        context,
+        "fuse_length_changing_truncate",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some("two 4 KiB descriptor truncates, each followed by fsync".to_owned()),
+            ..base_dataset.clone()
+        },
+        "each ftruncate and fsync returned before complete remote bytes were verified outside the measured interval",
+        truncate_batch.latencies,
+        truncate_batch.io,
+        truncate_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both active descriptors observed each shortened length".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut extend_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let length = expected.len() + RANGE_BYTES;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .set_len(length as u64)
+                .expect("zero-extend through an active FUSE descriptor");
+            writer.sync_all().expect("fsync FUSE zero extension");
+        });
+        extend_batch.push(measured);
+        expected.resize(length, 0);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "descriptor zero extension",
+        );
+    }
+    assert_length_batch(
+        context,
+        &extend_batch,
+        size,
+        RANGE_BYTES,
+        "descriptor zero extension",
+    );
+    assert_required_staging(context, &staging, size, "descriptor zero extension");
+    recorder.record(
+        context,
+        "fuse_length_changing_zero_extension",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some(
+                "two 4 KiB descriptor zero extensions, each followed by fsync".to_owned(),
+            ),
+            ..base_dataset.clone()
+        },
+        "each ftruncate and fsync returned before complete remote zero bytes were verified outside the measured interval",
+        extend_batch.latencies,
+        extend_batch.io,
+        extend_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both active descriptors observed each extended length".to_owned(),
+            "complete remote bytes, including inserted zeros, matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut shrink_extend_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let current = expected.len();
+        let shrunk = current - RANGE_BYTES;
+        let extended = current + RANGE_BYTES;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .set_len(shrunk as u64)
+                .expect("shrink before zero extension");
+            writer
+                .set_len(extended as u64)
+                .expect("extend after shrink");
+            writer.sync_all().expect("fsync shrink-then-extend");
+        });
+        shrink_extend_batch.push(measured);
+        expected.truncate(shrunk);
+        expected.resize(extended, 0);
+        let mut removed = vec![0xff_u8; 2 * RANGE_BYTES];
+        read_exact_at(&shared_reader, &mut removed, shrunk as u64);
+        assert!(
+            removed.iter().all(|byte| *byte == 0),
+            "shrink-then-extend resurrected bytes below the shortened EOF"
+        );
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "descriptor shrink-then-extend",
+        );
+    }
+    assert_length_batch(
+        context,
+        &shrink_extend_batch,
+        size,
+        2 * RANGE_BYTES,
+        "descriptor shrink-then-extend",
+    );
+    assert_required_staging(context, &staging, size, "descriptor shrink-then-extend");
+    recorder.record(
+        context,
+        "fuse_length_changing_shrink_then_extend",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some((2 * RANGE_BYTES) as u64),
+            read_pattern: Some(
+                "two rounds of a 4 KiB shrink followed by an 8 KiB zero extension and fsync"
+                    .to_owned(),
+            ),
+            ..base_dataset.clone()
+        },
+        "the shared reader and remote authority were checked after each publish; removed bytes read as zero",
+        shrink_extend_batch.latencies,
+        shrink_extend_batch.io,
+        shrink_extend_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "shrink-then-extend never resurrected removed base bytes".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut unchanged_batch = OperationBatch::default();
+    for _ in 0..2 {
+        unchanged_batch.push(measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .sync_all()
+                .expect("fsync unchanged length-changing descriptor");
+        }));
+    }
+    assert_eq!(
+        unchanged_batch.network.put, 0,
+        "an unchanged length-changing fsync emitted an unexpected backend PUT"
+    );
+    assert_eq!(
+        unchanged_batch.network.put_request_body_bytes, 0,
+        "an unchanged length-changing fsync uploaded bytes"
+    );
+    recorder.record(
+        context,
+        "fuse_length_changing_unchanged_fsync",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            read_pattern: Some("two unchanged fsync calls on the active descriptor".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the descriptor was fully published before measurement; only unchanged fsync calls are timed",
+        unchanged_batch.latencies,
+        unchanged_batch.io,
+        unchanged_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["unchanged fsync emitted zero backend PUT and zero PUT body bytes".to_owned()],
+    );
+
+    drop(writer);
+    drop(shared_reader);
+    mounted.unmount();
+
+    let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_length_changing_restart_mount_ready",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "interval begins before the replacement yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["replacement writable mount type=fuse.yinyang".to_owned()],
+    );
+    let tail_offset = expected.len() - RANGE_BYTES;
+    let mut restart_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let measured = measure_mount_operation(&meter, restarted.pid(), || {
+            let file = File::open(&path).expect("open length-changing file after restart");
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&file, &mut value, tail_offset as u64);
+            drop(file);
+            value
+        });
+        assert_eq!(
+            measured.value,
+            expected[tail_offset..tail_offset + RANGE_BYTES],
+            "restart did not return the final length-changing tail"
+        );
+        restart_batch.push(Measurement {
+            value: (),
+            latency_ms: measured.latency_ms,
+            io: measured.io,
+            network: measured.network,
+        });
+    }
+    assert_eq!(
+        remote_file_bytes(fixture, "length-changing.bin"),
+        expected,
+        "restart complete remote byte check"
+    );
+    recorder.record(
+        context,
+        "fuse_length_changing_restart_tail_read",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some(
+                "two fresh opens and 4 KiB tail reads after remount".to_owned(),
+            ),
+            ..base_dataset
+        },
+        "open and read completed after remount; complete remote bytes were checked outside the measured interval",
+        restart_batch.latencies,
+        restart_batch.io,
+        restart_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both restarted reads returned the final tail".to_owned(),
+            "complete remote bytes matched the final expected file".to_owned(),
+        ],
+    );
+    restarted.unmount();
+}
+
+fn assert_shared_length_and_remote(
+    fixture: &Fixture,
+    path: &Path,
+    writer: &File,
+    reader: &File,
+    expected: &[u8],
+    phase: &str,
+) {
+    let length = expected.len() as u64;
+    assert_eq!(
+        writer.metadata().expect("fstat active writer").len(),
+        length,
+        "{phase}: writer length"
+    );
+    assert_eq!(
+        reader.metadata().expect("fstat shared reader").len(),
+        length,
+        "{phase}: shared reader length"
+    );
+    assert_eq!(
+        fs::metadata(path).expect("stat length-changing path").len(),
+        length,
+        "{phase}: path length"
+    );
+    assert_eq!(
+        remote_file_bytes(fixture, "length-changing.bin"),
+        expected,
+        "{phase}: independent remote bytes"
+    );
+}
+
+fn assert_length_batch(
+    context: &RunContext,
+    batch: &OperationBatch,
+    file_size: usize,
+    useful_bytes: usize,
+    phase: &str,
+) {
+    assert!(
+        batch.network.put > 0,
+        "{phase}: a successful fsync did not publish backend bytes"
+    );
+    if context.incremental_expectation != "required" {
+        return;
+    }
+    let samples = batch.latencies.len() as u64;
+    let payload_limit = file_size as u64 / 2 * samples;
+    assert!(
+        batch.network.put_request_body_bytes < payload_limit,
+        "{phase}: PUT bodies were {} bytes for {samples} samples changing {useful_bytes} useful bytes in a {file_size}-byte file; this is consistent with full-file fallback",
+        batch.network.put_request_body_bytes
+    );
+    assert!(
+        batch.network.get_response_body_bytes < payload_limit,
+        "{phase}: GET bodies were {} bytes for {samples} samples changing {useful_bytes} useful bytes in a {file_size}-byte file; preparation imported the complete base",
+        batch.network.get_response_body_bytes
+    );
+}
+
+fn assert_required_staging(context: &RunContext, staging: &Path, file_size: usize, phase: &str) {
+    if context.incremental_expectation != "required" {
+        return;
+    }
+    let bytes = tree_bytes(staging);
+    assert!(
+        bytes < file_size as u64 / 2,
+        "{phase}: allocated staging was {bytes} bytes for a {file_size}-byte file; this is consistent with full local materialization"
+    );
 }
 
 fn run_read_only_range_matrix(
@@ -3541,6 +4143,14 @@ struct Dataset {
     random_seed: Option<u64>,
 }
 
+impl Dataset {
+    fn useful_bytes(&self) -> u64 {
+        self.working_set_bytes
+            .or(self.range_bytes)
+            .unwrap_or(self.logical_bytes)
+    }
+}
+
 #[derive(Serialize)]
 struct LatencyStats {
     p50_ms: f64,
@@ -3644,6 +4254,7 @@ struct CostRecord {
     cache_policy: String,
     incremental_expectation: String,
     dataset: Dataset,
+    useful_bytes: u64,
     completion: String,
     iterations: usize,
     wall_ms: f64,
@@ -3720,6 +4331,7 @@ impl Recorder {
         let latency = LatencyStats::new(&latencies);
         let latency_samples_ms = latencies.clone();
         let network_per_sample = NetworkPerSample::new(&network, latencies.len());
+        let useful_bytes = dataset.useful_bytes();
         let record = CostRecord {
             schema: RESULT_SCHEMA,
             scenario: scenario.to_owned(),
@@ -3747,6 +4359,7 @@ impl Recorder {
             cache_policy: cache_policy(context, scenario),
             incremental_expectation: context.incremental_expectation.clone(),
             dataset,
+            useful_bytes,
             completion: completion.to_owned(),
             iterations: latencies.len(),
             wall_ms: latencies.iter().sum(),
@@ -3767,11 +4380,12 @@ impl Recorder {
             .expect("terminate benchmark JSONL record");
         self.output.flush().expect("flush benchmark JSONL output");
         println!(
-            "linux-cost: {} publication={} scale={} samples={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} get_response_body_bytes={} put_request_body_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
+            "linux-cost: {} publication={} scale={} samples={} useful_bytes={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} get_response_body_bytes={} put_request_body_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
             record.scenario,
             record.publication,
             record.scale,
             record.iterations,
+            record.useful_bytes,
             record.latency.p50_ms,
             record.network.requests,
             record.network.request_bytes,
@@ -3831,6 +4445,7 @@ impl Recorder {
                 working_set_bytes: None,
                 random_seed: None,
             },
+            useful_bytes: 0,
             completion: "not applicable".to_owned(),
             iterations: 0,
             wall_ms: 0.0,
@@ -3890,15 +4505,15 @@ impl Recorder {
             unsupported,
         ));
         markdown.push_str(
-            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | GET response body MiB total/sample | PUT request body MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
+            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | Useful bytes | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | GET response body MiB total/sample | PUT request body MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
         );
         markdown.push_str(
-            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for record in &self.records {
             if !record.supported {
                 markdown.push_str(&format!(
-                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - | - | - |\n",
+                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - | - | - | - |\n",
                     record.scenario,
                     record.workload,
                     record.volume_mode,
@@ -3913,13 +4528,14 @@ impl Recorder {
             }
             let network = &record.network_per_sample;
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | {} | {} | measured | {} | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
                 record.scenario,
                 record.workload,
                 record.volume_mode,
                 record.publication,
                 record.scale,
                 record.iterations,
+                record.useful_bytes,
                 record.latency.p50_ms,
                 record.latency.p95_ms,
                 record.network.requests,
