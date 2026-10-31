@@ -1141,7 +1141,7 @@ fn assert_private_directory(path: &Path) {
 struct RemoteIdentity {
     path: String,
     length: u64,
-    etag: Option<String>,
+    etag: String,
 }
 
 fn retention_plan(
@@ -1293,7 +1293,11 @@ fn remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
             .map(|entry| RemoteIdentity {
                 path: entry.path().to_owned(),
                 length: entry.metadata().content_length(),
-                etag: entry.metadata().etag().map(str::to_owned),
+                etag: entry
+                    .metadata()
+                    .etag()
+                    .expect("isolated acceptance LIST must expose an ETag")
+                    .to_owned(),
             })
             .collect::<Vec<_>>()
     });
