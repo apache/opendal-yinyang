@@ -71,6 +71,29 @@ The closed historical umbrella
 [PR #26](https://github.com/apache/opendal-yinyang/pull/26) explicitly was not
 intended to merge and is not the active implementation stack.
 
+## Try the Linux binary
+
+The [Linux trial distribution workflow](https://github.com/apache/opendal-yinyang/actions/workflows/linux-trial.yml)
+publishes an experimental Ubuntu 24.04 x86_64 `yy` binary as a short-lived
+GitHub Actions artifact. Choose a successful run and download
+`yinyang-linux-x86_64`:
+
+```shell
+mkdir -p yinyang-linux-x86_64
+unzip yinyang-linux-x86_64.zip -d yinyang-linux-x86_64
+cd yinyang-linux-x86_64
+
+sha256sum --check yy.sha256
+chmod +x yy
+./yy --help
+./yy --volume /absolute/path/to/volume.json doctor --json
+```
+
+GitHub requires a signed-in account for browser artifact downloads and expires
+the artifact after 14 days. See the
+[Linux trial distribution guide](docs/linux-trial-distribution.md) for the
+artifact contents, supported matrix and volume setup.
+
 ## Publish and restore a directory
 
 Build the experimental CLI with `cargo build --bin yy`. It currently connects
