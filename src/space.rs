@@ -354,6 +354,7 @@ pub struct ReplicaBaselineEvidence {
 }
 
 impl ReplicaBaselineEvidence {
+    #[cfg(target_os = "linux")]
     fn from_baseline(baseline: ReplicaBaseline) -> Self {
         Self {
             revision: revision_hex(baseline.revision),
@@ -625,6 +626,7 @@ async fn inspect_backup_package_evidence(
     let path = display_path(backup);
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = filesystem;
         return unavailable_backup(
             &path,
             None,
@@ -1007,6 +1009,7 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
 /// Inspect a validated backup package state directory. The package validator
 /// already verified database hashes, the manifest, and the root payload, so
 /// this path reads protection facts without opening the original local root.
+#[cfg(target_os = "linux")]
 async fn inspect_package_staging(staging: &Path) -> StagingSpace {
     let content = inspect_local_content_staging(staging).await;
     let sync = inspect_sync_evidence(staging).await;
@@ -1342,6 +1345,7 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
 
 /// Read replica revision-protection facts from validated package state without
 /// opening the recorded original root or revalidating retained artifact bytes.
+#[cfg(target_os = "linux")]
 async fn inspect_replica_protection_evidence(staging: &Path) -> ReplicaInspection {
     let database = staging.join("replica.db");
     let mut inspection = ReplicaInspection {
@@ -1415,13 +1419,6 @@ async fn inspect_replica_protection_evidence(staging: &Path) -> ReplicaInspectio
                 inspection.evidence.error = Some(error.to_string());
             }
         }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        inspection.evidence.state = StagingState::Unavailable;
-        inspection.evidence.baseline_coverage = "unavailable";
-        inspection.evidence.error =
-            Some("backup replica protection is readable only on Linux".to_owned());
     }
     inspection
 }
