@@ -89,7 +89,7 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
     drop(sync);
 
     let backup = temp.path().join("backup");
-    let mut directory = DirectorySync::open(authority.clone(), &state)
+    let directory = DirectorySync::open(authority.clone(), &state)
         .await
         .unwrap();
     directory.backup(&backup).await.unwrap();

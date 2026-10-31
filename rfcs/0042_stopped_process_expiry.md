@@ -1,7 +1,7 @@
 - Proposal Name: `stopped_process_expiry`
 - Start Date: 2026-11-01
 - RFC PR: TBD
-- Tracking Issue: TBD
+- Tracking Issue: [apache/opendal-yinyang#78](https://github.com/apache/opendal-yinyang/issues/78)
 
 # Summary
 
@@ -38,7 +38,7 @@ observation into a safety claim.
 - No expiry mutator, default expiry, background scheduler, or automatic
   maintenance.
 - No physical object deletion, pack reclamation, compaction, or GC algorithm.
-- No merge, release, or compatibility promise for an unimplemented command.
+- No compatibility promise for an unimplemented command.
 
 # Proposed Design
 
