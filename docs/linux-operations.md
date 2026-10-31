@@ -560,7 +560,7 @@ separate explicit retention decision. The same applies to
 `$HOME/YinYang/<volume>`: it may contain acknowledged local bytes or a Sync
 source, not a disposable install artifact.
 
-Bounded sustained operation, sampled RSS/state/current-key growth and retained
-history when the backend exposes it, plus the explicit non-capacity limits, are
-recorded in
+Bounded sustained operation, sampled RSS/state/current-key growth and backend
+retained-version inventory when exposed, plus the explicit non-capacity limits,
+are recorded in
 [`linux-operating-envelope.md`](linux-operating-envelope.md).

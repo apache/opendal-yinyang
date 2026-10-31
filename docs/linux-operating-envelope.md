@@ -29,10 +29,11 @@ The v2 qualification harness defaults to:
 - independent latest-state restore and byte comparison at the midpoint and
   final state.
 
-The workload deliberately uses whole-file Managed staging rather than claiming
-delta upload. Current object-key inventory is sampled separately from local
-staging and SQLite state. When versioning is enabled, retained object count and
-stored bytes are sampled separately as well.
+The workload exercises sparse Managed staging and the existing bounded
+prepared-update path for length changes. It does not infer actual upload or
+delta bytes from current-key inventory. Current object keys are sampled
+separately from local staging and SQLite state. When backend versioning is
+enabled, backend version counts and stored bytes are sampled separately as well.
 
 The harness does not delete the remote prefix after a run. Its owner must
 remove the isolated prefix after preserving the JSON evidence; the verifier does
@@ -100,10 +101,12 @@ enabled solely to manufacture this number because enabling request metrics and
 retrieving them is a paid external resource change.
 
 `/proc/PID/io`, local staging growth, current-key growth and, when available,
-retained-version growth remain observable without that counter. Current-key
-growth is not upload bytes or full history. A report without exact requests must
-state that gap and must not convert TCP connections, GET calls made by the
-verifier, or object count into application request count.
+backend retained-version growth remain observable without that counter.
+Current-key growth is not upload bytes or complete retained-history accounting;
+retained YinYang snapshots and shared packs can remain among current keys. A
+report without exact requests must state that gap and must not convert TCP
+connections, GET calls made by the verifier, or object count into application
+request count.
 
 ## Fault boundaries
 
@@ -136,7 +139,7 @@ the complete raw `yy --volume CONFIG status` output, retry counters and parsed
 handle/ledger counts. It will not acknowledge any entry unless all of the
 following hold:
 
-- pwrite and reader errors are zero;
+- mutation errors (including pwrite) and reader errors are zero;
 - each phase has `fsync_retry_attempts == fsync_errors`,
   `fsync_retry_successes <= fsync_retry_attempts`, and retry successes are
   positive exactly when fsync errors are positive; no file remains uncertain;
@@ -161,16 +164,16 @@ never be acknowledged merely to make a later health check green.
 
 ## Reproduce
 
-Build or install the selected binary on Linux. The credential wrapper reads one
-short-lived STS Credentials JSON document from stdin, removes inherited
-credential and endpoint overrides, reads the measured artifact source from the
-adjacent package/direct `BUILD-MANIFEST`, and invokes the measured binary:
+Use the exact binary and its adjacent package/direct `BUILD-MANIFEST` on Linux.
+The credential wrapper reads one short-lived STS Credentials JSON document from
+stdin, removes inherited credential and endpoint overrides, reads the measured
+artifact source from that manifest, and invokes the measured binary:
 
 ```shell
 aws sts assume-role ... --output json |
   YINYANG_QUALIFICATION_REGION=us-east-2 \
   YINYANG_OPERATING_ENVELOPE_BUCKET=replace-with-dedicated-bucket \
-  YINYANG_OPERATING_ENVELOPE_YY="$HOME/.local/lib/yinyang/current/bin/yy" \
+  YINYANG_OPERATING_ENVELOPE_YY="$PWD/yy" \
   YINYANG_OPERATING_ENVELOPE_OUTPUT=/var/tmp/yinyang-envelope.json \
   YINYANG_OPERATING_ENVELOPE_DURATION=1800 \
   YINYANG_OPERATING_ENVELOPE_FILES=8 \
@@ -276,9 +279,11 @@ dataset creation to `184,325,734` bytes across `20,165` keys at the final
 sample: `+116,837,791` bytes and `+20,058` keys. Ten inventory samples were
 retained; completion timestamps had a maximum gap of `430.496s` because the
 scans themselves ran in the background. This current-key growth is not upload
-byte accounting, application request count, full version history, retained
-history, or reclaimable bytes. Because the bucket was unversioned,
-`retained_bytes` and `object_versions` remain unavailable.
+byte accounting, application request count, complete retained-history
+accounting, or reclaimable bytes. Disabling S3 bucket versioning does not mean
+YinYang stores no prior history: retained YinYang snapshots and shared packs can
+remain among current keys. `retained_bytes` and `object_versions` are backend
+version-inventory fields and remain unavailable for this unversioned bucket.
 
 Exact HTTPS request count remains unavailable; no compatible process-scoped
 client counter was supplied, and current keys or verifier requests do not
