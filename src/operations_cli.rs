@@ -1028,6 +1028,7 @@ fn direct_remediation(stage: CliStage, kind: ErrorKind) -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn runtime_kind_from_replica(kind: yinyang::replica::ErrorKind) -> ErrorKind {
     use yinyang::replica::ErrorKind as Kind;
     match kind {

@@ -22,7 +22,9 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use yinyang::core::{CommitId, Fs, Revision};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
-use yinyang::volume::{Model, VolumeContext, VolumeLoadError, VolumeLoadStage};
+#[cfg(target_os = "linux")]
+use yinyang::volume::Model;
+use yinyang::volume::{VolumeContext, VolumeLoadError, VolumeLoadStage};
 #[cfg(target_os = "linux")]
 mod direct_sync_cli;
 mod directory_cli;
