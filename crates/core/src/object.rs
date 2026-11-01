@@ -925,6 +925,20 @@ async fn read_snapshot_roots(
     if bytes.len() < OBJECT_SNAPSHOT_MAGIC.len() {
         return Err(corrupt("truncated snapshot descriptor"));
     }
+    if expected_mode == Some(0) && bytes[..OBJECT_SNAPSHOT_MAGIC.len()] != OBJECT_SNAPSHOT_MAGIC {
+        return Err(Error::unsupported(
+            "open snapshot",
+            "mode-0 head has an unknown snapshot profile",
+        ));
+    }
+    if expected_mode == Some(1)
+        && bytes[..OBJECT_SNAPSHOT_EXPIRY_MAGIC.len()] != OBJECT_SNAPSHOT_EXPIRY_MAGIC
+    {
+        return Err(Error::unsupported(
+            "open snapshot",
+            "mode-1 head has an unknown snapshot profile",
+        ));
+    }
     let (head_mode, roots) = if bytes[..OBJECT_SNAPSHOT_MAGIC.len()] == OBJECT_SNAPSHOT_MAGIC {
         let (magic, fs, encoded_root, rev, roots): SnapshotWire = decode(&bytes)?;
         validate_snapshot_envelope(

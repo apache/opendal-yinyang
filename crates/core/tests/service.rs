@@ -187,14 +187,21 @@ async fn suite(fs: &dyn Authority) {
 
 async fn expiry_contract(fs: &dyn Authority) {
     let initial = fs.observe_latest().await.unwrap();
+    let held_content = fs.prepare(&mut b"held".as_slice()).await.unwrap();
     let mut first = Planner::new(&initial, CommitId::generate());
     first
         .create_directory(fs.root(), "expired-name")
         .await
         .unwrap();
+    let held_file = first
+        .create_file(fs.root(), "held-file", held_content, false)
+        .await
+        .unwrap();
     let first_plan = first.finish().unwrap();
     let first_receipt = committed(fs.commit(&first_plan).await.unwrap());
     let first_revision = initial.revision();
+    let held = fs.observe_latest().await.unwrap();
+    let held_version = held.open_file(held_file).await.unwrap();
 
     let mut second = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
     second
@@ -225,6 +232,8 @@ async fn expiry_contract(fs: &dyn Authority) {
     let expired = fs.observe_revision(first_revision).await.unwrap_err();
     assert_eq!(expired.kind(), ErrorKind::Expired);
     assert_eq!(expired.expired_revision(), Some(first_revision));
+    assert!(held.resolve("held-file").await.unwrap().is_some());
+    assert_eq!(held_version.read(0, 4).await.unwrap(), b"held");
     let absent = fs
         .observe_revision(Revision::from_bytes([0xaa; 24]))
         .await

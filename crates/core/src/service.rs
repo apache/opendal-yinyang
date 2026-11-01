@@ -151,7 +151,18 @@ fn inspect_schema(conn: &Connection) -> Result<Option<SchemaProfile>> {
             "database is not a YinYang authority",
         ));
     }
-    let (profile, _, _, _) = manifest(conn)?;
+    let profile: Option<String> = conn
+        .query_row(
+            "SELECT profile FROM authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| corrupt_schema(format!("cannot read authority profile: {error}")))?;
+    let Some(profile) = profile else {
+        return Err(corrupt_schema("authority profile row is missing"));
+    };
+    let profile = SchemaProfile::parse(&profile)?;
     let required = match profile {
         SchemaProfile::Base => BASE_TABLES.as_slice(),
         SchemaProfile::Expiry => EXPIRY_TABLES.as_slice(),
@@ -302,13 +313,9 @@ fn parse_service_binding(bytes: &[u8]) -> Result<(NodeId, NodeId)> {
     Ok((NodeId::from_bytes(filesystem), NodeId::from_bytes(root)))
 }
 fn revision_exists(conn: &Connection, revision: Revision) -> Result<bool> {
-    let sequence = i64::try_from(revision.sequence).map_err(|_| {
-        Error::new(
-            ErrorKind::NotFound,
-            "observe service revision",
-            "revision not retained",
-        )
-    })?;
+    let Ok(sequence) = i64::try_from(revision.sequence) else {
+        return Ok(false);
+    };
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
         params![revision.to_bytes().as_slice(), sequence],
@@ -473,6 +480,38 @@ impl MetadataService {
                     "observe service revision",
                     revision,
                     "revision is logically expired",
+                ));
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(self.snapshot(db, revision))
+    }
+    /// Reopen records for an already-issued lazy observation. This validates
+    /// that the retained rows still exist, but deliberately does not re-check
+    /// expiry: logical expiry affects fresh observations, not immutable
+    /// observations already handed to a caller.
+    pub(crate) async fn retained_snapshot(&self, revision: Revision) -> Result<Snapshot> {
+        if revision.sequence > i64::MAX as u64 {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "observe service revision",
+                "revision not retained",
+            ));
+        }
+        let db = connect(&self.path, false).await?;
+        let expected_volume = self.filesystem;
+        let expected_root = self.root;
+        db_call(&db, move |c| {
+            let (_, volume, root, _) = manifest(c)?;
+            if volume != expected_volume || root != expected_root {
+                return Err(Error::invalid("observe service", "authority changed"));
+            }
+            if !revision_exists(c, revision)? {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "observe service revision",
+                    "revision not retained",
                 ));
             }
             Ok(())
