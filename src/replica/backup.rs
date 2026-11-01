@@ -21,7 +21,7 @@ use super::linux::{
     Identity, LocalKind, LocalNode, LocalSnapshot, Replica, scan_path, validate_path,
 };
 use super::state::{Binding, IdentityMap, Store};
-use super::{Error, Result};
+use super::{Error, ErrorKind, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::Connection;
 use std::cmp::Reverse;
@@ -502,22 +502,13 @@ impl BackupManifest {
             .map_err(|error| Error::io("canonicalize backup package", backup, error))?;
         let root = canonical_target(root)?;
         let state = canonical_target(state)?;
-        if root == state {
-            return Err(Error::invalid(
-                "restore root and state destinations must be different",
-            ));
-        }
         if root.starts_with(&backup) || backup.starts_with(&root) {
             return Err(Error::invalid("restore root overlaps the backup package"));
         }
         if state.starts_with(&backup) || backup.starts_with(&state) {
             return Err(Error::invalid("restore state overlaps the backup package"));
         }
-        if root.starts_with(&state) || state.starts_with(&root) {
-            return Err(Error::invalid(
-                "restore root and state must not contain each other",
-            ));
-        }
+        crate::volume::check_root_state(&root, &state).map_err(root_state_error)?;
         if root.exists() {
             return Err(Error::invalid(format!(
                 "restore root {} already exists",
@@ -658,6 +649,15 @@ fn canonical_target(path: &Path) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| Error::invalid("restore destination requires a directory name"))?;
     Ok(parent.join(name))
+}
+
+fn root_state_error(error: yinyang_core::Error) -> Error {
+    let kind = match error.kind() {
+        yinyang_core::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        yinyang_core::ErrorKind::Io => ErrorKind::Io,
+        _ => ErrorKind::Invalid,
+    };
+    Error::new(kind, error.to_string())
 }
 
 fn hash_file(path: &Path) -> Result<(u64, [u8; 32])> {

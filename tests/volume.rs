@@ -17,7 +17,6 @@
 
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
-use std::collections::BTreeSet;
 use support::TestBackend;
 use yinyang::core::{BackendProfile, Fs};
 use yinyang::volume::*;
@@ -54,10 +53,9 @@ fn direct_config(staging: std::path::PathBuf) -> VolumeConfig {
         access: Access::Mount,
         frontend: Frontend::Fuse,
         publication: Publication::Object,
-        storage_profile: StorageProfile::Minio,
+        storage_profile: BackendProfile::Minio,
         staging,
         read_only: false,
-        require: BTreeSet::new(),
         service_address: None,
     }
 }
@@ -69,26 +67,21 @@ fn config(path: std::path::PathBuf) -> VolumeConfig {
         access: Access::Mount,
         frontend: Frontend::Library,
         publication: Publication::Object,
-        storage_profile: StorageProfile::Minio,
+        storage_profile: BackendProfile::Minio,
         staging: path,
         read_only: false,
-        require: [Capability::Read, Capability::RemoteFsync]
-            .into_iter()
-            .collect(),
         service_address: None,
     }
 }
 #[tokio::test]
-async fn capability_intersection_and_startup_rejection_precede_visibility() {
+async fn admission_precedes_side_effects_and_rejects_unknown_fields() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
     let cfg = config(temp.path().join("state"));
     let caps = cfg.validate(&backend.operator()).unwrap();
-    let mut frontend = caps.frontend.clone();
-    frontend.remove(&Capability::Append);
-    let intersection = Capabilities::intersect(caps.volume, caps.storage, caps.access, frontend);
-    assert!(!intersection.effective.contains(&Capability::Append));
-    assert!(intersection.effective.contains(&Capability::RemoteFsync));
+    assert_eq!(caps.admitted, caps.effective);
+    assert!(caps.effective.contains(&Capability::Append));
+    assert!(caps.effective.contains(&Capability::RemoteFsync));
     for invalid in [
         VolumeConfig {
             model: Model::Direct,
@@ -99,11 +92,7 @@ async fn capability_intersection_and_startup_rejection_precede_visibility() {
             ..cfg.clone()
         },
         VolumeConfig {
-            frontend: Frontend::Macos,
-            ..cfg.clone()
-        },
-        VolumeConfig {
-            read_only: true,
+            name: " ".into(),
             ..cfg.clone()
         },
         VolumeConfig {
@@ -134,6 +123,9 @@ async fn capability_intersection_and_startup_rejection_precede_visibility() {
     let mut json = serde_json::to_value(&cfg).unwrap();
     json["ignore_conflicts"] = true.into();
     assert!(VolumeConfig::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
+    let mut json = serde_json::to_value(&cfg).unwrap();
+    json["require"] = serde_json::json!(["read"]);
+    assert!(VolumeConfig::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
 }
 #[tokio::test]
 async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
@@ -142,10 +134,9 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     let ro = VolumeConfig {
         frontend: Frontend::Fuse,
         read_only: true,
-        require: BTreeSet::new(),
         ..config(temp.path().join("state"))
     };
-    let caps = ro.capabilities(&backend.operator());
+    let caps = ro.capabilities(&backend.operator()).unwrap();
     let expected: CapabilitySet = [
         Capability::Read,
         Capability::List,
@@ -155,17 +146,15 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(caps.frontend, expected);
     assert_eq!(caps.effective, expected);
     assert!(!caps.effective.contains(&Capability::RecoverableStaging));
     if cfg!(target_os = "linux") {
         assert!(ro.validate(&backend.operator()).is_ok());
         let rw = VolumeConfig {
             read_only: false,
-            require: BTreeSet::new(),
             ..ro.clone()
         };
-        let caps = rw.capabilities(&backend.operator());
+        let caps = rw.capabilities(&backend.operator()).unwrap();
         assert!(caps.effective.contains(&Capability::Write));
         assert!(caps.effective.contains(&Capability::RemoteFsync));
         assert!(caps.effective.contains(&Capability::RecoverableStaging));
@@ -342,7 +331,6 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     drop(volume);
     let ro = VolumeConfig {
         read_only: true,
-        require: BTreeSet::new(),
         ..cfg.clone()
     };
     let volume = Volume::open(ro, backend.operator(), None).await.unwrap();
@@ -365,6 +353,46 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let mut handle = volume.runtime().recover(id).await.unwrap();
     handle.fsync().await.unwrap();
     handle.close().await.unwrap();
+}
+
+#[test]
+fn root_state_containment_rejects_both_directions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let state = temp.path().join("state");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    check_root_state(&root, &state).unwrap();
+
+    let state_inside_root = root.join("state");
+    let error = check_root_state(&root, &state_inside_root).unwrap_err();
+    assert_eq!(error.kind(), yinyang::core::ErrorKind::Invalid);
+
+    let root_inside_state = state.join("root");
+    let error = check_root_state(&root_inside_state, &state).unwrap_err();
+    assert_eq!(error.kind(), yinyang::core::ErrorKind::Invalid);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_replica_init_rejects_both_containment_directions() {
+    use yinyang::core::NodeId;
+    use yinyang::replica::{ErrorKind, Replica};
+
+    let temp = tempfile::tempdir().unwrap();
+    let volume = NodeId::from_bytes([1; 16]);
+
+    let root = temp.path().join("root-a");
+    let state = root.join("state");
+    let error = Replica::init(&state, &root, volume).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+    assert!(!state.join("replica.db").exists());
+
+    let state = temp.path().join("state-b");
+    let root = state.join("root");
+    let error = Replica::init(&state, &root, volume).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+    assert!(!state.join("replica.db").exists());
 }
 
 struct Daemon(std::process::Child);

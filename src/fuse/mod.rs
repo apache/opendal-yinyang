@@ -258,8 +258,7 @@ mod tests {
     use crate::mount::Mount;
     use crate::runtime::Runtime;
     use crate::support;
-    use crate::volume::{Access, Capability, Frontend, Model, Publication, StorageProfile};
-    use std::collections::BTreeSet;
+    use crate::volume::{Access, Frontend, Model, Publication};
     use std::sync::Arc;
     use yinyang_core::Authority;
 
@@ -270,10 +269,9 @@ mod tests {
             access: Access::Mount,
             frontend: Frontend::Fuse,
             publication: Publication::Object,
-            storage_profile: StorageProfile::Minio,
+            storage_profile: BackendProfile::Minio,
             staging: std::path::PathBuf::new(),
             read_only: true,
-            require: BTreeSet::new(),
             service_address: None,
         }
     }
@@ -298,10 +296,6 @@ mod tests {
             },
             VolumeConfig {
                 frontend: Frontend::Library,
-                ..direct_config()
-            },
-            VolumeConfig {
-                require: [Capability::Write].into_iter().collect(),
                 ..direct_config()
             },
         ] {
