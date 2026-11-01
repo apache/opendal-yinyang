@@ -216,7 +216,7 @@ impl ManagedBackend {
 
 pub(super) enum ManagedFile {
     Staged(MountFile),
-    ReadOnly(MountReadOnlyFile),
+    ReadOnly(Box<MountReadOnlyFile>),
 }
 
 impl Backend for ManagedBackend {
@@ -269,7 +269,7 @@ impl Backend for ManagedBackend {
         if self.read_only {
             let file = self.mount.open_read_only_node(id).await?;
             return Ok(Opened {
-                file: ManagedFile::ReadOnly(file),
+                file: ManagedFile::ReadOnly(Box::new(file)),
                 writable: false,
             });
         }
