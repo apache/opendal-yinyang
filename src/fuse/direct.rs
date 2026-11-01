@@ -927,4 +927,18 @@ mod tests {
         prune_unreferenced_views(&mut views);
         assert!(views.is_empty());
     }
+
+    #[test]
+    fn direct_node_identity_carries_the_accepted_file_observation() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
+        let node =
+            DirectNode::for_test_file(DirectId::from_bytes([7; 16]), "object", 19, Some(modified));
+        let attr = ObservedAttr::from_storage(node.is_directory(), node.size(), node.modified());
+        assert_eq!(node.id(), DirectId::from_bytes([7; 16]));
+        assert_eq!(attr.size, 19);
+        assert_eq!(
+            attr.time,
+            super::super::attrs::AttributeTime::Storage(modified)
+        );
+    }
 }

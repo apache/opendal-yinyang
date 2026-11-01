@@ -36,7 +36,7 @@ pub const DIRECTORY_SIZE: u64 = 4096;
 const STAMP_EPOCH: u64 = 1_600_000_000;
 
 /// Timestamp source for one immutable observation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttributeTime {
     Revision(Revision),
     Storage(SystemTime),
