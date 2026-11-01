@@ -772,6 +772,24 @@ mod tests {
     }
 
     #[test]
+    fn expiry_receipt_rejects_invalid_order() {
+        let receipt = ExpiryReceipt {
+            id: ExpiryId::generate(),
+            request_digest: [1; 32],
+            evidence_digest: [2; 32],
+            before: revision(5),
+            after: revision(5),
+            expired: vec![revision(1)],
+        };
+        assert_eq!(
+            ExpiryReceipt::decode(&receipt.encode().unwrap())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
+        );
+    }
+
+    #[test]
     fn expiry_marker_rejects_invalid_ordering() {
         let bytes = encode(&(
             EXPIRY_RECORD_MAGIC,
