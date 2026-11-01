@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
-use yinyang_core::{Authority, NodeId, PreparedContent, Receipt, Revision, Transaction};
+use yinyang_core::{Authority, NodeId, Receipt, Revision, Transaction};
 
 mod namespace;
 pub use namespace::{
@@ -168,7 +168,6 @@ struct Inner {
     runtime: Runtime,
     journal: Arc<Mutex<Connection>>,
     gate: Mutex<()>,
-    prepared: std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, PreparedContent>>,
 }
 /// Sync is independent of Mount. The caller supplies the common remote baseline,
 /// not a newly observed revision after an offline edit. Publication does not mark
@@ -281,7 +280,6 @@ impl Sync {
                 runtime,
                 journal: Arc::new(Mutex::new(journal)),
                 gate: Mutex::new(()),
-                prepared: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             }),
         };
         sync.collect_incomplete().await?;
@@ -289,50 +287,6 @@ impl Sync {
     }
     pub fn authority(&self) -> &dyn Authority {
         self.inner.runtime.authority()
-    }
-    fn remember_prepared(&self, content: &PreparedContent) -> Result<()> {
-        self.inner
-            .prepared
-            .lock()
-            .map_err(Error::local)?
-            .insert(content.descriptor().to_bytes(), content.clone());
-        Ok(())
-    }
-    async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
-        let (_, descriptors) = Transaction::inspect(bytes)?;
-        let prepared = {
-            let cache = self.inner.prepared.lock().map_err(Error::local)?;
-            descriptors
-                .iter()
-                .map(|descriptor| {
-                    cache
-                        .get(&descriptor.to_bytes())
-                        .cloned()
-                        .ok_or(Error::Invalid("prepared content is unavailable"))
-                })
-                .collect::<Result<Vec<_>>>()
-        };
-        match prepared {
-            Ok(prepared) => self
-                .authority()
-                .restore_transaction_with(bytes, &prepared)
-                .await
-                .map_err(Error::from),
-            Err(_) => self
-                .authority()
-                .restore_transaction(bytes)
-                .await
-                .map_err(Error::from),
-        }
-    }
-    fn forget_prepared(&self, request: &Transaction) -> Result<()> {
-        let bytes = request.to_bytes()?;
-        let (_, descriptors) = Transaction::inspect(&bytes)?;
-        let mut cache = self.inner.prepared.lock().map_err(Error::local)?;
-        for descriptor in descriptors {
-            cache.remove(&descriptor.to_bytes());
-        }
-        Ok(())
     }
     async fn call<T: Send + 'static>(
         &self,

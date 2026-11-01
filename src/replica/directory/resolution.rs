@@ -1202,6 +1202,7 @@ fn chosen_file_local(
             .map(|node| node.identity)
             .unwrap_or(Identity { dev: 0, ino: 0 }),
         parent: identity.and_then(|node| node.parent),
+        stat: identity.and_then(|node| node.stat),
     }
 }
 

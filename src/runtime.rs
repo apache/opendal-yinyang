@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 use yinyang_core::{
     Authority, CommitId, CommitOutcome, ContentDescriptor, ContentEdit, FileVersion, NodeId,
-    Planner, PreparedContent, Receipt, Revision, Snapshot, Transaction,
+    Planner, PreparedContent, Receipt, Revision, Snapshot,
 };
 
 mod staging;
@@ -75,7 +75,6 @@ struct Inner {
     stage: Stage,
     active: Mutex<BTreeSet<[u8; 16]>>,
     volatile_errors: Mutex<BTreeMap<[u8; 16], Failure>>,
-    prepared: Mutex<BTreeMap<Vec<u8>, PreparedContent>>,
 }
 struct HandleBase {
     expected: Option<Vec<u8>>,
@@ -117,7 +116,6 @@ impl Runtime {
                 stage,
                 active: Mutex::new(BTreeSet::new()),
                 volatile_errors: Mutex::new(BTreeMap::new()),
-                prepared: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -725,9 +723,7 @@ impl FileHandle {
     /// preparation is returned to the caller and never retried as a different
     /// streaming request.
     async fn prepare_publication(&self, r: &Record) -> Result<PreparedContent> {
-        let prepared = self.prepare_publication_uncached(r).await?;
-        self.remember_prepared(&prepared)?;
-        Ok(prepared)
+        self.prepare_publication_uncached(r).await
     }
 
     async fn prepare_publication_uncached(&self, r: &Record) -> Result<PreparedContent> {
@@ -827,58 +823,6 @@ impl FileHandle {
         Ok(prepared)
     }
 
-    fn remember_prepared(&self, prepared: &PreparedContent) -> Result<()> {
-        let descriptor = prepared.descriptor().to_bytes();
-        self.runtime
-            .inner
-            .prepared
-            .lock()
-            .map_err(Error::local)?
-            .insert(descriptor, prepared.clone());
-        Ok(())
-    }
-
-    async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
-        let (_, descriptors) = Transaction::inspect(bytes)?;
-        let prepared = {
-            let cache = self.runtime.inner.prepared.lock().map_err(Error::local)?;
-            descriptors
-                .iter()
-                .map(|descriptor| {
-                    cache
-                        .get(&descriptor.to_bytes())
-                        .cloned()
-                        .ok_or(Error::Invalid("prepared content is unavailable"))
-                })
-                .collect::<Result<Vec<_>>>()
-        };
-        match prepared {
-            Ok(prepared) => self
-                .runtime
-                .inner
-                .authority
-                .restore_transaction_with(bytes, &prepared)
-                .await
-                .map_err(Error::from),
-            Err(_) => self
-                .runtime
-                .inner
-                .authority
-                .restore_transaction(bytes)
-                .await
-                .map_err(Error::from),
-        }
-    }
-
-    fn forget_prepared(&self, request: &Transaction) -> Result<()> {
-        let bytes = request.to_bytes()?;
-        let (_, files) = Transaction::inspect(&bytes)?;
-        let mut cache = self.runtime.inner.prepared.lock().map_err(Error::local)?;
-        for descriptor in files {
-            cache.remove(&descriptor.to_bytes());
-        }
-        Ok(())
-    }
     async fn publish(&mut self) -> Result<Option<Receipt>> {
         let stage = &self.runtime.inner.stage;
         let mut r = stage.load(self.id).await?;
@@ -893,7 +837,12 @@ impl FileHandle {
             return Err(Error::Conflict);
         }
         let request = if let Some(bytes) = &r.plan {
-            self.restore_transaction(bytes).await?
+            self.runtime
+                .inner
+                .authority
+                .restore_transaction(bytes)
+                .await
+                .map_err(Error::from)?
         } else {
             let prepared = self.prepare_publication(&r).await?;
             let snapshot = self
@@ -948,13 +897,11 @@ impl FileHandle {
                     if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
                         errors.remove(&self.id);
                     }
-                    self.forget_prepared(&request)?;
                     Ok(Some(receipt))
                 }
                 CommitOutcome::Conflict => {
                     r.conflict = true;
                     stage.save(r).await?;
-                    self.forget_prepared(&request)?;
                     Err(Error::Conflict)
                 }
                 CommitOutcome::Retryable => Err(Error::Retryable),

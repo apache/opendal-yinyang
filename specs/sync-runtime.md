@@ -136,14 +136,16 @@ forbidden before that mapping. Interrupted staging can leave unreferenced,
 never-dispatched content, collected on restart or before the next stage.
 Missing referenced content is an error, not permission to replan.
 
-Prepared content stays as process-local `PreparedContent` evidence in the
-`Sync` instance after staging. Publication restores a frozen request with that
-evidence and does not download the content again. A restarted process has no
-such evidence, so it verifies the recorded descriptor once before dispatch and
-then retains that evidence for the rest of the process. The same rule applies to
-FileHandle staging and to the service authority. A service client sends a
-completed pack descriptor to the service; the service verifies it once and
-records durable preparation evidence before acknowledging registration.
+Each core `DataStore`, and all of its clones, owns one bounded set of verified
+`ContentDescriptor` values. Preparation records a descriptor only after the
+pack is verified; service preparation records it after the service answers
+`Registered`. Publication restores a frozen request through the normal
+`Authority::restore_transaction` path, and `DataStore::import` returns the
+prepared evidence without another read on a hit. The set is process-local and
+bounded at 65,536 entries, so a restarted or evicted descriptor falls back to
+one full verified import. A service client sends a completed pack descriptor to
+the service; the service verifies it once and records durable preparation
+evidence before acknowledging registration.
 
 The namespace table stores the logical operation, exact `CommitId`, canonical
 request digest, baseline, transaction bytes, durable state, receipt, and typed

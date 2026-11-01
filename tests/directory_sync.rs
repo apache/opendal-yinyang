@@ -28,7 +28,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
@@ -509,12 +509,17 @@ async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
         );
     }
 
+    drop(reader);
+    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
+        .await
+        .unwrap();
     assert!(reader.run().await.unwrap().in_sync);
     let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
         .await
         .unwrap();
     assert_eq!(reader_status.summary.retained_bytes, 0);
     assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     reader.reset_hash_bytes_read();
     assert!(reader.run().await.unwrap().in_sync);
     assert_eq!(
@@ -522,6 +527,19 @@ async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
         0,
         "a settled no-op must use cached stat identity instead of rehashing local files"
     );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let mut changed = vec![7_u8; LARGE];
+    changed[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(reader_root.join("large"), &changed).unwrap();
+    reader.reset_hash_bytes_read();
+    assert!(reader.run().await.unwrap().in_sync);
+    assert!(
+        reader.hash_bytes_read() >= LARGE as u64,
+        "a same-size in-place edit must invalidate persistent stat evidence"
+    );
+    assert!(writer.run().await.unwrap().in_sync);
+    assert_eq!(std::fs::read(&large).unwrap(), changed);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -724,6 +742,10 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
             .await
             .unwrap();
         let content_staged = reads() - before_stage;
+        drop(sync);
+        let sync = Sync::open(authority, temp.path().join("sync"))
+            .await
+            .unwrap();
         let before_publish = reads();
         sync.publish(content).await.unwrap();
         (staged, published, content_staged, reads() - before_publish)

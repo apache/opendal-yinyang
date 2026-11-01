@@ -17,7 +17,7 @@
 
 //! Canonical, range-verifiable content and process-local preparation evidence.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +39,7 @@ pub const MAX_UPDATE_UNITS: u64 = 4096;
 const MAX_NODE_BYTES: u32 = 512;
 const RANGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const RANGE_CACHE_ENTRIES: usize = 4096;
+const VERIFIED_DESCRIPTOR_ENTRIES: usize = 65_536;
 
 pub(crate) type RefWire = ([u8; 16], u64, u32, [u8; 32]);
 type ChildWire = ([u8; 32], RefWire);
@@ -284,6 +285,30 @@ pub fn update_is_bounded(
         && units <= MAX_UPDATE_UNITS
 }
 
+#[derive(Debug, Default)]
+struct VerifiedDescriptors {
+    entries: HashSet<ContentDescriptor>,
+    order: VecDeque<ContentDescriptor>,
+}
+
+impl VerifiedDescriptors {
+    fn contains(&self, descriptor: &ContentDescriptor) -> bool {
+        self.entries.contains(descriptor)
+    }
+
+    fn insert(&mut self, descriptor: ContentDescriptor) {
+        if !self.entries.insert(descriptor.clone()) {
+            return;
+        }
+        self.order.push_back(descriptor);
+        while self.order.len() > VERIFIED_DESCRIPTOR_ENTRIES {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+}
+
 /// Immutable data binding for one filesystem and one storage operator.
 ///
 /// Clones share preparation authority. A separately constructed binding cannot
@@ -294,6 +319,7 @@ pub struct DataStore {
     filesystem: NodeId,
     issuer: Arc<()>,
     range_cache: RangeCache,
+    verified: Arc<Mutex<VerifiedDescriptors>>,
 }
 
 impl DataStore {
@@ -314,6 +340,7 @@ impl DataStore {
             filesystem,
             issuer: Arc::new(()),
             range_cache: RangeCache::default(),
+            verified: Arc::new(Mutex::new(VerifiedDescriptors::default())),
         })
     }
 
@@ -342,6 +369,7 @@ impl DataStore {
         match result {
             Ok(descriptor) => {
                 pack.finish().await?;
+                self.mark_verified(&descriptor);
                 Ok(self.seal(descriptor))
             }
             Err(error) => {
@@ -421,10 +449,16 @@ impl DataStore {
         })
     }
 
-    /// Import untrusted references by verifying every logical unit.
+    /// Import untrusted references, verifying each descriptor once per
+    /// `DataStore` and its clones before reusing the bounded evidence set.
     pub async fn import(&self, descriptor: &ContentDescriptor) -> Result<PreparedContent> {
+        self.check(descriptor)?;
+        if self.is_verified(descriptor) {
+            return Ok(self.seal(descriptor.clone()));
+        }
         self.read_range(descriptor, 0..descriptor.length, &mut tokio::io::sink())
             .await?;
+        self.mark_verified(descriptor);
         Ok(self.seal(descriptor.clone()))
     }
 
@@ -604,10 +638,12 @@ impl DataStore {
         match result {
             Ok(root) => {
                 pack.finish().await?;
-                Ok(self.seal(ContentDescriptor {
+                let descriptor = ContentDescriptor {
                     root: Some(root),
                     ..descriptor
-                }))
+                };
+                self.mark_verified(&descriptor);
+                Ok(self.seal(descriptor))
             }
             Err(error) => {
                 pack.abort().await;
@@ -669,11 +705,13 @@ impl DataStore {
             return Ok(file.clone());
         }
         if final_length == 0 {
-            return Ok(self.seal(ContentDescriptor {
+            let descriptor = ContentDescriptor {
                 length: 0,
                 root: None,
                 ..descriptor
-            }));
+            };
+            self.mark_verified(&descriptor);
+            return Ok(self.seal(descriptor));
         }
         let mut pack = Pack::new(self).await?;
         let result = self
@@ -688,11 +726,13 @@ impl DataStore {
         match result {
             Ok(root) => {
                 pack.finish().await?;
-                Ok(self.seal(ContentDescriptor {
+                let descriptor = ContentDescriptor {
                     length: final_length,
                     root,
                     ..descriptor
-                }))
+                };
+                self.mark_verified(&descriptor);
+                Ok(self.seal(descriptor))
             }
             Err(error) => {
                 pack.abort().await;
@@ -1055,6 +1095,24 @@ impl DataStore {
             return Err(Error::invalid("use content", "filesystem does not match"));
         }
         Ok(())
+    }
+
+    fn is_verified(&self, descriptor: &ContentDescriptor) -> bool {
+        self.verified
+            .lock()
+            .expect("verified descriptor set poisoned")
+            .contains(descriptor)
+    }
+
+    fn mark_verified(&self, descriptor: &ContentDescriptor) {
+        self.verified
+            .lock()
+            .expect("verified descriptor set poisoned")
+            .insert(descriptor.clone());
+    }
+
+    pub(crate) fn record_verified(&self, descriptor: &ContentDescriptor) {
+        self.mark_verified(descriptor);
     }
 
     fn seal(&self, descriptor: ContentDescriptor) -> PreparedContent {
@@ -1699,7 +1757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_range_reuse_is_version_scoped_and_import_stays_uncached() {
+    async fn authenticated_range_reuse_is_version_scoped_and_import_reuses_verified_evidence() {
         let backend = TestBackend::default();
         let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
         let bytes = (0..BLOCK_BYTES * 3 + 17)
@@ -1769,10 +1827,22 @@ mod tests {
             .get_mut(&key)
             .unwrap()
             .bytes[0] ^= 1;
+        backend.state.lock().unwrap().data_reads = 0;
+        store.import(file.descriptor()).await.unwrap();
         assert_eq!(
-            store.import(file.descriptor()).await.unwrap_err().kind(),
+            backend.state.lock().unwrap().data_reads,
+            0,
+            "a verified descriptor must publish without reading its pack again"
+        );
+        let restarted = DataStore::new(backend.operator(), store.filesystem).unwrap();
+        assert_eq!(
+            restarted
+                .import(file.descriptor())
+                .await
+                .unwrap_err()
+                .kind(),
             crate::ErrorKind::Corrupt,
-            "import must independently verify storage rather than promote cached reads"
+            "a fresh DataStore must verify an untrusted descriptor once"
         );
     }
 

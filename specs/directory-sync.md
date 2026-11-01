@@ -29,6 +29,10 @@ required tables and positionally inserted columns have exact signatures. The
 historically additive columns remain supported upgrade inputs:
 
 - `baseline.remote_revision`;
+- `baseline.local_stat_size`, `baseline.local_stat_mtime`,
+  `baseline.local_stat_mtime_nsec`, `baseline.local_stat_ctime`,
+  `baseline.local_stat_ctime_nsec`, and `baseline.local_stat_recorded_ns`;
+- `artifacts.settle_pending`;
 - `work.seq`, `work.conflict`, `work.source_artifact`, `work.local_dev`,
   `work.local_ino`, `work.local_parent_dev`, `work.local_parent_ino`, and
   `work.commit_id`;
@@ -78,11 +82,15 @@ concurrent content edit.
 
 The run keeps that local observation and updates it for paths it installs,
 removes or patches; it does not rescan the whole tree inside a per-entry branch.
-Per-path rechecks use `Replica::observe_path`. A process-local stat cache reuses
-the last verified local fingerprint while device, inode, size, mtime and ctime
-remain stable, so a settled no-op does not rehash file payloads. The remote tree
-is walked once; successful publication results update the in-memory observation
-used for final pending counts when no second authority read is required.
+Per-path rechecks use `Replica::observe_path`. The replica baseline stores the
+verified digest together with device, inode, size, mtime, ctime and the time
+that evidence was recorded. A later process reuses that digest while the stat
+identity still matches and both mtime and ctime are strictly older than the
+recorded time minus one second; racy or changed entries are hashed and their
+evidence replaced. This makes a settled no-op independent of the process
+lifetime without missing an in-place edit. The remote tree is walked once;
+successful publication results update the in-memory observation used for final
+pending counts when no second authority read is required.
 
 Independent local file creations at one directory depth are staged first and
 published with one `Sync::publish_batch`. A batch member owns its own receipt,
@@ -143,8 +151,9 @@ artifacts expose their retained path; byte-stream export of a directory is
 unsupported. Upload and resolved-conflict artifacts are released at their
 durable release events. A displaced inode survives one reconciliation boundary
 so a late writer through the old inode is observable, then it is released if its
-stat identity still matches the accepted displacement. Active conflict material
-is never pruned; all other artifacts are bounded to 64 entries and 256 MiB,
+stat identity still matches the accepted displacement. The pending-settle bit
+is durable, so a later `sync run` in another process performs that check.
+Active conflict material is never pruned; all other artifacts are bounded to 64 entries and 256 MiB,
 oldest first.
 
 ## Backup and isolated restore

@@ -103,6 +103,12 @@ the conflict explicitly, and verifies the resulting remote revision. It does
 not require a watcher or claim uninterrupted `in_sync` while the only local
 change exists in an artifact.
 
+The lifecycle test closes and reopens the reader replica before the settle run.
+The durable `artifacts.settle_pending` marker must release the unchanged
+displaced inode in that new process. A second reopen after the racy-clean
+window must scan the settled tree without hashing file payloads; an in-place
+same-size edit then changes ctime and must be detected and published.
+
 ## Fault boundaries
 
 Completion-race and unknown-outcome coverage pauses or drops the real service

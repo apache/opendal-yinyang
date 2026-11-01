@@ -199,9 +199,11 @@ metadata-only change without reading the payload.
 `upload-retained` captures from ordinary local publication are deleted after the
 edit's committed baseline is durable. A `replaced-file` or
 `rollback-displaced` artifact is verified against its recorded stat identity at
-the start of the next run, then deleted if unchanged. Keeping it through one
-reconciliation boundary makes late writes through an already-open displaced
-inode observable; a changed inode becomes a conflict instead of being deleted.
+the start of the next run, then deleted if unchanged. The pending-settle marker
+is stored in `artifacts.settle_pending`, so the boundary survives a new CLI
+process. Keeping it through one reconciliation boundary makes late writes
+through an already-open displaced inode observable; a changed inode becomes a
+conflict instead of being deleted.
 Explicit resolution inputs are deleted after their publication receipt, baseline
 update and conflict clearance are all durable. Unknown, Retryable, active
 conflict and incomplete-install artifacts remain.

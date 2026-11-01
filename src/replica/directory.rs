@@ -1328,6 +1328,7 @@ fn accepted_local_before(
         executable: previous.executable,
         identity: current.identity,
         parent: current.parent,
+        stat: current.stat,
     }))
 }
 
@@ -1361,6 +1362,7 @@ fn accepted_local(record: &WorkRecord) -> Result<Option<LocalNode>> {
         executable: record.local_executable.unwrap_or(false),
         identity,
         parent,
+        stat: None,
     }))
 }
 
@@ -1781,6 +1783,7 @@ impl<'a> Context<'a> {
             executable: previous.executable,
             identity: current.identity,
             parent: current.parent,
+            stat: current.stat,
         }))
     }
 
@@ -2937,6 +2940,7 @@ async fn canonical_local(
                 executable: local.executable,
                 identity: local.identity,
                 parent: local.parent,
+                stat: local.stat,
             }))
         }
         _ => Ok(None),

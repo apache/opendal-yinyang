@@ -634,7 +634,6 @@ pub async fn stage_create_file(
     let snapshot = sync.authority().observe_revision(baseline).await?;
     let mut reader = HashingReader::new(source);
     let prepared = sync.authority().prepare(&mut reader).await?;
-    sync.remember_prepared(&prepared)?;
     let (length, digest) = reader.finish();
     let key = RequestKey::CreateFile {
         parent: *parent.as_bytes(),
@@ -984,7 +983,12 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
             }
         }
     }
-    let request = match sync.restore_transaction(&row.request).await {
+    let request = match sync
+        .authority()
+        .restore_transaction(&row.request)
+        .await
+        .map_err(Error::from)
+    {
         Ok(request) => request,
         Err(error) => {
             let state = match state {
@@ -1006,7 +1010,6 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
     match sync.authority().commit(&request).await.map_err(Error::from) {
         Ok(yinyang_core::CommitOutcome::Committed(receipt)) => {
             save_state_async(sync, id, COMMITTED, Some(receipt.clone()), None).await?;
-            sync.forget_prepared(&request)?;
             Ok(receipt.cursor.revision)
         }
         Ok(yinyang_core::CommitOutcome::Conflict) => {
@@ -1015,7 +1018,6 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
                 "namespace predicates changed; the original intent is retained",
             ));
             save_state_async(sync, id, CONFLICT, None, Some(failure.clone())).await?;
-            sync.forget_prepared(&request)?;
             Err(Error::Retained(failure))
         }
         Ok(yinyang_core::CommitOutcome::Retryable) => {
@@ -1073,7 +1075,12 @@ pub(super) async fn prepare_batch(sync: &Sync, id: EditId) -> Result<BatchPrepar
             }
         }
     }
-    let request = match sync.restore_transaction(&row.request).await {
+    let request = match sync
+        .authority()
+        .restore_transaction(&row.request)
+        .await
+        .map_err(Error::from)
+    {
         Ok(request) => request,
         Err(error) => {
             let state = match status.state {
@@ -1096,14 +1103,13 @@ pub(super) async fn prepare_batch(sync: &Sync, id: EditId) -> Result<BatchPrepar
 pub(super) async fn complete_batch(
     sync: &Sync,
     id: EditId,
-    request: &Transaction,
+    _request: &Transaction,
     outcome: CommitOutcome,
 ) -> Result<Revision> {
     match outcome {
         CommitOutcome::Committed(receipt) => {
             let revision = receipt.cursor.revision;
             save_state_async(sync, id, COMMITTED, Some(receipt), None).await?;
-            sync.forget_prepared(request)?;
             Ok(revision)
         }
         CommitOutcome::Conflict => {
@@ -1112,7 +1118,6 @@ pub(super) async fn complete_batch(
                 "namespace predicates changed; the original intent is retained",
             ));
             save_state_async(sync, id, CONFLICT, None, Some(failure.clone())).await?;
-            sync.forget_prepared(request)?;
             Err(Error::Retained(failure))
         }
         CommitOutcome::Retryable => {

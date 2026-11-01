@@ -16,12 +16,13 @@
 // under the License.
 
 use super::{Error, Result};
-use super::{LocalKind, LocalNode, LocalSnapshot};
+use super::{LocalKind, LocalNode, LocalSnapshot, LocalStat};
 use crate::replica::linux::{ContentHash, Identity};
 use crate::runtime::schema;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use yinyang_core::{Node, NodeId, NodeKind, Revision};
 
 pub(super) const PROFILE: &str = "yinyang-directory-replica-2";
@@ -127,6 +128,12 @@ const BASELINE_BASE: &[&str] = &[
     "local_ino",
     "local_parent_dev",
     "local_parent_ino",
+    "local_stat_size",
+    "local_stat_mtime",
+    "local_stat_mtime_nsec",
+    "local_stat_ctime",
+    "local_stat_ctime_nsec",
+    "local_stat_recorded_ns",
 ];
 const BASELINE_OPTIONAL: &[&str] = &["remote_revision"];
 const WORK_BASE: &[&str] = &[
@@ -258,6 +265,12 @@ const CREATE_SCHEMA: &str = "
       local_ino BLOB,
       local_parent_dev BLOB,
       local_parent_ino BLOB,
+      local_stat_size INTEGER,
+      local_stat_mtime INTEGER,
+      local_stat_mtime_nsec INTEGER,
+      local_stat_ctime INTEGER,
+      local_stat_ctime_nsec INTEGER,
+      local_stat_recorded_ns INTEGER,
       remote_revision BLOB
     );
     CREATE TABLE baseline_meta(
@@ -280,7 +293,8 @@ const CREATE_SCHEMA: &str = "
       stat_mtime INTEGER,
       stat_mtime_nsec INTEGER,
       stat_ctime INTEGER,
-      stat_ctime_nsec INTEGER
+      stat_ctime_nsec INTEGER,
+      settle_pending INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE installs(
       id TEXT PRIMARY KEY,
@@ -424,6 +438,7 @@ pub(super) struct ArtifactRecord {
     pub digest: Option<[u8; 32]>,
     pub length: u64,
     pub stat: Option<ArtifactStat>,
+    pub settle_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -454,6 +469,45 @@ pub(super) struct BaselineRecord {
     pub revision: Revision,
     pub remote: BTreeMap<String, BaselineNode>,
     pub local: LocalSnapshot,
+    pub local_scan_hints: BTreeMap<String, LocalScanHint>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct LocalScanHint {
+    pub node: LocalNode,
+    pub recorded_ns: i64,
+}
+
+type LocalScanColumns = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn local_scan_columns(local: Option<&LocalNode>) -> Result<LocalScanColumns> {
+    let Some(stat) = local.and_then(|node| node.stat) else {
+        return Ok((None, None, None, None, None, None));
+    };
+    let recorded_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::invalid("record local scan time before the Unix epoch"))?
+        .as_nanos();
+    let recorded_ns = i64::try_from(recorded_ns)
+        .map_err(|_| Error::invalid("local scan time exceeds SQLite range"))?;
+    Ok((
+        Some(
+            i64::try_from(stat.size)
+                .map_err(|_| Error::invalid("local stat size exceeds SQLite range"))?,
+        ),
+        Some(stat.mtime),
+        Some(stat.mtime_nsec),
+        Some(stat.ctime),
+        Some(stat.ctime_nsec),
+        Some(recorded_ns),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -969,13 +1023,24 @@ impl Store {
                     None::<[u8; 8]>,
                 ),
             };
+            let (
+                stat_size,
+                stat_mtime,
+                stat_mtime_nsec,
+                stat_ctime,
+                stat_ctime_nsec,
+                stat_recorded_ns,
+            ) = local_scan_columns(local.get(path))?;
             transaction
                 .execute(
                     "INSERT INTO baseline
                      (path,node,directory,executable,remote_digest,remote_length,
                       local_present,local_digest,local_length,local_executable,
-                      local_dev,local_ino,local_parent_dev,local_parent_ino,remote_revision)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                      local_dev,local_ino,local_parent_dev,local_parent_ino,
+                      local_stat_size,local_stat_mtime,local_stat_mtime_nsec,local_stat_ctime,
+                      local_stat_ctime_nsec,local_stat_recorded_ns,remote_revision)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                            ?16,?17,?18,?19,?20,?21)",
                     params![
                         path,
                         node.id().as_bytes().as_slice(),
@@ -993,6 +1058,12 @@ impl Store {
                         local_ino,
                         parent_dev,
                         parent_ino,
+                        stat_size,
+                        stat_mtime,
+                        stat_mtime_nsec,
+                        stat_ctime,
+                        stat_ctime_nsec,
+                        stat_recorded_ns,
                         revision.to_bytes().as_slice(),
                     ],
                 )
@@ -1087,13 +1158,34 @@ impl Store {
             ),
             None => (0_i64, None, None, None, None, None, None, None),
         };
+        let local_with_stat;
+        let scan_source = match local {
+            Some(node) if node.stat.is_none() => {
+                let mut node = node.clone();
+                node.stat = self.local_scan_hint(path)?.and_then(|hint| {
+                    if hint.node.identity == node.identity && hint.node.kind == node.kind {
+                        hint.node.stat
+                    } else {
+                        None
+                    }
+                });
+                local_with_stat = node;
+                Some(&local_with_stat)
+            }
+            _ => local,
+        };
+        let (stat_size, stat_mtime, stat_mtime_nsec, stat_ctime, stat_ctime_nsec, stat_recorded_ns) =
+            local_scan_columns(scan_source)?;
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO baseline
                  (path,node,directory,executable,remote_digest,remote_length,
                   local_present,local_digest,local_length,local_executable,
-                  local_dev,local_ino,local_parent_dev,local_parent_ino,remote_revision)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                  local_dev,local_ino,local_parent_dev,local_parent_ino,
+                  local_stat_size,local_stat_mtime,local_stat_mtime_nsec,local_stat_ctime,
+                  local_stat_ctime_nsec,local_stat_recorded_ns,remote_revision)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                        ?16,?17,?18,?19,?20,?21)",
                 params![
                     path,
                     node.as_bytes().as_slice(),
@@ -1111,6 +1203,12 @@ impl Store {
                     local_ino,
                     parent_dev,
                     parent_ino,
+                    stat_size,
+                    stat_mtime,
+                    stat_mtime_nsec,
+                    stat_ctime,
+                    stat_ctime_nsec,
+                    stat_recorded_ns,
                     revision.to_bytes().as_slice(),
                 ],
             )
@@ -1168,6 +1266,7 @@ impl Store {
             .map_err(|e| Error::corrupt(format!("decode baseline revision: {e}")))?;
         let mut remote = BTreeMap::new();
         let mut local = BTreeMap::new();
+        let mut local_scan_hints = BTreeMap::new();
         let remote_revision = if self.shape.baseline_remote_revision {
             "remote_revision"
         } else {
@@ -1179,6 +1278,8 @@ impl Store {
                 "SELECT path,node,directory,executable,remote_digest,remote_length,
                         local_present,local_digest,local_length,local_executable,
                         local_dev,local_ino,local_parent_dev,local_parent_ino,
+                        local_stat_size,local_stat_mtime,local_stat_mtime_nsec,
+                        local_stat_ctime,local_stat_ctime_nsec,local_stat_recorded_ns,
                         {remote_revision}
                  FROM baseline ORDER BY path"
             ))
@@ -1194,7 +1295,13 @@ impl Store {
                 let local_ino: Option<Vec<u8>> = row.get(11)?;
                 let local_parent_dev: Option<Vec<u8>> = row.get(12)?;
                 let local_parent_ino: Option<Vec<u8>> = row.get(13)?;
-                let revision: Option<Vec<u8>> = row.get(14)?;
+                let stat_size: Option<i64> = row.get(14)?;
+                let stat_mtime: Option<i64> = row.get(15)?;
+                let stat_mtime_nsec: Option<i64> = row.get(16)?;
+                let stat_ctime: Option<i64> = row.get(17)?;
+                let stat_ctime_nsec: Option<i64> = row.get(18)?;
+                let stat_recorded_ns: Option<i64> = row.get(19)?;
+                let revision: Option<Vec<u8>> = row.get(20)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     NodeId::from_bytes(fixed(&node, "baseline node")?),
@@ -1236,6 +1343,12 @@ impl Store {
                         .as_deref()
                         .map(|value| number(value, "baseline parent inode"))
                         .transpose()?,
+                    stat_size,
+                    stat_mtime,
+                    stat_mtime_nsec,
+                    stat_ctime,
+                    stat_ctime_nsec,
+                    stat_recorded_ns,
                     revision
                         .as_deref()
                         .map(|value| fixed(value, "baseline entry revision"))
@@ -1261,6 +1374,12 @@ impl Store {
                 local_ino,
                 local_parent_dev,
                 local_parent_ino,
+                stat_size,
+                stat_mtime,
+                stat_mtime_nsec,
+                stat_ctime,
+                stat_ctime_nsec,
+                stat_recorded_ns,
                 revision,
             ) = row.map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
             remote.insert(
@@ -1293,26 +1412,220 @@ impl Store {
                     ino: local_ino
                         .ok_or_else(|| Error::corrupt("local baseline entry lacks an inode"))?,
                 };
-                local.insert(
-                    path.clone(),
-                    LocalNode {
-                        path: path.clone(),
-                        kind,
-                        executable: local_executable.unwrap_or(false),
-                        identity,
-                        parent: match (local_parent_dev, local_parent_ino) {
-                            (Some(dev), Some(ino)) => Some(Identity { dev, ino }),
-                            _ => None,
-                        },
+                let stat = match (
+                    stat_size,
+                    stat_mtime,
+                    stat_mtime_nsec,
+                    stat_ctime,
+                    stat_ctime_nsec,
+                ) {
+                    (Some(size), Some(mtime), Some(mtime_nsec), Some(ctime), Some(ctime_nsec)) => {
+                        Some(LocalStat {
+                            dev: identity.dev,
+                            ino: identity.ino,
+                            size: u64::try_from(size)
+                                .map_err(|_| corrupt_sql("negative local stat size"))?,
+                            mtime,
+                            mtime_nsec,
+                            ctime,
+                            ctime_nsec,
+                        })
+                    }
+                    (None, None, None, None, None) => None,
+                    _ => return Err(corrupt_sql("incomplete local scan stat evidence")),
+                };
+                let local_node = LocalNode {
+                    path: path.clone(),
+                    kind,
+                    executable: local_executable.unwrap_or(false),
+                    identity,
+                    parent: match (local_parent_dev, local_parent_ino) {
+                        (Some(dev), Some(ino)) => Some(Identity { dev, ino }),
+                        _ => None,
                     },
-                );
+                    stat,
+                };
+                if let (Some(_), Some(recorded_ns)) = (local_node.stat, stat_recorded_ns) {
+                    local_scan_hints.insert(
+                        path.clone(),
+                        LocalScanHint {
+                            node: local_node.clone(),
+                            recorded_ns,
+                        },
+                    );
+                }
+                local.insert(path.clone(), local_node);
             }
         }
         Ok(Some(BaselineRecord {
             revision: Revision::from_bytes(global_revision),
             remote,
             local: LocalSnapshot::from_nodes(local),
+            local_scan_hints,
         }))
+    }
+
+    pub fn local_scan_hint(&self, path: &str) -> Result<Option<LocalScanHint>> {
+        if !self.shape.initialized {
+            return Ok(None);
+        }
+        type RawHint = (
+            bool,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<bool>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let row = self
+            .connection
+            .query_row(
+                "SELECT directory,local_digest,local_length,local_executable,
+                        local_dev,local_ino,local_parent_dev,local_parent_ino,
+                        local_stat_size,local_stat_mtime,local_stat_mtime_nsec,
+                        local_stat_ctime,local_stat_ctime_nsec,local_stat_recorded_ns
+                 FROM baseline WHERE path=?1 AND local_present=1",
+                params![path],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::corrupt(format!("read local scan evidence: {e}")))?;
+        let Some((
+            directory,
+            local_digest,
+            local_length,
+            local_executable,
+            local_dev,
+            local_ino,
+            local_parent_dev,
+            local_parent_ino,
+            stat_size,
+            stat_mtime,
+            stat_mtime_nsec,
+            stat_ctime,
+            stat_ctime_nsec,
+            stat_recorded_ns,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if directory {
+            return Ok(None);
+        }
+        let digest = local_digest
+            .as_deref()
+            .ok_or_else(|| Error::corrupt("local scan evidence lacks a digest"))
+            .and_then(|value| fixed(value, "local scan digest"))?;
+        let length = local_length
+            .ok_or_else(|| Error::corrupt("local scan evidence lacks a length"))
+            .and_then(|value| {
+                u64::try_from(value).map_err(|_| Error::corrupt("negative local scan length"))
+            })?;
+        let dev = local_dev
+            .as_deref()
+            .ok_or_else(|| Error::corrupt("local scan evidence lacks a device"))
+            .and_then(|value| number(value, "local scan device"))?;
+        let ino = local_ino
+            .as_deref()
+            .ok_or_else(|| Error::corrupt("local scan evidence lacks an inode"))
+            .and_then(|value| number(value, "local scan inode"))?;
+        let parent = match (local_parent_dev, local_parent_ino) {
+            (Some(dev), Some(ino)) => Some(Identity {
+                dev: number(&dev, "local scan parent device")?,
+                ino: number(&ino, "local scan parent inode")?,
+            }),
+            (None, None) => None,
+            _ => return Err(Error::corrupt("incomplete local scan parent identity")),
+        };
+        let stat = match (
+            stat_size,
+            stat_mtime,
+            stat_mtime_nsec,
+            stat_ctime,
+            stat_ctime_nsec,
+        ) {
+            (Some(size), Some(mtime), Some(mtime_nsec), Some(ctime), Some(ctime_nsec)) => {
+                Some(LocalStat {
+                    dev,
+                    ino,
+                    size: u64::try_from(size)
+                        .map_err(|_| Error::corrupt("negative local scan stat size"))?,
+                    mtime,
+                    mtime_nsec,
+                    ctime,
+                    ctime_nsec,
+                })
+            }
+            (None, None, None, None, None) => None,
+            _ => return Err(Error::corrupt("incomplete local scan stat evidence")),
+        };
+        Ok(Some(LocalScanHint {
+            node: LocalNode {
+                path: path.to_owned(),
+                kind: LocalKind::File {
+                    length,
+                    digest: ContentHash::from_bytes(digest),
+                },
+                executable: local_executable.unwrap_or(false),
+                identity: Identity { dev, ino },
+                parent,
+                stat,
+            },
+            recorded_ns: stat_recorded_ns
+                .ok_or_else(|| Error::corrupt("local scan evidence lacks a timestamp"))?,
+        }))
+    }
+
+    pub fn save_local_scan_evidence(&self, node: &LocalNode) -> Result<()> {
+        let LocalKind::File { digest, .. } = node.kind else {
+            return Ok(());
+        };
+        let (size, mtime, mtime_nsec, ctime, ctime_nsec, recorded_ns) =
+            local_scan_columns(Some(node))?;
+        self.connection
+            .execute(
+                "UPDATE baseline SET
+                   local_stat_size=?2,local_stat_mtime=?3,local_stat_mtime_nsec=?4,
+                   local_stat_ctime=?5,local_stat_ctime_nsec=?6,local_stat_recorded_ns=?7
+                 WHERE path=?1 AND local_present=1 AND local_digest=?8",
+                params![
+                    node.path,
+                    size,
+                    mtime,
+                    mtime_nsec,
+                    ctime,
+                    ctime_nsec,
+                    recorded_ns,
+                    digest.as_bytes().as_slice()
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("write local scan evidence: {e}")))?;
+        Ok(())
     }
 
     pub fn insert_conflict(&mut self, conflict: &ConflictRecord) -> Result<()> {
@@ -1616,8 +1929,9 @@ impl Store {
             .execute(
                 "INSERT INTO artifacts
                  (id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
-                  stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                  stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec,
+                  settle_pending)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     artifact.id,
                     artifact.origin,
@@ -1636,6 +1950,7 @@ impl Store {
                     artifact.stat.map(|stat| stat.mtime_nsec),
                     artifact.stat.map(|stat| stat.ctime),
                     artifact.stat.map(|stat| stat.ctime_nsec),
+                    artifact.settle_pending,
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write retained artifact: {e}")))?;
@@ -1645,7 +1960,7 @@ impl Store {
     pub fn update_artifact(&mut self, id: &str, phase: &str, error: Option<&str>) -> Result<()> {
         self.connection
             .execute(
-                "UPDATE artifacts SET phase=?2,error=?3 WHERE id=?1",
+                "UPDATE artifacts SET phase=?2,error=?3,settle_pending=(?2='retained') WHERE id=?1",
                 params![id, phase, error],
             )
             .map_err(|e| Error::corrupt(format!("update retained artifact: {e}")))?;
@@ -1819,7 +2134,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
-                        stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec
+                        stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec,
+                        settle_pending
                  FROM artifacts ORDER BY rowid,id",
             )
             .map_err(|e| Error::corrupt(format!("read retained artifacts: {e}")))?;
@@ -1859,6 +2175,7 @@ impl Store {
                         (None, None) => None,
                         _ => return Err(corrupt_sql("incomplete artifact stat identity")),
                     },
+                    settle_pending: row.get(16)?,
                 })
             })
             .map_err(|e| Error::corrupt(format!("read retained artifacts: {e}")))?

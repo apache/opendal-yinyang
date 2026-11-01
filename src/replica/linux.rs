@@ -17,7 +17,7 @@
 
 use super::backup::BackupManifest;
 use super::state::{
-    ArtifactRecord, ArtifactStat, ConflictRecord, InstallPhase, InstallRecord, Store,
+    ArtifactRecord, ArtifactStat, ConflictRecord, InstallPhase, InstallRecord, LocalScanHint, Store,
 };
 use super::{Error, Result};
 use rustix::fd::OwnedFd;
@@ -28,8 +28,8 @@ use rustix::fs::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use yinyang_core::{NodeId, Revision};
 
 /// Maximum number of non-conflict artifacts retained by one replica.
@@ -66,6 +66,31 @@ pub struct Identity {
     pub ino: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalStat {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+    pub ctime: i64,
+    pub ctime_nsec: i64,
+}
+
+impl LocalStat {
+    pub(crate) fn from_stat(stat: &Stat) -> Self {
+        Self {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            size: stat.st_size as u64,
+            mtime: stat.st_mtime,
+            mtime_nsec: stat.st_mtime_nsec as i64,
+            ctime: stat.st_ctime,
+            ctime_nsec: stat.st_ctime_nsec as i64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalNode {
     pub path: String,
@@ -73,6 +98,7 @@ pub struct LocalNode {
     pub executable: bool,
     pub identity: Identity,
     pub parent: Option<Identity>,
+    pub stat: Option<LocalStat>,
 }
 
 impl LocalNode {
@@ -277,8 +303,6 @@ pub struct Replica {
     _lease: Option<std::fs::File>,
     store: Store,
     hash_bytes: Arc<AtomicU64>,
-    scan_cache: Mutex<BTreeMap<String, (Stat, LocalNode)>>,
-    fresh_artifacts: BTreeSet<String>,
 }
 
 fn baseline_from_store(store: &Store) -> Result<Option<ReplicaBaseline>> {
@@ -378,8 +402,6 @@ impl Replica {
             _lease: Some(lease),
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
-            scan_cache: Mutex::new(BTreeMap::new()),
-            fresh_artifacts: BTreeSet::new(),
         };
         replica.recover_incomplete()?;
         Ok(replica)
@@ -452,8 +474,6 @@ impl Replica {
             _lease: Some(lease),
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
-            scan_cache: Mutex::new(BTreeMap::new()),
-            fresh_artifacts: BTreeSet::new(),
         };
         manifest.apply(&mut replica, &binding)?;
         replica.verify_retained_artifacts()?;
@@ -538,8 +558,6 @@ impl Replica {
             _lease: Some(lease),
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
-            scan_cache: Mutex::new(BTreeMap::new()),
-            fresh_artifacts: BTreeSet::new(),
         };
         replica.recover_incomplete()?;
         Ok(replica)
@@ -683,8 +701,6 @@ impl Replica {
             _lease: None,
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
-            scan_cache: Mutex::new(BTreeMap::new()),
-            fresh_artifacts: BTreeSet::new(),
         })
     }
 
@@ -820,6 +836,11 @@ impl Replica {
     /// symlink or a mutating file aborts the scan; callers must not convert an
     /// aborted scan into a delete set.
     pub fn scan(&self) -> Result<LocalSnapshot> {
+        let hints = self
+            .store
+            .load_baseline()?
+            .map(|baseline| baseline.local_scan_hints)
+            .unwrap_or_default();
         let mut nodes = BTreeMap::new();
         nodes.insert(
             String::new(),
@@ -829,13 +850,16 @@ impl Replica {
                 executable: false,
                 identity: self.root_identity,
                 parent: None,
+                stat: None,
             },
         );
-        self.scan_directory(&self.root_fd, "", self.root_identity, &mut nodes)?;
-        self.scan_cache
-            .lock()
-            .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
-            .retain(|path, _| nodes.contains_key(path));
+        self.scan_directory(
+            &self.root_fd,
+            "",
+            self.root_identity,
+            &mut nodes,
+            Some(&hints),
+        )?;
         Ok(LocalSnapshot { nodes })
     }
 
@@ -849,6 +873,7 @@ impl Replica {
                 executable: false,
                 identity: self.root_identity,
                 parent: None,
+                stat: None,
             }));
         }
         validate_path(path)?;
@@ -885,19 +910,22 @@ impl Replica {
                         "inspect observed local directory",
                     )?,
                     parent: Some(parent_identity),
+                    stat: Some(local_stat(&fstat(&fd).map_err(|error| {
+                        Error::errno(
+                            "inspect observed local directory",
+                            &self.root.join(path),
+                            error,
+                        )
+                    })?)),
                 }))
             }
             FileType::RegularFile => {
-                let cached = self
-                    .scan_cache
-                    .lock()
-                    .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
-                    .get(path)
-                    .filter(|(cached_stat, _)| same_stable_stat(&stat, cached_stat))
-                    .map(|(_, node)| node.clone());
-                if let Some(mut node) = cached {
+                let hint = self.store.local_scan_hint(path)?;
+                if let Some(hint) = hint.filter(|hint| scan_hint_matches(&stat, hint)) {
+                    let mut node = hint.node;
                     node.path = path.to_owned();
                     node.parent = Some(parent_identity);
+                    node.stat = Some(local_stat(&stat));
                     return Ok(Some(node));
                 }
                 let (length, digest, identity, executable) = hash_file_at_counted(
@@ -912,11 +940,9 @@ impl Replica {
                     executable,
                     identity,
                     parent: Some(parent_identity),
+                    stat: Some(local_stat(&stat)),
                 };
-                self.scan_cache
-                    .lock()
-                    .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
-                    .insert(path.to_owned(), (stat, node.clone()));
+                self.store.save_local_scan_evidence(&node)?;
                 Ok(Some(node))
             }
             FileType::Symlink => Err(Error::unsupported(format!(
@@ -933,6 +959,11 @@ impl Replica {
         if path.is_empty() {
             return self.scan();
         }
+        let hints = self
+            .store
+            .load_baseline()?
+            .map(|baseline| baseline.local_scan_hints)
+            .unwrap_or_default();
         validate_path(path)?;
         let (parent, name) = split_path(path)?;
         let parent_fd = self.open_relative_dir(parent)?;
@@ -960,6 +991,7 @@ impl Replica {
                         executable: false,
                         identity: root_identity,
                         parent: Some(parent_identity),
+                        stat: Some(local_stat(&stat)),
                     },
                 );
                 scan_directory(
@@ -969,27 +1001,38 @@ impl Replica {
                     &self.root,
                     self.root_identity.dev,
                     Some(&self.hash_bytes),
-                    Some(&self.scan_cache),
+                    Some(&hints),
                     &mut nodes,
                 )?;
             }
             FileType::RegularFile => {
-                let (length, digest, identity, executable) = hash_file_at_counted(
-                    &parent_fd,
-                    name,
-                    &self.root.join(path),
-                    Some(&self.hash_bytes),
-                )?;
-                nodes.insert(
-                    path.to_owned(),
-                    LocalNode {
-                        path: path.to_owned(),
-                        kind: LocalKind::File { length, digest },
-                        executable,
-                        identity,
-                        parent: Some(parent_identity),
-                    },
-                );
+                let mut node = match hints
+                    .get(path)
+                    .filter(|hint| scan_hint_matches(&stat, hint))
+                {
+                    Some(hint) => hint.node.clone(),
+                    None => {
+                        let (length, digest, identity, executable) = hash_file_at_counted(
+                            &parent_fd,
+                            name,
+                            &self.root.join(path),
+                            Some(&self.hash_bytes),
+                        )?;
+                        LocalNode {
+                            path: path.to_owned(),
+                            kind: LocalKind::File { length, digest },
+                            executable,
+                            identity,
+                            parent: Some(parent_identity),
+                            stat: Some(local_stat(&stat)),
+                        }
+                    }
+                };
+                node.path = path.to_owned();
+                node.parent = Some(parent_identity);
+                node.stat = Some(local_stat(&stat));
+                self.store.save_local_scan_evidence(&node)?;
+                nodes.insert(path.to_owned(), node);
             }
             FileType::Symlink => {
                 return Err(Error::unsupported(format!(
@@ -1085,6 +1128,7 @@ impl Replica {
             digest: None,
             length: expected_length,
             stat: None,
+            settle_pending: false,
         };
         self.store.insert_artifact(&artifact)?;
         let output = openat(
@@ -1271,24 +1315,21 @@ impl Replica {
     /// them if no old writer changed their bytes. This one-pass grace period
     /// keeps late writes through a displaced inode observable.
     pub fn settle_fresh_artifacts(&mut self) -> Result<()> {
-        let fresh = std::mem::take(&mut self.fresh_artifacts);
-        for id in fresh {
-            let Some(artifact) = self
-                .store
-                .artifacts()?
-                .into_iter()
-                .find(|artifact| artifact.id == id)
-            else {
-                continue;
-            };
+        let pending = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .filter(|artifact| artifact.settle_pending)
+            .collect::<Vec<_>>();
+        for artifact in pending {
             if artifact.phase == "conflict" {
                 continue;
             }
             if self.artifact_matches_record(&artifact)? {
-                self.release_artifact(&id)?;
+                self.release_artifact(&artifact.id)?;
             } else {
                 self.store.update_artifact(
-                    &id,
+                    &artifact.id,
                     "conflict",
                     Some("retained artifact changed after its reconciliation"),
                 )?;
@@ -1426,6 +1467,7 @@ impl Replica {
             digest: Some(*blake3::hash(bytes).as_bytes()),
             length: bytes.len() as u64,
             stat: None,
+            settle_pending: false,
         };
         self.store.insert_artifact(&record)?;
         let fd = openat(
@@ -1681,6 +1723,7 @@ impl Replica {
             digest: Some(*digest.as_bytes()),
             length,
             stat: None,
+            settle_pending: false,
         })?;
         let mut record = InstallRecord {
             id,
@@ -1813,6 +1856,7 @@ impl Replica {
                 })
                 .sum(),
             stat: None,
+            settle_pending: false,
         };
         self.store.insert_artifact(&record)?;
         if let Err(error) = renameat_with(
@@ -1859,9 +1903,6 @@ impl Replica {
         }
         self.store
             .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
-        if matches {
-            self.fresh_artifacts.insert(record.id.clone());
-        }
         Ok(self.artifact_from(record))
     }
 
@@ -1950,6 +1991,7 @@ impl Replica {
         prefix: &str,
         directory_identity: Identity,
         nodes: &mut BTreeMap<String, LocalNode>,
+        hints: Option<&BTreeMap<String, LocalScanHint>>,
     ) -> Result<()> {
         scan_directory(
             directory,
@@ -1958,7 +2000,7 @@ impl Replica {
             &self.root,
             self.root_identity.dev,
             Some(&self.hash_bytes),
-            Some(&self.scan_cache),
+            hints,
             nodes,
         )
     }
@@ -1985,6 +2027,7 @@ impl Replica {
                         executable: false,
                         identity,
                         parent: None,
+                        stat: Some(local_stat(&stat)),
                     },
                 );
                 scan_directory(
@@ -2009,6 +2052,7 @@ impl Replica {
                         executable,
                         identity,
                         parent: None,
+                        stat: Some(local_stat(&stat)),
                     },
                 );
             }
@@ -2700,6 +2744,7 @@ impl PreparedInstall<'_> {
             digest: None,
             length: 0,
             stat: None,
+            settle_pending: false,
         };
         self.replica.store.insert_artifact(&record)?;
         renameat_with(
@@ -2796,9 +2841,6 @@ impl PreparedInstall<'_> {
             },
             self.record.error.as_deref(),
         )?;
-        if phase == InstallPhase::Retained {
-            self.replica.fresh_artifacts.insert(self.record.id.clone());
-        }
         Ok(())
     }
 
@@ -2903,6 +2945,7 @@ pub fn scan_path(path: &Path) -> Result<LocalSnapshot> {
                     executable: false,
                     identity: root_identity,
                     parent: None,
+                    stat: Some(local_stat(&opened)),
                 },
             );
             scan_directory(
@@ -2926,6 +2969,7 @@ pub fn scan_path(path: &Path) -> Result<LocalSnapshot> {
                     executable,
                     identity,
                     parent: None,
+                    stat: Some(local_stat(&stat)),
                 },
             );
         }
@@ -2952,7 +2996,7 @@ fn scan_directory(
     display_root: &Path,
     filesystem_dev: u64,
     counter: Option<&AtomicU64>,
-    cache: Option<&Mutex<BTreeMap<String, (Stat, LocalNode)>>>,
+    hints: Option<&BTreeMap<String, LocalScanHint>>,
     nodes: &mut BTreeMap<String, LocalNode>,
 ) -> Result<()> {
     let mut reader =
@@ -3010,6 +3054,7 @@ fn scan_directory(
                         executable: false,
                         identity,
                         parent: Some(directory_identity),
+                        stat: Some(local_stat(&opened)),
                     },
                 );
                 scan_directory(
@@ -3019,21 +3064,19 @@ fn scan_directory(
                     display_root,
                     filesystem_dev,
                     counter,
-                    cache,
+                    hints,
                     nodes,
                 )?;
             }
             FileType::RegularFile => {
-                if let Some(cache) = cache
-                    && let Some((cached_stat, cached_node)) = cache
-                        .lock()
-                        .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
-                        .get(&path)
-                    && same_stable_stat(&stat, cached_stat)
+                if let Some(hint) = hints
+                    .and_then(|hints| hints.get(&path))
+                    .filter(|hint| scan_hint_matches(&stat, hint))
                 {
-                    let mut node = cached_node.clone();
+                    let mut node = hint.node.clone();
                     node.path = path.clone();
                     node.parent = Some(directory_identity);
+                    node.stat = Some(local_stat(&stat));
                     nodes.insert(path, node);
                     continue;
                 }
@@ -3045,13 +3088,8 @@ fn scan_directory(
                     executable,
                     identity,
                     parent: Some(directory_identity),
+                    stat: Some(local_stat(&stat)),
                 };
-                if let Some(cache) = cache {
-                    cache
-                        .lock()
-                        .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
-                        .insert(path.clone(), (stat, node.clone()));
-                }
                 nodes.insert(path, node);
             }
             FileType::Symlink => {
@@ -3281,6 +3319,10 @@ fn artifact_stat(stat: &Stat) -> ArtifactStat {
     }
 }
 
+fn local_stat(stat: &Stat) -> LocalStat {
+    LocalStat::from_stat(stat)
+}
+
 fn artifact_stat_matches(record: &ArtifactRecord, stat: &Stat) -> bool {
     record.stat.is_some_and(|stored| {
         stored.dev == stat.st_dev
@@ -3366,6 +3408,29 @@ fn same_stable_stat(left: &Stat, right: &Stat) -> bool {
         && left.st_mtime_nsec == right.st_mtime_nsec
         && left.st_ctime == right.st_ctime
         && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+fn scan_hint_matches(current: &Stat, hint: &LocalScanHint) -> bool {
+    let Some(stored) = hint.node.stat else {
+        return false;
+    };
+    stored.dev == current.st_dev
+        && stored.ino == current.st_ino
+        && stored.size == current.st_size as u64
+        && stored.mtime == current.st_mtime
+        && stored.mtime_nsec == current.st_mtime_nsec as i64
+        && stored.ctime == current.st_ctime
+        && stored.ctime_nsec == current.st_ctime_nsec as i64
+        && stat_is_racy_clean(current, hint.recorded_ns)
+}
+
+fn stat_is_racy_clean(stat: &Stat, recorded_ns: i64) -> bool {
+    let timestamp_ns = |seconds: i64, nanos: i64| -> i128 {
+        i128::from(seconds) * 1_000_000_000 + i128::from(nanos)
+    };
+    let cutoff = i128::from(recorded_ns) - 1_000_000_000;
+    timestamp_ns(stat.st_mtime, stat.st_mtime_nsec as i64) < cutoff
+        && timestamp_ns(stat.st_ctime, stat.st_ctime_nsec as i64) < cutoff
 }
 
 fn same_tree(expected: &BTreeMap<String, LocalNode>, actual: &BTreeMap<String, LocalNode>) -> bool {

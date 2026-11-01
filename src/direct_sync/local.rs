@@ -635,6 +635,7 @@ impl LocalTree {
                 executable: false,
                 identity: self.root_identity,
                 parent: None,
+                stat: None,
             }));
         }
         let (parent, name) = split_path(path)?;
@@ -672,6 +673,7 @@ impl LocalTree {
                         "inspect Direct Sync local directory",
                     )?,
                     parent: Some(parent_identity),
+                    stat: Some(crate::replica::LocalStat::from_stat(&stat)),
                 }))
             }
             FileType::RegularFile => {
@@ -689,6 +691,7 @@ impl LocalTree {
                         dev: fingerprint.parent_dev,
                         ino: fingerprint.parent_ino,
                     }),
+                    stat: Some(crate::replica::LocalStat::from_stat(&stat)),
                 }))
             }
             FileType::Symlink => Err(Error::unsupported(format!(

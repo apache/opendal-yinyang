@@ -531,7 +531,10 @@ impl ServiceClient {
         )
         .await?
         {
-            Response::Registered => self.data.published(descriptor),
+            Response::Registered => {
+                self.data.record_verified(&descriptor);
+                self.data.published(descriptor)
+            }
             _ => Err(protocol()),
         }
     }
@@ -572,6 +575,7 @@ impl ServiceClient {
         {
             return Err(protocol());
         }
+        self.data.record_verified(&descriptor);
         self.data.published(descriptor)
     }
     pub async fn prepare_update(
@@ -615,6 +619,7 @@ impl ServiceClient {
         {
             return Err(protocol());
         }
+        self.data.record_verified(&descriptor);
         self.data.published(descriptor)
     }
     pub async fn register(&self, content: &PreparedContent) -> Result<()> {
