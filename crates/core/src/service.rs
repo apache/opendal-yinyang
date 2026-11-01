@@ -950,4 +950,23 @@ mod admission_tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Corrupt);
     }
+
+    #[tokio::test]
+    async fn service_database_commits_with_full_synchronous_durability() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+
+        let db = connect(&path, false).await.unwrap();
+        let connection = db.lock().unwrap();
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
+    }
 }
