@@ -412,6 +412,7 @@ async fn explicit_expiry_preserves_protected_staging_work_and_is_idempotent() {
         expected
     );
     recovered.close().await.unwrap();
+    drop(recovered);
     drop(runtime);
 
     let before = authority.observe_latest().await.unwrap().revision();
