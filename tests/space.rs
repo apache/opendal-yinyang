@@ -25,13 +25,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::transaction::Planner;
 use yinyang::core::{
-    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs,
-    NodeId, Revision, Snapshot, Transaction,
+    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind,
+    ExpiryId, Fs, NodeId, Revision, RevisionState, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
-    MeasurementState, StagingBindingState, StagingState, inspect_bound_local_staging,
-    inspect_managed_space, plan_managed_retention,
+    ExpiryDecisionState, ExpiryReportState, MeasurementState, StagingBindingState, StagingState,
+    expire_managed_retention, inspect_bound_local_staging, inspect_managed_space,
+    plan_managed_retention,
 };
 use yinyang::sync::Sync;
 
@@ -321,6 +322,124 @@ async fn clean_handle_base_is_protected_and_remains_readable_and_writable() {
         expected
     );
     recovered.close().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_expiry_preserves_protected_staging_work_and_is_idempotent() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("editor");
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let original = b"version-zero".to_vec();
+    let prepared = authority.prepare(&mut original.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut create = Planner::new(&snapshot, CommitId::generate());
+    let node = create
+        .create_file(authority.root(), "protected.bin", prepared, false)
+        .await
+        .unwrap();
+    let CommitOutcome::Committed(zero) = authority.commit(&create.finish().unwrap()).await.unwrap()
+    else {
+        panic!("initial revision must commit");
+    };
+    let zero_revision = zero.cursor.revision;
+
+    let mut first = runtime.open_node(node, true).await.unwrap();
+    first.write(0, b"version-one").await.unwrap();
+    let one = first.fsync().await.unwrap().unwrap();
+    let one_revision = one.cursor.revision;
+    first.close().await.unwrap();
+
+    let mut protected = runtime.open_node(node, true).await.unwrap();
+    protected.write(4, b"protected-pending").await.unwrap();
+    let handle = protected.release().unwrap();
+    drop(runtime);
+
+    let report = expire_managed_retention(
+        authority.as_ref(),
+        &staging,
+        &[zero_revision],
+        &[],
+        ExpiryId::from_bytes([41; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.state, ExpiryReportState::Committed);
+    assert_eq!(report.revisions[0].state, ExpiryDecisionState::Expired);
+    assert_eq!(report.evidence_digest.len(), 64);
+    assert_eq!(
+        authority
+            .observe_revision(zero_revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired
+    );
+    assert!(authority.observe_revision(one_revision).await.is_ok());
+    let history = authority
+        .history_page(None, yinyang::core::RETAINED_REVISIONS_PAGE_MAX)
+        .await
+        .unwrap();
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == zero_revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    let mut expected = b"version-one".to_vec();
+    expected[4..4 + b"protected-pending".len()].copy_from_slice(b"protected-pending");
+    assert_eq!(recovered.read(0, expected.len()).await.unwrap(), expected);
+    let after = recovered.fsync().await.unwrap().unwrap();
+    assert!(after.cursor.revision > one_revision);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    recovered.close().await.unwrap();
+    drop(runtime);
+
+    let before = authority.observe_latest().await.unwrap().revision();
+    let repeated = expire_managed_retention(
+        authority.as_ref(),
+        &staging,
+        &[zero_revision],
+        &[],
+        ExpiryId::from_bytes([42; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated.state, ExpiryReportState::AlreadyExpired);
+    assert_eq!(
+        repeated.revisions[0].state,
+        ExpiryDecisionState::AlreadyExpired
+    );
+    assert_eq!(
+        authority.observe_latest().await.unwrap().revision(),
+        before,
+        "an idempotent already-expired request must not advance the head"
+    );
+    assert_eq!(
+        authority
+            .observe_revision(zero_revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired
+    );
 }
 
 #[tokio::test]
