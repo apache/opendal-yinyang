@@ -271,7 +271,6 @@ impl StorageCapabilities {
 pub struct Capabilities {
     pub admitted: CapabilitySet,
     pub storage: StorageCapabilities,
-    pub effective: CapabilitySet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -302,7 +301,6 @@ impl Admission {
         Ok(Capabilities {
             admitted: self.capabilities.clone(),
             storage: StorageCapabilities::inspect(operator),
-            effective: self.capabilities.clone(),
         })
     }
 }
@@ -319,10 +317,6 @@ impl VolumeConfig {
     }
     pub fn validate(&self, operator: &Operator) -> Result<Capabilities> {
         admit(self)?.capabilities(operator)
-    }
-
-    pub fn capabilities(&self, operator: &Operator) -> Result<Capabilities> {
-        self.validate(operator)
     }
 }
 
@@ -754,129 +748,6 @@ fn kind_from_io(error: &std::io::Error) -> ErrorKind {
     }
 }
 
-/// Reject equal or nested root/state paths and require one local filesystem.
-pub fn check_root_state(root: &Path, state: &Path) -> std::result::Result<(), yinyang_core::Error> {
-    let root = canonical_target(root, "root")?;
-    let state = canonical_target(state, "state")?;
-    if root == state {
-        return Err(root_state_error(
-            CoreErrorKind::Invalid,
-            "root and state must be different",
-        ));
-    }
-    if state.starts_with(&root) {
-        return Err(root_state_error(
-            CoreErrorKind::Invalid,
-            "state must not be inside the synchronized root",
-        ));
-    }
-    if root.starts_with(&state) {
-        return Err(root_state_error(
-            CoreErrorKind::Invalid,
-            "the synchronized root must not be inside state",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        if device_of(&root, "root")? != device_of(&state, "state")? {
-            return Err(root_state_error(
-                CoreErrorKind::Unsupported,
-                "root and state must be on the same filesystem",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn canonical_target(
-    path: &Path,
-    label: &'static str,
-) -> std::result::Result<PathBuf, yinyang_core::Error> {
-    if path.exists() {
-        return std::fs::canonicalize(path).map_err(|error| {
-            root_state_error(
-                CoreErrorKind::Io,
-                format!("canonicalize {label} {}: {error}", path.display()),
-            )
-        });
-    }
-    let mut missing = Vec::new();
-    let mut ancestor = path;
-    loop {
-        match std::fs::metadata(ancestor) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = ancestor.file_name().ok_or_else(|| {
-                    root_state_error(
-                        CoreErrorKind::Invalid,
-                        format!("{label} path has no existing ancestor"),
-                    )
-                })?;
-                missing.push(name.to_owned());
-                ancestor = ancestor.parent().ok_or_else(|| {
-                    root_state_error(
-                        CoreErrorKind::Invalid,
-                        format!("{label} path has no existing ancestor"),
-                    )
-                })?;
-            }
-            Err(error) => {
-                return Err(root_state_error(
-                    CoreErrorKind::Io,
-                    format!("inspect {label} {}: {error}", ancestor.display()),
-                ));
-            }
-        }
-    }
-    let mut canonical = std::fs::canonicalize(ancestor).map_err(|error| {
-        root_state_error(
-            CoreErrorKind::Io,
-            format!(
-                "canonicalize {label} ancestor {}: {error}",
-                ancestor.display()
-            ),
-        )
-    })?;
-    for component in missing.into_iter().rev() {
-        if component == std::ffi::OsStr::new(".") || component == std::ffi::OsStr::new("..") {
-            return Err(root_state_error(
-                CoreErrorKind::Invalid,
-                format!("{label} path must not contain unresolved . or .. components"),
-            ));
-        }
-        canonical.push(component);
-    }
-    Ok(canonical)
-}
-
-#[cfg(unix)]
-fn device_of(path: &Path, label: &'static str) -> std::result::Result<u64, yinyang_core::Error> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut candidate = path;
-    loop {
-        match std::fs::metadata(candidate) {
-            Ok(metadata) => return Ok(metadata.dev()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                candidate = candidate.parent().ok_or_else(|| {
-                    root_state_error(
-                        CoreErrorKind::Invalid,
-                        format!("{label} path has no existing ancestor"),
-                    )
-                })?;
-            }
-            Err(error) => {
-                return Err(root_state_error(
-                    CoreErrorKind::Io,
-                    format!("inspect {label} {}: {error}", candidate.display()),
-                ));
-            }
-        }
-    }
-}
-
-fn root_state_error(kind: CoreErrorKind, message: impl Into<String>) -> yinyang_core::Error {
-    yinyang_core::Error::new(kind, "root/state layout", message)
-}
 pub struct Volume {
     pub config: VolumeConfig,
     pub capabilities: Capabilities,

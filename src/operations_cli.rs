@@ -244,10 +244,10 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
         "admission",
         Health::Pass,
         format!(
-            "effective capabilities: {}",
+            "admitted capabilities: {}",
             context
                 .capabilities
-                .effective
+                .admitted
                 .iter()
                 .map(|capability| format!("{capability:?}").to_ascii_lowercase())
                 .collect::<Vec<_>>()

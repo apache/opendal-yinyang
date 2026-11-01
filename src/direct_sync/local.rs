@@ -58,22 +58,13 @@ struct ExistingPaths {
     state_identity: Identity,
 }
 
-fn root_state_error(error: yinyang_core::Error) -> Error {
-    let kind = match error.kind() {
-        yinyang_core::ErrorKind::Unsupported => ErrorKind::Unsupported,
-        yinyang_core::ErrorKind::Io => ErrorKind::Io,
-        _ => ErrorKind::Invalid,
-    };
-    Error::new(kind, error.to_string())
-}
-
 fn open_existing_paths(root: &Path, state: &Path) -> Result<ExistingPaths> {
     let root = std::fs::canonicalize(root)
         .map_err(|error| Error::io("canonicalize Direct Sync root", root, error))?;
     let state = std::fs::canonicalize(state)
         .map_err(|error| Error::io("canonicalize Direct Sync state", state, error))?;
     validate_private_state(&state)?;
-    crate::volume::check_root_state(&root, &state).map_err(root_state_error)?;
+    crate::replica::check_root_state(&root, &state)?;
     let root_fd = open(
         &root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,

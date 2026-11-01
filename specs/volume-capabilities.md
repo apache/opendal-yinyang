@@ -132,10 +132,9 @@ and conditional ETag reads. Writable Direct adds write, whole-file multi-write,
 empty writes, conditional create and conditional ETag replace. Direct Sync also
 requires conditional ETag delete.
 
-`yy capabilities` reports `admitted`, the raw storage capability flags, and
-`effective`. For an admitted combination `effective` equals `admitted`; the raw
-storage object remains useful for qualification and diagnosis. Missing storage
-primitives or unimplemented combinations fail before the authority is
+`yy capabilities` reports `admitted` and the raw storage capability flags. The
+raw storage object remains useful for qualification and diagnosis. Missing
+storage primitives or unimplemented combinations fail before the authority is
 connected or staging state is created.
 
 The mount entry point requires `frontend=fuse` before starting the kernel

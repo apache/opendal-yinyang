@@ -183,7 +183,7 @@ pub(crate) fn runtime_kind_from_direct(kind: yinyang::direct::ErrorKind) -> Runt
         Kind::NotFound => RuntimeErrorKind::NotFound,
         Kind::NotDirectory => RuntimeErrorKind::NotDirectory,
         Kind::IsDirectory => RuntimeErrorKind::IsDirectory,
-        Kind::Stale => RuntimeErrorKind::Corrupt,
+        Kind::Stale => RuntimeErrorKind::Conflict,
         Kind::Unsupported => RuntimeErrorKind::Unsupported,
         Kind::Storage => RuntimeErrorKind::Storage,
     }
@@ -662,7 +662,8 @@ fn hex_nibble(value: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_revision;
+    use super::{parse_revision, runtime_kind_from_direct};
+    use yinyang::runtime::ErrorKind;
 
     #[test]
     fn revision_requires_exactly_24_hex_bytes() {
@@ -675,6 +676,14 @@ mod tests {
                 .to_bytes()
                 .as_slice(),
             &[1; 24]
+        );
+    }
+
+    #[test]
+    fn stale_direct_pin_is_a_conflict() {
+        assert_eq!(
+            runtime_kind_from_direct(yinyang::direct::ErrorKind::Stale),
+            ErrorKind::Conflict
         );
     }
 }

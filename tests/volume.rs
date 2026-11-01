@@ -79,9 +79,8 @@ async fn admission_precedes_side_effects_and_rejects_unknown_fields() {
     let backend = TestBackend::default();
     let cfg = config(temp.path().join("state"));
     let caps = cfg.validate(&backend.operator()).unwrap();
-    assert_eq!(caps.admitted, caps.effective);
-    assert!(caps.effective.contains(&Capability::Append));
-    assert!(caps.effective.contains(&Capability::RemoteFsync));
+    assert!(caps.admitted.contains(&Capability::Append));
+    assert!(caps.admitted.contains(&Capability::RemoteFsync));
     for invalid in [
         VolumeConfig {
             model: Model::Direct,
@@ -136,7 +135,7 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
         read_only: true,
         ..config(temp.path().join("state"))
     };
-    let caps = ro.capabilities(&backend.operator()).unwrap();
+    let caps = ro.validate(&backend.operator()).unwrap();
     let expected: CapabilitySet = [
         Capability::Read,
         Capability::List,
@@ -146,18 +145,18 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(caps.effective, expected);
-    assert!(!caps.effective.contains(&Capability::RecoverableStaging));
+    assert_eq!(caps.admitted, expected);
+    assert!(!caps.admitted.contains(&Capability::RecoverableStaging));
     if cfg!(target_os = "linux") {
         assert!(ro.validate(&backend.operator()).is_ok());
         let rw = VolumeConfig {
             read_only: false,
             ..ro.clone()
         };
-        let caps = rw.capabilities(&backend.operator()).unwrap();
-        assert!(caps.effective.contains(&Capability::Write));
-        assert!(caps.effective.contains(&Capability::RemoteFsync));
-        assert!(caps.effective.contains(&Capability::RecoverableStaging));
+        let caps = rw.validate(&backend.operator()).unwrap();
+        assert!(caps.admitted.contains(&Capability::Write));
+        assert!(caps.admitted.contains(&Capability::RemoteFsync));
+        assert!(caps.admitted.contains(&Capability::RecoverableStaging));
         assert!(rw.validate(&backend.operator()).is_ok());
     } else {
         assert!(ro.validate(&backend.operator()).is_err());
@@ -259,13 +258,13 @@ fn direct_writable_admission_requires_staging_and_conditional_primitives() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(caps.effective, expected);
+    assert_eq!(caps.admitted, expected);
     for unsupported in [
         Capability::StableIdentity,
         Capability::AtomicRename,
         Capability::RetainedUnlinkRead,
     ] {
-        assert!(!caps.effective.contains(&unsupported));
+        assert!(!caps.admitted.contains(&unsupported));
     }
 }
 
@@ -281,9 +280,9 @@ fn direct_sync_requires_conditional_delete_and_library_admission() {
     };
 
     let caps = sync.validate(&direct_operator(&backend, true)).unwrap();
-    assert!(caps.effective.contains(&Capability::Write));
-    assert!(!caps.effective.contains(&Capability::AtomicRename));
-    assert!(!caps.effective.contains(&Capability::StableIdentity));
+    assert!(caps.admitted.contains(&Capability::Write));
+    assert!(!caps.admitted.contains(&Capability::AtomicRename));
+    assert!(!caps.admitted.contains(&Capability::StableIdentity));
 
     assert!(
         sync.validate(&direct_operator(&backend, false)).is_err(),
@@ -334,7 +333,7 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
         ..cfg.clone()
     };
     let volume = Volume::open(ro, backend.operator(), None).await.unwrap();
-    assert!(!volume.capabilities.effective.contains(&Capability::Write));
+    assert!(!volume.capabilities.admitted.contains(&Capability::Write));
     assert!(volume.runtime().open_file("file", true).await.is_err());
     assert!(
         volume
@@ -355,8 +354,11 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     handle.close().await.unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn root_state_containment_rejects_both_directions() {
+    use yinyang::replica::{ErrorKind, check_root_state};
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let state = temp.path().join("state");
@@ -366,11 +368,11 @@ fn root_state_containment_rejects_both_directions() {
 
     let state_inside_root = root.join("state");
     let error = check_root_state(&root, &state_inside_root).unwrap_err();
-    assert_eq!(error.kind(), yinyang::core::ErrorKind::Invalid);
+    assert_eq!(error.kind(), ErrorKind::Invalid);
 
     let root_inside_state = state.join("root");
     let error = check_root_state(&root_inside_state, &state).unwrap_err();
-    assert_eq!(error.kind(), yinyang::core::ErrorKind::Invalid);
+    assert_eq!(error.kind(), ErrorKind::Invalid);
 }
 
 #[cfg(target_os = "linux")]

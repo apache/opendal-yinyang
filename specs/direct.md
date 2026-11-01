@@ -197,8 +197,8 @@ startup if the namespace is still invalid.
 
 ## CLI and doctor
 
-`yy --volume CONFIG capabilities` reports the admitted capability set, raw
-storage primitives, and effective set without reading the namespace.
+`yy --volume CONFIG capabilities` reports the admitted capability set and raw
+storage primitives without reading the namespace.
 `yy --volume CONFIG mount MOUNTPOINT` performs admission before observing
 storage. `yy --volume CONFIG status` reports a Direct observation summary
 without creating staging state.
