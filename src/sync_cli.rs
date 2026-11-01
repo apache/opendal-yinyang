@@ -401,6 +401,7 @@ pub async fn run(context: VolumeContext, command: SyncCommand) -> CliResult<Exit
 
 /// Connects the configured publication authority, if it is reachable.
 async fn connect(context: &VolumeContext) -> CliResult<std::sync::Arc<dyn Authority>> {
+    context.storage_capabilities()?;
     context
         .connect_authority()
         .await

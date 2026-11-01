@@ -222,44 +222,73 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
         None::<String>,
     );
 
-    let environment = storage_environment(&context.config).and_then(|detail| {
-        validate_service_token(&context.config, context.service_token()).map(|_| detail)
-    });
-    let (environment_status, environment_detail, environment_remediation) = match environment {
-        Ok(detail) => (Health::Pass, detail, None),
-        Err(error) => (
-            Health::ActionRequired,
-            error.message().to_owned(),
-            Some(environment_remediation(&context.config)),
-        ),
-    };
-    let environment_ready = environment_status == Health::Pass;
+    let mut storage_ready = false;
+    let (environment_status, environment_detail, environment_remediation) =
+        match storage_environment(&context.config) {
+            Err(error) => (
+                Health::ActionRequired,
+                error.message().to_owned(),
+                Some(environment_remediation(&context.config)),
+            ),
+            Ok(detail) => match context.storage_capabilities() {
+                Ok(capabilities) => {
+                    report.push(
+                        "admission",
+                        Health::Pass,
+                        format!(
+                            "admitted capabilities: {}",
+                            capabilities
+                                .admitted
+                                .iter()
+                                .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        None::<String>,
+                    );
+                    match context
+                        .service_token()
+                        .map_err(CliError::from)
+                        .and_then(|token| validate_service_token(&context.config, token))
+                    {
+                        Ok(()) => {
+                            storage_ready = true;
+                            (Health::Pass, detail, None)
+                        }
+                        Err(error) => (
+                            Health::ActionRequired,
+                            error.message().to_owned(),
+                            Some(environment_remediation(&context.config)),
+                        ),
+                    }
+                }
+                Err(error) if error.stage() == VolumeLoadStage::Operator => (
+                    Health::ActionRequired,
+                    error.message().to_owned(),
+                    Some(load_error_remediation(&error)),
+                ),
+                Err(error) => {
+                    report.push(
+                        "admission",
+                        Health::ActionRequired,
+                        error.message(),
+                        Some(load_error_remediation(&error)),
+                    );
+                    (Health::Pass, detail, None)
+                }
+            },
+        };
     report.push(
         "environment",
         environment_status,
         environment_detail,
         environment_remediation,
     );
-    report.push(
-        "admission",
-        Health::Pass,
-        format!(
-            "admitted capabilities: {}",
-            context
-                .capabilities
-                .admitted
-                .iter()
-                .map(|capability| format!("{capability:?}").to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        None::<String>,
-    );
 
     check_fuse(&context.config, &mut report);
     check_local_state(&context.config, &mut report).await;
 
-    if environment_ready {
+    if storage_ready {
         if context.config.model == Model::Direct && context.config.access == Access::Sync {
             check_direct_sync_state(Some(&context), &context.config, None, &mut report).await;
         } else if context.config.model == Model::Direct && !context.config.read_only {

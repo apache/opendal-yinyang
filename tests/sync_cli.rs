@@ -26,9 +26,22 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+fn yy_command(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
+    command.args(args);
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("YINYANG_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 fn yy(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_yy"))
-        .args(args)
+    yy_command(args)
         // Dummy S3 settings are enough for admission: capability negotiation
         // reads declared operator capabilities and never contacts storage.
         .env("YINYANG_S3_BUCKET", "cli-admission")
@@ -37,6 +50,10 @@ fn yy(args: &[&str]) -> Output {
         .env("YINYANG_STORAGE_PROFILE", "minio")
         .output()
         .expect("run yy")
+}
+
+fn yy_without_storage(args: &[&str]) -> Output {
+    yy_command(args).output().expect("run yy without storage")
 }
 
 fn write_config(dir: &Path, name: &str, model: &str, access: &str) -> PathBuf {
@@ -84,7 +101,7 @@ fn sync_rejects_a_mount_volume() {
 fn sync_status_dispatches_a_direct_sync_volume() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path(), "direct", "direct", "sync");
-    let output = yy(&[
+    let output = yy_without_storage(&[
         "--volume",
         config.to_str().unwrap(),
         "sync",
@@ -121,7 +138,7 @@ fn sync_rejects_a_read_only_volume() {
 fn unbound_status_is_schema_valid_and_exits_three() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path(), "unbound", "managed", "sync");
-    let output = yy(&[
+    let output = yy_without_storage(&[
         "--volume",
         config.to_str().unwrap(),
         "sync",

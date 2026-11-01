@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use yinyang_core::service::ServiceClient;
 use yinyang_core::{Authority, BackendProfile, ErrorKind as CoreErrorKind, Fs};
 
@@ -535,7 +535,7 @@ pub enum VolumeLoadStage {
     Admission,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VolumeLoadError {
     stage: VolumeLoadStage,
     kind: ErrorKind,
@@ -577,6 +577,29 @@ impl VolumeLoadError {
     pub fn config(&self) -> Option<&VolumeConfig> {
         self.config.as_ref()
     }
+
+    fn into_runtime(self) -> Error {
+        let kind = match self.kind {
+            ErrorKind::Invalid => CoreErrorKind::Invalid,
+            ErrorKind::InvalidName => CoreErrorKind::InvalidName,
+            ErrorKind::NotFound => CoreErrorKind::NotFound,
+            ErrorKind::AlreadyExists => CoreErrorKind::AlreadyExists,
+            ErrorKind::NotDirectory => CoreErrorKind::NotDirectory,
+            ErrorKind::IsDirectory => CoreErrorKind::IsDirectory,
+            ErrorKind::NotEmpty => CoreErrorKind::NotEmpty,
+            ErrorKind::PermissionDenied => CoreErrorKind::PermissionDenied,
+            ErrorKind::Corrupt => CoreErrorKind::Corrupt,
+            ErrorKind::Unsupported => CoreErrorKind::Unsupported,
+            ErrorKind::Storage => CoreErrorKind::Storage,
+            ErrorKind::Io => CoreErrorKind::Io,
+            _ => CoreErrorKind::Storage,
+        };
+        Error::Core(yinyang_core::Error::new(
+            kind,
+            "volume storage",
+            self.message,
+        ))
+    }
 }
 
 impl std::fmt::Display for VolumeLoadError {
@@ -587,36 +610,30 @@ impl std::fmt::Display for VolumeLoadError {
 
 impl std::error::Error for VolumeLoadError {}
 
+struct StorageState {
+    connection: StorageConnection,
+    capabilities: Capabilities,
+}
+
 pub struct VolumeContext {
     pub path: PathBuf,
     pub config: VolumeConfig,
-    pub capabilities: Capabilities,
-    operator: Operator,
-    service_token: Option<String>,
+    admission: Admission,
+    storage: OnceLock<std::result::Result<StorageState, VolumeLoadError>>,
 }
 
 impl VolumeContext {
-    /// Load, resolve, admit, and build the storage connection before any
-    /// command-specific side effect.
+    /// Read, resolve, and validate configuration without contacting storage.
     pub async fn load(path: &Path) -> std::result::Result<Self, VolumeLoadError> {
         let config = Self::load_config(path).await?;
         let admission = admit(&config).map_err(|error| {
             VolumeLoadError::from_runtime(VolumeLoadStage::Admission, error, Some(&config))
         })?;
-        let connection = storage_connection().map_err(|error| {
-            VolumeLoadError::from_runtime(VolumeLoadStage::Operator, error, Some(&config))
-        })?;
-        let capabilities = admission
-            .capabilities(&connection.operator)
-            .map_err(|error| {
-                VolumeLoadError::from_runtime(VolumeLoadStage::Admission, error, Some(&config))
-            })?;
         Ok(Self {
             path: path.to_owned(),
             config,
-            capabilities,
-            operator: connection.operator,
-            service_token: connection.service_token,
+            admission,
+            storage: OnceLock::new(),
         })
     }
 
@@ -641,36 +658,69 @@ impl VolumeContext {
         Ok(config)
     }
 
-    pub fn operator(&self) -> &Operator {
-        &self.operator
+    fn storage(&self) -> std::result::Result<&StorageState, VolumeLoadError> {
+        match self.storage.get_or_init(|| {
+            let connection = storage_connection().map_err(|error| {
+                VolumeLoadError::from_runtime(VolumeLoadStage::Operator, error, Some(&self.config))
+            })?;
+            let capabilities =
+                self.admission
+                    .capabilities(&connection.operator)
+                    .map_err(|error| {
+                        VolumeLoadError::from_runtime(
+                            VolumeLoadStage::Admission,
+                            error,
+                            Some(&self.config),
+                        )
+                    })?;
+            Ok(StorageState {
+                connection,
+                capabilities,
+            })
+        }) {
+            Ok(storage) => Ok(storage),
+            Err(error) => Err(error.clone()),
+        }
     }
 
-    pub fn service_token(&self) -> Option<String> {
-        self.service_token.clone()
+    pub fn operator(&self) -> std::result::Result<Operator, VolumeLoadError> {
+        Ok(self.storage()?.connection.operator.clone())
+    }
+
+    pub fn storage_capabilities(&self) -> std::result::Result<Capabilities, VolumeLoadError> {
+        Ok(self.storage()?.capabilities.clone())
+    }
+
+    pub fn service_token(&self) -> std::result::Result<Option<String>, VolumeLoadError> {
+        Ok(self.storage()?.connection.service_token.clone())
     }
 
     pub async fn connect_authority(&self) -> Result<Arc<dyn Authority>> {
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
         Volume::connect(
             &self.config,
-            self.operator.clone(),
-            self.service_token.clone(),
+            storage.connection.operator.clone(),
+            storage.connection.service_token.clone(),
         )
         .await
     }
 
     pub fn direct_namespace(&self) -> Result<DirectNamespace> {
-        direct_namespace(&self.config, self.operator.clone())
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
+        direct_namespace(&self.config, storage.connection.operator.clone())
     }
 
     pub fn direct_storage_binding(&self) -> Result<DirectStorageBinding> {
-        direct_storage_binding(&self.config, &self.operator)
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
+        direct_storage_binding(&self.config, &storage.connection.operator)
     }
 
     pub async fn open_file_volume(&self) -> Result<Volume> {
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
         Volume::open(
             self.config.clone(),
-            self.operator.clone(),
-            self.service_token.clone(),
+            storage.connection.operator.clone(),
+            storage.connection.service_token.clone(),
         )
         .await
     }

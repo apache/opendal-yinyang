@@ -108,8 +108,8 @@ Checks are ordered from local policy to remote observation:
   health converges only after unresolved handles are resolved and reviewed
   ledger errors are acknowledged.
 - `admission`: report the single admission-table result and the storage
-  prerequisites checked by the same loader used by every other `--volume`
-  command. There is no second capability negotiation path.
+  prerequisites checked lazily by the same volume context used by every other
+  `--volume` command. There is no second capability negotiation path.
 - `authority`: Managed connects and observes the latest revision. Object mode checks the
   storage authority. Service mode uses the configured loopback address and
   separately supplied token; the check fails if either authentication or

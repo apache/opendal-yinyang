@@ -83,6 +83,7 @@ pub(crate) fn remote_adapter(context: &VolumeContext) -> CliResult<DirectRemoteA
             "Direct Sync requires a non-empty staging path",
         ));
     }
+    context.storage_capabilities()?;
     let binding = storage_binding(context)?;
     let namespace = context
         .direct_namespace()

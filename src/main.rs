@@ -42,7 +42,9 @@ pub(crate) enum CliStage {
     Admission,
     Connect,
     Observe,
+    #[cfg(target_os = "linux")]
     LocalState,
+    #[cfg(target_os = "linux")]
     SyncState,
     Publication,
     Output,
@@ -445,7 +447,10 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
         let context = VolumeContext::load(path).await?;
         return match cli.command {
             Command::Capabilities => {
-                println!("{}", serde_json::to_string_pretty(&context.capabilities)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&context.storage_capabilities()?)?
+                );
                 Ok(ExitCode::SUCCESS)
             }
             #[cfg(target_os = "linux")]

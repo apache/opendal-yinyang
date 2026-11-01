@@ -237,10 +237,12 @@ pub async fn run(context: VolumeContext, command: Command) -> CliResult<ExitCode
     if let Command::Mount { mountpoint } = command {
         #[cfg(target_os = "linux")]
         {
+            let operator = context.operator()?;
+            let service_token = context.service_token()?;
             return match yinyang::fuse::run(
                 context.config.clone(),
-                context.operator().clone(),
-                context.service_token(),
+                operator,
+                service_token,
                 mountpoint,
             )
             .await?
@@ -273,6 +275,7 @@ pub async fn run(context: VolumeContext, command: Command) -> CliResult<ExitCode
             "with --volume use mount, file, sync, space, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve",
         ));
     };
+    context.storage_capabilities()?;
     let volume = context.open_file_volume().await?;
     let runtime = volume.runtime();
     match command {

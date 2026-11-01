@@ -83,11 +83,13 @@ installs recoverable handles instead of reconciling a directory.
 
 `VolumeContext::load` is the only volume loader used by `yy --volume`. It reads
 the strict JSON document, resolves a non-empty relative `staging` against the
-configuration file's directory, applies `read_only` defaults, runs admission,
-builds the S3 operator once, and reads `YINYANG_SERVICE_TOKEN` once. Building
-the operator does not contact storage. Command-specific authority connection
-remains on demand, so local status and export paths can report unavailable
-remote state without blocking on it.
+configuration file's directory, applies `read_only` defaults, and runs the pure
+admission table. It does not require storage environment variables. The S3
+operator and `YINYANG_SERVICE_TOKEN` are built and read once, lazily, by the
+first storage-dependent operation. Building the operator does not contact
+storage. Authority connection remains on demand, so argument validation, local
+status and local export paths continue without storage configuration or
+connectivity.
 
 Admission is one table over `model`, `access`, `frontend`, `publication`,
 `read_only`, staging presence and `service_address`. It returns the admitted

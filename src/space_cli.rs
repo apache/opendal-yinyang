@@ -70,6 +70,7 @@ pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<Exi
             "space inspection supports Managed volumes only; Direct namespace objects are excluded",
         ));
     }
+    let operator = context.operator()?;
     let authority = context
         .connect_authority()
         .await
@@ -78,7 +79,7 @@ pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<Exi
         SpaceCommand::Report { json } => {
             let report = yinyang::space::inspect_managed_space(
                 authority.as_ref(),
-                context.operator(),
+                &operator,
                 &config.staging,
             )
             .await?;
