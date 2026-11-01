@@ -60,6 +60,8 @@ tar -xf ARCHIVE -C DESTINATION \
 The flags avoid ownership and timestamp restoration. Archive entries must use
 the mount's representable file types and modes. The workflow restores files and
 directories into a writable mount and checks payload bytes and executable mode.
+`--no-overwrite-dir` preserves the pre-created `0755` extraction root; the
+acceptance asserts that root separately from payload and child modes.
 It then stops writing, unmounts cleanly and remounts the same staging directory
 read-only before creating the backup archive with:
 

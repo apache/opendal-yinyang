@@ -5,41 +5,31 @@ Managed `fuse.yinyang` mounts and a quiesced read-only backup view. These are
 narrow command shapes, not a general POSIX filesystem support claim.
 
 Use the directly downloadable `yy` from the
-[trial distribution guide](linux-trial-distribution.md). The application
-workflow adds no installer, downloader, activation framework or consumer
-toolchain requirement.
+[trial distribution guide](linux-trial-distribution.md) with an existing
+configured Managed volume. The consumer workflow does not require Rust, Cargo,
+mise, Git, a local storage fixture or a separate installer.
 
-## Tested matrix
+## Tested workflows
 
-The fresh-main probe and continuous acceptance use the Ubuntu 24.04 packages
-listed here. Another version or build is not covered until it runs through the
-same acceptance entry point.
+The tested Ubuntu 24.04 application packages are GNU tar 1.35 and rsync 3.2.7.
+Another version or build is not covered until it runs through the command shape
+below.
 
-| Application | Tested workflow | Result | Recommendation |
-| --- | --- | --- | --- |
-| GNU tar 1.35 | `--no-same-owner --touch --no-overwrite-dir` extraction of representable files; archive creation; symlink rejection | Pass | Use the explicit flags below and validate the extracted payload |
-| rsync 3.2.7 | `--inplace` update of an existing representable destination tree, including `--delete` | Pass | Use for in-place updates only; do not assume default safe-save or new-file creation |
-| Git 2.43.0 | `git init --template=`; `hash-object -w` against a representable bare skeleton | Fail with `EOPNOTSUPP` on private temporary/loose-object modes | Not supported under the current mode contract |
+| Application | Tested workflow | Recommendation |
+| --- | --- | --- |
+| GNU tar 1.35 | Explicit extraction, a quiesced read-only backup archive, and symlink rejection | Use the flags below and validate the extracted payload |
+| rsync 3.2.7 | `--inplace` update of an existing representable destination tree, including `--delete` | Use for in-place updates only |
 
-Both passing workflows ran against object and authenticated loopback service
-publication. The test checked bytes, executable mode, namespace, independent
-authority visibility and a clean unmount/remount.
-
-## Prerequisites
-
-The native acceptance requires Linux, `/dev/fuse`, `fusermount3`, GNU tar,
-rsync and git:
+Start a foreground mount with the configured volume:
 
 ```shell
-sudo apt-get update
-sudo apt-get install --yes fuse3 git rsync tar
+yy --volume /absolute/path/to/volume.json mount /path/to/mountpoint
 ```
 
-Set the same isolated `YINYANG_S3_*` and `YINYANG_STORAGE_PROFILE=minio`
-environment used by the FUSE acceptance. Missing configuration, mount support
-or application binaries are hard failures.
+Keep `yy` running while the application operates on the mountpoint. See
+[Linux operations](linux-operations.md) for volume setup and service choices.
 
-## rsync
+## rsync update
 
 The tested update command is:
 
@@ -50,17 +40,16 @@ rsync -r --checksum --no-times --no-owner --no-group --omit-dir-times \
 
 The destination directories and files must already exist with representable
 modes before the first update, including an empty placeholder for each newly
-added source file. The acceptance verifies replacement bytes, an executable
-file, an updated new source entry, removal of a source-deleted file and the
-same tree after remount.
+added source file. The acceptance verifies replacement bytes, a new source
+entry, removal of a source-deleted entry, executable mode and the same tree
+after remount.
 
 Default rsync safe-save and new-file creation use mode `0600`, which the mount
-rejects with `EOPNOTSUPP`; the acceptance asserts that failure and that no
-destination entry is left behind. `--inplace` does not make new-file creation
-succeed. This guide does not claim general rsync mirroring, metadata
-preservation, hard links, symlinks, ACLs or xattrs.
+rejects with `EOPNOTSUPP`; no destination entry is left behind. `--inplace`
+does not make new-file creation succeed. This guide does not claim general
+rsync mirroring, metadata preservation, hard links, symlinks, ACLs or xattrs.
 
-## GNU tar
+## GNU tar restore and backup
 
 Extract into an existing mounted directory:
 
@@ -82,34 +71,32 @@ so the archive preserves payload bytes and the executable distinction but not
 the earlier writable bits. Extract the complete archive locally and compare
 every expected payload and executable bit.
 
+`--no-overwrite-dir` intentionally keeps the pre-existing extraction root at
+its current mode. The acceptance treats that root as setup state and separately
+checks every payload, child directory and executable mode.
+
 An archive containing a symlink must fail extraction with a symlink diagnostic
 and must not substitute another file type. The mount still does not support
 links.
 
-## Git boundary
+## Maintainer verification
 
-The Git probe ran:
-
-```shell
-git init --template= repository
-git --git-dir /path/to/mount/repository.git hash-object -w source-file
-```
-
-The first command needs a private `.git` temporary file and fails with
-`EOPNOTSUPP`; the second uses a representable bare-repository skeleton and
-fails at the loose-object temporary file before an object exists. Both report
-`Unable to create temporary file ... Operation not supported`. Git's private
-temporary and loose-object modes are not representable by the current
-`0644`/`0755` file contract. Git workflows are excluded rather than silently
-using a different mode model.
-
-## Run
+This section does not describe a consumer requirement. It covers the repository
+acceptance that produced the results above.
 
 ```shell
 cargo x test-linux-applications
 ```
 
-The entry point runs `tests/linux_applications.rs`, requires real
-`fuse.yinyang`, and uses `YY_UPGRADE_BIN` when set. The trial-distribution
-workflow sets that selector to the packaged archive's `bin/yy`, so application
-acceptance can be tied to the same binary offered to consumers.
+The entry point requires Linux, `/dev/fuse`, `fusermount3`, Git, rsync, GNU tar
+and the isolated `YINYANG_S3_*`/`YINYANG_STORAGE_PROFILE=minio` fixture. Missing
+tools or configuration are hard failures. The test runs both object and
+authenticated loopback service publication and uses `YY_UPGRADE_BIN` when set.
+The trial-distribution workflow sets that selector to the packaged archive's
+`bin/yy`.
+
+The maintainer suite also records the Git negative boundary.
+`git init --template=` and `git hash-object -w` against a representable
+bare-repository skeleton both fail with `EOPNOTSUPP` while creating private
+temporary or loose-object files. Git workflows are excluded rather than
+silently using a different mode model.
