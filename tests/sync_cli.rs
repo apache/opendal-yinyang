@@ -188,7 +188,7 @@ fn missing_managed_staging_is_rejected_before_every_command_side_effect() {
     let root_text = root.to_str().unwrap();
     let commands = [
         vec!["capabilities"],
-        vec!["file", "status"],
+        vec!["status"],
         vec!["sync", "status"],
         vec!["sync", "init", "--directory", root_text],
         vec!["sync", "run"],

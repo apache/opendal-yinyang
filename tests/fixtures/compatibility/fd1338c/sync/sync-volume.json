@@ -6,6 +6,5 @@
   "publication": "object",
   "storage_profile": "minio",
   "read_only": false,
-  "require": [],
   "staging": "tests/fixtures/compatibility/fd1338c/sync/state"
 }

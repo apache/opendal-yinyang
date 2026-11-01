@@ -22,7 +22,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Managed Sync acceptance](managed-sync-acceptance.md) | Real-process Linux acceptance for ordinary-directory reconciliation, conflicts, artifacts, and recovery. |
 | [Native bridge](native-bridge.md) | In-process ownership and private adapter request semantics. |
 | [Experimental macOS frontends](macos-frontends.md) | Isolated FSKit and File Provider prototypes; not ordinary CLI admission. |
-| [Volume capabilities](volume-capabilities.md) | Configuration, four-layer admission, Managed write policy, and CLI status. |
+| [Volume capabilities](volume-capabilities.md) | Configuration loading, single-table admission, Managed write policy, and CLI status. |
 | [Linux FUSE frontend](linux-fuse.md) | Experimental writable and read-only Managed mount with native kernel acceptance. |
 | [Transactional filesystem](transactional-filesystem.md) | Shared target contract. Object-storage and metadata-service bindings implemented experimentally. |
 

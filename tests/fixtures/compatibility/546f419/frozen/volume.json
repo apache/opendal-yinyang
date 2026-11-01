@@ -5,7 +5,6 @@
   "name": "stage3-frozen",
   "publication": "object",
   "read_only": false,
-  "require": [],
   "staging": "staging",
   "storage_profile": "minio"
 }

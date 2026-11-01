@@ -896,7 +896,6 @@ fn volume_status_rejects_historical_revision_selection() {
             "storage_profile": "minio",
             "staging": temp.path().join("state"),
             "read_only": false,
-            "require": [],
         }))
         .unwrap(),
     )

@@ -395,6 +395,53 @@ fn managed_replica_init_rejects_both_containment_directions() {
     assert!(!state.join("replica.db").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_restore_rejects_both_containment_directions_before_creation() {
+    use std::sync::Arc;
+    use yinyang::replica::{DirectorySync, ErrorKind};
+
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let authority: Arc<dyn yinyang::core::Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let source_root = temp.path().join("source-root");
+    let source_state = temp.path().join("source-state");
+    std::fs::create_dir(&source_root).unwrap();
+    let sync = DirectorySync::init(authority.clone(), &source_state, &source_root)
+        .await
+        .unwrap();
+    let backup = temp.path().join("backup");
+    sync.backup(&backup).await.unwrap();
+    drop(sync);
+
+    for root_inside_state in [false, true] {
+        let state = temp.path().join(if root_inside_state {
+            "restore-state-a"
+        } else {
+            "restore-root-b"
+        });
+        let root = if root_inside_state {
+            state.join("root")
+        } else {
+            state.join("state")
+        };
+        let error = DirectorySync::restore(authority.clone(), &backup, &state, &root)
+            .await
+            .err()
+            .expect("containment must reject restore");
+        let error = error
+            .downcast_ref::<yinyang::replica::Error>()
+            .expect("restore preserves the replica error kind");
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert!(!state.exists());
+        assert!(!root.exists());
+    }
+}
+
 struct Daemon(std::process::Child);
 impl Drop for Daemon {
     fn drop(&mut self) {

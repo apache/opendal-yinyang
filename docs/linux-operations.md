@@ -263,7 +263,6 @@ cat > "$HOME/.config/yinyang/volumes/object.json" <<EOF
   "storage_profile": "amazon-s3",
   "staging": "$HOME/.local/state/yinyang/object",
   "read_only": false,
-  "require": [],
   "service_address": null
 }
 EOF
@@ -285,7 +284,6 @@ cat > "$HOME/.config/yinyang/volumes/sync.json" <<EOF
   "storage_profile": "amazon-s3",
   "staging": "$HOME/.local/state/yinyang/sync",
   "read_only": false,
-  "require": [],
   "service_address": null
 }
 EOF
@@ -351,7 +349,6 @@ cat > "$HOME/.config/yinyang/volumes/service.json" <<EOF
   "storage_profile": "amazon-s3",
   "staging": "$HOME/.local/state/yinyang/service",
   "read_only": false,
-  "require": [],
   "service_address": "127.0.0.1:7447"
 }
 EOF
@@ -366,7 +363,6 @@ cat > "$HOME/.config/yinyang/volumes/service-sync.json" <<EOF
   "storage_profile": "amazon-s3",
   "staging": "$HOME/.local/state/yinyang/service-sync",
   "read_only": false,
-  "require": [],
   "service_address": "127.0.0.1:7447"
 }
 EOF

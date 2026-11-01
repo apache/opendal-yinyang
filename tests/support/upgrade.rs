@@ -429,7 +429,6 @@ pub fn write_config(
         "storage_profile": "minio",
         "staging": staging,
         "read_only": false,
-        "require": [],
     });
     if let Some(service) = service {
         document["service_address"] = Value::String(service.to_owned());

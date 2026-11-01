@@ -316,7 +316,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Inspect each capability layer and its effective intersection.
+    /// Inspect the admitted and storage-reported volume capabilities.
     Capabilities,
     /// Diagnose platform, configuration, storage, service and local-state readiness.
     Doctor {

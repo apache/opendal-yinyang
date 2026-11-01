@@ -1174,4 +1174,38 @@ mod tests {
             "endpoint https://<redacted>@example.com/path failed"
         );
     }
+
+    #[test]
+    fn remediation_uses_error_kind_and_stage() {
+        let service = VolumeConfig::from_json(
+            br#"{
+                "name": "service",
+                "model": "managed",
+                "access": "mount",
+                "frontend": "library",
+                "publication": "service",
+                "service_address": "127.0.0.1:7447",
+                "storage_profile": "minio",
+                "staging": "state",
+                "read_only": false
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            authority_remediation(&service, CliStage::Connect, ErrorKind::PermissionDenied)
+                .contains("YINYANG_SERVICE_TOKEN")
+        );
+        assert!(
+            authority_remediation(&service, CliStage::Connect, ErrorKind::Storage)
+                .contains("start the metadata service")
+        );
+        assert!(
+            direct_remediation(CliStage::Observe, ErrorKind::PermissionDenied)
+                .contains("principal")
+        );
+        assert!(
+            direct_remediation(CliStage::Connect, ErrorKind::Storage)
+                .contains("YINYANG_S3_ENDPOINT")
+        );
+    }
 }
