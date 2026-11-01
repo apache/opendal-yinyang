@@ -1665,6 +1665,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn remove_work(&mut self, id: &[u8; 32]) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM work WHERE id=?1", params![id.as_slice()])
+            .map_err(|e| Error::corrupt(format!("remove work association: {e}")))?;
+        Ok(())
+    }
+
     /// Persist the original commit identity of an edit before a replay can
     /// clear it from the staging handle.
     pub fn set_work_commit_id(&mut self, id: &[u8; 32], commit_id: [u8; 16]) -> Result<()> {

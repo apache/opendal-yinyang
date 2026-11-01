@@ -17,7 +17,7 @@
 
 //! Durable conditional uploads for OS-managed or ordinary local replicas.
 use crate::local::store;
-use crate::runtime::{Error, ErrorKind, HandleStatus, Result, Runtime};
+use crate::runtime::{Error, ErrorKind, Failure, HandleStatus, Result, Runtime};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeSet;
 use std::path::Path;
