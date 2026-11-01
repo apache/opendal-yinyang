@@ -21,9 +21,8 @@ use crate::compatibility::{
 };
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::expiry::{
-    ExpiryConflictKind, ExpiryMarker, ExpiryOutcome, ExpiryReceipt, ExpiryRefusal, ExpiryRequest,
-    HistoryEntry, HistoryPage, RevisionState, operation_key, parse_operation_key,
-    parse_revision_key, revision_key,
+    ExpiryConflictKind, ExpiryMarker, ExpiryOutcome, ExpiryRefusal, ExpiryRequest, HistoryEntry,
+    HistoryPage, RevisionState, operation_key, revision_key,
 };
 use crate::index::{Index, IndexCache};
 use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
@@ -115,7 +114,13 @@ impl ObjectState {
                 *self.filesystem.as_bytes(),
                 *self.root.as_bytes(),
                 self.revision.wire(),
-                roots[..5].try_into().expect("five base roots"),
+                [
+                    roots[0].clone(),
+                    roots[1].clone(),
+                    roots[2].clone(),
+                    roots[3].clone(),
+                    roots[4].clone(),
+                ],
             ))?,
             1 => encode(&(
                 OBJECT_SNAPSHOT_EXPIRY_MAGIC,
@@ -169,10 +174,6 @@ impl ObjectState {
 
     pub(crate) const fn expiry(&self) -> &Index {
         &self.expiry
-    }
-
-    pub(crate) const fn head_mode(&self) -> u8 {
-        self.head_mode
     }
 
     pub(crate) const fn reference(&self) -> &PackedRef {
@@ -419,7 +420,7 @@ impl ObjectFs {
             None
         };
         if bytes.is_none() && expired.is_some() {
-            return Err(corrupt(
+            return Err(Error::corrupt(
                 "observe revision",
                 "expiry marker has no retained snapshot reference",
             ));
@@ -548,7 +549,7 @@ impl ObjectFs {
                 match self.revision_marker(&latest, revision).await? {
                     Some(marker) => {
                         if marker.after > latest.revision {
-                            return Err(corrupt(
+                            return Err(Error::corrupt(
                                 "read history",
                                 "expiry marker was published after the observed head",
                             ));
@@ -611,13 +612,13 @@ impl ObjectFs {
                 .get(&self.data, None, &revision_key(*candidate))
                 .await?
                 .ok_or_else(|| {
-                    corrupt(
+                    Error::corrupt(
                         "expire revisions",
                         "committed operation is missing a revision marker",
                     )
                 })?;
             if ExpiryMarker::decode(&bytes)? != marker {
-                return Err(corrupt(
+                return Err(Error::corrupt(
                     "expire revisions",
                     "operation and revision markers disagree",
                 ));
@@ -981,7 +982,7 @@ async fn read_snapshot_roots(
         ));
     };
     if expected_mode.is_some_and(|mode| mode != head_mode) {
-        return Err(corrupt(
+        return Err(Error::corrupt(
             "open snapshot",
             "head mode disagrees with snapshot profile",
         ));

@@ -194,7 +194,7 @@ async fn expiry_contract(fs: &dyn Authority) {
         .unwrap();
     let first_plan = first.finish().unwrap();
     let first_receipt = committed(fs.commit(&first_plan).await.unwrap());
-    let first_revision = first_receipt.cursor.revision;
+    let first_revision = initial.revision();
 
     let mut second = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
     second
