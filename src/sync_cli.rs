@@ -963,7 +963,7 @@ fn emit(document: &SyncStatus, json: bool) -> Result<(), Box<dyn std::error::Err
     } else {
         writeln!(
             stdout,
-            "sync: {:?} remote: {:?} local: {:?} in-sync: {} pending: {} unknown: {} conflicts: {} failed: {} artifacts: {}",
+            "sync: {:?} remote: {:?} local: {:?} in-sync: {} pending: {} unknown: {} conflicts: {} failed: {} artifacts: {} retained-bytes: {}",
             document.binding.state,
             document.remote.availability,
             document.local.scan,
@@ -973,6 +973,7 @@ fn emit(document: &SyncStatus, json: bool) -> Result<(), Box<dyn std::error::Err
             document.summary.conflicts,
             document.summary.failed,
             document.summary.retained_artifacts,
+            document.summary.retained_bytes,
         )?;
     }
     Ok(())

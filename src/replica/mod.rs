@@ -36,7 +36,7 @@ pub use directory::{
 };
 pub use error::{Error, ErrorKind, Result};
 pub use linux::{
-    Artifact, ArtifactKind, CapturedContent, Conflict, ContentHash, Identity, InstallOutcome,
-    LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaBaseline, ReplicaProtection,
-    ReplicaStatus, scan_path,
+    ARTIFACT_BUDGET_BYTES, ARTIFACT_BUDGET_COUNT, Artifact, ArtifactKind, CapturedContent,
+    Conflict, ContentHash, Identity, InstallOutcome, LocalKind, LocalNode, LocalSnapshot, Replica,
+    ReplicaBaseline, ReplicaProtection, ReplicaStatus, scan_path,
 };
