@@ -621,7 +621,7 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
         .await
         .unwrap();
     eprintln!(
-        "W2 BASELINE {}",
+        "W2 BASELINE {:?}",
         probe
             .entries
             .iter()
