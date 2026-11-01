@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
-use yinyang::direct::{DirectNamespace, DirectRuntime, DirectRuntimeInspectionState};
+use yinyang::direct::{DirectRuntime, DirectRuntimeInspectionState};
 #[cfg(target_os = "linux")]
 use yinyang::direct_sync::{
     BindingState, DirectRemote, DirectRemoteAdapter, DirectSync, LocalScanState,
@@ -199,7 +199,6 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
                 check_direct_sync_state(
                     None,
                     config,
-                    None,
                     Some(error.message().to_owned()),
                     &mut report,
                 )
@@ -285,7 +284,6 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
             check_direct_sync_state(
                 None,
                 &context.config,
-                None,
                 Some("the storage or service environment is invalid".to_owned()),
                 &mut report,
             )
@@ -868,7 +866,7 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
                 error.to_string(),
                 Some(direct_remediation(
                     CliStage::Observe,
-                    crate::runtime_kind_from_direct(error.kind()),
+                    runtime_kind_from_replica(error.kind()),
                 )),
             ),
         }
@@ -905,7 +903,10 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
             "namespace",
             Health::ActionRequired,
             error.to_string(),
-            Some(direct_remediation(CliStage::Observe, error.kind())),
+            Some(direct_remediation(
+                CliStage::Observe,
+                crate::runtime_kind_from_direct(error.kind()),
+            )),
         ),
     }
 }
@@ -949,7 +950,7 @@ async fn check_authority(context: &VolumeContext, report: &mut DoctorReport) {
                 Some(authority_remediation(
                     config,
                     CliStage::Observe,
-                    error.kind(),
+                    crate::runtime_kind_from_core(error.kind()),
                 )),
             ),
         },

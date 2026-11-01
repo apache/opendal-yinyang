@@ -589,15 +589,8 @@ fn export_conflict_local(
     id: &str,
     output: &mut dyn std::io::Write,
 ) -> CliResult<()> {
-    yinyang::replica::export_conflict_local(&context.config.staging, id, output).map_err(
-        |error| {
-            CliError::new(
-                CliStage::LocalState,
-                runtime_kind_from_replica(error.kind()),
-                error.to_string(),
-            )
-        },
-    )?;
+    yinyang::replica::export_conflict_local(&context.config.staging, id, output)
+        .map_err(|error| CliError::from_boxed(CliStage::LocalState, error))?;
     Ok(())
 }
 

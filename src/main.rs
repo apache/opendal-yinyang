@@ -141,7 +141,7 @@ pub(crate) fn runtime_kind_from_io(kind: std::io::ErrorKind) -> RuntimeErrorKind
     }
 }
 
-fn runtime_kind_from_core(kind: yinyang::core::ErrorKind) -> RuntimeErrorKind {
+pub(crate) fn runtime_kind_from_core(kind: yinyang::core::ErrorKind) -> RuntimeErrorKind {
     use yinyang::core::ErrorKind as Kind;
     match kind {
         Kind::Invalid => RuntimeErrorKind::Invalid,
