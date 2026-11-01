@@ -1108,7 +1108,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("yinyang-w1-write-bench-")
+            .tempdir_in(std::env::var_os("HOME").expect("HOME"))
+            .unwrap();
         let runtime = Runtime::open(authority.clone(), temp.path().join("staging"))
             .await
             .unwrap();
