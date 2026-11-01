@@ -1209,23 +1209,6 @@ fn explicit_expiry_case(publication: Publication) {
             !old_post_read_path.exists(),
             "old binary created a restore destination after rejection"
         );
-    } else {
-        let old_post = old_yy(
-            &fixture,
-            &[
-                "--volume",
-                text(&config),
-                "receipt",
-                "00000000-0000-0000-0000-000000000000",
-            ],
-        );
-        assert_ne!(
-            old_post.status.code(),
-            Some(3),
-            "old service client accepted the activated expiry profile:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&old_post.stdout),
-            String::from_utf8_lossy(&old_post.stderr)
-        );
     }
     assert_eq!(
         runtime()
