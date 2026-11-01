@@ -352,7 +352,7 @@ impl Mount {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn reference_count(&self, id: NodeId) -> Option<usize> {
         self.inner
             .nodes
