@@ -3595,5 +3595,15 @@ mod tests {
         );
         let error = DirectRuntime::inspect(&state, Some(&binding("other"))).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Invalid);
+
+        rusqlite::Connection::open(state.join("runtime.db"))
+            .unwrap()
+            .execute(
+                "UPDATE authority SET profile='yinyang-direct-runtime-1' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let error = DirectRuntime::inspect(&state, Some(&binding("bucket"))).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
     }
 }

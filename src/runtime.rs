@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Managed file handles with durable local writes and conditional remote fsync.
+//! Managed file handles with explicit local barriers and conditional remote fsync.
 //! No OS mount, background synchronization, or full POSIX behavior is implied.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

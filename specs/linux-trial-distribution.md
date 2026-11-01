@@ -53,7 +53,7 @@ The archive inventory is fixed by schema v1:
 - `bin/yy`;
 - the three systemd user-unit templates;
 - the environment example;
-- the operational, qualification, recovery, compatibility, operating-envelope
+- the operational, qualification, recovery, profile-admission, operating-envelope
   and trial-distribution documents;
 - `install-release.sh` and `verify-release.sh`.
 
@@ -103,22 +103,11 @@ configuration or state, or infers compatibility from equal package versions.
 
 ## Transition boundary
 
-The installer has no rollback or downgrade command. After a newer binary has
-opened or written configuration, staging, Sync, journal, receipt or service
-state, launching an older binary against that state is unsupported. The
-operator must use compatibility admission and a quiesced backup or isolated
-restore instead.
-
-The supported cross-version evidence remains an exact producer/target pair.
-`linux_prefix_upgrade` qualifies `fd1338c` against the selected target archive
-binary while preserving pending, frozen, Unknown, receipt and service-WAL
-state. `linux_stage3_upgrade` qualifies the immutable `546f419` stage-3 corpus
-against the selected target archive: sparse base and segment visibility,
-pending publication, the original frozen and Unknown CommitIds/digests, and
-reopening a copied service database with its non-empty WAL. The corpus producer
-is the accepted `546f419` trial archive binary rather than a current-writer
-synthetic downgrade. Equal package versions or an equal source tree do not
-create broader compatibility.
+The installer has no rollback or downgrade command. A newer binary with
+different local profiles cannot reopen older staging, Sync, journal, receipt or
+service state; admission returns `Unsupported` before mutation. A quiesced
+backup or isolated restore preserves evidence but does not convert old profiles
+into current ones.
 
 ## Read-only accounting and retention
 
@@ -153,11 +142,7 @@ The fresh-runner workflow must:
   using the shared native-acceptance binary selector and recording its SHA-256;
 - exercise the existing installed-operations foreground writable Mount, remount
   and finite Sync entrypoint with the same packaged binary and selector;
-- build the pinned legacy producer and run the existing installed-prefix
-  upgrade with the archive's target binary;
-- run the immutable genuine stage-3 fixture upgrade with the same installed
-  target binary and record its target and fixture identities separately;
-- retain pending, frozen, Unknown, receipts, Sync and service-WAL evidence;
+- retain installed diagnostics, finite Sync and recovery evidence;
 - upload the direct binary files and internal evidence only as normal
   short-lived Actions artifacts.
 

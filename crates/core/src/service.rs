@@ -912,4 +912,58 @@ mod admission_tests {
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
     }
+
+    #[tokio::test]
+    async fn old_sqlite_profile_is_rejected_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE authority SET profile='yinyang-sqlite-1' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+
+        let error = MetadataService::open(&path, backend.operator())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let connection = Connection::open(&path).unwrap();
+        let profile: String = connection
+            .query_row(
+                "SELECT profile FROM authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(profile, "yinyang-sqlite-1");
+    }
+
+    #[tokio::test]
+    async fn partial_current_sqlite_schema_is_rejected_as_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE prepared")
+            .unwrap();
+
+        let error = MetadataService::open(&path, backend.operator())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
+    }
 }

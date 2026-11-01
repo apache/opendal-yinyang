@@ -19,7 +19,7 @@
 //!
 //! This module intentionally has no deletion path. It observes authority
 //! metadata, current backend objects, and existing local staging state without
-//! opening a writer, acquiring a runtime lease, or migrating local databases.
+//! opening a writer, acquiring a runtime lease, or changing local databases.
 
 #[cfg(target_os = "linux")]
 use crate::replica::{Replica, ReplicaBaseline, inspect_backup_package};
@@ -996,7 +996,7 @@ pub async fn plan_managed_retention(
 }
 
 /// Inspect existing Managed content, Sync, and replica evidence without creating
-/// a directory or database, acquiring a runtime lease, migrating state, or
+/// a directory or database, acquiring a runtime lease, changing state, or
 /// recovering records. Known SQLite read-only behavior may create or update
 /// derived WAL/SHM files.
 pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
@@ -1544,7 +1544,7 @@ fn staging_state(
 }
 
 /// Inspect existing Managed content staging databases without creating a
-/// directory or database, acquiring a runtime lease, migrating state, or
+/// directory or database, acquiring a runtime lease, changing state, or
 /// recovering records.
 async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
     let mut errors = Vec::new();

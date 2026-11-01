@@ -1189,3 +1189,51 @@ fn decode_id(bytes: &[u8], context: &str) -> Result<[u8; 16]> {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding() -> Binding {
+        Binding {
+            root: PathBuf::from("/root"),
+            root_identity: Identity { dev: 1, ino: 2 },
+            state_identity: Identity { dev: 1, ino: 3 },
+            namespace: "namespace".to_owned(),
+        }
+    }
+
+    #[test]
+    fn old_profile_and_partial_current_schema_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("direct-sync.db");
+        drop(Store::create(&path, &binding()).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE binding SET profile='yinyang-direct-sync-1' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            Store::open_read_only(&path).unwrap_err().kind(),
+            crate::replica::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            Store::open(&path).unwrap_err().kind(),
+            crate::replica::ErrorKind::Unsupported
+        );
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE binding SET profile='yinyang-direct-sync-2' WHERE singleton=1;
+                 DROP TABLE installs;",
+            )
+            .unwrap();
+        assert_eq!(
+            Store::open_read_only(&path).unwrap_err().kind(),
+            crate::replica::ErrorKind::Corrupt
+        );
+    }
+}

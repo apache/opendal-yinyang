@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Durable local write staging. SQLite keeps each acknowledged write and its
-//! generation atomic; exact dirty ranges overlay an authenticated base.
+//! Local write staging. SQLite commits each accepted write and its generation
+//! atomically; explicit barriers make the WAL durable.
 use super::*;
 use crate::local::store;
 use borsh::{BorshDeserialize, BorshSerialize};

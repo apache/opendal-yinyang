@@ -99,7 +99,7 @@ different binding is `Invalid` before crash recovery or mutation.
 
 ## Durable local profile
 
-The profile is `yinyang-direct-runtime-1`. A writable runtime requires a
+The profile is `yinyang-direct-runtime-2`. A writable runtime requires a
 dedicated staging directory:
 
 ```text
@@ -110,7 +110,7 @@ objects/<16-byte-object-id>.data      shared local object generation
 inputs/<16-byte-mutation-id>.data     immutable accepted dispatch input
 ```
 
-`runtime.db` uses SQLite WAL and `synchronous=FULL`. Its exact tables are:
+`runtime.db` uses SQLite WAL and `synchronous=NORMAL`. Its exact tables are:
 
 - `authority(singleton, profile, binding, binding_diagnostic)`;
 - `objects(id, key, record)`;
@@ -148,12 +148,21 @@ whole-second time. `ObservationRecord` is `Present`, `Missing` or
 name and precondition. The exact Borsh enum and struct field order is part of
 this profile.
 
-There is no migration, downgrade or mixed-profile writer support for this
-initial profile. An existing nonempty database is read-only preflighted before
-creating directories or a lease: missing authority, unknown profile, missing or
-extra table, reordered columns, or binding mismatch rejects without DDL,
-journal-mode change or recovery. An absent or zero-length database may be
-initialized. A partial first initialization is therefore not silently adopted.
+There is no migration, downgrade or mixed-profile writer support. An existing
+nonempty database is read-only preflighted before creating directories or a
+lease. Missing authority, an older or unknown profile, missing or extra tables
+or columns, a missing or duplicate profile row, or binding mismatch rejects
+without DDL, journal-mode change or recovery. Column order is not part of the
+schema signature because maintained inserts name their columns. An absent or
+zero-length database may be initialized. A partial first initialization is
+therefore not silently adopted.
+
+Mutation journal rows that make an external write or delete recoverable are
+checkpointed before that storage request. This includes `Dispatching`,
+`SourceDispatching`, object `Pending`, and the paired frozen mutation input
+records. Completion rows may remain at the normal-commit durability level until
+the next explicit barrier or process exit because a restart safely converts an
+unacknowledged dispatch state to `Unknown`.
 
 On reopen, a stored `Dispatching` mutation becomes `Unknown`; a stored
 `SourceDispatching` rename becomes `PendingSourceCleanup`; and an object left
@@ -198,9 +207,10 @@ Larger bytes found beyond the last committed record are not acknowledged and
 are discarded on reopen. A missing shorter data file is corruption.
 
 `flush` first freezes the exact current generation into `inputs/<id>.data` and
-records its length and BLAKE3 digest. It then commits `Dispatching` before the
-network call. A newer local write cannot alter that frozen input. `flush` on a
-read-only handle is `Unchanged`; Drop and release never publish.
+records its length and BLAKE3 digest. It then commits and checkpoints
+`Dispatching` before the network call. A newer local write cannot alter that
+frozen input. `flush` on a read-only handle is `Unchanged`; Drop and release
+never publish.
 
 The writable open/create creates an empty local generation. No remote object
 exists before its first flush. `discard_local` removes only a never-dispatched
@@ -268,8 +278,9 @@ Directory/exchange/whiteout callers must reject before invoking this runtime.
 ## Errors and integration boundaries
 
 Conflict, Unknown, Missing, response metadata and retained local bytes are
-normal typed results, not generic storage failures. Local/state failures use the
-Direct `Storage` error unless a narrower Direct error applies. FUSE admission,
+normal typed results, not generic storage failures. Malformed local profiles or
+records use `Corrupt`; I/O and storage failures use `Storage` unless a narrower
+Direct error applies. FUSE admission,
 writable volume configuration, CLI status, Direct Sync baselines and Sync
 algorithm code remain separate owners. They must consume this runtime and the
 stateless seam instead of implementing a second Direct publication engine.

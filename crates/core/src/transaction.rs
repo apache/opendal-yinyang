@@ -937,11 +937,10 @@ mod tests {
     use crate::data::{ContentDescriptor, DataStore};
     use crate::support::{StoredObject, TestBackend};
 
-    const PLAN: &[u8] = include_bytes!("../tests/fixtures/compatibility-v2/transaction.plan");
-    const DESCRIPTOR: &[u8] =
-        include_bytes!("../tests/fixtures/compatibility-v2/content.descriptor");
-    const PACK: &[u8] = include_bytes!("../tests/fixtures/compatibility-v2/content.pack");
-    const DIGEST: &str = include_str!("../tests/fixtures/compatibility-v2/request.digest");
+    const PLAN: &[u8] = include_bytes!("../tests/fixtures/format/transaction.plan");
+    const DESCRIPTOR: &[u8] = include_bytes!("../tests/fixtures/format/content.descriptor");
+    const PACK: &[u8] = include_bytes!("../tests/fixtures/format/content.pack");
+    const DIGEST: &str = include_str!("../tests/fixtures/format/request.digest");
 
     #[test]
     fn canonical_noop_request_vector() {

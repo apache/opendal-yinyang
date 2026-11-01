@@ -83,11 +83,14 @@ observation: a real version ID when both observations expose one, otherwise
 ETag, size and known whole-second mtime using the same fallback rule as Direct
 reads.
 
-The state database profile is `yinyang-direct-sync-1` with tables `binding`,
+The state database profile is `yinyang-direct-sync-2` with tables `binding`,
 `baseline`, `work`, `installs`, `artifacts` and `conflicts`. SQLite uses WAL and
-`synchronous=FULL`. An existing database is validated before journal-mode or
+`synchronous=NORMAL`; explicit checkpoints cover work dispatch and local-effect
+journal transitions. An existing database is validated before journal-mode or
 schema changes. Initialization rejects an existing database instead of
-migrating or reinterpreting it.
+migrating or reinterpreting it. Schema admission compares exact table and
+column-name sets, and older or unknown profile identifiers are rejected with
+`Unsupported`.
 
 ## Initialization
 
@@ -145,8 +148,8 @@ Before any remote request, Direct Sync:
 2. records the operation, path, accepted baseline and accepted local
    fingerprint;
 3. records the exact ETag or absence precondition;
-4. commits the work record as `Prepared`;
-5. durably changes it to `Unknown` before dispatch.
+4. commits and checkpoints the work record as `Prepared`;
+5. changes it to `Unknown` and checkpoints it before dispatch.
 
 The state is `Unknown` before the request because a process crash or lost
 response cannot prove that storage did not accept it.
@@ -172,7 +175,8 @@ The selected backend must provide a real conditional DELETE.
 
 Pulled bytes are written to a private temporary file under the state directory,
 validated against the accepted remote pin, fsynced and recorded in the local
-install journal.
+install journal. The journal row and its artifact record are checkpointed before
+the local rename, exchange, or deletion that recovery must interpret.
 
 - Creation uses `RENAME_NOREPLACE`; an occupied local name is a conflict.
 - Replacement verifies the scanned inode, parent identity and bytes, then uses

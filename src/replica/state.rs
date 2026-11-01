@@ -1707,7 +1707,7 @@ mod tests {
     fn unsupported_profile_is_rejected_before_sqlite_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("replica.db");
-        create_database(&path, "yinyang-directory-replica-99", CREATE_SCHEMA);
+        create_database(&path, "yinyang-directory-replica-1", CREATE_SCHEMA);
         assert_eq!(
             Store::open_read_only(&path).err().unwrap().kind(),
             ErrorKind::Unsupported

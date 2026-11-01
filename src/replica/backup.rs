@@ -22,8 +22,8 @@ use super::linux::{
 };
 use super::state::{Binding, IdentityMap, Store};
 use super::{Error, Result};
+use crate::local::store;
 use borsh::{BorshDeserialize, BorshSerialize};
-use rusqlite::Connection;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -633,7 +633,7 @@ impl BackupManifest {
 
 /// Validate an explicit backup package with the existing manifest checksum,
 /// shape, and package validator. Validation is read-only: it never restores,
-/// migrates state, acquires a writer lease, or requires the original local root.
+/// changes state, acquires a writer lease, or requires the original local root.
 pub fn inspect_backup_package(backup: &Path) -> Result<BackupInspection> {
     let manifest = BackupManifest::load(backup)?;
     manifest.validate_package(backup)?;
@@ -756,7 +756,7 @@ fn create_private_directory(path: &Path, operation: &str) -> Result<()> {
 }
 
 fn vacuum(source: &Path, destination: &Path) -> Result<()> {
-    let connection = Connection::open(source)
+    let connection = store::open_read_write(source, false)
         .map_err(|error| Error::io("open SQLite database for backup", source, error))?;
     let destination_text = destination
         .to_str()

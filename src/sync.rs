@@ -161,7 +161,7 @@ pub struct Sync {
 }
 impl Sync {
     /// Validate copied Sync and content-staging databases without acquiring a
-    /// writer lease, migrating schemas, or recovering records.
+    /// writer lease, changing schemas, or recovering records.
     pub async fn validate_restore(directory: impl AsRef<Path>, filesystem: NodeId) -> Result<()> {
         let directory = directory.as_ref().to_owned();
         preflight_open(&directory, filesystem, true).await?;
@@ -197,8 +197,8 @@ impl Sync {
         let filesystem = *authority.filesystem().as_bytes();
         let filesystem = NodeId::from_bytes(filesystem);
         let directory = directory.as_ref().to_owned();
-        // Reject every unsupported existing component before Runtime::open can
-        // migrate staging or remove incomplete handles.
+        // Reject every unsupported existing component before Runtime::open
+        // validates staging or removes incomplete handles.
         preflight_open(&directory, filesystem, false).await?;
         let runtime = Runtime::open(authority.clone(), directory.join("content")).await?;
         let path = directory.join("sync.db");
@@ -218,8 +218,6 @@ impl Sync {
                     )],
                 )
                 .map_err(store_error)?;
-            } else {
-                validate_profile(&tx, filesystem)?;
             }
             validate_profile(&tx, filesystem)?;
             tx.commit().map_err(Error::local)?;
