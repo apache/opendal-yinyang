@@ -142,11 +142,14 @@ import json
 import sys
 
 path, expected_source, expected_workload = sys.argv[1:]
+WRITE_LATENCY_BATCH_FILES = 4
+WRITE_LATENCY_BATCHES = 3
+WRITE_LATENCY_TOTAL_FILES = WRITE_LATENCY_BATCH_FILES * WRITE_LATENCY_BATCHES
 records = []
 with open(path, encoding="utf-8") as source:
     for line in source:
         record = json.loads(line)
-        if record.get("schema") != "yinyang.linux-cost.v6":
+        if record.get("schema") != "yinyang.linux-cost.v7":
             raise SystemExit(f"unexpected schema: {record.get('schema')!r}")
         if record.get("workload") != expected_workload:
             raise SystemExit(f"unexpected workload: {record.get('workload')!r}")
@@ -173,6 +176,48 @@ with open(path, encoding="utf-8") as source:
                 raise SystemExit(
                     f"{record.get('scenario')} did not retain multiple samples"
                 )
+        if (
+            expected_workload == "incremental"
+            and record.get("scenario", "").startswith("fuse_write_latency_")
+            and not record.get("scenario", "").endswith("_mount_ready")
+        ):
+            if record.get("iterations") != WRITE_LATENCY_TOTAL_FILES:
+                raise SystemExit(
+                    f"{record.get('scenario')} did not retain three batches of phase samples"
+                )
+            dataset = record.get("dataset") or {}
+            if (
+                dataset.get("files") != WRITE_LATENCY_TOTAL_FILES
+                or dataset.get("range_bytes") != 4096
+            ):
+                raise SystemExit(f"unexpected matched-write dataset: {dataset!r}")
+            for key in ("s3_activity", "service_activity"):
+                activity = record.get("network", {}).get(key)
+                if not isinstance(activity, dict):
+                    raise SystemExit(f"{record.get('scenario')} has no {key}")
+                if activity.get("in_flight_at_end") != 0:
+                    raise SystemExit(
+                        f"{record.get('scenario')} ended with {key} work in flight"
+                    )
+                if not isinstance(activity.get("max_concurrency"), int):
+                    raise SystemExit(
+                        f"{record.get('scenario')} has invalid {key} concurrency"
+                    )
+            phases = record.get("observed_phases")
+            if not isinstance(phases, dict):
+                raise SystemExit(f"{record.get('scenario')} has no observed_phases")
+            for key in ("open_ms", "mutation_ms", "fsync_ms"):
+                samples = phases.get(key)
+                if not isinstance(samples, list) or len(samples) != WRITE_LATENCY_TOTAL_FILES:
+                    raise SystemExit(
+                        f"{record.get('scenario')} has invalid {key} phase samples"
+                    )
+            if not isinstance(record.get("batch_wall_ms"), (int, float)):
+                raise SystemExit(f"{record.get('scenario')} has no batch wall time")
+            scenario = record["scenario"]
+            network = record.get("network") or {}
+            if not network.get("put", 0):
+                raise SystemExit(f"{scenario} published no content")
         records.append(record)
 
 if not records:
@@ -193,6 +238,14 @@ if expected_workload == "length-changing":
     missing = sorted(required - seen)
     if missing:
         raise SystemExit(f"length-changing workload is missing records: {missing}")
+if expected_workload == "incremental":
+    required = {
+        f"fuse_write_latency_{writers}" for writers in (1, 4)
+    }
+    seen = {record.get("scenario") for record in records}
+    missing = sorted(required - seen)
+    if missing:
+        raise SystemExit(f"incremental workload is missing records: {missing}")
 binary_paths = {record.get("binary_path") for record in records}
 binary_hashes = {record.get("binary_blake3") for record in records}
 if len(binary_paths) != 1 or len(binary_hashes) != 1:
