@@ -354,7 +354,7 @@ impl DataStore {
     /// returned evidence until that remote verification succeeds.
     pub(crate) async fn prepare_for_remote_verification(
         &self,
-        source: &mut (impl AsyncRead + Unpin),
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
     ) -> Result<PreparedContent> {
         let mut pack = Pack::new(self).await?;
         let result = self.prepare_into(source, &mut pack).await;
@@ -375,7 +375,7 @@ impl DataStore {
 
     async fn prepare_into(
         &self,
-        source: &mut (impl AsyncRead + Unpin),
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
         pack: &mut Pack,
     ) -> Result<ContentDescriptor> {
         let mut frontier = Vec::<(u64, u64, Child)>::new();
@@ -1559,7 +1559,7 @@ async fn finish_update_frontier(
     Ok(root)
 }
 
-async fn read_unit(source: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+async fn read_unit(source: &mut (impl AsyncRead + Unpin + ?Sized)) -> Result<Vec<u8>> {
     let mut bytes = vec![0; BLOCK_BYTES];
     let mut used = 0;
     while used < bytes.len() {

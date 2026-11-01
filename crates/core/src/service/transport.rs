@@ -518,7 +518,10 @@ impl ServiceClient {
         }
         Ok(RevisionPage { revisions, next })
     }
-    pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
+    pub async fn prepare(
+        &self,
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
+    ) -> Result<PreparedContent> {
         let content = self.data.prepare_for_remote_verification(source).await?;
         let descriptor = self.data.accept(&content)?;
         match rpc(
