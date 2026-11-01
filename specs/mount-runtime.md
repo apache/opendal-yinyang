@@ -55,8 +55,8 @@ returns the first failure. Every failure remains in runtime status. A successful
 local write or an OS close that cannot report errors is not remote completion.
 
 `flush` is the named publication attempt for a frontend close path that can
-report errors. It performs the same conditional publication as `fsync` and
-never reports success before the remote result is durable. Dropping or
+report errors. It and `fsync` share one publication implementation and never
+report success before the remote result is durable. Dropping or
 releasing the reference is different: it performs no I/O, publication or
 staging deletion. Pending, frozen and failed states remain recoverable, and
 `reclaim` rejects them. A frontend whose release callback cannot report errors

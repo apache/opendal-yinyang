@@ -747,6 +747,13 @@ mod tests {
             observe_gate: AsyncMutex::new(()),
         };
         let before = backend_state.head_stat_calls();
+        backend
+            .lookup(authority.root(), "file")
+            .await
+            .unwrap()
+            .unwrap();
+        backend.getattr(id, None).await.unwrap();
+        let reads_after_warm = backend_state.state.lock().unwrap().data_reads;
         for _ in 0..32 {
             backend
                 .lookup(authority.root(), "file")
@@ -759,6 +766,11 @@ mod tests {
             backend_state.head_stat_calls(),
             before,
             "metadata callbacks within the window observed the head again"
+        );
+        assert_eq!(
+            backend_state.state.lock().unwrap().data_reads,
+            reads_after_warm,
+            "warm metadata callbacks performed a new page read"
         );
     }
 }

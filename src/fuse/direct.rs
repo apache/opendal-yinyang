@@ -31,7 +31,7 @@ use crate::direct::{
 };
 use crate::volume::VolumeConfig;
 use fuser::OpenFlags;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -98,6 +98,7 @@ pub(super) struct DirectBackend {
     direct: Option<DirectRuntime>,
     snapshot: RwLock<Arc<DirectSnapshot>>,
     pending: Mutex<BTreeMap<DirectId, DirectObjectStatus>>,
+    open_ids: Mutex<BTreeSet<DirectId>>,
     views: Mutex<BTreeMap<ViewKey, Arc<Mutex<FileView>>>>,
     refresh_error: Mutex<Option<String>>,
 }
@@ -140,6 +141,7 @@ impl DirectBackend {
                     .map(|status| (status.id, status))
                     .collect(),
             ),
+            open_ids: Mutex::new(BTreeSet::new()),
             views: Mutex::new(BTreeMap::new()),
             refresh_error: Mutex::new(None),
         };
@@ -416,6 +418,7 @@ impl Backend for DirectBackend {
             }
             let file = snapshot.open_file(id).await?;
             let view = self.view_for(ViewKey::Remote(id), node.size(), node.modified());
+            guard(&self.open_ids).insert(id);
             return Ok(Opened {
                 file: DirectOpenFile {
                     id,
@@ -459,6 +462,7 @@ impl Backend for DirectBackend {
         let length = file.len().await?;
         let view = self.view_for(ViewKey::Staged(file.object_id()), length, modified);
         file.status().await?;
+        guard(&self.open_ids).insert(id);
         Ok(Opened {
             file: DirectOpenFile {
                 id,
@@ -518,10 +522,11 @@ impl Backend for DirectBackend {
 
     async fn release(
         &self,
-        _id: DirectId,
+        id: DirectId,
         file: Arc<DirectOpenFile>,
         _writable: bool,
     ) -> Result<()> {
+        guard(&self.open_ids).remove(&id);
         drop(file);
         {
             let mut views = guard(&self.views);
@@ -665,6 +670,7 @@ impl Backend for DirectBackend {
                     .and_then(DirectObjectPin::modified)
             });
         let view = self.view_for(ViewKey::Staged(file.object_id()), status.length, modified);
+        guard(&self.open_ids).insert(id);
         let attr = ObservedAttr::from_storage(false, status.length, modified);
         Ok(Created {
             id,
@@ -693,6 +699,9 @@ impl Backend for DirectBackend {
         let direct = self.direct.as_ref().ok_or(BackendError::MutationIo)?;
         if let Some(status) = self.pending_child(parent, name) {
             if !status.existed_remote {
+                if guard(&self.open_ids).contains(&status.id) {
+                    return Err(BackendError::MutationUnsupported);
+                }
                 direct.discard_local(status.id).await?;
                 if let Err(error) = self.refresh_pending().await {
                     eprintln!("yy: fuse unlink: cannot refresh local state: {error}");
