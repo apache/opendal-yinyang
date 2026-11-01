@@ -117,6 +117,7 @@ fn rsync(source: &Path, destination: &Path, delete: bool) -> AppOutput {
         "--no-owner",
         "--no-group",
         "--omit-dir-times",
+        "--inplace",
     ]);
     if delete {
         command.arg("--delete");
@@ -277,9 +278,9 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
             .join(format!("mnt-application-tar-{suffix}"));
         fs::create_dir(&mountpoint).expect("create tar mountpoint");
         let extracted = mountpoint.join("tar-tree");
-        fs::create_dir(&extracted).expect("create mounted extraction root");
 
         let mut mounted = fixture.mount(&config, &mountpoint);
+        fs::create_dir(&extracted).expect("create mounted extraction root");
         tar_extract(&archive, &extracted).success_or("extract tar through FUSE");
         assert_tar_round_trip(&extracted);
         assert_eq!(
