@@ -674,7 +674,7 @@ async fn managed_sync_edit_benchmark() {
 async fn managed_sync_publication_does_not_reimport_prepared_content() {
     const SIZE: usize = 4 * 1024 * 1024;
 
-    async fn measure(authority: Arc<dyn Authority>, backend: &TestBackend) -> (u64, u64) {
+    async fn measure(authority: Arc<dyn Authority>, backend: &TestBackend) -> (u64, u64, u64, u64) {
         let temp = tempfile::tempdir().unwrap();
         let sync = Sync::open(authority.clone(), temp.path().join("sync"))
             .await
@@ -694,8 +694,25 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
             .unwrap();
         let staged = reads() - before;
         let before_publish = reads();
-        sync.publish(edit).await.unwrap();
-        (staged, reads() - before_publish)
+        let revision = sync.publish(edit).await.unwrap();
+        let published = reads() - before_publish;
+        let node = sync
+            .namespace_status(edit)
+            .await
+            .unwrap()
+            .intent
+            .operation
+            .node_id();
+        let replacement = vec![3_u8; SIZE];
+        let before_stage = reads();
+        let content = sync
+            .stage(node, revision, &mut &replacement[..])
+            .await
+            .unwrap();
+        let content_staged = reads() - before_stage;
+        let before_publish = reads();
+        sync.publish(content).await.unwrap();
+        (staged, published, content_staged, reads() - before_publish)
     }
 
     let object_backend = TestBackend::default();
@@ -704,12 +721,17 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
             .await
             .unwrap(),
     );
-    let (object_stage, object_publish) = measure(object, &object_backend).await;
+    let (object_stage, object_publish, object_content_stage, object_content_publish) =
+        measure(object, &object_backend).await;
     assert!(
         object_publish < 64 * 1024,
         "object publication read {object_publish} bytes after preparation"
     );
     assert!(object_stage <= SIZE as u64 + 64 * 1024);
+    assert!(
+        object_content_publish <= SIZE as u64 + 64 * 1024,
+        "object content publication read {object_content_publish} bytes"
+    );
 
     let service_backend = TestBackend::default();
     let service_temp = tempfile::tempdir().unwrap();
@@ -728,7 +750,8 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
             .await
             .unwrap(),
     );
-    let (service_stage, service_publish) = measure(client, &service_backend).await;
+    let (service_stage, service_publish, service_content_stage, service_content_publish) =
+        measure(client, &service_backend).await;
     assert!(
         service_publish < 64 * 1024,
         "service publication read {service_publish} bytes after preparation"
@@ -737,9 +760,16 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
         service_stage <= SIZE as u64 + 64 * 1024,
         "service preparation read {service_stage} bytes"
     );
+    assert!(
+        service_content_publish <= SIZE as u64 + 64 * 1024,
+        "service content publication read {service_content_publish} bytes"
+    );
     println!(
         "W2_READBACK object_stage={object_stage} object_publish={object_publish} \
-         service_stage={service_stage} service_publish={service_publish}"
+         object_content_stage={object_content_stage} \
+         object_content_publish={object_content_publish} service_stage={service_stage} \
+         service_publish={service_publish} service_content_stage={service_content_stage} \
+         service_content_publish={service_content_publish}"
     );
     server.abort();
 }

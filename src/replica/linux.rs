@@ -707,7 +707,9 @@ impl Replica {
                             .to_owned(),
                     );
                 }
-            } else if !self.artifact_matches_record(&record).unwrap_or_default() {
+            } else if record.phase == "retained"
+                && !self.artifact_matches_record(&record).unwrap_or_default()
+            {
                 artifact.phase = "conflict".to_owned();
                 artifact.error = Some(
                     "retained artifact changed after creation; export before cleanup".to_owned(),
@@ -767,7 +769,7 @@ impl Replica {
             }
         }
         for mut artifact in self.store.artifacts()? {
-            if artifact.phase == "conflict" {
+            if artifact.phase != "retained" {
                 continue;
             }
             match self.artifact_matches_record(&artifact) {
