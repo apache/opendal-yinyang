@@ -1012,12 +1012,13 @@ fn explicit_expiry_preserves_staged_and_backup_work_on_object_and_service() {
 fn explicit_expiry_case(publication: Publication) {
     const OPERATION_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
+    let old_hash = run_external("sha256sum", &[OLD_YY_BIN], Duration::from_secs(30));
     assert_eq!(
-        run_external("sha256sum", &[OLD_YY_BIN], Duration::from_secs(30))
-            .stdout
+        std::str::from_utf8(&old_hash.stdout)
+            .unwrap()
             .split_ascii_whitespace()
             .next(),
-        Some(OLD_YY_SHA256.as_bytes()),
+        Some(OLD_YY_SHA256),
         "old binary identity changed"
     );
 
@@ -1255,7 +1256,7 @@ fn explicit_expiry_case(publication: Publication) {
         &handle.to_string(),
     ]);
     assert_eq!(
-        fixture.remote_entry_bytes("protected.txt").as_deref(),
+        remote_entry_bytes(&fixture, "protected.txt").as_deref(),
         Some(expected.as_slice()),
         "{publication:?} did not publish recovered protected work"
     );
