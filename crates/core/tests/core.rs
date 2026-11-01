@@ -890,6 +890,20 @@ async fn concurrent_object_expiry_same_request_resolves_committed() {
     let right = right.unwrap();
     assert!(matches!(left, ExpiryOutcome::Committed(_)));
     assert_eq!(left, right);
+
+    let different = ExpiryRequest::new(
+        first.filesystem(),
+        request.id(),
+        first.observe_latest().await.unwrap().revision(),
+        vec![initial],
+        Vec::new(),
+        [4; 32],
+    )
+    .unwrap();
+    assert_eq!(
+        first.expire_revisions(&different).await.unwrap_err().kind(),
+        ErrorKind::Invalid
+    );
 }
 
 #[tokio::test]
