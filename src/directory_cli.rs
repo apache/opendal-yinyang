@@ -21,6 +21,7 @@ use clap::Subcommand;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use uuid::Uuid;
 use yinyang::core::{CommitId, Fs, Receipt};
 use yinyang::runtime::{Error, ErrorKind};
@@ -179,7 +180,7 @@ async fn retry(
     state: &Path,
     commit_id: Uuid,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let journal = DirectoryJournal::open(fs, state).await?;
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
     publish(&journal, CommitId::from_bytes(*commit_id.as_bytes())).await
 }
 
@@ -189,7 +190,7 @@ async fn export(
     commit_id: Uuid,
     destination: &Path,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let journal = DirectoryJournal::open(fs, state).await?;
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
     let id = CommitId::from_bytes(*commit_id.as_bytes());
     let status = journal.status(id).await?.ok_or_else(|| {
         format!(

@@ -170,22 +170,11 @@ impl std::fmt::Debug for DirectoryJournal {
 }
 
 impl DirectoryJournal {
-    /// Open or create a journal bound to one cloneable publication authority.
+    /// Open or create a journal bound to one shared publication authority.
     ///
     /// Keep this directory outside every source tree published through it.
     /// [`Self::prepare`] rejects a source that contains the journal directory.
-    pub async fn open<A>(authority: &A, directory: impl AsRef<Path>) -> Result<Self>
-    where
-        A: Authority + Clone + 'static,
-    {
-        Self::open_owned(Arc::new(authority.clone()), directory).await
-    }
-
-    /// Open or create a journal from an already shared publication authority.
-    pub async fn open_owned(
-        authority: Arc<dyn Authority>,
-        directory: impl AsRef<Path>,
-    ) -> Result<Self> {
+    pub async fn open(authority: Arc<dyn Authority>, directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref().to_owned();
         tokio::fs::create_dir_all(&directory).await.map_err(local)?;
         let directory = tokio::fs::canonicalize(&directory).await.map_err(local)?;

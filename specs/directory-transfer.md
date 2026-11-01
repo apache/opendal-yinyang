@@ -22,10 +22,11 @@ retries. Replanning from another snapshot or changed local input is a new
 logical request and requires a new identity.
 
 `DirectoryJournal` adds opt-in cross-process recovery for callers that cannot
-retain all in-process evidence. `prepare` accepts only a new identity and rejects
-an identity already in the journal before reading the source. `publish` takes
-only a `CommitId`; it restores and retries the original frozen transaction and
-never accepts, scans or replans from a source path.
+retain all in-process evidence. It is opened with one
+`Arc<dyn Authority>` and retains that shared authority. `prepare` accepts only a
+new identity and rejects an identity already in the journal before reading the
+source. `publish` takes only a `CommitId`; it restores and retries the original
+frozen transaction and never accepts, scans or replans from a source path.
 
 For backup, stop the publishing process and use a consistent SQLite backup of
 `directory.db`; copy the complete immutable object prefix referenced by the

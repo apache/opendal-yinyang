@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
 use yinyang::core::{CommitId, Fs, Revision};
 #[cfg(target_os = "linux")]
 mod direct_sync_cli;
@@ -235,7 +236,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
             let id = CommitId::from_bytes(*uuid.as_bytes());
             let journal = if let Some(state) = &state {
-                let journal = yinyang::DirectoryJournal::open(&fs, state).await?;
+                let journal = yinyang::DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
                 if journal.status(id).await?.is_some() {
                     return Err(format!(
                         "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",

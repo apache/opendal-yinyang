@@ -32,6 +32,7 @@ use futures_util::future::BoxFuture;
 use opendal::Operator;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -67,18 +68,21 @@ mod connection_tracking {
 }
 
 type Db = Arc<Mutex<Connection>>;
+const ROLLBACK_FAILURE_PREFIX: &str = "yy metadata service: ROLLBACK failed";
 
 struct SqliteTransaction {
     writer: Db,
     gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    poisoned: Arc<AtomicBool>,
     active: bool,
 }
 
 impl SqliteTransaction {
-    fn new(writer: Db, gate: tokio::sync::OwnedMutexGuard<()>) -> Self {
+    fn new(writer: Db, gate: tokio::sync::OwnedMutexGuard<()>, poisoned: Arc<AtomicBool>) -> Self {
         Self {
             writer,
             gate: Some(gate),
+            poisoned,
             active: true,
         }
     }
@@ -88,11 +92,15 @@ impl SqliteTransaction {
     }
 
     async fn rollback(mut self) {
-        let _ = db_call(&self.writer, |connection| {
-            connection.execute_batch("ROLLBACK").map_err(sql)?;
-            Ok(())
+        let result = db_call(&self.writer, |connection| {
+            rollback_connection(connection).map_err(|message| {
+                Error::new(ErrorKind::Storage, "rollback metadata transaction", message)
+            })
         })
         .await;
+        if let Err(error) = result {
+            report_rollback_failure(&self.poisoned, error);
+        }
         self.active = false;
     }
 }
@@ -105,24 +113,57 @@ impl Drop for SqliteTransaction {
         let Some(gate) = self.gate.take() else {
             return;
         };
+        // Dropping the cancelled future removes every handle that could enqueue
+        // another db_call. At most one already-running blocking call can still
+        // hold the writer mutex; this cleanup waits for it, then rolls back, and
+        // keeps the gate until cleanup finishes.
         let writer = self.writer.clone();
+        let poisoned = self.poisoned.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             drop(runtime.spawn_blocking(move || {
-                rollback_sync(&writer);
+                if let Err(error) = rollback_sync(&writer) {
+                    report_rollback_failure(&poisoned, error);
+                }
                 drop(gate);
             }));
         } else {
-            rollback_sync(&writer);
+            if let Err(error) = rollback_sync(&writer) {
+                report_rollback_failure(&poisoned, error);
+            }
             drop(gate);
         }
     }
 }
 
-fn rollback_sync(writer: &Db) {
-    let Ok(connection) = writer.lock() else {
-        return;
-    };
-    let _ = connection.execute_batch("ROLLBACK");
+fn rollback_sync(writer: &Db) -> std::result::Result<(), String> {
+    let connection = writer
+        .lock()
+        .map_err(|_| "writer connection lock is poisoned".to_owned())?;
+    rollback_connection(&connection)
+}
+
+fn rollback_connection(connection: &Connection) -> std::result::Result<(), String> {
+    match connection.execute_batch("ROLLBACK") {
+        Ok(()) => Ok(()),
+        Err(_) if connection.is_autocommit() => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn report_rollback_failure(poisoned: &AtomicBool, error: impl std::fmt::Display) {
+    poisoned.store(true, Ordering::Release);
+    eprintln!("{ROLLBACK_FAILURE_PREFIX}: {error}; reopen the metadata service");
+}
+
+fn ensure_writer_healthy(poisoned: &AtomicBool) -> Result<()> {
+    if poisoned.load(Ordering::Acquire) {
+        return Err(Error::new(
+            ErrorKind::Storage,
+            "metadata database",
+            "writer connection is unusable after a failed ROLLBACK; reopen the metadata service",
+        ));
+    }
+    Ok(())
 }
 
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
@@ -150,6 +191,7 @@ pub struct MetadataService {
     writer: Db,
     reader: Db,
     write_gate: Arc<tokio::sync::Mutex<()>>,
+    writer_poisoned: Arc<AtomicBool>,
     data: DataStore,
     filesystem: NodeId,
     root: NodeId,
@@ -405,6 +447,7 @@ impl MetadataService {
             writer,
             reader,
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            writer_poisoned: Arc::new(AtomicBool::new(false)),
             data: DataStore::new(operator.clone(), filesystem)?,
             filesystem,
             root,
@@ -432,6 +475,7 @@ impl MetadataService {
             writer,
             reader,
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            writer_poisoned: Arc::new(AtomicBool::new(false)),
             data: DataStore::new(operator.clone(), filesystem)?,
             filesystem,
             root,
@@ -686,6 +730,7 @@ impl MetadataService {
     pub(crate) async fn remember(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?.to_bytes();
         let _guard = self.write_gate.lock().await;
+        ensure_writer_healthy(&self.writer_poisoned)?;
         db_call(&self.writer, move |c| {
             c.execute(
                 "INSERT OR IGNORE INTO prepared VALUES(?1)",
@@ -744,6 +789,7 @@ impl MetadataService {
             return Ok(vec![]);
         }
         let gate = Arc::clone(&self.write_gate).lock_owned().await;
+        ensure_writer_healthy(&self.writer_poisoned)?;
         // Even an in-process caller must have registered durable readiness.
         let mut restored = Vec::new();
         for request in requests {
@@ -763,7 +809,8 @@ impl MetadataService {
         requests: &[Transaction],
         gate: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<Vec<Outcome>> {
-        let transaction = SqliteTransaction::new(self.writer.clone(), gate);
+        let transaction =
+            SqliteTransaction::new(self.writer.clone(), gate, Arc::clone(&self.writer_poisoned));
         let result = self.publish_inner(requests).await;
         if result.as_ref().is_err()
             || result.as_ref().is_ok_and(|outcomes| {
@@ -1005,7 +1052,6 @@ mod connection_tests {
     use super::*;
     use crate::support::TestBackend;
     use crate::{CommitId, Planner};
-    use std::time::Instant;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metadata_service_reuses_connections() {
@@ -1051,7 +1097,11 @@ mod connection_tests {
         .await
         .unwrap();
 
-        drop(SqliteTransaction::new(service.writer.clone(), gate));
+        drop(SqliteTransaction::new(
+            service.writer.clone(),
+            gate,
+            Arc::clone(&service.writer_poisoned),
+        ));
 
         let _gate = Arc::clone(&service.write_gate).lock_owned().await;
         db_call(&service.writer, |connection| {
@@ -1063,47 +1113,41 @@ mod connection_tests {
         .unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "measurement benchmark; run explicitly on nier"]
-    async fn metadata_service_connection_reuse_measurement() {
-        const CALLS: usize = 200;
+    #[test]
+    fn rollback_accepts_an_already_finished_transaction() {
+        let connection = Connection::open_in_memory().unwrap();
+        assert!(rollback_connection(&connection).is_ok());
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_writer_requires_service_reopen() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("metadata.db");
         let backend = TestBackend::default();
-        let started = Instant::now();
-        let service = MetadataService::create(&path, backend.operator())
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
             .await
             .unwrap();
-        let open_elapsed = started.elapsed();
-        let after_open = connection_tracking::count(&path);
-
-        let started = Instant::now();
-        for _ in 0..CALLS {
-            service.observe_latest().await.unwrap();
-        }
-        let observe_elapsed = started.elapsed();
-        let after_observe = connection_tracking::count(&path);
+        service.writer_poisoned.store(true, Ordering::Release);
 
         let content = service
             .data()
-            .prepare(&mut b"measurement".as_slice())
+            .prepare(&mut b"poisoned".as_slice())
             .await
             .unwrap();
-        let started = Instant::now();
-        for _ in 0..CALLS {
-            service.remember(&content).await.unwrap();
-        }
-        let remember_elapsed = started.elapsed();
-        let after_remember = connection_tracking::count(&path);
+        let error = service.remember(&content).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("reopen the metadata service"));
 
-        println!(
-            "connection-reuse calls={CALLS} opens=create:{after_open} \
-             observe:{after_observe} remember:{after_remember} \
-             create_us={} observe_us_per_call={} remember_us_per_call={}",
-            open_elapsed.as_micros(),
-            observe_elapsed.as_micros() / CALLS as u128,
-            remember_elapsed.as_micros() / CALLS as u128,
-        );
+        let observed = service.observe_latest().await.unwrap();
+        let mut planner = Planner::new(&observed, CommitId::generate());
+        planner
+            .create_file(service.root(), "file", content, false)
+            .await
+            .unwrap();
+        let error = service
+            .commit(&planner.finish().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("reopen the metadata service"));
     }
 }

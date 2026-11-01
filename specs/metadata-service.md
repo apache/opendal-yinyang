@@ -165,6 +165,14 @@ not cancel or prove rollback of an in-flight durable transaction. Resolve via
 a retained receipt or retry the exact frozen request. Absent receipt is not
 proof that a delayed request cannot still commit.
 
+Cancelling a publication drops every future handle that could enqueue another
+database call. Transaction cleanup waits for at most the blocking call that was
+already in flight, rolls back, and only then releases the writer gate. If
+`ROLLBACK` fails and SQLite has not returned to autocommit mode, the service
+logs a stable `yy metadata service: ROLLBACK failed` diagnostic and marks the
+writer connection poisoned. Later writes return `Storage` and require the caller
+to reopen the service; reads on the separate read connection remain available.
+
 Duplicate identity/digest returns the original receipt. Identity reused with a
 different digest is invalid. Reopening the same database retains receipts,
 readiness, changes, and historical revisions. No automatic failover or
