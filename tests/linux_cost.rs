@@ -1245,7 +1245,7 @@ fn run_write_latency_case(
     let fixture = &bench.fixture;
     let meter = bench.network(proxy);
     fixture.remote_create_directory("write-latency");
-    let expected = (0..WRITE_LATENCY_TOTAL_FILES)
+    let mut expected = (0..WRITE_LATENCY_TOTAL_FILES)
         .map(|index| payload(size, 0x50 + u8::try_from(index).expect("small file set")))
         .collect::<Vec<_>>();
     for batch in 0..WRITE_LATENCY_BATCHES {
@@ -1257,6 +1257,9 @@ fn run_write_latency_case(
                 false,
             );
         }
+    }
+    for bytes in &mut expected {
+        bytes[offset as usize..offset as usize + RANGE_BYTES].copy_from_slice(&replacement);
     }
     let (config, staging, mountpoint) = mount_paths(
         fixture,
