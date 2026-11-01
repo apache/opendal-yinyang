@@ -4,6 +4,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 
 | Specification | Status |
 | --- | --- |
+| [Design principles](design-principles.md) | Maintained rules every change must satisfy: layering, single implementations, cost, retention, durability and review checklist. |
 | [Compatibility](compatibility.md) | Supported persistent and wire profile matrix, admission, and transition limits. |
 | [YinYang object profile](yinyang-format.md) | Experimental indexed transactions and OpenDAL head publication. |
 | [Directory transfer](directory-transfer.md) | One-shot local directory publication and restoration. |
@@ -31,13 +32,8 @@ invariants, compatibility rules, and implementation boundaries. Specifications
 evolve with the implementation and must be updated in the same change as the
 contract they describe.
 
-On 2026-10-27,
-[PR #83](https://github.com/apache/opendal-yinyang/pull/83),
-[PR #84](https://github.com/apache/opendal-yinyang/pull/84), and
-[PR #85](https://github.com/apache/opendal-yinyang/pull/85) established the
-Linux Managed Mount and its native acceptance suite. All 22 real-mount
-scenarios passed on an isolated Ubuntu 24.04 AWS host and in GitHub Linux CI,
-using both publication authorities. See the
+The Linux Managed Mount native acceptance suite runs every real-mount scenario
+in GitHub Linux CI with both publication authorities. See the
 [acceptance guide](../docs/linux-fuse-acceptance.md). This evidence does not
 make the frontend a release-supported combination.
 

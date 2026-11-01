@@ -29,16 +29,11 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 ## Current support
 
 - **Managed Mount:** The experimental Linux FUSE frontend supports read-only and
-  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`.
-  [PR #83](https://github.com/apache/opendal-yinyang/pull/83),
-  [PR #84](https://github.com/apache/opendal-yinyang/pull/84), and
-  [PR #85](https://github.com/apache/opendal-yinyang/pull/85) added the
-  frontend, writable callbacks, and native acceptance on 2026-10-27. The
-  [PR #85 record](https://github.com/apache/opendal-yinyang/pull/85) documents
-  all 22 real-mount scenarios passing on an isolated Ubuntu 24.04 AWS host;
-  the [GitHub Linux FUSE job](https://github.com/apache/opendal-yinyang/actions/runs/40312762537/job/121539655561)
-  also passed all 22. Both publication authorities are exercised, covering
-  saves, failure retention, refresh, crash recovery, and teardown. See the
+  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`. The
+  native acceptance suite (`cargo x test-linux-fuse`) runs every real-mount
+  scenario in GitHub Linux CI against both publication authorities, covering
+  saves, failure retention, refresh, crash recovery, read-only range
+  hydration, incremental writes, retention and teardown. See the
   [frontend contract](specs/linux-fuse.md) and
   [acceptance guide](docs/linux-fuse-acceptance.md). This is experimental
   native validation, not release support.
@@ -52,18 +47,22 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   isolated macOS 27 / Xcode 27 prototypes. They share the native bridge and
   runtimes, but ordinary volume CLI admission does not select them. See the
   [macOS frontend contract](specs/macos-frontends.md).
-- **Direct:** The library and Linux FUSE frontend can browse and read an
-  existing S3-compatible object namespace without importing it into Managed
-  metadata. Keys use a reversible Linux-name mapping, recursive listing is an
-  explicit SIGHUP-refreshed observation, and each descriptor pins a real object
-  version or uses conditional ETag ranges. The library also has an experimental
-  conditional whole-object mutation runtime with retained local generations and
-  safe-save copy/rename outcomes. See the [Direct contract](specs/direct.md) and
-  [mutation runtime](specs/direct-mutations.md). Writable FUSE admission and
-  Direct Sync remain separate integration work. The current MinIO-compatible
+- **Direct:** The library and Linux FUSE frontend browse, read and
+  conditionally write an existing S3-compatible object namespace without
+  importing it into Managed metadata. Keys use a reversible Linux-name mapping,
+  recursive listing is an explicit SIGHUP-refreshed observation, and each
+  descriptor pins a real object version or uses conditional ETag ranges.
+  Writable Direct Mount publishes whole objects conditionally with retained
+  local generations and safe-save rename outcomes, and Direct Sync reconciles
+  an ordinary Linux directory with the namespace. See the
+  [Direct contract](specs/direct.md),
+  [mutation runtime](specs/direct-mutations.md) and
+  [Direct Sync contract](specs/direct-sync.md). The current MinIO-compatible
   Silo qualification does not cover a namespace whose LIST hides a descendant
   behind an existing file-prefix alias; the selected service must enumerate
   every current key.
+
+Every change follows the [design principles](specs/design-principles.md).
 
 The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
 tracks the remaining integration and platform work.
