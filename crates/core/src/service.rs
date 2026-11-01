@@ -107,10 +107,10 @@ impl Drop for SqliteTransaction {
         };
         let writer = self.writer.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let _ = runtime.spawn_blocking(move || {
+            drop(runtime.spawn_blocking(move || {
                 rollback_sync(&writer);
                 drop(gate);
-            });
+            }));
         } else {
             rollback_sync(&writer);
             drop(gate);
