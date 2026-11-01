@@ -432,7 +432,7 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
         if root_inside_state {
             std::fs::create_dir(&state).unwrap();
         } else {
-            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
         }
         let error = DirectorySync::restore(authority.clone(), &backup, &state, &root)
             .await

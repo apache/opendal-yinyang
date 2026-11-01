@@ -211,7 +211,7 @@ fn managed_sync_containment_is_symmetric_for_init_and_restore() {
         if root_inside_state {
             fs::create_dir(&state).unwrap();
         } else {
-            fs::create_dir(&root).unwrap();
+            fs::create_dir_all(&root).unwrap();
         }
         let config = write_sync_config(&fixture, "containment-restore", &state);
         let output = fixture.yy(&[
