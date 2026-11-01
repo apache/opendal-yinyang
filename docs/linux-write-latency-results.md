@@ -13,9 +13,9 @@ publication.
 Fsync dominates the lifecycle. Writable open is roughly an eighth of the total,
 and the local SQLite-backed mutation is the smallest contribution. Four workers
 reduce whole-batch wall time while increasing each file's end-to-end latency.
-The proxies observed four simultaneous S3 requests and up to six simultaneous
-metadata-service RPCs, so the concurrency result is measured rather than
-inferred from the configured writer count.
+The proxies observed up to four overlapping S3 request intervals and up to six
+overlapping metadata-service proxy connections, so the concurrency result is
+measured rather than inferred from the configured writer count.
 
 The values are one bounded loopback-Silo run. Twelve file samples were collected
 in three correlated rounds; they are not twelve independent production
@@ -56,7 +56,7 @@ phase.
 
 ## Lifecycle latency
 
-| Authority | Writers | Samples | p50 ms | p95 ms | Batch wall ms | S3 GET/HEAD/PUT | Service RPCs |
+| Authority | Writers | Samples | p50 ms | p95 ms | Batch wall ms | S3 GET/HEAD/PUT | Service proxy connections |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | object | 1 | 12 | 90.639 | 96.762 | 1,098.388 | 452/72/84 | 0 |
 | object | 4 | 12 | 193.854 | 283.066 | 665.116 | 458/72/84 | 0 |
@@ -77,7 +77,7 @@ the end-to-end sample or batch wall.
 
 ## Concurrency
 
-| Authority | Max S3 requests | S3 overlap ms | Max service RPCs | RPC overlap ms | Batch wall change |
+| Authority | Max S3 request intervals | S3 overlap ms | Max service proxy connections | Connection overlap ms | Batch wall change |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | object | 4 | 323.641 | 0 | 0 | -39.4% |
 | service | 4 | 70.170 | 6 | 410.599 | -56.6% |
@@ -87,15 +87,21 @@ and from 69.968 to 103.649 ms for service publication. The concurrent case
 therefore improves aggregate wall time while increasing contention observed by
 each writer.
 
-Object publication reaches content and metadata-request concurrency four but
-individual fsyncs wait materially longer. Service publication overlaps more RPC
-work and has the larger whole-batch improvement.
+Object publication reaches S3 request-interval concurrency four but individual
+fsyncs wait materially longer. Service publication has more overlapping proxy
+connection intervals and the larger whole-batch improvement.
 
 `observed_application_operation_overlap_ms` in the raw records is computed as
 the sum of worker file totals minus batch span. It measures concurrency excess,
 not the exact wall-clock duration in which at least two application operations
-were simultaneously active. The exact peak concurrency values in this table
-come from observed S3 and service request intervals.
+were simultaneously active. S3 peak concurrency comes from request start to
+response completion, not server CPU parallelism. Service peak concurrency comes
+from accepted proxy connection intervals through bidirectional forwarding and
+teardown. It can include connection setup, queueing, forwarding, and teardown
+overlap, and does not prove that the metadata server executed that many RPCs in
+parallel. The raw field name
+`observed_service_rpc_max_concurrency` is retained for artifact compatibility;
+the report calls it observed proxy connection overlap.
 
 ## Attribution boundary
 
@@ -127,7 +133,7 @@ Planning reuses it only when its revision exactly equals the durable staged
 base. Frozen retry, recovery, revision advance, conflict, abort, and close clear
 or bypass the observation and retain the original fallback behavior.
 
-| Authority | Writers | p50 ms baseline -> optimized | p95 ms baseline -> optimized | Batch wall ms baseline -> optimized | S3 requests | Service RPCs |
+| Authority | Writers | p50 ms baseline -> optimized | p95 ms baseline -> optimized | Batch wall ms baseline -> optimized | S3 requests | Service proxy connections |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | object | 1 | 90.639 -> 85.357 | 96.762 -> 100.599 | 1,098.388 -> 1,054.363 | 608 -> 568 | 0 -> 0 |
 | object | 4 | 193.854 -> 191.509 | 283.066 -> 277.879 | 665.116 -> 647.623 | 614 -> 568 | 0 -> 0 |
@@ -136,9 +142,9 @@ or bypass the observation and retain the original fallback behavior.
 
 The deterministic effect is one fewer exact-base metadata observation per
 publication. Object publication removes 40 GET requests for one writer and 46
-for four writers across twelve files. Service publication removes one RPC per
-file, reducing 161 RPCs to 149 without changing its S3 request count or body
-bytes.
+for four writers across twelve files. Service publication removes one proxy
+connection per file, reducing 161 accepted proxy connections to 149 without
+changing its S3 request count or body bytes.
 
 Latency movement remains mixed. Object single-writer p50 improves 5.8%, while
 its p95 regresses 4.0%. Service four-writer p50 improves 7.1%, but batch wall
@@ -151,9 +157,10 @@ one-writer, 21,244 to 21,176 KiB for object four-writer, 18,056 to 18,148 KiB fo
 service one-writer, and 17,892 to 18,608 KiB for service four-writer. These are
 process-wide observations after earlier scenarios, not an isolated snapshot
 cache delta. The retained observation keeps the existing bounded snapshot cache
-alive for one active writable handle; the theoretical combined cache ceiling is
-48 MiB only if it becomes maximally populated. Normal open and planning load
-only the file and predicate pages.
+payload alive for one active writable handle. Its 48 MiB combined theoretical
+ceiling is encoded page and external-value cache payload only, not a bound on
+total process RSS. Normal open and planning load only the file and predicate
+pages.
 
 ## Evidence
 

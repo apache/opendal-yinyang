@@ -71,13 +71,15 @@ that does not exactly match therefore uses the normal `observe_revision` path.
 
 Retaining the observation also retains its operation-local index cache. The
 existing object snapshot bounds are 256 pages and 4,096 external values totaling
-at most 32 MiB, making the combined cache ceiling 48 MiB for a maximally filled
-snapshot retained by one active writable handle. Opening and planning normally
-load only the pages needed for the file and its predicates. An in-process
-metadata-service snapshot also retains its idle SQLite connection and records
-reader; it has no active read transaction between calls. A remote service
-client and the object-backed metadata path do not retain a database
-transaction. Releasing or closing the handle releases its retained snapshot.
+at most 32 MiB. A maximally filled snapshot can therefore retain at most 48 MiB
+of encoded page and external-value cache payload for one active writable
+handle. This is not a bound on total process RSS or allocator overhead. Opening
+and planning normally load only the pages needed for the file and its
+predicates. An in-process metadata-service snapshot also retains its idle
+SQLite connection and records reader; it has no active read transaction between
+calls. A remote service client and the object-backed metadata path do not
+retain a database transaction. Releasing or closing the handle releases its
+retained snapshot.
 
 A handle is uniquely leased in a runtime and is not cloneable. Its UUID can be
 recovered after drop or process restart. Rename does not change its node
