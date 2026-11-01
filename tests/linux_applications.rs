@@ -304,22 +304,29 @@ fn tar_extract(archive: &Path, destination: &Path) -> AppOutput {
     run_application(command)
 }
 
-fn assert_tar_round_trip(root: &Path, expected_payload: &[u8]) {
-    assert_file(&root.join("assets/payload.bin"), expected_payload, 0o644);
+fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool) {
+    let file_mode = if read_only { 0o444 } else { 0o644 };
+    let writable_mode = if read_only { 0o555 } else { 0o755 };
+    let directory_mode = if read_only { 0o555 } else { 0o755 };
+    assert_file(
+        &root.join("assets/payload.bin"),
+        expected_payload,
+        file_mode,
+    );
     assert_file(
         &root.join("notes/readme.txt"),
         b"YinYang application trial\n",
-        0o644,
+        file_mode,
     );
     assert_file(
         &root.join("notes/remove.txt"),
         b"this file is removed by the second sync\n",
-        0o644,
+        file_mode,
     );
     assert_file(
         &root.join("bin/run.sh"),
         b"#!/bin/sh\nprintf 'archive trial\\n'\n",
-        0o755,
+        writable_mode,
     );
     for directory in ["", "assets", "bin", "notes"] {
         let path = if directory.is_empty() {
@@ -327,10 +334,15 @@ fn assert_tar_round_trip(root: &Path, expected_payload: &[u8]) {
         } else {
             root.join(directory)
         };
-        assert_eq!(mode(&path), 0o755, "directory mode for {}", path.display());
+        assert_eq!(
+            mode(&path),
+            directory_mode,
+            "directory mode for {}",
+            path.display()
+        );
     }
     assert!(root.join("empty").is_dir());
-    assert_eq!(mode(&root.join("empty")), 0o755);
+    assert_eq!(mode(&root.join("empty")), directory_mode);
 }
 
 #[test]
@@ -357,7 +369,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         let mut mounted = fixture.mount(&config, &mountpoint);
         fs::create_dir(&extracted).expect("create mounted extraction root");
         tar_extract(&archive, &extracted).success_or("extract tar through FUSE");
-        assert_tar_round_trip(&extracted, &expected_payload);
+        assert_tar_round_trip(&extracted, &expected_payload, false);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/notes/readme.txt", 64),
             b"YinYang application trial\n"
@@ -394,6 +406,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         assert_tar_round_trip(
             &remounted.mountpoint().join("tar-tree").as_path(),
             &expected_payload,
+            true,
         );
         let mounted_archive = fixture.temp.path().join("mounted-tree.tar");
         tar_create(&mounted_archive, &remounted.mountpoint().join("tar-tree"))
@@ -401,7 +414,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         fs::create_dir(&roundtrip).expect("create local tar round-trip root");
         tar_extract(&mounted_archive, &roundtrip)
             .success_or("extract mounted-tree archive locally");
-        assert_tar_round_trip(&roundtrip, &expected_payload);
+        assert_tar_round_trip(&roundtrip, &expected_payload, false);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/bin/run.sh", 64),
             b"#!/bin/sh\nprintf 'archive trial\\n'\n"
