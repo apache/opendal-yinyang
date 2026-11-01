@@ -800,6 +800,19 @@ impl Stage {
     pub fn full_sync_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.full_sync_calls.clone()
     }
+    #[cfg(test)]
+    pub async fn set_synchronous(&self, synchronous: &'static str) -> Result<()> {
+        let pragma = match synchronous {
+            "NORMAL" => "PRAGMA synchronous=NORMAL",
+            "FULL" => "PRAGMA synchronous=FULL",
+            _ => return Err(Error::Invalid("unsupported synchronous mode")),
+        };
+        self.call(move |connection| {
+            connection.execute_batch(pragma).map_err(local)?;
+            Ok(())
+        })
+        .await
+    }
     async fn call_durable<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
