@@ -402,6 +402,31 @@ impl LocalTree {
         Ok(())
     }
 
+    pub fn release_artifact(&self, artifact: &ArtifactRecord) -> Result<bool> {
+        let Some(stat) = optional_stat(
+            &self.artifact_fd,
+            &artifact.name,
+            &self.artifact_path(artifact),
+        )?
+        else {
+            return Ok(true);
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Ok(false);
+        }
+        unlinkat(&self.artifact_fd, artifact.name.as_str(), AtFlags::empty()).map_err(|error| {
+            Error::errno(
+                "release Direct Sync artifact",
+                &self.artifact_path(artifact),
+                error,
+            )
+        })?;
+        fsync(&self.artifact_fd).map_err(|error| {
+            Error::errno("persist Direct Sync artifact release", &self.state, error)
+        })?;
+        Ok(true)
+    }
+
     pub fn open_live_file(&self, path: &str) -> Result<std::fs::File> {
         validate_path(path)?;
         let (parent, name) = split_path(path)?;
@@ -538,6 +563,7 @@ impl LocalTree {
                         self.settle_displaced_artifact(store, &install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
                         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
+                        self.release_completed_artifact(store, &install)?;
                     } else if self.local_matches_expected(&install)? {
                         install.state = InstallState::Prepared;
                         store.update_install(&install)?;
@@ -556,6 +582,7 @@ impl LocalTree {
                         self.settle_displaced_artifact(store, &install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
                         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
+                        self.release_completed_artifact(store, &install)?;
                     } else {
                         install.state = InstallState::Conflict;
                         install.error = Some(
@@ -597,6 +624,80 @@ impl LocalTree {
             parent_dev: parent_identity.dev,
             parent_ino: parent_identity.ino,
         })
+    }
+
+    pub fn observe_path(&self, path: &str) -> Result<Option<LocalNode>> {
+        validate_path(path)?;
+        if path.is_empty() {
+            return Ok(Some(LocalNode {
+                path: String::new(),
+                kind: crate::replica::LocalKind::Directory,
+                executable: false,
+                identity: self.root_identity,
+                parent: None,
+            }));
+        }
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        let parent_identity = identity(
+            &parent_fd,
+            &self.root.join(parent),
+            "inspect Direct Sync local parent",
+        )?;
+        let Some(stat) = optional_stat(&parent_fd, name, &self.root.join(path))? else {
+            return Ok(None);
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let fd = openat(
+                    &parent_fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    Error::errno(
+                        "open Direct Sync local directory",
+                        &self.root.join(path),
+                        error,
+                    )
+                })?;
+                Ok(Some(LocalNode {
+                    path: path.to_owned(),
+                    kind: crate::replica::LocalKind::Directory,
+                    executable: false,
+                    identity: identity(
+                        &fd,
+                        &self.root.join(path),
+                        "inspect Direct Sync local directory",
+                    )?,
+                    parent: Some(parent_identity),
+                }))
+            }
+            FileType::RegularFile => {
+                let fingerprint = self.local_fingerprint(path)?;
+                Ok(Some(LocalNode {
+                    path: path.to_owned(),
+                    kind: crate::replica::LocalKind::File {
+                        length: fingerprint.length,
+                        digest: ContentHash::from_bytes(fingerprint.digest),
+                    },
+                    executable: Mode::from_raw_mode(stat.st_mode)
+                        .intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH),
+                    identity: fingerprint.identity(),
+                    parent: Some(Identity {
+                        dev: fingerprint.parent_dev,
+                        ino: fingerprint.parent_ino,
+                    }),
+                }))
+            }
+            FileType::Symlink => Err(Error::unsupported(format!(
+                "Direct Sync local symlink is not supported: {path}"
+            ))),
+            _ => Err(Error::unsupported(format!(
+                "Direct Sync local special file is not supported: {path}"
+            ))),
+        }
     }
 
     fn install_file(&self, store: &mut Store, install: &mut InstallRecord) -> Result<()> {
@@ -813,6 +914,7 @@ impl LocalTree {
         }
         let baseline = build_baseline(install, fingerprint)?;
         store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
+        self.release_completed_artifact(store, install)?;
         Ok(())
     }
 
@@ -970,6 +1072,26 @@ impl LocalTree {
                 Error::errno("persist Direct Sync artifact directory", &self.state, error)
             })?;
             store.update_artifact(id, ArtifactPhase::Retained, None)?;
+        }
+        Ok(())
+    }
+
+    fn release_completed_artifact(&self, store: &mut Store, install: &InstallRecord) -> Result<()> {
+        if install.operation != InstallOperation::Replace {
+            return Ok(());
+        }
+        let Some(id) = install.artifact.as_deref() else {
+            return Ok(());
+        };
+        let Some(artifact) = store
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == id)
+        else {
+            return Ok(());
+        };
+        if self.release_artifact(&artifact)? {
+            store.remove_artifact(id)?;
         }
         Ok(())
     }

@@ -16,7 +16,9 @@
 // under the License.
 
 use super::backup::BackupManifest;
-use super::state::{ArtifactRecord, ConflictRecord, InstallPhase, InstallRecord, Store};
+use super::state::{
+    ArtifactRecord, ArtifactStat, ConflictRecord, InstallPhase, InstallRecord, Store,
+};
 use super::{Error, Result};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
@@ -27,6 +29,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use yinyang_core::{NodeId, Revision};
+
+/// Maximum number of non-conflict artifacts retained by one replica.
+pub const ARTIFACT_BUDGET_COUNT: usize = 64;
+/// Maximum bytes retained by non-conflict artifacts in one replica.
+pub const ARTIFACT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ContentHash([u8; 32]);
@@ -116,6 +123,48 @@ impl LocalSnapshot {
             })
             .collect()
     }
+
+    pub fn insert_node(&mut self, node: LocalNode) -> Option<LocalNode> {
+        self.nodes.insert(node.path.clone(), node)
+    }
+
+    pub fn remove_path(&mut self, path: &str) -> Option<LocalNode> {
+        self.nodes.remove(path)
+    }
+
+    pub fn remove_subtree(&mut self, path: &str) {
+        let prefix = format!("{path}/");
+        self.nodes
+            .retain(|candidate, _| candidate != path && !candidate.starts_with(&prefix));
+    }
+
+    pub fn move_subtree(&mut self, from: &str, to: &str, observed_root: &LocalNode) {
+        let prefix = format!("{from}/");
+        let moved = self
+            .nodes
+            .iter()
+            .filter(|(path, _)| *path == from || path.starts_with(&prefix))
+            .map(|(path, node)| {
+                let destination = if path == from {
+                    to.to_owned()
+                } else {
+                    format!("{to}{}", &path[from.len()..])
+                };
+                (path.clone(), destination, node.clone())
+            })
+            .collect::<Vec<_>>();
+        for (source, _, _) in &moved {
+            self.nodes.remove(source);
+        }
+        for (source, destination, mut node) in moved {
+            node.path = destination.clone();
+            if source == from {
+                node.identity = observed_root.identity;
+                node.parent = observed_root.parent;
+            }
+            self.nodes.insert(destination, node);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +197,7 @@ pub struct Artifact {
     pub error: Option<String>,
     pub path: PathBuf,
     pub exportable: bool,
+    pub length: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +233,7 @@ pub struct ReplicaStatus {
     pub filesystem: NodeId,
     pub pending_installs: usize,
     pub artifacts: Vec<Artifact>,
+    pub retained_bytes: u64,
     pub conflicts: Vec<Conflict>,
     pub baseline: Option<ReplicaBaseline>,
 }
@@ -507,7 +558,8 @@ impl Replica {
             .artifacts()?
             .into_iter()
             .map(|record| self.artifact_from(record))
-            .collect();
+            .collect::<Vec<_>>();
+        let retained_bytes = artifacts.iter().map(|artifact| artifact.length).sum();
         let conflicts = self
             .store
             .conflicts()?
@@ -519,6 +571,7 @@ impl Replica {
             filesystem: self.filesystem,
             pending_installs: self.store.incomplete_installs()?.len(),
             artifacts,
+            retained_bytes,
             conflicts,
             baseline: baseline_from_store(&self.store)?,
         })
@@ -626,13 +679,7 @@ impl Replica {
                 && (install.phase == InstallPhase::Retained
                     || install.phase == InstallPhase::Conflict)
             {
-                let matches = hash_artifact_matches(
-                    &self.quarantine_fd,
-                    &record.name,
-                    &install.expected_digest,
-                    install.expected_length,
-                )
-                .unwrap_or_default();
+                let matches = self.artifact_matches_expected(install).unwrap_or_default();
                 if !matches {
                     artifact.phase = "conflict".to_owned();
                     artifact.error = Some(
@@ -640,6 +687,11 @@ impl Replica {
                             .to_owned(),
                     );
                 }
+            } else if !self.artifact_matches_record(&record).unwrap_or_default() {
+                artifact.phase = "conflict".to_owned();
+                artifact.error = Some(
+                    "retained artifact changed after creation; export before cleanup".to_owned(),
+                );
             }
         }
         let conflicts = self
@@ -648,11 +700,13 @@ impl Replica {
             .into_iter()
             .map(Conflict::from)
             .collect();
+        let retained_bytes = artifacts.iter().map(|artifact| artifact.length).sum();
         Ok(ReplicaStatus {
             root: self.root.clone(),
             filesystem: self.filesystem,
             pending_installs: self.store.incomplete_installs()?.len(),
             artifacts,
+            retained_bytes,
             conflicts,
             baseline: baseline_from_store(&self.store)?,
         })
@@ -688,6 +742,48 @@ impl Replica {
                 self.store.update_install(&install)?;
                 self.store
                     .update_artifact(&install.id, "conflict", install.error.as_deref())?;
+            } else {
+                self.refresh_artifact_stat(&install)?;
+            }
+        }
+        for mut artifact in self.store.artifacts()? {
+            if artifact.phase == "conflict" {
+                continue;
+            }
+            match self.artifact_matches_record(&artifact) {
+                Ok(true) => {
+                    if let Some(stat) =
+                        optional_stat(&self.quarantine_fd, &artifact.name, &self.state)?
+                    {
+                        let length =
+                            if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+                                stat.st_size as u64
+                            } else {
+                                artifact.length
+                            };
+                        if !artifact_stat_matches(&artifact, &stat) {
+                            self.store.update_artifact_stat(
+                                &artifact.id,
+                                length,
+                                artifact_stat(&stat),
+                            )?;
+                            artifact.length = length;
+                            artifact.stat = Some(artifact_stat(&stat));
+                        }
+                    }
+                }
+                Ok(false) | Err(_) => {
+                    artifact.phase = "conflict".to_owned();
+                    artifact.error = Some(
+                        "retained artifact changed after creation; export before cleanup"
+                            .to_owned(),
+                    );
+                    self.store.update_artifact(
+                        &artifact.id,
+                        &artifact.phase,
+                        artifact.error.as_deref(),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -710,6 +806,171 @@ impl Replica {
         );
         self.scan_directory(&self.root_fd, "", self.root_identity, &mut nodes)?;
         Ok(LocalSnapshot { nodes })
+    }
+
+    /// Recheck exactly one path. Files are hashed only when their current bytes
+    /// are needed; directories use their descriptor identity directly.
+    pub fn observe_path(&self, path: &str) -> Result<Option<LocalNode>> {
+        if path.is_empty() {
+            return Ok(Some(LocalNode {
+                path: String::new(),
+                kind: LocalKind::Directory,
+                executable: false,
+                identity: self.root_identity,
+                parent: None,
+            }));
+        }
+        validate_path(path)?;
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        let parent_identity = identity(&parent_fd, &self.root, "inspect observed parent")?;
+        let Some(stat) = optional_stat(&parent_fd, name, &self.root.join(path))? else {
+            return Ok(None);
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let fd = openat(
+                    &parent_fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    Error::errno(
+                        "open observed local directory",
+                        &self.root.join(path),
+                        error,
+                    )
+                })?;
+                Ok(Some(LocalNode {
+                    path: path.to_owned(),
+                    kind: LocalKind::Directory,
+                    executable: false,
+                    identity: identity(
+                        &fd,
+                        &self.root.join(path),
+                        "inspect observed local directory",
+                    )?,
+                    parent: Some(parent_identity),
+                }))
+            }
+            FileType::RegularFile => {
+                let (length, digest, identity, executable) =
+                    hash_file_at(&parent_fd, name, &self.root.join(path))?;
+                Ok(Some(LocalNode {
+                    path: path.to_owned(),
+                    kind: LocalKind::File { length, digest },
+                    executable,
+                    identity,
+                    parent: Some(parent_identity),
+                }))
+            }
+            FileType::Symlink => Err(Error::unsupported(format!(
+                "local symlink is not supported: {path}"
+            ))),
+            _ => Err(Error::unsupported(format!(
+                "local special file is not supported: {path}"
+            ))),
+        }
+    }
+
+    /// Scan exactly one path and, for a directory, its descendants.
+    pub fn scan_subtree(&self, path: &str) -> Result<LocalSnapshot> {
+        if path.is_empty() {
+            return self.scan();
+        }
+        validate_path(path)?;
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        let parent_identity = identity(&parent_fd, &self.root, "inspect subtree parent")?;
+        let stat = statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| Error::errno("inspect local subtree", &self.root.join(path), error))?;
+        let mut nodes = BTreeMap::new();
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let fd = openat(
+                    &parent_fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    Error::errno("open local subtree", &self.root.join(path), error)
+                })?;
+                let root_identity = identity(&fd, &self.root.join(path), "inspect local subtree")?;
+                nodes.insert(
+                    path.to_owned(),
+                    LocalNode {
+                        path: path.to_owned(),
+                        kind: LocalKind::Directory,
+                        executable: false,
+                        identity: root_identity,
+                        parent: Some(parent_identity),
+                    },
+                );
+                scan_directory(
+                    &fd,
+                    path,
+                    root_identity,
+                    &self.root,
+                    self.root_identity.dev,
+                    &mut nodes,
+                )?;
+            }
+            FileType::RegularFile => {
+                let (length, digest, identity, executable) =
+                    hash_file_at(&parent_fd, name, &self.root.join(path))?;
+                nodes.insert(
+                    path.to_owned(),
+                    LocalNode {
+                        path: path.to_owned(),
+                        kind: LocalKind::File { length, digest },
+                        executable,
+                        identity,
+                        parent: Some(parent_identity),
+                    },
+                );
+            }
+            FileType::Symlink => {
+                return Err(Error::unsupported(format!(
+                    "local symlink is not supported: {path}"
+                )));
+            }
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "local special file is not supported: {path}"
+                )));
+            }
+        }
+        Ok(LocalSnapshot::from_nodes(nodes))
+    }
+
+    /// Open the exact scanned inode for a one-pass remote content comparison.
+    pub fn open_observed_file(&self, path: &str, expected: &LocalNode) -> Result<std::fs::File> {
+        let LocalKind::File { .. } = expected.kind else {
+            return Err(Error::invalid("observed content must be a regular file"));
+        };
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        let fd = openat(
+            &parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::errno("open observed local file", &self.root.join(path), error))?;
+        let stat = fstat(&fd).map_err(|error| {
+            Error::errno("inspect observed local file", &self.root.join(path), error)
+        })?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_dev != expected.identity.dev
+            || stat.st_ino != expected.identity.ino
+        {
+            return Err(Error::conflict(
+                "observed local file identity changed before use",
+            ));
+        }
+        Ok(std::fs::File::from(fd))
     }
 
     pub fn install_bytes(
@@ -761,6 +1022,9 @@ impl Replica {
             remote_revision: None,
             phase: "preparing".to_owned(),
             error: None,
+            digest: None,
+            length: expected_length,
+            stat: None,
         };
         self.store.insert_artifact(&artifact)?;
         let output = openat(
@@ -823,6 +1087,8 @@ impl Replica {
                     e,
                 )
             })?;
+            let retained = fstat(&output)
+                .map_err(|e| Error::errno("inspect retained upload", &self.state, e))?;
             let digest = ContentHash(*hasher.finalize().as_bytes());
             if length != expected_length || digest.as_bytes() != expected_digest.as_bytes() {
                 return Err(Error::conflict(
@@ -831,6 +1097,13 @@ impl Replica {
             }
             fsync(&self.quarantine_fd)
                 .map_err(|e| Error::errno("persist retained upload directory", &self.state, e))?;
+            self.store
+                .update_artifact_stat(&artifact.id, length, artifact_stat(&retained))?;
+            self.store
+                .update_artifact_digest(&artifact.id, *digest.as_bytes())?;
+            artifact.digest = Some(*digest.as_bytes());
+            artifact.length = length;
+            artifact.stat = Some(artifact_stat(&retained));
             artifact.phase = "retained".to_owned();
             self.store
                 .update_artifact(&artifact.id, &artifact.phase, artifact.error.as_deref())?;
@@ -852,10 +1125,7 @@ impl Replica {
                     AtFlags::empty(),
                 );
             }
-            artifact.phase = "failed".to_owned();
-            artifact.error = Some("capture did not establish a stable local version".to_owned());
-            self.store
-                .update_artifact(&artifact.id, &artifact.phase, artifact.error.as_deref())?;
+            self.store.remove_artifact(&artifact.id)?;
         }
         capture
     }
@@ -893,6 +1163,158 @@ impl Replica {
         Ok(std::fs::File::from(fd))
     }
 
+    /// Release one terminal artifact after the reconciliation that consumed it
+    /// is durable. Active conflicts and unresolved work keep their evidence.
+    pub fn release_artifact(&mut self, id: &str) -> Result<bool> {
+        let Some(record) = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == id)
+        else {
+            return Ok(true);
+        };
+        if record.phase == "conflict" || self.artifact_referenced(&record, true)? {
+            return Ok(false);
+        }
+        if !self.remove_artifact_payload(&record)? {
+            return Ok(false);
+        }
+        self.store.remove_install_by_artifact(&record.name)?;
+        self.store.remove_artifact(&record.id)?;
+        Ok(true)
+    }
+
+    /// Release superseded local versions for one path after its accepted
+    /// baseline is durable.
+    pub fn release_superseded(&mut self, path: &str) -> Result<()> {
+        let ids = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .filter(|artifact| {
+                artifact.origin == path
+                    && matches!(
+                        artifact.kind.as_str(),
+                        "replaced-file" | "rollback-displaced"
+                    )
+            })
+            .map(|artifact| artifact.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.release_artifact(&id)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the documented count and byte budget to release eligible
+    /// artifacts oldest-first. Conflict material and referenced work are never
+    /// candidates.
+    pub fn prune_artifacts(&mut self) -> Result<()> {
+        let artifacts = self.store.artifacts()?;
+        let mut count = artifacts
+            .iter()
+            .filter(|artifact| artifact.phase != "conflict")
+            .count();
+        let mut bytes = artifacts
+            .iter()
+            .filter(|artifact| artifact.phase != "conflict")
+            .map(|artifact| artifact.length)
+            .sum::<u64>();
+        for artifact in artifacts {
+            if count <= ARTIFACT_BUDGET_COUNT && bytes <= ARTIFACT_BUDGET_BYTES {
+                break;
+            }
+            if artifact.phase == "conflict"
+                || self.artifact_referenced(&artifact, true)?
+                || !self.remove_artifact_payload(&artifact)?
+            {
+                continue;
+            }
+            self.store.remove_install_by_artifact(&artifact.name)?;
+            self.store.remove_artifact(&artifact.id)?;
+            count = count.saturating_sub(1);
+            bytes = bytes.saturating_sub(artifact.length);
+        }
+        Ok(())
+    }
+
+    fn artifact_referenced(
+        &self,
+        artifact: &ArtifactRecord,
+        allow_terminal_install: bool,
+    ) -> Result<bool> {
+        if self
+            .store
+            .conflicts()?
+            .iter()
+            .any(|conflict| conflict.local_artifact.as_deref() == Some(artifact.id.as_str()))
+        {
+            return Ok(true);
+        }
+        if self.store.work()?.iter().any(|work| {
+            work.source_artifact.as_deref() == Some(artifact.id.as_str())
+                || work.upload_artifact.as_deref() == Some(artifact.id.as_str())
+        }) {
+            return Ok(true);
+        }
+        for install in self.store.installs()? {
+            if install.artifact != artifact.name {
+                continue;
+            }
+            if !(allow_terminal_install && install.phase == InstallPhase::Retained) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn remove_artifact_payload(&self, artifact: &ArtifactRecord) -> Result<bool> {
+        let Some(stat) = optional_stat(&self.quarantine_fd, &artifact.name, &self.state)? else {
+            return Ok(true);
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => {
+                unlinkat(
+                    &self.quarantine_fd,
+                    artifact.name.as_str(),
+                    AtFlags::empty(),
+                )
+                .map_err(|error| {
+                    Error::errno(
+                        "release retained artifact",
+                        &self.state.join("quarantine").join(&artifact.name),
+                        error,
+                    )
+                })?;
+            }
+            FileType::Directory if artifact.phase == "retained" => {
+                remove_artifact_directory(
+                    &self.quarantine_fd,
+                    &artifact.name,
+                    &self.state.join("quarantine"),
+                )?;
+                unlinkat(
+                    &self.quarantine_fd,
+                    artifact.name.as_str(),
+                    AtFlags::REMOVEDIR,
+                )
+                .map_err(|error| {
+                    Error::errno(
+                        "release retained directory artifact",
+                        &self.state.join("quarantine").join(&artifact.name),
+                        error,
+                    )
+                })?;
+            }
+            FileType::Directory => return Ok(false),
+            _ => return Ok(false),
+        }
+        fsync(&self.quarantine_fd)
+            .map_err(|error| Error::errno("persist artifact release", &self.state, error))?;
+        Ok(true)
+    }
+
     /// Retain an arbitrary byte stream as an immutable artifact so an explicit
     /// conflict resolution input survives a crash, export and a later path
     /// change.
@@ -909,6 +1331,9 @@ impl Replica {
             remote_revision: None,
             phase: "preparing".to_owned(),
             error: None,
+            digest: Some(*blake3::hash(bytes).as_bytes()),
+            length: bytes.len() as u64,
+            stat: None,
         };
         self.store.insert_artifact(&record)?;
         let fd = openat(
@@ -937,6 +1362,14 @@ impl Replica {
             fsync(&self.quarantine_fd).map_err(|e| {
                 Error::errno("persist retained resolution directory", &self.state, e)
             })?;
+            let retained = fstat(&file)
+                .map_err(|e| Error::errno("inspect retained resolution input", &self.state, e))?;
+            self.store.update_artifact_stat(
+                &record.id,
+                bytes.len() as u64,
+                artifact_stat(&retained),
+            )?;
+            record.stat = Some(artifact_stat(&retained));
             Ok(())
         })();
         match written {
@@ -947,10 +1380,8 @@ impl Replica {
                 Ok(id)
             }
             Err(error) => {
-                record.phase = "failed".to_owned();
-                record.error = Some(error.to_string());
-                self.store
-                    .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
+                let _ = self.remove_artifact_payload(&record);
+                self.store.remove_artifact(&record.id)?;
                 Err(error)
             }
         }
@@ -1155,6 +1586,9 @@ impl Replica {
             remote_revision,
             phase: "preparing".to_owned(),
             error: None,
+            digest: Some(*digest.as_bytes()),
+            length,
+            stat: None,
         })?;
         let mut record = InstallRecord {
             id,
@@ -1274,6 +1708,19 @@ impl Replica {
             remote_revision,
             phase: "prepared".to_owned(),
             error: None,
+            digest: match expected_node.kind {
+                LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
+                LocalKind::Directory => None,
+            },
+            length: expected
+                .subtree(path)
+                .values()
+                .map(|node| match node.kind {
+                    LocalKind::File { length, .. } => length,
+                    LocalKind::Directory => 0,
+                })
+                .sum(),
+            stat: None,
         };
         self.store.insert_artifact(&record)?;
         if let Err(error) = renameat_with(
@@ -1283,10 +1730,7 @@ impl Replica {
             artifact_name.as_str(),
             RenameFlags::NOREPLACE,
         ) {
-            record.phase = "failed".to_owned();
-            record.error = Some(error.to_string());
-            self.store
-                .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
+            self.store.remove_artifact(&record.id)?;
             return Err(Error::errno(
                 "quarantine local path",
                 &self.root.join(path),
@@ -1302,6 +1746,18 @@ impl Replica {
             .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
         let actual = self.scan_artifact(&artifact_name)?;
         let matches = same_tree(&expected.subtree(path), &actual);
+        if let Some(stat) = optional_stat(&self.quarantine_fd, &artifact_name, &self.state)? {
+            record.length = actual
+                .values()
+                .map(|node| match node.kind {
+                    LocalKind::File { length, .. } => length,
+                    LocalKind::Directory => 0,
+                })
+                .sum();
+            record.stat = Some(artifact_stat(&stat));
+            self.store
+                .update_artifact_stat(&record.id, record.length, artifact_stat(&stat))?;
+        }
         record.phase = if matches { "retained" } else { "conflict" }.to_owned();
         if !matches {
             record.error = Some(
@@ -1370,6 +1826,7 @@ impl Replica {
             error: record.error,
             path,
             exportable,
+            length: record.length,
         }
     }
 
@@ -1786,9 +2243,60 @@ impl Replica {
         if !matches!(FileType::from_raw_mode(stat.st_mode), FileType::RegularFile) {
             return Ok(false);
         }
+        if let Some(record) = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .find(|record| record.name == install.artifact)
+            && artifact_stat_matches(&record, &stat)
+        {
+            return Ok(true);
+        }
         let (length, digest, _, _) =
             hash_file_at(&self.quarantine_fd, &install.artifact, &self.state)?;
         Ok(length == install.expected_length && digest.as_bytes() == &install.expected_digest)
+    }
+
+    fn refresh_artifact_stat(&mut self, install: &InstallRecord) -> Result<()> {
+        let Some(stat) = optional_stat(&self.quarantine_fd, &install.artifact, &self.state)? else {
+            return Ok(());
+        };
+        let Some(record) = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .find(|record| record.name == install.artifact)
+        else {
+            return Ok(());
+        };
+        if artifact_stat_matches(&record, &stat) {
+            return Ok(());
+        }
+        let length = if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+            stat.st_size as u64
+        } else {
+            record.length
+        };
+        self.store
+            .update_artifact_stat(&record.id, length, artifact_stat(&stat))
+    }
+
+    fn artifact_matches_record(&self, artifact: &ArtifactRecord) -> Result<bool> {
+        let Some(stat) = optional_stat(&self.quarantine_fd, &artifact.name, &self.state)? else {
+            return Ok(false);
+        };
+        if artifact_stat_matches(artifact, &stat) {
+            return Ok(true);
+        }
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Ok(false);
+        }
+        let Some(expected) = artifact.digest else {
+            return Ok(false);
+        };
+        let (length, digest, _, _) =
+            hash_file_at(&self.quarantine_fd, &artifact.name, &self.state)?;
+        Ok(length == artifact.length && digest.as_bytes() == &expected)
     }
 }
 
@@ -2050,6 +2558,9 @@ impl PreparedInstall<'_> {
             remote_revision: self.record.remote_revision,
             phase: "prepared".to_owned(),
             error: None,
+            digest: None,
+            length: 0,
+            stat: None,
         };
         self.replica.store.insert_artifact(&record)?;
         renameat_with(
@@ -2076,6 +2587,16 @@ impl PreparedInstall<'_> {
         fsync(&self.replica.quarantine_fd).map_err(|e| {
             Error::errno("persist rollback-displaced inode", &self.replica.state, e)
         })?;
+        if let Some(stat) = optional_stat(&self.replica.quarantine_fd, &name, &self.replica.state)?
+        {
+            record.length = stat.st_size as u64;
+            record.stat = Some(artifact_stat(&stat));
+            self.replica.store.update_artifact_stat(
+                &record.id,
+                record.length,
+                artifact_stat(&stat),
+            )?;
+        }
         record.phase = "conflict".to_owned();
         record.error = Some(reason.to_owned());
         self.replica
@@ -2109,6 +2630,17 @@ impl PreparedInstall<'_> {
         fsync(&self.replica.quarantine_fd).map_err(|e| {
             Error::errno("persist retained displaced inode", &self.replica.state, e)
         })?;
+        if let Some(stat) = optional_stat(
+            &self.replica.quarantine_fd,
+            &self.record.artifact,
+            &self.replica.state,
+        )? {
+            self.replica.store.update_artifact_stat(
+                &self.record.id,
+                stat.st_size as u64,
+                artifact_stat(&stat),
+            )?;
+        }
         self.record.phase = phase.clone();
         self.record.error = if phase == InstallPhase::Conflict {
             Some(reason.to_owned())
@@ -2455,6 +2987,53 @@ fn unlink_temporary_if_owned(
         .map_err(|e| Error::errno("remove owned staged temporary", path, e))
 }
 
+fn remove_artifact_directory(parent: &OwnedFd, name: &str, display: &Path) -> Result<()> {
+    let directory = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::errno("open retained directory artifact", display, error))?;
+    let mut names = Vec::new();
+    let mut reader = Dir::read_from(&directory)
+        .map_err(|error| Error::errno("read retained directory artifact", display, error))?;
+    while let Some(entry) = reader.read() {
+        let entry = entry
+            .map_err(|error| Error::errno("read retained directory artifact", display, error))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| Error::unsupported("retained artifact contains a non-UTF-8 name"))?;
+        if name != "." && name != ".." {
+            names.push(name.to_owned());
+        }
+    }
+    for child in names {
+        let stat = statat(&directory, child.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| Error::errno("inspect retained directory artifact", display, error))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => {
+                unlinkat(&directory, child.as_str(), AtFlags::empty()).map_err(|error| {
+                    Error::errno("remove retained artifact file", display, error)
+                })?;
+            }
+            FileType::Directory => {
+                remove_artifact_directory(&directory, &child, &display.join(&child))?;
+                unlinkat(&directory, child.as_str(), AtFlags::REMOVEDIR).map_err(|error| {
+                    Error::errno("remove retained artifact directory", display, error)
+                })?;
+            }
+            _ => {
+                return Err(Error::unsupported(
+                    "retained directory artifact contains a symlink or special file",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn find_directory(
     directory: &OwnedFd,
     filesystem_dev: u64,
@@ -2512,6 +3091,30 @@ fn stat_identity(stat: &Stat) -> Identity {
     }
 }
 
+fn artifact_stat(stat: &Stat) -> ArtifactStat {
+    ArtifactStat {
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        mtime: stat.st_mtime,
+        mtime_nsec: stat.st_mtime_nsec,
+        ctime: stat.st_ctime,
+        ctime_nsec: stat.st_ctime_nsec,
+    }
+}
+
+fn artifact_stat_matches(record: &ArtifactRecord, stat: &Stat) -> bool {
+    record.stat.is_some_and(|stored| {
+        stored.dev == stat.st_dev
+            && stored.ino == stat.st_ino
+            && stored.mtime == stat.st_mtime
+            && stored.mtime_nsec == stat.st_mtime_nsec
+            && stored.ctime == stat.st_ctime
+            && stored.ctime_nsec == stat.st_ctime_nsec
+            && (FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || stat.st_size as u64 == record.length)
+    })
+}
+
 fn hash_file_at(
     parent: &OwnedFd,
     name: &str,
@@ -2562,22 +3165,6 @@ fn hash_file_at(
         stat_identity(&after),
         Mode::from_raw_mode(after.st_mode).intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH),
     ))
-}
-
-fn hash_artifact_matches(
-    parent: &OwnedFd,
-    name: &str,
-    expected_digest: &[u8; 32],
-    expected_length: u64,
-) -> Result<bool> {
-    let Some(stat) = optional_stat(parent, name, Path::new(name))? else {
-        return Ok(false);
-    };
-    if !matches!(FileType::from_raw_mode(stat.st_mode), FileType::RegularFile) {
-        return Ok(false);
-    }
-    let (length, digest, _, _) = hash_file_at(parent, name, Path::new(name))?;
-    Ok(length == expected_length && digest.as_bytes() == expected_digest)
 }
 
 fn same_stable_stat(left: &Stat, right: &Stat) -> bool {

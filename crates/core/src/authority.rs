@@ -195,6 +195,31 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
             Transaction::restore(bytes, &snapshot, &prepared).await
         })
     }
+    /// Restore a transaction using preparation evidence issued by this
+    /// authority's [`DataStore`]. Missing evidence falls back to the default
+    /// verified import path.
+    fn restore_transaction_with<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        available: &'a [PreparedContent],
+    ) -> BoxFuture<'a, Result<Transaction>> {
+        Box::pin(async move {
+            let (revision, files) = Transaction::inspect(bytes)?;
+            let mut prepared = Vec::with_capacity(files.len());
+            for descriptor in files {
+                let Some(content) = available
+                    .iter()
+                    .find(|content| content.descriptor() == &descriptor)
+                else {
+                    return self.restore_transaction(bytes).await;
+                };
+                self.data().accept(content)?;
+                prepared.push(content.clone());
+            }
+            let snapshot = self.observe_revision(revision).await?;
+            Transaction::restore(bytes, &snapshot, &prepared).await
+        })
+    }
 }
 impl Authority for ObjectFs {
     fn data(&self) -> &DataStore {

@@ -519,9 +519,18 @@ impl ServiceClient {
         Ok(RevisionPage { revisions, next })
     }
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
-        let content = self.data.prepare(source).await?;
-        self.register(&content).await?;
-        Ok(content)
+        let content = self.data.prepare_for_remote_verification(source).await?;
+        let descriptor = self.data.accept(&content)?;
+        match rpc(
+            self.addr,
+            &self.token,
+            Command::Register(descriptor.to_bytes()),
+        )
+        .await?
+        {
+            Response::Registered => self.data.published(descriptor),
+            _ => Err(protocol()),
+        }
     }
     pub async fn prepare_overwrite(
         &self,

@@ -55,13 +55,23 @@ impl ContentId {
     /// Identify unknown local bytes without uploading them. This shares the
     /// canonical hash profile with prepared content and uses bounded buffers.
     pub async fn calculate(source: &mut (impl AsyncRead + Unpin)) -> Result<Self> {
+        Ok(Self::calculate_with_raw_digest(source).await?.0)
+    }
+
+    /// Identify unknown bytes while also returning their flat BLAKE3 digest.
+    /// Callers that maintain both content and local fingerprints use one read.
+    pub async fn calculate_with_raw_digest(
+        source: &mut (impl AsyncRead + Unpin),
+    ) -> Result<(Self, [u8; 32])> {
         let mut frontier = Vec::<(u64, u64, [u8; 32])>::new();
+        let mut raw = blake3::Hasher::new();
         let mut length = 0_u64;
         loop {
             let bytes = read_unit(source).await?;
             if bytes.is_empty() {
                 break;
             }
+            raw.update(&bytes);
             let start = length / BLOCK_BYTES as u64;
             length = length
                 .checked_add(bytes.len() as u64)
@@ -87,10 +97,13 @@ impl ContentId {
         let mut hash = domain(b"file");
         hash.update(&length.to_le_bytes());
         hash.update(&subtree);
-        Ok(Self {
-            length,
-            digest: hash.finalize().into(),
-        })
+        Ok((
+            Self {
+                length,
+                digest: hash.finalize().into(),
+            },
+            raw.finalize().into(),
+        ))
     }
     pub const fn length(self) -> u64 {
         self.length
@@ -329,6 +342,30 @@ impl DataStore {
                 pack.finish().await?;
                 Ok(self.seal(descriptor))
             }
+            Err(error) => {
+                pack.abort().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Prepare content for an authority that verifies the completed pack
+    /// before acknowledging registration. The caller must not trust the
+    /// returned evidence until that remote verification succeeds.
+    pub(crate) async fn prepare_for_remote_verification(
+        &self,
+        source: &mut (impl AsyncRead + Unpin),
+    ) -> Result<PreparedContent> {
+        let mut pack = Pack::new(self).await?;
+        let result = self.prepare_into(source, &mut pack).await;
+        match result {
+            Ok(descriptor) => match pack.close().await {
+                Ok(()) => Ok(self.seal(descriptor)),
+                Err(error) => {
+                    pack.abort().await;
+                    Err(error)
+                }
+            },
             Err(error) => {
                 pack.abort().await;
                 Err(error)
@@ -1430,7 +1467,7 @@ impl Pack {
         Ok(Child { hash, reference })
     }
 
-    async fn finish(mut self) -> Result<()> {
+    async fn close(&mut self) -> Result<()> {
         if self.length == 0 {
             self.abort().await;
             return Ok(());
@@ -1438,6 +1475,14 @@ impl Pack {
         if let Err(error) = self.writer.close().await {
             self.abort().await;
             return Err(Error::from_storage("finish immutable pack", error));
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.close().await?;
+        if self.length == 0 {
+            return Ok(());
         }
         let reader = self
             .store

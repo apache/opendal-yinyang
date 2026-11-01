@@ -75,6 +75,7 @@ struct Inner {
     stage: Stage,
     active: Mutex<BTreeSet<[u8; 16]>>,
     volatile_errors: Mutex<BTreeMap<[u8; 16], Failure>>,
+    prepared: Mutex<BTreeMap<Vec<u8>, PreparedContent>>,
 }
 struct HandleBase {
     expected: Option<Vec<u8>>,
@@ -116,6 +117,7 @@ impl Runtime {
                 stage,
                 active: Mutex::new(BTreeSet::new()),
                 volatile_errors: Mutex::new(BTreeMap::new()),
+                prepared: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -723,6 +725,12 @@ impl FileHandle {
     /// preparation is returned to the caller and never retried as a different
     /// streaming request.
     async fn prepare_publication(&self, r: &Record) -> Result<PreparedContent> {
+        let prepared = self.prepare_publication_uncached(r).await?;
+        self.remember_prepared(&prepared)?;
+        Ok(prepared)
+    }
+
+    async fn prepare_publication_uncached(&self, r: &Record) -> Result<PreparedContent> {
         let stage = &self.runtime.inner.stage;
         let base = self.base_file().await?;
         if let Some(base) = &base
@@ -818,6 +826,56 @@ impl FileHandle {
         produced?;
         Ok(prepared)
     }
+
+    fn remember_prepared(&self, prepared: &PreparedContent) -> Result<()> {
+        let descriptor = prepared.descriptor().to_bytes();
+        self.inner
+            .prepared
+            .lock()
+            .map_err(Error::local)?
+            .insert(descriptor, prepared.clone());
+        Ok(())
+    }
+
+    async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
+        let (_, descriptors) = Transaction::inspect(bytes)?;
+        let prepared = {
+            let cache = self.inner.prepared.lock().map_err(Error::local)?;
+            descriptors
+                .iter()
+                .map(|descriptor| {
+                    cache
+                        .get(&descriptor.to_bytes())
+                        .cloned()
+                        .ok_or_else(|| Error::Invalid("prepared content is unavailable"))
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        match prepared {
+            Ok(prepared) => self
+                .inner
+                .authority
+                .restore_transaction_with(bytes, &prepared)
+                .await
+                .map_err(Error::from),
+            Err(_) => self
+                .inner
+                .authority
+                .restore_transaction(bytes)
+                .await
+                .map_err(Error::from),
+        }
+    }
+
+    fn forget_prepared(&self, request: &Transaction) -> Result<()> {
+        let bytes = request.to_bytes()?;
+        let (_, files) = Transaction::inspect(&bytes)?;
+        let mut cache = self.inner.prepared.lock().map_err(Error::local)?;
+        for descriptor in files {
+            cache.remove(&descriptor.to_bytes());
+        }
+        Ok(())
+    }
     async fn publish(&mut self) -> Result<Option<Receipt>> {
         let stage = &self.runtime.inner.stage;
         let mut r = stage.load(self.id).await?;
@@ -832,7 +890,7 @@ impl FileHandle {
             return Err(Error::Conflict);
         }
         let request = if let Some(bytes) = &r.plan {
-            self.runtime.authority().restore_transaction(bytes).await?
+            self.runtime.restore_transaction(bytes).await?
         } else {
             let prepared = self.prepare_publication(&r).await?;
             let snapshot = self
@@ -887,11 +945,13 @@ impl FileHandle {
                     if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
                         errors.remove(&self.id);
                     }
+                    self.runtime.forget_prepared(&request)?;
                     Ok(Some(receipt))
                 }
                 CommitOutcome::Conflict => {
                     r.conflict = true;
                     stage.save(r).await?;
+                    self.runtime.forget_prepared(&request)?;
                     Err(Error::Conflict)
                 }
                 CommitOutcome::Retryable => Err(Error::Retryable),

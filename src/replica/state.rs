@@ -53,6 +53,14 @@ const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[
             "remote_revision",
             "phase",
             "error",
+            "digest",
+            "length",
+            "stat_dev",
+            "stat_ino",
+            "stat_mtime",
+            "stat_mtime_nsec",
+            "stat_ctime",
+            "stat_ctime_nsec",
         ],
     ),
     (
@@ -146,6 +154,7 @@ const WORK_OPTIONAL: &[&str] = &[
     "commit_id",
     "conflict",
     "source_artifact",
+    "upload_artifact",
 ];
 const WORK_UPGRADE_ORDER: &[&str] = &[
     "seq",
@@ -156,6 +165,7 @@ const WORK_UPGRADE_ORDER: &[&str] = &[
     "local_parent_dev",
     "local_parent_ino",
     "commit_id",
+    "upload_artifact",
 ];
 const WORK_COLUMNS: &[&str] = &[
     "seq",
@@ -178,6 +188,7 @@ const WORK_COLUMNS: &[&str] = &[
     "commit_id",
     "conflict",
     "source_artifact",
+    "upload_artifact",
     "state",
     "error",
 ];
@@ -216,6 +227,7 @@ const CREATE_WORK_TABLE: &str = "
       commit_id BLOB,
       conflict TEXT,
       source_artifact TEXT,
+      upload_artifact TEXT,
       state TEXT NOT NULL,
       error TEXT
     );";
@@ -260,7 +272,15 @@ const CREATE_SCHEMA: &str = "
       reason TEXT NOT NULL,
       remote_revision BLOB,
       phase TEXT NOT NULL,
-      error TEXT
+      error TEXT,
+      digest BLOB,
+      length INTEGER NOT NULL,
+      stat_dev BLOB,
+      stat_ino BLOB,
+      stat_mtime INTEGER,
+      stat_mtime_nsec INTEGER,
+      stat_ctime INTEGER,
+      stat_ctime_nsec INTEGER
     );
     CREATE TABLE installs(
       id TEXT PRIMARY KEY,
@@ -316,6 +336,7 @@ const CREATE_SCHEMA: &str = "
       commit_id BLOB,
       conflict TEXT,
       source_artifact TEXT,
+      upload_artifact TEXT,
       state TEXT NOT NULL,
       error TEXT
     );";
@@ -400,6 +421,19 @@ pub(super) struct ArtifactRecord {
     pub remote_revision: Option<[u8; 24]>,
     pub phase: String,
     pub error: Option<String>,
+    pub digest: Option<[u8; 32]>,
+    pub length: u64,
+    pub stat: Option<ArtifactStat>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ArtifactStat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+    pub ctime: i64,
+    pub ctime_nsec: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -465,6 +499,9 @@ pub(super) struct WorkRecord {
     pub conflict: Option<String>,
     /// Retained artifact holding the exact local input published by this edit.
     pub source_artifact: Option<String>,
+    /// Retained copy of an ordinary local upload. It is released after the
+    /// edit reaches a terminal receipt, but kept for Unknown/Retryable work.
+    pub upload_artifact: Option<String>,
     pub state: String,
     pub error: Option<String>,
 }
@@ -1397,10 +1434,10 @@ impl Store {
                  (seq,id,path,original_path,desired_path,operation,local_kind,local_digest,
                   local_length,local_executable,local_dev,local_ino,local_parent_dev,
                   local_parent_ino,baseline_node,baseline_revision,remote_revision,
-                  commit_id,conflict,source_artifact,state,error)
+                  commit_id,conflict,source_artifact,upload_artifact,state,error)
                  VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM work),
                         ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
-                        ?16,?17,?18,?19,?20,?21)",
+                        ?16,?17,?18,?19,?20,?21,?22)",
                 params![
                     work.id.as_slice(),
                     work.path,
@@ -1424,6 +1461,7 @@ impl Store {
                     work.commit_id.as_ref().map(|v| v.as_slice()),
                     work.conflict,
                     work.source_artifact,
+                    work.upload_artifact,
                     work.state,
                     work.error,
                 ],
@@ -1450,6 +1488,13 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("update work association: {e}")))?;
+        Ok(())
+    }
+
+    pub fn remove_work(&mut self, id: &[u8; 32]) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM work WHERE id=?1", params![id.as_slice()])
+            .map_err(|e| Error::corrupt(format!("remove work association: {e}")))?;
         Ok(())
     }
 
@@ -1549,8 +1594,9 @@ impl Store {
                         .transpose()?,
                     conflict: row.get(18)?,
                     source_artifact: row.get(19)?,
-                    state: row.get(20)?,
-                    error: row.get(21)?,
+                    upload_artifact: row.get(20)?,
+                    state: row.get(21)?,
+                    error: row.get(22)?,
                 })
             })
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?
@@ -1562,7 +1608,9 @@ impl Store {
         self.connection
             .execute(
                 "INSERT INTO artifacts
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                 (id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
+                  stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     artifact.id,
                     artifact.origin,
@@ -1572,6 +1620,15 @@ impl Store {
                     artifact.remote_revision.as_ref().map(|v| v.as_slice()),
                     artifact.phase,
                     artifact.error,
+                    artifact.digest.as_ref().map(|digest| digest.as_slice()),
+                    i64::try_from(artifact.length)
+                        .map_err(|_| Error::invalid("artifact length exceeds SQLite range"))?,
+                    artifact.stat.map(|stat| stat.dev.to_be_bytes().to_vec()),
+                    artifact.stat.map(|stat| stat.ino.to_be_bytes().to_vec()),
+                    artifact.stat.map(|stat| stat.mtime),
+                    artifact.stat.map(|stat| stat.mtime_nsec),
+                    artifact.stat.map(|stat| stat.ctime),
+                    artifact.stat.map(|stat| stat.ctime_nsec),
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write retained artifact: {e}")))?;
@@ -1585,6 +1642,58 @@ impl Store {
                 params![id, phase, error],
             )
             .map_err(|e| Error::corrupt(format!("update retained artifact: {e}")))?;
+        Ok(())
+    }
+
+    pub fn update_artifact_stat(
+        &mut self,
+        id: &str,
+        length: u64,
+        stat: ArtifactStat,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE artifacts SET
+                   length=?2,stat_dev=?3,stat_ino=?4,stat_mtime=?5,stat_mtime_nsec=?6,
+                   stat_ctime=?7,stat_ctime_nsec=?8
+                 WHERE id=?1",
+                params![
+                    id,
+                    i64::try_from(length)
+                        .map_err(|_| Error::invalid("artifact length exceeds SQLite range"))?,
+                    stat.dev.to_be_bytes().as_slice(),
+                    stat.ino.to_be_bytes().as_slice(),
+                    stat.mtime,
+                    stat.mtime_nsec,
+                    stat.ctime,
+                    stat.ctime_nsec,
+                ],
+            )
+            .map_err(|e| Error::corrupt(format!("update retained artifact stat: {e}")))?;
+        Ok(())
+    }
+
+    pub fn update_artifact_digest(&mut self, id: &str, digest: [u8; 32]) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE artifacts SET digest=?2 WHERE id=?1",
+                params![id, digest.as_slice()],
+            )
+            .map_err(|e| Error::corrupt(format!("update retained artifact digest: {e}")))?;
+        Ok(())
+    }
+
+    pub fn remove_artifact(&mut self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM artifacts WHERE id=?1", params![id])
+            .map_err(|e| Error::corrupt(format!("remove retained artifact: {e}")))?;
+        Ok(())
+    }
+
+    pub fn remove_install_by_artifact(&mut self, artifact: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM installs WHERE artifact=?1", params![artifact])
+            .map_err(|e| Error::corrupt(format!("remove retained install: {e}")))?;
         Ok(())
     }
 
@@ -1702,12 +1811,17 @@ impl Store {
         let mut query = self
             .connection
             .prepare(
-                "SELECT id,origin,name,kind,reason,remote_revision,phase,error
-                 FROM artifacts ORDER BY id",
+                "SELECT id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
+                        stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec
+                 FROM artifacts ORDER BY rowid,id",
             )
             .map_err(|e| Error::corrupt(format!("read retained artifacts: {e}")))?;
         query
             .query_map([], |row| {
+                let digest = row.get::<_, Option<Vec<u8>>>(8)?;
+                let length = row.get::<_, i64>(9)?;
+                let stat_dev = row.get::<_, Option<Vec<u8>>>(10)?;
+                let stat_ino = row.get::<_, Option<Vec<u8>>>(11)?;
                 Ok(ArtifactRecord {
                     id: row.get(0)?,
                     origin: row.get(1)?,
@@ -1720,6 +1834,24 @@ impl Store {
                         .transpose()?,
                     phase: row.get(6)?,
                     error: row.get(7)?,
+                    digest: digest
+                        .as_deref()
+                        .map(|value| fixed(value, "artifact digest"))
+                        .transpose()?,
+                    length: u64::try_from(length)
+                        .map_err(|_| corrupt_sql("negative artifact length"))?,
+                    stat: match (stat_dev, stat_ino) {
+                        (Some(dev), Some(ino)) => Some(ArtifactStat {
+                            dev: number(&dev, "artifact stat device")?,
+                            ino: number(&ino, "artifact stat inode")?,
+                            mtime: row.get(12)?,
+                            mtime_nsec: row.get(13)?,
+                            ctime: row.get(14)?,
+                            ctime_nsec: row.get(15)?,
+                        }),
+                        (None, None) => None,
+                        _ => return Err(corrupt_sql("incomplete artifact stat identity")),
+                    },
                 })
             })
             .map_err(|e| Error::corrupt(format!("read retained artifacts: {e}")))?
@@ -1919,7 +2051,7 @@ fn upgrade(connection: &mut Connection, shape: &Shape) -> Result<()> {
         for column in &shape.work_missing {
             let declaration = if *column == "seq" {
                 "INTEGER NOT NULL DEFAULT 0"
-            } else if matches!(*column, "conflict" | "source_artifact") {
+            } else if matches!(*column, "conflict" | "source_artifact" | "upload_artifact") {
                 "TEXT"
             } else {
                 "BLOB"

@@ -1058,6 +1058,13 @@ impl Store {
         Ok(())
     }
 
+    pub fn remove_artifact(&mut self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM artifacts WHERE id=?1", params![id])
+            .map_err(|error| Error::corrupt(format!("remove Direct Sync artifact: {error}")))?;
+        Ok(())
+    }
+
     pub fn conflicts(&self) -> Result<Vec<ConflictRecord>> {
         let mut statement = self
             .connection

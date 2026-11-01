@@ -383,11 +383,10 @@ impl<R: DirectRemote> DirectSync<R> {
         }
 
         let remote_snapshot = self.remote.observe().await?;
-        let local_snapshot = self.local.scan()?;
-        reject_unsupported_directories(&local_snapshot, &remote_snapshot, &pending_paths)?;
+        reject_unsupported_directories(&observed_local, &remote_snapshot, &pending_paths)?;
         let baseline = self.store.baseline()?;
         let blocked = self.blocked_paths()?;
-        let actions = plan_actions(&baseline, &local_snapshot, &remote_snapshot, &blocked)?;
+        let actions = plan_actions(&baseline, &observed_local, &remote_snapshot, &blocked)?;
 
         let mut outcome = RunOutcome::default();
         for action in actions {
@@ -954,6 +953,31 @@ impl<R: DirectRemote> DirectSync<R> {
             .map_err(|error| Error::io("export Direct Sync artifact", self.local.state(), error))
     }
 
+    fn release_artifact(&mut self, id: &str) -> Result<()> {
+        let Some(artifact) = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == id)
+        else {
+            return Ok(());
+        };
+        if self.local.release_artifact(&artifact)? {
+            self.store.remove_artifact(id)?;
+        }
+        Ok(())
+    }
+
+    fn release_conflict_artifacts(&mut self, conflict: &ConflictRecord) -> Result<()> {
+        if let Some(id) = conflict.local_artifact.as_deref() {
+            self.release_artifact(id)?;
+        }
+        if let Some(id) = conflict.remote_artifact.as_deref() {
+            self.release_artifact(id)?;
+        }
+        Ok(())
+    }
+
     /// Export one retained artifact without constructing an operator, acquiring
     /// the writer lease or contacting storage.
     pub fn export_artifact_local(state: &Path, id: &str, output: &mut dyn Write) -> Result<()> {
@@ -1274,6 +1298,8 @@ impl<R: DirectRemote> DirectSync<R> {
         match outcome {
             MutationOutcome::Applied { accepted } => match work.operation {
                 RemoteOperation::Publish => {
+                    let upload_artifact = work.desired_artifact.clone();
+                    let path = work.path.clone();
                     let accepted = accepted.ok_or_else(|| {
                         Error::unsupported(
                             "conditional write returned no accepted version or ETag; Direct Sync cannot baseline it",
@@ -1301,6 +1327,18 @@ impl<R: DirectRemote> DirectSync<R> {
                             local,
                         }),
                     )?;
+                    if let Some(artifact) = upload_artifact.as_deref() {
+                        self.release_artifact(artifact)?;
+                    }
+                    for conflict in self
+                        .store
+                        .conflicts()?
+                        .into_iter()
+                        .filter(|conflict| conflict.path == path)
+                    {
+                        self.store.remove_conflict(&conflict.id)?;
+                        self.release_conflict_artifacts(&conflict)?;
+                    }
                     applied = true;
                 }
                 RemoteOperation::Delete => {
@@ -1318,8 +1356,10 @@ impl<R: DirectRemote> DirectSync<R> {
                     )?;
                 } else {
                     let remote_snapshot = self.remote.observe().await?;
-                    let local_snapshot = self.local.scan()?;
-                    let local = local_file(&local_snapshot, &work.path).cloned();
+                    let local = self
+                        .local
+                        .observe_path(&work.path)?
+                        .filter(|node| matches!(node.kind, LocalKind::File { .. }));
                     let remote = remote_files(&remote_snapshot).get(&work.path).cloned();
                     self.record_conflict(
                         &work.path,
@@ -1452,8 +1492,10 @@ impl<R: DirectRemote> DirectSync<R> {
                 if let Some(artifact) = &remote_artifact {
                     self.store.insert_artifact(artifact)?;
                 }
-                let local_snapshot = self.local.scan()?;
-                let local = local_file(&local_snapshot, &install.path).cloned();
+                let local = self
+                    .local
+                    .observe_path(&install.path)?
+                    .filter(|node| matches!(node.kind, LocalKind::File { .. }));
                 self.record_conflict(
                     &install.path,
                     local.as_ref(),
@@ -1486,8 +1528,10 @@ impl<R: DirectRemote> DirectSync<R> {
         self.store.insert_install(&install)?;
         if let Err(error) = self.local.apply_install(&mut self.store, &mut install) {
             if error.kind() == ErrorKind::Conflict {
-                let local_snapshot = self.local.scan()?;
-                let local = local_file(&local_snapshot, &install.path).cloned();
+                let local = self
+                    .local
+                    .observe_path(&install.path)?
+                    .filter(|node| matches!(node.kind, LocalKind::File { .. }));
                 self.record_conflict(
                     &install.path,
                     local.as_ref(),
@@ -1589,16 +1633,17 @@ impl<R: DirectRemote> DirectSync<R> {
         match resolution {
             Resolution::KeepRemote => {
                 let remote = snapshot.entries.get(&conflict.path).cloned();
-                let current = self.local.scan()?;
+                let current = self.local.observe_path(&conflict.path)?;
                 if current
-                    .get(&conflict.path)
+                    .as_ref()
                     .is_some_and(|node| matches!(node.kind, LocalKind::Directory))
                 {
                     return Err(Error::conflict(
                         "local path is a directory; keep-remote cannot replace it with a file",
                     ));
                 }
-                let current_local = local_file(&current, &conflict.path).cloned();
+                let current_local =
+                    current.filter(|node| matches!(node.kind, LocalKind::File { .. }));
                 if let Some(entry) = remote.as_ref().filter(|entry| entry.is_file()) {
                     let expected_local = current_local
                         .as_ref()
@@ -1631,6 +1676,7 @@ impl<R: DirectRemote> DirectSync<R> {
                     ));
                 }
                 self.store.remove_conflict(&conflict.id)?;
+                self.release_conflict_artifacts(&conflict)?;
             }
             Resolution::KeepLocal => {
                 let local_node = self.local_fingerprint_node(&conflict.path)?;
@@ -1687,6 +1733,7 @@ impl<R: DirectRemote> DirectSync<R> {
                     None => {
                         self.store.remove_baseline(&conflict.path)?;
                         self.store.remove_conflict(&conflict.id)?;
+                        self.release_conflict_artifacts(&conflict)?;
                         return Ok(());
                     }
                 };
@@ -1707,6 +1754,7 @@ impl<R: DirectRemote> DirectSync<R> {
                     .any(|record| record.path == conflict.path)
                 {
                     self.store.remove_conflict(&conflict.id)?;
+                    self.release_conflict_artifacts(&conflict)?;
                 }
             }
         }
@@ -1721,16 +1769,17 @@ impl<R: DirectRemote> DirectSync<R> {
     ) -> Result<()> {
         match resolution {
             Resolution::KeepLocal => {
-                let current = self.local.scan()?;
+                let current = self.local.observe_path(&work.path)?;
                 if current
-                    .get(&work.path)
+                    .as_ref()
                     .is_some_and(|node| matches!(node.kind, LocalKind::Directory))
                 {
                     return Err(Error::conflict(
                         "local path is a directory; keep-local cannot publish it as a file",
                     ));
                 }
-                let current_local = local_file(&current, &work.path).cloned();
+                let current_local =
+                    current.filter(|node| matches!(node.kind, LocalKind::File { .. }));
                 let remote_entry = snapshot.entries.get(&work.path);
                 if remote_entry.is_some_and(|entry| !entry.is_file()) {
                     return Err(Error::conflict(
@@ -1792,16 +1841,16 @@ impl<R: DirectRemote> DirectSync<R> {
             }
             Resolution::KeepRemote => {
                 let remote = snapshot.entries.get(&work.path).cloned();
-                let current = self.local.scan()?;
+                let current = self.local.observe_path(&work.path)?;
                 if current
-                    .get(&work.path)
+                    .as_ref()
                     .is_some_and(|node| matches!(node.kind, LocalKind::Directory))
                 {
                     return Err(Error::conflict(
                         "local path is a directory; keep-remote cannot replace it with a file",
                     ));
                 }
-                let local = local_file(&current, &work.path).cloned();
+                let local = current.filter(|node| matches!(node.kind, LocalKind::File { .. }));
                 if let Some(entry) = remote.as_ref().filter(|entry| entry.is_file()) {
                     let expected_local = local
                         .as_ref()
@@ -1840,8 +1889,10 @@ impl<R: DirectRemote> DirectSync<R> {
     }
 
     fn local_fingerprint_node(&self, path: &str) -> Result<Option<LocalNode>> {
-        let snapshot = self.local.scan()?;
-        Ok(local_file(&snapshot, path).cloned())
+        Ok(self
+            .local
+            .observe_path(path)?
+            .filter(|node| matches!(node.kind, LocalKind::File { .. })))
     }
 }
 

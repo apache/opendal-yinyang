@@ -52,8 +52,8 @@ impl DirectorySync {
             Resolution::Content(bytes) => Some(bytes.clone()),
             _ => None,
         };
-        let current = self.replica.scan()?;
-        match (bytes, current.get(&path)) {
+        let current = self.replica.observe_path(&path)?;
+        match (bytes, current.as_ref()) {
             (Some(bytes), _) => {
                 self.publish_keep_local_file(record, baseline, &path, bytes)
                     .await
@@ -171,7 +171,7 @@ impl DirectorySync {
         executable: bool,
         pre_dispatch: Option<&LocalNode>,
     ) -> Result<Option<LocalNode>> {
-        let live = self.replica.scan()?.get(path).cloned();
+        let live = self.replica.observe_path(path)?;
         let chosen = chosen_file_local(path, bytes, executable, pre_dispatch);
         // A crash after the selected bytes were already installed but before
         // the baseline was saved leaves them on a new inode. Accept the actual
@@ -312,6 +312,7 @@ impl DirectorySync {
                     Some(revision),
                     None,
                 )?;
+                self.replica.store_mut().remove_work(edit.as_bytes())?;
                 Ok(true)
             }
             Err(error) => {
@@ -338,7 +339,7 @@ impl DirectorySync {
         path: &str,
         bytes: Vec<u8>,
     ) -> Result<bool> {
-        let expected = self.replica.scan()?.get(path).cloned();
+        let expected = self.replica.observe_path(path)?;
         let executable = expected
             .as_ref()
             .filter(|node| matches!(node.kind, LocalKind::File { .. }))
@@ -477,6 +478,7 @@ impl DirectorySync {
             (node, predicate)
         };
         let artifact = self.replica.retain_bytes(path, bytes)?;
+        let artifact_id = Some(artifact.clone());
         let mut source = bytes;
         let edit = self
             .sync
@@ -503,7 +505,7 @@ impl DirectorySync {
             Ok(published) => {
                 let accepted = self.install_chosen_bytes(path, bytes, executable, local)?;
                 self.refresh_parent_baseline(path, published).await?;
-                if self
+                let resolved = self
                     .apply_resolved_baseline(
                         record,
                         path,
@@ -511,8 +513,8 @@ impl DirectorySync {
                         Some(node_id),
                         accepted.as_ref(),
                     )
-                    .await?
-                {
+                    .await?;
+                if resolved {
                     self.clear_resolved_conflict(&record.id)?;
                 }
                 self.replica.store_mut().update_work(
@@ -521,6 +523,12 @@ impl DirectorySync {
                     Some(published),
                     None,
                 )?;
+                if resolved {
+                    self.replica.store_mut().remove_work(edit.as_bytes())?;
+                    if let Some(artifact) = artifact_id.as_deref() {
+                        self.replica.release_artifact(artifact)?;
+                    }
+                }
                 Ok(true)
             }
             Err(error) => {
@@ -549,6 +557,7 @@ impl DirectorySync {
         executable: bool,
         local: Option<&LocalNode>,
     ) -> Result<bool> {
+        let artifact_id = artifact.clone();
         self.associate_resolution(
             record,
             edit,
@@ -563,7 +572,7 @@ impl DirectorySync {
             Ok(revision) => {
                 let accepted = self.install_chosen_bytes(path, bytes, executable, local)?;
                 self.refresh_parent_baseline(path, revision).await?;
-                if self
+                let resolved = self
                     .apply_resolved_baseline(
                         record,
                         path,
@@ -571,8 +580,8 @@ impl DirectorySync {
                         Some(node_id),
                         accepted.as_ref(),
                     )
-                    .await?
-                {
+                    .await?;
+                if resolved {
                     self.clear_resolved_conflict(&record.id)?;
                 }
                 self.replica.store_mut().update_work(
@@ -581,6 +590,12 @@ impl DirectorySync {
                     Some(revision),
                     None,
                 )?;
+                if resolved {
+                    self.replica.store_mut().remove_work(edit.as_bytes())?;
+                    if let Some(artifact) = artifact_id.as_deref() {
+                        self.replica.release_artifact(artifact)?;
+                    }
+                }
                 Ok(true)
             }
             Err(error) if error.kind() == crate::runtime::ErrorKind::Unknown => {
@@ -682,6 +697,7 @@ impl DirectorySync {
                             Some(published),
                             None,
                         )?;
+                        self.replica.store_mut().remove_work(edit.as_bytes())?;
                     }
                     Err(error) => {
                         self.replica.store_mut().update_work(
@@ -695,6 +711,7 @@ impl DirectorySync {
                 }
             } else {
                 let captured = self.replica.capture_file(entry, &local)?;
+                let captured_id = captured.artifact.id.clone();
                 let mut source =
                     tokio::fs::File::from_std(self.replica.open_artifact(&captured.artifact.id)?);
                 let edit = self
@@ -716,7 +733,7 @@ impl DirectorySync {
                     Some(&local),
                     Some(parent_id),
                     running,
-                    Some(captured.artifact.id),
+                    Some(captured_id.clone()),
                 )?;
                 match self.sync.publish(edit).await {
                     Ok(published) => {
@@ -730,6 +747,8 @@ impl DirectorySync {
                             Some(published),
                             None,
                         )?;
+                        self.replica.store_mut().remove_work(edit.as_bytes())?;
+                        self.replica.release_artifact(&captured_id)?;
                     }
                     Err(error) => {
                         self.replica.store_mut().update_work(
@@ -781,7 +800,7 @@ impl DirectorySync {
                 .sync
                 .stage_create_directory(parent_id, name, running)
                 .await?;
-            let local = self.replica.scan()?.get(path).cloned();
+            let local = self.replica.observe_path(path)?;
             self.associate_resolution(
                 record,
                 edit,
@@ -806,6 +825,7 @@ impl DirectorySync {
                         Some(published),
                         None,
                     )?;
+                    self.replica.store_mut().remove_work(edit.as_bytes())?;
                 }
                 Err(error) => {
                     self.replica.store_mut().update_work(
@@ -829,15 +849,17 @@ impl DirectorySync {
         record: &ConflictRecord,
         path: &str,
     ) -> Result<bool> {
-        let current = self.replica.scan()?;
-        if current.get(path).is_some() {
-            self.replica.quarantine(
+        let quarantined = if self.replica.observe_path(path)?.is_some() {
+            let current = self.replica.scan_subtree(path)?;
+            Some(self.replica.quarantine(
                 path,
                 &current,
                 "conflict resolution kept the remote deletion",
                 record.remote_revision,
-            )?;
-        }
+            )?)
+        } else {
+            None
+        };
         self.replica.store_mut().remove_baseline_subtree(path)?;
         if record.path != path {
             self.replica
@@ -845,6 +867,9 @@ impl DirectorySync {
                 .remove_baseline_subtree(&record.path)?;
         }
         self.clear_resolved_conflict(&record.id)?;
+        if let Some(artifact) = quarantined {
+            self.replica.release_artifact(&artifact.id)?;
+        }
         Ok(true)
     }
 
@@ -860,13 +885,9 @@ impl DirectorySync {
         node: Node,
     ) -> Result<bool> {
         let bytes = self.download_remote_bytes(snapshot, &node).await?;
-        let expected = self.replica.scan()?.get(path).cloned();
+        let expected = self.replica.observe_path(path)?;
         match expected {
             Some(expected) if !expected.is_directory() => {
-                if !local_file_matches(&expected, &bytes)? {
-                    // Preserve the replaced local bytes as a retained artifact.
-                    self.replica.capture_file(path, &expected)?;
-                }
                 self.replica.install_bytes(
                     path,
                     &expected,
@@ -888,6 +909,7 @@ impl DirectorySync {
             .await?
         {
             self.clear_resolved_conflict(&record.id)?;
+            self.replica.release_superseded(path)?;
             Ok(true)
         } else {
             Ok(false)
@@ -916,7 +938,7 @@ impl DirectorySync {
         pending.sort_by_key(|(entry, _)| (entry.matches('/').count(), entry.clone()));
         let mut materialized: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (entry, node) in &pending {
-            if self.replica.scan()?.get(entry).is_some() {
+            if self.replica.observe_path(entry)?.is_some() {
                 continue;
             }
             if node.is_directory() {
@@ -935,7 +957,7 @@ impl DirectorySync {
                     None => return Ok(false),
                 }
             } else {
-                let live = match self.replica.scan()?.get(entry).cloned() {
+                let live = match self.replica.observe_path(entry)? {
                     Some(live) => live,
                     None => return Ok(false),
                 };
@@ -956,26 +978,26 @@ impl DirectorySync {
         // Drop baselines for recorded-remote-deleted descendants that no
         // longer exist on either side; local-only entries keep no baseline and
         // stay pending.
-        let stale: Vec<String> = {
-            let baseline = self.replica.store().load_baseline()?;
-            let fresh = self.replica.scan()?;
-            let prefix = format!("{path}/");
-            baseline
-                .as_ref()
-                .map(|baseline| {
-                    baseline
-                        .remote
-                        .keys()
-                        .filter(|entry| {
-                            entry.starts_with(&prefix)
-                                && !tree.contains_key(*entry)
-                                && fresh.get(entry).is_none()
-                        })
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let prefix = format!("{path}/");
+        let candidates = self
+            .replica
+            .store()
+            .load_baseline()?
+            .map(|baseline| {
+                baseline
+                    .remote
+                    .keys()
+                    .filter(|entry| entry.starts_with(&prefix) && !tree.contains_key(*entry))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut stale = Vec::new();
+        for entry in candidates {
+            if self.replica.observe_path(&entry)?.is_none() {
+                stale.push(entry);
+            }
+        }
         for entry in stale {
             self.replica.store_mut().remove_baseline_path(&entry)?;
         }
@@ -1082,7 +1104,7 @@ impl DirectorySync {
     }
 
     fn verified_local_file(&self, path: &str, bytes: &[u8]) -> Result<Option<LocalNode>> {
-        let Some(node) = self.replica.scan()?.get(path).cloned() else {
+        let Some(node) = self.replica.observe_path(path)? else {
             return Ok(None);
         };
         if matches!(node.kind, LocalKind::File { .. }) && local_file_matches(&node, bytes)? {
@@ -1093,7 +1115,7 @@ impl DirectorySync {
     }
 
     fn verified_local_directory(&self, path: &str) -> Result<Option<LocalNode>> {
-        match self.replica.scan()?.get(path).cloned() {
+        match self.replica.observe_path(path)? {
             Some(node) if matches!(node.kind, LocalKind::Directory) => Ok(Some(node)),
             _ => Ok(None),
         }
@@ -1154,6 +1176,7 @@ impl DirectorySync {
             commit_id: None,
             conflict: Some(record.id.clone()),
             source_artifact,
+            upload_artifact: None,
             state: "prepared".to_owned(),
             error: None,
         })?;

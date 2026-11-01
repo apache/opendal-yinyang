@@ -185,6 +185,7 @@ pub struct StatusSummary {
     pub conflicts: usize,
     pub failed: u64,
     pub retained_artifacts: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -732,6 +733,7 @@ fn project(inspection: &domain::Inspection) -> Result<SyncStatus, String> {
             conflicts: inspection.summary.conflicts,
             failed: inspection.summary.failed,
             retained_artifacts: inspection.summary.retained_artifacts,
+            retained_bytes: inspection.summary.retained_bytes,
         },
         entries,
         conflicts,
