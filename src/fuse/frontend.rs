@@ -26,8 +26,8 @@ use super::flags::{has_open_flag, representable_mode, writable_create, writable_
 use super::reject_unpublished_staging;
 use crate::mount::{Mount, MountFile, MountReadOnlyFile};
 use crate::volume::{Volume, VolumeConfig};
-use fuser::{FileType, OpenFlags};
-use std::sync::{Arc, RwLock};
+use fuser::OpenFlags;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use yinyang_core::{FileVersion, Node, NodeId, ScanToken, Snapshot};
@@ -214,7 +214,7 @@ impl ManagedBackend {
     }
 }
 
-enum ManagedFile {
+pub(super) enum ManagedFile {
     Staged(MountFile),
     ReadOnly(MountReadOnlyFile),
 }
@@ -657,6 +657,7 @@ mod tests {
     use crate::core::{BackendProfile, Fs};
     use crate::runtime::Runtime;
     use crate::support::TestBackend;
+    use std::sync::Arc;
     use yinyang_core::Authority;
 
     async fn backend(

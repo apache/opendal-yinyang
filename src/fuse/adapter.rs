@@ -17,9 +17,9 @@
 
 //! The single `fuser::Filesystem` adapter over a metadata backend.
 
-use super::attrs::{ATTR_TTL, ObservedAttr, synthesize};
-use super::backend::{Backend, BackendError, DirectoryEntry, Result, SetAttrRequest};
-use super::flags::{RenameRejection, has_open_flag, rename_replace, writable_open};
+use super::attrs::{ObservedAttr, synthesize};
+use super::backend::{Backend, BackendError, Result, SetAttrRequest};
+use super::flags::{has_open_flag, rename_replace, writable_open};
 use super::inode::{CachedInfo, InodeTable};
 use fuser::{
     AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -116,10 +116,6 @@ impl<B: Backend> AdapterInner<B> {
             next_handle: AtomicU64::new(0),
             runtime,
         }
-    }
-
-    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        self.runtime.spawn(future);
     }
 
     fn next_handle(&self) -> u64 {
