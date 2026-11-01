@@ -681,31 +681,29 @@ impl MetadataService {
             if volume != expected_volume || root != expected_root {
                 return Err(Error::invalid("expire revisions", "authority changed"));
             }
-            if profile == SchemaProfile::Expiry {
-                if let Some(marker) = load_expiry(&tx, &operation_key(request_for_write.id()))? {
-                    if marker.request_digest != request_digest {
-                        return Err(Error::invalid(
-                            "expire revisions",
-                            "operation identity was reused with a different request",
-                        ));
-                    }
-                    request_for_write.validate_marker(&marker)?;
-                    for candidate in request_for_write.candidates() {
-                        let bytes = load_expiry(&tx, &revision_key(*candidate))?.ok_or_else(|| {
-                            corrupt_schema(
-                                "committed expiry operation is missing a revision marker",
-                            )
-                        })?;
-                        if bytes != marker {
-                            return Err(corrupt_schema(
-                                "expiry operation and revision markers disagree",
-                            ));
-                        }
-                    }
-                    return Ok(ExpiryOutcome::Committed(
-                        request_for_write.receipt(marker),
+            if profile == SchemaProfile::Expiry
+                && let Some(marker) = load_expiry(&tx, &operation_key(request_for_write.id()))?
+            {
+                if marker.request_digest != request_digest {
+                    return Err(Error::invalid(
+                        "expire revisions",
+                        "operation identity was reused with a different request",
                     ));
                 }
+                request_for_write.validate_marker(&marker)?;
+                for candidate in request_for_write.candidates() {
+                    let bytes = load_expiry(&tx, &revision_key(*candidate))?.ok_or_else(|| {
+                        corrupt_schema("committed expiry operation is missing a revision marker")
+                    })?;
+                    if bytes != marker {
+                        return Err(corrupt_schema(
+                            "expiry operation and revision markers disagree",
+                        ));
+                    }
+                }
+                return Ok(ExpiryOutcome::Committed(
+                    request_for_write.receipt(marker),
+                ));
             }
             if latest != request_for_write.expected_latest() {
                 return Ok(ExpiryOutcome::Conflict);
