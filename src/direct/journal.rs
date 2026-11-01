@@ -498,7 +498,12 @@ fn validate_schema(
             store::Binding::text("binding_diagnostic", binding.description()),
         ]
     });
-    store::validate(connection, &PROFILE, bindings.as_deref()).map_err(store_error)?;
+    store::validate(
+        connection,
+        &PROFILE,
+        bindings.as_ref().map(|bindings| bindings.as_slice()),
+    )
+    .map_err(store_error)?;
     let (bound, diagnostic) = connection
         .query_row(
             "SELECT binding,binding_diagnostic FROM authority WHERE singleton=1",

@@ -197,7 +197,12 @@ fn validate_store(c: &Connection, filesystem: Option<NodeId>) -> Result<()> {
             filesystem.as_bytes().to_vec(),
         )]
     });
-    store::validate(c, &PROFILE, bindings.as_deref()).map_err(store_error)
+    store::validate(
+        c,
+        &PROFILE,
+        bindings.as_ref().map(|bindings| bindings.as_slice()),
+    )
+    .map_err(store_error)
 }
 fn decoded_record(bytes: &[u8], failure: Option<Vec<u8>>) -> Result<Record> {
     let mut r = decode(bytes)?;

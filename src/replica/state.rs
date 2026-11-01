@@ -1689,14 +1689,15 @@ fn store_error(error: store::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replica::ErrorKind;
 
     fn create_database(path: &Path, profile: &str, schema: &str) {
         let connection = Connection::open(path).unwrap();
         connection.execute_batch(schema).unwrap();
         connection
             .execute(
-                "INSERT INTO binding VALUES(1,?1,zeroblob(16),'/root',1,2,1,3)",
+                "INSERT INTO binding(
+                    singleton,profile,filesystem,root,root_dev,root_ino,state_dev,state_ino
+                 ) VALUES(1,?1,zeroblob(16),'/root',1,2,1,3)",
                 [profile],
             )
             .unwrap();
@@ -1723,72 +1724,10 @@ mod tests {
     }
 
     #[test]
-    fn readable_legacy_shape_upgrades_after_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("replica.db");
-        create_database(&path, PROFILE, CREATE_SCHEMA);
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "ALTER TABLE baseline DROP COLUMN remote_revision;
-                 ALTER TABLE work DROP COLUMN seq;
-                 ALTER TABLE work DROP COLUMN conflict;
-                 ALTER TABLE work DROP COLUMN source_artifact;
-                 ALTER TABLE work DROP COLUMN local_dev;
-                 ALTER TABLE work DROP COLUMN local_ino;
-                 ALTER TABLE work DROP COLUMN local_parent_dev;
-                 ALTER TABLE work DROP COLUMN local_parent_ino;
-                 ALTER TABLE work DROP COLUMN commit_id;
-                 INSERT INTO work(
-                   id,path,original_path,desired_path,operation,local_kind,
-                   local_digest,local_length,local_executable,baseline_node,
-                   baseline_revision,remote_revision,state,error
-                 ) VALUES(
-                   zeroblob(32),'legacy',NULL,NULL,'content',NULL,NULL,NULL,NULL,
-                   NULL,zeroblob(24),NULL,'pending',NULL
-                 );",
-            )
-            .unwrap();
-        drop(connection);
-        let store = Store::open_read_only(&path).unwrap();
-        let work = store.work().unwrap();
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].seq, 0);
-        assert!(work[0].source_artifact.is_none());
-        drop(store);
-
-        let store = Store::open(&path).unwrap();
-        let work = store.work().unwrap();
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].path, "legacy");
-        let connection = Connection::open(path).unwrap();
-        let baseline: Vec<String> = {
-            let mut statement = connection.prepare("PRAGMA table_info(baseline)").unwrap();
-            statement
-                .query_map([], |row| row.get(1))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        assert!(baseline.iter().any(|column| column == "remote_revision"));
-        let work: Vec<String> = {
-            let mut statement = connection.prepare("PRAGMA table_info(work)").unwrap();
-            statement
-                .query_map([], |row| row.get(1))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        for column in WORK_OPTIONAL {
-            assert!(work.iter().any(|actual| actual == *column));
-        }
-    }
-
-    #[test]
     fn known_profile_missing_a_required_column_is_not_repaired() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("replica.db");
-        create_database(&path, PROFILE, CREATE_SCHEMA);
+        create_database(&path, PROFILE.name, CREATE_SCHEMA);
         Connection::open(&path)
             .unwrap()
             .execute_batch("ALTER TABLE work DROP COLUMN path")

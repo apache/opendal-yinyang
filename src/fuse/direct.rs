@@ -1469,7 +1469,7 @@ fn direct_errno(error: &DirectError) -> fuser::Errno {
         DirectErrorKind::IsDirectory => fuser::Errno::EISDIR,
         DirectErrorKind::Stale => fuser::Errno::ESTALE,
         DirectErrorKind::Unsupported => fuser::Errno::EOPNOTSUPP,
-        DirectErrorKind::Storage => fuser::Errno::EIO,
+        DirectErrorKind::Corrupt | DirectErrorKind::Storage => fuser::Errno::EIO,
     }
 }
 
