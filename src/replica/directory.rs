@@ -1462,7 +1462,8 @@ impl<'a> Context<'a> {
             }
             let local = local_action(self.baseline.local.get(path), self.current.get(path));
             let remote = remote_action(self.baseline.remote.get(path), self.remote.get(path));
-            let batchable = local == Action::Create
+            let batchable = false
+                && local == Action::Create
                 && remote == Action::None
                 && self
                     .current
