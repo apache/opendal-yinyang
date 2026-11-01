@@ -17,7 +17,6 @@
 
 //! Durable namespace intents on top of the shared Authority/Planner contract.
 use super::{EditId, Sync};
-use crate::local::store;
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
