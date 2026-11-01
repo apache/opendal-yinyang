@@ -80,6 +80,17 @@ fn assert_file(path: &Path, expected: &[u8], expected_mode: u32) {
     assert_eq!(mode(path), expected_mode, "mode for {}", path.display());
 }
 
+fn assert_not_found(path: &Path, context: &str) {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "{context} at {}: expected NotFound, got {error}",
+            path.display()
+        ),
+        Ok(_) => panic!("{context} unexpectedly exists at {}", path.display()),
+    }
+}
+
 fn write_source_tree(source: &Path) -> Vec<u8> {
     fs::create_dir_all(source.join("assets")).expect("create source assets");
     fs::create_dir_all(source.join("bin")).expect("create source bin");
@@ -200,7 +211,7 @@ fn assert_rsync_tree(target: &Path, expected_payload: &[u8]) {
 
 #[test]
 #[ignore = "requires /dev/fuse, rsync, and isolated S3; run with cargo x test-linux-applications"]
-fn application_rsync_mirror_survives_remount_both_publications() {
+fn application_rsync_existing_tree_update_survives_remount_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         let fixture = Fixture::new(publication);
         let suffix = fixture.publication().as_str();
@@ -290,6 +301,7 @@ fn application_rsync_mirror_survives_remount_both_publications() {
 fn tar_create(archive: &Path, source: &Path) -> AppOutput {
     let mut command = Command::new("tar");
     command
+        .env("LC_ALL", "C")
         .arg("-cf")
         .arg(archive)
         .arg("-C")
@@ -301,6 +313,7 @@ fn tar_create(archive: &Path, source: &Path) -> AppOutput {
 fn tar_extract(archive: &Path, destination: &Path) -> AppOutput {
     let mut command = Command::new("tar");
     command
+        .env("LC_ALL", "C")
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -394,12 +407,12 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         );
         let stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
         assert!(
-            stderr.contains("symlink"),
-            "tar failed before reaching the symlink boundary:\n{stderr}"
+            stderr.contains("cannot create symlink") && stderr.contains("operation not supported"),
+            "tar failed before reaching the symlink syscall with the expected diagnostic:\n{stderr}"
         );
-        assert!(
-            fs::symlink_metadata(symlink_destination.join("link")).is_err(),
-            "a rejected symlink must not appear as another file type"
+        assert_not_found(
+            &symlink_destination.join("link"),
+            "rejected symlink destination",
         );
 
         mounted.unmount();
@@ -526,11 +539,7 @@ fn application_git_loose_object_mode_is_rejected() {
         .join("objects")
         .join(&object_id[..2])
         .join(&object_id[2..]);
-    assert!(
-        fs::symlink_metadata(&object_path).is_err(),
-        "a rejected Git object must not exist at {}",
-        object_path.display()
-    );
+    assert_not_found(&object_path, "rejected Git object");
 
     mounted.unmount();
 }
