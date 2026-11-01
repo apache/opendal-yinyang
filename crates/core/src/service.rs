@@ -129,7 +129,31 @@ fn check_columns(conn: &Connection, table: &str, expected: &[(&str, &str)]) -> R
     }
     Ok(())
 }
+fn with_read_snapshot<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let owns_snapshot = conn.is_autocommit();
+    if owns_snapshot {
+        conn.execute_batch("BEGIN DEFERRED").map_err(sql)?;
+    }
+    let result = read(conn);
+    if owns_snapshot {
+        match &result {
+            Ok(_) => conn.execute_batch("COMMIT").map_err(sql)?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    result
+}
+
 fn inspect_schema(conn: &Connection) -> Result<Option<SchemaProfile>> {
+    with_read_snapshot(conn, inspect_schema_inner)
+}
+
+fn inspect_schema_inner(conn: &Connection) -> Result<Option<SchemaProfile>> {
     let tables = conn
         .prepare(
             "SELECT name FROM sqlite_schema
@@ -462,27 +486,29 @@ impl MetadataService {
         let expected_volume = self.filesystem;
         let expected_root = self.root;
         db_call(&db, move |c| {
-            let (profile, volume, root, _) = manifest(c)?;
-            if volume != expected_volume || root != expected_root {
-                return Err(Error::invalid("observe service", "authority changed"));
-            }
-            if !revision_exists(c, revision)? {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    "observe service revision",
-                    "revision not retained",
-                ));
-            }
-            if profile == SchemaProfile::Expiry
-                && load_expiry(c, &revision_key(revision))?.is_some()
-            {
-                return Err(Error::expired(
-                    "observe service revision",
-                    revision,
-                    "revision is logically expired",
-                ));
-            }
-            Ok(())
+            with_read_snapshot(c, |c| {
+                let (profile, volume, root, _) = manifest(c)?;
+                if volume != expected_volume || root != expected_root {
+                    return Err(Error::invalid("observe service", "authority changed"));
+                }
+                if !revision_exists(c, revision)? {
+                    return Err(Error::new(
+                        ErrorKind::NotFound,
+                        "observe service revision",
+                        "revision not retained",
+                    ));
+                }
+                if profile == SchemaProfile::Expiry
+                    && load_expiry(c, &revision_key(revision))?.is_some()
+                {
+                    return Err(Error::expired(
+                        "observe service revision",
+                        revision,
+                        "revision is logically expired",
+                    ));
+                }
+                Ok(())
+            })
         })
         .await?;
         Ok(self.snapshot(db, revision))
@@ -503,18 +529,20 @@ impl MetadataService {
         let expected_volume = self.filesystem;
         let expected_root = self.root;
         db_call(&db, move |c| {
-            let (_, volume, root, _) = manifest(c)?;
-            if volume != expected_volume || root != expected_root {
-                return Err(Error::invalid("observe service", "authority changed"));
-            }
-            if !revision_exists(c, revision)? {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    "observe service revision",
-                    "revision not retained",
-                ));
-            }
-            Ok(())
+            with_read_snapshot(c, |c| {
+                let (_, volume, root, _) = manifest(c)?;
+                if volume != expected_volume || root != expected_root {
+                    return Err(Error::invalid("observe service", "authority changed"));
+                }
+                if !revision_exists(c, revision)? {
+                    return Err(Error::new(
+                        ErrorKind::NotFound,
+                        "observe service revision",
+                        "revision not retained",
+                    ));
+                }
+                Ok(())
+            })
         })
         .await?;
         Ok(self.snapshot(db, revision))
@@ -600,69 +628,71 @@ impl MetadataService {
         let expected_volume = self.filesystem;
         let expected_root = self.root;
         db_call(&db, move |conn| {
-            let (profile, volume, root, latest) = manifest(conn)?;
-            if volume != expected_volume || root != expected_root {
-                return Err(Error::invalid("read history", "authority changed"));
-            }
-            let sql_limit = i64::from(limit) + 1;
-            let mut rows = Vec::new();
-            if let Some(after) = after.as_ref() {
-                let mut statement = conn
-                    .prepare(
-                        "SELECT token,sequence FROM revisions
+            with_read_snapshot(conn, |conn| {
+                let (profile, volume, root, latest) = manifest(conn)?;
+                if volume != expected_volume || root != expected_root {
+                    return Err(Error::invalid("read history", "authority changed"));
+                }
+                let sql_limit = i64::from(limit) + 1;
+                let mut rows = Vec::new();
+                if let Some(after) = after.as_ref() {
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT token,sequence FROM revisions
                          WHERE token>?1 ORDER BY token LIMIT ?2",
-                    )
-                    .map_err(sql)?;
-                let values = statement
-                    .query_map(params![after.as_slice(), sql_limit], |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map_err(sql)?;
-                for value in values {
-                    rows.push(value.map_err(sql)?);
-                }
-            } else {
-                let mut statement = conn
-                    .prepare("SELECT token,sequence FROM revisions ORDER BY token LIMIT ?1")
-                    .map_err(sql)?;
-                let values = statement
-                    .query_map(params![sql_limit], |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map_err(sql)?;
-                for value in values {
-                    rows.push(value.map_err(sql)?);
-                }
-            }
-            let more = rows.len() > limit as usize;
-            rows.truncate(limit as usize);
-            let mut entries = Vec::with_capacity(rows.len());
-            for (token, sequence) in rows {
-                let revision = Revision::from_bytes(fixed(token)?);
-                if sequence < 0 || revision.sequence != sequence as u64 {
-                    return Err(corrupt_schema(
-                        "retained revision token disagrees with its sequence",
-                    ));
-                }
-                let state = if profile == SchemaProfile::Expiry {
-                    match load_expiry(conn, &revision_key(revision))? {
-                        Some(marker) if marker.after > latest => {
-                            return Err(corrupt_schema(
-                                "expiry marker was published after the latest revision",
-                            ));
-                        }
-                        Some(marker) => RevisionState::Expired(marker),
-                        None => RevisionState::Readable,
+                        )
+                        .map_err(sql)?;
+                    let values = statement
+                        .query_map(params![after.as_slice(), sql_limit], |row| {
+                            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .map_err(sql)?;
+                    for value in values {
+                        rows.push(value.map_err(sql)?);
                     }
                 } else {
-                    RevisionState::Readable
-                };
-                entries.push(HistoryEntry { revision, state });
-            }
-            let next = more.then(|| entries.last().expect("nonempty history page").revision);
-            let page = HistoryPage { entries, next };
-            page.validate()?;
-            Ok(page)
+                    let mut statement = conn
+                        .prepare("SELECT token,sequence FROM revisions ORDER BY token LIMIT ?1")
+                        .map_err(sql)?;
+                    let values = statement
+                        .query_map(params![sql_limit], |row| {
+                            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .map_err(sql)?;
+                    for value in values {
+                        rows.push(value.map_err(sql)?);
+                    }
+                }
+                let more = rows.len() > limit as usize;
+                rows.truncate(limit as usize);
+                let mut entries = Vec::with_capacity(rows.len());
+                for (token, sequence) in rows {
+                    let revision = Revision::from_bytes(fixed(token)?);
+                    if sequence < 0 || revision.sequence != sequence as u64 {
+                        return Err(corrupt_schema(
+                            "retained revision token disagrees with its sequence",
+                        ));
+                    }
+                    let state = if profile == SchemaProfile::Expiry {
+                        match load_expiry(conn, &revision_key(revision))? {
+                            Some(marker) if marker.after > latest => {
+                                return Err(corrupt_schema(
+                                    "expiry marker was published after the latest revision",
+                                ));
+                            }
+                            Some(marker) => RevisionState::Expired(marker),
+                            None => RevisionState::Readable,
+                        }
+                    } else {
+                        RevisionState::Readable
+                    };
+                    entries.push(HistoryEntry { revision, state });
+                }
+                let next = more.then(|| entries.last().expect("nonempty history page").revision);
+                let page = HistoryPage { entries, next };
+                page.validate()?;
+                Ok(page)
+            })
         })
         .await
     }
@@ -1000,8 +1030,14 @@ impl MetadataService {
         let mut outcomes = vec![None; plans.len()];
         let mut pending = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
-            let (base, _) = Transaction::inspect(plan)?;
-            match self.observe_revision(base).await {
+            let identity = Transaction::inspect_replay_identity(plan)?;
+            if identity.volume != self.filesystem {
+                return Err(Error::invalid(
+                    "service batch",
+                    "request belongs to another volume",
+                ));
+            }
+            match self.observe_revision(identity.base).await {
                 Ok(snapshot) => {
                     pending.push((index, self.restore_from_snapshot(plan, snapshot).await?));
                 }
@@ -1058,6 +1094,9 @@ impl MetadataService {
         }
         if requests.is_empty() {
             return Ok(vec![]);
+        }
+        for request in requests {
+            request.validate(self.filesystem)?;
         }
         let plans = requests
             .iter()

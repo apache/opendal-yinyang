@@ -169,6 +169,7 @@ type RequestWire = (
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplayIdentity {
     pub(crate) volume: NodeId,
+    pub(crate) base: crate::Revision,
     pub(crate) id: CommitId,
     pub(crate) digest: [u8; 32],
 }
@@ -264,7 +265,7 @@ impl Transaction {
     /// Validate the complete canonical request and recompute its digest without
     /// requiring the base snapshot or content preparation evidence.
     pub(crate) fn inspect_replay_identity(bytes: &[u8]) -> Result<ReplayIdentity> {
-        let (_, volume, id, _, stored_digest, conditions, mutations) = Self::wire(bytes)?;
+        let (_, volume, id, revision, stored_digest, conditions, mutations) = Self::wire(bytes)?;
         let mut seen = BTreeSet::new();
         for (key, _) in &conditions {
             if key.is_empty()
@@ -302,7 +303,12 @@ impl Transaction {
                 "stored request digest does not match canonical bytes",
             ));
         }
-        Ok(ReplayIdentity { volume, id, digest })
+        Ok(ReplayIdentity {
+            volume,
+            base: crate::Revision::from_bytes(revision),
+            id,
+            digest,
+        })
     }
     fn wire(bytes: &[u8]) -> Result<RequestWire> {
         if bytes.len() > 16 * 1024 * 1024 {
