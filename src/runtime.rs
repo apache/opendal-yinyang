@@ -1056,7 +1056,8 @@ mod tests {
                 })?;
                 self.observed_plan
                     .store(record.plan.is_some(), Ordering::SeqCst);
-                Err(yinyang_core::Error::unsupported(
+                Err(yinyang_core::Error::new(
+                    yinyang_core::ErrorKind::Unsupported,
                     "commit probe",
                     "stop before dispatch",
                 ))
