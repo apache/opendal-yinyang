@@ -206,6 +206,13 @@ impl<B: Backend> AdapterInner<B> {
         })
     }
 
+    fn file_for_id(&self, id: B::Inode) -> Option<Arc<OpenFile<B>>> {
+        guard(&self.files)
+            .values()
+            .find(|open| self.backend.file_matches(&open.file, id))
+            .cloned()
+    }
+
     fn detach_file(&self, fh: FileHandle) -> Option<Arc<OpenFile<B>>> {
         guard(&self.files).remove(&fh.0)
     }
@@ -312,7 +319,9 @@ impl<B: Backend> AdapterInner<B> {
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
-        let open = fh.and_then(|fh| self.open_file(fh));
+        let open = fh
+            .and_then(|fh| self.open_file(fh))
+            .or_else(|| self.file_for_id(id));
         let result = self
             .backend
             .getattr(id, open.as_deref().map(|open| open.file.as_ref()))
