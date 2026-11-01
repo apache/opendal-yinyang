@@ -1010,8 +1010,6 @@ fn explicit_expiry_preserves_staged_and_backup_work_on_object_and_service() {
 }
 
 fn explicit_expiry_case(publication: Publication) {
-    const OPERATION_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-
     let old_hash = run_external("sha256sum", &[OLD_YY_BIN], Duration::from_secs(30));
     assert_eq!(
         std::str::from_utf8(&old_hash.stdout)
@@ -1137,8 +1135,6 @@ fn explicit_expiry_case(publication: Publication) {
         &zero_text,
         "--backup",
         text(&backup),
-        "--operation-id",
-        OPERATION_ID,
         "--json",
     ]);
     let report: serde_json::Value =

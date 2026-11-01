@@ -17,7 +17,7 @@ yy --volume CONFIG space retention plan \
   [--keep-last N] [--keep REVISION]... [--backup PATH]... [--json]
 yy --volume CONFIG space retention expire \
   --revision REVISION [--revision REVISION]... \
-  [--backup PATH]... [--operation-id UUID] [--json]
+  [--backup PATH]... [--json]
 ```
 
 `--volume` is required. The configuration must use `model: managed`; Direct
@@ -320,9 +320,10 @@ cleanup decision a separate future contract.
 
 ## Explicit logical expiry
 
-Expiry requires every writer, reader, mount, Sync process, and backup activity
-for the volume to be stopped. The CLI does not infer quiescence from a
-successful command and reports `quiescence: "not_observed"`.
+Expiry requires every affected writer, reader, mount, Sync process, and backup
+activity for the volume to be stopped. A metadata authority daemon may remain
+online and process the maintenance RPC. The CLI does not infer quiescence from
+a successful command and reports `quiescence: "not_observed"`.
 
 For the configured local staging path, expiry acquires the existing protocol
 leases in the same order as the real writers:
@@ -337,6 +338,10 @@ lock files, but it never creates, migrates, or recovers `staging.db`, `sync.db`,
 mutation. A held writer lease, malformed or foreign state, partial evidence, or
 unavailable state refuses the operation before mutation. SQLite `-wal`/`-shm`
 files and derived locks are not authoritative database bytes.
+
+These leases protect the configured local state only for the lifetime of the
+running command. They are not a durable or global fence across a crash,
+another unconfigured staging path, external readers, or undisclosed backups.
 
 Every ready durable handle protects its base revision as `staging_base`,
 including clean handles recoverable only by UUID. Dirty/frozen/conflict/
@@ -359,21 +364,29 @@ targets are mixed, only eligible targets are sent as candidates. Any
 current/missing/protected/incomplete input blocks every new mutation. Expiry
 does not reinterpret this as replay of the original request receipt.
 
-The command uses an explicit operation identity. A generated UUID is reported
-in the result. `--operation-id UUID` is only for retrying the exact same
-command after a retryable or unknown outcome; it creates no local retry journal.
-The authority request binds the volume, operation identity, expected latest
-revision, canonical candidate/protected sets, and an opaque canonical evidence
-digest. Core validates existence, current revision, protection, evidence
-outcomes, and expected latest before writing under its existing atomic
-publication boundary.
+The CLI generates a new operation identity for every invocation and reports it
+as audit evidence. It creates no local retry journal and exposes no
+user-supplied replay identity. The authority request binds the volume,
+operation identity, expected latest revision, canonical candidate/protected
+sets, and an opaque canonical evidence digest. Core validates existence,
+current revision, protection, evidence outcomes, and expected latest before
+writing under its existing atomic publication boundary.
+
+If the command returns retryable/unknown or its process crashes, keep every
+affected client and backup activity stopped. Rerun the same candidate set and
+confirm it reaches `committed` or the desired `already_expired` state before
+resuming them. A read that does not yet observe an expiry marker is not proof
+that a delayed earlier request can no longer take effect. Core retains its
+lower-level exact `ExpiryRequest` replay semantics, but the CLI does not claim
+that rerunning equivalent flags or reusing an identity replays the original
+canonical request.
 
 Exit codes are:
 
 - `0`: committed, or every requested target was already expired;
 - `2`: refused or expected-latest conflict, with no new expiry;
-- `3`: retryable or unknown outcome; retry the exact command with the reported
-  operation identity.
+- `3`: retryable or unknown outcome; keep clients and backups stopped and rerun
+  the same candidate set to confirm the target state.
 
 An expired revision retains its identity. `observe_revision` returns
 `ErrorKind::Expired` rather than `NotFound`, and detailed history exposes the

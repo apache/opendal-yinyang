@@ -1735,7 +1735,9 @@ fn expiry_limits(protected: u64, requested: u64) -> Vec<String> {
         "Logical expiry never authorizes physical deletion or estimates reclaimable bytes.".to_owned(),
         "External readers, untracked pins, other staging directories, and undisclosed backups remain unknown.".to_owned(),
         "Quiescence is not observed; the operator must stop every writer, reader, mount, Sync process, and backup activity.".to_owned(),
-        "Configured local-state writer entry points are held under their existing protocol leases through the Core mutation.".to_owned(),
+        "Configured local-state writer entry points are held under their existing protocol leases through the Core mutation; those leases end with the process and are not a crash-durable global fence.".to_owned(),
+        "After retryable or unknown outcome, keep affected clients and backups stopped and rerun the same candidates until committed or already expired.".to_owned(),
+        "A read that has not yet observed an expiry marker does not prove that a delayed earlier request can no longer take effect.".to_owned(),
         "Mutable authority metadata may advance; pre-existing immutable content and packs are not rewritten or deleted.".to_owned(),
         "Default keep-all remains unchanged and does not resurrect an explicitly expired revision.".to_owned(),
     ]

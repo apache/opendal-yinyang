@@ -68,9 +68,6 @@ pub enum RetentionCommand {
         /// Protect revisions referenced by an explicit validated backup package.
         #[arg(long = "backup")]
         backup: Vec<PathBuf>,
-        /// Reuse an operation identity only when retrying the exact same command.
-        #[arg(long)]
-        operation_id: Option<uuid::Uuid>,
         /// Emit the versioned `yinyang.managed-retention.expiry.v1` document.
         #[arg(long)]
         json: bool,
@@ -145,7 +142,6 @@ pub async fn run(
                 RetentionCommand::Expire {
                     revision,
                     backup,
-                    operation_id,
                     json,
                 },
         } => {
@@ -153,9 +149,7 @@ pub async fn run(
                 .into_iter()
                 .map(|revision| revision.0)
                 .collect::<Vec<_>>();
-            let operation_id = operation_id
-                .map(|id| ExpiryId::from_bytes(*id.as_bytes()))
-                .unwrap_or_else(ExpiryId::generate);
+            let operation_id = ExpiryId::generate();
             let report = yinyang::space::expire_managed_retention(
                 authority.as_ref(),
                 &config.staging,
@@ -557,8 +551,7 @@ fn print_expiry(report: &ManagedExpiryReport) {
         }
         ExpiryReportState::Unknown => {
             println!(
-                "expiry outcome is unknown; retry the exact command with --operation-id {}",
-                report.operation_id
+                "expiry outcome is unknown; keep clients and backups stopped and rerun the same candidate set"
             );
         }
     }
