@@ -43,13 +43,18 @@
 //!
 //! See `specs/linux-fuse.md` for the full contract.
 
+mod adapter;
 mod attrs;
+mod backend;
 mod direct;
+mod flags;
 mod frontend;
 mod inode;
 
 use crate::mount::Mount;
 use crate::volume::{Frontend, Model, Volume, VolumeConfig};
+use adapter::Adapter;
+use backend::Backend;
 use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,34 +89,23 @@ pub async fn run(
     }
     config.validate(&operator)?;
     if config.model == Model::Direct {
-        return direct::run(config, operator, mountpoint).await;
+        let backend = Arc::new(direct::DirectBackend::open(config, operator).await?);
+        return run_backend(backend, mountpoint).await;
     }
-    let read_only = config.read_only;
-    let authority = Volume::connect(&config, operator, token).await?;
-    let mount = Mount::open(authority, &config.staging, read_only).await?;
-    if read_only {
-        reject_unpublished_staging(&mount).await?;
-    }
-    let snapshot = mount.authority().observe_latest().await?;
-    let root = mount.authority().root();
-    let root_node = snapshot.node(root).await?;
-    if !root_node.is_some_and(|node| node.is_directory()) {
-        return Err(std::io::Error::other(
-            "remote filesystem root is unavailable or not a directory",
-        )
-        .into());
-    }
-    let inner = Arc::new(frontend::Inner::with_read_only(
-        mount,
-        tokio::runtime::Handle::current(),
-        read_only,
-    ));
-    let filesystem = frontend::FuseFrontend {
-        inner: inner.clone(),
-    };
+    let backend = Arc::new(frontend::ManagedBackend::open(config, operator, token).await?);
+    run_backend(backend, mountpoint).await
+}
+
+async fn run_backend<B: Backend>(
+    backend: Arc<B>,
+    mountpoint: PathBuf,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let read_only = backend.read_only();
+    let name = backend.name().to_owned();
+    let adapter = Adapter::new(backend, tokio::runtime::Handle::current());
     let mut options = Config::default();
     options.mount_options = vec![
-        MountOption::FSName(format!("yinyang-{}", config.name)),
+        MountOption::FSName(format!("yinyang-{name}")),
         MountOption::Subtype("yinyang".into()),
     ];
     if read_only {
@@ -128,11 +122,11 @@ pub async fn run(
             None
         }
     };
-    let session = Session::new(filesystem, &mountpoint, &options)?;
-    inner.install_notifier(session.notifier());
+    let session = Session::new(adapter.clone(), &mountpoint, &options)?;
+    adapter.install_notifier(session.notifier());
     println!(
         "yy: mounted {} {} at {} (fuse.yinyang)",
-        config.name,
+        name,
         if read_only { "read-only" } else { "read-write" },
         mountpoint.display()
     );
@@ -145,7 +139,7 @@ pub async fn run(
     let background = session.spawn()?;
     let (stop_refresh, stop_refresh_rx) = tokio::sync::oneshot::channel::<()>();
     let refresh_task = hangup.map(|signal| {
-        let refresh = inner.clone();
+        let refresh = adapter.clone();
         tokio::runtime::Handle::current()
             .spawn(async move { refresh.serve_hup(signal, stop_refresh_rx).await })
     });
@@ -216,7 +210,9 @@ fn blocking_error(error: tokio::task::JoinError) -> std::io::Error {
 /// A read-only snapshot must never expose staged bytes that were not
 /// published. The staging lease is already held, so the check cannot race
 /// another client, and refusing startup changes no remote state.
-async fn reject_unpublished_staging(mount: &Mount) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn reject_unpublished_staging(
+    mount: &Mount,
+) -> Result<(), Box<dyn std::error::Error>> {
     let status = mount.status().await?;
     if let Some(handle) = status
         .handles

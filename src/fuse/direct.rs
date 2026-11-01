@@ -15,162 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Linux FUSE adapter for storage-native Direct namespaces.
-//!
-//! Read-only mounts pin remote versions directly. Writable mounts share the
-//! storage-bound Direct object runtime and serve its retained local generations
-//! as an overlay without creating Managed metadata.
+//! Direct metadata backend for storage-native namespaces.
 
-use super::attrs::{ATTR_TTL, DIRECTORY_SIZE};
-use super::{Outcome, TEARDOWN_GRACE, blocking_error, shutdown_signal};
+use super::attrs::{ATTR_TTL, ObservedAttr};
+use super::backend::{
+    Backend, BackendError, Created, DirectoryEntry, DirectoryOpen, DirectoryPage, Entry, Opened,
+    Result, SetAttrRequest, file_type,
+};
+use super::flags::{has_open_flag, representable_mode, writable_create, writable_open};
+use super::inode::InodeIdentity;
 use crate::direct::{
     DirectFile, DirectFileHandle, DirectFlushOutcome, DirectId, DirectKind, DirectMutationState,
     DirectMutationStatus, DirectNamespace, DirectNode, DirectObjectId, DirectObjectPin,
-    DirectObjectState, DirectObjectStatus, DirectRuntime, DirectSnapshot, Error as DirectError,
-    ErrorKind as DirectErrorKind,
+    DirectObjectState, DirectObjectStatus, DirectRuntime, DirectSnapshot,
 };
 use crate::volume::VolumeConfig;
-use fuser::{
-    AccessFlags, BsdFileFlags, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, Notifier, OpenAccMode,
-    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session, SessionACL,
-    TimeOrNow, WriteFlags,
-};
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
-use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use fuser::OpenFlags;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::runtime::Handle;
+use std::time::{Duration, SystemTime};
 
-const ROOT_INODE: u64 = 1;
-const INODE_DOMAIN: &[u8] = b"yinyang direct fuse inode v1";
-const FALLBACK_STAMP_SECONDS: u64 = 1_600_000_000;
+impl InodeIdentity for DirectId {
+    const DOMAIN: &'static [u8] = b"yinyang direct fuse inode v1";
 
-fn has_open_flag(flags: i32, flag: nix::fcntl::OFlag) -> bool {
-    flags & flag.bits() != 0
-}
-
-fn writable_open(flags: OpenFlags) -> bool {
-    flags.acc_mode() != OpenAccMode::O_RDONLY
-}
-
-fn writable_create(flags: i32) -> bool {
-    flags & libc::O_ACCMODE != libc::O_RDONLY
-}
-
-fn representable_mode(mode: u32, umask: u32, read_only: bool, directory: bool) -> bool {
-    const S_IFMT: u32 = 0o170000;
-    const S_IFREG: u32 = 0o100000;
-    const S_IFDIR: u32 = 0o040000;
-    let file_type = mode & S_IFMT;
-    let type_ok = file_type == 0
-        || (directory && file_type == S_IFDIR)
-        || (!directory && file_type == S_IFREG);
-    if !type_ok || mode & !(S_IFMT | 0o777) != 0 {
-        return false;
-    }
-    let effective = mode & !umask & 0o777;
-    let expected = if directory {
-        if read_only { 0o555 } else { 0o755 }
-    } else if read_only {
-        0o444
-    } else {
-        0o644
-    };
-    effective == expected
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RenameRejection {
-    Invalid,
-    Unsupported,
-}
-
-impl RenameRejection {
-    fn errno(self) -> fuser::Errno {
-        match self {
-            Self::Invalid => fuser::Errno::EINVAL,
-            Self::Unsupported => fuser::Errno::EOPNOTSUPP,
-        }
-    }
-}
-
-fn rename_replace(flags: RenameFlags) -> Result<bool, RenameRejection> {
-    let known =
-        RenameFlags::RENAME_NOREPLACE | RenameFlags::RENAME_EXCHANGE | RenameFlags::RENAME_WHITEOUT;
-    if flags.bits() & !known.bits() != 0 {
-        return Err(RenameRejection::Invalid);
-    }
-    if flags.contains(RenameFlags::RENAME_EXCHANGE) || flags.contains(RenameFlags::RENAME_WHITEOUT)
-    {
-        return Err(RenameRejection::Unsupported);
-    }
-    Ok(!flags.contains(RenameFlags::RENAME_NOREPLACE))
-}
-
-struct DirectInodeTable {
-    by_inode: BTreeMap<u64, DirectId>,
-    by_id: BTreeMap<DirectId, u64>,
-    lookups: BTreeMap<u64, u64>,
-}
-
-impl DirectInodeTable {
-    fn new(root: DirectId) -> Self {
-        Self {
-            by_inode: [(ROOT_INODE, root)].into_iter().collect(),
-            by_id: [(root, ROOT_INODE)].into_iter().collect(),
-            lookups: BTreeMap::new(),
-        }
-    }
-
-    fn inode(&mut self, id: DirectId) -> Result<u64, fuser::Errno> {
-        if let Some(inode) = self.by_id.get(&id) {
-            return Ok(*inode);
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(INODE_DOMAIN);
-        hasher.update(id.as_bytes());
-        let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
-        let inode = u64::from_be_bytes(bytes);
-        if inode <= ROOT_INODE || self.by_inode.contains_key(&inode) {
-            return Err(fuser::Errno::EIO);
-        }
-        self.by_inode.insert(inode, id);
-        self.by_id.insert(id, inode);
-        Ok(inode)
-    }
-
-    fn node(&self, inode: u64) -> Option<DirectId> {
-        self.by_inode.get(&inode).copied()
-    }
-
-    fn remember_lookup(&mut self, inode: u64) {
-        let count = self.lookups.entry(inode).or_default().saturating_add(1);
-        self.lookups.insert(inode, count);
-    }
-
-    fn forget(&mut self, inode: u64, count: u64) {
-        let Some(remaining) = self.lookups.get_mut(&inode) else {
-            return;
-        };
-        *remaining = remaining.saturating_sub(count);
-        if *remaining == 0 {
-            self.lookups.remove(&inode);
-        }
-    }
-
-    fn inodes(&self) -> Vec<u64> {
-        self.by_inode.keys().copied().collect()
+    fn identity_bytes(self) -> [u8; 16] {
+        *self.as_bytes()
     }
 }
 
 #[derive(Clone)]
 struct FileView {
     size: u64,
-    modified: Option<std::time::SystemTime>,
+    modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -189,15 +65,14 @@ enum OpenSource {
     Staged(DirectFileHandle),
 }
 
-#[derive(Clone)]
-struct OpenFile {
+pub(super) struct DirectOpenFile {
     id: DirectId,
     source: OpenSource,
     writable: bool,
     view: Arc<Mutex<FileView>>,
 }
 
-impl OpenFile {
+impl DirectOpenFile {
     fn current_id(&self) -> DirectId {
         match &self.source {
             OpenSource::Remote(file) => file.id(),
@@ -210,49 +85,53 @@ impl OpenFile {
     }
 }
 
-#[derive(Clone)]
-struct DirItem {
-    ino: u64,
-    kind: FileType,
-    name: String,
+pub(super) struct DirectDirectory {
+    entries: Vec<DirectoryEntry<DirectId>>,
+    served: bool,
 }
 
-struct DirCursor {
-    ino: u64,
-    parent_ino: u64,
-    items: Vec<DirItem>,
-}
-
-pub(super) struct DirectInner {
+pub(super) struct DirectBackend {
     namespace: DirectNamespace,
+    name: String,
     read_only: bool,
+    root: DirectId,
     direct: Option<DirectRuntime>,
     snapshot: RwLock<Arc<DirectSnapshot>>,
     pending: Mutex<BTreeMap<DirectId, DirectObjectStatus>>,
     views: Mutex<BTreeMap<ViewKey, Arc<Mutex<FileView>>>>,
     refresh_error: Mutex<Option<String>>,
-    inodes: Mutex<DirectInodeTable>,
-    files: Mutex<BTreeMap<u64, Arc<OpenFile>>>,
-    dirs: Mutex<BTreeMap<u64, Arc<Mutex<DirCursor>>>>,
-    dentries: Mutex<BTreeSet<(u64, String)>>,
-    notifier: Mutex<Option<Notifier>>,
-    next_handle: AtomicU64,
-    tokio: Handle,
 }
 
-impl DirectInner {
-    fn new(
-        namespace: DirectNamespace,
-        read_only: bool,
-        direct: Option<DirectRuntime>,
-        pending: Vec<DirectObjectStatus>,
-        snapshot: DirectSnapshot,
-        tokio: Handle,
-    ) -> Self {
+impl DirectBackend {
+    pub(super) async fn open(
+        config: VolumeConfig,
+        operator: opendal::Operator,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let namespace = DirectNamespace::new(operator.clone())?;
+        let (direct, pending) = if config.read_only {
+            (None, Vec::new())
+        } else {
+            let binding = crate::volume::direct_storage_binding(&config, &operator)?;
+            let direct = DirectRuntime::open(
+                namespace.clone(),
+                Some(config.staging.clone()),
+                false,
+                binding,
+            )
+            .await?;
+            let pending = direct.pending_objects().await?;
+            (Some(direct), pending)
+        };
+        let snapshot = namespace.observe().await?;
+        if !snapshot.root_node().is_directory() {
+            return Err(std::io::Error::other("Direct namespace root is not a directory").into());
+        }
         let root = snapshot.root();
-        Self {
+        let backend = Self {
             namespace,
-            read_only,
+            name: config.name,
+            read_only: config.read_only,
+            root,
             direct,
             snapshot: RwLock::new(Arc::new(snapshot)),
             pending: Mutex::new(
@@ -263,22 +142,8 @@ impl DirectInner {
             ),
             views: Mutex::new(BTreeMap::new()),
             refresh_error: Mutex::new(None),
-            inodes: Mutex::new(DirectInodeTable::new(root)),
-            files: Mutex::new(BTreeMap::new()),
-            dirs: Mutex::new(BTreeMap::new()),
-            dentries: Mutex::new(BTreeSet::new()),
-            notifier: Mutex::new(None),
-            next_handle: AtomicU64::new(0),
-            tokio,
-        }
-    }
-
-    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
-        self.tokio.spawn(future);
-    }
-
-    fn next_handle(&self) -> u64 {
-        self.next_handle.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        Ok(backend)
     }
 
     fn pending_status(&self, id: DirectId) -> Option<DirectObjectStatus> {
@@ -306,14 +171,11 @@ impl DirectInner {
         }
     }
 
-    async fn refresh_pending(&self) -> Result<(), fuser::Errno> {
+    async fn refresh_pending(&self) -> Result<()> {
         let Some(direct) = &self.direct else {
             return Ok(());
         };
-        let statuses = direct
-            .pending_objects()
-            .await
-            .map_err(|error| direct_errno(&error))?;
+        let statuses = direct.pending_objects().await?;
         let mut pending = BTreeMap::new();
         for status in statuses {
             if !matches!(
@@ -327,11 +189,22 @@ impl DirectInner {
         Ok(())
     }
 
+    fn current(&self) -> Result<Arc<DirectSnapshot>> {
+        if guard(&self.refresh_error).is_some() {
+            return Err(BackendError::MutationIo);
+        }
+        Ok(self
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
+    }
+
     fn view_for(
         &self,
         key: ViewKey,
         size: u64,
-        modified: Option<std::time::SystemTime>,
+        modified: Option<SystemTime>,
     ) -> Arc<Mutex<FileView>> {
         let mut views = guard(&self.views);
         prune_unreferenced_views(&mut views);
@@ -349,39 +222,23 @@ impl DirectInner {
         view
     }
 
-    fn view_attr(
-        &self,
-        ino: INodeNo,
-        id: DirectId,
-        fallback_modified: Option<std::time::SystemTime>,
-    ) -> Option<FileAttr> {
-        let view = guard(&self.files)
-            .values()
-            .find(|open| open.current_id() == id)
-            .map(|open| open.view.clone())?;
-        let view = guard(&view).clone();
-        Some(attribute_with_size(
-            ino,
-            false,
-            view.size,
-            view.modified.or(fallback_modified),
-            self.read_only,
-        ))
-    }
-
-    fn open_attr(&self, ino: INodeNo, open: &OpenFile) -> FileAttr {
+    fn open_attr(&self, open: &DirectOpenFile) -> ObservedAttr {
         let view = guard(&open.view).clone();
-        attribute_with_size(ino, false, view.size, view.modified, self.read_only)
+        ObservedAttr::from_storage(false, view.size, view.modified)
     }
 
-    fn live_file_attr(&self, ino: INodeNo, id: DirectId) -> Option<FileAttr> {
-        guard(&self.files)
-            .values()
-            .find(|open| open.matches_id(id))
-            .map(|open| self.open_attr(ino, open))
+    fn live_file_attr(&self, id: DirectId) -> Option<ObservedAttr> {
+        let views = guard(&self.views);
+        let view = views.iter().find_map(|(key, view)| {
+            matches!(key, ViewKey::Remote(remote) if *remote == id)
+                .then_some(view)
+                .filter(|view| Arc::strong_count(view) > 1)
+        })?;
+        let view = guard(view).clone();
+        Some(ObservedAttr::from_storage(false, view.size, view.modified))
     }
 
-    fn status_attr(&self, ino: INodeNo, status: &DirectObjectStatus) -> FileAttr {
+    fn status_attr(&self, status: &DirectObjectStatus) -> ObservedAttr {
         let modified = status
             .accepted
             .as_ref()
@@ -392,51 +249,7 @@ impl DirectInner {
                     .present()
                     .and_then(DirectObjectPin::modified)
             });
-        attribute_with_size(ino, false, status.length, modified, self.read_only)
-    }
-
-    fn install_notifier(&self, notifier: Notifier) {
-        guard(&self.notifier).replace(notifier);
-    }
-
-    fn current(&self) -> Result<Arc<DirectSnapshot>, fuser::Errno> {
-        if guard(&self.refresh_error).is_some() {
-            return Err(fuser::Errno::EIO);
-        }
-        let snapshot = self
-            .snapshot
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        Ok(snapshot)
-    }
-
-    fn attr_ttl(&self) -> std::time::Duration {
-        if self.read_only {
-            ATTR_TTL
-        } else {
-            std::time::Duration::ZERO
-        }
-    }
-
-    fn node(&self, ino: INodeNo) -> Option<DirectId> {
-        guard(&self.inodes).node(ino.0)
-    }
-
-    fn inode_for(&self, id: DirectId) -> Result<INodeNo, fuser::Errno> {
-        guard(&self.inodes).inode(id).map(INodeNo)
-    }
-
-    fn remember_lookup(&self, ino: INodeNo) {
-        guard(&self.inodes).remember_lookup(ino.0);
-    }
-
-    fn forget(&self, ino: INodeNo, count: u64) {
-        guard(&self.inodes).forget(ino.0, count);
-    }
-
-    fn record_dentry(&self, parent: INodeNo, name: &str) {
-        guard(&self.dentries).insert((parent.0, name.to_owned()));
+        ObservedAttr::from_storage(false, status.length, modified)
     }
 
     async fn refresh_remote_only(&self) {
@@ -452,8 +265,8 @@ impl DirectInner {
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(snapshot);
                 *guard(&self.refresh_error) = None;
-                if let Err(errno) = self.refresh_pending().await {
-                    eprintln!("yy: fuse refresh: cannot load Direct pending state: {errno:?}");
+                if let Err(error) = self.refresh_pending().await {
+                    eprintln!("yy: fuse refresh: cannot load Direct pending state: {error}");
                 }
                 let pending = guard(&self.pending).len();
                 eprintln!(
@@ -470,153 +283,153 @@ impl DirectInner {
         }
     }
 
-    async fn refresh_once(&self) {
-        self.refresh_remote_only().await;
-        if guard(&self.refresh_error).is_none() {
-            self.invalidate_known().await;
-        }
-    }
-
-    async fn invalidate_known(&self) {
-        let inodes = guard(&self.inodes).inodes();
-        let dentries = guard(&self.dentries).iter().cloned().collect::<Vec<_>>();
-        let Some(notifier) = guard(&self.notifier).clone() else {
-            eprintln!("yy: fuse refresh: notifier not installed; skipping kernel invalidation");
-            return;
-        };
-        let attempts = inodes.len() + dentries.len();
-        let result = tokio::task::spawn_blocking(move || {
-            let (mut inode_ok, mut entry_ok, mut errors) = (0usize, 0usize, 0usize);
-            for inode in inodes {
-                match notifier.inval_inode(INodeNo(inode), -1, 0) {
-                    Ok(()) => inode_ok += 1,
-                    Err(_) => errors += 1,
+    async fn flush_handle(&self, file: &DirectFileHandle) -> Result<()> {
+        match file.flush().await? {
+            DirectFlushOutcome::Unchanged => Ok(()),
+            DirectFlushOutcome::Applied { .. } => {
+                if let Ok(status) = file.status().await {
+                    self.store_pending(status);
                 }
+                self.refresh_remote_only().await;
+                Ok(())
             }
-            for (parent, name) in dentries {
-                match notifier.inval_entry(INodeNo(parent), OsStr::new(&name)) {
-                    Ok(()) => entry_ok += 1,
-                    Err(_) => errors += 1,
+            DirectFlushOutcome::Conflict { .. } => {
+                if let Err(error) = self.refresh_pending().await {
+                    eprintln!("yy: fuse flush: cannot retain Direct conflict state: {error}");
                 }
+                self.refresh_remote_only().await;
+                Err(BackendError::NamespaceConflict)
             }
-            (inode_ok, entry_ok, errors)
-        })
-        .await
-        .unwrap_or((0, 0, attempts));
-        eprintln!(
-            "yy: fuse refresh: done (inode={} entries={} errors={})",
-            result.0, result.1, result.2
-        );
-    }
-
-    pub(super) async fn serve_hup(
-        self: Arc<Self>,
-        mut signal: tokio::signal::unix::Signal,
-        mut stop: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut stop => return,
-                event = signal.recv() => match event {
-                    Some(()) => self.refresh_once().await,
-                    None => return,
-                },
+            DirectFlushOutcome::Unknown { .. } => {
+                if let Err(error) = self.refresh_pending().await {
+                    eprintln!("yy: fuse flush: cannot retain Direct unknown state: {error}");
+                }
+                self.refresh_remote_only().await;
+                Err(BackendError::MutationIo)
+            }
+            DirectFlushOutcome::Unsupported { message } => {
+                eprintln!("yy: fuse flush: Direct publication is unsupported: {message}");
+                Err(BackendError::MutationUnsupported)
             }
         }
     }
 
-    async fn lookup(&self, parent: INodeNo, name: String, reply: ReplyEntry) {
-        let Some(parent_id) = self.node(parent) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        if let Some(status) = self.pending_child(parent_id, &name) {
-            let ino = match self.inode_for(status.id) {
-                Ok(ino) => ino,
-                Err(errno) => return reply.error(errno),
-            };
-            self.record_dentry(parent, &name);
-            self.remember_lookup(ino);
-            return reply.entry(
-                &self.attr_ttl(),
-                &self.status_attr(ino, &status),
-                Generation(0),
-            );
+    async fn flush_staged(&self, open: &DirectOpenFile) -> Result<()> {
+        if !open.writable {
+            return Ok(());
         }
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
+        let OpenSource::Staged(file) = &open.source else {
+            return Err(BackendError::MutationUnsupported);
         };
-        let node = match snapshot.lookup(parent_id, &name) {
+        self.flush_handle(file).await
+    }
+
+    fn mutation_error(status: &DirectMutationStatus) -> Result<()> {
+        match status.state {
+            DirectMutationState::Applied => Ok(()),
+            DirectMutationState::Conflict => Err(BackendError::NamespaceConflict),
+            DirectMutationState::DestinationApplied | DirectMutationState::PendingSourceCleanup => {
+                Err(BackendError::MutationIo)
+            }
+            DirectMutationState::Failed => Err(BackendError::MutationUnsupported),
+            DirectMutationState::Staged
+            | DirectMutationState::Dispatching
+            | DirectMutationState::Unknown => Err(BackendError::MutationIo),
+        }
+    }
+}
+
+impl Backend for DirectBackend {
+    type Inode = DirectId;
+    type File = DirectOpenFile;
+    type Directory = DirectDirectory;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn root(&self) -> DirectId {
+        self.root
+    }
+
+    fn attr_ttl(&self) -> Duration {
+        if self.read_only {
+            ATTR_TTL
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn file_matches(&self, file: &DirectOpenFile, id: DirectId) -> bool {
+        file.matches_id(id)
+    }
+
+    async fn lookup(&self, parent: DirectId, name: &str) -> Result<Option<Entry<DirectId>>> {
+        if let Some(status) = self.pending_child(parent, name) {
+            return Ok(Some(Entry {
+                id: status.id,
+                attr: self.status_attr(&status),
+            }));
+        }
+        let snapshot = self.current()?;
+        let node = match snapshot.lookup(parent, name) {
             Ok(Some(node)) => node,
-            Ok(None) => return reply.error(fuser::Errno::ENOENT),
-            Err(error) => return reply.error(direct_errno(&error)),
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
-        let ino = match self.inode_for(node.id()) {
-            Ok(ino) => ino,
-            Err(errno) => return reply.error(errno),
-        };
-        self.record_dentry(parent, &name);
-        self.remember_lookup(ino);
-        reply.entry(
-            &self.attr_ttl(),
-            &attribute(ino, node, node.modified(), self.read_only),
-            Generation(0),
-        );
+        Ok(Some(Entry {
+            id: node.id(),
+            attr: ObservedAttr::from_storage(node.is_directory(), node.size(), node.modified()),
+        }))
     }
 
-    async fn getattr(&self, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        if let Some(fh) = fh
-            && let Some(open) = guard(&self.files).get(&fh.0).cloned()
-        {
-            return reply.attr(&self.attr_ttl(), &self.open_attr(ino, &open));
-        }
-        let Some(id) = self.node(ino) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        if let Some(attr) = self.live_file_attr(ino, id) {
-            return reply.attr(&self.attr_ttl(), &attr);
+    async fn getattr(&self, id: DirectId, file: Option<&DirectOpenFile>) -> Result<ObservedAttr> {
+        if let Some(file) = file {
+            return Ok(self.open_attr(file));
         }
         if let Some(status) = self.pending_status(id) {
-            return reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
+            return Ok(self.status_attr(&status));
         }
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
-        };
-        let Some(node) = snapshot.node(id) else {
-            return reply.error(fuser::Errno::ENOENT);
-        };
-        if let Some(attr) = self.view_attr(ino, id, node.modified()) {
-            return reply.attr(&self.attr_ttl(), &attr);
+        let snapshot = self.current()?;
+        let node = snapshot.node(id).ok_or(BackendError::NotFound)?;
+        if let Some(attr) = self.live_file_attr(id) {
+            return Ok(attr);
         }
-        reply.attr(
-            &self.attr_ttl(),
-            &attribute(ino, node, node.modified(), self.read_only),
-        );
+        Ok(ObservedAttr::from_storage(
+            node.is_directory(),
+            node.size(),
+            node.modified(),
+        ))
     }
 
-    async fn open(&self, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let Some(id) = self.node(ino) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
+    async fn open(&self, id: DirectId, flags: OpenFlags) -> Result<Opened<DirectOpenFile>> {
         let writable = writable_open(flags);
-        let truncate = has_open_flag(flags.0, nix::fcntl::OFlag::O_TRUNC);
-        if truncate && !writable {
-            return reply.error(fuser::Errno::EINVAL);
-        }
         if self.read_only {
-            if writable {
-                return reply.error(fuser::Errno::EROFS);
+            let snapshot = self.current()?;
+            let node = snapshot.node(id).ok_or(BackendError::MutationIo)?;
+            if node.is_directory() {
+                return Err(BackendError::IsDirectory);
             }
-            return self.open_read_only(ino, id, reply).await;
+            let file = snapshot.open_file(id).await?;
+            let view = self.view_for(ViewKey::Remote(id), node.size(), node.modified());
+            return Ok(Opened {
+                file: DirectOpenFile {
+                    id,
+                    source: OpenSource::Remote(file),
+                    writable: false,
+                    view,
+                },
+                writable: false,
+            });
         }
-        let Some(direct) = &self.direct else {
-            return reply.error(fuser::Errno::EIO);
-        };
+        let direct = self.direct.as_ref().ok_or(BackendError::MutationIo)?;
         let (file, modified) = if let Some(status) = self.pending_status(id) {
             if status.observed.is_missing() {
-                return reply.error(fuser::Errno::ENOENT);
+                return Err(BackendError::NotFound);
             }
             let modified = status
                 .accepted
@@ -628,165 +441,212 @@ impl DirectInner {
                         .present()
                         .and_then(DirectObjectPin::modified)
                 });
-            let file = match direct.open_pending(id, writable).await {
-                Ok(file) => file,
-                Err(error) => return reply.error(direct_errno(&error)),
-            };
-            (file, modified)
+            (direct.open_pending(id, writable).await?, modified)
         } else {
-            let snapshot = match self.current() {
-                Ok(snapshot) => snapshot,
-                Err(errno) => return reply.error(errno),
-            };
-            let Some(node) = snapshot.node(id) else {
-                return reply.error(fuser::Errno::ESTALE);
-            };
+            let snapshot = self.current()?;
+            let node = snapshot.node(id).ok_or(BackendError::MutationIo)?;
             if node.is_directory() {
-                return reply.error(fuser::Errno::EISDIR);
+                return Err(BackendError::IsDirectory);
             }
-            let file = match direct.open_file(&snapshot, id, writable).await {
-                Ok(file) => file,
-                Err(error) => return reply.error(direct_errno(&error)),
-            };
-            (file, node.modified())
+            (
+                direct.open_file(&snapshot, id, writable).await?,
+                node.modified(),
+            )
         };
-        if let Err(errno) = self.invalidate_before_open(ino).await {
-            return reply.error(errno);
+        if has_open_flag(flags.0, nix::fcntl::OFlag::O_TRUNC) {
+            file.truncate(0).await?;
         }
-        if truncate && let Err(error) = file.truncate(0).await {
-            return reply.error(direct_errno(&error));
-        }
-        let length = match file.len().await {
-            Ok(length) => length,
-            Err(error) => return reply.error(direct_errno(&error)),
-        };
+        let length = file.len().await?;
         let view = self.view_for(ViewKey::Staged(file.object_id()), length, modified);
-        if let Err(error) = file.status().await {
-            return reply.error(direct_errno(&error));
-        }
-        let fh = self.next_handle();
-        guard(&self.files).insert(
-            fh,
-            Arc::new(OpenFile {
+        file.status().await?;
+        Ok(Opened {
+            file: DirectOpenFile {
                 id,
                 source: OpenSource::Staged(file),
                 writable,
                 view,
-            }),
-        );
-        reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+            },
+            writable,
+        })
     }
 
-    async fn open_read_only(&self, ino: INodeNo, id: DirectId, reply: ReplyOpen) {
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
-        };
-        let Some(node) = snapshot.node(id) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        if node.is_directory() {
-            return reply.error(fuser::Errno::EISDIR);
+    async fn read(&self, file: &DirectOpenFile, offset: u64, size: usize) -> Result<Vec<u8>> {
+        match &file.source {
+            OpenSource::Remote(file) => Ok(file.read(offset, size).await?),
+            OpenSource::Staged(file) => Ok(file.read(offset, size).await?),
         }
-        let file = match snapshot.open_file(id).await {
-            Ok(file) => file,
-            Err(error) => return reply.error(direct_errno(&error)),
+    }
+
+    async fn write(
+        &self,
+        file: &DirectOpenFile,
+        offset: u64,
+        data: &[u8],
+        flags: OpenFlags,
+    ) -> Result<()> {
+        let OpenSource::Staged(staged) = &file.source else {
+            return Err(BackendError::MutationIo);
         };
-        if let Err(errno) = self.invalidate_before_open(ino).await {
-            return reply.error(errno);
+        if has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND) {
+            staged.append(data).await?;
+        } else {
+            staged.write(offset, data).await?;
         }
-        let view = self.view_for(ViewKey::Remote(id), node.size(), node.modified());
-        let fh = self.next_handle();
-        guard(&self.files).insert(
-            fh,
-            Arc::new(OpenFile {
-                id,
-                source: OpenSource::Remote(file),
-                writable: false,
-                view,
-            }),
-        );
-        reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+        if let Ok(length) = staged.len().await {
+            let mut view = guard(&file.view);
+            view.size = length;
+            view.modified = Some(SystemTime::now());
+        }
+        if let Ok(status) = staged.status().await {
+            self.store_pending(status);
+        }
+        if has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
+            || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC)
+        {
+            self.flush_staged(file).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&self, file: &DirectOpenFile) -> Result<()> {
+        self.flush_staged(file).await
+    }
+
+    async fn fsync(&self, file: &DirectOpenFile) -> Result<()> {
+        self.flush_staged(file).await
+    }
+
+    async fn release(&self, _id: DirectId, _file: &DirectOpenFile, _writable: bool) -> Result<()> {
+        {
+            let mut views = guard(&self.views);
+            prune_unreferenced_views(&mut views);
+        }
+        if let Err(error) = self.refresh_pending().await {
+            eprintln!("yy: fuse release: cannot refresh Direct pending state: {error}");
+        }
+        Ok(())
+    }
+
+    async fn setattr(
+        &self,
+        id: DirectId,
+        file: Option<&DirectOpenFile>,
+        request: SetAttrRequest,
+    ) -> Result<ObservedAttr> {
+        if request.mode.is_some()
+            || request.uid.is_some()
+            || request.gid.is_some()
+            || request.flags.is_some()
+            || (request.size.is_none() && request.has_timestamp())
+        {
+            return Err(BackendError::MutationUnsupported);
+        }
+        let Some(length) = request.size else {
+            if let Some(status) = self.pending_status(id) {
+                return Ok(self.status_attr(&status));
+            }
+            let snapshot = self.current()?;
+            let node = snapshot.node(id).ok_or(BackendError::MutationIo)?;
+            if let Some(file) = file {
+                return Ok(self.open_attr(file));
+            }
+            if let Some(attr) = self.live_file_attr(id) {
+                return Ok(attr);
+            }
+            return Ok(ObservedAttr::from_storage(
+                node.is_directory(),
+                node.size(),
+                node.modified(),
+            ));
+        };
+        if self.read_only {
+            return Err(BackendError::Runtime(crate::runtime::Error::State(
+                crate::runtime::ErrorKind::ReadOnly,
+                "Direct mount is read-only",
+            )));
+        }
+        if let Some(open) = file {
+            let OpenSource::Staged(file) = &open.source else {
+                return Err(BackendError::MutationUnsupported);
+            };
+            file.truncate(length).await?;
+            if let Ok(size) = file.len().await {
+                let mut view = guard(&open.view);
+                view.size = size;
+                view.modified = Some(SystemTime::now());
+            }
+            if let Ok(status) = file.status().await {
+                self.store_pending(status);
+            }
+            return Ok(self.open_attr(open));
+        }
+        let direct = self.direct.as_ref().ok_or(BackendError::MutationIo)?;
+        let file = if self.pending_status(id).is_some() {
+            direct.open_pending(id, true).await?
+        } else {
+            let snapshot = self.current()?;
+            let node = snapshot.node(id).ok_or(BackendError::MutationIo)?;
+            if node.is_directory() {
+                return Err(BackendError::IsDirectory);
+            }
+            direct.open_file(&snapshot, id, true).await?
+        };
+        file.truncate(length).await?;
+        self.flush_handle(&file).await?;
+        let status = file.status().await?;
+        self.store_pending(status.clone());
+        Ok(self.status_attr(&status))
     }
 
     async fn create(
         &self,
-        parent: INodeNo,
-        name: String,
+        parent: DirectId,
+        name: &str,
         mode: u32,
         umask: u32,
         flags: i32,
-        reply: ReplyCreate,
-    ) {
-        if self.read_only {
-            return reply.error(fuser::Errno::EROFS);
+    ) -> Result<Created<DirectId, DirectOpenFile>> {
+        if !representable_mode(mode, umask, false, false, false) {
+            return Err(BackendError::MutationUnsupported);
         }
-        if !representable_mode(mode, umask, false, false) {
-            return reply.error(fuser::Errno::EOPNOTSUPP);
-        }
-        let Some(parent_id) = self.node(parent) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
-        };
-        let Some(direct) = &self.direct else {
-            return reply.error(fuser::Errno::EIO);
-        };
-        let file = match direct.create_file(&snapshot, parent_id, &name).await {
-            Ok(file) => file,
-            Err(error) => return reply.error(direct_errno(&error)),
-        };
+        let snapshot = self.current()?;
+        let direct = self.direct.as_ref().ok_or(BackendError::MutationIo)?;
+        let file = direct.create_file(&snapshot, parent, name).await?;
         let writable = writable_create(flags);
         if !writable {
-            let flush = match file.flush().await {
-                Ok(flush) => flush,
-                Err(error) => return reply.error(direct_errno(&error)),
-            };
-            match flush {
+            match file.flush().await? {
                 DirectFlushOutcome::Unchanged | DirectFlushOutcome::Applied { .. } => {
                     self.refresh_remote_only().await;
                 }
                 DirectFlushOutcome::Conflict { .. } => {
                     let _ = self.refresh_pending().await;
                     self.refresh_remote_only().await;
-                    return reply.error(fuser::Errno::ESTALE);
+                    return Err(BackendError::NamespaceConflict);
                 }
                 DirectFlushOutcome::Unknown { .. } => {
                     let _ = self.refresh_pending().await;
                     self.refresh_remote_only().await;
-                    return reply.error(fuser::Errno::EIO);
+                    return Err(BackendError::MutationIo);
                 }
                 DirectFlushOutcome::Unsupported { message } => {
                     let _ = self.refresh_pending().await;
                     self.refresh_remote_only().await;
                     eprintln!("yy: fuse create: Direct publication is unsupported: {message}");
-                    return reply.error(fuser::Errno::EOPNOTSUPP);
+                    return Err(BackendError::MutationUnsupported);
                 }
             }
         }
-        let status = match file.status().await {
-            Ok(status) => status,
-            Err(error) => return reply.error(direct_errno(&error)),
-        };
+        let status = file.status().await?;
         self.store_pending(status.clone());
         let id = if writable {
             file.id()
         } else {
-            match self.current() {
-                Ok(snapshot) => snapshot
-                    .lookup(parent_id, &name)
-                    .ok()
-                    .flatten()
-                    .map(DirectNode::id)
-                    .unwrap_or_else(|| file.id()),
-                Err(_) => file.id(),
-            }
-        };
-        let ino = match self.inode_for(id) {
-            Ok(ino) => ino,
-            Err(errno) => return reply.error(errno),
+            self.current()?
+                .lookup(parent, name)
+                .ok()
+                .flatten()
+                .map(DirectNode::id)
+                .unwrap_or_else(|| file.id())
         };
         let modified = status
             .accepted
@@ -799,55 +659,41 @@ impl DirectInner {
                     .and_then(DirectObjectPin::modified)
             });
         let view = self.view_for(ViewKey::Staged(file.object_id()), status.length, modified);
-        let fh = self.next_handle();
-        let open = OpenFile {
+        let attr = ObservedAttr::from_storage(false, status.length, modified);
+        Ok(Created {
             id,
-            source: OpenSource::Staged(file),
+            attr,
+            file: DirectOpenFile {
+                id,
+                source: OpenSource::Staged(file),
+                writable,
+                view,
+            },
             writable,
-            view,
-        };
-        self.record_dentry(parent, &name);
-        self.remember_lookup(ino);
-        let attr = self.open_attr(ino, &open);
-        guard(&self.files).insert(fh, Arc::new(open));
-        reply.created(
-            &self.attr_ttl(),
-            &attr,
-            Generation(0),
-            FileHandle(fh),
-            FopenFlags::FOPEN_DIRECT_IO,
-        );
+        })
     }
 
-    async fn unlink(&self, parent: INodeNo, name: String, reply: ReplyEmpty) {
-        if self.read_only {
-            return reply.error(fuser::Errno::EROFS);
-        }
-        let Some(parent_id) = self.node(parent) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let Some(direct) = &self.direct else {
-            return reply.error(fuser::Errno::EIO);
-        };
-        if let Some(status) = self.pending_child(parent_id, &name) {
+    async fn mkdir(
+        &self,
+        _parent: DirectId,
+        _name: &str,
+        _mode: u32,
+        _umask: u32,
+    ) -> Result<Entry<DirectId>> {
+        Err(BackendError::MutationUnsupported)
+    }
+
+    async fn unlink(&self, parent: DirectId, name: &str) -> Result<()> {
+        let direct = self.direct.as_ref().ok_or(BackendError::MutationIo)?;
+        if let Some(status) = self.pending_child(parent, name) {
             if !status.existed_remote {
-                if guard(&self.files).values().any(|open| open.id == status.id) {
-                    return reply.error(fuser::Errno::EOPNOTSUPP);
+                direct.discard_local(status.id).await?;
+                if let Err(error) = self.refresh_pending().await {
+                    eprintln!("yy: fuse unlink: cannot refresh local state: {error}");
                 }
-                match direct.discard_local(status.id).await {
-                    Ok(()) => {
-                        if let Err(errno) = self.refresh_pending().await {
-                            eprintln!("yy: fuse unlink: cannot refresh local state: {errno:?}");
-                        }
-                        return reply.ok();
-                    }
-                    Err(error) => return reply.error(direct_errno(&error)),
-                }
+                return Ok(());
             }
-            let snapshot = match self.current() {
-                Ok(snapshot) => snapshot,
-                Err(errno) => return reply.error(errno),
-            };
+            let snapshot = self.current()?;
             let source = snapshot
                 .node(status.id)
                 .filter(|node| node.is_file())
@@ -857,94 +703,41 @@ impl DirectInner {
                         .resolve(&status.path)
                         .filter(|node| node.is_file())
                         .map(DirectNode::id)
-                });
-            let Some(source) = source else {
-                return reply.error(fuser::Errno::ESTALE);
-            };
-            return self.finish_unlink(direct, &snapshot, source, reply).await;
+                })
+                .ok_or(BackendError::MutationIo)?;
+            return self.finish_unlink(direct, &snapshot, source).await;
         }
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
-        };
-        let source = match snapshot.lookup(parent_id, &name) {
+        let snapshot = self.current()?;
+        let source = match snapshot.lookup(parent, name) {
             Ok(Some(node)) if node.is_file() => node.id(),
-            Ok(Some(_)) => return reply.error(fuser::Errno::EISDIR),
-            Ok(None) => return reply.error(fuser::Errno::ENOENT),
-            Err(error) => return reply.error(direct_errno(&error)),
+            Ok(Some(_)) => {
+                return Err(BackendError::IsDirectory);
+            }
+            Ok(None) => {
+                return Err(BackendError::NotFound);
+            }
+            Err(error) => return Err(error.into()),
         };
-        self.finish_unlink(direct, &snapshot, source, reply).await;
+        self.finish_unlink(direct, &snapshot, source).await
     }
 
-    async fn finish_unlink(
-        &self,
-        direct: &DirectRuntime,
-        snapshot: &DirectSnapshot,
-        source: DirectId,
-        reply: ReplyEmpty,
-    ) {
-        let status = match direct.unlink_file(snapshot, source).await {
-            Ok(status) => status,
-            Err(error) => return reply.error(direct_errno(&error)),
-        };
-        match namespace_mutation_errno(&status) {
-            None => {
-                self.refresh_remote_only().await;
-                reply.ok();
-            }
-            Some(errno) => {
-                if let Err(pending) = self.refresh_pending().await {
-                    eprintln!("yy: fuse unlink: cannot retain mutation state: {pending:?}");
-                }
-                if should_rebase_namespace_after_failure(status.state) {
-                    self.refresh_remote_only().await;
-                }
-                eprintln!(
-                    "yy: fuse unlink: Direct mutation {} retained in {:?}: {}",
-                    status.id.to_hex(),
-                    status.state,
-                    status.error.as_deref().unwrap_or("no diagnostic recorded")
-                );
-                reply.error(errno);
-            }
-        }
+    async fn rmdir(&self, _parent: DirectId, _name: &str) -> Result<()> {
+        Err(BackendError::MutationUnsupported)
     }
 
     async fn rename(
         &self,
-        parent: INodeNo,
-        name: String,
-        new_parent: INodeNo,
-        new_name: String,
-        flags: RenameFlags,
-        reply: ReplyEmpty,
-    ) {
-        if self.read_only {
-            return reply.error(fuser::Errno::EROFS);
-        }
-        let replace = match rename_replace(flags) {
-            Ok(replace) => replace,
-            Err(rejection) => return reply.error(rejection.errno()),
-        };
-        if parent == new_parent && name == new_name {
-            return reply.ok();
-        }
-        let Some(parent_id) = self.node(parent) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let Some(new_parent_id) = self.node(new_parent) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let Some(direct) = &self.direct else {
-            return reply.error(fuser::Errno::EIO);
-        };
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
-        };
-        let source = if let Some(status) = self.pending_child(parent_id, &name) {
+        parent: DirectId,
+        name: &str,
+        new_parent: DirectId,
+        new_name: &str,
+        replace: bool,
+    ) -> Result<()> {
+        let direct = self.direct.as_ref().ok_or(BackendError::MutationIo)?;
+        let snapshot = self.current()?;
+        let source = if let Some(status) = self.pending_child(parent, name) {
             if !status.existed_remote {
-                return reply.error(fuser::Errno::EOPNOTSUPP);
+                return Err(BackendError::MutationUnsupported);
             }
             snapshot
                 .node(status.id)
@@ -957,1053 +750,137 @@ impl DirectInner {
                         .map(DirectNode::id)
                 })
         } else {
-            match snapshot.lookup(parent_id, &name) {
+            match snapshot.lookup(parent, name) {
                 Ok(Some(node)) if node.is_file() => Some(node.id()),
-                Ok(Some(_)) => return reply.error(fuser::Errno::EOPNOTSUPP),
-                Ok(None) => return reply.error(fuser::Errno::ENOENT),
-                Err(error) => return reply.error(direct_errno(&error)),
-            }
-        };
-        let Some(source) = source else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let status = match direct
-            .rename_file(&snapshot, source, new_parent_id, &new_name, replace)
-            .await
-        {
-            Ok(status) => status,
-            Err(error) => {
-                eprintln!(
-                    "yy: fuse rename: Direct rename of {:?} to {:?} failed: {error}",
-                    name, new_name
-                );
-                return reply.error(direct_errno(&error));
-            }
-        };
-        match namespace_mutation_errno(&status) {
-            None => {
-                self.refresh_remote_only().await;
-                reply.ok();
-            }
-            Some(errno) => {
-                if let Err(pending) = self.refresh_pending().await {
-                    eprintln!("yy: fuse rename: cannot retain mutation state: {pending:?}");
+                Ok(Some(_)) => return Err(BackendError::MutationUnsupported),
+                Ok(None) => {
+                    return Err(BackendError::NotFound);
                 }
-                if should_rebase_namespace_after_failure(status.state) {
-                    self.refresh_remote_only().await;
-                }
-                eprintln!(
-                    "yy: fuse rename: Direct mutation {} retained in {:?}: {}",
-                    status.id.to_hex(),
-                    status.state,
-                    status.error.as_deref().unwrap_or("no diagnostic recorded")
-                );
-                reply.error(errno);
+                Err(error) => return Err(error.into()),
             }
         }
+        .ok_or(BackendError::MutationIo)?;
+        let status = direct
+            .rename_file(&snapshot, source, new_parent, new_name, replace)
+            .await?;
+        self.finish_mutation(status, "rename").await
     }
 
-    async fn invalidate_before_open(&self, ino: INodeNo) -> Result<(), fuser::Errno> {
-        let Some(notifier) = guard(&self.notifier).clone() else {
-            return Err(fuser::Errno::EIO);
-        };
-        match tokio::task::spawn_blocking(move || notifier.inval_inode(ino, -1, 0)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                eprintln!(
-                    "yy: fuse direct open: cannot invalidate inode {}: {error}",
-                    ino.0
-                );
-                Err(fuser::Errno::EIO)
-            }
-            Err(error) => {
-                eprintln!(
-                    "yy: fuse direct open: inode {} invalidation task failed: {error}",
-                    ino.0
-                );
-                Err(fuser::Errno::EIO)
-            }
-        }
-    }
-
-    async fn read(&self, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, reply: ReplyData) {
-        let id = self.node(ino);
-        let open = {
-            let files = guard(&self.files);
-            files.get(&fh.0).cloned().or_else(|| {
-                let id = id?;
-                files.values().find(|open| open.matches_id(id)).cloned()
-            })
-        };
-        let Some(open) = open else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-        let result = match &open.source {
-            OpenSource::Remote(file) => file
-                .read(offset, size as usize)
-                .await
-                .map_err(|error| direct_errno(&error)),
-            OpenSource::Staged(file) => file
-                .read(offset, size as usize)
-                .await
-                .map_err(|error| direct_errno(&error)),
-        };
-        match result {
-            Ok(bytes) => reply.data(&bytes),
-            Err(errno) => reply.error(errno),
-        }
-    }
-
-    async fn write(
+    async fn open_directory(
         &self,
-        fh: FileHandle,
-        offset: u64,
-        data: Vec<u8>,
-        flags: OpenFlags,
-        reply: ReplyWrite,
-    ) {
-        let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-        if !open.writable {
-            return reply.error(fuser::Errno::EBADF);
-        }
-        let OpenSource::Staged(file) = &open.source else {
-            return reply.error(fuser::Errno::EROFS);
-        };
-        let append = has_open_flag(flags.0, nix::fcntl::OFlag::O_APPEND);
-        let sync = has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
-            || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC);
-        let written = match u32::try_from(data.len()) {
-            Ok(written) => written,
-            Err(_) => return reply.error(fuser::Errno::EINVAL),
-        };
-        let staged = if append {
-            file.append(&data).await.map(|_| ())
-        } else {
-            file.write(offset, &data).await
-        };
-        if let Err(error) = staged {
-            return reply.error(direct_errno(&error));
-        }
-        if let Ok(length) = file.len().await {
-            let mut view = guard(&open.view);
-            view.size = length;
-            view.modified = Some(std::time::SystemTime::now());
-        }
-        if let Ok(status) = file.status().await {
-            self.store_pending(status);
-        }
-        if sync && let Err(errno) = self.flush_staged(&open).await {
-            return reply.error(errno);
-        }
-        reply.written(written);
-    }
-
-    async fn flush(&self, fh: FileHandle, reply: ReplyEmpty) {
-        let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-        match self.flush_staged(&open).await {
-            Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
-        }
-    }
-
-    async fn fsync(&self, fh: FileHandle, reply: ReplyEmpty) {
-        self.flush(fh, reply).await;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn setattr(
-        &self,
-        ino: INodeNo,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        atime: Option<TimeOrNow>,
-        mtime: Option<TimeOrNow>,
-        ctime: Option<std::time::SystemTime>,
-        crtime: Option<std::time::SystemTime>,
-        chgtime: Option<std::time::SystemTime>,
-        bkuptime: Option<std::time::SystemTime>,
-        flags: Option<BsdFileFlags>,
-        fh: Option<FileHandle>,
-        reply: ReplyAttr,
-    ) {
-        let kernel_timestamps = atime.is_some()
-            || mtime.is_some()
-            || ctime.is_some()
-            || crtime.is_some()
-            || chgtime.is_some()
-            || bkuptime.is_some();
-        if mode.is_some()
-            || uid.is_some()
-            || gid.is_some()
-            || flags.is_some()
-            || (size.is_none() && kernel_timestamps)
-        {
-            return reply.error(fuser::Errno::EOPNOTSUPP);
-        }
-        let Some(length) = size else {
-            let Some(id) = self.node(ino) else {
-                return reply.error(fuser::Errno::ESTALE);
-            };
-            if let Some(status) = self.pending_status(id) {
-                return reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
-            }
-            let snapshot = match self.current() {
-                Ok(snapshot) => snapshot,
-                Err(errno) => return reply.error(errno),
-            };
-            let Some(node) = snapshot.node(id) else {
-                return reply.error(fuser::Errno::ENOENT);
-            };
-            let attr = self
-                .view_attr(ino, id, node.modified())
-                .unwrap_or_else(|| attribute(ino, node, node.modified(), self.read_only));
-            return reply.attr(&self.attr_ttl(), &attr);
-        };
-        if self.read_only {
-            return reply.error(fuser::Errno::EROFS);
-        }
-        if let Some(fh) = fh {
-            let Some(open) = guard(&self.files).get(&fh.0).cloned() else {
-                return reply.error(fuser::Errno::EBADF);
-            };
-            if !open.writable {
-                return reply.error(fuser::Errno::EINVAL);
-            }
-            let OpenSource::Staged(file) = &open.source else {
-                return reply.error(fuser::Errno::EROFS);
-            };
-            if let Err(error) = file.truncate(length).await {
-                return reply.error(direct_errno(&error));
-            }
-            if let Ok(size) = file.len().await {
-                let mut view = guard(&open.view);
-                view.size = size;
-                view.modified = Some(std::time::SystemTime::now());
-            }
-            if let Ok(status) = file.status().await {
-                self.store_pending(status);
-            }
-            return reply.attr(&self.attr_ttl(), &self.open_attr(ino, &open));
-        }
-
-        let Some(id) = self.node(ino) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let Some(direct) = &self.direct else {
-            return reply.error(fuser::Errno::EIO);
-        };
-        let file = if self.pending_status(id).is_some() {
-            match direct.open_pending(id, true).await {
-                Ok(file) => file,
-                Err(error) => return reply.error(direct_errno(&error)),
-            }
-        } else {
-            let snapshot = match self.current() {
-                Ok(snapshot) => snapshot,
-                Err(errno) => return reply.error(errno),
-            };
-            let Some(node) = snapshot.node(id) else {
-                return reply.error(fuser::Errno::ENOENT);
-            };
-            if node.is_directory() {
-                return reply.error(fuser::Errno::EISDIR);
-            }
-            match direct.open_file(&snapshot, id, true).await {
-                Ok(file) => file,
-                Err(error) => return reply.error(direct_errno(&error)),
-            }
-        };
-        if let Err(error) = file.truncate(length).await {
-            return reply.error(direct_errno(&error));
-        }
-        if let Err(errno) = self.flush_handle(&file).await {
-            return reply.error(errno);
-        }
-        let status = match file.status().await {
-            Ok(status) => status,
-            Err(error) => return reply.error(direct_errno(&error)),
-        };
-        self.store_pending(status.clone());
-        let current_id = match self.current() {
-            Ok(snapshot) => snapshot
-                .resolve(&status.path)
-                .map(DirectNode::id)
-                .unwrap_or(status.id),
-            Err(_) => status.id,
-        };
-        let ino = match self.inode_for(current_id) {
-            Ok(ino) => ino,
-            Err(errno) => return reply.error(errno),
-        };
-        reply.attr(&self.attr_ttl(), &self.status_attr(ino, &status));
-    }
-
-    async fn flush_staged(&self, open: &OpenFile) -> Result<(), fuser::Errno> {
-        if !open.writable {
-            return Ok(());
-        }
-        let OpenSource::Staged(file) = &open.source else {
-            return Err(fuser::Errno::EROFS);
-        };
-        self.flush_handle(file).await
-    }
-
-    async fn flush_handle(&self, file: &DirectFileHandle) -> Result<(), fuser::Errno> {
-        match file.flush().await.map_err(|error| direct_errno(&error))? {
-            DirectFlushOutcome::Unchanged => Ok(()),
-            DirectFlushOutcome::Applied { .. } => {
-                if let Ok(status) = file.status().await {
-                    self.store_pending(status);
-                }
-                self.refresh_remote_only().await;
-                Ok(())
-            }
-            DirectFlushOutcome::Conflict { .. } => {
-                if let Err(errno) = self.refresh_pending().await {
-                    eprintln!("yy: fuse flush: cannot retain Direct conflict state: {errno:?}");
-                }
-                self.refresh_remote_only().await;
-                Err(fuser::Errno::ESTALE)
-            }
-            DirectFlushOutcome::Unknown { .. } => {
-                if let Err(errno) = self.refresh_pending().await {
-                    eprintln!("yy: fuse flush: cannot retain Direct unknown state: {errno:?}");
-                }
-                self.refresh_remote_only().await;
-                Err(fuser::Errno::EIO)
-            }
-            DirectFlushOutcome::Unsupported { message } => {
-                eprintln!("yy: fuse flush: Direct publication is unsupported: {message}");
-                Err(fuser::Errno::EOPNOTSUPP)
-            }
-        }
-    }
-
-    async fn release(&self, fh: FileHandle, reply: ReplyEmpty) {
-        guard(&self.files).remove(&fh.0);
-        {
-            let mut views = guard(&self.views);
-            prune_unreferenced_views(&mut views);
-        }
-        if let Err(errno) = self.refresh_pending().await {
-            eprintln!("yy: fuse release: cannot refresh Direct pending state: {errno:?}");
-        }
-        reply.ok();
-    }
-
-    async fn opendir(&self, ino: INodeNo, reply: ReplyOpen) {
-        let Some(id) = self.node(ino) else {
-            return reply.error(fuser::Errno::ESTALE);
-        };
-        let snapshot = match self.current() {
-            Ok(snapshot) => snapshot,
-            Err(errno) => return reply.error(errno),
-        };
-        let Some(directory) = snapshot.node(id) else {
-            return reply.error(fuser::Errno::ENOENT);
-        };
+        id: DirectId,
+    ) -> Result<DirectoryOpen<DirectId, DirectDirectory>> {
+        let snapshot = self.current()?;
+        let directory = snapshot.node(id).ok_or(BackendError::NotFound)?;
         if !directory.is_directory() {
-            return reply.error(fuser::Errno::ENOTDIR);
+            return Err(BackendError::NotDirectory);
         }
-        let parent_ino = match directory.parent() {
-            Some(parent) => match self.inode_for(parent) {
-                Ok(ino) => ino.0,
-                Err(errno) => return reply.error(errno),
-            },
-            None => ROOT_INODE,
-        };
-        let children = match snapshot.read_dir(id) {
-            Ok(children) => children,
-            Err(error) => return reply.error(direct_errno(&error)),
-        };
-        let mut items = BTreeMap::new();
-        for node in children {
-            let ino = match self.inode_for(node.id()) {
-                Ok(ino) => ino.0,
-                Err(errno) => return reply.error(errno),
-            };
-            items.insert(
+        let parent = directory.parent().unwrap_or(id);
+        let mut entries = BTreeMap::new();
+        for node in snapshot.read_dir(id)? {
+            entries.insert(
                 node.name().to_owned(),
-                DirItem {
-                    ino,
-                    kind: match node.kind() {
-                        DirectKind::Directory => FileType::Directory,
-                        DirectKind::File => FileType::RegularFile,
-                    },
+                DirectoryEntry {
+                    id: node.id(),
+                    kind: file_type(matches!(node.kind(), DirectKind::Directory)),
                     name: node.name().to_owned(),
                 },
             );
         }
-        let pending = guard(&self.pending).values().cloned().collect::<Vec<_>>();
-        for status in pending {
+        for status in guard(&self.pending).values().cloned() {
             if status.parent != id || status.observed.is_missing() {
                 continue;
             }
-            let ino = match self.inode_for(status.id) {
-                Ok(ino) => ino.0,
-                Err(errno) => return reply.error(errno),
-            };
-            items.insert(
+            entries.insert(
                 status.name.clone(),
-                DirItem {
-                    ino,
-                    kind: FileType::RegularFile,
+                DirectoryEntry {
+                    id: status.id,
+                    kind: file_type(false),
                     name: status.name,
                 },
             );
         }
-        // A pending replacement wins over the last remote observation.
-        let items = items.into_values().collect::<Vec<_>>();
-        let fh = self.next_handle();
-        guard(&self.dirs).insert(
-            fh,
-            Arc::new(Mutex::new(DirCursor {
-                ino: ino.0,
-                parent_ino,
-                items,
-            })),
-        );
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+        Ok(DirectoryOpen {
+            id,
+            parent,
+            state: DirectDirectory {
+                entries: entries.into_values().collect(),
+                served: false,
+            },
+        })
     }
 
-    async fn readdir(&self, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        let Some(cursor) = guard(&self.dirs).get(&fh.0).cloned() else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-        let cursor = guard(&cursor);
-        let mut index = offset as usize;
-        loop {
-            if index == 0 {
-                if reply.add(INodeNo(cursor.ino), 1, FileType::Directory, ".") {
-                    break;
-                }
-                index = 1;
-                continue;
-            }
-            if index == 1 {
-                if reply.add(INodeNo(cursor.parent_ino), 2, FileType::Directory, "..") {
-                    break;
-                }
-                index = 2;
-                continue;
-            }
-            let local = index - 2;
-            let Some(item) = cursor.items.get(local) else {
-                break;
-            };
-            if reply.add(INodeNo(item.ino), index as u64 + 1, item.kind, &item.name) {
-                break;
-            }
-            index += 1;
+    async fn read_directory(
+        &self,
+        state: &mut DirectDirectory,
+        restart: bool,
+    ) -> Result<DirectoryPage<DirectId>> {
+        if restart {
+            state.served = false;
         }
-        reply.ok();
-    }
-
-    async fn releasedir(&self, fh: FileHandle, reply: ReplyEmpty) {
-        guard(&self.dirs).remove(&fh.0);
-        reply.ok();
-    }
-}
-
-fn attribute(
-    ino: INodeNo,
-    node: &DirectNode,
-    modified: Option<std::time::SystemTime>,
-    read_only: bool,
-) -> FileAttr {
-    attribute_with_size(ino, node.is_directory(), node.size(), modified, read_only)
-}
-
-fn attribute_with_size(
-    ino: INodeNo,
-    directory: bool,
-    node_size: u64,
-    modified: Option<std::time::SystemTime>,
-    read_only: bool,
-) -> FileAttr {
-    use nix::unistd::{getegid, geteuid};
-    let stamp = modified.unwrap_or_else(|| {
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(FALLBACK_STAMP_SECONDS)
-    });
-    let size = if directory { DIRECTORY_SIZE } else { node_size };
-    FileAttr {
-        ino,
-        size,
-        blocks: size.div_ceil(512),
-        atime: stamp,
-        mtime: stamp,
-        ctime: stamp,
-        crtime: stamp,
-        kind: if directory {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        },
-        perm: if directory {
-            if read_only { 0o555 } else { 0o755 }
-        } else if read_only {
-            0o444
-        } else {
-            0o644
-        },
-        nlink: if directory { 2 } else { 1 },
-        uid: geteuid().as_raw(),
-        gid: getegid().as_raw(),
-        rdev: 0,
-        blksize: 4096,
-        flags: 0,
-    }
-}
-
-fn direct_errno(error: &DirectError) -> fuser::Errno {
-    match error.kind() {
-        DirectErrorKind::Invalid | DirectErrorKind::InvalidName => fuser::Errno::EINVAL,
-        DirectErrorKind::NotFound => fuser::Errno::ENOENT,
-        DirectErrorKind::NotDirectory => fuser::Errno::ENOTDIR,
-        DirectErrorKind::IsDirectory => fuser::Errno::EISDIR,
-        DirectErrorKind::Stale => fuser::Errno::ESTALE,
-        DirectErrorKind::Unsupported => fuser::Errno::EOPNOTSUPP,
-        DirectErrorKind::Storage => fuser::Errno::EIO,
-    }
-}
-
-fn namespace_mutation_errno(status: &DirectMutationStatus) -> Option<fuser::Errno> {
-    match status.state {
-        DirectMutationState::Applied => None,
-        // Linux namei retries ESTALE once inside the same syscall. A global
-        // refresh can advance pins before that retry, so report EAGAIN and
-        // leave any retry to a later caller-owned operation.
-        DirectMutationState::Conflict => Some(fuser::Errno::EAGAIN),
-        DirectMutationState::DestinationApplied | DirectMutationState::PendingSourceCleanup => {
-            Some(fuser::Errno::EIO)
+        if state.served {
+            return Ok(DirectoryPage {
+                entries: Vec::new(),
+                complete: true,
+            });
         }
-        DirectMutationState::Failed => Some(fuser::Errno::EOPNOTSUPP),
-        DirectMutationState::Staged
-        | DirectMutationState::Dispatching
-        | DirectMutationState::Unknown => Some(fuser::Errno::EIO),
+        state.served = true;
+        Ok(DirectoryPage {
+            entries: state.entries.clone(),
+            complete: true,
+        })
+    }
+
+    async fn refresh(&self, _ids: &[DirectId]) -> Result<()> {
+        self.refresh_remote_only().await;
+        match guard(&self.refresh_error).as_ref() {
+            Some(message) => {
+                let _ = message;
+                Err(BackendError::MutationIo)
+            }
+            None => Ok(()),
+        }
     }
 }
 
-fn should_rebase_namespace_after_failure(state: DirectMutationState) -> bool {
-    // A conflict callback must not rebase its failed pin. Other namespace
-    // failures return EIO/EOPNOTSUPP and may install the successful refresh.
-    state != DirectMutationState::Conflict
+impl DirectBackend {
+    async fn finish_unlink(
+        &self,
+        direct: &DirectRuntime,
+        snapshot: &DirectSnapshot,
+        source: DirectId,
+    ) -> Result<()> {
+        let status = direct.unlink_file(snapshot, source).await?;
+        self.finish_mutation(status, "unlink").await
+    }
+
+    async fn finish_mutation(&self, status: DirectMutationStatus, operation: &str) -> Result<()> {
+        match DirectBackend::mutation_error(&status) {
+            Ok(()) => {
+                self.refresh_remote_only().await;
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(pending) = self.refresh_pending().await {
+                    eprintln!("yy: fuse {operation}: cannot retain mutation state: {pending}");
+                }
+                if status.state != DirectMutationState::Conflict {
+                    self.refresh_remote_only().await;
+                }
+                eprintln!(
+                    "yy: fuse {operation}: Direct mutation {} retained in {:?}: {}",
+                    status.id.to_hex(),
+                    status.state,
+                    status.error.as_deref().unwrap_or("no diagnostic recorded")
+                );
+                Err(error)
+            }
+        }
+    }
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-pub(super) async fn run(
-    config: VolumeConfig,
-    operator: opendal::Operator,
-    mountpoint: std::path::PathBuf,
-) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let namespace = DirectNamespace::new(operator.clone())?;
-    let (direct, pending) = if config.read_only {
-        (None, Vec::new())
-    } else {
-        let binding = crate::volume::direct_storage_binding(&config, &operator)?;
-        let direct = DirectRuntime::open(
-            namespace.clone(),
-            Some(config.staging.clone()),
-            false,
-            binding,
-        )
-        .await?;
-        let pending = direct.pending_objects().await?;
-        (Some(direct), pending)
-    };
-    let snapshot = namespace.observe().await?;
-    if !snapshot.root_node().is_directory() {
-        return Err(std::io::Error::other("Direct namespace root is not a directory").into());
-    }
-    let inner = Arc::new(DirectInner::new(
-        namespace,
-        config.read_only,
-        direct,
-        pending,
-        snapshot,
-        tokio::runtime::Handle::current(),
-    ));
-    let filesystem = DirectFuseFrontend {
-        inner: inner.clone(),
-    };
-    let mut options = Config::default();
-    options.mount_options = vec![
-        MountOption::FSName(format!("yinyang-{}", config.name)),
-        MountOption::Subtype("yinyang".into()),
-    ];
-    if config.read_only {
-        options.mount_options.insert(0, MountOption::RO);
-    }
-    options.acl = SessionACL::Owner;
-    let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(signal) => Some(signal),
-        Err(error) => {
-            eprintln!("yy: fuse refresh: cannot handle SIGHUP: {error}");
-            None
-        }
-    };
-    let session = Session::new(filesystem, &mountpoint, &options)?;
-    inner.install_notifier(session.notifier());
-    println!(
-        "yy: mounted {} {} Direct at {} (fuse.yinyang)",
-        config.name,
-        if config.read_only {
-            "read-only"
-        } else {
-            "read-write"
-        },
-        mountpoint.display()
-    );
-    let background = session.spawn()?;
-    let (stop_refresh, stop_refresh_rx) = tokio::sync::oneshot::channel::<()>();
-    let refresh_task = hangup.map(|signal| {
-        let refresh = inner.clone();
-        tokio::runtime::Handle::current()
-            .spawn(async move { refresh.serve_hup(signal, stop_refresh_rx).await })
-    });
-    let (teardown, teardown_rx) = std::sync::mpsc::channel();
-    let join = tokio::task::spawn_blocking(move || {
-        loop {
-            match teardown_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return background.umount_and_join();
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if background.guard.is_finished() {
-                        return background.join();
-                    }
-                }
-            }
-        }
-    });
-    tokio::pin!(join);
-    let joined = tokio::select! {
-        result = &mut join => Some(result),
-        _ = shutdown_signal() => {
-            let _ = teardown.send(());
-            None
-        }
-    };
-    let _ = stop_refresh.send(());
-    match tokio::time::timeout(TEARDOWN_GRACE, async {
-        let session = match joined {
-            Some(result) => result,
-            None => join.await,
-        };
-        let refresh = match refresh_task {
-            Some(task) => task.await,
-            None => Ok(()),
-        };
-        session.map_err(blocking_error)??;
-        refresh.map_err(blocking_error)?;
-        Ok(())
-    })
-    .await
-    {
-        Ok(Ok(())) => {
-            println!("yy: unmounted {}", mountpoint.display());
-            Ok(Outcome::Unmounted)
-        }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Ok(Outcome::TeardownExpired {
-            grace: TEARDOWN_GRACE,
-        }),
-    }
-}
-
-struct DirectFuseFrontend {
-    inner: Arc<DirectInner>,
-}
-
-impl Filesystem for DirectFuseFrontend {
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
-        let _ = config.add_capabilities(InitFlags::FUSE_FILE_OPS | InitFlags::FUSE_PARALLEL_DIROPS);
-        let _ = config.set_time_granularity(std::time::Duration::from_secs(1));
-        Ok(())
-    }
-
-    fn destroy(&mut self) {}
-
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let Some(name) = name.to_str() else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        let name = name.to_owned();
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.lookup(parent, name, reply).await });
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.getattr(ino, fh, reply).await });
-    }
-
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.open(ino, flags, reply).await });
-    }
-
-    fn read(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        size: u32,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.read(ino, fh, offset, size, reply).await });
-    }
-
-    fn release(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.release(fh, reply).await });
-    }
-
-    fn flush(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _lock_owner: LockOwner,
-        reply: ReplyEmpty,
-    ) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.flush(fh, reply).await });
-    }
-
-    fn fsync(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.fsync(fh, reply).await });
-    }
-
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.opendir(ino, reply).await });
-    }
-
-    fn readdir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        reply: ReplyDirectory,
-    ) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.readdir(fh, offset, reply).await });
-    }
-
-    fn releasedir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        reply: ReplyEmpty,
-    ) {
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.releasedir(fh, reply).await });
-    }
-
-    fn fsyncdir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
-        reply.ok();
-    }
-
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 0);
-    }
-
-    fn access(&self, _req: &Request, _ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        if self.inner.read_only && mask.contains(AccessFlags::W_OK) {
-            reply.error(fuser::Errno::EROFS);
-        } else {
-            reply.ok();
-        }
-    }
-
-    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.inner.forget(ino, nlookup);
-    }
-
-    fn setattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
-        atime: Option<TimeOrNow>,
-        mtime: Option<TimeOrNow>,
-        ctime: Option<std::time::SystemTime>,
-        fh: Option<FileHandle>,
-        crtime: Option<std::time::SystemTime>,
-        chgtime: Option<std::time::SystemTime>,
-        bkuptime: Option<std::time::SystemTime>,
-        flags: Option<BsdFileFlags>,
-        reply: ReplyAttr,
-    ) {
-        let inner = self.inner.clone();
-        self.inner.spawn(async move {
-            inner
-                .setattr(
-                    ino, mode, uid, gid, size, atime, mtime, ctime, crtime, chgtime, bkuptime,
-                    flags, fh, reply,
-                )
-                .await
-        });
-    }
-
-    fn readlink(&self, _req: &Request, _ino: INodeNo, reply: ReplyData) {
-        reply.error(fuser::Errno::EINVAL);
-    }
-
-    fn mknod(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(if self.inner.read_only {
-            fuser::Errno::EROFS
-        } else {
-            fuser::Errno::EOPNOTSUPP
-        });
-    }
-
-    fn mkdir(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        reply.error(if self.inner.read_only {
-            fuser::Errno::EROFS
-        } else {
-            fuser::Errno::EOPNOTSUPP
-        });
-    }
-
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let Some(name) = name.to_str() else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        let name = name.to_owned();
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.unlink(parent, name, reply).await });
-    }
-
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(if self.inner.read_only {
-            fuser::Errno::EROFS
-        } else {
-            fuser::Errno::EOPNOTSUPP
-        });
-    }
-
-    fn symlink(
-        &self,
-        _req: &Request,
-        _parent: INodeNo,
-        _link_name: &OsStr,
-        _target: &std::path::Path,
-        reply: ReplyEntry,
-    ) {
-        reply.error(if self.inner.read_only {
-            fuser::Errno::EROFS
-        } else {
-            fuser::Errno::EOPNOTSUPP
-        });
-    }
-
-    fn rename(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        newparent: INodeNo,
-        newname: &OsStr,
-        flags: RenameFlags,
-        reply: ReplyEmpty,
-    ) {
-        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        let (name, newname) = (name.to_owned(), newname.to_owned());
-        let inner = self.inner.clone();
-        self.inner.spawn(async move {
-            inner
-                .rename(parent, name, newparent, newname, flags, reply)
-                .await
-        });
-    }
-
-    fn link(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _newparent: INodeNo,
-        _newname: &OsStr,
-        reply: ReplyEntry,
-    ) {
-        reply.error(if self.inner.read_only {
-            fuser::Errno::EROFS
-        } else {
-            fuser::Errno::EOPNOTSUPP
-        });
-    }
-
-    fn write(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        data: &[u8],
-        _write_flags: WriteFlags,
-        flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyWrite,
-    ) {
-        let data = data.to_vec();
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.write(fh, offset, data, flags, reply).await });
-    }
-
-    fn setxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(fuser::Errno::EOPNOTSUPP);
-    }
-
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(fuser::Errno::EOPNOTSUPP);
-    }
-
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.error(fuser::Errno::EOPNOTSUPP);
-    }
-
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(fuser::Errno::EOPNOTSUPP);
-    }
-
-    fn create(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        mode: u32,
-        umask: u32,
-        flags: i32,
-        reply: ReplyCreate,
-    ) {
-        let Some(name) = name.to_str() else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        let name = name.to_owned();
-        let inner = self.inner.clone();
-        self.inner
-            .spawn(async move { inner.create(parent, name, mode, umask, flags, reply).await });
-    }
-
-    fn fallocate(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: u64,
-        _length: u64,
-        _mode: i32,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(if self.inner.read_only {
-            fuser::Errno::EROFS
-        } else {
-            fuser::Errno::EOPNOTSUPP
-        });
-    }
-
-    fn lseek(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: i64,
-        _whence: i32,
-        reply: fuser::ReplyLseek,
-    ) {
-        reply.error(fuser::Errno::ENOSYS);
-    }
 }
 
 #[cfg(test)]
@@ -2034,76 +911,5 @@ mod tests {
         drop(live);
         prune_unreferenced_views(&mut views);
         assert!(views.is_empty());
-    }
-
-    #[test]
-    fn attributes_use_storage_time_and_safe_fallback() {
-        let modified = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
-        let file = attribute_with_size(INodeNo(42), false, 7, Some(modified), true);
-        assert_eq!(file.ino, INodeNo(42));
-        assert_eq!(file.size, 7);
-        assert_eq!(file.mtime, modified);
-        assert_eq!(file.ctime, modified);
-
-        let directory = attribute_with_size(INodeNo(43), true, 0, None, true);
-        assert_eq!(directory.size, DIRECTORY_SIZE);
-        assert_eq!(
-            directory.mtime,
-            std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_secs(FALLBACK_STAMP_SECONDS)
-        );
-    }
-
-    #[test]
-    fn open_file_attributes_are_files_with_object_length() {
-        let node = DirectNode::for_test_file(
-            DirectId::from_bytes([7; 16]),
-            "object",
-            19,
-            Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123)),
-        );
-        let attr = attribute(INodeNo(88), &node, node.modified(), true);
-        assert_eq!(attr.kind, FileType::RegularFile);
-        assert_eq!(attr.size, 19);
-        assert_eq!(attr.perm, 0o444);
-    }
-
-    #[test]
-    fn writable_modes_match_the_storage_native_contract() {
-        assert_eq!(
-            attribute_with_size(INodeNo(44), false, 7, None, false).perm,
-            0o644
-        );
-        assert_eq!(
-            attribute_with_size(INodeNo(45), true, 0, None, false).perm,
-            0o755
-        );
-        assert!(representable_mode(0o100644, 0o022, false, false));
-        assert!(representable_mode(0o755, 0, false, true));
-        assert!(!representable_mode(0o100600, 0o022, false, false));
-        assert!(!representable_mode(0o100755, 0, false, false));
-        assert!(!representable_mode(0o1004644, 0, false, false));
-        assert!(!representable_mode(0o100644, 0, true, false));
-    }
-
-    #[test]
-    fn rename_flags_name_supported_replace_semantics() {
-        assert!(matches!(rename_replace(RenameFlags::empty()), Ok(true)));
-        assert!(matches!(
-            rename_replace(RenameFlags::RENAME_NOREPLACE),
-            Ok(false)
-        ));
-        assert!(matches!(
-            rename_replace(RenameFlags::RENAME_EXCHANGE),
-            Err(RenameRejection::Unsupported)
-        ));
-        assert!(matches!(
-            rename_replace(RenameFlags::RENAME_WHITEOUT),
-            Err(RenameRejection::Unsupported)
-        ));
-        assert!(matches!(
-            rename_replace(RenameFlags::from_bits_retain(1 << 20)),
-            Err(RenameRejection::Invalid)
-        ));
     }
 }
