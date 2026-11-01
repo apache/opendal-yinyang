@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Managed space and retention CLI.
+//! Managed space reporting, retention planning, and explicit logical expiry CLI.
 
 use crate::RevisionArg;
 use clap::Subcommand;
@@ -61,6 +61,10 @@ pub enum RetentionCommand {
         json: bool,
     },
     /// Explicitly expire selected historical revisions after protection checks.
+    ///
+    /// Stop every affected client and backup before running. The first
+    /// successful expiry switches the authority format, so older readers and
+    /// daemons reject it. Physical objects are not deleted.
     Expire {
         /// Historical revision to expire; repeat for an atomic batch.
         #[arg(long = "revision", required = true)]

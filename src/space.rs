@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Managed space accounting and declarative retention planning.
+//! Managed space accounting, retention planning, and explicit logical expiry.
 //!
-//! This module intentionally has no deletion path. It observes authority
-//! metadata, current backend objects, and existing local staging state without
-//! opening a writer, acquiring a runtime lease, or migrating local databases.
+//! Reporting and planning observe authority metadata, current backend objects,
+//! and existing local staging state without opening a writer or migrating local
+//! databases. Expiry is Linux-only and holds the existing writer leases through
+//! evidence collection and the Core mutation. This module has no physical
+//! deletion path.
 
 #[cfg(target_os = "linux")]
 use crate::replica::{Replica, ReplicaBaseline, ReplicaStateLease, inspect_backup_package};
