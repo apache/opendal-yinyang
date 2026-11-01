@@ -1,11 +1,13 @@
-# Managed space reporting and retention planning
+# Managed space reporting, retention planning, and logical expiry
 
-**Status: experimental and non-destructive.**
+**Status: experimental. Reporting and planning are non-destructive; expiry is
+an explicit logical metadata mutation and never performs physical deletion.**
 
 The `yy --volume CONFIG space` commands report observed Managed storage and
-build an explicit revision-protection plan. They do not delete data, run
-garbage collection, create a remote pin protocol, or estimate reclaimable
-bytes.
+build an explicit revision-protection plan. The explicit expiry command makes
+selected historical revisions unreadable while retaining their identity and
+marker. These commands do not delete content, run garbage collection, create a
+remote pin protocol, or estimate reclaimable bytes.
 
 ## Commands
 
@@ -13,23 +15,28 @@ bytes.
 yy --volume CONFIG space report [--json]
 yy --volume CONFIG space retention plan \
   [--keep-last N] [--keep REVISION]... [--backup PATH]... [--json]
+yy --volume CONFIG space retention expire \
+  --revision REVISION [--revision REVISION]... \
+  [--backup PATH]... [--operation-id UUID] [--json]
 ```
 
 `--volume` is required. The configuration must use `model: managed`; Direct
 volumes and their namespace objects are rejected before authority connection.
-The command is observation-only even when the volume configuration is writable.
+`space report` and `space retention plan` are observation-only even when the
+volume configuration is writable.
 
 `space report --json` emits `yinyang.managed-space.report.v3`. `space retention
-plan --json` emits `yinyang.managed-retention.plan.v3`. Revisions are 24-byte
+plan --json` emits `yinyang.managed-retention.plan.v3`. `space retention expire
+--json` emits `yinyang.managed-retention.expiry.v1`. Revisions are 24-byte
 hexadecimal strings, filesystem identities are 16-byte hexadecimal strings,
 and enum values are `snake_case`. Unknown values are `null`; optional evidence
 is not represented by fabricated zeroes.
 
 ## Admission and read-only effects
 
-The command performs the ordinary strict volume parse and capability admission,
-constructs the selected Managed authority, and observes existing state. It
-does not:
+`space report` and `space retention plan` perform the ordinary strict volume
+parse and capability admission, construct the selected Managed authority, and
+observe existing state. They do not:
 
 - create a filesystem or call `Fs::create`;
 - create, migrate, recover, or clean a local staging database;
@@ -37,6 +44,8 @@ does not:
 - call `Runtime::open`, `Sync::open`, or a mount entry point;
 - publish, repair, acknowledge, or delete namespace or content records; or
 - change authoritative existing SQLite/WAL bytes.
+
+`space retention expire` uses the separate admission and mutation rules below.
 
 Appropriate `retained_revisions` support is authority-specific. The object
 authority returns metadata-authenticated revisions from its existing history
@@ -299,15 +308,83 @@ must be established by the operator outside this command.
 
 `--keep` and `--keep-last` apply only to one invocation; they are not persistent
 pins and do not create a registry. Revisions outside a bounded policy remain
-readable with `outside_bounded_policy`. This contract has no expiry command:
-selection, including `outside_bounded_policy`, never makes a retained revision
-unreadable or indistinguishable from a revision that never existed.
+readable with `outside_bounded_policy`. Planning, including a bounded selection,
+never makes a retained revision unreadable. Only the separate explicit expiry
+command can change a revision's readable state.
 
 Every plan has `deletion_authorized: false` and `reclaimable_bytes: null`.
 Selecting or excluding a revision does not prove that any extent or object is
 unreachable. Shared packs, noncurrent backend versions, prepared orphans,
 metadata pages, external readers, and unobserved staging make a physical
 cleanup decision a separate future contract.
+
+## Explicit logical expiry
+
+Expiry requires every writer, reader, mount, Sync process, and backup activity
+for the volume to be stopped. The CLI does not infer quiescence from a
+successful command and reports `quiescence: "not_observed"`.
+
+For the configured local staging path, expiry acquires the existing protocol
+leases in the same order as the real writers:
+
+1. `replica.lock`;
+2. `content/runtime.lock`; and
+3. the Mount/file runtime `runtime.lock`.
+
+Acquisition may create the configured directory, `content/`, and those derived
+lock files, but it never creates, migrates, or recovers `staging.db`, `sync.db`,
+`content/staging.db`, or `replica.db`. The guards remain held through the Core
+mutation. A held writer lease, malformed or foreign state, partial evidence, or
+unavailable state refuses the operation before mutation. SQLite `-wal`/`-shm`
+files and derived locks are not authoritative database bytes.
+
+Every ready durable handle protects its base revision as `staging_base`,
+including clean handles recoverable only by UUID. Dirty/frozen/conflict/
+Unknown/failed reasons remain additive. Validated backup packages use
+`backup_staging_base` and their other backup-specific reasons. A stale
+protected revision that is missing or already expired is refused rather than
+silently dropped.
+
+The requested candidates are classified against the detailed authority
+history:
+
+- `eligible`: retained and unprotected, and can be expired;
+- `already_expired`: target state is confirmed and no mutation is needed;
+- `current`, `missing`, `protected`, `protected_missing`, or
+  `protected_expired`: refuse the whole request.
+
+The input set is deduplicated. If all targets are already expired, the command
+returns success without issuing a new mutation. If already-expired and eligible
+targets are mixed, only eligible targets are sent as candidates. Any
+current/missing/protected/incomplete input blocks every new mutation. Expiry
+does not reinterpret this as replay of the original request receipt.
+
+The command uses an explicit operation identity. A generated UUID is reported
+in the result. `--operation-id UUID` is only for retrying the exact same
+command after a retryable or unknown outcome; it creates no local retry journal.
+The authority request binds the volume, operation identity, expected latest
+revision, canonical candidate/protected sets, and an opaque canonical evidence
+digest. Core validates existence, current revision, protection, evidence
+outcomes, and expected latest before writing under its existing atomic
+publication boundary.
+
+Exit codes are:
+
+- `0`: committed, or every requested target was already expired;
+- `2`: refused or expected-latest conflict, with no new expiry;
+- `3`: retryable or unknown outcome; retry the exact command with the reported
+  operation identity.
+
+An expired revision retains its identity. `observe_revision` returns
+`ErrorKind::Expired` rather than `NotFound`, and detailed history exposes the
+stored expiry marker. Default keep-all and ordinary commits do not resurrect
+an expired revision. Receipt identity, canonical request replay, and receipt
+metadata remain separate from snapshot readability.
+
+Expiry may add metadata and advance mutable `.yinyang/head` or metadata-service
+SQL rows. It must not delete, rewrite, or truncate pre-existing immutable
+content/packs. The result always states `physical_cleanup: "not_performed"`,
+`deletion_authorized: false`, and `reclaimable_bytes: null`.
 
 ## Report coverage
 
@@ -340,19 +417,24 @@ yy --volume notes.json space retention plan \
 yy --volume notes.json space retention plan \
   --backup /backups/notes-2026-11-01 \
   --json
+yy --volume notes.json space retention expire \
+  --revision 00112233445566778899aabbccddeeff0011223344556677 \
+  --backup /backups/notes-2026-11-01 \
+  --json
 ```
 
 ## Limits
 
 This contract does not provide physical garbage collection, deletion,
 compaction, repacking, a persistent remote pin registry, background scheduling,
-expiry, or a release-supported storage reclamation promise. `--keep` is a
-one-invocation declaration, not a persistent pin. Explicit backup packages are
-validated read-only and do not require the original local root; they remain
-protection evidence, not deletion or expiry authorization. A revision needed
-by an undisclosed backup, external reader, or unpinned workflow must still be
-supplied explicitly. It does not inspect Direct namespaces. It does not make
-SQLite sidecar files byte-identical or infer noncurrent backend versions that
-the configured backend does not return. Reachability does not scrub content
-payloads, and a complete observed root set does not prove global orphanhood,
-external-reader absence, or deletion eligibility.
+default expiry, or a release-supported storage reclamation promise. `--keep` is
+a one-invocation declaration, not a persistent pin. Explicit backup packages
+are validated read-only and do not require the original local root; they remain
+protection evidence, not deletion authorization. A revision needed by an
+undisclosed backup, external reader, or unpinned workflow must still be
+supplied explicitly. Expiry cannot prove those omitted activities absent. It
+does not inspect Direct namespaces. It does not make SQLite sidecar files
+byte-identical or infer noncurrent backend versions that the configured backend
+does not return. Reachability does not scrub content payloads, and a complete
+observed root set does not prove global orphanhood, external-reader absence, or
+deletion eligibility.

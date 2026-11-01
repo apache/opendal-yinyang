@@ -32,10 +32,15 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use yinyang_core::reachability::PhysicalReferenceKind;
-use yinyang_core::{Authority, Error, ErrorKind, NodeId, NodeKind, Result, Revision, Snapshot};
+use yinyang_core::{
+    Authority, Error, ErrorKind, ExpiryId, NodeId, NodeKind, Result, Revision, Snapshot,
+};
+#[cfg(target_os = "linux")]
+use yinyang_core::{ExpiryConflictKind, ExpiryOutcome, HistoryEntry, RevisionState};
 
 pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v3";
 pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v3";
+pub const RETENTION_EXPIRY_SCHEMA: &str = "yinyang.managed-retention.expiry.v1";
 
 const HEAD_KEY: &str = ".yinyang/head";
 const PACK_ROOT: &str = ".yinyang/v2";
@@ -47,7 +52,6 @@ const SCAN_LIMIT: usize = 4096;
 /// Sync content runtime, then any Mount/file runtime. The guards fence all
 /// known configured writer entry points through the Core mutation.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub(crate) struct ExpiryLeases {
     _replica: ReplicaStateLease,
     _sync_content: StagingLease,
@@ -55,7 +59,6 @@ pub(crate) struct ExpiryLeases {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 impl ExpiryLeases {
     pub(crate) async fn acquire(staging: &Path) -> std::result::Result<Self, ExpiryLeaseError> {
         let replica =
@@ -90,7 +93,6 @@ pub(crate) struct ExpiryLeaseError {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 impl ExpiryLeaseError {
     fn from_replica(error: crate::replica::Error) -> Self {
         let kind = if error.kind() == crate::replica::ErrorKind::Busy {
@@ -575,6 +577,59 @@ pub struct ReceiptEvidence {
     pub revisions: Option<u64>,
     pub treatment: &'static str,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedExpiryReport {
+    pub schema: &'static str,
+    pub filesystem: String,
+    pub operation_id: String,
+    pub observed_revision: String,
+    pub after_revision: Option<String>,
+    pub state: ExpiryReportState,
+    pub evidence_digest: String,
+    pub staging: StagingProtection,
+    pub backups: BackupProtection,
+    pub revisions: Vec<ExpiryRevisionDecision>,
+    pub unresolved: Vec<Unresolved>,
+    pub external_readers: &'static str,
+    pub untracked_pins: &'static str,
+    pub quiescence: &'static str,
+    pub deletion_authorized: bool,
+    pub reclaimable_bytes: Option<u64>,
+    pub physical_cleanup: &'static str,
+    pub limits: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryReportState {
+    Committed,
+    AlreadyExpired,
+    Refused,
+    Conflict,
+    Retryable,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryDecisionState {
+    Eligible,
+    Expired,
+    AlreadyExpired,
+    Current,
+    Missing,
+    Protected,
+    ProtectedMissing,
+    ProtectedExpired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExpiryRevisionDecision {
+    pub revision: String,
+    pub state: ExpiryDecisionState,
+    pub reasons: Vec<&'static str>,
 }
 
 #[derive(Default)]
@@ -1098,6 +1153,562 @@ pub async fn plan_managed_retention(
         reclaimable_bytes: None,
         limits: retention_limits(),
     })
+}
+
+/// Explicitly expire the requested historical revisions after validating all
+/// configured local protection evidence under the existing writer leases.
+#[cfg(not(target_os = "linux"))]
+pub async fn expire_managed_retention(
+    _authority: &dyn Authority,
+    _staging: &Path,
+    _candidates: &[Revision],
+    _backup_packages: &[PathBuf],
+    _operation_id: ExpiryId,
+) -> Result<ManagedExpiryReport> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "expire managed retention",
+        "logical history expiry requires the Linux local-state lease protocol",
+    ))
+}
+
+/// Explicitly expire the requested historical revisions after validating all
+/// configured local protection evidence under the existing writer leases.
+#[cfg(target_os = "linux")]
+pub async fn expire_managed_retention(
+    authority: &dyn Authority,
+    staging_path: &Path,
+    candidates: &[Revision],
+    backup_packages: &[PathBuf],
+    operation_id: ExpiryId,
+) -> Result<ManagedExpiryReport> {
+    let candidates = candidates.iter().copied().collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Invalid,
+            "expire managed retention",
+            "at least one revision is required",
+        ));
+    }
+
+    let leases = ExpiryLeases::acquire(staging_path).await.map_err(|error| {
+        let kind = if error.is_busy() {
+            ErrorKind::Invalid
+        } else {
+            ErrorKind::Io
+        };
+        Error::new(kind, "expire managed retention", error.to_string())
+    })?;
+    let observed = authority.observe_latest().await?;
+    let expected_latest = observed.revision();
+    let staging = inspect_bound_local_staging(staging_path, authority.filesystem()).await;
+    let backups = inspect_backup_packages(backup_packages, authority.filesystem()).await;
+    let history = collect_expiry_history(authority, expected_latest).await?;
+    let mut unresolved = staging
+        .errors
+        .iter()
+        .map(|detail| Unresolved {
+            subject: "local-staging".to_owned(),
+            state: "unavailable".to_owned(),
+            detail: detail.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut evidence_complete = matches!(
+        staging.state,
+        StagingState::Missing | StagingState::NotInitialized | StagingState::Available
+    ) && staging.binding.state == StagingBindingState::Verified;
+    if !evidence_complete && unresolved.is_empty() {
+        unresolved.push(Unresolved {
+            subject: "local-staging".to_owned(),
+            state: "partial".to_owned(),
+            detail: format!(
+                "staging state {:?} with binding {:?}",
+                staging.state, staging.binding.state
+            ),
+        });
+    }
+    for package in &backups.packages {
+        if package.state == BackupPackageState::Validated {
+            continue;
+        }
+        evidence_complete = false;
+        let state = match package.state {
+            BackupPackageState::Validated => unreachable!(),
+            BackupPackageState::Partial => "partial",
+            BackupPackageState::Foreign => "foreign",
+            BackupPackageState::Unavailable => "unavailable",
+        };
+        unresolved.push(Unresolved {
+            subject: "backup-package".to_owned(),
+            state: state.to_owned(),
+            detail: format!(
+                "{}: {}",
+                package.path,
+                package
+                    .error
+                    .as_deref()
+                    .unwrap_or("package evidence is incomplete")
+            ),
+        });
+    }
+
+    let mut protected = staging.protected.clone();
+    let mut backup_protected = BTreeMap::<Revision, BTreeSet<&'static str>>::new();
+    for package in &backups.packages {
+        for (revision, reasons) in &package.protected {
+            let entry = backup_protected.entry(*revision).or_default();
+            for reason in reasons {
+                entry.insert(backup_reason(reason));
+            }
+        }
+    }
+    merge_protected(&mut protected, &backup_protected);
+
+    for (revision, reasons) in &protected {
+        if *revision == expected_latest {
+            continue;
+        }
+        let state = history.get(revision);
+        let detail = match state {
+            Some(RevisionState::Readable) => continue,
+            Some(RevisionState::Expired(_)) => "protected-expired",
+            None => "protected-missing",
+        };
+        evidence_complete = false;
+        unresolved.push(Unresolved {
+            subject: "protected-revision".to_owned(),
+            state: detail.to_owned(),
+            detail: format!(
+                "{} is protected by {}",
+                revision_hex(*revision),
+                reasons.iter().copied().collect::<Vec<_>>().join(",")
+            ),
+        });
+    }
+
+    let evidence_digest = expiry_evidence_digest(
+        authority,
+        expected_latest,
+        &staging,
+        &backups,
+        &protected,
+        &unresolved,
+    )?;
+    let mut decisions = candidates
+        .iter()
+        .map(|revision| classify_expiry_candidate(*revision, expected_latest, &history, &protected))
+        .collect::<Vec<_>>();
+    let has_refusal = !evidence_complete
+        || decisions.iter().any(|decision| {
+            !matches!(
+                decision.state,
+                ExpiryDecisionState::Eligible | ExpiryDecisionState::AlreadyExpired
+            )
+        });
+    if has_refusal {
+        drop(leases);
+        return Ok(expiry_report(
+            authority,
+            operation_id,
+            expected_latest,
+            None,
+            ExpiryReportState::Refused,
+            evidence_digest,
+            &staging,
+            &backups,
+            &protected,
+            decisions,
+            unresolved,
+        ));
+    }
+
+    let expire = decisions
+        .iter()
+        .filter(|decision| decision.state == ExpiryDecisionState::Eligible)
+        .map(|decision| Revision::from_bytes(parse_revision_hex(&decision.revision)))
+        .collect::<Vec<_>>();
+    if expire.is_empty() {
+        drop(leases);
+        return Ok(expiry_report(
+            authority,
+            operation_id,
+            expected_latest,
+            None,
+            ExpiryReportState::AlreadyExpired,
+            evidence_digest,
+            &staging,
+            &backups,
+            &protected,
+            decisions,
+            unresolved,
+        ));
+    }
+
+    let protected_for_request = protected
+        .keys()
+        .copied()
+        .filter(|revision| *revision != expected_latest)
+        .collect::<Vec<_>>();
+    let request = ExpiryRequest::new(
+        authority.filesystem(),
+        operation_id,
+        expected_latest,
+        expire,
+        protected_for_request,
+        evidence_digest,
+    )?;
+    let outcome = authority.expire_revisions(&request).await?;
+    let (state, after_revision) = match &outcome {
+        ExpiryOutcome::Committed(receipt) => {
+            for decision in &mut decisions {
+                if receipt
+                    .expired
+                    .iter()
+                    .any(|revision| revision_hex(*revision) == decision.revision)
+                {
+                    decision.state = ExpiryDecisionState::Expired;
+                }
+            }
+            (ExpiryReportState::Committed, Some(receipt.after))
+        }
+        ExpiryOutcome::Refused(refusal) => {
+            let mut only_already = true;
+            for conflict in &refusal.conflicts {
+                if conflict.kind != ExpiryConflictKind::AlreadyExpired {
+                    only_already = false;
+                }
+                if let Some(decision) = decisions
+                    .iter_mut()
+                    .find(|decision| decision.revision == revision_hex(conflict.revision))
+                {
+                    decision.state = expiry_conflict_state(conflict.kind);
+                    decision.reasons = protected
+                        .get(&conflict.revision)
+                        .map(|reasons| reasons.iter().copied().collect())
+                        .unwrap_or_default();
+                }
+            }
+            let state = if only_already {
+                ExpiryReportState::AlreadyExpired
+            } else {
+                ExpiryReportState::Refused
+            };
+            (state, None)
+        }
+        ExpiryOutcome::Conflict => (ExpiryReportState::Conflict, None),
+        ExpiryOutcome::Retryable => (ExpiryReportState::Retryable, None),
+        ExpiryOutcome::Unknown(_) => (ExpiryReportState::Unknown, None),
+    };
+    drop(leases);
+    Ok(expiry_report(
+        authority,
+        operation_id,
+        expected_latest,
+        after_revision,
+        state,
+        evidence_digest,
+        &staging,
+        &backups,
+        &protected,
+        decisions,
+        unresolved,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+async fn collect_expiry_history(
+    authority: &dyn Authority,
+    latest: Revision,
+) -> Result<BTreeMap<Revision, RevisionState>> {
+    let mut after = None;
+    let mut history = BTreeMap::new();
+    loop {
+        let page = authority
+            .history_page(after, yinyang_core::RETAINED_REVISIONS_PAGE_MAX)
+            .await?;
+        let page_len = page.entries.len();
+        for HistoryEntry { revision, state } in page.entries {
+            if history.insert(revision, state).is_some() {
+                return Err(Error::new(
+                    ErrorKind::Corrupt,
+                    "read expiry history",
+                    "history page repeated a revision",
+                ));
+            }
+        }
+        match page.next {
+            Some(next)
+                if page_len > 0
+                    && after.is_none_or(|cursor| next > cursor)
+                    && history.last_key_value().map(|(revision, _)| *revision) == Some(next) =>
+            {
+                after = Some(next);
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::Corrupt,
+                    "read expiry history",
+                    "history continuation does not advance",
+                ));
+            }
+            None => break,
+        }
+    }
+    if !history.contains_key(&latest) {
+        return Err(Error::new(
+            ErrorKind::Corrupt,
+            "read expiry history",
+            "latest revision is absent from the history index",
+        ));
+    }
+    Ok(history)
+}
+
+#[cfg(target_os = "linux")]
+fn classify_expiry_candidate(
+    revision: Revision,
+    latest: Revision,
+    history: &BTreeMap<Revision, RevisionState>,
+    protected: &BTreeMap<Revision, BTreeSet<&'static str>>,
+) -> ExpiryRevisionDecision {
+    let protected_reasons = protected
+        .get(&revision)
+        .map(|reasons| reasons.iter().copied().collect())
+        .unwrap_or_default();
+    let state = if revision == latest {
+        ExpiryDecisionState::Current
+    } else {
+        match history.get(&revision) {
+            Some(RevisionState::Readable) if protected.contains_key(&revision) => {
+                ExpiryDecisionState::Protected
+            }
+            Some(RevisionState::Readable) => ExpiryDecisionState::Eligible,
+            Some(RevisionState::Expired(_)) if protected.contains_key(&revision) => {
+                ExpiryDecisionState::ProtectedExpired
+            }
+            Some(RevisionState::Expired(_)) => ExpiryDecisionState::AlreadyExpired,
+            None if protected.contains_key(&revision) => ExpiryDecisionState::ProtectedMissing,
+            None => ExpiryDecisionState::Missing,
+        }
+    };
+    ExpiryRevisionDecision {
+        revision: revision_hex(revision),
+        state,
+        reasons: protected_reasons,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_conflict_state(kind: ExpiryConflictKind) -> ExpiryDecisionState {
+    match kind {
+        ExpiryConflictKind::Current => ExpiryDecisionState::Current,
+        ExpiryConflictKind::Missing => ExpiryDecisionState::Missing,
+        ExpiryConflictKind::AlreadyExpired => ExpiryDecisionState::AlreadyExpired,
+        ExpiryConflictKind::Protected => ExpiryDecisionState::Protected,
+        ExpiryConflictKind::ProtectedMissing => ExpiryDecisionState::ProtectedMissing,
+        ExpiryConflictKind::ProtectedExpired => ExpiryDecisionState::ProtectedExpired,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_report(
+    authority: &dyn Authority,
+    operation_id: ExpiryId,
+    observed: Revision,
+    after: Option<Revision>,
+    state: ExpiryReportState,
+    evidence_digest: [u8; 32],
+    staging: &StagingSpace,
+    backups: &BackupProtection,
+    protected: &BTreeMap<Revision, BTreeSet<&'static str>>,
+    revisions: Vec<ExpiryRevisionDecision>,
+    unresolved: Vec<Unresolved>,
+) -> ManagedExpiryReport {
+    ManagedExpiryReport {
+        schema: RETENTION_EXPIRY_SCHEMA,
+        filesystem: identity_hex(authority.filesystem()),
+        operation_id: expiry_id_string(operation_id),
+        observed_revision: revision_hex(observed),
+        after_revision: after.map(revision_hex),
+        state,
+        evidence_digest: bytes_hex(&evidence_digest),
+        staging: staging_protection(staging),
+        backups: backups.clone(),
+        revisions,
+        unresolved,
+        external_readers: "unknown",
+        untracked_pins: "unknown",
+        quiescence: "not_observed",
+        deletion_authorized: false,
+        reclaimable_bytes: None,
+        physical_cleanup: "not_performed",
+        limits: expiry_limits(protected.len() as u64, revisions.len() as u64),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_evidence_digest(
+    authority: &dyn Authority,
+    expected_latest: Revision,
+    staging: &StagingSpace,
+    backups: &BackupProtection,
+    protected: &BTreeMap<Revision, BTreeSet<&'static str>>,
+    unresolved: &[Unresolved],
+) -> Result<[u8; 32]> {
+    let protected = protected
+        .iter()
+        .map(|(revision, reasons)| {
+            (
+                revision.to_bytes(),
+                reasons
+                    .iter()
+                    .map(|reason| (*reason).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut backup_rows = backups
+        .packages
+        .iter()
+        .map(|package| {
+            let protected = package
+                .protected
+                .iter()
+                .map(|(revision, reasons)| {
+                    (
+                        revision.to_bytes(),
+                        reasons
+                            .iter()
+                            .map(|reason| (*reason).to_owned())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                backup_state_tag(package.state),
+                package.filesystem.map(|volume| parse_identity_hex(&volume)),
+                *blake3::hash(package.path.as_bytes()).as_bytes(),
+                protected,
+            )
+        })
+        .collect::<Vec<_>>();
+    backup_rows.sort();
+    let unresolved = unresolved
+        .iter()
+        .map(|item| {
+            (
+                item.subject.clone(),
+                item.state.clone(),
+                item.detail.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let bytes = borsh::to_vec(&(
+        *b"YYMEXP01",
+        authority.filesystem().as_bytes(),
+        expected_latest.to_bytes(),
+        staging_state_tag(staging.state),
+        staging_binding_tag(staging.binding.state),
+        *blake3::hash(staging.path.as_bytes()).as_bytes(),
+        staging.handles.total,
+        staging.handles.pending,
+        staging.handles.frozen,
+        staging.handles.conflict,
+        staging.handles.unknown,
+        staging.handles.failed,
+        staging.sync.namespace_prepared,
+        staging.sync.namespace_unknown,
+        staging.sync.namespace_committed,
+        staging.sync.namespace_conflict,
+        staging.sync.namespace_retryable,
+        staging.sync.namespace_failed,
+        protected,
+        backup_rows,
+        unresolved,
+    ))
+    .map_err(|error| {
+        Error::new(
+            ErrorKind::Invalid,
+            "encode expiry evidence",
+            error.to_string(),
+        )
+    })?;
+    Ok(blake3::derive_key(
+        "yinyang managed-retention expiry evidence v1",
+        &bytes,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn staging_state_tag(state: StagingState) -> u8 {
+    match state {
+        StagingState::Missing => 0,
+        StagingState::NotInitialized => 1,
+        StagingState::Available => 2,
+        StagingState::Partial => 3,
+        StagingState::Unavailable => 4,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn staging_binding_tag(state: StagingBindingState) -> u8 {
+    match state {
+        StagingBindingState::Unbound => 0,
+        StagingBindingState::Verified => 1,
+        StagingBindingState::Unavailable => 2,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn backup_state_tag(state: BackupPackageState) -> u8 {
+    match state {
+        BackupPackageState::Validated => 0,
+        BackupPackageState::Partial => 1,
+        BackupPackageState::Foreign => 2,
+        BackupPackageState::Unavailable => 3,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_id_string(id: ExpiryId) -> String {
+    uuid::Uuid::from_bytes(*id.as_bytes()).to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_revision_hex(value: &str) -> [u8; 24] {
+    let mut bytes = [0_u8; 24];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .expect("expiry decisions always contain canonical revisions");
+    }
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn parse_identity_hex(value: &str) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .expect("backup package identities are always canonical");
+    }
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_limits(protected: u64, requested: u64) -> Vec<String> {
+    vec![
+        format!(
+            "Observed {protected} locally protected revisions and requested {requested} explicit expiry candidates."
+        ),
+        "Logical expiry never authorizes physical deletion or estimates reclaimable bytes.".to_owned(),
+        "External readers, untracked pins, other staging directories, and undisclosed backups remain unknown.".to_owned(),
+        "Quiescence is not observed; the operator must stop every writer, reader, mount, Sync process, and backup activity.".to_owned(),
+        "Configured local-state writer entry points are held under their existing protocol leases through the Core mutation.".to_owned(),
+        "Mutable authority metadata may advance; pre-existing immutable content and packs are not rewritten or deleted.".to_owned(),
+        "Default keep-all remains unchanged and does not resurrect an explicitly expired revision.".to_owned(),
+    ]
 }
 
 /// Inspect existing Managed content, Sync, and replica evidence without creating

@@ -21,9 +21,10 @@ use crate::RevisionArg;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use yinyang::core::Revision;
+use yinyang::core::{ExpiryId, Revision};
 use yinyang::space::{
-    ListingConsistency, ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, StagingState,
+    ExpiryReportState, ListingConsistency, ManagedExpiryReport, ManagedRetentionPlan,
+    ManagedSpaceReport, MeasurementState, StagingState,
 };
 use yinyang::volume::{Model, Volume, VolumeConfig};
 
@@ -35,7 +36,7 @@ pub enum SpaceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Build an explicit declarative retention selection without deleting data.
+    /// Plan or explicitly expire retained history without physical deletion.
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
@@ -56,6 +57,21 @@ pub enum RetentionCommand {
         #[arg(long = "backup")]
         backup: Vec<PathBuf>,
         /// Emit the versioned `yinyang.managed-retention.plan.v3` document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly expire selected historical revisions after protection checks.
+    Expire {
+        /// Historical revision to expire; repeat for an atomic batch.
+        #[arg(long = "revision", required = true)]
+        revision: Vec<RevisionArg>,
+        /// Protect revisions referenced by an explicit validated backup package.
+        #[arg(long = "backup")]
+        backup: Vec<PathBuf>,
+        /// Reuse an operation identity only when retrying the exact same command.
+        #[arg(long)]
+        operation_id: Option<uuid::Uuid>,
+        /// Emit the versioned `yinyang.managed-retention.expiry.v1` document.
         #[arg(long)]
         json: bool,
     },
@@ -123,6 +139,42 @@ pub async fn run(
             } else {
                 print_plan(&plan);
             }
+        }
+        SpaceCommand::Retention {
+            command:
+                RetentionCommand::Expire {
+                    revision,
+                    backup,
+                    operation_id,
+                    json,
+                },
+        } => {
+            let revisions = revision
+                .into_iter()
+                .map(|revision| revision.0)
+                .collect::<Vec<_>>();
+            let operation_id = operation_id
+                .map(|id| ExpiryId::from_bytes(*id.as_bytes()))
+                .unwrap_or_else(ExpiryId::generate);
+            let report = yinyang::space::expire_managed_retention(
+                authority.as_ref(),
+                &config.staging,
+                &revisions,
+                &backup,
+                operation_id,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_expiry(&report);
+            }
+            let code = match report.state {
+                ExpiryReportState::Committed | ExpiryReportState::AlreadyExpired => 0,
+                ExpiryReportState::Refused | ExpiryReportState::Conflict => 2,
+                ExpiryReportState::Retryable | ExpiryReportState::Unknown => 3,
+            };
+            return Ok(ExitCode::from(code));
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -435,9 +487,104 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     println!("deletion authorized: no");
     println!("reclaimable bytes: unknown; selection is not a cleanup estimate");
     println!(
-        "outside-policy revisions remain readable; --keep is not a persistent pin; no expiry command exists"
+        "outside-policy revisions remain readable; --keep is not a persistent pin; planning never expires history"
     );
     if plan.protection.staging.state == StagingState::Unavailable {
         println!("local staging evidence is unavailable; do not infer that no pending work exists");
+    }
+}
+
+fn print_expiry(report: &ManagedExpiryReport) {
+    println!(
+        "retention expiry: filesystem {} revision {} operation {}",
+        report.filesystem, report.observed_revision, report.operation_id
+    );
+    println!(
+        "state: {}{}",
+        expiry_state_name(report.state),
+        report
+            .after_revision
+            .as_deref()
+            .map(|revision| format!("; after revision {revision}"))
+            .unwrap_or_default()
+    );
+    for revision in &report.revisions {
+        println!(
+            "revision {}: {} [{}]",
+            revision.revision,
+            expiry_decision_name(revision.state),
+            revision.reasons.join(",")
+        );
+    }
+    println!(
+        "protected staging: binding {:?} pending {} frozen {} conflict {} unknown {} failed {}",
+        report.staging.binding.state,
+        report.staging.pending,
+        report.staging.frozen,
+        report.staging.conflict,
+        report.staging.unknown,
+        report.staging.failed
+    );
+    println!(
+        "backup packages: {} supplied, {} validated",
+        report.backups.supplied, report.backups.validated
+    );
+    for unresolved in &report.unresolved {
+        println!(
+            "unresolved {} ({}): {}",
+            unresolved.subject, unresolved.state, unresolved.detail
+        );
+    }
+    println!(
+        "external readers: {}; untracked pins: {}; quiescence: {}",
+        report.external_readers, report.untracked_pins, report.quiescence
+    );
+    println!("evidence digest: {}", report.evidence_digest);
+    println!(
+        "physical cleanup: {}; reclaimable bytes: unknown; deletion authorized: no",
+        report.physical_cleanup
+    );
+    match report.state {
+        ExpiryReportState::Committed => {}
+        ExpiryReportState::AlreadyExpired => {
+            println!("all requested revisions were already expired; no new mutation was issued");
+        }
+        ExpiryReportState::Refused | ExpiryReportState::Conflict => {
+            println!("no new revision was expired");
+        }
+        ExpiryReportState::Retryable => {
+            println!("expiry is retryable; no physical cleanup is implied");
+        }
+        ExpiryReportState::Unknown => {
+            println!(
+                "expiry outcome is unknown; retry the exact command with --operation-id {}",
+                report.operation_id
+            );
+        }
+    }
+}
+
+fn expiry_state_name(state: ExpiryReportState) -> &'static str {
+    match state {
+        ExpiryReportState::Committed => "committed",
+        ExpiryReportState::AlreadyExpired => "already_expired",
+        ExpiryReportState::Refused => "refused",
+        ExpiryReportState::Conflict => "conflict",
+        ExpiryReportState::Retryable => "retryable",
+        ExpiryReportState::Unknown => "unknown",
+    }
+}
+
+fn expiry_decision_name(state: yinyang::space::ExpiryDecisionState) -> &'static str {
+    use yinyang::space::ExpiryDecisionState;
+    match state {
+        ExpiryDecisionState::Eligible => "eligible",
+        ExpiryDecisionState::Expired => "expired",
+        ExpiryDecisionState::AlreadyExpired => "already_expired",
+        ExpiryDecisionState::Current => "current",
+        ExpiryDecisionState::Missing => "missing",
+        ExpiryDecisionState::Protected => "protected",
+        ExpiryDecisionState::ProtectedMissing => "protected_missing",
+        ExpiryDecisionState::ProtectedExpired => "protected_expired",
     }
 }
