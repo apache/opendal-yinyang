@@ -1,6 +1,6 @@
 - Proposal Name: `architecture_consolidation`
 - Start Date: 2026-11-01
-- RFC PR: [apache/opendal-yinyang#TBD](https://github.com/apache/opendal-yinyang/pulls)
+- RFC PR: [apache/opendal-yinyang#138](https://github.com/apache/opendal-yinyang/pull/138)
 - Tracking Issue: [apache/opendal-yinyang#67](https://github.com/apache/opendal-yinyang/issues/67)
 
 # Summary
