@@ -931,7 +931,8 @@ async fn content_preparation_requires_verified_storage_acknowledgement() {
 async fn canonical_content_range_reads_and_incremental_overwrites() {
     use yinyang_core::data::{BLOCK_BYTES, DataStore};
     let backend = TestBackend::default();
-    let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    let id = NodeId::generate();
+    let store = DataStore::new(backend.operator(), id).unwrap();
     let bytes = (0..BLOCK_BYTES * 9 + 17)
         .map(|n| (n % 251) as u8)
         .collect::<Vec<_>>();
@@ -1015,8 +1016,14 @@ async fn content_corruption_is_rejected_before_releasing_its_unit() {
         .await
         .unwrap();
     assert_eq!(output, vec![7]);
+    store.import(file.descriptor()).await.unwrap();
+    let restarted = DataStore::new(backend.operator(), id).unwrap();
     assert_eq!(
-        store.import(file.descriptor()).await.unwrap_err().kind(),
+        restarted
+            .import(file.descriptor())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::Corrupt
     );
 }
