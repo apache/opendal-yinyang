@@ -1016,8 +1016,7 @@ fn explicit_expiry_case(publication: Publication) {
     // the package records a real common baseline rather than an initial-sync
     // conflict.
     fixture.sync_run_ok(&backup_source);
-    let external_baseline =
-        fixture.remote_create_file("expiry-baseline-only.txt", b"external-baseline", false);
+    fixture.remote_create_file("expiry-baseline-only.txt", b"external-baseline", false);
     fixture.sync_run_ok(&backup_source);
     fs::write(
         backup_source.directory.join("backup-only.txt"),
@@ -1025,6 +1024,7 @@ fn explicit_expiry_case(publication: Publication) {
     )
     .unwrap();
     fixture.sync_run_ok(&backup_source);
+    let baseline_target = fixture.remote_file_version("expiry-baseline-only.txt").2;
     let backup = fixture.path("expiry-backup");
     fixture.yy_ok(&[
         "--volume",
@@ -1048,7 +1048,7 @@ fn explicit_expiry_case(publication: Publication) {
         text(&restored.directory),
     ]);
     let restored_plan = retention_plan(&fixture, &restored.config, 1, &[], None);
-    let baseline_target_text = revision_text(external_baseline.cursor.revision);
+    let baseline_target_text = revision_text(baseline_target);
     let baseline_entries =
         restored_plan["protection"]["staging"]["replica"]["baseline"]["entry_revisions"]
             .as_array()
