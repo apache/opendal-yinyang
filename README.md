@@ -41,7 +41,9 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   saves, failure retention, refresh, crash recovery, and teardown. See the
   [frontend contract](specs/linux-fuse.md) and
   [acceptance guide](docs/linux-fuse-acceptance.md). This is experimental
-  native validation, not release support.
+  native validation, not release support. The
+  [application workflow guide](docs/linux-applications.md) records the narrow
+  rsync and GNU tar examples that passed through this mount.
 - **Managed Sync:** The Linux ordinary-directory frontend reconciles a directory
   with a Managed volume through `yy --volume CONFIG sync init|run|status|export|resolve`
   and a versioned `yinyang.sync.status.v1` document. See the

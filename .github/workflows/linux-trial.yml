@@ -25,12 +25,15 @@ on:
       - "Cargo.toml"
       - "crates/**"
       - "deploy/linux/**"
+      - "docs/linux-applications.md"
       - "docs/linux-operations.md"
       - "docs/linux-qualification.md"
       - "docs/linux-trial-distribution.md"
       - "src/**"
+      - "specs/linux-applications.md"
       - "specs/linux-operations.md"
       - "specs/linux-trial-distribution.md"
+      - "tests/linux_applications.rs"
       - "tests/linux_fuse/harness.rs"
       - "tests/linux_operations.rs"
       - "tests/linux_prefix_upgrade.rs"
@@ -41,6 +44,7 @@ on:
       - "tests/support/**"
       - "tests/fixtures/compatibility/546f419/**"
       - "tools/linux/**"
+      - "xtask/**"
   workflow_dispatch:
 
 permissions:
@@ -75,7 +79,7 @@ jobs:
           printf 'TRIAL_ROOT=%s\n' "$TRIAL_ROOT" >>"$GITHUB_ENV"
           export TRIAL_ROOT
           sudo apt-get update
-          sudo apt-get install --yes fuse3 sqlite3
+          sudo apt-get install --yes fuse3 git rsync sqlite3
           mkdir -p "$TRIAL_ROOT/artifacts" "$TRIAL_ROOT/evidence"
           {
             date --utc
@@ -210,6 +214,20 @@ jobs:
             --yy "$TRIAL_YY" \
             --evidence "$TRIAL_ROOT/evidence" \
             2>&1 | tee "$TRIAL_ROOT/evidence/archive-smoke.log"
+
+      - name: Run application acceptance with the archive binary
+        run: |
+          set -euo pipefail
+          yy_sha256=$(sha256sum "$TRIAL_YY" | awk '{print $1}')
+          {
+            printf 'schema=yinyang-linux-trial-applications-binary.v1\n'
+            printf 'source_commit=%s\n' "$GITHUB_SHA"
+            printf 'binary=%s\n' "$TRIAL_YY"
+            printf 'yy_sha256=%s\n' "$yy_sha256"
+          } | tee "$TRIAL_ROOT/evidence/applications-binary.txt"
+          export YY_UPGRADE_BIN="$TRIAL_YY"
+          cargo x test-linux-applications \
+            2>&1 | tee "$TRIAL_ROOT/evidence/applications.log"
 
       - name: Run installed archive Mount and finite Sync acceptance
         run: |
