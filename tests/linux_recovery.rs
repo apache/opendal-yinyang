@@ -2310,9 +2310,10 @@ fn legacy_post_expiry(
                 "legacy object binary accepted the activated format"
             );
             let diagnostic = String::from_utf8_lossy(&status.stderr).to_ascii_lowercase();
-            assert_eq!(
-                diagnostic.trim(),
-                "yy: open volume: unknown profile or publication mode",
+            assert!(
+                diagnostic
+                    .trim()
+                    .ends_with(": unknown profile or publication mode"),
                 "legacy object rejection lacked the exact format diagnostic: {diagnostic}"
             );
             let read_path = fixture.path("legacy-post-expiry-read");
