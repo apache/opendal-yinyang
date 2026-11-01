@@ -1954,6 +1954,7 @@ impl<'a> Context<'a> {
             self.accept_local(path, &local, node_id, revision).await?;
         }
         self.refresh_parent_baseline(path, revision).await?;
+        self.refresh_local_path(path)?;
         self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
@@ -2003,6 +2004,7 @@ impl<'a> Context<'a> {
         self.mark_parent_dirty(path);
         self.accept_local(path, node, node_id, revision).await?;
         self.refresh_parent_baseline(path, revision).await?;
+        self.refresh_local_path(path)?;
         self.complete_work(edit, revision, Some(&upload_artifact))?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
@@ -2038,6 +2040,7 @@ impl<'a> Context<'a> {
         self.revision = revision;
         self.revisions.insert(path.to_owned(), revision);
         self.accept_local(path, node, remote_node, revision).await?;
+        self.refresh_local_path(path)?;
         self.complete_work(edit, revision, Some(&upload_artifact))?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
@@ -2073,6 +2076,7 @@ impl<'a> Context<'a> {
         self.mark_parent_dirty(path);
         self.replica.store_mut().remove_baseline_path(path)?;
         self.refresh_parent_baseline(path, revision).await?;
+        self.refresh_local_path(path)?;
         self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
@@ -2123,6 +2127,8 @@ impl<'a> Context<'a> {
         }
         self.refresh_parent_baseline(from, revision).await?;
         self.refresh_parent_baseline(to, revision).await?;
+        self.refresh_local_path(from)?;
+        self.refresh_local_path(to)?;
         self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
@@ -2483,6 +2489,18 @@ impl<'a> Context<'a> {
         self.replica.store_mut().remove_work(edit.as_bytes())?;
         if let Some(artifact) = upload_artifact {
             self.replica.release_artifact(artifact)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_local_path(&mut self, path: &str) -> Result<()> {
+        match self.replica.observe_path(path)? {
+            Some(node) => {
+                self.current.insert_node(node);
+            }
+            None => {
+                self.current.remove_subtree(path);
+            }
         }
         Ok(())
     }
