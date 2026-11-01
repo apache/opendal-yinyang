@@ -617,6 +617,21 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     assert_eq!(first.published_local, 2);
     assert!(first.conflicts.is_empty());
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
+    let probe = DirectorySync::inspect(authority.clone(), &state)
+        .await
+        .unwrap();
+    eprintln!(
+        "W2 BASELINE {}",
+        probe
+            .entries
+            .iter()
+            .map(|entry| (
+                entry.path.as_str(),
+                entry.baseline.revision,
+                entry.remote.revision,
+            ))
+            .collect::<Vec<_>>()
+    );
     drop(sync);
 
     // The next run stages local edits while the remote is observed unchanged,
