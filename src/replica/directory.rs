@@ -1364,6 +1364,14 @@ enum Action {
     Delete,
 }
 
+struct PendingFileCreate {
+    edit: EditId,
+    path: String,
+    local: LocalNode,
+    parent: String,
+    upload_artifact: String,
+}
+
 struct Context<'a> {
     sync: &'a mut Sync,
     replica: &'a mut Replica,
@@ -1443,6 +1451,8 @@ impl<'a> Context<'a> {
 
         let mut ascending: Vec<String> = paths.iter().cloned().collect();
         ascending.sort_by_key(|path| (depth(path), path.clone()));
+        let mut pending_files = Vec::new();
+        let mut pending_depth = None;
         for path in &ascending {
             if path.is_empty() || handled.contains(path) || self.blocked.contains(path) {
                 continue;
@@ -1450,8 +1460,32 @@ impl<'a> Context<'a> {
             if under_any(&retained, path) {
                 continue;
             }
+            let local = local_action(self.baseline.local.get(path), self.current.get(path));
+            let remote = remote_action(self.baseline.remote.get(path), self.remote.get(path));
+            let batchable = local == Action::Create
+                && remote == Action::None
+                && self
+                    .current
+                    .get(path)
+                    .is_some_and(|node| matches!(node.kind, LocalKind::File { .. }));
+            if batchable {
+                if pending_depth != Some(depth(path)) {
+                    self.flush_file_batch(&mut pending_files).await?;
+                    pending_depth = Some(depth(path));
+                }
+                let node = self
+                    .current
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| "pending local file disappeared".to_string())?;
+                pending_files.push(self.stage_file_create(path, &node).await?);
+                continue;
+            }
+            self.flush_file_batch(&mut pending_files).await?;
+            pending_depth = None;
             self.entry(path).await?;
         }
+        self.flush_file_batch(&mut pending_files).await?;
 
         let mut descending = ascending.clone();
         descending.sort_by_key(|path| (depth(path), path.clone()));
@@ -1958,6 +1992,113 @@ impl<'a> Context<'a> {
         self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
+        Ok(())
+    }
+
+    async fn stage_file_create(
+        &mut self,
+        path: &str,
+        node: &LocalNode,
+    ) -> Result<PendingFileCreate> {
+        let (parent, name) = split(path);
+        let parent_node = self
+            .nodes
+            .get(parent)
+            .copied()
+            .ok_or_else(|| format!("file parent {parent:?} is missing"))?;
+        let parent_revision = self.entry_revision(parent);
+        let captured = self.replica.capture_file(path, node)?;
+        let upload_artifact = captured.artifact.id.clone();
+        let mut source = tokio::fs::File::from_std(self.replica.open_artifact(&upload_artifact)?);
+        let edit = self
+            .sync
+            .stage_create_file(
+                parent_node,
+                name,
+                parent_revision,
+                FileMetadata::new(node.executable),
+                &mut source,
+            )
+            .await?;
+        self.associate(
+            edit,
+            path,
+            None,
+            Some(path),
+            "create-file",
+            Some(node),
+            Some(parent_node),
+            parent_revision,
+            Some(&upload_artifact),
+        )?;
+        Ok(PendingFileCreate {
+            edit,
+            path: path.to_owned(),
+            local: node.clone(),
+            parent: parent.to_owned(),
+            upload_artifact,
+        })
+    }
+
+    async fn flush_file_batch(&mut self, pending: &mut Vec<PendingFileCreate>) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let edits = pending.iter().map(|member| member.edit).collect::<Vec<_>>();
+        let results = self.sync.publish_batch(&edits).await;
+        let mut parents = BTreeMap::<String, Revision>::new();
+        for (member, result) in pending.drain(..).zip(results) {
+            match result {
+                Ok(revision) => {
+                    self.revision = self.revision.max(revision);
+                    self.outcome.revision = Some(self.revision);
+                    let node_id = self.namespace_node(member.edit).await?;
+                    self.accept_local(&member.path, &member.local, node_id, revision)
+                        .await?;
+                    self.mark_parent_dirty(&member.path);
+                    self.refresh_local_path(&member.path)?;
+                    self.complete_work(member.edit, revision, Some(&member.upload_artifact))?;
+                    parents.entry(member.parent).or_insert(revision);
+                    self.outcome.published_local += 1;
+                }
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Conflict => {
+                    self.replica.store_mut().update_work(
+                        member.edit.as_bytes(),
+                        "conflict",
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                    self.record_publish_conflict(&member.path).await?;
+                }
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Retryable => {
+                    self.replica.store_mut().update_work(
+                        member.edit.as_bytes(),
+                        "retryable",
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                }
+                Err(error) => {
+                    if error.kind() == crate::runtime::ErrorKind::Unknown {
+                        self.outcome.unknown += 1;
+                    }
+                    if let Some(commit) = error.commit_id() {
+                        self.replica
+                            .store_mut()
+                            .set_work_commit_id(member.edit.as_bytes(), *commit.as_bytes())?;
+                    }
+                    self.replica.store_mut().update_work(
+                        member.edit.as_bytes(),
+                        work_state_for(&error),
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                }
+            }
+        }
+        for (parent, revision) in parents {
+            self.refresh_parent_baseline(&parent, revision).await?;
+        }
         Ok(())
     }
 

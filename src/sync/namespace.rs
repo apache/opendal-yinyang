@@ -24,7 +24,9 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use yinyang_core::{ContentDescriptor, NodeId, Planner, Receipt, Revision, Transaction};
+use yinyang_core::{
+    CommitOutcome, ContentDescriptor, NodeId, Planner, Receipt, Revision, Transaction,
+};
 
 const PREPARED: u8 = 0;
 const UNKNOWN: u8 = 1;
@@ -149,6 +151,11 @@ pub enum NamespaceState {
     Retryable,
     /// Validation, readiness, corruption, or another definitive failure.
     Failed,
+}
+
+pub(super) enum BatchPrepare {
+    Done(Result<Revision>),
+    Request(Transaction),
 }
 
 /// Reopen-safe status for a namespace intent.
@@ -1031,6 +1038,98 @@ pub(super) async fn publish(sync: &Sync, id: EditId) -> Result<Revision> {
             Err(Error::Retained(failure))
         }
     }
+}
+
+pub(super) async fn prepare_batch(sync: &Sync, id: EditId) -> Result<BatchPrepare> {
+    let row = load_async(sync, id)
+        .await?
+        .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown namespace intent"))?;
+    let status = row.status()?;
+    match &status.state {
+        NamespaceState::Committed(receipt) => {
+            return Ok(BatchPrepare::Done(Ok(receipt.cursor.revision)));
+        }
+        NamespaceState::Conflict | NamespaceState::Failed => {
+            return Ok(BatchPrepare::Done(Err(Error::Retained(
+                status.failure.ok_or_else(|| {
+                    Error::local_kind(ErrorKind::Corrupt, "terminal intent has no failure")
+                })?,
+            ))));
+        }
+        NamespaceState::Prepared | NamespaceState::Unknown | NamespaceState::Retryable => {}
+    }
+    if matches!(&status.state, NamespaceState::Unknown) {
+        match receipt_for(sync, &status.intent).await {
+            Ok(Some(receipt)) => {
+                let revision = receipt.cursor.revision;
+                save_state_async(sync, id, COMMITTED, Some(receipt), None).await?;
+                return Ok(BatchPrepare::Done(Ok(revision)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let failure = Failure::capture(&error);
+                save_state_async(sync, id, UNKNOWN, None, Some(failure.clone())).await?;
+                return Ok(BatchPrepare::Done(Err(Error::Retained(failure))));
+            }
+        }
+    }
+    let request = match sync.restore_transaction(&row.request).await {
+        Ok(request) => request,
+        Err(error) => {
+            let state = match status.state {
+                NamespaceState::Unknown => UNKNOWN,
+                NamespaceState::Prepared | NamespaceState::Retryable => match error.kind() {
+                    ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => FAILED,
+                    _ => RETRYABLE,
+                },
+                _ => unreachable!("terminal states returned above"),
+            };
+            let failure = Failure::capture(&error);
+            save_state_async(sync, id, state, None, Some(failure.clone())).await?;
+            return Ok(BatchPrepare::Done(Err(Error::Retained(failure))));
+        }
+    };
+    save_state_async(sync, id, UNKNOWN, None, None).await?;
+    Ok(BatchPrepare::Request(request))
+}
+
+pub(super) async fn complete_batch(
+    sync: &Sync,
+    id: EditId,
+    request: &Transaction,
+    outcome: CommitOutcome,
+) -> Result<Revision> {
+    match outcome {
+        CommitOutcome::Committed(receipt) => {
+            let revision = receipt.cursor.revision;
+            save_state_async(sync, id, COMMITTED, Some(receipt), None).await?;
+            sync.forget_prepared(request)?;
+            Ok(revision)
+        }
+        CommitOutcome::Conflict => {
+            let failure = Failure::capture(&Error::State(
+                ErrorKind::Conflict,
+                "namespace predicates changed; the original intent is retained",
+            ));
+            save_state_async(sync, id, CONFLICT, None, Some(failure.clone())).await?;
+            sync.forget_prepared(request)?;
+            Err(Error::Retained(failure))
+        }
+        CommitOutcome::Retryable => {
+            let failure = Failure::capture(&Error::Retryable);
+            save_state_async(sync, id, RETRYABLE, None, Some(failure.clone())).await?;
+            Err(Error::Retained(failure))
+        }
+        CommitOutcome::Unknown(commit) => {
+            let failure = Failure::capture(&Error::Unknown(commit));
+            save_state_async(sync, id, UNKNOWN, None, Some(failure.clone())).await?;
+            Err(Error::Retained(failure))
+        }
+    }
+}
+
+pub(super) async fn mark_batch_unknown(sync: &Sync, id: EditId, failure: Failure) -> Result<()> {
+    save_state_async(sync, id, UNKNOWN, None, Some(failure)).await
 }
 
 pub(super) async fn resolve(sync: &Sync, id: EditId) -> Result<Option<Receipt>> {
