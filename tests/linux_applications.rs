@@ -400,7 +400,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         let config = fixture.volume_config(&config_name, Frontend::Fuse, true);
         let mut remounted = fixture.mount(&config, &mountpoint);
         assert_tar_round_trip(
-            &remounted.mountpoint().join("tar-tree").as_path(),
+            remounted.mountpoint().join("tar-tree").as_path(),
             &expected_payload,
             true,
         );
