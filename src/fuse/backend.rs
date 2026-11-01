@@ -44,6 +44,7 @@ pub(super) enum BackendError {
     NotFound,
     NotDirectory,
     IsDirectory,
+    Stale,
     MutationIo,
     MutationUnsupported,
 }
@@ -68,6 +69,7 @@ impl BackendError {
             Self::NotFound => fuser::Errno::ENOENT,
             Self::NotDirectory => fuser::Errno::ENOTDIR,
             Self::IsDirectory => fuser::Errno::EISDIR,
+            Self::Stale => fuser::Errno::ESTALE,
             Self::MutationIo => fuser::Errno::EIO,
             Self::MutationUnsupported => fuser::Errno::EOPNOTSUPP,
         }
@@ -84,6 +86,7 @@ impl fmt::Display for BackendError {
             Self::NotFound => formatter.write_str("entry is absent"),
             Self::NotDirectory => formatter.write_str("entry is not a directory"),
             Self::IsDirectory => formatter.write_str("entry is a directory"),
+            Self::Stale => formatter.write_str("accepted object pin is stale"),
             Self::MutationIo => formatter.write_str("namespace mutation did not complete"),
             Self::MutationUnsupported => {
                 formatter.write_str("namespace mutation is unsupported by the backend")
@@ -276,7 +279,7 @@ pub(super) trait Backend: Send + Sync + 'static {
     fn release(
         &self,
         id: Self::Inode,
-        file: &Self::File,
+        file: std::sync::Arc<Self::File>,
         writable: bool,
     ) -> impl Future<Output = Result<()>> + Send;
     fn setattr(

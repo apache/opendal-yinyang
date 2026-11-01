@@ -411,11 +411,11 @@ impl<B: Backend> AdapterInner<B> {
     }
 
     async fn release(&self, open: Arc<OpenFile<B>>, reply: ReplyEmpty) {
-        if let Err(error) = self
-            .backend
-            .release(open.id, &open.file, open.writable)
-            .await
-        {
+        let file = Arc::clone(&open.file);
+        let id = open.id;
+        let writable = open.writable;
+        drop(open);
+        if let Err(error) = self.backend.release(id, file, writable).await {
             eprintln!("yy: fuse release: {}: {error}", self.backend.name());
         }
         reply.ok();

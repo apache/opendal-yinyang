@@ -27,7 +27,7 @@ use super::reject_unpublished_staging;
 use crate::mount::{Mount, MountFile, MountReadOnlyFile};
 use crate::volume::{Volume, VolumeConfig};
 use fuser::OpenFlags;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use yinyang_core::{FileVersion, Node, NodeId, ScanToken, Snapshot};
@@ -333,15 +333,13 @@ impl Backend for ManagedBackend {
         Ok(())
     }
 
-    async fn release(&self, id: NodeId, file: &ManagedFile, _writable: bool) -> Result<()> {
-        match file {
-            ManagedFile::Staged(file) => {
-                let _ = file;
-                self.mount.reclaim(id).await?;
-            }
-            ManagedFile::ReadOnly(_) => {
-                self.mount.reclaim_read_only(id)?;
-            }
+    async fn release(&self, id: NodeId, file: Arc<ManagedFile>, _writable: bool) -> Result<()> {
+        let staged = matches!(&*file, ManagedFile::Staged(_));
+        drop(file);
+        if staged {
+            self.mount.reclaim(id).await?;
+        } else {
+            self.mount.reclaim_read_only(id)?;
         }
         Ok(())
     }

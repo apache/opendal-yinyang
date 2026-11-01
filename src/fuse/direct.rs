@@ -298,7 +298,7 @@ impl DirectBackend {
                     eprintln!("yy: fuse flush: cannot retain Direct conflict state: {error}");
                 }
                 self.refresh_remote_only().await;
-                Err(BackendError::NamespaceConflict)
+                Err(BackendError::Stale)
             }
             DirectFlushOutcome::Unknown { .. } => {
                 if let Err(error) = self.refresh_pending().await {
@@ -516,7 +516,13 @@ impl Backend for DirectBackend {
         self.flush_staged(file).await
     }
 
-    async fn release(&self, _id: DirectId, _file: &DirectOpenFile, _writable: bool) -> Result<()> {
+    async fn release(
+        &self,
+        _id: DirectId,
+        file: Arc<DirectOpenFile>,
+        _writable: bool,
+    ) -> Result<()> {
+        drop(file);
         {
             let mut views = guard(&self.views);
             prune_unreferenced_views(&mut views);
@@ -621,7 +627,7 @@ impl Backend for DirectBackend {
                 DirectFlushOutcome::Conflict { .. } => {
                     let _ = self.refresh_pending().await;
                     self.refresh_remote_only().await;
-                    return Err(BackendError::NamespaceConflict);
+                    return Err(BackendError::Stale);
                 }
                 DirectFlushOutcome::Unknown { .. } => {
                     let _ = self.refresh_pending().await;

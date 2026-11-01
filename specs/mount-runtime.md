@@ -14,9 +14,12 @@ this staging directory.
 writes from other references immediately after local acceptance. Writes,
 truncate, append and fsync are serialized per node; append chooses its offset
 under the same lock. Different nodes do not share an I/O lock. Initial base
-capture is serialized per NodeId by a short-lived open gate, and the instance
-node map is not held during the remote observation or staging write.
-The node lookup and gate registration share one critical section, so a
+capture is serialized per NodeId and reference kind by one short-lived open
+gate, and the instance node map is not held during the remote observation or
+staging write. Writable and read-only observations share one node map; each
+entry owns either the shared staged handle or the pinned immutable
+`FileVersion`. The node lookup and gate registration share one critical section,
+so a
 completion cannot slip between them and start a second materialization.
 Success, failure and cancellation close the gate to wake every waiter for a
 retry; a retry rechecks the node map and either joins the materialized node or
@@ -34,10 +37,10 @@ without creating a staging record or reading the complete payload. Concurrent
 opens of one NodeId share that immutable `FileVersion`; a later remote revision
 does not rebase an existing reference. Calls after the last reference has been
 released reclaim the zero-reference observation and observe latest again.
-Initial pinning uses its own per-NodeId open gate, with the same success,
-failure and cancellation broadcast rules as staged base capture. The method is
-rejected on a writable Mount so read-only descriptors of a writable volume
-cannot bypass its shared staged state.
+Initial pinning uses the same open-gate mechanism keyed by NodeId and reference
+kind, with the same success, failure and cancellation broadcast rules as staged
+base capture. The method is rejected on a writable Mount so read-only
+descriptors of a writable volume cannot bypass its shared staged state.
 
 Dropping a reference performs no I/O and never publishes or deletes data.
 `reclaim` rejects referenced, pending, frozen or failed nodes. Clean unreferenced
