@@ -1049,7 +1049,7 @@ fn explicit_expiry_case(publication: Publication) {
     let backup_baseline_text =
         restored_plan["protection"]["staging"]["replica"]["baseline"]["revision"]
             .as_str()
-            .expect("restored replica baseline revision")
+            .unwrap_or_else(|| panic!("restored replica baseline revision: {restored_plan}"))
             .to_owned();
 
     let staging = fixture.path("expiry-staging");
