@@ -84,8 +84,10 @@ verified digest together with device, inode, size, mtime, ctime and the time
 that evidence was recorded. A later process reuses that digest while the stat
 identity still matches and both mtime and ctime are strictly older than the
 recorded time minus one second; racy or changed entries are hashed and their
-evidence replaced. This makes a settled no-op independent of the process
-lifetime without missing an in-place edit. The remote tree is walked once;
+evidence replaced. All evidence refreshed by one scan commits in one SQLite
+transaction; per-path `observe_path` refreshes one row. This makes a settled
+no-op independent of the process lifetime without missing an in-place edit. The
+remote tree is walked once;
 successful publication results update the in-memory observation used for final
 pending counts when no second authority read is required.
 
