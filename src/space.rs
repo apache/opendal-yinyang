@@ -35,10 +35,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use yinyang_core::reachability::PhysicalReferenceKind;
 use yinyang_core::{
-    Authority, Error, ErrorKind, ExpiryId, NodeId, NodeKind, Result, Revision, Snapshot,
+    Authority, Error, ErrorKind, ExpiryId, HistoryEntry, NodeId, NodeKind, Result, Revision,
+    RevisionState, Snapshot,
 };
 #[cfg(target_os = "linux")]
-use yinyang_core::{ExpiryConflictKind, ExpiryOutcome, ExpiryRequest, HistoryEntry, RevisionState};
+use yinyang_core::{ExpiryConflictKind, ExpiryOutcome, ExpiryRequest};
 
 pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v3";
 pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v3";
