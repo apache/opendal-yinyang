@@ -1174,15 +1174,6 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     let final_status = DirectorySync::inspect(authority.clone(), &state)
         .await
         .unwrap();
-    println!(
-        "W2_INTERLEAVED summary={:?} entries={:?}",
-        final_status.summary,
-        final_status
-            .entries
-            .iter()
-            .filter(|entry| entry.state != yinyang::replica::EntryState::InSync)
-            .collect::<Vec<_>>()
-    );
     assert!(final_status.conflicts.is_empty());
     assert!(final_status.summary.in_sync);
 }

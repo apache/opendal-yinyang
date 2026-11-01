@@ -105,9 +105,10 @@ change exists in an artifact.
 
 The lifecycle test closes and reopens the reader replica before the settle run.
 The durable `artifacts.settle_pending` marker must release the unchanged
-displaced inode in that new process. A second reopen after the racy-clean
-window must scan the settled tree without hashing file payloads; an in-place
-same-size edit then changes ctime and must be detected and published.
+displaced inode in that new process. After the racy-clean window, one run may
+refresh evidence for the most recently changed file; a following no-op must
+hash no file payloads. An in-place same-size edit then changes ctime and must
+be detected and published.
 
 ## Fault boundaries
 
