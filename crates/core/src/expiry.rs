@@ -137,6 +137,12 @@ impl ExpiryRequest {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(Error::unsupported(
+                "decode expiry request",
+                "request exceeds 16 MiB",
+            ));
+        }
         if bytes.len() < EXPIRY_REQUEST_MAGIC.len() {
             return Err(Error::corrupt(
                 "decode expiry request",
@@ -172,7 +178,7 @@ impl ExpiryRequest {
             protected.into_iter().map(Revision::from_bytes).collect(),
             evidence_digest,
         )?;
-        if request.to_bytes()? != bytes {
+        if request.to_bytes()?.as_slice() != bytes {
             return Err(Error::invalid(
                 "decode expiry request",
                 "request encoding is not canonical",
@@ -264,7 +270,7 @@ impl ExpiryMarker {
             ));
         }
         let (magic, id, request_digest, evidence_digest, before, after): (
-            [u8; 8],
+            [u8; 7],
             [u8; 16],
             [u8; 32],
             [u8; 32],
@@ -355,6 +361,18 @@ impl ExpiryReceipt {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < EXPIRY_RECEIPT_MAGIC.len() {
+            return Err(Error::corrupt(
+                "decode expiry receipt",
+                "receipt is truncated",
+            ));
+        }
+        if bytes[..EXPIRY_RECEIPT_MAGIC.len()] != EXPIRY_RECEIPT_MAGIC {
+            return Err(Error::unsupported(
+                "decode expiry receipt",
+                "unknown expiry receipt profile",
+            ));
+        }
         let (magic, id, request_digest, evidence_digest, before, after, expired): (
             [u8; 8],
             [u8; 16],
@@ -467,6 +485,18 @@ impl ExpiryRefusal {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < EXPIRY_REFUSAL_MAGIC.len() {
+            return Err(Error::corrupt(
+                "decode expiry refusal",
+                "refusal is truncated",
+            ));
+        }
+        if bytes[..EXPIRY_REFUSAL_MAGIC.len()] != EXPIRY_REFUSAL_MAGIC {
+            return Err(Error::unsupported(
+                "decode expiry refusal",
+                "unknown expiry refusal profile",
+            ));
+        }
         let (magic, current_latest, conflicts): ([u8; 8], [u8; 24], Vec<(u8, [u8; 24])>) =
             decode(bytes)?;
         if magic != EXPIRY_REFUSAL_MAGIC {
@@ -671,10 +701,23 @@ mod tests {
             [0; 32],
         )
         .unwrap();
-        let mut bytes = request.to_bytes().unwrap();
-        let offset = 8 + 16;
-        bytes[offset + 16..offset + 24].copy_from_slice(&[0xff; 8]);
-        assert!(ExpiryRequest::from_bytes(&bytes).is_err());
+        let bytes = request.to_bytes().unwrap();
+        let (magic, volume, id, expected, mut candidates, protected, evidence): (
+            [u8; 8],
+            [u8; 16],
+            [u8; 16],
+            [u8; 24],
+            Vec<[u8; 24]>,
+            Vec<[u8; 24]>,
+            [u8; 32],
+        ) = borsh::from_slice(&bytes).unwrap();
+        candidates.reverse();
+        let noncanonical =
+            borsh::to_vec(&(magic, volume, id, expected, candidates, protected, evidence)).unwrap();
+        assert_eq!(
+            ExpiryRequest::from_bytes(&noncanonical).unwrap_err().kind(),
+            ErrorKind::Invalid
+        );
     }
 
     #[test]

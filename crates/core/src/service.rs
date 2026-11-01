@@ -157,7 +157,7 @@ fn inspect_schema(conn: &Connection) -> Result<Option<SchemaProfile>> {
         SchemaProfile::Expiry => EXPIRY_TABLES.as_slice(),
     };
     for required in required {
-        if !tables.iter().any(|table| table.as_str() == required) {
+        if !tables.iter().any(|table| table.as_str() == *required) {
             return Err(corrupt_schema(format!(
                 "schema profile is missing table {required}"
             )));
@@ -340,7 +340,7 @@ impl MetadataService {
     pub async fn create(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
         let path = path.as_ref().to_owned();
         let db = connect(&path, true).await?;
-        let (filesystem, root, _) = db_call(&db, |conn| {
+        let (_, filesystem, root, _) = db_call(&db, |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
             tx.execute_batch("CREATE TABLE IF NOT EXISTS authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL, root BLOB NOT NULL, latest BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS revisions(token BLOB PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL);

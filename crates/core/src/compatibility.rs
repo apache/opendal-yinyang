@@ -38,7 +38,7 @@ pub(crate) const SQLITE_SCHEMA_PROFILE_EXPIRY: &str = "yinyang-sqlite-2";
 pub(crate) const RPC_PROTOCOL_VERSION: u8 = 1;
 
 pub(crate) const EXPIRY_REQUEST_MAGIC: [u8; 8] = *b"YYEXPQ01";
-pub(crate) const EXPIRY_RECORD_MAGIC: [u8; 8] = *b"YYEXP01";
+pub(crate) const EXPIRY_RECORD_MAGIC: [u8; 7] = *b"YYEXP01";
 pub(crate) const EXPIRY_RECEIPT_MAGIC: [u8; 8] = *b"YYEXPR01";
 pub(crate) const EXPIRY_REFUSAL_MAGIC: [u8; 8] = *b"YYEXPF01";
 pub(crate) const EXPIRY_HASH_CONTEXT: &str = "Apache OpenDAL YinYang expiry request profile 1";
