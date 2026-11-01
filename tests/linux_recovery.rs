@@ -1012,11 +1012,10 @@ fn explicit_expiry_case(publication: Publication) {
     let mut fixture = Fixture::new(publication);
     let zero = fixture.remote_create_file("protected.txt", b"version-zero", false);
     let backup_source = fixture.sync_client("expiry-backup-source");
-    fs::write(
-        backup_source.directory.join("protected.txt"),
-        b"version-zero",
-    )
-    .unwrap();
+    // Admit the remote-only initial state before adding a local-only path, so
+    // the package records a real common baseline rather than an initial-sync
+    // conflict.
+    fixture.sync_run_ok(&backup_source);
     fs::write(
         backup_source.directory.join("backup-only.txt"),
         b"backup-baseline",
@@ -1051,6 +1050,18 @@ fn explicit_expiry_case(publication: Publication) {
             .as_str()
             .unwrap_or_else(|| panic!("restored replica baseline revision: {restored_plan}"))
             .to_owned();
+
+    fixture.remote_create_file("expiry-handle-base.txt", b"handle-base", false);
+    let handle_base_text = revision_text(
+        runtime()
+            .block_on(fixture_authority(&fixture).observe_latest())
+            .unwrap()
+            .revision(),
+    );
+    assert_ne!(
+        backup_baseline_text, handle_base_text,
+        "backup baseline must be distinct from the live file-handle base"
+    );
 
     let staging = fixture.path("expiry-staging");
     let config = fixture.path("expiry.json");
@@ -1100,46 +1111,56 @@ fn explicit_expiry_case(publication: Publication) {
     ]);
 
     let zero_text = revision_text(zero.cursor.revision);
-    let before_backup_refusal = fixture.remote_file_version("protected.txt").2;
-    let backup_refusal = fixture.yy(&[
-        "--volume",
-        text(&restored.config),
-        "space",
-        "retention",
-        "expire",
-        "--revision",
-        &backup_baseline_text,
-        "--backup",
-        text(&backup),
-        "--json",
-    ]);
-    assert_eq!(
-        backup_refusal.status.code(),
-        Some(2),
-        "backup-only baseline refusal failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&backup_refusal.stdout),
-        String::from_utf8_lossy(&backup_refusal.stderr)
-    );
-    let backup_refusal: serde_json::Value =
-        serde_json::from_slice(&backup_refusal.stdout).expect("parse backup refusal JSON");
-    assert_eq!(backup_refusal["state"], "refused");
-    assert_eq!(backup_refusal["revisions"][0]["state"], "protected");
-    assert!(
-        backup_refusal["revisions"][0]["reasons"]
-            .as_array()
-            .is_some_and(|reasons| {
-                reasons.iter().any(|reason| {
-                    reason
-                        .as_str()
-                        .is_some_and(|reason| reason.ends_with("replica_baseline"))
-                })
-            })
-    );
-    assert_eq!(
-        fixture.remote_file_version("protected.txt").2,
-        before_backup_refusal,
-        "backup-only refusal advanced the head"
-    );
+    let refusal_cases = [
+        (&config, Some(backup.as_path()), "backup_replica_baseline"),
+        (&restored.config, None, "replica_baseline"),
+    ];
+    for (config, backup, reason) in refusal_cases {
+        let before = runtime()
+            .block_on(fixture_authority(&fixture).observe_latest())
+            .unwrap()
+            .revision();
+        assert_ne!(
+            backup_baseline_text,
+            revision_text(before),
+            "baseline refusal target must not be the current revision"
+        );
+        let mut args = vec![
+            "--volume",
+            text(config),
+            "space",
+            "retention",
+            "expire",
+            "--revision",
+            &backup_baseline_text,
+        ];
+        if let Some(backup) = backup {
+            args.extend(["--backup", text(backup)]);
+        }
+        args.push("--json");
+        let refusal = fixture.yy(&args);
+        assert_eq!(
+            refusal.status.code(),
+            Some(2),
+            "{reason} refusal failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&refusal.stdout),
+            String::from_utf8_lossy(&refusal.stderr)
+        );
+        let refusal: serde_json::Value =
+            serde_json::from_slice(&refusal.stdout).expect("parse baseline refusal JSON");
+        assert_eq!(refusal["state"], "refused", "{reason}");
+        assert_eq!(refusal["revisions"][0]["state"], "protected", "{reason}");
+        assert_eq!(
+            refusal["revisions"][0]["reasons"],
+            serde_json::json!([reason]),
+            "{reason}"
+        );
+        let after = runtime()
+            .block_on(fixture_authority(&fixture).observe_latest())
+            .unwrap()
+            .revision();
+        assert_eq!(after, before, "{reason} refusal advanced the head");
+    }
     assert!(
         runtime()
             .block_on(fixture_authority(&fixture).observe_revision(zero.cursor.revision),)
