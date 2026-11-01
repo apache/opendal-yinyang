@@ -37,7 +37,9 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
   preserves accepted fingerprints, commit identities, Unknown work, and
   historical artifact digests.
 - `run` performs one finite reconciliation pass: it retries any associated
-  durable work, pulls remote changes, and publishes eligible local edits.
+  durable work, observes the local and remote trees once, pulls remote changes,
+  and publishes independent local file creations with one authority batch per
+  directory depth (up to the authority's 4096-member limit).
 - `status` reports the current binding, remote and local observations, and the
   derived per-path state. It never changes authoritative database/WAL bytes,
   logical state, or acquires the publication lease, so it stays usable while
@@ -150,7 +152,7 @@ hex, and revisions are 24-byte hex.
                "revision": "...", "error": null },
   "local":   { "scan": "not_scanned|clean|changed|failed", "error": null },
   "summary": { "in_sync": false, "pending": 0, "unknown": 0, "conflicts": 0,
-               "failed": 0, "retained_artifacts": 0 },
+               "failed": 0, "retained_artifacts": 0, "retained_bytes": 0 },
   "entries": [ {
     "path": "...", "original_path": null, "desired_path": null,
     "state": "in_sync|local_pending|remote_pending|conflict|unknown|failed",
@@ -180,10 +182,34 @@ hex, and revisions are 24-byte hex.
 
 `entries` is sorted by `path`. `summary.conflicts` equals the number of
 top-level conflicts and `summary.retained_artifacts` equals the number of
-artifacts. An entry in conflict carries the same conflict identity in its nested
+artifacts. `summary.retained_bytes` is the sum of their recorded payload
+lengths. An entry in conflict carries the same conflict identity in its nested
 `conflict` object. `summary.in_sync` is true only after a valid binding and
 baseline, an observed remote, no unresolved work, and an actual local/remote
 match.
+
+## Retained artifact lifecycle
+
+An artifact is verified when it is created. Status and run use its recorded
+device, inode, size, modification time and change time as cheap evidence; they
+hash retained bytes only when that evidence changed, when the artifact is
+exported, or when recovery uses it. A matching stat refreshes evidence after a
+metadata-only change without reading the payload.
+
+`upload-retained` captures from ordinary local publication are deleted after the
+edit's committed baseline is durable. `replaced-file` and
+`rollback-displaced` artifacts are deleted after the reconciliation that
+superseded them is durable and no conflict references them. Explicit resolution
+inputs are deleted after their publication receipt, baseline update and
+conflict clearance are all durable. Unknown, Retryable, active conflict and
+incomplete-install artifacts remain.
+
+Every artifact not held by unknown work, retryable work or an active conflict is
+limited to 64 artifacts and 256 MiB per replica. The run releases oldest rows
+first until both limits hold. Directory quarantine artifacts are removed
+recursively only after the creation-time tree check succeeded; a changed or
+ambiguous directory is retained and reported as a conflict. Status counts and
+byte summaries include every remaining artifact.
 
 ## Example
 

@@ -335,6 +335,7 @@ pub struct StatusSummary {
     pub conflicts: usize,
     pub failed: u64,
     pub retained_artifacts: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

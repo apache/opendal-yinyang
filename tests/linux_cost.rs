@@ -651,7 +651,7 @@ fn run_sync_matrix(
     for index in 0..3 {
         fs::write(
             &edit,
-            payload(1024, 0x40 + u8::try_from(index).expect("three edits")),
+            payload(256 * 1024, 0x40 + u8::try_from(index).expect("three edits")),
         )
         .expect("write one Sync edit");
         let measured = run_yy_operation(
@@ -2603,6 +2603,7 @@ fn run_publish_restore_matrix(
 }
 
 fn populate_small_tree(root: &Path, scale: Scale) {
+    const FILE_SIZE: usize = 256 * 1024;
     fs::create_dir_all(root).expect("create Sync benchmark root");
     for directory in 0..scale.directories() {
         fs::create_dir_all(root.join(format!("dir-{directory:04}")))
@@ -2613,7 +2614,10 @@ fn populate_small_tree(root: &Path, scale: Scale) {
         let path = root.join(format!("dir-{directory:04}/file-{index:04}"));
         fs::write(
             path,
-            payload(1024, 0x10 + u8::try_from(index % 16).expect("file pattern")),
+            payload(
+                FILE_SIZE,
+                0x10 + u8::try_from(index % 16).expect("file pattern"),
+            ),
         )
         .expect("write Sync benchmark file");
     }
@@ -2621,12 +2625,13 @@ fn populate_small_tree(root: &Path, scale: Scale) {
 
 fn tree_dataset(root: &Path) -> Dataset {
     let (files, directories, bytes) = tree_counts(root);
+    let file_size_bytes = (files > 0).then_some(bytes / files as u64);
     Dataset {
         kind: "small_file_tree".to_owned(),
         files,
         directories,
         logical_bytes: bytes,
-        file_size_bytes: Some(1024),
+        file_size_bytes,
         range_bytes: None,
         writers: None,
         read_pattern: None,

@@ -24,7 +24,7 @@ The baseline exists only after admission and is stored in the replica database.
 Status never reports `in_sync` for a binding without an accepted common
 baseline.
 
-Profile `yinyang-directory-replica-1` binds the state to one filesystem. Its
+Profile `yinyang-directory-replica-2` binds the state to one filesystem. Its
 required tables and positionally inserted columns have exact signatures. The
 historically additive columns remain supported upgrade inputs:
 
@@ -76,6 +76,20 @@ detected by identity and applied as one per-root move with each descendant's
 accepted fingerprint relocated, so a namespace receipt never acknowledges a
 concurrent content edit.
 
+The run keeps that local observation and updates it for paths it installs,
+removes or patches; it does not rescan the whole tree inside a per-entry branch.
+Per-path rechecks use `Replica::observe_path`. A process-local stat cache reuses
+the last verified local fingerprint while device, inode, size, mtime and ctime
+remain stable, so a settled no-op does not rehash file payloads. The remote tree
+is walked once; successful publication results update the in-memory observation
+used for final pending counts when no second authority read is required.
+
+Independent local file creations at one directory depth are staged first and
+published with one `Sync::publish_batch`. A batch member owns its own receipt,
+Conflict, Retryable or Unknown state. Parent directories are published before a
+child depth, and each parent baseline is refreshed once per batch rather than
+once per child.
+
 A namespace operation stages against the path's own accepted revision.
 Only paths whose parent directory entry list this run already changed advance to
 the running revision, so a child removal permits its parent's later removal
@@ -126,7 +140,9 @@ Retained artifacts export their current bytes, including writes that landed
 after the exchange. A conflict side exports its retained artifact or live local
 bytes (`local`) or the recorded remote node version (`remote`). Directory
 artifacts expose their retained path; byte-stream export of a directory is
-unsupported.
+unsupported. Upload, superseded and resolved-conflict artifacts are released at
+their durable release events. Active conflict material is never pruned; all
+other artifacts are bounded to 64 entries and 256 MiB, oldest first.
 
 ## Backup and isolated restore
 

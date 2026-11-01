@@ -28,6 +28,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
@@ -560,6 +561,115 @@ async fn managed_sync_pull_hashing_is_linear() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "release-mode scale benchmark; run explicitly with --ignored --nocapture"]
+async fn managed_sync_scale_benchmark() {
+    const SIZE: usize = 512 * 1024;
+    for files in [32_usize, 64, 128, 256] {
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let push_root = temp.path().join("push");
+        for index in 0..files {
+            let directory = push_root.join(format!("d{}", index % 4));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut bytes = vec![(index % 251) as u8; SIZE];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            std::fs::write(directory.join(format!("f{index}")), bytes).unwrap();
+        }
+        let mut push = DirectorySync::init(
+            authority.clone(),
+            &temp.path().join("push-state"),
+            &push_root,
+        )
+        .await
+        .unwrap();
+        let before = Instant::now();
+        assert!(push.run().await.unwrap().in_sync);
+        let push_seconds = before.elapsed().as_secs_f64();
+
+        let pull_root = temp.path().join("pull");
+        std::fs::create_dir_all(&pull_root).unwrap();
+        let mut pull = DirectorySync::init(
+            authority.clone(),
+            &temp.path().join("pull-state"),
+            &pull_root,
+        )
+        .await
+        .unwrap();
+        pull.reset_hash_bytes_read();
+        let before = Instant::now();
+        assert!(pull.run().await.unwrap().in_sync);
+        let pull_seconds = before.elapsed().as_secs_f64();
+        let pull_hashes = pull.hash_bytes_read();
+        let before = Instant::now();
+        assert!(pull.run().await.unwrap().in_sync);
+        let noop_seconds = before.elapsed().as_secs_f64();
+        println!(
+            "W2_SCALE files={files} size={SIZE} push_s={push_seconds:.3} pull_s={pull_seconds:.3} \
+             noop_s={noop_seconds:.3} pull_hashed_bytes={pull_hashes} tree_bytes={}",
+            files * SIZE
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "release-mode edit benchmark; run explicitly with --ignored --nocapture"]
+async fn managed_sync_edit_benchmark() {
+    const SIZE: usize = 1024 * 1024;
+    const EDITS: usize = 40;
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let (writer_root, reader_root) = (temp.path().join("writer"), temp.path().join("reader"));
+    let (writer_state, reader_state) = (temp.path().join("ws"), temp.path().join("rs"));
+    std::fs::create_dir_all(&writer_root).unwrap();
+    std::fs::create_dir_all(&reader_root).unwrap();
+    let file = writer_root.join("file");
+    std::fs::write(&file, vec![1_u8; SIZE]).unwrap();
+    let mut writer = DirectorySync::init(authority.clone(), &writer_state, &writer_root)
+        .await
+        .unwrap();
+    assert!(writer.run().await.unwrap().in_sync);
+    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
+        .await
+        .unwrap();
+    assert!(reader.run().await.unwrap().in_sync);
+    for edit in 0..EDITS {
+        let mut bytes = vec![(edit % 250 + 2) as u8; SIZE];
+        bytes[..8].copy_from_slice(&(edit as u64).to_le_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        assert!(writer.run().await.unwrap().in_sync);
+        assert!(reader.run().await.unwrap().in_sync);
+    }
+    let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
+        .await
+        .unwrap();
+    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
+    reader.reset_hash_bytes_read();
+    let before = Instant::now();
+    assert!(reader.run().await.unwrap().in_sync);
+    println!(
+        "W2_EDITS edits={EDITS} writer_retained_bytes={} reader_retained_bytes={} \
+         noop_hashed_bytes={} noop_s={:.3} quarantine_bytes={}",
+        writer_status.summary.retained_bytes,
+        reader_status.summary.retained_bytes,
+        reader.hash_bytes_read(),
+        before.elapsed().as_secs_f64(),
+        tree_bytes(&reader_state.join("quarantine"))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_sync_publication_does_not_reimport_prepared_content() {
     const SIZE: usize = 4 * 1024 * 1024;
@@ -626,6 +736,10 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
     assert!(
         service_stage <= SIZE as u64 + 64 * 1024,
         "service preparation read {service_stage} bytes"
+    );
+    println!(
+        "W2_READBACK object_stage={object_stage} object_publish={object_publish} \
+         service_stage={service_stage} service_publish={service_publish}"
     );
     server.abort();
 }

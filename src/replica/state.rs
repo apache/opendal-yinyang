@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use yinyang_core::{Node, NodeId, NodeKind, Revision};
 
-pub(super) const PROFILE: &str = "yinyang-directory-replica-1";
+pub(super) const PROFILE: &str = "yinyang-directory-replica-2";
 pub(super) type IdentityMap = BTreeMap<(u64, u64), (u64, u64)>;
 
 const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[

@@ -57,6 +57,8 @@ cross-field invariants:
 
 - `summary.conflicts` equals `conflicts.length`.
 - `summary.retained_artifacts` equals `artifacts.length`.
+- `summary.retained_bytes` equals the sum of the retained artifact payload
+  lengths reported by the replica.
 - `summary.in_sync` requires an available remote and zero pending, unknown,
   conflict and failed counts.
 - Every top-level conflict references an entry with the same conflict ID.

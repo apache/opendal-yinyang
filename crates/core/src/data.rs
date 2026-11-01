@@ -333,7 +333,9 @@ impl DataStore {
     ///
     /// This conservative binding verifies the acknowledged pack once during
     /// preparation: an OpenDAL writer-close acknowledgement alone does not
-    /// establish end-to-end integrity. Commit never repeats this read.
+    /// establish end-to-end integrity. Publication of the returned
+    /// `PreparedContent` does not repeat this read; restoring a serialized
+    /// descriptor after restart verifies it once again.
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
         let mut pack = Pack::new(self).await?;
         let result = self.prepare_into(source, &mut pack).await;
