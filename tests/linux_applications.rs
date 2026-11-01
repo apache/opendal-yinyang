@@ -128,6 +128,27 @@ fn rsync(source: &Path, destination: &Path, delete: bool) -> AppOutput {
     run_application(command)
 }
 
+fn seed_rsync_destination(target: &Path) {
+    // rsync creates new files and default safe-save temporaries with mode 0600.
+    // This trial therefore exercises explicit in-place updates of entries whose
+    // modes the Managed mount can represent instead of claiming general rsync.
+    for directory in ["assets", "bin", "notes", "empty"] {
+        fs::create_dir_all(target.join(directory))
+            .unwrap_or_else(|error| panic!("create rsync target {directory}: {error}"));
+    }
+    for path in [
+        "assets/payload.bin",
+        "notes/readme.txt",
+        "notes/remove.txt",
+        "bin/run.sh",
+    ] {
+        fs::write(target.join(path), b"")
+            .unwrap_or_else(|error| panic!("seed rsync destination {path}: {error}"));
+    }
+    fs::set_permissions(target.join("bin/run.sh"), fs::Permissions::from_mode(0o755))
+        .expect("set seeded script mode");
+}
+
 fn assert_rsync_tree(target: &Path, expected_payload: &[u8]) {
     assert_file(&target.join("assets/payload.bin"), expected_payload, 0o644);
     assert_file(
@@ -166,6 +187,7 @@ fn application_rsync_mirror_survives_remount_both_publications() {
 
         let mut mounted = fixture.mount(&config, &mountpoint);
         let mount_root = mounted.mountpoint().to_path_buf();
+        seed_rsync_destination(&target);
         rsync(&source, &target, false).success_or("initial rsync");
         assert_rsync_tree(&target, &initial_payload);
         assert_eq!(
@@ -183,6 +205,7 @@ fn application_rsync_mirror_survives_remount_both_publications() {
             .expect("update source payload");
         fs::remove_file(source.join("notes/remove.txt")).expect("remove source note");
         fs::write(source.join("notes/new.txt"), b"added by rsync\n").expect("add source note");
+        fs::write(target.join("notes/new.txt"), b"").expect("seed added rsync destination");
         rsync(&source, &target, true).success_or("updating rsync with deletion");
         assert_file(&target.join("assets/payload.bin"), &updated_payload, 0o644);
         assert!(
@@ -224,7 +247,10 @@ fn application_rsync_mirror_survives_remount_both_publications() {
 
 fn tar_create(archive: &Path, source: &Path) -> AppOutput {
     let mut command = Command::new("tar");
+    // Managed mtimes are revision-derived. tar's warning does not describe
+    // changed bytes, and every archived byte is verified by extraction.
     command
+        .arg("--warning=no-file-changed")
         .arg("-cf")
         .arg(archive)
         .arg("-C")
