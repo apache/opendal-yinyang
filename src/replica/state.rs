@@ -421,7 +421,7 @@ impl Store {
         } else {
             validate_profile(&connection)?
         };
-        store::configure(&connection).map_err(store_error)?;
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         Ok(Self { connection, shape })
     }
 
@@ -433,10 +433,6 @@ impl Store {
             validate_profile(&connection)?
         };
         Ok(Self { connection, shape })
-    }
-
-    pub fn barrier(&self) -> Result<()> {
-        store::barrier(&self.connection).map_err(store_error)
     }
 
     pub fn binding(&self) -> Result<Option<Binding>> {
@@ -500,7 +496,6 @@ impl Store {
             Err(error) if error.kind() == store::ErrorKind::Invalid => false,
             Err(error) => return Err(store_error(error)),
         };
-        self.barrier()?;
         Ok(matches)
     }
 
@@ -1276,7 +1271,7 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write work association: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn update_work(
@@ -1297,7 +1292,7 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("update work association: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     /// Persist the original commit identity of an edit before a replay can
@@ -1309,7 +1304,7 @@ impl Store {
                 params![id.as_slice(), commit_id.as_slice()],
             )
             .map_err(|e| Error::corrupt(format!("set work commit id: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn work(&self) -> Result<Vec<WorkRecord>> {
@@ -1410,7 +1405,7 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write retained artifact: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn update_artifact(&mut self, id: &str, phase: &str, error: Option<&str>) -> Result<()> {
@@ -1420,7 +1415,7 @@ impl Store {
                 params![id, phase, error],
             )
             .map_err(|e| Error::corrupt(format!("update retained artifact: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn insert_install(&mut self, install: &InstallRecord) -> Result<()> {
@@ -1461,7 +1456,7 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write install journal: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn update_install(&mut self, install: &InstallRecord) -> Result<()> {
@@ -1486,7 +1481,7 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("update install journal: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     /// Re-baseline the expected inode digest of a retained install so a late
@@ -1506,7 +1501,7 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("retarget install journal: {e}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn incomplete_installs(&self) -> Result<Vec<InstallRecord>> {

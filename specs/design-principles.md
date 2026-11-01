@@ -105,9 +105,10 @@ choice.
 - A journal record that crash recovery needs to interpret a local filesystem
   change, such as an install, exchange or rename, is durable before that
   change.
-- Local stores run SQLite in WAL mode with `synchronous=NORMAL` and make the
-  state durable at the barriers above. A store does not pay a per-write fsync
-  for a guarantee the contract does not make.
+- Stores whose acknowledgements precede a barrier run WAL with
+  `synchronous=NORMAL` and an explicit barrier. Journals whose every record
+  precedes an effect commit with `synchronous=FULL`. Neither kind pays a
+  per-write fsync for a guarantee the contract does not make.
 
 ## Untrusted bytes are verified once
 

@@ -669,8 +669,7 @@ impl FileHandle {
             ));
         }
         record.base = revision.to_bytes();
-        stage.save(record).await?;
-        stage.barrier().await
+        stage.save_durable(record).await
     }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
@@ -848,10 +847,9 @@ impl FileHandle {
             let request = plan.finish()?;
             r.plan = Some(request.to_bytes()?);
             // Persist before dispatch: cancellation can never lose request identity.
-            stage.save(r.clone()).await?;
+            stage.save_durable(r.clone()).await?;
             request
         };
-        stage.barrier().await?;
         match self.runtime.authority().commit(&request).await {
             Err(error) => {
                 // The plan is already frozen and dispatch may still publish.
@@ -883,7 +881,6 @@ impl FileHandle {
                     r.conflict = false;
                     let descriptor = base.descriptor().to_bytes();
                     stage.complete_base(r, descriptor.clone()).await?;
-                    stage.barrier().await?;
                     *self.base.lock().await = HandleBase {
                         expected: Some(descriptor),
                         file: Some(base),
@@ -985,7 +982,9 @@ mod tests {
         inner: Arc<dyn Authority>,
         staging: PathBuf,
         barrier: Mutex<Arc<AtomicUsize>>,
+        full_sync: Mutex<Arc<AtomicUsize>>,
         observed_barrier: AtomicUsize,
+        observed_full_sync: AtomicUsize,
         observed_plan: AtomicBool,
     }
 
@@ -1028,6 +1027,9 @@ mod tests {
                 let barrier = self.barrier.lock().unwrap().clone();
                 self.observed_barrier
                     .store(barrier.load(Ordering::SeqCst), Ordering::SeqCst);
+                let full_sync = self.full_sync.lock().unwrap().clone();
+                self.observed_full_sync
+                    .store(full_sync.load(Ordering::SeqCst), Ordering::SeqCst);
                 let connection = crate::local::store::open_read_only(
                     &self.staging.join("staging.db"),
                 )
@@ -1066,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frozen_plan_is_checkpointed_before_commit_dispatch() {
+    async fn frozen_plan_is_durable_before_commit_dispatch() {
         let backend = crate::support::TestBackend::default();
         let inner = Arc::new(
             yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
@@ -1084,15 +1086,19 @@ mod tests {
             inner: inner.clone(),
             staging: staging.clone(),
             barrier: Mutex::new(Arc::new(AtomicUsize::new(0))),
+            full_sync: Mutex::new(Arc::new(AtomicUsize::new(0))),
             observed_barrier: AtomicUsize::new(0),
+            observed_full_sync: AtomicUsize::new(0),
             observed_plan: AtomicBool::new(false),
         });
         let runtime = Runtime::open(probe.clone(), &staging).await.unwrap();
         *probe.barrier.lock().unwrap() = runtime.inner.stage.barrier_counter();
+        *probe.full_sync.lock().unwrap() = runtime.inner.stage.full_sync_counter();
         let mut handle = runtime.open_file("file", true).await.unwrap();
         handle.write(0, b"frozen").await.unwrap();
         assert!(handle.fsync().await.is_err());
-        assert_eq!(probe.observed_barrier.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.observed_barrier.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.observed_full_sync.load(Ordering::SeqCst), 1);
         assert!(probe.observed_plan.load(Ordering::SeqCst));
         assert!(handle.status().await.unwrap().frozen);
     }

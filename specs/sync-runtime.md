@@ -12,9 +12,9 @@ callbacks, local edit tracking and materialization.
 ## Content edits
 
 `stage` streams replacement bytes into FileHandle staging in 64 KiB chunks. It
-materializes the baseline before replacing it, checkpoints the staged bytes and
-local journal mapping, and returns only after that `stage` acknowledgement is
-durable. The returned EditId is BLAKE3 with derive-key context
+materializes the baseline before replacing it, makes the staged bytes durable,
+then commits the local journal mapping with `synchronous=FULL`. It returns only
+after both records are durable. The returned EditId is BLAKE3 with derive-key context
 `yinyang-sync-content-edit-1` over filesystem ID, node ID, 24-byte baseline
 revision and all replacement bytes. Repeating this exact intent returns the same
 local edit, including after restart. An empty replacement is still conditional
@@ -99,9 +99,10 @@ The required interleavings are:
 ## Durable state and resolution
 
 The dedicated directory contains `sync.db` and `content/` (the runtime staging
-directory and exclusive process lock). Both databases use SQLite WAL with
-`synchronous=NORMAL`; explicit barriers checkpoint the journal before external
-dispatch and after controlled state transitions. Profile `yinyang-sync-3`
+directory and exclusive process lock). Both databases use SQLite WAL. Staging
+uses `synchronous=NORMAL` with explicit barriers; the journal uses
+`synchronous=FULL`, so every committed intent is durable before dispatch.
+Profile `yinyang-sync-3`
 binds the journal to one filesystem. Its exact schema is `binding`, `edits`,
 and `namespaces`. Schema admission compares exact table and column-name sets,
 not column order. Every insert names its target columns.
@@ -121,7 +122,8 @@ the current profile without DDL or a writer lease. Keep both databases and their
 WALs together.
 
 The content edit table maps 32-byte EditIds to 16-byte staged handle IDs. A
-mapping is committed and checkpointed only after all local bytes are accepted;
+mapping is committed with `synchronous=FULL` only after all local bytes are made
+durable;
 publication is forbidden before that mapping. Interrupted staging can leave
 unreferenced, never-dispatched content, collected on restart or before the next
 stage. Missing referenced content is an error, not permission to replan.
@@ -153,9 +155,9 @@ staging database, relying on the existing invariant that a mapping is committed
 only after its staging record is durable; this ordering avoids a false
 missing-handle result during concurrent staging.
 
-The original namespace intent is checkpointed when prepared. Before dispatch,
-Sync changes `Prepared`/`Retryable` to `Unknown` in a SQLite transaction and
-checkpoints it. A crash or lost response therefore cannot turn a possibly
+The original namespace intent is committed durably when prepared. Before
+dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a
+`synchronous=FULL` transaction. A crash or lost response therefore cannot turn a possibly
 published request into a safe abort. `publish` retries `Unknown` and `Retryable`
 with the same transaction and CommitId. It does not dispatch `Conflict` or
 `Failed` again, and never replans either one. A caller that wants a different

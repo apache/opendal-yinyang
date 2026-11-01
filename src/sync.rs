@@ -221,7 +221,7 @@ impl Sync {
             }
             validate_profile(&tx, filesystem)?;
             tx.commit().map_err(Error::local)?;
-            store::configure(&c).map_err(store_error)?;
+            store::configure(&c, store::Durability::Journal).map_err(store_error)?;
             Ok(c)
         })
         .await
@@ -247,10 +247,6 @@ impl Sync {
         tokio::task::spawn_blocking(move || f(&mut c))
             .await
             .map_err(Error::local)?
-    }
-    async fn barrier(&self) -> Result<()> {
-        self.call(|connection| store::barrier(connection).map_err(store_error))
-            .await
     }
     async fn handle_id(&self, edit: EditId) -> Result<uuid::Uuid> {
         self.call(move |c| {
@@ -342,7 +338,6 @@ impl Sync {
                 .map_err(Error::local)
             })
             .await?;
-        self.barrier().await?;
         if inserted == 0 {
             handle.abort().await?;
         }

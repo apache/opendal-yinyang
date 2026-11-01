@@ -8,9 +8,9 @@ provide high availability, multi-host consensus, or a remotely exposed transport
 ## Authority and storage
 
 `MetadataService::create/open` binds one local SQLite database to one content
-prefix. The database uses WAL, `synchronous=NORMAL`, and `BEGIN IMMEDIATE` for
-publication. A successful preparation or commit runs a FULL WAL checkpoint
-before returning. Its filesystem must honor SQLite locking and
+prefix. The database uses WAL, `synchronous=FULL`, and `BEGIN IMMEDIATE` for
+publication. A successful preparation or commit is durable when its transaction
+commits. Its filesystem must honor SQLite locking and
 synchronization; network-mounted database files are unsupported. Keep the
 database and its WAL together; copying only the live main database is not a
 backup procedure.
@@ -62,7 +62,7 @@ migrate, recover, take the writer transaction, or infer retained revisions from
 content packs. `ServiceClient` exposes the same bounded page contract.
 
 In-process preparation carries trusted `DataStore` evidence and records
-readiness durably with an explicit checkpoint. A client uploads through OpenDAL,
+readiness with a durable `synchronous=FULL` commit. A client uploads through OpenDAL,
 then registers its content descriptor. The service fully verifies an untrusted
 descriptor before recording readiness. Publication and restart use that
 persisted evidence; they do not download the file again. Credentials and prefix
@@ -157,10 +157,10 @@ error reporting, not the persisted metadata or transaction encoding.
 ## Failure and recovery
 
 Database contention before commit returns `Retryable`; replay the original
-request, not a newly observed/replanned one. A successful SQLite `COMMIT` is
-followed by a WAL checkpoint before local success is reported. A failed commit
-or checkpoint acknowledgement and lost/timeout transport responses return
-`Unknown(commit_id)`. A timeout does not cancel or prove rollback of an
+request, not a newly observed/replanned one. A successful `synchronous=FULL`
+SQLite `COMMIT` is durable before local success is reported. A failed commit
+acknowledgement and lost/timeout transport responses return `Unknown(commit_id)`.
+A timeout does not cancel or prove rollback of an
 in-flight durable transaction. Resolve via a retained receipt or retry the
 exact frozen request. Absent receipt is not proof that a delayed request cannot
 still commit.
@@ -168,7 +168,7 @@ still commit.
 Duplicate identity/digest returns the original receipt. Identity reused with a
 different digest is invalid. Reopening the same database retains receipts,
 readiness, changes, and historical revisions. No automatic failover or
-checkpoint writer exists. Listener shutdown stops accepting new work; already
+background durability writer exists. Listener shutdown stops accepting new work; already
 accepted requests may finish.
 
 For a supported quiesced backup, freeze service clients and create a consistent

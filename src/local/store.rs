@@ -30,6 +30,12 @@ const CHECKPOINT_BUDGET: Duration = Duration::from_secs(3);
 
 pub(crate) type TableColumns<'a> = (&'a str, &'a [&'a str]);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Durability {
+    Journal,
+    Barrier,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Profile {
     pub name: &'static str,
@@ -136,14 +142,21 @@ pub(crate) fn open_read_write(path: &Path, create: bool) -> Result<Connection> {
     Ok(connection)
 }
 
-pub(crate) fn configure(connection: &Connection) -> Result<()> {
+pub(crate) fn configure(connection: &Connection, durability: Durability) -> Result<()> {
     connection
-        .execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;",
-        )
-        .map_err(|error| sqlite("configure local database durability", error))
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .map_err(|error| sqlite("configure local database journal", error))?;
+    set_durability(connection, durability)
+}
+
+pub(crate) fn set_durability(connection: &Connection, durability: Durability) -> Result<()> {
+    let pragma = match durability {
+        Durability::Journal => "PRAGMA synchronous=FULL",
+        Durability::Barrier => "PRAGMA synchronous=NORMAL",
+    };
+    connection
+        .execute_batch(pragma)
+        .map_err(|error| sqlite("configure local database synchronous mode", error))
 }
 
 pub(crate) fn is_empty(connection: &Connection) -> Result<bool> {
@@ -518,5 +531,26 @@ mod tests {
             .unwrap();
         let malformed = validate(&connection, &PROFILE, None).unwrap_err();
         assert_eq!(malformed.kind(), ErrorKind::Corrupt);
+    }
+
+    #[test]
+    fn durability_modes_configure_wal_commit_sync_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let connection = open_read_write(&temp.path().join("state.db"), true).unwrap();
+        let synchronous = || -> i64 {
+            connection
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        configure(&connection, Durability::Journal).unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous(), 2);
+
+        configure(&connection, Durability::Barrier).unwrap();
+        assert_eq!(synchronous(), 1);
     }
 }

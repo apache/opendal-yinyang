@@ -61,7 +61,7 @@ generations. Receipt lookup alone is not publication of a newly scanned source.
 
 The caller supplies a dedicated local state directory. It contains
 `directory.db`, an experimental SQLite WAL database using
-`synchronous=NORMAL`, bound to exactly one filesystem and root. Keep the
+`synchronous=FULL`, bound to exactly one filesystem and root. Keep the
 database and WAL together. Profile `yinyang-directory-2` stores the exact
 serialized `Transaction`, its
 CommitId, baseline revision, request digest, diagnostic source path, and a
@@ -81,9 +81,9 @@ tables, changing authoritative database/WAL bytes, or changing journal mode.
 SQLite may create an empty `-wal` and may create or update derived `-shm`;
 existing WAL/journal bytes remain protected.
 
-The frozen publication row is checkpointed before the function returns.
-`Prepared` is therefore durable before dispatch, and the `Unknown` claim is
-checkpointed before every commit request.
+The frozen publication row is committed durably before the function returns.
+`Prepared` is therefore durable before dispatch, and the `Unknown` claim is also
+durable before every commit request.
 
 The canonical journal directory must be outside the canonical source tree. A
 preparation that would publish the journal's own `directory.db` or WAL files is

@@ -479,8 +479,7 @@ async fn save_state_async(
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(Error::local)?;
         save_state(&tx, id, state, receipt.as_ref(), failure.as_ref())?;
-        tx.commit().map_err(Error::local)?;
-        store::barrier(connection).map_err(super::store_error)
+        tx.commit().map_err(Error::local)
     })
     .await
 }
@@ -593,8 +592,7 @@ async fn insert(
             ],
         )
         .map_err(Error::local)?;
-        tx.commit().map_err(Error::local)?;
-        store::barrier(connection).map_err(super::store_error)
+        tx.commit().map_err(Error::local)
     })
     .await
 }

@@ -117,6 +117,8 @@ pub(super) struct Stage {
     _lock: Arc<File>,
     #[cfg(test)]
     barrier_calls: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    full_sync_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 fn store_error(error: store::Error) -> Error {
     let kind = match error.kind() {
@@ -754,12 +756,14 @@ impl Stage {
                 }
             }
             tx.commit().map_err(local)?;
-            store::configure(&c).map_err(store_error)?;
+            store::configure(&c, store::Durability::Barrier).map_err(store_error)?;
             Ok(Self {
                 db: Arc::new(Mutex::new(c)),
                 _lock: Arc::new(lock),
                 #[cfg(test)]
                 barrier_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                #[cfg(test)]
+                full_sync_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
         })
         .await
@@ -792,11 +796,46 @@ impl Stage {
     pub fn barrier_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.barrier_calls.clone()
     }
+    #[cfg(test)]
+    pub fn full_sync_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.full_sync_calls.clone()
+    }
+    async fn call_durable<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        #[cfg(test)]
+        let full_sync_calls = self.full_sync_calls.clone();
+        let result = self
+            .call(move |connection| {
+                store::set_durability(connection, store::Durability::Journal)
+                    .map_err(store_error)?;
+                let result = f(connection);
+                let restored = store::set_durability(connection, store::Durability::Barrier)
+                    .map_err(store_error);
+                match (result, restored) {
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                    (Ok(value), Ok(())) => Ok(value),
+                }
+            })
+            .await;
+        #[cfg(test)]
+        if result.is_ok() {
+            full_sync_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
     pub async fn load(&self, id: [u8; 16]) -> Result<Record> {
         self.call(move |c| record(c, id)).await
     }
     pub async fn save(&self, r: Record) -> Result<()> {
         self.call(move |c| save(c, &r)).await
+    }
+    pub async fn save_durable(&self, r: Record) -> Result<()> {
+        // A FULL commit syncs the whole WAL, so it also makes every earlier
+        // NORMAL write durable. One WAL fsync is cheaper than a FULL checkpoint.
+        self.call_durable(move |c| save(c, &r)).await
     }
     pub async fn base(&self, id: [u8; 16]) -> Result<Option<Base>> {
         self.call(move |c| base(c, id)).await
@@ -859,7 +898,7 @@ impl Stage {
         .await
     }
     pub async fn complete_base(&self, r: Record, descriptor: Vec<u8>) -> Result<()> {
-        self.call(move |c| {
+        self.call_durable(move |c| {
             let tx = c.transaction().map_err(local)?;
             put_base(&tx, r.id, &descriptor, r.length)?;
             tx.execute(

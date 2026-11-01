@@ -304,7 +304,7 @@ impl Store {
                 .commit()
                 .map_err(|error| sqlite("commit Direct runtime initialization", error))?;
         }
-        store::configure(&connection).map_err(store_error)?;
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         let store = Self {
             connection,
             root: root.to_owned(),
@@ -312,10 +312,6 @@ impl Store {
         };
         store.recover_dispatching()?;
         Ok(store)
-    }
-
-    pub fn barrier(&self) -> Result<()> {
-        store::barrier(&self.connection).map_err(store_error)
     }
 
     pub fn object(&self, key: &str) -> Result<Option<ObjectRecord>> {

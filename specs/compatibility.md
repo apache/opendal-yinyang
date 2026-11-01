@@ -109,9 +109,10 @@ state each have one current identifier:
 
 Every local database contains exactly one profile row with `singleton=1`.
 The shared local store validates the current identifier and the exact table and
-column sets before journal-mode changes, recovery, or external effects. Local
-stores use SQLite WAL with `synchronous=NORMAL`; durability barriers checkpoint
-the WAL at the runtime contract points instead of syncing every write.
+column sets before journal-mode changes, recovery, or external effects. Stores
+whose acknowledgements precede a barrier use SQLite WAL with
+`synchronous=NORMAL`; journals whose records precede effects use
+`synchronous=FULL`.
 
 The authoritative local details are in
 [file operation](file-runtime.md), [Sync](sync-runtime.md), [directory

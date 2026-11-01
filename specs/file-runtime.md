@@ -115,7 +115,7 @@ does not by itself provide a mounted editor workflow.
 | write(offset, bytes) | Atomically stage only the exact replaced bytes; gaps read as zeros. Empty writes do not extend the file. |
 | append(bytes) | Append to this handle's private length, returning its offset. Concurrent handles do not merge appends. |
 | truncate(length) | Shrink or zero-extend. Removed bytes never reappear after extension; a durable base-prefix limit fences later reads. |
-| sync_local | Checkpoint local staged bytes and metadata without publishing; return the current local and remote positions. |
+| sync_local | Make local staged bytes and metadata durable without publishing; return the current local and remote positions. |
 | flush / fsync / commit | Prepare bytes and conditionally publish their metadata; success means remote durability, not just local acceptance. |
 | close | Publish dirty data, then release staging. Failure keeps the handle open/recoverable. |
 | release | Consume the caller's handle reference and return its recovery UUID. Do not publish, delete staging, acknowledge errors, or resolve a frozen request. |
@@ -155,12 +155,13 @@ without that row is corrupt.
 
 Publication first checkpoints local writes, then plans a conditional content
 update against the original base revision and saves the exact frozen
-transaction. It checkpoints again before dispatch. While frozen, new writes are
-rejected. Retry restores that same identity, digest, descriptor, and predicates,
-including after process restart; it does not reprepare or rebase. Success
-updates the sparse base to the receipt's revision and checkpoints that
-completion before returning. It never silently observes a newer conflicting
-file.
+transaction with a `synchronous=FULL` commit. The full WAL sync also makes every
+earlier `NORMAL` write durable, so no second checkpoint is needed before
+dispatch. While frozen, new writes are rejected. Retry restores that same
+identity, digest, descriptor, and predicates, including after process restart;
+it does not reprepare or rebase. Success updates the sparse base to the
+receipt's revision with another `synchronous=FULL` commit before returning. It
+never silently observes a newer conflicting file.
 
 A stale file generation, changed executable state, or unlink produces Conflict.
 Staged bytes remain readable for explicit recovery/export or abort. Retryable
@@ -195,13 +196,15 @@ clear an active handle's error, pending data or frozen request.
 The current local profile is `yinyang-stage-4`. It stores the filesystem
 binding, handle records, the typed error ledger, sparse base descriptors, and
 exact dirty segments in `staging.db`. The shared local store opens SQLite in WAL
-mode with `synchronous=NORMAL`; `sync_local`, `flush`, `fsync`, `commit`,
-`close`, and frozen-request publication use an explicit WAL checkpoint barrier.
+mode with `synchronous=NORMAL`; `sync_local`, `flush`, `fsync`, `commit` and
+`close` use an explicit WAL checkpoint barrier. Frozen-request and completion
+records instead use a `synchronous=FULL` transaction, whose WAL sync also covers
+every earlier `NORMAL` commit.
 The process lock is `runtime.lock`. Keep WAL with the database; a copied live
 main database alone is not a supported backup. Incomplete opens were never
-exposed and are discarded on reopen. Completed handles, accepted writes,
-frozen requests, receipts and typed failures survive a successful barrier and
-process restart.
+exposed and are discarded on reopen. Completed handles, accepted writes, frozen
+requests, receipts and typed failures survive their contract durability point
+and process restart.
 
 The schema signature is the exact table set plus the exact column-name set for
 each table. SQLite internal tables are excluded; column order, primary-key

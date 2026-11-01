@@ -568,16 +568,15 @@ impl Store {
         transaction.commit().map_err(|error| {
             Error::corrupt(format!("commit Direct Sync initialization: {error}"))
         })?;
-        store::configure(&connection).map_err(store_error)?;
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         validate_schema(&connection)?;
-        store::barrier(&connection).map_err(store_error)?;
         Ok(Self { connection })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
         let connection = store::open_read_write(path, false).map_err(store_error)?;
         validate_schema(&connection)?;
-        store::configure(&connection).map_err(store_error)?;
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         Ok(Self { connection })
     }
 
@@ -620,10 +619,6 @@ impl Store {
             },
             namespace: row.5,
         })
-    }
-
-    pub fn barrier(&self) -> Result<()> {
-        store::barrier(&self.connection).map_err(store_error)
     }
 
     pub fn baseline(&self) -> Result<BTreeMap<String, BaselineEntry>> {
@@ -756,7 +751,7 @@ impl Store {
                 ],
             )
             .map_err(|error| Error::corrupt(format!("insert Direct Sync work: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn update_work_state(
@@ -771,7 +766,7 @@ impl Store {
                 params![id.as_slice(), state.as_str(), error],
             )
             .map_err(|error| Error::corrupt(format!("update Direct Sync work: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn complete_work(&mut self, id: [u8; 16], baseline: Option<&BaselineEntry>) -> Result<()> {
@@ -807,7 +802,7 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| Error::corrupt(format!("commit Direct Sync completion: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn remove_baseline(&mut self, path: &str) -> Result<()> {
@@ -898,7 +893,7 @@ impl Store {
                 ],
             )
             .map_err(|error| Error::corrupt(format!("insert Direct Sync install: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn update_install(&mut self, record: &InstallRecord) -> Result<()> {
@@ -927,7 +922,7 @@ impl Store {
                 ],
             )
             .map_err(|error| Error::corrupt(format!("update Direct Sync install: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn complete_install(
@@ -965,7 +960,7 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| Error::corrupt(format!("commit install completion: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn remove_install(&mut self, id: &str) -> Result<()> {
@@ -1034,7 +1029,7 @@ impl Store {
                 ],
             )
             .map_err(|error| Error::corrupt(format!("insert Direct Sync artifact: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn update_artifact(
@@ -1049,7 +1044,7 @@ impl Store {
                 params![id, phase.as_str(), error],
             )
             .map_err(|error| Error::corrupt(format!("update Direct Sync artifact: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn conflicts(&self) -> Result<Vec<ConflictRecord>> {
@@ -1112,7 +1107,7 @@ impl Store {
                 ],
             )
             .map_err(|error| Error::corrupt(format!("record Direct Sync conflict: {error}")))?;
-        self.barrier()
+        Ok(())
     }
 
     pub fn remove_conflict(&mut self, id: &str) -> Result<()> {

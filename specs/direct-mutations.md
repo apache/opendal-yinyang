@@ -110,7 +110,7 @@ objects/<16-byte-object-id>.data      shared local object generation
 inputs/<16-byte-mutation-id>.data     immutable accepted dispatch input
 ```
 
-`runtime.db` uses SQLite WAL and `synchronous=NORMAL`. Its exact tables are:
+`runtime.db` uses SQLite WAL and `synchronous=FULL`. Its exact tables are:
 
 - `authority(singleton, profile, binding, binding_diagnostic)`;
 - `objects(id, key, record)`;
@@ -158,11 +158,10 @@ zero-length database may be initialized. A partial first initialization is
 therefore not silently adopted.
 
 Mutation journal rows that make an external write or delete recoverable are
-checkpointed before that storage request. This includes `Dispatching`,
-`SourceDispatching`, object `Pending`, and the paired frozen mutation input
-records. Completion rows may remain at the normal-commit durability level until
-the next explicit barrier or process exit because a restart safely converts an
-unacknowledged dispatch state to `Unknown`.
+durable `synchronous=FULL` commits before that storage request. This includes
+`Dispatching`, `SourceDispatching`, object `Pending`, and the paired frozen
+mutation input records. Completion rows use the same mode, so every record has
+one commit and at most one WAL fsync.
 
 On reopen, a stored `Dispatching` mutation becomes `Unknown`; a stored
 `SourceDispatching` rename becomes `PendingSourceCleanup`; and an object left
@@ -207,10 +206,9 @@ Larger bytes found beyond the last committed record are not acknowledged and
 are discarded on reopen. A missing shorter data file is corruption.
 
 `flush` first freezes the exact current generation into `inputs/<id>.data` and
-records its length and BLAKE3 digest. It then commits and checkpoints
-`Dispatching` before the network call. A newer local write cannot alter that
-frozen input. `flush` on a read-only handle is `Unchanged`; Drop and release
-never publish.
+records its length and BLAKE3 digest. It then commits `Dispatching` durably
+before the network call. A newer local write cannot alter that frozen input.
+`flush` on a read-only handle is `Unchanged`; Drop and release never publish.
 
 The writable open/create creates an empty local generation. No remote object
 exists before its first flush. `discard_local` removes only a never-dispatched

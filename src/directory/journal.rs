@@ -223,7 +223,7 @@ impl DirectoryJournal {
             }
             validate_binding(&tx, filesystem, root)?;
             tx.commit().map_err(sql)?;
-            store::configure(&connection).map_err(store_error)?;
+            store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
             Ok(connection)
         })
         .await
@@ -313,7 +313,6 @@ impl DirectoryJournal {
             tx.commit().map_err(sql)
         })
         .await?;
-        self.barrier().await?;
         load_async(self, commit_id)
             .await?
             .map(|row| row.status(commit_id))
@@ -608,10 +607,6 @@ impl DirectoryJournal {
             .await
             .map_err(local)?
     }
-    async fn barrier(&self) -> Result<()> {
-        self.call(|connection| store::barrier(connection).map_err(store_error))
-            .await
-    }
 }
 
 #[derive(Clone)]
@@ -821,8 +816,7 @@ async fn save_state_async(
             save_state(&tx, id, state, receipt.as_ref(), failure.as_ref(), filter)?;
             tx.commit().map_err(sql)
         })
-        .await?;
-    journal.barrier().await
+        .await
 }
 
 async fn unknown_after_dispatch(

@@ -27,8 +27,9 @@ baseline.
 Profile `yinyang-directory-replica-2` binds the state to one filesystem.
 Its exact table and column-name sets are current; column order is not part of
 the signature because maintained inserts name their columns. SQLite uses WAL
-with `synchronous=NORMAL`. Install and artifact journal writes that precede a
-local rename, exchange or quarantine are checkpointed before that effect.
+with `synchronous=FULL`. Install and artifact journal writes that precede a
+local rename, exchange or quarantine are durable when committed before that
+effect.
 
 There is no schema upgrade or shape-synthesis path. An older or unknown profile
 returns `Unsupported`; a current identifier with a missing, extra or malformed
@@ -53,7 +54,8 @@ operation, the accepted local fingerprint and identity, the baseline node and
 revision, any known original commit identity, the linked conflict, and the
 retained input artifact. Retry publishes only associated work and never
 resurrects orphaned staging. The association and the transition to a
-possibly-dispatched state are checkpointed before the remote request.
+possibly-dispatched state are durable `synchronous=FULL` commits before the
+remote request.
 
 Receipt application is ordered so an interrupted run is recoverable: the common
 baseline (and any linked-conflict clearance) is applied from the returned

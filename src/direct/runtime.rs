@@ -950,7 +950,6 @@ impl DirectRuntime {
         };
         let store = self.store.as_ref().expect("writable runtime has a store");
         guard(store).put_mutation(&mutation)?;
-        guard(store).barrier()?;
         let outcome = self
             .mutation
             .delete(
@@ -1222,7 +1221,6 @@ impl DirectRuntime {
         mutation.state = MUTATION_DISPATCHING;
         mutation.error = None;
         guard(store).put_mutation(&mutation)?;
-        guard(store).barrier()?;
         let source = mutation
             .source
             .as_ref()
@@ -1595,7 +1593,6 @@ impl DirectRuntime {
         mutation.state = MUTATION_DISPATCHING;
         mutation.error = None;
         guard(store).put_mutation(&mutation)?;
-        guard(store).barrier()?;
         let destination = mutation
             .destination
             .as_ref()
@@ -1713,7 +1710,6 @@ impl DirectRuntime {
 
         mutation.state = MUTATION_SOURCE_DISPATCHING;
         guard(store).put_mutation(&mutation)?;
-        guard(store).barrier()?;
         let outcome = self.mutation.delete(&source_key, source_precondition).await;
         match outcome {
             Ok(DirectMutationOutcome::Applied { .. }) => {
@@ -2106,7 +2102,6 @@ impl DirectRuntime {
             std::slice::from_ref(&object),
             std::slice::from_ref(&mutation),
         )?;
-        guard(store).barrier()?;
         inner.state = DirectObjectState::Pending;
 
         let outcome = self

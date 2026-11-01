@@ -34,7 +34,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncRead;
 
 mod transport;
@@ -43,8 +43,6 @@ pub use transport::{ServiceClient, serve};
 type Db = Arc<Mutex<Connection>>;
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
-const CHECKPOINT_RETRY: Duration = Duration::from_millis(10);
-const CHECKPOINT_BUDGET: Duration = Duration::from_secs(3);
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
     ("singleton", "INTEGER"),
     ("profile", "TEXT"),
@@ -222,7 +220,7 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
             ));
         }
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )
         .map_err(sql)?;
         Ok(Arc::new(Mutex::new(conn)))
@@ -249,46 +247,6 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
     })
     .await
     .map_err(|e| Error::new(ErrorKind::Storage, "open metadata worker", e.to_string()))?
-}
-fn barrier(conn: &Connection) -> Result<()> {
-    // A FULL checkpoint syncs the WAL and database after NORMAL commits. Disable
-    // SQLite's busy wait during the retry loop so a concurrent reader cannot
-    // extend this operation beyond the three-second wall-clock budget.
-    conn.busy_timeout(Duration::ZERO).map_err(sql)?;
-    let checkpoint = checkpoint_until(conn, Instant::now());
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
-    checkpoint
-}
-fn checkpoint_until(conn: &Connection, started: Instant) -> Result<()> {
-    loop {
-        if started.elapsed() >= CHECKPOINT_BUDGET {
-            break;
-        }
-        let checkpoint: rusqlite::Result<(i64, i64, i64)> =
-            conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            });
-        match checkpoint {
-            Ok((0, _, _)) => return Ok(()),
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(code, _))
-                if matches!(
-                    code.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                ) => {}
-            Err(error) => return Err(sql(error)),
-        }
-        let remaining = CHECKPOINT_BUDGET.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        std::thread::sleep(CHECKPOINT_RETRY.min(remaining));
-    }
-    Err(Error::new(
-        ErrorKind::Storage,
-        "checkpoint metadata database",
-        "database is busy",
-    ))
 }
 fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
     let (profile, fs, root, revision): (String, Vec<u8>, Vec<u8>, Vec<u8>) = conn
@@ -360,7 +318,6 @@ impl MetadataService {
             }
             let result = manifest(&tx)?;
             tx.commit().map_err(sql)?;
-            barrier(conn)?;
             Ok(result)
         }).await?;
         let fs = Self {
@@ -652,7 +609,7 @@ impl MetadataService {
                 params![descriptor],
             )
             .map_err(sql)?;
-            barrier(c)
+            Ok(())
         })
         .await
     }
@@ -824,7 +781,7 @@ impl MetadataService {
         // A failed durability acknowledgement is not proof of rollback.
         if db_call(&db, |c| {
             c.execute_batch("COMMIT").map_err(sql)?;
-            barrier(c)
+            Ok(())
         })
         .await
         .is_err()
