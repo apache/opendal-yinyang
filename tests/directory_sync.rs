@@ -427,7 +427,6 @@ async fn renamed_and_re_edited_local_file_converges() {
 /// commit so an external edit can land on the authority in between. The
 /// original commit outcomes are returned unchanged; lost or Unknown responses
 /// are a separate acceptance concern.
-#[derive(Debug)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
     const SMALL: usize = 512 * 1024;
@@ -622,6 +621,7 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
     server.abort();
 }
 
+#[derive(Debug)]
 struct HeldAuthority {
     inner: Arc<dyn Authority>,
     committed: tokio::sync::mpsc::UnboundedSender<()>,
