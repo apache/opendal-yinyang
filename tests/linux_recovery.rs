@@ -1130,7 +1130,14 @@ fn explicit_expiry_case(publication: Publication) {
 
     if let Some(binary) = &legacy {
         let latest = fixture.remote_file_version("protected.txt").2;
-        legacy_pre_expiry(binary, &mut fixture, publication, zero.commit_id, latest);
+        legacy_pre_expiry(
+            binary,
+            &mut fixture,
+            publication,
+            zero.cursor.revision,
+            zero.commit_id,
+            latest,
+        );
     }
 
     let immutable_before = immutable_remote_identities(&fixture.operator());
@@ -2206,11 +2213,7 @@ fn legacy_pre_expiry(
             let metadata = fixture.path("metadata.db");
             let mut service = legacy_service(binary, fixture, &metadata);
             let config = fixture.path("legacy-service.json");
-            write_read_only_service_config(
-                &config,
-                &fixture.path("legacy-state"),
-                service.address(),
-            );
+            write_read_only_service_config(&config, &fixture.path("legacy-state"), service.address);
             let receipt = legacy_yy(
                 binary,
                 fixture,
