@@ -860,8 +860,10 @@ impl Replica {
             &mut nodes,
             Some(&hints),
         )?;
-        for node in nodes.values() {
-            self.store.save_local_scan_evidence(node)?;
+        if self._lease.is_some() {
+            for node in nodes.values() {
+                self.store.save_local_scan_evidence(node)?;
+            }
         }
         Ok(LocalSnapshot { nodes })
     }
@@ -945,7 +947,9 @@ impl Replica {
                     parent: Some(parent_identity),
                     stat: Some(local_stat(&stat)),
                 };
-                self.store.save_local_scan_evidence(&node)?;
+                if self._lease.is_some() {
+                    self.store.save_local_scan_evidence(&node)?;
+                }
                 Ok(Some(node))
             }
             FileType::Symlink => Err(Error::unsupported(format!(
@@ -1034,7 +1038,9 @@ impl Replica {
                 node.path = path.to_owned();
                 node.parent = Some(parent_identity);
                 node.stat = Some(local_stat(&stat));
-                self.store.save_local_scan_evidence(&node)?;
+                if self._lease.is_some() {
+                    self.store.save_local_scan_evidence(&node)?;
+                }
                 nodes.insert(path.to_owned(), node);
             }
             FileType::Symlink => {
@@ -1048,8 +1054,10 @@ impl Replica {
                 )));
             }
         }
-        for node in nodes.values() {
-            self.store.save_local_scan_evidence(node)?;
+        if self._lease.is_some() {
+            for node in nodes.values() {
+                self.store.save_local_scan_evidence(node)?;
+            }
         }
         Ok(LocalSnapshot::from_nodes(nodes))
     }
