@@ -708,15 +708,15 @@ impl FileHandle {
         Ok(())
     }
     pub async fn flush(&mut self) -> Result<Option<Receipt>> {
-        self.entry_durability_barrier().await
+        self.publish_and_report().await
     }
     pub async fn commit(&mut self) -> Result<Option<Receipt>> {
-        self.entry_durability_barrier().await
+        self.publish_and_report().await
     }
     pub async fn fsync(&mut self) -> Result<Option<Receipt>> {
-        self.entry_durability_barrier().await
+        self.publish_and_report().await
     }
-    async fn entry_durability_barrier(&mut self) -> Result<Option<Receipt>> {
+    async fn publish_and_report(&mut self) -> Result<Option<Receipt>> {
         self.live()?;
         let result = self.publish().await;
         self.report(result).await

@@ -18,7 +18,7 @@
 use crate::compatibility::OBJECT_INDEX_MAGIC;
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::{Error, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 const MAX: usize = 32;
@@ -52,8 +52,8 @@ pub(crate) struct IndexCache {
 
 #[derive(Debug, Default)]
 struct IndexCacheState {
-    pages: HashMap<PackedRef, CacheEntry>,
-    values: HashMap<PackedRef, CacheEntry>,
+    entries: HashMap<PackedRef, CacheEntry>,
+    recency: BTreeMap<u64, PackedRef>,
     bytes: usize,
     clock: u64,
 }
@@ -61,7 +61,7 @@ struct IndexCacheState {
 #[derive(Debug)]
 struct CacheEntry {
     bytes: Vec<u8>,
-    last_used: u64,
+    tick: u64,
 }
 
 impl IndexCache {
@@ -70,11 +70,7 @@ impl IndexCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.clock = state.clock.saturating_add(1);
-        let clock = state.clock;
-        let entry = state.pages.get_mut(reference)?;
-        entry.last_used = clock;
-        Some(entry.bytes.clone())
+        touch(&mut state, reference)
     }
 
     fn insert_page(&self, reference: PackedRef, bytes: Vec<u8>) {
@@ -83,16 +79,7 @@ impl IndexCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = &mut *state;
-        state.clock = state.clock.saturating_add(1);
-        insert_bounded(
-            &mut state.pages,
-            &mut state.values,
-            &mut state.bytes,
-            reference,
-            bytes,
-            state.clock,
-            true,
-        );
+        insert_bounded(state, reference, bytes);
     }
 
     fn value(&self, reference: &PackedRef) -> Option<Vec<u8>> {
@@ -100,11 +87,7 @@ impl IndexCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.clock = state.clock.saturating_add(1);
-        let clock = state.clock;
-        let entry = state.values.get_mut(reference)?;
-        entry.last_used = clock;
-        Some(entry.bytes.clone())
+        touch(&mut state, reference)
     }
 
     fn insert_value(&self, reference: PackedRef, bytes: Vec<u8>) {
@@ -113,86 +96,51 @@ impl IndexCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = &mut *state;
-        state.clock = state.clock.saturating_add(1);
-        insert_bounded(
-            &mut state.pages,
-            &mut state.values,
-            &mut state.bytes,
-            reference,
-            bytes,
-            state.clock,
-            false,
-        );
+        insert_bounded(state, reference, bytes);
     }
 }
 
-fn insert_bounded(
-    pages: &mut HashMap<PackedRef, CacheEntry>,
-    values: &mut HashMap<PackedRef, CacheEntry>,
-    charged: &mut usize,
-    reference: PackedRef,
-    bytes: Vec<u8>,
-    clock: u64,
-    target_is_page: bool,
-) {
-    if bytes.len() > CACHE_BYTES
-        || pages.contains_key(&reference)
-        || values.contains_key(&reference)
-    {
+fn next_tick(state: &mut IndexCacheState) -> u64 {
+    state.clock = state.clock.saturating_add(1);
+    state.clock
+}
+
+fn touch(state: &mut IndexCacheState, reference: &PackedRef) -> Option<Vec<u8>> {
+    let tick = next_tick(state);
+    let (old_tick, bytes) = {
+        let entry = state.entries.get_mut(reference)?;
+        let old_tick = std::mem::replace(&mut entry.tick, tick);
+        (old_tick, entry.bytes.clone())
+    };
+    state.recency.remove(&old_tick);
+    state.recency.insert(tick, reference.clone());
+    Some(bytes)
+}
+
+fn insert_bounded(state: &mut IndexCacheState, reference: PackedRef, bytes: Vec<u8>) {
+    if bytes.len() > CACHE_BYTES || state.entries.contains_key(&reference) {
         return;
     }
-    while charged.saturating_add(bytes.len()) > CACHE_BYTES {
-        if !evict_one(pages, values, charged) {
+    while state.bytes.saturating_add(bytes.len()) > CACHE_BYTES {
+        if !evict_one(state) {
             return;
         }
     }
-    *charged += bytes.len();
-    if target_is_page {
-        pages.insert(
-            reference,
-            CacheEntry {
-                bytes,
-                last_used: clock,
-            },
-        );
-    } else {
-        values.insert(
-            reference,
-            CacheEntry {
-                bytes,
-                last_used: clock,
-            },
-        );
-    }
+    let tick = next_tick(state);
+    state.bytes += bytes.len();
+    state.recency.insert(tick, reference.clone());
+    state.entries.insert(reference, CacheEntry { bytes, tick });
 }
 
-fn evict_one(
-    pages: &mut HashMap<PackedRef, CacheEntry>,
-    values: &mut HashMap<PackedRef, CacheEntry>,
-    charged: &mut usize,
-) -> bool {
-    let page = pages
-        .iter()
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(reference, entry)| (true, reference.clone(), entry.bytes.len()));
-    let value = values
-        .iter()
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(reference, entry)| (false, reference.clone(), entry.bytes.len()));
-    let (is_page, reference, length) = match (page, value) {
-        (Some(page), Some(value)) if page.2 <= value.2 => page,
-        (Some(_), Some(value)) => value,
-        (Some(page), None) => page,
-        (None, Some(value)) => value,
-        (None, None) => return false,
+fn evict_one(state: &mut IndexCacheState) -> bool {
+    let Some((tick, reference)) = state.recency.first_key_value() else {
+        return false;
     };
-    let removed = if is_page {
-        pages.remove(&reference)
-    } else {
-        values.remove(&reference)
-    };
-    if removed.is_some() {
-        *charged = charged.saturating_sub(length);
+    let tick = *tick;
+    let reference = reference.clone();
+    state.recency.remove(&tick);
+    if let Some(entry) = state.entries.remove(&reference) {
+        state.bytes = state.bytes.saturating_sub(entry.bytes.len());
         true
     } else {
         false
@@ -652,7 +600,7 @@ mod tests {
         cache.insert_value(reference, vec![1, 2, 3, 4]);
         {
             let state = cache.state.lock().unwrap();
-            assert_eq!(state.values.len(), 1);
+            assert_eq!(state.entries.len(), 1);
             assert_eq!(state.bytes, 4);
         }
 
@@ -667,7 +615,44 @@ mod tests {
         }
         let state = cache.state.lock().unwrap();
         assert!(state.bytes <= CACHE_BYTES);
-        assert!(state.values.len() < 4);
+        assert!(state.entries.len() < 4);
+    }
+
+    #[test]
+    fn cache_evicts_the_oldest_small_values_at_the_byte_bound() {
+        let cache = IndexCache::default();
+        let capacity = CACHE_BYTES / 512;
+        let mut references = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            let reference = PackedRef {
+                object: (i as u128).to_be_bytes(),
+                offset: i as u64,
+                length: 512,
+                digest: [3; 32],
+            };
+            cache.insert_value(reference.clone(), vec![0; 512]);
+            references.push(reference);
+        }
+
+        // Touch the first entry so it is newer than the untouched entries.
+        assert!(cache.value(&references[0]).is_some());
+        for i in capacity..capacity + 3 {
+            let reference = PackedRef {
+                object: (i as u128).to_be_bytes(),
+                offset: i as u64,
+                length: 512,
+                digest: [3; 32],
+            };
+            cache.insert_value(reference, vec![0; 512]);
+        }
+
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.contains_key(&references[0]));
+        assert!(!state.entries.contains_key(&references[1]));
+        assert!(!state.entries.contains_key(&references[2]));
+        assert!(!state.entries.contains_key(&references[3]));
+        assert_eq!(state.entries.len(), state.recency.len());
+        assert!(state.bytes <= CACHE_BYTES);
     }
 
     #[tokio::test]
