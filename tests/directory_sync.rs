@@ -28,7 +28,6 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
@@ -1122,65 +1121,4 @@ async fn composite_preflight_rejects_an_old_staging_profile() {
         )
         .unwrap();
     assert_eq!(profile, "yinyang-stage-3");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manual release DirectorySync durability benchmark"]
-async fn managed_directory_sync_durability_benchmark() {
-    const FILES: usize = 256;
-    const FILE_SIZE: usize = 256 * 1024;
-
-    let home = std::env::var_os("HOME").expect("HOME");
-    let mut pushes = Vec::new();
-    let mut pulls = Vec::new();
-    for sample in 0..3 {
-        let backend = TestBackend::default();
-        let authority = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
-        let temp = tempfile::Builder::new()
-            .prefix(&format!("yinyang-directory-sync-bench-{sample}-"))
-            .tempdir_in(&home)
-            .unwrap();
-        let root = temp.path().join("push-root");
-        std::fs::create_dir(&root).unwrap();
-        for index in 0..FILES {
-            std::fs::write(
-                root.join(format!("file-{index:03}")),
-                vec![index as u8; FILE_SIZE],
-            )
-            .unwrap();
-        }
-
-        let mut push =
-            DirectorySync::init(authority.clone(), &temp.path().join("push-state"), &root)
-                .await
-                .unwrap();
-        let started = Instant::now();
-        let outcome = push.run().await.unwrap();
-        pushes.push(started.elapsed());
-        assert_eq!(outcome.published_local, FILES as u64);
-        assert!(outcome.in_sync);
-        drop(push);
-
-        let pull_root = temp.path().join("pull-root");
-        std::fs::create_dir(&pull_root).unwrap();
-        let mut pull = DirectorySync::init(authority, &temp.path().join("pull-state"), &pull_root)
-            .await
-            .unwrap();
-        let started = Instant::now();
-        let outcome = pull.run().await.unwrap();
-        pulls.push(started.elapsed());
-        assert_eq!(outcome.materialized_remote, FILES as u64);
-        assert!(outcome.in_sync);
-    }
-    pushes.sort();
-    pulls.sort();
-    println!(
-        "W1_DIRECTORY_SYNC_BENCH files={FILES} size={FILE_SIZE} push_ms={} pull_ms={}",
-        pushes[1].as_millis(),
-        pulls[1].as_millis(),
-    );
 }
