@@ -181,8 +181,11 @@ the batch wall time. Complete remote bytes are checked after all workers finish,
 outside every measured interval.
 
 The counting proxies record request intervals independently of the configured
-writer count. The report exposes application-operation overlap, S3 request
-overlap, and metadata-service RPC overlap as separate observations. Four active
+writer count. The report exposes application `sum - batch span`, S3 request
+concurrency excess, and metadata-service connection concurrency excess as
+separate observations. Each proxy `overlap_ms` is
+`sum(interval_durations) - union_active_ms`, a duration-weighted excess that is
+not the wall-clock duration with at least two active intervals. Four active
 application writers with maximum remote concurrency one is a valid serialized
 authority result. Concurrent network values remain whole-batch totals; the
 collector does not subtract global proxy counters around one writer and assign
@@ -234,9 +237,9 @@ Each JSONL record includes:
 - service TCP connections and raw framed bytes in both directions;
 - batch totals and per-sample network values, where per-sample divides only a
   sequential batch and explicitly notes that concurrent samples overlap;
-- application-operation overlap plus S3 request and metadata-service RPC
-  interval summaries, including maximum observed concurrency and in-flight
-  work at the end of each phase;
+- application `sum - batch span` plus S3 request and metadata-service
+  connection interval summaries, including weighted concurrency excess,
+  maximum observed concurrency, and in-flight work at the end of each phase;
 - allocated local payload, Sync state, mount staging, SQLite database plus
   `-wal`/`-shm`, and persistent S3 object bytes and counts;
 - assertions that completed successfully and the failure count (zero for a

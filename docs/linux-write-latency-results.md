@@ -77,7 +77,7 @@ the end-to-end sample or batch wall.
 
 ## Concurrency
 
-| Authority | Max S3 request intervals | S3 overlap ms | Max service proxy connections | Connection overlap ms | Batch wall change |
+| Authority | Max S3 request intervals | Weighted S3 concurrency excess ms | Max service proxy connections | Weighted service connection excess ms | Batch wall change |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | object | 4 | 323.641 | 0 | 0 | -39.4% |
 | service | 4 | 70.170 | 6 | 410.599 | -56.6% |
@@ -86,6 +86,14 @@ Per-file p50 latency increased from 90.639 to 193.854 ms for object publication
 and from 69.968 to 103.649 ms for service publication. The concurrent case
 therefore improves aggregate wall time while increasing contention observed by
 each writer.
+
+For both S3 and service activity, `activity.overlap_ms` is
+`sum(interval_durations) - union_active_ms`. It is a duration-weighted measure
+of concurrency excess, not the wall-clock duration in which at least two
+intervals were active. It can exceed the batch window: service's `410.599 ms`
+excess is larger than its `367.399 ms` batch wall because multiple active
+intervals contribute repeatedly. The maximum observed concurrency still comes
+from interval boundaries.
 
 Object publication reaches S3 request-interval concurrency four but individual
 fsyncs wait materially longer. Service publication has more overlapping proxy
