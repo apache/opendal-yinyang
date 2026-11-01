@@ -1,15 +1,17 @@
 # Direct volumes
 
-**Status: experimental S3-compatible read-only library/Linux FUSE support and
-conditional mutation library runtime.**
+**Status: experimental S3-compatible read-only library and Linux FUSE support,
+writable Linux FUSE Mount, and Direct Sync over the conditional mutation
+runtime.**
 
 A Direct volume keeps the configured storage namespace authoritative. It lists
 and reads existing objects without creating YinYang metadata, Managed NodeIds,
 content proofs, transactions or Managed identities. This specification defines
 the read-only observation and FUSE contract. The separate
 [Direct mutation runtime](direct-mutations.md) defines conditional publication,
-retained local generations and safe-save namespace mutation. Writable FUSE
-admission is defined by the Linux FUSE frontend.
+retained local generations and safe-save namespace mutation;
+[Linux FUSE](linux-fuse.md) defines writable Direct Mount admission and
+[Direct Sync](direct-sync.md) defines ordinary-directory reconciliation.
 
 ## Configuration and admission
 
@@ -27,11 +29,13 @@ A Direct volume uses this configuration shape:
 }
 ```
 
-`read_only` defaults to `true` for Direct and must be `true` when present.
-`staging` must be omitted. The existing Managed default remains
-`read_only=false` with a required staging path.
+`read_only` defaults to `true` for Direct. A read-only Direct volume omits
+`staging`. A writable Direct Mount (`read_only=false`, `frontend=fuse`) and a
+Direct Sync volume (`access=sync`, `frontend=library`) require a `staging`
+path. The Managed default remains `read_only=false` with a required staging
+path.
 
-Direct admission accepts only:
+Read-only Direct admission accepts only:
 
 - `access=mount`;
 - `publication=object` with no service address;
