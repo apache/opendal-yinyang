@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -42,12 +43,12 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "yinyang.linux-operating-envelope.v1"
+SCHEMA = "yinyang.linux-operating-envelope.v2"
 REQUEST_SCHEMA = "yinyang.linux-request-accounting.v1"
 STORAGE_NAMES = (
     "YINYANG_STORAGE_PROFILE",
@@ -69,6 +70,22 @@ MAX_FIRST_ERRORS = 16
 FSYNC_RETRY_SECONDS = 30.0
 FSYNC_RETRY_INTERVAL = 0.5
 FSYNC_RETRY_MAX_INTERVAL = 5.0
+DEFAULT_FILE_BYTES = 8 * 1024 * 1024 + 17
+BOUNDED_EXTENSION_BYTES = 128 * 1024
+BOUNDED_SHRINK_BYTES = 1024 * 1024
+MUTATION_CYCLE = (
+    "overwrite",
+    "append",
+    "overwrite",
+    "zero-extension",
+    "overwrite",
+    "truncate",
+    "append",
+    "overwrite",
+    "append",
+    "zero-extension",
+)
+MUTATION_OPERATIONS = ("overwrite", "append", "truncate", "zero-extension")
 
 
 class EnvelopeError(RuntimeError):
@@ -212,6 +229,82 @@ def latency_summary(values: list[float], errors: int) -> dict[str, Any]:
     }
 
 
+def max_concurrency(intervals: list[tuple[float, float]]) -> int:
+    events: list[tuple[float, int]] = []
+    for started, ended in intervals:
+        events.append((started, 1))
+        events.append((max(started, ended), -1))
+    active = 0
+    maximum = 0
+    for _, change in sorted(events, key=lambda event: (event[0], event[1])):
+        active += change
+        maximum = max(maximum, active)
+    return maximum
+
+
+def merged_interval_seconds(intervals: list[tuple[float, float]]) -> float:
+    total = 0.0
+    current_start: float | None = None
+    current_end = 0.0
+    for started, ended in sorted(intervals):
+        ended = max(started, ended)
+        if current_start is None:
+            current_start = started
+            current_end = ended
+        elif started <= current_end:
+            current_end = max(current_end, ended)
+        else:
+            total += current_end - current_start
+            current_start = started
+            current_end = ended
+    if current_start is not None:
+        total += current_end - current_start
+    return total
+
+
+def overlap_summary(
+    write_intervals: list[tuple[float, float]],
+    read_intervals: list[tuple[float, float]],
+) -> dict[str, Any]:
+    write_seconds = merged_interval_seconds(write_intervals)
+    read_seconds = merged_interval_seconds(read_intervals)
+    combined_seconds = merged_interval_seconds(
+        [*write_intervals, *read_intervals]
+    )
+    return {
+        "max_concurrent_writers": max_concurrency(write_intervals),
+        "max_concurrent_readers": max_concurrency(read_intervals),
+        "max_concurrent_operations": max_concurrency(
+            [*write_intervals, *read_intervals]
+        ),
+        "writer_active_seconds": round(write_seconds, 3),
+        "reader_active_seconds": round(read_seconds, 3),
+        "writer_reader_overlap_seconds": round(
+            max(0.0, write_seconds + read_seconds - combined_seconds), 3
+        ),
+    }
+
+
+def sampling_summary(
+    samples: list[dict[str, Any]], interval_seconds: float
+) -> dict[str, Any]:
+    elapsed = sorted(float(sample["elapsed_seconds"]) for sample in samples)
+    gaps = [
+        round(later - earlier, 3)
+        for earlier, later in itertools.pairwise(elapsed)
+    ]
+    return {
+        "count": len(samples),
+        "interval_seconds": interval_seconds,
+        "first_elapsed_seconds": elapsed[0] if elapsed else None,
+        "last_elapsed_seconds": elapsed[-1] if elapsed else None,
+        "max_gap_seconds": max(gaps) if gaps else None,
+        "gaps_at_least_twice_interval": [
+            gap for gap in gaps if gap >= interval_seconds * 2
+        ],
+    }
+
+
 def parse_os_release() -> dict[str, str]:
     path = Path("/etc/os-release")
     if not path.exists():
@@ -274,6 +367,32 @@ class Completed:
     stdout: str
     stderr: str
     returncode: int
+
+
+@dataclass
+class FileState:
+    index: int
+    expected: bytearray
+    minimum_bytes: int
+    maximum_bytes: int
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    epoch: int = 0
+    mutation_active: bool = False
+
+    @property
+    def name(self) -> str:
+        return f"file-{self.index:04d}.bin"
+
+    def begin_mutation(self) -> None:
+        with self.lock:
+            if self.mutation_active:
+                raise EnvelopeError(f"{self.name} already has an active mutation")
+            self.mutation_active = True
+
+    def publish_mutation(self) -> None:
+        with self.lock:
+            self.epoch += 1
+            self.mutation_active = False
 
 
 def file_status_snapshot(stdout: str) -> dict[str, Any]:
@@ -484,6 +603,7 @@ class Workload:
         seed: int,
         fsync_retry_seconds: float = FSYNC_RETRY_SECONDS,
         fsync_retry_interval: float = FSYNC_RETRY_INTERVAL,
+        mutation_cycle: tuple[str, ...] = MUTATION_CYCLE,
     ) -> None:
         self.mountpoint = mountpoint
         self.expected = expected
@@ -494,20 +614,61 @@ class Workload:
         self.seed = seed
         self.fsync_retry_seconds = fsync_retry_seconds
         self.fsync_retry_interval = fsync_retry_interval
+        self.mutation_cycle = mutation_cycle
+        self.states = [
+            FileState(
+                index=index,
+                expected=bytes_,
+                minimum_bytes=max(
+                    PAGE_BYTES, len(bytes_) - BOUNDED_SHRINK_BYTES
+                ),
+                maximum_bytes=len(bytes_) + BOUNDED_EXTENSION_BYTES,
+            )
+            for index, bytes_ in enumerate(expected)
+        ]
         self.stop = threading.Event()
         self.threads: list[threading.Thread] = []
         self.lock = threading.Lock()
         self.write_latencies: list[float] = []
         self.read_latencies: list[float] = []
+        self.read_attempt_latencies: list[float] = []
         self.pwrite_errors = 0
+        self.mutation_errors = 0
         self.fsync_errors = 0
         self.uncertain_files: set[int] = set()
+        self.failed_files: set[int] = set()
         self.read_errors = 0
+        self.read_validation_mismatches = 0
+        self.read_attempts = 0
+        self.read_validated = 0
+        self.read_concurrent_skips = 0
+        self.read_validation_bytes = 0
+        self.read_short = 0
+        self.read_short_during_transition = 0
         self.fatal: list[str] = []
         self.first_errors: list[dict[str, Any]] = []
         self.started_at: float | None = None
         self.fsync_retry_attempts = 0
         self.fsync_retry_successes = 0
+        self.operation_latencies: dict[str, list[float]] = {
+            name: [] for name in MUTATION_OPERATIONS
+        }
+        self.operation_errors: dict[str, int] = {
+            name: 0 for name in MUTATION_OPERATIONS
+        }
+        self.operation_counts: dict[str, int] = {
+            name: 0 for name in MUTATION_OPERATIONS
+        }
+        self.file_operation_counts: list[dict[str, int]] = [
+            {name: 0 for name in MUTATION_OPERATIONS}
+            for _ in self.states
+        ]
+        self.operation_acknowledged_bytes: dict[str, int] = {
+            name: 0 for name in MUTATION_OPERATIONS
+        }
+        self.write_intervals: list[tuple[float, float]] = []
+        self.read_attempt_intervals: list[tuple[float, float]] = []
+        self.read_validated_intervals: list[tuple[float, float]] = []
 
     def start(self) -> None:
         self.started_at = time.monotonic()
@@ -533,109 +694,275 @@ class Workload:
     def path(self, index: int) -> Path:
         return self.mountpoint / f"file-{index:04d}.bin"
 
+    def operation_for(self, requested: str, state: FileState) -> str:
+        length = len(state.expected)
+        if (
+            requested in {"append", "zero-extension"}
+            and length + PAGE_BYTES > state.maximum_bytes
+        ):
+            return "truncate"
+        if requested == "truncate" and length <= state.minimum_bytes:
+            return "overwrite"
+        if requested not in MUTATION_OPERATIONS:
+            raise EnvelopeError(f"unsupported mutation operation: {requested}")
+        return requested
+
+    def note_mutation_error(
+        self, operation: str, index: int, error: OSError
+    ) -> None:
+        self.record_first_error(operation, index, error)
+        with self.lock:
+            self.operation_errors[operation] += 1
+            self.mutation_errors += 1
+            if operation == "overwrite":
+                self.pwrite_errors += 1
+            self.uncertain_files.add(index)
+            self.failed_files.add(index)
+
     def writer(self, worker: int) -> None:
         random_source = random.Random(self.seed + worker)
-        descriptors: dict[int, int] = {}
+        owned = list(range(worker, len(self.states), self.writers))
+        sequence = 0
+        file_sequence = {index: 0 for index in owned}
         failures = 0
-        try:
-            for index in range(worker, len(self.expected), self.writers):
-                descriptors[index] = os.open(self.path(index), os.O_RDWR)
-            while not self.stop.is_set():
-                started = time.monotonic()
-                index = random_source.choice(list(descriptors))
-                maximum_page = (len(self.expected[index]) // PAGE_BYTES) - 1
-                offset = random_source.randint(0, maximum_page) * PAGE_BYTES
-                page = random_source.randbytes(PAGE_BYTES)
+        while not self.stop.is_set():
+            available = [
+                index
+                for index in owned
+                if index not in self.failed_files
+            ]
+            if not available:
+                with self.lock:
+                    self.fatal.append(f"writer {worker} has no writable files")
+                self.stop.set()
+                return
+            index = available[sequence % len(available)]
+            state = self.states[index]
+            requested = self.mutation_cycle[
+                file_sequence[index] % len(self.mutation_cycle)
+            ]
+            file_sequence[index] += 1
+            operation = self.operation_for(requested, state)
+            sequence += 1
+            flags = os.O_WRONLY | os.O_APPEND
+            if operation != "append":
+                flags = os.O_RDWR
+            started = time.monotonic()
+            try:
+                descriptor = os.open(self.path(index), flags)
+            except OSError as error:
+                self.note_mutation_error(operation, index, error)
+                failures += 1
+                if failures >= 3:
+                    self.fatal.append(
+                        f"three consecutive file opens failed: {error}"
+                    )
+                    self.stop.set()
+                self.stop.wait(self.write_interval)
+                continue
+            before_length = len(state.expected)
+            acknowledged_bytes = 0
+            try:
+                state.begin_mutation()
                 try:
-                    view = memoryview(page)
-                    written = 0
-                    while view:
-                        count = os.pwrite(descriptors[index], view, offset + written)
-                        if count <= 0:
-                            raise OSError("short pwrite through FUSE")
-                        segment = page[written : written + count]
-                        self.expected[index][
-                            offset + written : offset + written + count
-                        ] = segment
-                        written += count
-                        view = view[count:]
+                    if operation == "overwrite":
+                        maximum_page = (len(state.expected) // PAGE_BYTES) - 1
+                        offset = (
+                            random_source.randint(0, maximum_page) * PAGE_BYTES
+                        )
+                        page = random_source.randbytes(PAGE_BYTES)
+                        view = memoryview(page)
+                        written = 0
+                        while view:
+                            count = os.pwrite(
+                                descriptor, view, offset + written
+                            )
+                            if count <= 0:
+                                raise OSError("short pwrite through FUSE")
+                            segment = page[written : written + count]
+                            state.expected[
+                                offset + written : offset + written + count
+                            ] = segment
+                            acknowledged_bytes += count
+                            written += count
+                            view = view[count:]
+                    elif operation == "append":
+                        page = random_source.randbytes(PAGE_BYTES)
+                        view = memoryview(page)
+                        written = 0
+                        while view:
+                            count = os.write(descriptor, view)
+                            if count <= 0:
+                                raise OSError("short append through FUSE")
+                            state.expected.extend(page[written : written + count])
+                            acknowledged_bytes += count
+                            written += count
+                            view = view[count:]
+                    elif operation == "zero-extension":
+                        target = len(state.expected) + PAGE_BYTES
+                        os.ftruncate(descriptor, target)
+                        state.expected.extend(b"\0" * PAGE_BYTES)
+                        acknowledged_bytes = target - before_length
+                    else:
+                        target = state.minimum_bytes
+                        os.ftruncate(descriptor, target)
+                        del state.expected[target:]
+                        acknowledged_bytes = before_length - target
                 except OSError as error:
-                    self.record_first_error("pwrite", index, error)
-                    with self.lock:
-                        self.pwrite_errors += 1
-                        self.uncertain_files.add(index)
+                    self.note_mutation_error(operation, index, error)
                     failures += 1
                     if failures >= 3:
-                        self.fatal.append(f"three consecutive writes failed: {error}")
-                        self.stop.set()
-                else:
-                    if not self.fsync_with_retry(descriptors[index], index):
                         self.fatal.append(
-                            f"fsync retry deadline expired for file-{index:04d}.bin"
+                            f"three consecutive {operation} operations failed: "
+                            f"{error}"
                         )
                         self.stop.set()
-                    else:
-                        with self.lock:
-                            self.write_latencies.append(
-                                (time.monotonic() - started) * 1000
-                            )
-                            self.uncertain_files.discard(index)
-                        failures = 0
+                    continue
+                if not self.fsync_with_retry(descriptor, state):
+                    self.fatal.append(
+                        f"fsync retry deadline expired for {state.name}"
+                    )
+                    self.stop.set()
+                    continue
+                state.publish_mutation()
                 elapsed = time.monotonic() - started
-                self.stop.wait(max(0.0, self.write_interval - elapsed))
-        except OSError as error:
-            self.record_first_error("open", None, error)
-            self.fatal.append(f"writer {worker} failed outside an operation: {error}")
-            self.stop.set()
-        finally:
-            for descriptor in descriptors.values():
+                with self.lock:
+                    self.write_latencies.append(elapsed * 1000)
+                    self.operation_latencies[operation].append(elapsed * 1000)
+                    self.operation_counts[operation] += 1
+                    self.file_operation_counts[index][operation] += 1
+                    self.operation_acknowledged_bytes[
+                        operation
+                    ] += acknowledged_bytes
+                    self.uncertain_files.discard(index)
+                    self.write_intervals.append(
+                        (started - self.started_at, started - self.started_at + elapsed)
+                    )
+                failures = 0
+            except EnvelopeError as error:
+                self.record_first_error(operation, index, OSError(str(error)))
+                with self.lock:
+                    self.fatal.append(str(error))
+                self.stop.set()
+            finally:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
+            elapsed = time.monotonic() - started
+            self.stop.wait(max(0.0, self.write_interval - elapsed))
 
     def reader(self, worker: int) -> None:
         random_source = random.Random(self.seed + 10_000 + worker)
         failures = 0
         while not self.stop.is_set():
             started = time.monotonic()
-            index = random_source.randrange(len(self.expected))
-            maximum_page = (len(self.expected[index]) // PAGE_BYTES) - 1
-            offset = random_source.randint(0, maximum_page) * PAGE_BYTES
+            state = random_source.choice(self.states)
+            with self.lock:
+                self.read_attempts += 1
+            with state.lock:
+                stable_before = not state.mutation_active
+                epoch_before = state.epoch
+                length_before = len(state.expected)
+            if not stable_before:
+                with self.lock:
+                    self.read_concurrent_skips += 1
+                self.record_read_interval(started, validated=False)
+                self.stop.wait(self.read_interval)
+                continue
+            if random_source.randrange(4) == 0:
+                offset = max(0, length_before - PAGE_BYTES)
+            else:
+                offset = random_source.randrange(
+                    0, max(1, length_before - PAGE_BYTES + 1)
+                )
             try:
-                descriptor = os.open(self.path(index), os.O_RDONLY)
+                descriptor = os.open(self.path(state.index), os.O_RDONLY)
                 try:
-                    bytes_ = os.pread(descriptor, PAGE_BYTES, offset)
+                    actual = os.pread(descriptor, PAGE_BYTES, offset)
                 finally:
                     os.close(descriptor)
-                if len(bytes_) != PAGE_BYTES:
-                    raise OSError(
-                        f"short FUSE read at {self.path(index)}:{offset}: "
-                        f"{len(bytes_)} bytes"
-                    )
-                with self.lock:
-                    self.read_latencies.append((time.monotonic() - started) * 1000)
-                failures = 0
             except OSError as error:
-                self.record_first_error("read", index, error)
+                with state.lock:
+                    stable_after = (
+                        not state.mutation_active
+                        and state.epoch == epoch_before
+                    )
+                if not stable_after:
+                    with self.lock:
+                        self.read_concurrent_skips += 1
+                    self.record_read_interval(started, validated=False)
+                    continue
+                self.record_first_error("read", state.index, error)
                 with self.lock:
                     self.read_errors += 1
                 failures += 1
                 if failures >= 3:
                     self.fatal.append(f"three consecutive reads failed: {error}")
                     self.stop.set()
+                self.record_read_interval(started, validated=False)
+                self.stop.wait(self.read_interval)
+                continue
+            if len(actual) != PAGE_BYTES:
+                with self.lock:
+                    self.read_short += 1
+            with state.lock:
+                stable_after = (
+                    not state.mutation_active and state.epoch == epoch_before
+                )
+                matches = (
+                    stable_after
+                    and len(state.expected) == length_before
+                    and actual == state.expected[offset : offset + PAGE_BYTES]
+                )
             elapsed = time.monotonic() - started
+            with self.lock:
+                self.read_attempt_latencies.append(elapsed * 1000)
+            if not stable_after:
+                with self.lock:
+                    self.read_concurrent_skips += 1
+                    if len(actual) != PAGE_BYTES:
+                        self.read_short_during_transition += 1
+                self.record_read_interval(started, validated=False)
+                self.stop.wait(max(0.0, self.read_interval - elapsed))
+                continue
+            if not matches:
+                with self.lock:
+                    self.read_validation_mismatches += 1
+                    self.fatal.append(
+                        f"stable read content mismatch for {state.name}: "
+                        f"expected {len(state.expected)} bytes "
+                        f"sha256={bytes_sha256(state.expected)}, "
+                        f"got {len(actual)} bytes sha256={bytes_sha256(actual)}"
+                    )
+                self.record_read_interval(started, validated=False)
+                self.stop.set()
+                continue
+            with self.lock:
+                self.read_latencies.append(elapsed * 1000)
+                self.read_validated += 1
+                self.read_validation_bytes += len(actual)
+            self.record_read_interval(started, validated=True)
+            failures = 0
             self.stop.wait(max(0.0, self.read_interval - elapsed))
 
-    def fsync_with_retry(self, descriptor: int, index: int) -> bool:
+    def record_read_interval(self, started: float, *, validated: bool) -> None:
+        ended = time.monotonic()
+        interval = (started - self.started_at, ended - self.started_at)
+        with self.lock:
+            self.read_attempt_intervals.append(interval)
+            if validated:
+                self.read_validated_intervals.append(interval)
+
+    def fsync_with_retry(self, descriptor: int, state: FileState) -> bool:
         try:
             os.fsync(descriptor)
             return True
         except OSError as error:
-            self.record_first_error("fsync", index, error)
+            self.record_first_error("fsync", state.index, error)
             with self.lock:
                 self.fsync_errors += 1
-                self.uncertain_files.add(index)
+                self.uncertain_files.add(state.index)
 
         deadline = time.monotonic() + self.fsync_retry_seconds
         interval = self.fsync_retry_interval
@@ -654,15 +981,15 @@ class Workload:
             try:
                 os.fsync(descriptor)
             except OSError as error:
-                self.record_first_error("fsync-retry", index, error)
+                self.record_first_error("fsync-retry", state.index, error)
                 with self.lock:
                     self.fsync_errors += 1
-                    self.uncertain_files.add(index)
+                    self.uncertain_files.add(state.index)
                 interval = min(interval * 2, FSYNC_RETRY_MAX_INTERVAL)
                 continue
             with self.lock:
                 self.fsync_retry_successes += 1
-                self.uncertain_files.discard(index)
+                self.uncertain_files.discard(state.index)
             return True
         return False
 
@@ -689,34 +1016,92 @@ class Workload:
     def finish(self) -> dict[str, Any]:
         self.stop.set()
         for thread in self.threads:
-            thread.join(timeout=self.write_interval + self.read_interval + 30)
+            thread.join(timeout=self.write_interval + self.read_interval + 60)
         if any(thread.is_alive() for thread in self.threads):
             raise EnvelopeError("workload thread did not stop within its bounded timeout")
-        write_errors = self.pwrite_errors + self.fsync_errors
+        write_errors = self.mutation_errors + self.fsync_errors
+        operations = {}
+        for name in MUTATION_OPERATIONS:
+            operations[name] = {
+                **latency_summary(
+                    self.operation_latencies[name],
+                    self.operation_errors[name],
+                ),
+                "acknowledged_bytes": self.operation_acknowledged_bytes[name],
+            }
         writers = {
             **latency_summary(self.write_latencies, write_errors),
             "interval_seconds": self.write_interval,
             "threads": self.writers,
-            "bytes_per_write": PAGE_BYTES,
+            "operation_cycle": self.mutation_cycle,
+            "operation_counts": dict(self.operation_counts),
+            "file_operation_counts": self.file_operation_counts,
+            "operations": operations,
+            "bytes_per_overwrite": PAGE_BYTES,
+            "bytes_per_append": PAGE_BYTES,
+            "bytes_per_zero_extension": PAGE_BYTES,
+            "bounded_extension_bytes": BOUNDED_EXTENSION_BYTES,
+            "bounded_shrink_bytes": BOUNDED_SHRINK_BYTES,
             "fsync_each_write": True,
             "pwrite_errors": self.pwrite_errors,
+            "mutation_errors": self.mutation_errors,
             "fsync_errors": self.fsync_errors,
             "fsync_retry_attempts": self.fsync_retry_attempts,
             "fsync_retry_successes": self.fsync_retry_successes,
             "fsync_retry_seconds": self.fsync_retry_seconds,
             "fsync_retry_interval": self.fsync_retry_interval,
             "uncertain_files": sorted(self.uncertain_files),
+            "active_mutations": [
+                state.name for state in self.states if state.mutation_active
+            ],
         }
+        observed_overlap = overlap_summary(
+            self.write_intervals, self.read_attempt_intervals
+        )
+        observed_overlap["scope"] = (
+            "read attempts, including attempts skipped before or during "
+            "a file mutation"
+        )
+        validated_read_overlap = overlap_summary(
+            self.write_intervals, self.read_validated_intervals
+        )
+        validated_read_overlap["scope"] = (
+            "stable-epoch reads that compared actual bytes with expected bytes"
+        )
         return {
             "fatal": list(self.fatal),
             "first_errors": self.first_errors,
             "writers": writers,
             "readers": {
-                **latency_summary(self.read_latencies, self.read_errors),
+                **latency_summary(
+                    self.read_latencies,
+                    self.read_errors + self.read_validation_mismatches,
+                ),
+                "attempts": self.read_attempts,
+                "validated": self.read_validated,
+                "concurrent_skips": self.read_concurrent_skips,
+                "validation_mismatches": self.read_validation_mismatches,
+                "validation_bytes": self.read_validation_bytes,
+                "short_reads": self.read_short,
+                "short_reads_during_transition": (
+                    self.read_short_during_transition
+                ),
                 "interval_seconds": self.read_interval,
                 "threads": self.readers,
                 "bytes_per_read": PAGE_BYTES,
+                "mean_attempt_ms": (
+                    statistics.fmean(self.read_attempt_latencies)
+                    if self.read_attempt_latencies
+                    else None
+                ),
+                "max_attempt_ms": (
+                    max(self.read_attempt_latencies)
+                    if self.read_attempt_latencies
+                    else None
+                ),
             },
+            "observed_overlap": observed_overlap,
+            "validated_read_overlap": validated_read_overlap,
         }
 
 
@@ -762,12 +1147,21 @@ class Harness:
             self.yy, self.env, self.config, self.mountpoint, self.log_root
         )
         self.samples: list[dict[str, Any]] = []
-        self.history_samples: list[dict[str, Any]] = []
+        self.inventory_samples: list[dict[str, Any]] = []
         self.io_totals: dict[str, int] = {}
         self.last_io_pid: int | None = None
         self.last_io: dict[str, int | None] | None = None
+        self.current_phase = "preflight"
+        self.current_phase_lock = threading.Lock()
+        self.resource_stop = threading.Event()
+        self.resource_thread: threading.Thread | None = None
+        self.resource_errors: list[str] = []
+        self.history_stop = threading.Event()
+        self.history_thread: threading.Thread | None = None
+        self.history_errors: list[str] = []
+        self.versioning_status: str | None = None
         self.report["samples"] = self.samples
-        self.report["history_samples"] = self.history_samples
+        self.report["inventory_samples"] = self.inventory_samples
         self.report["workdir"] = str(self.work)
         self.report["backend"]["storage_root"] = self.root
 
@@ -779,14 +1173,26 @@ class Harness:
 
     def storage_environment(self) -> dict[str, str]:
         profile = self.source_environment.get("YINYANG_STORAGE_PROFILE")
-        if profile != "amazon-s3":
-            raise EnvelopeError(
-                "YINYANG_STORAGE_PROFILE must be amazon-s3 for non-loopback evidence"
-            )
-        if self.source_environment.get("YINYANG_S3_ENDPOINT"):
-            raise EnvelopeError(
-                "YINYANG_S3_ENDPOINT must be unset for the Amazon S3 qualification"
-            )
+        endpoint = self.source_environment.get("YINYANG_S3_ENDPOINT")
+        if self.args.backend_mode == "amazon-s3":
+            if profile != "amazon-s3":
+                raise EnvelopeError(
+                    "YINYANG_STORAGE_PROFILE must be amazon-s3 for this evidence"
+                )
+            if endpoint:
+                raise EnvelopeError(
+                    "YINYANG_S3_ENDPOINT must be unset for the Amazon S3 qualification"
+                )
+        else:
+            if profile != "minio":
+                raise EnvelopeError("Silo smoke mode requires minio storage profile")
+            if not endpoint or not any(
+                host in endpoint
+                for host in ("127.0.0.1", "localhost", "[::1]")
+            ):
+                raise EnvelopeError(
+                    "Silo smoke mode requires a loopback YINYANG_S3_ENDPOINT"
+                )
         for name in (
             "YINYANG_S3_BUCKET",
             "YINYANG_S3_REGION",
@@ -802,7 +1208,7 @@ class Harness:
         }
         for name, value in self.source_environment.items():
             env[name] = value
-        env["YINYANG_STORAGE_PROFILE"] = "amazon-s3"
+        env["YINYANG_STORAGE_PROFILE"] = profile
         env["YINYANG_S3_ROOT"] = self.root
         env["AWS_EC2_METADATA_DISABLED"] = "true"
         return env
@@ -874,11 +1280,16 @@ class Harness:
         )
 
     def aws(self, arguments: list[str], timeout: float = 120) -> dict[str, Any]:
+        endpoint_arguments = []
+        endpoint = self.source_environment.get("YINYANG_S3_ENDPOINT")
+        if self.args.backend_mode == "silo" and endpoint:
+            endpoint_arguments = ["--endpoint-url", endpoint]
         completed = self.run(
             [
                 self.aws_cli,
                 "s3api",
                 *arguments,
+                *endpoint_arguments,
                 "--region",
                 self.source_environment["YINYANG_S3_REGION"],
                 "--no-cli-pager",
@@ -908,19 +1319,20 @@ class Harness:
         if not self.yy.is_file():
             raise EnvelopeError(f"yy binary is unavailable: {self.yy}")
         self.request_accounting = self.load_request_accounting()
-        versioning = self.aws(
-            [
-                "get-bucket-versioning",
-                "--bucket",
-                self.source_environment["YINYANG_S3_BUCKET"],
-            ]
-        )
-        if versioning.get("Status") != "Enabled":
-            raise EnvelopeError(
-                "the dedicated qualification bucket must have versioning enabled"
+        if self.args.backend_mode == "amazon-s3":
+            versioning = self.aws(
+                [
+                    "get-bucket-versioning",
+                    "--bucket",
+                    self.source_environment["YINYANG_S3_BUCKET"],
+                ]
             )
+            self.versioning_status = versioning.get("Status", "unversioned")
+        else:
+            self.versioning_status = "not-queried-silo"
+        self.report["backend"]["versioning"] = self.versioning_status
         # Establish pagination and permission before spending the soak interval.
-        self.remote_history(0.0)
+        self.remote_inventory(0.0)
 
     def write_config(self) -> None:
         document = {
@@ -929,7 +1341,9 @@ class Harness:
             "access": "mount",
             "frontend": "fuse",
             "publication": "object",
-            "storage_profile": "amazon-s3",
+            "storage_profile": self.source_environment[
+                "YINYANG_STORAGE_PROFILE"
+            ],
             "staging": str(self.state),
             "read_only": False,
             "require": [],
@@ -999,52 +1413,208 @@ class Harness:
         self.samples.append(sample)
         return sample
 
-    def remote_history(self, elapsed: float) -> dict[str, Any]:
+    def remote_inventory(self, started_elapsed: float) -> dict[str, Any]:
+        inventory_started = time.monotonic()
         bucket = self.source_environment["YINYANG_S3_BUCKET"]
-        versions = 0
-        delete_markers = 0
-        stored_bytes = 0
-        pages = 0
-        key_marker: str | None = None
-        version_marker: str | None = None
+        prefix = f"{self.root}/"
+        version_pages = 0
+        object_versions: int | None = None
+        delete_markers: int | None = None
+        retained_bytes: int | None = None
+        if self.versioning_status == "Enabled":
+            object_versions = 0
+            delete_markers = 0
+            retained_bytes = 0
+            key_marker: str | None = None
+            version_marker: str | None = None
+            while True:
+                arguments = [
+                    "list-object-versions",
+                    "--bucket",
+                    bucket,
+                    "--prefix",
+                    prefix,
+                    "--no-paginate",
+                ]
+                if key_marker is not None:
+                    arguments.extend(["--key-marker", key_marker])
+                if version_marker is not None:
+                    arguments.extend(["--version-id-marker", version_marker])
+                response = self.aws(arguments, timeout=300)
+                version_pages += 1
+                page_versions = response.get("Versions", [])
+                object_versions += len(page_versions)
+                delete_markers += len(response.get("DeleteMarkers", []))
+                retained_bytes += sum(
+                    int(item.get("Size", 0)) for item in page_versions
+                )
+                if not response.get("IsTruncated", False):
+                    break
+                key_marker = response.get("NextKeyMarker")
+                version_marker = response.get("NextVersionIdMarker")
+                if not key_marker or not version_marker:
+                    raise EnvelopeError(
+                        "ListObjectVersions omitted continuation markers "
+                        "for a truncated page"
+                    )
+        current_pages = 0
+        current_keys = 0
+        current_bytes = 0
+        continuation: str | None = None
         while True:
             arguments = [
-                "list-object-versions",
+                "list-objects-v2",
                 "--bucket",
                 bucket,
                 "--prefix",
-                f"{self.root}/",
+                prefix,
                 "--no-paginate",
             ]
-            if key_marker is not None:
-                arguments.extend(["--key-marker", key_marker])
-            if version_marker is not None:
-                arguments.extend(["--version-id-marker", version_marker])
+            if continuation is not None:
+                arguments.extend(["--continuation-token", continuation])
             response = self.aws(arguments, timeout=300)
-            pages += 1
-            page_versions = response.get("Versions", [])
-            versions += len(page_versions)
-            delete_markers += len(response.get("DeleteMarkers", []))
-            stored_bytes += sum(int(item.get("Size", 0)) for item in page_versions)
+            current_pages += 1
+            contents = response.get("Contents", [])
+            current_keys += len(contents)
+            current_bytes += sum(int(item.get("Size", 0)) for item in contents)
             if not response.get("IsTruncated", False):
                 break
-            key_marker = response.get("NextKeyMarker")
-            version_marker = response.get("NextVersionIdMarker")
-            if not key_marker or not version_marker:
+            continuation = response.get("NextContinuationToken")
+            if not continuation:
                 raise EnvelopeError(
-                    "ListObjectVersions omitted continuation markers for a truncated page"
+                    "ListObjectsV2 omitted a continuation token for a truncated page"
                 )
+        completed_elapsed = started_elapsed + (time.monotonic() - inventory_started)
         sample = {
             "timestamp": utc_now(),
-            "elapsed_seconds": round(elapsed, 3),
-            "object_versions": versions,
+            "started_elapsed_seconds": round(started_elapsed, 3),
+            "completed_elapsed_seconds": round(completed_elapsed, 3),
+            "elapsed_seconds": round(completed_elapsed, 3),
+            "duration_seconds": round(time.monotonic() - inventory_started, 3),
+            "object_versions": object_versions,
             "delete_markers": delete_markers,
-            "stored_bytes": stored_bytes,
-            "pages": pages,
-            "method": "paginated ListObjectVersions over the isolated prefix",
+            "retained_bytes": retained_bytes,
+            "retained_history": (
+                "sampled"
+                if self.versioning_status == "Enabled"
+                else "unavailable-without-versioning"
+            ),
+            "version_pages": version_pages,
+            "current_keys": current_keys,
+            "current_bytes": current_bytes,
+            "current_pages": current_pages,
+            "method": (
+                "paginated ListObjectsV2 and version-aware ListObjectVersions "
+                "over the isolated prefix"
+                if self.versioning_status == "Enabled"
+                else "paginated ListObjectsV2 over the isolated prefix; "
+                "retained versions unavailable"
+            ),
         }
-        self.history_samples.append(sample)
+        self.inventory_samples.append(sample)
         return sample
+
+    def set_phase(self, phase: str) -> None:
+        with self.current_phase_lock:
+            self.current_phase = phase
+
+    def phase_name(self) -> str:
+        with self.current_phase_lock:
+            return self.current_phase
+
+    def start_resource_sampler(self) -> None:
+        if self.resource_thread is not None:
+            raise EnvelopeError("resource sampler is already running")
+        self.resource_stop.clear()
+
+        def sample_loop() -> None:
+            next_sample = time.monotonic()
+            while not self.resource_stop.is_set():
+                try:
+                    self.sample(
+                        time.monotonic() - self.report_started,
+                        self.phase_name(),
+                    )
+                except Exception as error:  # noqa: BLE001 - preserve sampler failure.
+                    self.resource_errors.append(
+                        f"{error.__class__.__name__}: {self.redact(str(error))}"
+                    )
+                    return
+                next_sample += self.args.sample_interval
+                self.resource_stop.wait(
+                    max(0.0, next_sample - time.monotonic())
+                )
+
+        self.resource_thread = threading.Thread(
+            target=sample_loop,
+            name="resource-sampler",
+            daemon=True,
+        )
+        self.resource_thread.start()
+
+    def check_background_errors(self) -> None:
+        if self.resource_errors:
+            raise EnvelopeError(
+                "resource sampler failed: " + "; ".join(self.resource_errors)
+            )
+        if self.history_errors:
+            raise EnvelopeError(
+                "inventory sampler failed: " + "; ".join(self.history_errors)
+            )
+
+    def stop_resource_sampler(self) -> None:
+        if self.resource_thread is None:
+            return
+        self.resource_stop.set()
+        self.resource_thread.join(timeout=30)
+        if self.resource_thread.is_alive():
+            self.resource_errors.append(
+                "resource sampler did not stop within 30 seconds"
+            )
+        self.resource_thread = None
+
+    def start_history_sampler(self) -> None:
+        if self.history_thread is not None:
+            raise EnvelopeError("inventory sampler is already running")
+        self.history_stop.clear()
+        started_elapsed = time.monotonic() - self.report_started
+
+        def inventory_loop() -> None:
+            next_start = started_elapsed + self.args.history_interval
+            while True:
+                delay = next_start - (time.monotonic() - self.report_started)
+                if self.history_stop.wait(max(0.0, delay)):
+                    return
+                try:
+                    self.remote_inventory(
+                        time.monotonic() - self.report_started
+                    )
+                except Exception as error:  # noqa: BLE001 - preserve inventory failure.
+                    self.history_errors.append(
+                        f"{error.__class__.__name__}: {self.redact(str(error))}"
+                    )
+                    return
+                next_start += self.args.history_interval
+
+        self.history_thread = threading.Thread(
+            target=inventory_loop,
+            name="inventory-sampler",
+            daemon=True,
+        )
+        self.history_thread.start()
+
+    def stop_history_sampler(self) -> float:
+        if self.history_thread is None:
+            return 0.0
+        stopped_at = time.monotonic()
+        self.history_stop.set()
+        self.history_thread.join(timeout=330)
+        if self.history_thread.is_alive():
+            self.history_errors.append(
+                "inventory scan did not stop within 330 seconds"
+            )
+        self.history_thread = None
+        return round(time.monotonic() - stopped_at, 3)
 
     def run_phase(
         self, name: str, duration: float, expected: list[bytearray]
@@ -1062,31 +1632,29 @@ class Harness:
         )
         phase_started = time.monotonic()
         phase_deadline = phase_started + duration
+        self.set_phase(name)
+        self.start_history_sampler()
         workload.start()
-        next_sample = phase_started
-        next_history = phase_started + self.args.history_interval
         try:
             while time.monotonic() < phase_deadline:
-                now = time.monotonic()
-                if now >= next_sample:
-                    self.sample(now - self.report_started, name)
-                    next_sample = now + self.args.sample_interval
-                if now >= next_history:
-                    self.remote_history(now - self.report_started)
-                    next_history = now + self.args.history_interval
                 if workload.fatal:
                     raise EnvelopeError("; ".join(workload.fatal))
+                self.check_background_errors()
                 time.sleep(
                     min(
                         0.5,
                         max(0.0, phase_deadline - time.monotonic()),
-                        max(0.0, next_sample - time.monotonic()),
                     )
                 )
         finally:
+            workload_stopped = time.monotonic()
             summary = workload.finish()
+            history_join_seconds = self.stop_history_sampler()
             summary["pwrite_acknowledged_expected"] = {
-                "basis": "pwrite-acknowledged expected bytes; fsync uncertainty is separate",
+                "basis": (
+                    "successfully issued mutation bytes; fsync uncertainty "
+                    "is separate"
+                ),
                 "files": [
                     {
                         "file": f"file-{index:04d}.bin",
@@ -1097,14 +1665,18 @@ class Harness:
                 ],
             }
             summary["planned_seconds"] = duration
-            summary["actual_seconds"] = round(time.monotonic() - phase_started, 3)
+            summary["actual_seconds"] = round(workload_stopped - phase_started, 3)
+            summary["inventory_join_seconds"] = history_join_seconds
             summary["phase_started_report_elapsed_seconds"] = round(
                 phase_started - self.report_started, 3
             )
+            summary["phase_completed_report_elapsed_seconds"] = round(
+                time.monotonic() - self.report_started, 3
+            )
             self.report.setdefault("phases", {})[name] = summary
-            self.sample(time.monotonic() - self.report_started, f"{name}-final")
         if summary["fatal"]:
             raise EnvelopeError("; ".join(summary["fatal"]))
+        self.check_background_errors()
         return summary
 
     def verify_bytes(self, label: str, expected: list[bytearray]) -> dict[str, Any]:
@@ -1204,8 +1776,18 @@ class Harness:
             for sample in self.samples
             if sample["process"]["hwm_bytes"] is not None
         ]
+        retained = [
+            sample["retained_bytes"]
+            for sample in self.inventory_samples
+            if sample["retained_bytes"] is not None
+        ]
         self.report["summary"] = {
-            "samples": len(self.samples),
+            "resource_sampling": sampling_summary(
+                self.samples, self.args.sample_interval
+            ),
+            "inventory_sampling": sampling_summary(
+                self.inventory_samples, self.args.history_interval
+            ),
             "max_rss_bytes": max(rss) if rss else None,
             "max_hwm_bytes": max(hwm) if hwm else None,
             "max_state_allocated_bytes": max(
@@ -1223,6 +1805,25 @@ class Harness:
             "process_io_cumulative": {
                 name: value for name, value in sorted(self.io_totals.items())
             },
+            "max_object_versions": max(
+                (
+                    sample["object_versions"]
+                    for sample in self.inventory_samples
+                    if sample["object_versions"] is not None
+                ),
+                default=None,
+            ),
+            "max_current_keys": max(
+                (
+                    sample["current_keys"]
+                    for sample in self.inventory_samples
+                    if sample["current_keys"] is not None
+                ),
+                default=None,
+            ),
+            "max_retained_bytes": max(retained) if retained else None,
+            "inventory_errors": list(self.history_errors),
+            "resource_sampling_errors": list(self.resource_errors),
         }
 
     def execute(self) -> None:
@@ -1230,19 +1831,24 @@ class Harness:
         self.report["started_at"] = utc_now()
         self.report_started = time.monotonic()
         self.report["phase"] = "mount-start"
+        self.start_resource_sampler()
         self.prepare_authority()
         self.mount.start(self.redact)
         expected = self.create_dataset()
-        self.remote_history(time.monotonic() - self.report_started)
+        inventory_baseline = self.remote_inventory(
+            time.monotonic() - self.report_started
+        )
         first_duration = self.args.duration_seconds / 2
         second_duration = self.args.duration_seconds - first_duration
         self.report["phase"] = "steady-state-one"
+        self.set_phase("steady-state-one")
         first = self.run_phase("steady-state-one", first_duration, expected)
         self.verify_mount_bytes(expected)
         self.report["phase"] = "restart"
+        self.set_phase("restart")
         stopped_one = self.mount.stop(self.redact)
         first_verify = self.verify_bytes("first-phase", expected)
-        self.remote_history(time.monotonic() - self.report_started)
+        self.remote_inventory(time.monotonic() - self.report_started)
         self.mount.start(self.redact)
         self.verify_mount_bytes(expected)
         self.report["restart"] = {
@@ -1251,12 +1857,12 @@ class Harness:
             "remount": "fuse.yinyang",
         }
         self.report["phase"] = "steady-state-two"
+        self.set_phase("steady-state-two")
         second = self.run_phase("steady-state-two", second_duration, expected)
         self.report["phases"] = {
             "steady-state-one": first,
             "steady-state-two": second,
         }
-        self.finalize_statistics()
         self.report["request_accounting"] = self.request_accounting
         uncertain_files = sorted(
             set(first["writers"]["uncertain_files"])
@@ -1269,6 +1875,10 @@ class Harness:
                 first["writers"]["pwrite_errors"]
                 + second["writers"]["pwrite_errors"]
             ),
+            "mutation_errors": (
+                first["writers"]["mutation_errors"]
+                + second["writers"]["mutation_errors"]
+            ),
             "fsync_errors": (
                 first["writers"]["fsync_errors"]
                 + second["writers"]["fsync_errors"]
@@ -1276,6 +1886,7 @@ class Harness:
         }
         self.verify_mount_bytes(expected)
         self.report["phase"] = "final-stop"
+        self.set_phase("final-stop")
         stopped_two = self.mount.stop(self.redact)
         completion = {
             "clean_unmounts": [stopped_one, stopped_two],
@@ -1284,12 +1895,40 @@ class Harness:
         self.report["completion"] = completion
         final_verify = self.verify_bytes("final", expected)
         completion["final_restore"] = final_verify
-        completion["final_remote_history"] = self.remote_history(
+        final_inventory = self.remote_inventory(
             time.monotonic() - self.report_started
         )
+        completion["final_inventory"] = final_inventory
+        completion["inventory_growth"] = {
+            "basis": "post-dataset inventory to final inventory",
+            "current_keys": (
+                final_inventory["current_keys"]
+                - inventory_baseline["current_keys"]
+            ),
+            "current_bytes": (
+                final_inventory["current_bytes"]
+                - inventory_baseline["current_bytes"]
+            ),
+            "object_versions": (
+                "unavailable-without-versioning"
+                if final_inventory["object_versions"] is None
+                else (
+                    final_inventory["object_versions"]
+                    - inventory_baseline["object_versions"]
+                )
+            ),
+            "retained_bytes": (
+                "unavailable-without-versioning"
+                if final_inventory["retained_bytes"] is None
+                else (
+                    final_inventory["retained_bytes"]
+                    - inventory_baseline["retained_bytes"]
+                )
+            ),
+        }
         completion["sqlite"] = self.sqlite_integrity()
         retry_counts = {
-            "pwrite_errors": self.report["durability"]["pwrite_errors"],
+            "mutation_errors": self.report["durability"]["mutation_errors"],
             "reader_errors": first["readers"]["errors"] + second["readers"]["errors"],
             "fsync_errors": self.report["durability"]["fsync_errors"],
             "fsync_retry_attempts": (
@@ -1344,8 +1983,10 @@ class Harness:
         }
         completion["acknowledgment"] = acknowledgment
         unsafe = []
-        if retry_counts["pwrite_errors"]:
-            unsafe.append(f"pwrite_errors={retry_counts['pwrite_errors']}")
+        if retry_counts["mutation_errors"]:
+            unsafe.append(
+                f"mutation_errors={retry_counts['mutation_errors']}"
+            )
         if retry_counts["reader_errors"]:
             unsafe.append(f"reader_errors={retry_counts['reader_errors']}")
         if retry_counts["fatal"]:
@@ -1448,6 +2089,9 @@ class Harness:
         completion["doctor"] = doctor
         if doctor.get("status") != "pass":
             raise EnvelopeError(f"doctor status is {doctor.get('status')!r}")
+        self.stop_resource_sampler()
+        self.check_background_errors()
+        self.finalize_statistics()
         self.report["status"] = "pass"
         self.report["phase"] = "complete"
         self.report["ended_at"] = utc_now()
@@ -1460,6 +2104,8 @@ class Harness:
             self.report["workdir_retained"] = True
 
     def cleanup_failure(self) -> None:
+        self.stop_resource_sampler()
+        self.stop_history_sampler()
         self.mount.force_unmount()
         self.report["workdir_retained"] = True
 
@@ -1469,27 +2115,51 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     if not yy.is_file():
         raise EnvelopeError(f"yy binary is unavailable: {yy}")
     source_sha = args.source_sha.strip()
-    if len(source_sha) != 40 or any(character not in "0123456789abcdef" for character in source_sha):
-        raise EnvelopeError("--source-sha must be a 40-character lowercase Git SHA")
+    if len(source_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in source_sha
+    ):
+        raise EnvelopeError(
+            "--source-sha must be a 40-character lowercase Git SHA"
+        )
+    script_source_sha = args.script_source_sha.strip()
+    if len(script_source_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in script_source_sha
+    ):
+        raise EnvelopeError(
+            "--script-source-sha must be a 40-character lowercase Git SHA"
+        )
     return {
         "schema": SCHEMA,
         "status": "fail",
         "started_at": utc_now(),
         "source_sha": source_sha,
+        "artifact_source": {
+            "source_sha": source_sha,
+            "provenance": args.artifact_provenance,
+        },
+        "qualification_script": {
+            "source_sha": script_source_sha,
+        },
         "binary": {
             "path": str(yy),
             "sha256": binary_sha256(yy),
         },
         "backend": {
             "label": args.backend_label,
+            "mode": args.backend_mode,
             "profile": os.environ.get("YINYANG_STORAGE_PROFILE"),
             "region": os.environ.get("YINYANG_S3_REGION"),
             "bucket": os.environ.get("YINYANG_S3_BUCKET"),
-            "endpoint": "provider-default",
+            "endpoint": os.environ.get(
+                "YINYANG_S3_ENDPOINT", "provider-default"
+            ),
         },
         "host": host_identity(),
         "workload": {
             "duration_seconds": args.duration_seconds,
+            "phases": 2,
+            "files": args.files,
+            "initial_file_bytes": args.file_bytes,
             "sample_interval_seconds": args.sample_interval,
             "history_interval_seconds": args.history_interval,
             "writers": args.writers,
@@ -1499,12 +2169,19 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "fsync_retry_seconds": args.fsync_retry_seconds,
             "fsync_retry_interval": args.fsync_retry_interval,
             "restart_at_fraction": 0.5,
+            "mutation_cycle": list(MUTATION_CYCLE),
+            "bounded_extension_bytes": BOUNDED_EXTENSION_BYTES,
+            "bounded_shrink_bytes": BOUNDED_SHRINK_BYTES,
+            "reader_validation": (
+                "one 4 KiB range per stable file epoch; concurrent transitions "
+                "are recorded as skipped, not as corruption"
+            ),
         },
         "limits": [
             "one finite sample on one host and one exact binary",
-            "not a production throughput, latency, concurrency or capacity claim",
-            "whole-file Managed staging can retain a complete new S3 version per write",
-            "no automatic garbage collection or retained-history upper bound",
+            "not a production throughput, latency, capacity, or endurance claim",
+            "retained version history is unavailable when bucket versioning is disabled",
+            "current-key inventory is not an atomic snapshot of workload writes",
             "optional exact request count requires compatible process-scoped client accounting",
         ],
     }
@@ -1533,7 +2210,27 @@ def atomic_json(path: Path, document: dict[str, Any]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--yy", required=True, help="installed yy binary to measure")
-    parser.add_argument("--source-sha", required=True, help="40-character source commit")
+    parser.add_argument(
+        "--source-sha",
+        required=True,
+        help="40-character source commit recorded by the measured artifact",
+    )
+    parser.add_argument(
+        "--script-source-sha",
+        required=True,
+        help="40-character checkout commit that supplied this harness",
+    )
+    parser.add_argument(
+        "--artifact-provenance",
+        default="supplied-by-caller",
+        help="human-readable source of the measured artifact identity",
+    )
+    parser.add_argument(
+        "--backend-mode",
+        choices=("amazon-s3", "silo"),
+        default="amazon-s3",
+        help="amazon-s3 for qualification or silo for a loopback smoke",
+    )
     parser.add_argument("--backend-label", required=True)
     parser.add_argument("--output", required=True, help="JSON evidence destination")
     parser.add_argument(
@@ -1541,11 +2238,11 @@ def parse_args() -> argparse.Namespace:
         default="/var/tmp/yinyang-operating-envelope",
         help="private parent for temporary state",
     )
-    parser.add_argument("--duration-seconds", type=int, default=2700)
+    parser.add_argument("--duration-seconds", type=int, default=1800)
     parser.add_argument("--sample-interval", type=float, default=5.0)
     parser.add_argument("--history-interval", type=float, default=300.0)
-    parser.add_argument("--files", type=int, default=24)
-    parser.add_argument("--file-bytes", type=int, default=256 * 1024)
+    parser.add_argument("--files", type=int, default=8)
+    parser.add_argument("--file-bytes", type=int, default=DEFAULT_FILE_BYTES)
     parser.add_argument("--writers", type=int, default=4)
     parser.add_argument("--readers", type=int, default=2)
     parser.add_argument("--write-interval", type=float, default=2.0)
@@ -1565,8 +2262,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("sample and history intervals must be positive")
     if args.files <= 0 or args.file_bytes <= 0:
         parser.error("files and file bytes must be positive")
-    if args.file_bytes % PAGE_BYTES != 0:
-        parser.error("--file-bytes must be a multiple of 4096")
+    if args.file_bytes <= PAGE_BYTES:
+        parser.error("--file-bytes must be larger than one 4096-byte page")
+    if args.file_bytes - BOUNDED_SHRINK_BYTES < PAGE_BYTES:
+        parser.error("--file-bytes is too small for the bounded shrink cycle")
     if args.writers <= 0 or args.writers > args.files:
         parser.error("--writers must be between 1 and --files")
     if args.readers < 0:
