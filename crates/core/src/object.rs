@@ -114,13 +114,7 @@ impl ObjectState {
                 *self.filesystem.as_bytes(),
                 *self.root.as_bytes(),
                 self.revision.wire(),
-                [
-                    roots[0].clone(),
-                    roots[1].clone(),
-                    roots[2].clone(),
-                    roots[3].clone(),
-                    roots[4].clone(),
-                ],
+                [roots[0], roots[1], roots[2], roots[3], roots[4]],
             ))?,
             1 => encode(&(
                 OBJECT_SNAPSHOT_EXPIRY_MAGIC,

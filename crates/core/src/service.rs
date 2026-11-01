@@ -681,31 +681,29 @@ impl MetadataService {
             if volume != expected_volume || root != expected_root {
                 return Err(Error::invalid("expire revisions", "authority changed"));
             }
-            if profile == SchemaProfile::Expiry {
-                if let Some(marker) = load_expiry(&tx, &operation_key(request_for_write.id()))? {
-                    if marker.request_digest != request_digest {
-                        return Err(Error::invalid(
-                            "expire revisions",
-                            "operation identity was reused with a different request",
-                        ));
-                    }
-                    request_for_write.validate_marker(&marker)?;
-                    for candidate in request_for_write.candidates() {
-                        let bytes = load_expiry(&tx, &revision_key(*candidate))?.ok_or_else(|| {
-                            corrupt_schema(
-                                "committed expiry operation is missing a revision marker",
-                            )
-                        })?;
-                        if bytes != marker {
-                            return Err(corrupt_schema(
-                                "expiry operation and revision markers disagree",
-                            ));
-                        }
-                    }
-                    return Ok(ExpiryOutcome::Committed(
-                        request_for_write.receipt(marker),
+            if profile == SchemaProfile::Expiry
+                && let Some(marker) = load_expiry(&tx, &operation_key(request_for_write.id()))?
+            {
+                if marker.request_digest != request_digest {
+                    return Err(Error::invalid(
+                        "expire revisions",
+                        "operation identity was reused with a different request",
                     ));
                 }
+                request_for_write.validate_marker(&marker)?;
+                for candidate in request_for_write.candidates() {
+                    let bytes = load_expiry(&tx, &revision_key(*candidate))?.ok_or_else(|| {
+                        corrupt_schema("committed expiry operation is missing a revision marker")
+                    })?;
+                    if bytes != marker {
+                        return Err(corrupt_schema(
+                            "expiry operation and revision markers disagree",
+                        ));
+                    }
+                }
+                return Ok(ExpiryOutcome::Committed(
+                    request_for_write.receipt(marker),
+                ));
             }
             if latest != request_for_write.expected_latest() {
                 return Ok(ExpiryOutcome::Conflict);
@@ -989,24 +987,6 @@ impl MetadataService {
         }
         Transaction::restore(bytes, &snapshot, &prepared).await
     }
-    async fn resolve_plan_receipt(&self, bytes: &[u8]) -> Result<Option<Receipt>> {
-        let identity = Transaction::inspect_replay_identity(bytes)?;
-        if identity.volume != self.filesystem {
-            return Err(Error::invalid(
-                "resolve receipt",
-                "request belongs to another volume",
-            ));
-        }
-        let latest = self.observe_latest().await?;
-        match latest.receipt(identity.id).await? {
-            Some(receipt) if receipt.request_digest == identity.digest => Ok(Some(receipt)),
-            Some(_) => Err(Error::invalid(
-                "resolve receipt",
-                "commit identity was reused with a different request digest",
-            )),
-            None => Ok(None),
-        }
-    }
     pub(crate) async fn commit_encoded(&self, plans: &[Vec<u8>]) -> Result<Vec<Outcome>> {
         if plans.len() > 4096 {
             return Err(Error::unsupported(
@@ -1026,7 +1006,7 @@ impl MetadataService {
                     pending.push((index, self.restore_from_snapshot(plan, snapshot).await?));
                 }
                 Err(error) if error.kind() == ErrorKind::Expired => {
-                    let Some(receipt) = self.resolve_plan_receipt(plan).await? else {
+                    let Some(receipt) = crate::Authority::resolve_receipt(self, plan).await? else {
                         return Err(error);
                     };
                     outcomes[index] = Some(Outcome::Committed(receipt));
