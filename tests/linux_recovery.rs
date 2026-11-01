@@ -1012,17 +1012,10 @@ fn explicit_expiry_case(publication: Publication) {
     let mut fixture = Fixture::new(publication);
     let zero = fixture.remote_create_file("protected.txt", b"version-zero", false);
     let backup_source = fixture.sync_client("expiry-backup-source");
-    // Admit the remote-only initial state before adding a local-only path, so
-    // the package records a real common baseline rather than an initial-sync
-    // conflict.
-    fixture.sync_run_ok(&backup_source);
+    // Admit several remote-only revisions so the package records baseline
+    // entries that are not also local Sync receipts.
     fixture.remote_create_file("expiry-baseline-only.txt", b"external-baseline", false);
-    fixture.sync_run_ok(&backup_source);
-    fs::write(
-        backup_source.directory.join("backup-only.txt"),
-        b"backup-baseline",
-    )
-    .unwrap();
+    fixture.remote_create_file("expiry-latest-only.txt", b"external-latest", false);
     fixture.sync_run_ok(&backup_source);
     let baseline_target = fixture.remote_file_version("expiry-baseline-only.txt").2;
     let backup = fixture.path("expiry-backup");
@@ -1120,6 +1113,10 @@ fn explicit_expiry_case(publication: Publication) {
     ]);
 
     let zero_text = revision_text(zero.cursor.revision);
+    assert_ne!(
+        baseline_target_text, zero_text,
+        "baseline refusal target must differ from the later expiry target"
+    );
     let refusal_cases = [
         (&config, Some(backup.as_path()), "backup_replica_baseline"),
         (&restored.config, None, "replica_baseline"),
