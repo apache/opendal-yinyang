@@ -1540,7 +1540,10 @@ impl Store {
         let digest = local_digest
             .as_deref()
             .ok_or_else(|| Error::corrupt("local scan evidence lacks a digest"))
-            .and_then(|value| fixed(value, "local scan digest"))?;
+            .and_then(|value| {
+                fixed(value, "local scan digest")
+                    .map_err(|error| Error::corrupt(format!("decode local scan digest: {error}")))
+            })?;
         let length = local_length
             .ok_or_else(|| Error::corrupt("local scan evidence lacks a length"))
             .and_then(|value| {
@@ -1549,15 +1552,25 @@ impl Store {
         let dev = local_dev
             .as_deref()
             .ok_or_else(|| Error::corrupt("local scan evidence lacks a device"))
-            .and_then(|value| number(value, "local scan device"))?;
+            .and_then(|value| {
+                number(value, "local scan device")
+                    .map_err(|error| Error::corrupt(format!("decode local scan device: {error}")))
+            })?;
         let ino = local_ino
             .as_deref()
             .ok_or_else(|| Error::corrupt("local scan evidence lacks an inode"))
-            .and_then(|value| number(value, "local scan inode"))?;
+            .and_then(|value| {
+                number(value, "local scan inode")
+                    .map_err(|error| Error::corrupt(format!("decode local scan inode: {error}")))
+            })?;
         let parent = match (local_parent_dev, local_parent_ino) {
             (Some(dev), Some(ino)) => Some(Identity {
-                dev: number(&dev, "local scan parent device")?,
-                ino: number(&ino, "local scan parent inode")?,
+                dev: number(&dev, "local scan parent device").map_err(|error| {
+                    Error::corrupt(format!("decode local scan parent device: {error}"))
+                })?,
+                ino: number(&ino, "local scan parent inode").map_err(|error| {
+                    Error::corrupt(format!("decode local scan parent inode: {error}"))
+                })?,
             }),
             (None, None) => None,
             _ => return Err(Error::corrupt("incomplete local scan parent identity")),
