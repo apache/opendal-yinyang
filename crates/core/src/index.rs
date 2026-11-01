@@ -18,7 +18,6 @@
 use crate::compatibility::OBJECT_INDEX_MAGIC;
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::{Error, Result};
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -28,9 +27,7 @@ const PAGE_BYTES: u32 = 64 * 1024;
 const VALUE_BYTES: u32 = 16 * 1024 * 1024;
 const INLINE: usize = 512;
 const KEY_BYTES: usize = 1024;
-const CACHED_PAGES: usize = 256;
-const CACHED_VALUES: usize = 4096;
-const CACHED_VALUE_BYTES: usize = 32 * 1024 * 1024;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
 type Wire = ([u8; 8], u8, Vec<(Vec<u8>, Vec<u8>, Option<RefWire>)>);
 
 /// An immutable, authenticated B+ tree. Branch separators are inclusive maxima.
@@ -42,10 +39,12 @@ pub(crate) trait MetadataVisitor: Send {
     fn value(&mut self, reference: Option<&PackedRef>, key: &[u8], bytes: &[u8]);
 }
 
-/// Operation-local memoization for one immutable snapshot view.
+/// Authority-lifetime memoization shared by immutable snapshot views.
 ///
-/// Index pages and external values are content-addressed, so reuse cannot
-/// change what the pinned snapshot observes. Writers never use this cache.
+/// Index pages and external values are content-addressed, so reuse across
+/// snapshots cannot change what a pinned snapshot observes. The byte bound is
+/// shared by pages and values and eviction is oldest-use-first. Writers pass
+/// no cache and therefore never populate or consume it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IndexCache {
     state: Arc<Mutex<IndexCacheState>>,
@@ -53,18 +52,29 @@ pub(crate) struct IndexCache {
 
 #[derive(Debug, Default)]
 struct IndexCacheState {
-    pages: HashMap<PackedRef, Vec<u8>>,
-    values: HashMap<PackedRef, Vec<u8>>,
-    value_bytes: usize,
+    pages: HashMap<PackedRef, CacheEntry>,
+    values: HashMap<PackedRef, CacheEntry>,
+    bytes: usize,
+    clock: u64,
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    bytes: Vec<u8>,
+    last_used: u64,
 }
 
 impl IndexCache {
     fn page(&self, reference: &PackedRef) -> Option<Vec<u8>> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.pages.get(reference).cloned()
+        state.clock = state.clock.saturating_add(1);
+        let clock = state.clock;
+        let entry = state.pages.get_mut(reference)?;
+        entry.last_used = clock;
+        Some(entry.bytes.clone())
     }
 
     fn insert_page(&self, reference: PackedRef, bytes: Vec<u8>) {
@@ -72,17 +82,29 @@ impl IndexCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.pages.len() < CACHED_PAGES {
-            state.pages.entry(reference).or_insert(bytes);
-        }
+        let state = &mut *state;
+        state.clock = state.clock.saturating_add(1);
+        insert_bounded(
+            &mut state.pages,
+            &mut state.values,
+            &mut state.bytes,
+            reference,
+            bytes,
+            state.clock,
+            true,
+        );
     }
 
     fn value(&self, reference: &PackedRef) -> Option<Vec<u8>> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.values.get(reference).cloned()
+        state.clock = state.clock.saturating_add(1);
+        let clock = state.clock;
+        let entry = state.values.get_mut(reference)?;
+        entry.last_used = clock;
+        Some(entry.bytes.clone())
     }
 
     fn insert_value(&self, reference: PackedRef, bytes: Vec<u8>) {
@@ -90,17 +112,90 @@ impl IndexCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.values.len() >= CACHED_VALUES {
+        let state = &mut *state;
+        state.clock = state.clock.saturating_add(1);
+        insert_bounded(
+            &mut state.pages,
+            &mut state.values,
+            &mut state.bytes,
+            reference,
+            bytes,
+            state.clock,
+            false,
+        );
+    }
+}
+
+fn insert_bounded(
+    pages: &mut HashMap<PackedRef, CacheEntry>,
+    values: &mut HashMap<PackedRef, CacheEntry>,
+    charged: &mut usize,
+    reference: PackedRef,
+    bytes: Vec<u8>,
+    clock: u64,
+    target_is_page: bool,
+) {
+    if bytes.len() > CACHE_BYTES
+        || pages.contains_key(&reference)
+        || values.contains_key(&reference)
+    {
+        return;
+    }
+    while charged.saturating_add(bytes.len()) > CACHE_BYTES {
+        if !evict_one(pages, values, charged) {
             return;
         }
-        let state = &mut *state;
-        if let Entry::Vacant(entry) = state.values.entry(reference) {
-            let next = state.value_bytes.saturating_add(bytes.len());
-            if next <= CACHED_VALUE_BYTES {
-                state.value_bytes = next;
-                entry.insert(bytes);
-            }
-        }
+    }
+    *charged += bytes.len();
+    if target_is_page {
+        pages.insert(
+            reference,
+            CacheEntry {
+                bytes,
+                last_used: clock,
+            },
+        );
+    } else {
+        values.insert(
+            reference,
+            CacheEntry {
+                bytes,
+                last_used: clock,
+            },
+        );
+    }
+}
+
+fn evict_one(
+    pages: &mut HashMap<PackedRef, CacheEntry>,
+    values: &mut HashMap<PackedRef, CacheEntry>,
+    charged: &mut usize,
+) -> bool {
+    let page = pages
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(reference, entry)| (true, reference.clone(), entry.bytes.len()));
+    let value = values
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(reference, entry)| (false, reference.clone(), entry.bytes.len()));
+    let (is_page, reference, length) = match (page, value) {
+        (Some(page), Some(value)) if page.2 <= value.2 => page,
+        (Some(_), Some(value)) => value,
+        (Some(page), None) => page,
+        (None, Some(value)) => value,
+        (None, None) => return false,
+    };
+    let removed = if is_page {
+        pages.remove(&reference)
+    } else {
+        values.remove(&reference)
+    };
+    if let Some(removed) = removed {
+        *charged = charged.saturating_sub(length);
+        true
+    } else {
+        false
     }
 }
 
@@ -545,7 +640,7 @@ mod tests {
     use crate::{ErrorKind, NodeId, support::TestBackend};
 
     #[test]
-    fn cache_charges_duplicate_values_once_and_respects_its_bounds() {
+    fn cache_charges_duplicate_values_once_and_respects_its_byte_bound() {
         let cache = IndexCache::default();
         let reference = PackedRef {
             object: [1; 16],
@@ -558,19 +653,21 @@ mod tests {
         {
             let state = cache.state.lock().unwrap();
             assert_eq!(state.values.len(), 1);
-            assert_eq!(state.value_bytes, 4);
+            assert_eq!(state.bytes, 4);
         }
 
-        for i in 0..CACHED_VALUES + 1 {
+        for i in 0..4 {
             let reference = PackedRef {
                 object: (i as u128).to_be_bytes(),
                 offset: i as u64,
-                length: 1,
+                length: 20 * 1024 * 1024,
                 digest: [3; 32],
             };
-            cache.insert_value(reference, vec![0]);
+            cache.insert_value(reference, vec![0; 20 * 1024 * 1024]);
         }
-        assert_eq!(cache.state.lock().unwrap().values.len(), CACHED_VALUES);
+        let state = cache.state.lock().unwrap();
+        assert!(state.bytes <= CACHE_BYTES);
+        assert!(state.values.len() < 4);
     }
 
     #[tokio::test]
