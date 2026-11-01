@@ -2211,7 +2211,7 @@ fn legacy_pre_expiry(
             let original_address = fixture.service_address();
             fixture.stop_service();
             let metadata = fixture.path("metadata.db");
-            let mut service = legacy_service(binary, fixture, &metadata);
+            let service = legacy_service(binary, fixture, &metadata);
             let config = fixture.path("legacy-service.json");
             write_read_only_service_config(&config, &fixture.path("legacy-state"), service.address);
             let receipt = legacy_yy(
