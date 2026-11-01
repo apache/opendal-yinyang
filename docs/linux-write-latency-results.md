@@ -181,6 +181,9 @@ pages.
 - [Optimized binary identity](benchmarks/linux-cost-write-latency-2026-11-01-optimized-8403d18.binary.txt)
 
 The raw records retain source and binary identity, exact datasets, every
-end-to-end and phase sample, batch wall, process I/O, S3 and service request
-intervals, maximum observed concurrency, space, completion semantics, and
-successful complete-byte checks.
+end-to-end and phase sample, batch wall, process I/O, S3 and service proxy
+request-window summaries (active, union, weighted excess, maximum, and
+in-flight), space, completion semantics, and successful complete-byte checks.
+The public JSONL does not retain per-request start/end interval arrays or a
+complete timeline. Peak summaries were derived at runtime from the proxy
+intervals.

@@ -238,8 +238,9 @@ Each JSONL record includes:
 - batch totals and per-sample network values, where per-sample divides only a
   sequential batch and explicitly notes that concurrent samples overlap;
 - application `sum - batch span` plus S3 request and metadata-service
-  connection interval summaries, including weighted concurrency excess,
-  maximum observed concurrency, and in-flight work at the end of each phase;
+  connection window summaries, including active and union duration, weighted
+  concurrency excess, maximum observed concurrency, and in-flight work at the
+  end of each phase;
 - allocated local payload, Sync state, mount staging, SQLite database plus
   `-wal`/`-shm`, and persistent S3 object bytes and counts;
 - assertions that completed successfully and the failure count (zero for a
@@ -250,6 +251,11 @@ is the actual latency sample count. The summary shows both `total/sample` values
 so a five-run no-op batch is not presented as one run. A concurrent writer batch
 shares one network interval, so its per-sample network values are descriptive
 shares, not independent operation costs.
+
+The public JSONL retains the request-window summaries, not the per-request
+start/end interval arrays or a complete request timeline. Peak concurrency and
+overlap summaries are derived at runtime from proxy intervals before each
+record is written.
 
 `/proc/<pid>/io` is polled while the process is alive, so terminal increments can
 be missed and every value is a lower bound. Character counts also include socket
