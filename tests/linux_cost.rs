@@ -1307,10 +1307,11 @@ fn run_write_latency_case(
         vec!["writable mount type=fuse.yinyang".to_owned()],
     );
 
+    let mountpoint_root = &mountpoint;
     let all_paths = (0..WRITE_LATENCY_BATCHES)
         .flat_map(|batch| {
             (0..WRITE_LATENCY_BATCH_FILES).map(move |index| {
-                mountpoint.join(format!("write-latency/batch-{batch}-file-{index:02}.bin"))
+                mountpoint_root.join(format!("write-latency/batch-{batch}-file-{index:02}.bin"))
             })
         })
         .collect::<Vec<_>>();
@@ -1405,6 +1406,8 @@ fn run_write_latency_case(
         fsync_ms: samples.iter().map(|sample| sample.fsync_ms).collect(),
     };
     let application_active_ms = latencies.iter().sum::<f64>();
+    let s3_max_concurrency = network.s3_activity.max_concurrency;
+    let service_max_concurrency = network.service_activity.max_concurrency;
     recorder.record_with_timing(
         context,
         &format!("fuse_write_latency_{writers}"),
@@ -1427,11 +1430,11 @@ fn run_write_latency_case(
             ),
             format!(
                 "observed_s3_request_max_concurrency={}",
-                network.s3_activity.max_concurrency
+                s3_max_concurrency
             ),
             format!(
                 "observed_service_rpc_max_concurrency={}",
-                network.service_activity.max_concurrency
+                service_max_concurrency
             ),
             "network totals cover the complete lifecycle batch; phase arrays are latency diagnostics, not network attribution"
                 .to_owned(),
