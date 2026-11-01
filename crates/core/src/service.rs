@@ -960,10 +960,14 @@ impl MetadataService {
         self.remember(&content).await
     }
     pub async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
-        let (revision, files) = Transaction::inspect(bytes)?;
+        let (revision, _) = Transaction::inspect(bytes)?;
         let snapshot = self.observe_revision(revision).await?;
+        self.restore_from_snapshot(bytes, snapshot).await
+    }
+    async fn restore_from_snapshot(&self, bytes: &[u8], snapshot: Snapshot) -> Result<Transaction> {
         let db = connect(&self.path, false).await?;
         let mut prepared = Vec::new();
+        let (_, files) = Transaction::inspect(bytes)?;
         for file in files {
             let descriptor = file.to_bytes();
             let present = db_call(&db, move |c| {
@@ -985,6 +989,80 @@ impl MetadataService {
         }
         Transaction::restore(bytes, &snapshot, &prepared).await
     }
+    async fn resolve_plan_receipt(&self, bytes: &[u8]) -> Result<Option<Receipt>> {
+        let identity = Transaction::inspect_replay_identity(bytes)?;
+        if identity.volume != self.filesystem {
+            return Err(Error::invalid(
+                "resolve receipt",
+                "request belongs to another volume",
+            ));
+        }
+        let latest = self.observe_latest().await?;
+        match latest.receipt(identity.id).await? {
+            Some(receipt) if receipt.request_digest == identity.digest => Ok(Some(receipt)),
+            Some(_) => Err(Error::invalid(
+                "resolve receipt",
+                "commit identity was reused with a different request digest",
+            )),
+            None => Ok(None),
+        }
+    }
+    pub async fn commit_encoded(&self, plans: &[Vec<u8>]) -> Result<Vec<Outcome>> {
+        if plans.len() > 4096 {
+            return Err(Error::unsupported(
+                "service batch",
+                "more than 4096 requests",
+            ));
+        }
+        if plans.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut outcomes = vec![None; plans.len()];
+        let mut pending = Vec::new();
+        for (index, plan) in plans.iter().enumerate() {
+            let (base, _) = Transaction::inspect(plan)?;
+            match self.observe_revision(base).await {
+                Ok(snapshot) => {
+                    pending.push((index, self.restore_from_snapshot(plan, snapshot).await?));
+                }
+                Err(error) if error.kind() == ErrorKind::Expired => {
+                    let Some(receipt) = self.resolve_plan_receipt(plan).await? else {
+                        return Err(error);
+                    };
+                    outcomes[index] = Some(Outcome::Committed(receipt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !pending.is_empty() {
+            let requests = pending
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect::<Vec<_>>();
+            let published = match self.publish(&requests).await {
+                Ok(outcomes) => outcomes,
+                Err(error) if error.kind() == ErrorKind::Storage => {
+                    vec![Outcome::Retryable; requests.len()]
+                }
+                Err(error) => return Err(error),
+            };
+            for ((index, _), outcome) in pending.into_iter().zip(published) {
+                outcomes[index] = Some(outcome);
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Corrupt,
+                        "service batch",
+                        "missing outcome for an encoded request",
+                    )
+                })
+            })
+            .collect()
+    }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
             .commit_batch(std::slice::from_ref(request))
@@ -992,28 +1070,11 @@ impl MetadataService {
             .remove(0))
     }
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
-        if requests.len() > 4096 {
-            return Err(Error::unsupported(
-                "service batch",
-                "more than 4096 requests",
-            ));
-        }
-        if requests.is_empty() {
-            return Ok(vec![]);
-        }
-        // Even an in-process caller must have registered durable readiness.
-        let mut restored = Vec::new();
-        for request in requests {
-            request.validate(self.filesystem)?;
-            restored.push(self.restore_transaction(&request.to_bytes()?).await?);
-        }
-        let result = self.publish(&restored).await;
-        match result {
-            Err(e) if e.kind() == ErrorKind::Storage => {
-                Ok(requests.iter().map(|_| Outcome::Retryable).collect())
-            }
-            other => other,
-        }
+        let plans = requests
+            .iter()
+            .map(Transaction::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_encoded(&plans).await
     }
     async fn publish(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
         let db = connect(&self.path, false).await?;

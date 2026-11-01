@@ -185,7 +185,7 @@ async fn suite(fs: &dyn Authority) {
     assert_eq!(bytes, expected);
 }
 
-async fn expiry_contract(fs: &dyn Authority) {
+async fn expiry_contract(fs: &dyn Authority, label: &str) {
     let initial = fs.observe_latest().await.unwrap();
     let held_content = fs.prepare(&mut b"held".as_slice()).await.unwrap();
     let mut first = Planner::new(&initial, CommitId::generate());
@@ -201,6 +201,7 @@ async fn expiry_contract(fs: &dyn Authority) {
     let first_receipt = committed(fs.commit(&first_plan).await.unwrap());
     let first_revision = initial.revision();
     let held = fs.observe_latest().await.unwrap();
+    let held_revision = held.revision();
     let held_version = held.open_file(held_file).await.unwrap();
 
     let mut second = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
@@ -215,7 +216,7 @@ async fn expiry_contract(fs: &dyn Authority) {
         fs.filesystem(),
         ExpiryId::generate(),
         latest,
-        vec![first_revision],
+        vec![first_revision, held_revision],
         Vec::new(),
         [7; 32],
     )
@@ -223,9 +224,9 @@ async fn expiry_contract(fs: &dyn Authority) {
     let ExpiryOutcome::Committed(receipt) =
         Authority::expire_revisions(fs, &request).await.unwrap()
     else {
-        panic!("expected committed expiry");
+        panic!("{label}: expected committed expiry");
     };
-    assert_eq!(receipt.expired, vec![first_revision]);
+    assert_eq!(receipt.expired, vec![first_revision, held_revision]);
     assert_eq!(receipt.before, latest);
     assert!(receipt.after > latest);
 
@@ -240,9 +241,14 @@ async fn expiry_contract(fs: &dyn Authority) {
         .unwrap_err();
     assert_eq!(absent.kind(), ErrorKind::NotFound);
 
-    let history = Authority::history_page(fs, None, 256).await.unwrap();
+    let history = Authority::history_page(fs, None, 256)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: read history: {error}"));
     assert!(history.entries.iter().any(|entry| {
         entry.revision == first_revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == held_revision && matches!(entry.state, RevisionState::Expired(_))
     }));
     assert!(history.entries.iter().any(|entry| {
         entry.revision == receipt.after && matches!(entry.state, RevisionState::Readable)
@@ -255,6 +261,10 @@ async fn expiry_contract(fs: &dyn Authority) {
         .unwrap()
         .expect("original receipt remains resolvable");
     assert_eq!(resolved, first_receipt);
+    assert_eq!(
+        committed(fs.commit(&first_plan).await.unwrap()),
+        first_receipt
+    );
 
     type Wire = (
         [u8; 8],
@@ -288,7 +298,7 @@ async fn expiry_contract(fs: &dyn Authority) {
     let ExpiryOutcome::Refused(refusal) =
         Authority::expire_revisions(fs, &protected).await.unwrap()
     else {
-        panic!("expected protected refusal");
+        panic!("{label}: expected protected refusal");
     };
     assert!(refusal.conflicts.iter().any(|conflict| {
         conflict.revision == first_revision
@@ -309,7 +319,7 @@ async fn expiry_contract(fs: &dyn Authority) {
     .unwrap();
     let ExpiryOutcome::Refused(refusal) = Authority::expire_revisions(fs, &missing).await.unwrap()
     else {
-        panic!("expected missing refusal");
+        panic!("{label}: expected missing refusal");
     };
     assert!(
         refusal
@@ -354,14 +364,14 @@ async fn logical_expiry_contract_object_service_and_client() {
     let object = ObjectFs::create(object_backend.operator(), BackendProfile::Minio)
         .await
         .unwrap();
-    expiry_contract(&object).await;
+    expiry_contract(&object, "object").await;
 
     let dir = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
     let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
         .await
         .unwrap();
-    expiry_contract(&service).await;
+    expiry_contract(&service, "embedded-service").await;
 
     let dir = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
@@ -375,7 +385,7 @@ async fn logical_expiry_contract_object_service_and_client() {
     let client = ServiceClient::connect(addr, token.into(), backend.operator())
         .await
         .unwrap();
-    expiry_contract(&client).await;
+    expiry_contract(&client, "service-client").await;
     server.abort();
     let _ = server.await;
 }

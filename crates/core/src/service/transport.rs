@@ -409,13 +409,9 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
             if plans.len() > 4096 {
                 return Err(protocol());
             }
-            let mut requests = Vec::new();
-            for plan in plans {
-                requests.push(service.restore_transaction(&plan).await?);
-            }
             Response::Outcomes(
                 service
-                    .commit_batch(&requests)
+                    .commit_encoded(&plans)
                     .await?
                     .into_iter()
                     .map(|outcome| {
