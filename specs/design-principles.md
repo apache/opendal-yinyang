@@ -47,7 +47,7 @@ a second one beside it.
 | Concept | Single owner |
 | --- | --- |
 | Volume configuration loading, relative path resolution and admission | `volume` |
-| Root and state containment check | `volume` |
+| Root and state containment check | the sync engine's local tree |
 | Storage operator and service token construction from the environment | `volume` |
 | Error kinds, errno mapping and CLI exit codes | `runtime::error` over the core `ErrorKind` |
 | SQLite open, schema check, durability mode and row encoding | the local store |
@@ -102,6 +102,9 @@ choice.
   locally durable before dispatch. The record that a request may have been
   dispatched is also durable before dispatch, so a crash can never turn an
   Unknown outcome into a safe abort.
+- A journal record that crash recovery needs to interpret a local filesystem
+  change, such as an install, exchange or rename, is durable before that
+  change.
 - Local stores run SQLite in WAL mode with `synchronous=NORMAL` and make the
   state durable at the barriers above. A store does not pay a per-write fsync
   for a guarantee the contract does not make.
@@ -111,8 +114,9 @@ choice.
 - Bytes are verified where they cross a trust boundary: content prepared from
   a local source, content imported from an untrusted descriptor, and content
   read back from remote storage for a user.
-- Content prepared by this process, or recorded as prepared in durable local
-  state, is not imported again before publication.
+- Content prepared by this process is not imported again before this process
+  publishes it. Recovery after a restart verifies recorded content at most
+  once.
 - A remote read-back needs a stated integrity requirement and reads each byte
   at most once.
 
