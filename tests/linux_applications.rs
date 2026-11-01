@@ -309,10 +309,11 @@ fn tar_extract(archive: &Path, destination: &Path) -> AppOutput {
     run_application(command)
 }
 
-fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool) {
+fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool, root_mode: u32) {
     let file_mode = if read_only { 0o444 } else { 0o644 };
-    let writable_mode = if read_only { 0o555 } else { 0o755 };
+    let executable_mode = if read_only { 0o555 } else { 0o755 };
     let directory_mode = if read_only { 0o555 } else { 0o755 };
+    assert_eq!(mode(root), root_mode, "extraction root mode");
     assert_file(
         &root.join("assets/payload.bin"),
         expected_payload,
@@ -331,7 +332,7 @@ fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool) 
     assert_file(
         &root.join("bin/run.sh"),
         b"#!/bin/sh\nprintf 'archive trial\\n'\n",
-        writable_mode,
+        executable_mode,
     );
     for directory in ["assets", "bin", "notes"] {
         let path = root.join(directory);
@@ -370,7 +371,8 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         let mut mounted = fixture.mount(&config, &mountpoint);
         fs::create_dir(&extracted).expect("create mounted extraction root");
         tar_extract(&archive, &extracted).success_or("extract tar through FUSE");
-        assert_tar_round_trip(&extracted, &expected_payload, false);
+        // --no-overwrite-dir leaves the pre-created writable root at 0755.
+        assert_tar_round_trip(&extracted, &expected_payload, false, 0o755);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/notes/readme.txt", 64),
             b"YinYang application trial\n"
@@ -408,6 +410,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
             remounted.mountpoint().join("tar-tree").as_path(),
             &expected_payload,
             true,
+            0o555,
         );
         let mounted_archive = fixture.temp.path().join("mounted-tree.tar");
         assert!(
@@ -419,7 +422,8 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         fs::create_dir(&roundtrip).expect("create local tar round-trip root");
         tar_extract(&mounted_archive, &roundtrip)
             .success_or("extract mounted-tree archive locally");
-        assert_tar_round_trip(&roundtrip, &expected_payload, true);
+        // The local no-overwrite-dir target also keeps its pre-created 0755 root.
+        assert_tar_round_trip(&roundtrip, &expected_payload, true, 0o755);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/bin/run.sh", 64),
             b"#!/bin/sh\nprintf 'archive trial\\n'\n"
