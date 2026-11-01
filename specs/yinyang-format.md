@@ -162,7 +162,7 @@ Physical references never enter logical content identities or request digests.
   successor records its predecessor descriptor; descriptors never hash themselves.
 - Expiry index key: `(tag:u8=0, revision:Revision)` for an expired revision, or
   `(tag:u8=1, operation_id:[u8;16])` for a committed operation record.
-- Expiry value: `(YYEXP01:[u8;8], operation_id:[u8;16],
+- Expiry value: `(YYEXP01:[u8;7], operation_id:[u8;16],
   request_digest:[u8;32], evidence_digest:[u8;32], before:Revision,
   after:Revision)`. A revision marker and its operation record must agree
   exactly. `after` is the maintenance revision; the original snapshot Ref
