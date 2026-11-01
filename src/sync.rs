@@ -667,7 +667,7 @@ impl Sync {
                     }
                 }
                 Err(error) => {
-                    let failure = Failure::capture(&error);
+                    let failure = Failure::capture(&Error::from(error));
                     for (index, edit, _) in &requests {
                         let _ = namespace::mark_batch_unknown(self, *edit, failure.clone()).await;
                         results[*index] = Some(Err(Error::Retained(failure.clone())));
