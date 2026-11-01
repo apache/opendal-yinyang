@@ -11,13 +11,14 @@ callbacks, local edit tracking and materialization.
 
 ## Content edits
 
-`stage` streams replacement bytes into durable FileHandle staging, in 64 KiB
-chunks. It currently materializes the baseline before replacing it. The returned
-EditId is BLAKE3 with derive-key context `yinyang-sync-content-edit-1` over
-filesystem ID, node ID, 24-byte baseline revision and all replacement bytes.
-Repeating this exact intent returns the same local edit, including after
-restart. An empty replacement is still conditional even when the baseline was
-also empty.
+`stage` streams replacement bytes into FileHandle staging in 64 KiB chunks. It
+materializes the baseline before replacing it, makes the staged bytes durable,
+then commits the local journal mapping with `synchronous=FULL`. It returns only
+after both records are durable. The returned EditId is BLAKE3 with derive-key context
+`yinyang-sync-content-edit-1` over filesystem ID, node ID, 24-byte baseline
+revision and all replacement bytes. Repeating this exact intent returns the same
+local edit, including after restart. An empty replacement is still conditional
+even when the baseline was also empty.
 
 `publish` uses that edit's original staged baseline and frozen request. Remote
 success returns the revision that accepted the edit, never a later observation.
@@ -104,37 +105,35 @@ The required interleavings are:
 
 ## Durable state and resolution
 
-The dedicated directory contains `sync.db` (SQLite WAL, `synchronous=FULL`) and
-`content/` (the existing runtime's durable staging and exclusive process lock).
-Profile `yinyang-sync-2` binds the journal to one filesystem. Its exact schema is
-`binding`, `edits`, and `namespaces`; the maintained positional writers make
-ordered columns part of that signature. Profile `yinyang-sync-1` is the known
-two-table schema `binding` and `edits`.
+The dedicated directory contains `sync.db` and `content/` (the runtime staging
+directory and exclusive process lock). Both databases use SQLite WAL. Staging
+uses `synchronous=NORMAL` with explicit barriers; the journal uses
+`synchronous=FULL`, so every committed intent is durable before dispatch.
+Profile `yinyang-sync-3`
+binds the journal to one filesystem. Its exact schema is `binding`, `edits`,
+and `namespaces`. Schema admission compares exact table and column-name sets,
+not column order. Every insert names its target columns.
 
 A writer validates both the journal and existing staging database read-only
-before changing either component. A valid sync-1 journal is then upgraded in one
-SQLite transaction by creating `namespaces` and advancing the profile to
-sync-2; content mappings, staged bytes, frozen requests, and receipts are not
-rewritten. A sync-2 journal is validated without DDL. Unknown profiles or
-missing/extra/reordered maintained columns fail before PRAGMA journal-mode
-configuration, DDL, staging migration, or incomplete-content cleanup. A
-read-only WAL open may create an empty `-wal` and may create or update derived
-`-shm`; the main database, any existing WAL/journal bytes, configured journal
-mode, logical rows, and recovery state remain unchanged. A missing filesystem
-binding or mismatched filesystem remains an error.
+before changing either component. Older, newer or unknown profiles and
+missing/extra columns fail before journal-mode configuration, DDL, recovery, or
+incomplete-content cleanup. There is no schema upgrade path. A read-only WAL
+open may create an empty `-wal` and may create or update derived `-shm`; the
+main database, any existing WAL/journal bytes, configured journal mode, logical
+rows, and recovery state remain unchanged. A missing filesystem binding or
+mismatched filesystem remains an error.
 
 Opening through `DirectorySync` preflights existing replica, Sync, and content
-staging state as a group before replica upgrade or recovery starts. Inspect and
-backup validation accept sync-1 or sync-2 without migration or a writer lease.
-Keep both databases and their WALs together. Older binaries do not accept a
-state that requires their own unsupported newer profile; downgrade is not
-inferred.
+staging state before recovery starts. Inspect and backup validation accept only
+the current profile without DDL or a writer lease. Keep both databases and their
+WALs together.
 
 The content edit table maps 32-byte EditIds to 16-byte staged handle IDs. A
-mapping is committed only after all local bytes are accepted; publication is
-forbidden before that mapping. Interrupted staging can leave unreferenced,
-never-dispatched content, collected on restart or before the next stage.
-Missing referenced content is an error, not permission to replan.
+mapping is committed with `synchronous=FULL` only after all local bytes are made
+durable;
+publication is forbidden before that mapping. Interrupted staging can leave
+unreferenced, never-dispatched content, collected on restart or before the next
+stage. Missing referenced content is an error, not permission to replan.
 
 Each core `DataStore`, and all of its clones, owns one bounded set of verified
 `ContentDescriptor` values. Preparation records a descriptor only after the
@@ -174,8 +173,9 @@ staging database, relying on the existing invariant that a mapping is committed
 only after its staging record is durable; this ordering avoids a false
 missing-handle result during concurrent staging.
 
-Before dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a durable
-SQLite transaction. A crash or lost response therefore cannot turn a possibly
+The original namespace intent is committed durably when prepared. Before
+dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a
+`synchronous=FULL` transaction. A crash or lost response therefore cannot turn a possibly
 published request into a safe abort. `publish` retries `Unknown` and `Retryable`
 with the same transaction and CommitId. It does not dispatch `Conflict` or
 `Failed` again, and never replans either one. A caller that wants a different

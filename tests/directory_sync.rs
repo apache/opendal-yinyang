@@ -1480,30 +1480,8 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
     assert_eq!(local_tree(&root), remote_tree(&authority).await);
 }
 
-fn make_replica_shape_legacy(state: &Path) {
-    rusqlite::Connection::open(state.join("replica.db"))
-        .unwrap()
-        .execute_batch(
-            "ALTER TABLE baseline DROP COLUMN remote_revision;
-             ALTER TABLE work DROP COLUMN seq;
-             ALTER TABLE work DROP COLUMN source_artifact;",
-        )
-        .unwrap();
-}
-
-fn replica_has_column(state: &Path, table: &str, column: &str) -> bool {
-    let connection = rusqlite::Connection::open(state.join("replica.db")).unwrap();
-    let mut statement = connection
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .unwrap();
-    statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .any(|value| value.unwrap() == column)
-}
-
 #[tokio::test]
-async fn composite_preflight_rejects_unknown_sync_before_replica_upgrade() {
+async fn composite_preflight_rejects_an_old_sync_profile() {
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(
         Fs::create(backend.operator(), BackendProfile::Minio)
@@ -1518,11 +1496,10 @@ async fn composite_preflight_rejects_unknown_sync_before_replica_upgrade() {
             .await
             .unwrap(),
     );
-    make_replica_shape_legacy(&state);
     rusqlite::Connection::open(state.join("sync.db"))
         .unwrap()
         .execute(
-            "UPDATE binding SET profile='yinyang-sync-99' WHERE singleton=1",
+            "UPDATE binding SET profile='yinyang-sync-2' WHERE singleton=1",
             [],
         )
         .unwrap();
@@ -1540,13 +1517,15 @@ async fn composite_preflight_rejects_unknown_sync_before_replica_upgrade() {
             .kind(),
         RuntimeErrorKind::Unsupported
     );
-    assert!(!replica_has_column(&state, "work", "source_artifact"));
-    assert!(!replica_has_column(&state, "work", "seq"));
-    assert!(!replica_has_column(&state, "baseline", "remote_revision"));
+    let profile: String = rusqlite::Connection::open(state.join("sync.db"))
+        .unwrap()
+        .query_row("SELECT profile FROM binding", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(profile, "yinyang-sync-2");
 }
 
 #[tokio::test]
-async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
+async fn composite_preflight_rejects_an_old_staging_profile() {
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(
         Fs::create(backend.operator(), BackendProfile::Minio)
@@ -1561,11 +1540,10 @@ async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
             .await
             .unwrap(),
     );
-    make_replica_shape_legacy(&state);
     rusqlite::Connection::open(state.join("content/staging.db"))
         .unwrap()
         .execute(
-            "UPDATE authority SET profile='yinyang-stage-99' WHERE singleton=1",
+            "UPDATE authority SET profile='yinyang-stage-3' WHERE singleton=1",
             [],
         )
         .unwrap();
@@ -1583,9 +1561,6 @@ async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
             .kind(),
         RuntimeErrorKind::Unsupported
     );
-    assert!(!replica_has_column(&state, "work", "source_artifact"));
-    assert!(!replica_has_column(&state, "work", "seq"));
-    assert!(!replica_has_column(&state, "baseline", "remote_revision"));
     let profile: String = rusqlite::Connection::open(state.join("content/staging.db"))
         .unwrap()
         .query_row(
@@ -1594,5 +1569,5 @@ async fn composite_preflight_rejects_unknown_staging_before_replica_upgrade() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(profile, "yinyang-stage-99");
+    assert_eq!(profile, "yinyang-stage-3");
 }

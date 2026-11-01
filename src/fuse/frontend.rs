@@ -1264,8 +1264,7 @@ fn runtime_errno(error: &crate::runtime::Error) -> fuser::Errno {
         | ErrorKind::Unknown
         | ErrorKind::Corrupt
         | ErrorKind::Storage
-        | ErrorKind::Io
-        | ErrorKind::Unclassified => fuser::Errno::EIO,
+        | ErrorKind::Io => fuser::Errno::EIO,
     }
 }
 

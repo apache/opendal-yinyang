@@ -861,14 +861,16 @@ impl Replica {
             Some(&hints),
         )?;
         if self._lease.is_some() {
-            for (path, node) in &nodes {
-                if !hints
-                    .get(path)
-                    .is_some_and(|hint| scan_hint_matches_node(node, hint))
-                {
-                    self.store.save_local_scan_evidence(node)?;
-                }
-            }
+            let updates = nodes
+                .iter()
+                .filter(|(path, node)| {
+                    !hints
+                        .get(*path)
+                        .is_some_and(|hint| scan_hint_matches_node(node, hint))
+                })
+                .map(|(_, node)| node)
+                .collect::<Vec<_>>();
+            self.store.save_local_scan_evidence(&updates)?;
         }
         Ok(LocalSnapshot { nodes })
     }
@@ -953,7 +955,7 @@ impl Replica {
                     stat: Some(local_stat(&stat)),
                 };
                 if self._lease.is_some() {
-                    self.store.save_local_scan_evidence(&node)?;
+                    self.store.save_local_scan_evidence(&[&node])?;
                 }
                 Ok(Some(node))
             }
@@ -1057,14 +1059,16 @@ impl Replica {
             }
         }
         if self._lease.is_some() {
-            for (path, node) in &nodes {
-                if !hints
-                    .get(path)
-                    .is_some_and(|hint| scan_hint_matches_node(node, hint))
-                {
-                    self.store.save_local_scan_evidence(node)?;
-                }
-            }
+            let updates = nodes
+                .iter()
+                .filter(|(path, node)| {
+                    !hints
+                        .get(*path)
+                        .is_some_and(|hint| scan_hint_matches_node(node, hint))
+                })
+                .map(|(_, node)| node)
+                .collect::<Vec<_>>();
+            self.store.save_local_scan_evidence(&updates)?;
         }
         Ok(LocalSnapshot::from_nodes(nodes))
     }

@@ -213,8 +213,8 @@ implemented by this profile.
 
 ## Conformance
 
-[`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) contains
-independently encoded descriptors, proof nodes, ranges, and malformed/unknown
-records consumed directly by the core tests. The fixed hash vectors above and
-these stored vectors must both continue to pass. The complete reader/writer
-matrix and transition limits are defined by [Compatibility](compatibility.md).
+[`format`](../crates/core/tests/fixtures/format) contains independently encoded
+current content descriptor and pack vectors consumed directly by the core
+tests. The fixed hash vectors above and these stored vectors must both continue
+to pass. The reader/writer matrix and transition limits are defined by
+[Compatibility](compatibility.md).

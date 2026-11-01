@@ -22,9 +22,9 @@ use std::sync::OnceLock;
 
 /// Select the actual archive binary when YY_UPGRADE_BIN is present.
 ///
-/// The same selector is used by installed-prefix upgrade acceptance, so a
-/// trial workflow can exercise one immutable binary across upgrade and
-/// retained-state recovery without introducing a second override.
+/// The same selector is used by installed operations and retained-state
+/// recovery, so a trial workflow can exercise one immutable archive binary
+/// without introducing a second override.
 pub fn binary() -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY

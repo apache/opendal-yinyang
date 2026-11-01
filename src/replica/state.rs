@@ -15,20 +15,67 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{Error, Result};
+use super::{Error, ErrorKind, Result};
 use super::{LocalKind, LocalNode, LocalSnapshot, LocalStat};
+use crate::local::store;
 use crate::replica::linux::{ContentHash, Identity};
-use crate::runtime::schema;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use yinyang_core::{Node, NodeId, NodeKind, Revision};
 
-pub(super) const PROFILE: &str = "yinyang-directory-replica-2";
 pub(super) type IdentityMap = BTreeMap<(u64, u64), (u64, u64)>;
 
-const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[
+const BASELINE_COLUMNS: &[&str] = &[
+    "path",
+    "node",
+    "directory",
+    "executable",
+    "remote_digest",
+    "remote_length",
+    "local_present",
+    "local_digest",
+    "local_length",
+    "local_executable",
+    "local_dev",
+    "local_ino",
+    "local_parent_dev",
+    "local_parent_ino",
+    "local_stat_size",
+    "local_stat_mtime",
+    "local_stat_mtime_nsec",
+    "local_stat_ctime",
+    "local_stat_ctime_nsec",
+    "local_stat_recorded_ns",
+    "remote_revision",
+];
+const WORK_COLUMNS: &[&str] = &[
+    "seq",
+    "id",
+    "path",
+    "original_path",
+    "desired_path",
+    "operation",
+    "local_kind",
+    "local_digest",
+    "local_length",
+    "local_executable",
+    "local_dev",
+    "local_ino",
+    "local_parent_dev",
+    "local_parent_ino",
+    "baseline_node",
+    "baseline_revision",
+    "remote_revision",
+    "commit_id",
+    "conflict",
+    "source_artifact",
+    "upload_artifact",
+    "state",
+    "error",
+];
+const SCHEMA: &[store::TableColumns<'static>] = &[
     (
         "binding",
         &[
@@ -42,6 +89,7 @@ const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[
             "state_ino",
         ],
     ),
+    ("baseline", BASELINE_COLUMNS),
     ("baseline_meta", &["singleton", "revision"]),
     (
         "artifacts",
@@ -89,156 +137,28 @@ const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[
             "error",
         ],
     ),
+    (
+        "conflicts",
+        &[
+            "id",
+            "path",
+            "original_path",
+            "desired_path",
+            "local",
+            "remote",
+            "local_artifact",
+            "remote_node",
+            "remote_revision",
+            "error",
+        ],
+    ),
+    ("work", WORK_COLUMNS),
 ];
-const TABLE_NAMES: &[&str] = &[
-    "binding",
-    "baseline",
-    "baseline_meta",
-    "artifacts",
-    "installs",
-    "conflicts",
-    "work",
-];
-const CONFLICTS_SCHEMA: schema::TableColumns<'static> = (
-    "conflicts",
-    &[
-        "id",
-        "path",
-        "original_path",
-        "desired_path",
-        "local",
-        "remote",
-        "local_artifact",
-        "remote_node",
-        "remote_revision",
-        "error",
-    ],
-);
-const BASELINE_BASE: &[&str] = &[
-    "path",
-    "node",
-    "directory",
-    "executable",
-    "remote_digest",
-    "remote_length",
-    "local_present",
-    "local_digest",
-    "local_length",
-    "local_executable",
-    "local_dev",
-    "local_ino",
-    "local_parent_dev",
-    "local_parent_ino",
-    "local_stat_size",
-    "local_stat_mtime",
-    "local_stat_mtime_nsec",
-    "local_stat_ctime",
-    "local_stat_ctime_nsec",
-    "local_stat_recorded_ns",
-];
-const BASELINE_OPTIONAL: &[&str] = &["remote_revision"];
-const WORK_BASE: &[&str] = &[
-    "id",
-    "path",
-    "original_path",
-    "desired_path",
-    "operation",
-    "local_kind",
-    "local_digest",
-    "local_length",
-    "local_executable",
-    "baseline_node",
-    "baseline_revision",
-    "remote_revision",
-    "state",
-    "error",
-];
-const WORK_OPTIONAL: &[&str] = &[
-    "seq",
-    "local_dev",
-    "local_ino",
-    "local_parent_dev",
-    "local_parent_ino",
-    "commit_id",
-    "conflict",
-    "source_artifact",
-    "upload_artifact",
-];
-const WORK_UPGRADE_ORDER: &[&str] = &[
-    "seq",
-    "conflict",
-    "source_artifact",
-    "local_dev",
-    "local_ino",
-    "local_parent_dev",
-    "local_parent_ino",
-    "commit_id",
-    "upload_artifact",
-];
-const WORK_COLUMNS: &[&str] = &[
-    "seq",
-    "id",
-    "path",
-    "original_path",
-    "desired_path",
-    "operation",
-    "local_kind",
-    "local_digest",
-    "local_length",
-    "local_executable",
-    "local_dev",
-    "local_ino",
-    "local_parent_dev",
-    "local_parent_ino",
-    "baseline_node",
-    "baseline_revision",
-    "remote_revision",
-    "commit_id",
-    "conflict",
-    "source_artifact",
-    "upload_artifact",
-    "state",
-    "error",
-];
-const CREATE_CONFLICTS_TABLE: &str = "
-    CREATE TABLE conflicts(
-      id TEXT PRIMARY KEY,
-      path TEXT NOT NULL,
-      original_path TEXT,
-      desired_path TEXT,
-      local TEXT NOT NULL,
-      remote TEXT NOT NULL,
-      local_artifact TEXT,
-      remote_node BLOB,
-      remote_revision BLOB,
-      error TEXT NOT NULL
-    );";
-const CREATE_WORK_TABLE: &str = "
-    CREATE TABLE work(
-      id BLOB PRIMARY KEY,
-      seq INTEGER NOT NULL DEFAULT 0,
-      path TEXT NOT NULL,
-      original_path TEXT,
-      desired_path TEXT,
-      operation TEXT NOT NULL,
-      local_kind TEXT,
-      local_digest BLOB,
-      local_length INTEGER,
-      local_executable INTEGER,
-      local_dev BLOB,
-      local_ino BLOB,
-      local_parent_dev BLOB,
-      local_parent_ino BLOB,
-      baseline_node BLOB,
-      baseline_revision BLOB NOT NULL,
-      remote_revision BLOB,
-      commit_id BLOB,
-      conflict TEXT,
-      source_artifact TEXT,
-      upload_artifact TEXT,
-      state TEXT NOT NULL,
-      error TEXT
-    );";
+pub(super) const PROFILE: store::Profile = store::Profile {
+    name: "yinyang-directory-replica-3",
+    table: "binding",
+    schema: SCHEMA,
+};
 
 const CREATE_SCHEMA: &str = "
     CREATE TABLE binding(
@@ -554,8 +474,7 @@ pub(super) struct WorkRecord {
     pub conflict: Option<String>,
     /// Retained artifact holding the exact local input published by this edit.
     pub source_artifact: Option<String>,
-    /// Retained copy of an ordinary local upload. It is released after the
-    /// edit reaches a terminal receipt, but kept for Unknown/Retryable work.
+    /// Retained copy of an ordinary local upload.
     pub upload_artifact: Option<String>,
     pub state: String,
     pub error: Option<String>,
@@ -564,11 +483,6 @@ pub(super) struct WorkRecord {
 #[derive(Clone, Debug)]
 struct Shape {
     initialized: bool,
-    has_conflicts: bool,
-    has_work: bool,
-    baseline_remote_revision: bool,
-    work_columns: BTreeSet<String>,
-    work_missing: Vec<&'static str>,
 }
 
 pub(super) struct Store {
@@ -581,77 +495,31 @@ impl Store {
         let exists = path
             .try_exists()
             .map_err(|e| Error::io("inspect", path, e))?;
-        let mut connection = Connection::open_with_flags(
-            path,
-            if exists {
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            } else {
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            },
-        )
-        .map_err(|e| Error::io("open", path, e))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(1))
-            .map_err(|e| Error::io("configure replica timeout", path, e))?;
-        let empty = schema::table_names(&connection)
-            .map_err(|e| Error::io("read replica schema", path, e))?
-            .is_empty();
-        if empty {
+        let mut connection = store::open_read_write(path, !exists).map_err(store_error)?;
+        let empty = store::is_empty(&connection).map_err(store_error)?;
+        let shape = if empty {
             let transaction = connection
                 .transaction()
                 .map_err(|e| Error::io("begin replica initialization", path, e))?;
-            transaction
-                .execute_batch(CREATE_SCHEMA)
-                .map_err(|e| Error::io("initialize replica state", path, e))?;
+            store::create_schema(&transaction, CREATE_SCHEMA).map_err(store_error)?;
             transaction
                 .commit()
                 .map_err(|e| Error::io("commit replica initialization", path, e))?;
+            Shape { initialized: false }
         } else {
-            let shape = validate_profile(&connection)?;
-            upgrade(&mut connection, &shape)?;
-        }
-        let shape = validate_profile(&connection)?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=FULL;
-                 PRAGMA foreign_keys=ON;",
-            )
-            .map_err(|e| Error::io("configure replica state", path, e))?;
+            validate_profile(&connection)?
+        };
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         Ok(Self { connection, shape })
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        use rusqlite::OpenFlags;
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| Error::io("open", path, e))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(1))
-            .map_err(|e| Error::io("configure replica inspection", path, e))?;
-        let shape = if schema::table_names(&connection)
-            .map_err(|e| Error::io("read replica schema", path, e))?
-            .is_empty()
-        {
-            Shape {
-                initialized: false,
-                has_conflicts: false,
-                has_work: false,
-                baseline_remote_revision: false,
-                work_columns: BTreeSet::new(),
-                work_missing: Vec::new(),
-            }
+        let connection = store::open_read_only(path).map_err(store_error)?;
+        let shape = if store::is_empty(&connection).map_err(store_error)? {
+            Shape { initialized: false }
         } else {
             validate_profile(&connection)?
         };
-        connection
-            .execute_batch("PRAGMA query_only=ON")
-            .map_err(|e| Error::io("configure replica inspection", path, e))?;
         Ok(Self { connection, shape })
     }
 
@@ -685,61 +553,37 @@ impl Store {
     }
 
     pub fn initialize_binding(&mut self, binding: &Binding) -> Result<bool> {
+        let bindings = [
+            store::Binding::blob("filesystem", binding.filesystem.as_bytes().to_vec()),
+            store::Binding::text("root", binding.root.clone()),
+            store::Binding::blob("root_dev", binding.root_dev.to_be_bytes().to_vec()),
+            store::Binding::blob("root_ino", binding.root_ino.to_be_bytes().to_vec()),
+            store::Binding::blob("state_dev", binding.state_dev.to_be_bytes().to_vec()),
+            store::Binding::blob("state_ino", binding.state_ino.to_be_bytes().to_vec()),
+        ];
         let transaction = self
             .connection
             .transaction()
             .map_err(|e| Error::corrupt(format!("begin replica binding: {e}")))?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO binding
-                 VALUES(1,?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    PROFILE,
-                    binding.filesystem.as_bytes().as_slice(),
-                    binding.root,
-                    binding.root_dev.to_be_bytes().as_slice(),
-                    binding.root_ino.to_be_bytes().as_slice(),
-                    binding.state_dev.to_be_bytes().as_slice(),
-                    binding.state_ino.to_be_bytes().as_slice(),
-                ],
-            )
-            .map_err(|e| Error::corrupt(format!("write replica binding: {e}")))?;
-        let stored = transaction
+        let has_binding: bool = transaction
             .query_row(
-                "SELECT profile,filesystem,root,root_dev,root_ino,state_dev,state_ino
-                 FROM binding WHERE singleton=1",
+                "SELECT EXISTS(SELECT 1 FROM binding WHERE singleton=1)",
                 [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, Vec<u8>>(6)?,
-                    ))
-                },
+                |row| row.get(0),
             )
             .map_err(|e| Error::corrupt(format!("read replica binding: {e}")))?;
+        if !has_binding {
+            store::write_binding(&transaction, &PROFILE, &bindings).map_err(store_error)?;
+        }
         transaction
             .commit()
             .map_err(|e| Error::corrupt(format!("commit replica binding: {e}")))?;
-        let matches = stored.0 == PROFILE
-            && stored.1 == binding.filesystem.as_bytes()
-            && stored.2 == binding.root
-            && number(&stored.3, "root device")
-                .map_err(|e| Error::corrupt(format!("decode root device: {e}")))?
-                == binding.root_dev
-            && number(&stored.4, "root inode")
-                .map_err(|e| Error::corrupt(format!("decode root inode: {e}")))?
-                == binding.root_ino
-            && number(&stored.5, "state device")
-                .map_err(|e| Error::corrupt(format!("decode state device: {e}")))?
-                == binding.state_dev
-            && number(&stored.6, "state inode")
-                .map_err(|e| Error::corrupt(format!("decode state inode: {e}")))?
-                == binding.state_ino;
+        self.shape.initialized = true;
+        let matches = match store::validate(&self.connection, &PROFILE, Some(&bindings)) {
+            Ok(()) => true,
+            Err(error) if error.kind() == store::ErrorKind::Invalid => false,
+            Err(error) => return Err(store_error(error)),
+        };
         Ok(matches)
     }
 
@@ -754,11 +598,10 @@ impl Store {
         let updated = transaction
             .execute(
                 "UPDATE binding SET
-                   profile=?1,filesystem=?2,root=?3,root_dev=?4,root_ino=?5,
-                   state_dev=?6,state_ino=?7
+                   filesystem=?1,root=?2,root_dev=?3,root_ino=?4,
+                   state_dev=?5,state_ino=?6
                  WHERE singleton=1",
                 params![
-                    PROFILE,
                     binding.filesystem.as_bytes().as_slice(),
                     binding.root,
                     binding.root_dev.to_be_bytes().as_slice(),
@@ -1075,7 +918,7 @@ impl Store {
             .map_err(|e| Error::corrupt(format!("clear baseline revision: {e}")))?;
         transaction
             .execute(
-                "INSERT INTO baseline_meta VALUES(1,?1)",
+                "INSERT INTO baseline_meta(singleton,revision) VALUES(1,?1)",
                 params![revision.to_bytes().as_slice()],
             )
             .map_err(|e| Error::corrupt(format!("write baseline revision: {e}")))?;
@@ -1240,7 +1083,7 @@ impl Store {
     pub fn set_baseline_revision(&mut self, revision: Revision) -> Result<()> {
         self.connection
             .execute(
-                "INSERT OR REPLACE INTO baseline_meta VALUES(1,?1)",
+                "INSERT OR REPLACE INTO baseline_meta(singleton,revision) VALUES(1,?1)",
                 params![revision.to_bytes().as_slice()],
             )
             .map_err(|e| Error::corrupt(format!("write baseline revision: {e}")))?;
@@ -1268,22 +1111,17 @@ impl Store {
         let mut remote = BTreeMap::new();
         let mut local = BTreeMap::new();
         let mut local_scan_hints = BTreeMap::new();
-        let remote_revision = if self.shape.baseline_remote_revision {
-            "remote_revision"
-        } else {
-            "NULL AS remote_revision"
-        };
         let mut statement = self
             .connection
-            .prepare(&format!(
+            .prepare(
                 "SELECT path,node,directory,executable,remote_digest,remote_length,
                         local_present,local_digest,local_length,local_executable,
                         local_dev,local_ino,local_parent_dev,local_parent_ino,
                         local_stat_size,local_stat_mtime,local_stat_mtime_nsec,
                         local_stat_ctime,local_stat_ctime_nsec,local_stat_recorded_ns,
-                        {remote_revision}
-                 FROM baseline ORDER BY path"
-            ))
+                        remote_revision
+                 FROM baseline ORDER BY path",
+            )
             .map_err(|e| Error::corrupt(format!("read baseline: {e}")))?;
         let rows = statement
             .query_map([], |row| -> rusqlite::Result<_> {
@@ -1615,37 +1453,49 @@ impl Store {
         }))
     }
 
-    pub fn save_local_scan_evidence(&self, node: &LocalNode) -> Result<()> {
-        let LocalKind::File { digest, .. } = node.kind else {
-            return Ok(());
-        };
-        let (size, mtime, mtime_nsec, ctime, ctime_nsec, recorded_ns) =
-            local_scan_columns(Some(node))?;
-        self.connection
-            .execute(
-                "UPDATE baseline SET
-                   local_stat_size=?2,local_stat_mtime=?3,local_stat_mtime_nsec=?4,
-                   local_stat_ctime=?5,local_stat_ctime_nsec=?6,local_stat_recorded_ns=?7
-                 WHERE path=?1 AND local_present=1 AND local_digest=?8",
-                params![
-                    node.path,
-                    size,
-                    mtime,
-                    mtime_nsec,
-                    ctime,
-                    ctime_nsec,
-                    recorded_ns,
-                    digest.as_bytes().as_slice()
-                ],
-            )
-            .map_err(|e| Error::corrupt(format!("write local scan evidence: {e}")))?;
+    pub fn save_local_scan_evidence(&self, nodes: &[&LocalNode]) -> Result<()> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|e| Error::corrupt(format!("begin local scan evidence: {e}")))?;
+        for node in nodes {
+            let LocalKind::File { digest, .. } = node.kind else {
+                continue;
+            };
+            let (size, mtime, mtime_nsec, ctime, ctime_nsec, recorded_ns) =
+                local_scan_columns(Some(node))?;
+            transaction
+                .execute(
+                    "UPDATE baseline SET
+                       local_stat_size=?2,local_stat_mtime=?3,local_stat_mtime_nsec=?4,
+                       local_stat_ctime=?5,local_stat_ctime_nsec=?6,local_stat_recorded_ns=?7
+                     WHERE path=?1 AND local_present=1 AND local_digest=?8",
+                    params![
+                        node.path,
+                        size,
+                        mtime,
+                        mtime_nsec,
+                        ctime,
+                        ctime_nsec,
+                        recorded_ns,
+                        digest.as_bytes().as_slice()
+                    ],
+                )
+                .map_err(|e| Error::corrupt(format!("write local scan evidence: {e}")))?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| Error::corrupt(format!("commit local scan evidence: {e}")))?;
         Ok(())
     }
 
     pub fn insert_conflict(&mut self, conflict: &ConflictRecord) -> Result<()> {
         self.connection
             .execute(
-                "INSERT INTO conflicts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                "INSERT INTO conflicts(
+                    id,path,original_path,desired_path,local,remote,local_artifact,
+                    remote_node,remote_revision,error
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     conflict.id,
                     conflict.path,
@@ -1667,9 +1517,6 @@ impl Store {
     }
 
     pub fn conflicts(&self) -> Result<Vec<ConflictRecord>> {
-        if !self.shape.has_conflicts {
-            return Ok(Vec::new());
-        }
         let mut query = self
             .connection
             .prepare(
@@ -1794,13 +1641,6 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write work association: {e}")))?;
-        self.connection
-            .execute(
-                "DELETE FROM work
-                 WHERE path=?1 AND id!=?2 AND state IN ('committed','superseded')",
-                params![work.path, work.id.as_slice()],
-            )
-            .map_err(|e| Error::corrupt(format!("prune terminal work: {e}")))?;
         Ok(())
     }
 
@@ -1825,13 +1665,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove_work(&mut self, id: &[u8; 32]) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM work WHERE id=?1", params![id.as_slice()])
-            .map_err(|e| Error::corrupt(format!("remove work association: {e}")))?;
-        Ok(())
-    }
-
     /// Persist the original commit identity of an edit before a replay can
     /// clear it from the staging handle.
     pub fn set_work_commit_id(&mut self, id: &[u8; 32], commit_id: [u8; 16]) -> Result<()> {
@@ -1845,25 +1678,12 @@ impl Store {
     }
 
     pub fn work(&self) -> Result<Vec<WorkRecord>> {
-        if !self.shape.has_work {
-            return Ok(Vec::new());
-        }
-        let projection = WORK_COLUMNS
-            .iter()
-            .map(|column| {
-                if self.shape.work_columns.contains(*column) {
-                    (*column).to_owned()
-                } else if *column == "seq" {
-                    "0 AS seq".to_owned()
-                } else {
-                    format!("NULL AS {column}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
         let mut query = self
             .connection
-            .prepare(&format!("SELECT {projection} FROM work ORDER BY path,id"))
+            .prepare(&format!(
+                "SELECT {} FROM work ORDER BY path,id",
+                WORK_COLUMNS.join(",")
+            ))
             .map_err(|e| Error::corrupt(format!("read work associations: {e}")))?;
         query
             .query_map([], |row| {
@@ -1941,11 +1761,11 @@ impl Store {
     pub fn insert_artifact(&mut self, artifact: &ArtifactRecord) -> Result<()> {
         self.connection
             .execute(
-                "INSERT INTO artifacts
-                 (id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
-                  stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec,
-                  settle_pending)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                "INSERT INTO artifacts(
+                    id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
+                    stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec,
+                    settle_pending
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     artifact.id,
                     artifact.origin,
@@ -2036,9 +1856,13 @@ impl Store {
     pub fn insert_install(&mut self, install: &InstallRecord) -> Result<()> {
         self.connection
             .execute(
-                "INSERT INTO installs
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,
-                        ?14,?15,?16,?17,?18,?19)",
+                "INSERT INTO installs(
+                    id,path,parent,name,temporary,temporary_dev,temporary_ino,
+                    expected_digest,expected_length,expected_dev,expected_ino,parent_dev,
+                    parent_ino,replacement_digest,replacement_length,remote_revision,
+                    artifact,phase,error
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,
+                          ?14,?15,?16,?17,?18,?19)",
                 params![
                     install.id,
                     install.path,
@@ -2150,7 +1974,7 @@ impl Store {
                 "SELECT id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
                         stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec,
                         settle_pending
-                 FROM artifacts ORDER BY rowid,id",
+                 FROM artifacts ORDER BY id",
             )
             .map_err(|e| Error::corrupt(format!("read retained artifacts: {e}")))?;
         query
@@ -2261,160 +2085,8 @@ fn fixed<const N: usize>(bytes: &[u8], name: &str) -> rusqlite::Result<[u8; N]> 
 }
 
 fn validate_profile(connection: &Connection) -> Result<Shape> {
-    let profile: Option<String> = connection
-        .query_row("SELECT profile FROM binding WHERE singleton=1", [], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|error| Error::corrupt(format!("read replica profile: {error}")))?;
-    if profile.as_deref().is_some_and(|profile| profile != PROFILE) {
-        return Err(Error::unsupported(format!(
-            "replica state uses unsupported profile {}",
-            profile.as_deref().unwrap_or_default()
-        )));
-    }
-    let tables = schema::table_names(connection)
-        .map_err(|error| Error::corrupt(format!("read replica tables: {error}")))?;
-    if tables
-        .iter()
-        .any(|table| !TABLE_NAMES.contains(&table.as_str()))
-    {
-        return Err(Error::corrupt(
-            "replica state contains an unsupported table",
-        ));
-    }
-    if !schema::columns_match(connection, REQUIRED_SCHEMA)
-        .map_err(|error| Error::corrupt(format!("read replica schema: {error}")))?
-    {
-        return Err(Error::corrupt(
-            "replica state has an unsupported required-table schema",
-        ));
-    }
-
-    let baseline = schema::column_names(connection, "baseline")
-        .map_err(|error| Error::corrupt(format!("read baseline schema: {error}")))?
-        .ok_or_else(|| Error::corrupt("replica state is missing its baseline table"))?;
-    let baseline_set = baseline.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    validate_columns("baseline", &baseline_set, BASELINE_BASE, BASELINE_OPTIONAL)?;
-    let baseline_remote_revision = baseline_set.contains("remote_revision");
-
-    let has_conflicts = tables.contains("conflicts");
-    if has_conflicts
-        && !schema::columns_match(connection, &[CONFLICTS_SCHEMA])
-            .map_err(|error| Error::corrupt(format!("read conflict schema: {error}")))?
-    {
-        return Err(Error::corrupt(
-            "replica state has an unsupported conflicts schema",
-        ));
-    }
-
-    let has_work = tables.contains("work");
-    let mut work_columns = BTreeSet::new();
-    let mut work_missing = Vec::new();
-    if has_work {
-        let columns = schema::column_names(connection, "work")
-            .map_err(|error| Error::corrupt(format!("read work schema: {error}")))?
-            .ok_or_else(|| Error::corrupt("replica state is missing its work table"))?;
-        work_columns.extend(columns);
-        let work_set = work_columns
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        validate_columns("work", &work_set, WORK_BASE, WORK_OPTIONAL)?;
-        work_missing = WORK_UPGRADE_ORDER
-            .iter()
-            .copied()
-            .filter(|column| !work_columns.contains(*column))
-            .collect();
-    }
-
-    Ok(Shape {
-        initialized: true,
-        has_conflicts,
-        has_work,
-        baseline_remote_revision,
-        work_columns,
-        work_missing,
-    })
-}
-
-fn validate_columns(
-    table: &str,
-    actual: &BTreeSet<&str>,
-    base: &[&str],
-    optional: &[&str],
-) -> Result<()> {
-    if base.iter().any(|column| !actual.contains(column)) {
-        return Err(Error::corrupt(format!(
-            "replica {table} table is missing a required column"
-        )));
-    }
-    if actual
-        .iter()
-        .any(|column| !base.contains(column) && !optional.contains(column))
-    {
-        return Err(Error::corrupt(format!(
-            "replica {table} table contains an unsupported column"
-        )));
-    }
-    Ok(())
-}
-
-fn upgrade(connection: &mut Connection, shape: &Shape) -> Result<()> {
-    if shape.has_conflicts
-        && shape.has_work
-        && shape.baseline_remote_revision
-        && shape.work_missing.is_empty()
-    {
-        return Ok(());
-    }
-    let transaction = connection
-        .transaction()
-        .map_err(|error| Error::corrupt(format!("begin replica upgrade: {error}")))?;
-    if !shape.has_conflicts {
-        transaction
-            .execute_batch(CREATE_CONFLICTS_TABLE)
-            .map_err(|error| Error::corrupt(format!("create conflicts table: {error}")))?;
-    }
-    if !shape.baseline_remote_revision {
-        transaction
-            .execute_batch("ALTER TABLE baseline ADD COLUMN remote_revision BLOB")
-            .map_err(|error| Error::corrupt(format!("add baseline revision: {error}")))?;
-    }
-    if !shape.has_work {
-        transaction
-            .execute_batch(CREATE_WORK_TABLE)
-            .map_err(|error| Error::corrupt(format!("create work table: {error}")))?;
-    } else {
-        for column in &shape.work_missing {
-            let declaration = if *column == "seq" {
-                "INTEGER NOT NULL DEFAULT 0"
-            } else if matches!(*column, "conflict" | "source_artifact" | "upload_artifact") {
-                "TEXT"
-            } else {
-                "BLOB"
-            };
-            transaction
-                .execute_batch(&format!(
-                    "ALTER TABLE work ADD COLUMN {column} {declaration}"
-                ))
-                .map_err(|error| Error::corrupt(format!("add work column {column}: {error}")))?;
-        }
-    }
-    transaction
-        .commit()
-        .map_err(|error| Error::corrupt(format!("commit replica upgrade: {error}")))?;
-    let upgraded = validate_profile(connection)?;
-    if !upgraded.has_conflicts
-        || !upgraded.has_work
-        || !upgraded.baseline_remote_revision
-        || !upgraded.work_missing.is_empty()
-    {
-        return Err(Error::corrupt(
-            "replica upgrade did not produce the supported schema",
-        ));
-    }
-    Ok(())
+    store::validate(connection, &PROFILE, None).map_err(store_error)?;
+    Ok(Shape { initialized: true })
 }
 
 fn number(bytes: &[u8], name: &str) -> rusqlite::Result<u64> {
@@ -2453,17 +2125,34 @@ fn corrupt_sql(message: impl Into<String>) -> rusqlite::Error {
     )
 }
 
+fn store_error(error: store::Error) -> Error {
+    let kind = match error.kind() {
+        store::ErrorKind::Invalid => ErrorKind::Invalid,
+        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
+        store::ErrorKind::Busy => ErrorKind::Busy,
+        store::ErrorKind::AlreadyExists
+        | store::ErrorKind::NotFound
+        | store::ErrorKind::ReadOnly
+        | store::ErrorKind::PermissionDenied
+        | store::ErrorKind::NoSpace
+        | store::ErrorKind::Io => ErrorKind::Io,
+    };
+    Error::new(kind, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replica::ErrorKind;
 
     fn create_database(path: &Path, profile: &str, schema: &str) {
         let connection = Connection::open(path).unwrap();
         connection.execute_batch(schema).unwrap();
         connection
             .execute(
-                "INSERT INTO binding VALUES(1,?1,zeroblob(16),'/root',1,2,1,3)",
+                "INSERT INTO binding(
+                    singleton,profile,filesystem,root,root_dev,root_ino,state_dev,state_ino
+                 ) VALUES(1,?1,zeroblob(16),'/root',1,2,1,3)",
                 [profile],
             )
             .unwrap();
@@ -2473,7 +2162,7 @@ mod tests {
     fn unsupported_profile_is_rejected_before_sqlite_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("replica.db");
-        create_database(&path, "yinyang-directory-replica-99", CREATE_SCHEMA);
+        create_database(&path, "yinyang-directory-replica-1", CREATE_SCHEMA);
         assert_eq!(
             Store::open_read_only(&path).err().unwrap().kind(),
             ErrorKind::Unsupported
@@ -2490,72 +2179,10 @@ mod tests {
     }
 
     #[test]
-    fn readable_legacy_shape_upgrades_after_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("replica.db");
-        create_database(&path, PROFILE, CREATE_SCHEMA);
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "ALTER TABLE baseline DROP COLUMN remote_revision;
-                 ALTER TABLE work DROP COLUMN seq;
-                 ALTER TABLE work DROP COLUMN conflict;
-                 ALTER TABLE work DROP COLUMN source_artifact;
-                 ALTER TABLE work DROP COLUMN local_dev;
-                 ALTER TABLE work DROP COLUMN local_ino;
-                 ALTER TABLE work DROP COLUMN local_parent_dev;
-                 ALTER TABLE work DROP COLUMN local_parent_ino;
-                 ALTER TABLE work DROP COLUMN commit_id;
-                 INSERT INTO work(
-                   id,path,original_path,desired_path,operation,local_kind,
-                   local_digest,local_length,local_executable,baseline_node,
-                   baseline_revision,remote_revision,state,error
-                 ) VALUES(
-                   zeroblob(32),'legacy',NULL,NULL,'content',NULL,NULL,NULL,NULL,
-                   NULL,zeroblob(24),NULL,'pending',NULL
-                 );",
-            )
-            .unwrap();
-        drop(connection);
-        let store = Store::open_read_only(&path).unwrap();
-        let work = store.work().unwrap();
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].seq, 0);
-        assert!(work[0].source_artifact.is_none());
-        drop(store);
-
-        let store = Store::open(&path).unwrap();
-        let work = store.work().unwrap();
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].path, "legacy");
-        let connection = Connection::open(path).unwrap();
-        let baseline: Vec<String> = {
-            let mut statement = connection.prepare("PRAGMA table_info(baseline)").unwrap();
-            statement
-                .query_map([], |row| row.get(1))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        assert!(baseline.iter().any(|column| column == "remote_revision"));
-        let work: Vec<String> = {
-            let mut statement = connection.prepare("PRAGMA table_info(work)").unwrap();
-            statement
-                .query_map([], |row| row.get(1))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        for column in WORK_OPTIONAL {
-            assert!(work.iter().any(|actual| actual == *column));
-        }
-    }
-
-    #[test]
     fn known_profile_missing_a_required_column_is_not_repaired() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("replica.db");
-        create_database(&path, PROFILE, CREATE_SCHEMA);
+        create_database(&path, PROFILE.name, CREATE_SCHEMA);
         Connection::open(&path)
             .unwrap()
             .execute_batch("ALTER TABLE work DROP COLUMN path")
