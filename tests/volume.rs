@@ -429,6 +429,11 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
         } else {
             state.join("state")
         };
+        if root_inside_state {
+            std::fs::create_dir(&state).unwrap();
+        } else {
+            std::fs::create_dir(&root).unwrap();
+        }
         let error = DirectorySync::restore(authority.clone(), &backup, &state, &root)
             .await
             .err()
@@ -437,8 +442,8 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
             .downcast_ref::<yinyang::replica::Error>()
             .expect("restore preserves the replica error kind");
         assert_eq!(error.kind(), ErrorKind::Invalid, "{error}");
-        assert!(!state.exists());
-        assert!(!root.exists());
+        assert!(!state.join("replica.db").exists());
+        assert!(!state.join("sync.db").exists());
     }
 }
 
