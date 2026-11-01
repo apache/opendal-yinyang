@@ -20,7 +20,7 @@ use crate::compatibility::{
     EXPIRY_REQUEST_MAGIC,
 };
 use crate::namespace::{decode, encode};
-use crate::{Error, ErrorKind, NodeId, Result, Revision};
+use crate::{Error, NodeId, Result, Revision};
 use std::collections::BTreeSet;
 
 /// Maximum number of candidates and protected identities in one request.
@@ -652,6 +652,7 @@ impl HistoryPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
 
     fn revision(sequence: u64) -> Revision {
         Revision::new(sequence)

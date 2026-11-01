@@ -21,9 +21,8 @@ use crate::compatibility::{
 };
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::expiry::{
-    ExpiryConflictKind, ExpiryMarker, ExpiryOutcome, ExpiryReceipt, ExpiryRefusal, ExpiryRequest,
-    HistoryEntry, HistoryPage, RevisionState, operation_key, parse_operation_key,
-    parse_revision_key, revision_key,
+    ExpiryConflictKind, ExpiryMarker, ExpiryOutcome, ExpiryRefusal, ExpiryRequest, HistoryEntry,
+    HistoryPage, RevisionState, operation_key, revision_key,
 };
 use crate::index::{Index, IndexCache};
 use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
@@ -175,10 +174,6 @@ impl ObjectState {
 
     pub(crate) const fn expiry(&self) -> &Index {
         &self.expiry
-    }
-
-    pub(crate) const fn head_mode(&self) -> u8 {
-        self.head_mode
     }
 
     pub(crate) const fn reference(&self) -> &PackedRef {
