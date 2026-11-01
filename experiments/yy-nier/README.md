@@ -23,7 +23,10 @@ ssh nier ~/Code/yinyang/devbox/experiments/yy-nier/status.sh <label> 80
 - The environment uses the mbx Cargo shim, cargo-deny 0.14.22, and the local
   Silo at `127.0.0.1:19000` with buckets `yinyang-test` and the versioned
   `yinyang-direct-versioned`.
-- `suite.sh quick` runs lint, check and test. `suite.sh full` adds the lockfile
+- `suite.sh quick` runs lint, check and test. Like GitHub's Check, Test and
+  MSRV jobs, those steps (and lockfile, envelope-fault, licenses, MSRV) run with
+  every `YINYANG_*` variable removed; only the acceptance steps see the Silo
+  settings. `suite.sh full` adds the lockfile
   check, operating-envelope fault test, licenses, MSRV, S3, Managed Sync, Linux
   FUSE, Direct and operations acceptance. Any explicit step list also works,
   for example `suite.sh check linux-fuse`, or pass a direct command such as

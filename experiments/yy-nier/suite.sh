@@ -28,18 +28,27 @@ case "${1:-quick}" in
     *) steps=("$@") ;;
 esac
 
+# GitHub's Check, Test and MSRV jobs run without storage settings; only the
+# acceptance jobs export them. Mirror that split so offline behavior is tested.
+offline() {
+    env -u YINYANG_S3_BUCKET -u YINYANG_S3_ENDPOINT -u YINYANG_S3_REGION \
+        -u YINYANG_S3_ACCESS_KEY_ID -u YINYANG_S3_SECRET_ACCESS_KEY \
+        -u YINYANG_S3_ROOT -u YINYANG_STORAGE_PROFILE \
+        -u YINYANG_DIRECT_VERSIONED_BUCKET -u YINYANG_SERVICE_TOKEN "$@"
+}
+
 failed=()
 for step in "${steps[@]}"; do
     start=$(date +%s)
     echo "=== STEP $step begin $(date -Is)"
     case "$step" in
-        lockfile) cargo update -w --locked ;;
-        lint) cargo x lint ;;
-        check) cargo x check ;;
-        envelope-fault) python3 tests/linux_operating_envelope_fault_test.py ;;
-        test) cargo x test ;;
-        licenses) cargo x licenses ;;
-        msrv) cargo +1.91.0 check --workspace --all-targets --locked ;;
+        lockfile) offline cargo update -w --locked ;;
+        lint) offline cargo x lint ;;
+        check) offline cargo x check ;;
+        envelope-fault) offline python3 tests/linux_operating_envelope_fault_test.py ;;
+        test) offline cargo x test ;;
+        licenses) offline cargo x licenses ;;
+        msrv) offline cargo +1.91.0 check --workspace --all-targets --locked ;;
         s3) cargo test --workspace --all-targets s3_ -- --ignored --nocapture \
                 --skip isolated_s3_cli_smoke --skip real_amazon_s3_cli_smoke --skip direct_amazon_s3_ ;;
         managed-sync) cargo x test-managed-sync ;;
