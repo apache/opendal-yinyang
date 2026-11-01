@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use yinyang_core::service::{MetadataService, ServiceClient, serve};
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome, ErrorKind, ExpiryId, ExpiryOutcome, ExpiryRequest, Planner,
+    CommitId, CommitOutcome, ErrorKind, ExpiryId, ExpiryOutcome, ExpiryRequest, Planner,
 };
 
 fn committed(outcome: CommitOutcome) -> yinyang_core::Receipt {
@@ -104,7 +104,7 @@ async fn lost_expiry_response_replays_without_advancing_authority() {
         .await
         .unwrap();
     let request = ExpiryRequest::new(
-        service.volume(),
+        service.filesystem(),
         ExpiryId::generate(),
         before,
         vec![first_revision],
