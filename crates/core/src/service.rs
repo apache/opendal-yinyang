@@ -67,6 +67,64 @@ mod connection_tracking {
 }
 
 type Db = Arc<Mutex<Connection>>;
+
+struct SqliteTransaction {
+    writer: Db,
+    gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    active: bool,
+}
+
+impl SqliteTransaction {
+    fn new(writer: Db, gate: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self {
+            writer,
+            gate: Some(gate),
+            active: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+
+    async fn rollback(mut self) {
+        let _ = db_call(&self.writer, |connection| {
+            connection.execute_batch("ROLLBACK").map_err(sql)?;
+            Ok(())
+        })
+        .await;
+        self.active = false;
+    }
+}
+
+impl Drop for SqliteTransaction {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(gate) = self.gate.take() else {
+            return;
+        };
+        let writer = self.writer.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _ = runtime.spawn_blocking(move || {
+                rollback_sync(&writer);
+                drop(gate);
+            });
+        } else {
+            rollback_sync(&writer);
+            drop(gate);
+        }
+    }
+}
+
+fn rollback_sync(writer: &Db) {
+    let Ok(mut connection) = writer.lock() else {
+        return;
+    };
+    let _ = connection.execute_batch("ROLLBACK");
+}
+
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
     ("singleton", "INTEGER"),
@@ -685,14 +743,14 @@ impl MetadataService {
         if requests.is_empty() {
             return Ok(vec![]);
         }
-        let _guard = self.write_gate.lock().await;
+        let gate = Arc::clone(&self.write_gate).lock_owned().await;
         // Even an in-process caller must have registered durable readiness.
         let mut restored = Vec::new();
         for request in requests {
             request.validate(self.filesystem)?;
             restored.push(self.restore_transaction(&request.to_bytes()?).await?);
         }
-        let result = self.publish(&restored).await;
+        let result = self.publish(&restored, gate).await;
         match result {
             Err(e) if e.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
@@ -700,14 +758,23 @@ impl MetadataService {
             other => other,
         }
     }
-    async fn publish(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+    async fn publish(
+        &self,
+        requests: &[Transaction],
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Vec<Outcome>> {
+        let transaction = SqliteTransaction::new(self.writer.clone(), gate);
         let result = self.publish_inner(requests).await;
-        if result.is_err() {
-            let _ = db_call(&self.writer, |c| {
-                c.execute_batch("ROLLBACK").map_err(sql)?;
-                Ok(())
+        if result.as_ref().is_err()
+            || result.as_ref().is_ok_and(|outcomes| {
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, Outcome::Unknown(_)))
             })
-            .await;
+        {
+            transaction.rollback().await;
+        } else {
+            transaction.disarm();
         }
         result
     }
@@ -821,11 +888,6 @@ impl MetadataService {
         .await
         .is_err()
         {
-            let _ = db_call(&self.writer, |c| {
-                c.execute_batch("ROLLBACK").map_err(sql)?;
-                Ok(())
-            })
-            .await;
             return Ok(requests.iter().map(|r| Outcome::Unknown(r.id())).collect());
         }
         Ok(outcomes)
@@ -972,6 +1034,33 @@ mod connection_tests {
             .unwrap();
 
         assert_eq!(connection_tracking::count(&path), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_publication_transaction_releases_the_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let gate = Arc::clone(&service.write_gate).lock_owned().await;
+        db_call(&service.writer, |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        drop(SqliteTransaction::new(service.writer.clone(), gate));
+
+        let _gate = Arc::clone(&service.write_gate).lock_owned().await;
+        db_call(&service.writer, |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+            connection.execute_batch("ROLLBACK").map_err(sql)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
