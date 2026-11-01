@@ -640,8 +640,9 @@ async fn managed_sync_scale_benchmark() {
         assert!(pull.run().await.unwrap().in_sync);
         let pull_seconds = before.elapsed().as_secs_f64();
         let pull_hashes = pull.hash_bytes_read();
-        assert!(pull.run().await.unwrap().in_sync);
         tokio::time::sleep(Duration::from_millis(1100)).await;
+        pull.reset_hash_bytes_read();
+        assert!(pull.run().await.unwrap().in_sync);
         pull.reset_hash_bytes_read();
         let before = Instant::now();
         assert!(pull.run().await.unwrap().in_sync);
@@ -696,8 +697,9 @@ async fn managed_sync_edit_benchmark() {
     let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
         .await
         .unwrap();
-    assert!(reader.run().await.unwrap().in_sync);
     tokio::time::sleep(Duration::from_millis(1100)).await;
+    reader.reset_hash_bytes_read();
+    assert!(reader.run().await.unwrap().in_sync);
     reader.reset_hash_bytes_read();
     let before = Instant::now();
     assert!(reader.run().await.unwrap().in_sync);
