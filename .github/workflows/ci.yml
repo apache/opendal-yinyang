@@ -229,7 +229,7 @@ jobs:
       - name: Show FUSE device
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3
+          sudo apt-get install -y fuse3 git rsync
           ls -l /dev/fuse
 
       - name: Start isolated S3-compatible storage
@@ -249,6 +249,9 @@ jobs:
 
       - name: Run real Linux FUSE acceptance
         run: cargo x test-linux-fuse
+
+      - name: Run Linux application acceptance
+        run: cargo x test-linux-applications
 
       - name: Run deterministic Direct Mount and Sync acceptance
         run: cargo x test-linux-direct
