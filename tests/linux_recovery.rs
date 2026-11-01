@@ -38,7 +38,10 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, CommitId, NodeId};
+use yinyang::core::{
+    Authority, BackendProfile, CommitId, ErrorKind as CoreErrorKind, Fs, NodeId, Revision,
+    RevisionState,
+};
 use yinyang::runtime::{Runtime, RuntimeStatus};
 
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
@@ -998,6 +1001,348 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
+fn explicit_expiry_preserves_staged_and_backup_work_on_object_and_service() {
+    for publication in [Publication::Object, Publication::Service] {
+        explicit_expiry_case(publication);
+    }
+}
+
+fn explicit_expiry_case(publication: Publication) {
+    let legacy = legacy_yy_binary();
+    let mut fixture = Fixture::new(publication);
+    let zero = fixture.remote_create_file("protected.txt", b"version-zero", false);
+    let backup_source = fixture.sync_client("expiry-backup-source");
+    // Admit several remote-only revisions so the package records baseline
+    // entries that are not also local Sync receipts.
+    fixture.remote_create_file("expiry-baseline-only.txt", b"external-baseline", false);
+    fixture.remote_create_file("expiry-latest-only.txt", b"external-latest", false);
+    fixture.sync_run_ok(&backup_source);
+    let backup = fixture.path("expiry-backup");
+    fixture.yy_ok(&[
+        "--volume",
+        text(&backup_source.config),
+        "sync",
+        "backup",
+        "--output",
+        text(&backup),
+    ]);
+    let restored = fixture.sync_paths("expiry-backup-restore");
+    let moved_source_root = fixture.path("expiry-backup-source-root-moved");
+    fs::rename(&backup_source.directory, &moved_source_root).unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&restored.config),
+        "sync",
+        "restore",
+        "--backup",
+        text(&backup),
+        "--directory",
+        text(&restored.directory),
+    ]);
+    let restored_plan = retention_plan(&fixture, &restored.config, 1, &[], None);
+    let baseline_target_text =
+        restored_plan["protection"]["staging"]["replica"]["baseline"]["revision"]
+            .as_str()
+            .unwrap_or_else(|| panic!("restored replica baseline revision: {restored_plan}"))
+            .to_owned();
+
+    fixture.remote_create_file("expiry-handle-base.txt", b"handle-base", false);
+    let handle_base_text = revision_text(
+        runtime()
+            .block_on(fixture_authority(&fixture).observe_latest())
+            .unwrap()
+            .revision(),
+    );
+    assert_ne!(
+        baseline_target_text, handle_base_text,
+        "backup baseline must be distinct from the live file-handle base"
+    );
+
+    let staging = fixture.path("expiry-staging");
+    let config = fixture.path("expiry.json");
+    write_volume_config(
+        &config,
+        "expiry",
+        &staging,
+        publication == Publication::Object,
+        (publication == Publication::Service).then(|| fixture.service_address()),
+    );
+    let handle = parse_handle(&fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "open",
+        "protected.txt",
+        "--write",
+    ]));
+    let published = fixture.path("expiry-published");
+    fs::write(&published, b"version-one!").unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "write",
+        &handle.to_string(),
+        text(&published),
+    ]);
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "fsync",
+        &handle.to_string(),
+    ]);
+    let pending = fixture.path("expiry-pending");
+    fs::write(&pending, b"PEND").unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "write",
+        &handle.to_string(),
+        text(&pending),
+        "--offset",
+        "4",
+    ]);
+
+    let zero_text = revision_text(zero.cursor.revision);
+    assert_ne!(
+        baseline_target_text, zero_text,
+        "baseline refusal target must differ from the later expiry target"
+    );
+    let refusal_cases = [
+        (&config, Some(backup.as_path()), "backup_replica_baseline"),
+        (&restored.config, None, "replica_baseline"),
+    ];
+    for (config, backup, reason) in refusal_cases {
+        let before = runtime()
+            .block_on(fixture_authority(&fixture).observe_latest())
+            .unwrap()
+            .revision();
+        assert_ne!(
+            baseline_target_text,
+            revision_text(before),
+            "baseline refusal target must not be the current revision"
+        );
+        let mut args = vec![
+            "--volume",
+            text(config),
+            "space",
+            "retention",
+            "expire",
+            "--revision",
+            &baseline_target_text,
+        ];
+        if let Some(backup) = backup {
+            args.extend(["--backup", text(backup)]);
+        }
+        args.push("--json");
+        let refusal = fixture.yy(&args);
+        assert_eq!(
+            refusal.status.code(),
+            Some(2),
+            "{reason} refusal failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&refusal.stdout),
+            String::from_utf8_lossy(&refusal.stderr)
+        );
+        let refusal: serde_json::Value =
+            serde_json::from_slice(&refusal.stdout).expect("parse baseline refusal JSON");
+        assert_eq!(refusal["state"], "refused", "{reason}");
+        assert_eq!(refusal["revisions"][0]["state"], "protected", "{reason}");
+        assert_eq!(
+            refusal["revisions"][0]["reasons"],
+            serde_json::json!([reason]),
+            "{reason}"
+        );
+        let after = runtime()
+            .block_on(fixture_authority(&fixture).observe_latest())
+            .unwrap()
+            .revision();
+        assert_eq!(after, before, "{reason} refusal advanced the head");
+    }
+    assert!(
+        runtime()
+            .block_on(fixture_authority(&fixture).observe_revision(zero.cursor.revision),)
+            .is_ok(),
+        "backup-only refusal changed the unprotected target revision"
+    );
+
+    if let Some(binary) = &legacy {
+        let latest = fixture.remote_file_version("protected.txt").2;
+        legacy_pre_expiry(
+            binary,
+            &mut fixture,
+            publication,
+            zero.cursor.revision,
+            zero.commit_id,
+            latest,
+        );
+    }
+
+    let immutable_before = immutable_remote_identities(&fixture.operator());
+    let expiry = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "expire",
+        "--revision",
+        &zero_text,
+        "--backup",
+        text(&backup),
+        "--json",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&expiry.stdout).expect("parse expiry JSON");
+    assert_eq!(report["schema"], "yinyang.managed-retention.expiry.v1");
+    assert_eq!(report["state"], "committed");
+    assert_eq!(report["revisions"][0]["state"], "expired");
+    assert_eq!(
+        report["evidence_digest"]
+            .as_str()
+            .expect("expiry evidence digest")
+            .len(),
+        64
+    );
+    assert_eq!(report["deletion_authorized"], false);
+    assert!(report["reclaimable_bytes"].is_null());
+    assert_eq!(report["physical_cleanup"], "not_performed");
+    let space = fixture.yy_ok(&["--volume", text(&config), "space", "report", "--json"]);
+    let space: serde_json::Value =
+        serde_json::from_slice(&space.stdout).expect("parse post-expiry space report");
+    assert_eq!(space["logical"]["retained"]["state"], "available");
+    assert_eq!(space["logical"]["retained"]["expired_revision_count"], 1);
+    assert!(
+        space["logical"]["retained"]["expired_revisions"]
+            .as_array()
+            .is_some_and(|revisions| {
+                revisions
+                    .iter()
+                    .any(|revision| revision == zero_text.as_str())
+            })
+    );
+    let plan = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "plan",
+        "--json",
+    ]);
+    let plan: serde_json::Value =
+        serde_json::from_slice(&plan.stdout).expect("parse post-expiry retention plan");
+    assert_eq!(plan["state"], "available");
+    assert_eq!(plan["policy"]["published_history"], "readable_by_default");
+    assert_eq!(plan["expired_revision_count"], 1);
+    let expired = plan["revisions"]
+        .as_array()
+        .expect("post-expiry plan revisions")
+        .iter()
+        .find(|revision| revision["revision"] == zero_text.as_str())
+        .expect("expired revision in plan");
+    assert_eq!(expired["state"], "expired");
+    assert_eq!(expired["selected"], false);
+    assert_eq!(expired["reasons"], serde_json::json!(["expired"]));
+
+    let authority = fixture_authority(&fixture);
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_revision(zero.cursor.revision))
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired
+    );
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_revision(Revision::from_bytes([0x7f; 24])))
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::NotFound
+    );
+    let history = runtime()
+        .block_on(authority.history_page(None, yinyang::core::RETAINED_REVISIONS_PAGE_MAX))
+        .unwrap();
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == zero.cursor.revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+
+    if let Some(binary) = &legacy {
+        legacy_post_expiry(binary, &mut fixture, publication, &zero_text);
+    }
+
+    let mut expected = b"version-one!".to_vec();
+    expected[4..8].copy_from_slice(b"PEND");
+    let read = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "read",
+        &handle.to_string(),
+        "--length",
+        &expected.len().to_string(),
+    ]);
+    assert_eq!(read.stdout, expected);
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "fsync",
+        &handle.to_string(),
+    ]);
+    assert_eq!(
+        remote_entry_bytes(&fixture, "protected.txt").as_deref(),
+        Some(expected.as_slice()),
+        "{publication:?} did not publish recovered protected work"
+    );
+
+    let authority = fixture_authority(&fixture);
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_revision(zero.cursor.revision))
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired,
+        "{publication:?} lost the expiry marker after a normal commit"
+    );
+    let immutable_after = immutable_remote_identities(&fixture.operator());
+    for identity in &immutable_before {
+        assert!(
+            immutable_after.contains(identity),
+            "{publication:?} deleted or rewrote pre-existing immutable content: {identity:?}"
+        );
+    }
+
+    let before_repeat = runtime()
+        .block_on(authority.observe_latest())
+        .unwrap()
+        .revision();
+    let repeated = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "expire",
+        "--revision",
+        &zero_text,
+        "--backup",
+        text(&backup),
+        "--json",
+    ]);
+    let repeated: serde_json::Value =
+        serde_json::from_slice(&repeated.stdout).expect("parse repeated expiry JSON");
+    assert_eq!(repeated["state"], "already_expired");
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_latest())
+            .unwrap()
+            .revision(),
+        before_repeat,
+        "idempotent expiry advanced the head"
+    );
+}
+
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
 fn object_publication_journal_restore_preserves_history_and_unknown() {
     let fixture = Fixture::new(Publication::Object);
     let history = fixture.path("history-source");
@@ -1183,7 +1528,7 @@ fn assert_plan_boundaries(plan: &serde_json::Value) {
     assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v3");
     assert_eq!(plan["deletion_authorized"], false);
     assert!(plan["reclaimable_bytes"].is_null());
-    assert_eq!(plan["policy"]["published_history"], "retained_by_default");
+    assert_eq!(plan["policy"]["published_history"], "readable_by_default");
 }
 
 fn plan_decision<'a>(plan: &'a serde_json::Value, revision: &str) -> &'a serde_json::Value {
@@ -1303,6 +1648,13 @@ fn remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
     });
     identities.sort();
     identities
+}
+
+fn immutable_remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
+    remote_identities(operator)
+        .into_iter()
+        .filter(|identity| identity.path != ".yinyang/head")
+        .collect()
 }
 
 fn remove_prefix(operator: &opendal::Operator) {
@@ -1822,6 +2174,316 @@ fn upstream_endpoint() -> SocketAddr {
 
 fn commit_text(commit: CommitId) -> String {
     uuid::Uuid::from_bytes(*commit.as_bytes()).to_string()
+}
+
+fn revision_text(revision: Revision) -> String {
+    revision
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn legacy_yy_binary() -> Option<PathBuf> {
+    let Some(path) = std::env::var_os("YY_LEGACY_EXPIRY_BIN") else {
+        eprintln!("legacy expiry qualification: not run (YY_LEGACY_EXPIRY_BIN is unset)");
+        return None;
+    };
+    let path = PathBuf::from(path);
+    assert!(
+        path.is_file(),
+        "YY_LEGACY_EXPIRY_BIN must name the recorded legacy yy binary: {}",
+        path.display()
+    );
+    let hash = run_external("sha256sum", &[text(&path)], Duration::from_secs(30));
+    let hash = std::str::from_utf8(&hash.stdout)
+        .unwrap()
+        .split_ascii_whitespace()
+        .next()
+        .expect("sha256sum output");
+    eprintln!(
+        "legacy expiry qualification: running {} sha256={} source={}",
+        path.display(),
+        hash,
+        std::env::var("YY_LEGACY_EXPIRY_SOURCE").unwrap_or_else(|_| "unspecified".to_owned())
+    );
+    Some(path)
+}
+
+fn legacy_yy(binary: &Path, fixture: &Fixture, args: &[&str]) -> Captured {
+    run_command(
+        legacy_yy_command(binary, fixture, args),
+        Duration::from_secs(60),
+    )
+}
+
+fn legacy_pre_expiry(
+    binary: &Path,
+    fixture: &mut Fixture,
+    publication: Publication,
+    zero: Revision,
+    zero_commit: CommitId,
+    latest: Revision,
+) {
+    let head_before = runtime()
+        .block_on(fixture_authority(fixture).observe_latest())
+        .unwrap()
+        .revision();
+    let zero_text = revision_text(zero);
+    match publication {
+        Publication::Object => {
+            legacy_yy(binary, fixture, &["status", "--revision", &zero_text])
+                .success_or("legacy object status before expiry");
+            let read_path = fixture.path("legacy-pre-expiry-read");
+            legacy_yy(
+                binary,
+                fixture,
+                &["restore", text(&read_path), "--revision", &zero_text],
+            )
+            .success_or("legacy object read before expiry");
+            assert_eq!(
+                fs::read(read_path.join("protected.txt")).unwrap(),
+                b"version-zero"
+            );
+        }
+        Publication::Service => {
+            let original_address = fixture.service_address();
+            fixture.stop_service();
+            let metadata = fixture.path("metadata.db");
+            let service = legacy_service(binary, fixture, &metadata);
+            let config = fixture.path("legacy-service.json");
+            write_read_only_service_config(&config, &fixture.path("legacy-state"), service.address);
+            let receipt = legacy_yy(
+                binary,
+                fixture,
+                &[
+                    "--volume",
+                    text(&config),
+                    "receipt",
+                    &commit_text(zero_commit),
+                ],
+            );
+            receipt.success_or("legacy service receipt before expiry");
+            assert!(
+                String::from_utf8_lossy(&receipt.stdout).contains("revision:"),
+                "legacy service did not read the known receipt: {}",
+                String::from_utf8_lossy(&receipt.stdout)
+            );
+            let status = legacy_yy(binary, fixture, &["--volume", text(&config), "status"]);
+            status.success_or("legacy service status before expiry");
+            assert!(
+                String::from_utf8_lossy(&status.stdout)
+                    .contains(&format!("remote latest: {}", revision_text(latest))),
+                "legacy service did not read the known snapshot: {}",
+                String::from_utf8_lossy(&status.stdout)
+            );
+            service.stop();
+            fixture.restart_service();
+            assert_eq!(fixture.service_address(), original_address);
+        }
+    }
+    assert_eq!(
+        runtime()
+            .block_on(fixture_authority(fixture).observe_latest())
+            .unwrap()
+            .revision(),
+        head_before,
+        "legacy pre-expiry qualification mutated the head"
+    );
+}
+
+fn legacy_post_expiry(
+    binary: &Path,
+    fixture: &mut Fixture,
+    publication: Publication,
+    expired: &str,
+) {
+    let head_before = runtime()
+        .block_on(fixture_authority(fixture).observe_latest())
+        .unwrap()
+        .revision();
+    match publication {
+        Publication::Object => {
+            let status = legacy_yy(binary, fixture, &["status", "--revision", expired]);
+            assert!(
+                !status.status.success(),
+                "legacy object binary accepted the activated format"
+            );
+            let diagnostic = String::from_utf8_lossy(&status.stderr).to_ascii_lowercase();
+            assert!(
+                diagnostic
+                    .trim()
+                    .ends_with(": unknown profile or publication mode"),
+                "legacy object rejection lacked the exact format diagnostic: {diagnostic}"
+            );
+            let read_path = fixture.path("legacy-post-expiry-read");
+            let read = legacy_yy(
+                binary,
+                fixture,
+                &["restore", text(&read_path), "--revision", expired],
+            );
+            assert!(!read.status.success());
+            assert!(!read_path.exists());
+        }
+        Publication::Service => {
+            fixture.stop_service();
+            let metadata = fixture.path("metadata.db");
+            let serve = legacy_yy(
+                binary,
+                fixture,
+                &[
+                    "serve",
+                    "--database",
+                    text(&metadata),
+                    "--listen",
+                    "127.0.0.1:0",
+                ],
+            );
+            assert!(
+                !serve.status.success(),
+                "legacy service daemon accepted the activated profile"
+            );
+            let diagnostic = String::from_utf8_lossy(&serve.stderr).to_ascii_lowercase();
+            assert!(
+                diagnostic.trim().ends_with(": unknown schema profile"),
+                "legacy service rejection lacked the exact profile diagnostic: {diagnostic}"
+            );
+            fixture.restart_service();
+        }
+    }
+    assert_eq!(
+        runtime()
+            .block_on(fixture_authority(fixture).observe_latest())
+            .unwrap()
+            .revision(),
+        head_before,
+        "legacy post-activation qualification mutated the head"
+    );
+}
+
+fn write_read_only_service_config(path: &Path, state: &Path, address: SocketAddr) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "legacy-service",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "service",
+            "service_address": address.to_string(),
+            "storage_profile": "minio",
+            "staging": state,
+            "read_only": true,
+            "require": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+struct LegacyService {
+    child: Child,
+    address: SocketAddr,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl LegacyService {
+    fn stop(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn legacy_service(binary: &Path, fixture: &Fixture, metadata: &Path) -> LegacyService {
+    let mut command = legacy_yy_command(
+        binary,
+        fixture,
+        &[
+            "serve",
+            "--database",
+            text(metadata),
+            "--listen",
+            "127.0.0.1:0",
+        ],
+    );
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn legacy yy serve");
+    let stdout = child.stdout.take().expect("legacy service stdout");
+    let stderr = child.stderr.take().expect("legacy service stderr");
+    let (sender, receiver) = mpsc::channel();
+    let stdout_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let sent = reader.read_line(&mut line).is_ok();
+        let _ = sender.send((sent, line));
+        let mut rest = Vec::new();
+        let _ = reader.read_to_end(&mut rest);
+        rest
+    });
+    let stderr_thread = thread::spawn(move || read_all(stderr));
+    let (sent, line) = receiver
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("legacy yy serve did not report readiness: {error:?}");
+        });
+    assert!(sent, "legacy yy serve closed stdout before readiness");
+    let address = line
+        .trim()
+        .strip_prefix("metadata service listening on ")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected legacy service readiness line {line:?}"));
+    LegacyService {
+        child,
+        address,
+        stdout: Some(stdout_thread),
+        stderr: Some(stderr_thread),
+    }
+}
+
+fn legacy_yy_command(binary: &Path, fixture: &Fixture, args: &[&str]) -> Command {
+    let source = fixture.yy_command(&[]);
+    let envs = source
+        .get_envs()
+        .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
+        .collect::<Vec<_>>();
+    let mut command = Command::new(binary);
+    for (key, value) in envs {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    command.args(args);
+    command
+}
+
+fn fixture_authority(fixture: &Fixture) -> Arc<dyn Authority> {
+    match fixture.publication {
+        Publication::Object => Arc::new(
+            runtime()
+                .block_on(Fs::open(fixture.operator(), BackendProfile::Minio))
+                .expect("open object authority"),
+        ),
+        Publication::Service => {
+            let command = fixture.yy_command(&[]);
+            let token = command
+                .get_envs()
+                .find(|(key, _)| *key == "YINYANG_SERVICE_TOKEN")
+                .and_then(|(_, value)| value)
+                .expect("fixture service token")
+                .to_string_lossy()
+                .into_owned();
+            service_authority(fixture.service_address(), &token, fixture.operator())
+        }
+    }
 }
 
 fn operator_for_root(root: &str) -> opendal::Operator {

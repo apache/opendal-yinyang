@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Managed space and retention CLI.
+//! Managed space reporting, retention planning, and explicit logical expiry CLI.
 
 use crate::RevisionArg;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use yinyang::core::Revision;
+use yinyang::core::{ExpiryId, Revision};
 use yinyang::space::{
-    ListingConsistency, ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, StagingState,
+    ExpiryReportState, ListingConsistency, ManagedExpiryReport, ManagedRetentionPlan,
+    ManagedSpaceReport, MeasurementState, RetentionRevisionState, StagingState,
 };
 use yinyang::volume::{Model, Volume, VolumeConfig};
 
@@ -35,7 +36,7 @@ pub enum SpaceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Build an explicit declarative retention selection without deleting data.
+    /// Plan or explicitly expire retained history without physical deletion.
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
@@ -59,6 +60,22 @@ pub enum RetentionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Explicitly expire selected historical revisions after protection checks.
+    ///
+    /// Stop every affected client and backup before running. The first
+    /// successful expiry switches the authority format, so older readers and
+    /// daemons reject it. Physical objects are not deleted.
+    Expire {
+        /// Historical revision to expire; repeat for an atomic batch.
+        #[arg(long = "revision", required = true)]
+        revision: Vec<RevisionArg>,
+        /// Protect revisions referenced by an explicit validated backup package.
+        #[arg(long = "backup")]
+        backup: Vec<PathBuf>,
+        /// Emit the versioned `yinyang.managed-retention.expiry.v1` document.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(
@@ -76,6 +93,19 @@ pub async fn run(
     if config.model != Model::Managed {
         return Err(
             "space inspection supports Managed volumes only; Direct namespace objects are excluded"
+                .into(),
+        );
+    }
+    if config.read_only
+        && matches!(
+            &command,
+            SpaceCommand::Retention {
+                command: RetentionCommand::Expire { .. }
+            }
+        )
+    {
+        return Err(
+            "space retention expire requires a writable Managed volume; read-only volumes support report and plan only"
                 .into(),
         );
     }
@@ -124,6 +154,39 @@ pub async fn run(
                 print_plan(&plan);
             }
         }
+        SpaceCommand::Retention {
+            command:
+                RetentionCommand::Expire {
+                    revision,
+                    backup,
+                    json,
+                },
+        } => {
+            let revisions = revision
+                .into_iter()
+                .map(|revision| revision.0)
+                .collect::<Vec<_>>();
+            let operation_id = ExpiryId::generate();
+            let report = yinyang::space::expire_managed_retention(
+                authority.as_ref(),
+                &config.staging,
+                &revisions,
+                &backup,
+                operation_id,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_expiry(&report);
+            }
+            let code = match report.state {
+                ExpiryReportState::Committed | ExpiryReportState::AlreadyExpired => 0,
+                ExpiryReportState::Refused | ExpiryReportState::Conflict => 2,
+                ExpiryReportState::Retryable | ExpiryReportState::Unknown => 3,
+            };
+            return Ok(ExitCode::from(code));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -156,7 +219,13 @@ fn print_report(report: &ManagedSpaceReport) {
     );
     match report.logical.retained.state {
         MeasurementState::Available | MeasurementState::Partial => println!(
-            "logical retained: {} revisions observed, {} bytes across snapshots, {} unique-content bytes",
+            "logical retained: {} history identities ({} expired), {} readable revisions observed, {} bytes across readable snapshots, {} unique-content bytes",
+            report.logical.retained.revision_count.unwrap_or_default(),
+            report
+                .logical
+                .retained
+                .expired_revision_count
+                .unwrap_or_default(),
             report.logical.retained.observed_revisions.len(),
             report.logical.retained.observed_file_bytes,
             report.logical.retained.observed_unique_content_bytes
@@ -309,7 +378,22 @@ fn print_plan(plan: &ManagedRetentionPlan) {
             .unwrap_or_else(|| "not-set".to_owned()),
         plan.policy.requested_pins.len()
     );
+    for pin in &plan.policy.requested_pins {
+        println!("requested pin {}: {:?}", pin.revision, pin.state);
+    }
     println!("published history: {}", plan.policy.published_history);
+    println!(
+        "history identities: {} total, {} readable, {} expired",
+        plan.retained_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.readable_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.expired_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned())
+    );
     let selected = plan
         .revisions
         .iter()
@@ -327,8 +411,12 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     }
     for revision in &plan.revisions {
         println!(
-            "revision {}: {} [{}]",
+            "revision {}: {} {} [{}]",
             revision.revision,
+            match revision.state {
+                RetentionRevisionState::Readable => "readable",
+                RetentionRevisionState::Expired => "expired",
+            },
             if revision.selected {
                 "selected"
             } else {
@@ -435,9 +523,103 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     println!("deletion authorized: no");
     println!("reclaimable bytes: unknown; selection is not a cleanup estimate");
     println!(
-        "outside-policy revisions remain readable; --keep is not a persistent pin; no expiry command exists"
+        "readable outside-policy revisions remain readable; expired identities stay expired; --keep is not a persistent pin"
     );
     if plan.protection.staging.state == StagingState::Unavailable {
         println!("local staging evidence is unavailable; do not infer that no pending work exists");
+    }
+}
+
+fn print_expiry(report: &ManagedExpiryReport) {
+    println!(
+        "retention expiry: filesystem {} revision {} operation {}",
+        report.filesystem, report.observed_revision, report.operation_id
+    );
+    println!(
+        "state: {}{}",
+        expiry_state_name(report.state),
+        report
+            .after_revision
+            .as_deref()
+            .map(|revision| format!("; after revision {revision}"))
+            .unwrap_or_default()
+    );
+    for revision in &report.revisions {
+        println!(
+            "revision {}: {} [{}]",
+            revision.revision,
+            expiry_decision_name(revision.state),
+            revision.reasons.join(",")
+        );
+    }
+    println!(
+        "protected staging: binding {:?} pending {} frozen {} conflict {} unknown {} failed {}",
+        report.staging.binding.state,
+        report.staging.pending,
+        report.staging.frozen,
+        report.staging.conflict,
+        report.staging.unknown,
+        report.staging.failed
+    );
+    println!(
+        "backup packages: {} supplied, {} validated",
+        report.backups.supplied, report.backups.validated
+    );
+    for unresolved in &report.unresolved {
+        println!(
+            "unresolved {} ({}): {}",
+            unresolved.subject, unresolved.state, unresolved.detail
+        );
+    }
+    println!(
+        "external readers: {}; untracked pins: {}; quiescence: {}",
+        report.external_readers, report.untracked_pins, report.quiescence
+    );
+    println!("evidence digest: {}", report.evidence_digest);
+    println!(
+        "physical cleanup: {}; reclaimable bytes: unknown; deletion authorized: no",
+        report.physical_cleanup
+    );
+    match report.state {
+        ExpiryReportState::Committed => {}
+        ExpiryReportState::AlreadyExpired => {
+            println!("all requested revisions were already expired; no new mutation was issued");
+        }
+        ExpiryReportState::Refused | ExpiryReportState::Conflict => {
+            println!("no new revision was expired");
+        }
+        ExpiryReportState::Retryable => {
+            println!("expiry is retryable; no physical cleanup is implied");
+        }
+        ExpiryReportState::Unknown => {
+            println!(
+                "expiry outcome is unknown; keep clients and backups stopped and rerun the same candidate set"
+            );
+        }
+    }
+}
+
+fn expiry_state_name(state: ExpiryReportState) -> &'static str {
+    match state {
+        ExpiryReportState::Committed => "committed",
+        ExpiryReportState::AlreadyExpired => "already_expired",
+        ExpiryReportState::Refused => "refused",
+        ExpiryReportState::Conflict => "conflict",
+        ExpiryReportState::Retryable => "retryable",
+        ExpiryReportState::Unknown => "unknown",
+    }
+}
+
+fn expiry_decision_name(state: yinyang::space::ExpiryDecisionState) -> &'static str {
+    use yinyang::space::ExpiryDecisionState;
+    match state {
+        ExpiryDecisionState::Eligible => "eligible",
+        ExpiryDecisionState::Expired => "expired",
+        ExpiryDecisionState::AlreadyExpired => "already_expired",
+        ExpiryDecisionState::Current => "current",
+        ExpiryDecisionState::Missing => "missing",
+        ExpiryDecisionState::Protected => "protected",
+        ExpiryDecisionState::ProtectedMissing => "protected_missing",
+        ExpiryDecisionState::ProtectedExpired => "protected_expired",
     }
 }

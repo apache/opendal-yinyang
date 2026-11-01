@@ -18,6 +18,7 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 
+use futures_util::future::BoxFuture;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,13 +26,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::transaction::Planner;
 use yinyang::core::{
-    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs,
-    NodeId, Revision, Snapshot, Transaction,
+    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind,
+    ExpiryConflict, ExpiryConflictKind, ExpiryId, ExpiryOutcome, ExpiryRefusal, ExpiryRequest, Fs,
+    HistoryPage, NodeId, Revision, RevisionState, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
-    MeasurementState, StagingBindingState, StagingState, inspect_bound_local_staging,
-    inspect_managed_space, plan_managed_retention,
+    ExpiryDecisionState, ExpiryReportState, MeasurementState, RequestedPinState,
+    RetentionRevisionState, StagingBindingState, StagingState, expire_managed_retention,
+    inspect_bound_local_staging, inspect_managed_space, plan_managed_retention,
 };
 use yinyang::sync::Sync;
 
@@ -94,6 +97,68 @@ impl Authority for LostResponseAuthority {
                 ));
             }
             Ok(outcomes)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RefusedExpiryAuthority {
+    inner: Arc<dyn Authority>,
+    latest: Revision,
+    already_expired: Revision,
+}
+
+impl Authority for RefusedExpiryAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+
+    fn observe_latest(&self) -> BoxFuture<'_, yinyang::core::Result<Snapshot>> {
+        self.inner.observe_latest()
+    }
+
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> BoxFuture<'_, yinyang::core::Result<Snapshot>> {
+        self.inner.observe_revision(revision)
+    }
+
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> BoxFuture<'a, yinyang::core::Result<Vec<CommitOutcome>>> {
+        self.inner.commit_batch(requests)
+    }
+
+    fn history_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, yinyang::core::Result<HistoryPage>> {
+        self.inner.history_page(after, limit)
+    }
+
+    fn expire_revisions<'a>(
+        &'a self,
+        _request: &'a ExpiryRequest,
+    ) -> BoxFuture<'a, yinyang::core::Result<ExpiryOutcome>> {
+        Box::pin(async move {
+            Ok(ExpiryOutcome::Refused(ExpiryRefusal {
+                current_latest: self.latest,
+                conflicts: vec![ExpiryConflict {
+                    revision: self.already_expired,
+                    kind: ExpiryConflictKind::AlreadyExpired,
+                }],
+            }))
         })
     }
 }
@@ -212,7 +277,7 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
         .unwrap();
 
     assert_eq!(plan.policy.mode, "bounded");
-    assert_eq!(plan.policy.published_history, "retained_by_default");
+    assert_eq!(plan.policy.published_history, "readable_by_default");
     assert_eq!(plan.retained_revision_count, Some(3));
     assert!(!plan.deletion_authorized);
     assert_eq!(plan.reclaimable_bytes, None);
@@ -241,6 +306,360 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
             && !revision.selected
             && revision.reasons == ["outside_bounded_policy"]
     }));
+}
+
+#[test]
+fn read_only_expire_is_rejected_before_storage_or_local_state_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let config = temp.path().join("read-only.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "read-only-expiry",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "service",
+            "service_address": "127.0.0.1:9",
+            "storage_profile": "minio",
+            "staging": state.clone(),
+            "read_only": true,
+            "require": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args([
+            "--volume",
+            config.to_str().unwrap(),
+            "space",
+            "retention",
+            "expire",
+            "--revision",
+            "00112233445566778899aabbccddeeff0011223344556677",
+            "--json",
+        ])
+        .env("YINYANG_STORAGE_PROFILE", "minio")
+        .env("YINYANG_S3_BUCKET", "dummy")
+        .env("YINYANG_S3_REGION", "us-east-1")
+        .env("YINYANG_S3_ENDPOINT", "http://127.0.0.1:9")
+        .env("YINYANG_S3_ACCESS_KEY_ID", "dummy")
+        .env("YINYANG_S3_SECRET_ACCESS_KEY", "dummy")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires a writable Managed volume")
+            && stderr.contains("report and plan only"),
+        "unexpected readonly admission failure: {stderr}"
+    );
+    assert!(
+        !state.exists(),
+        "readonly expiry rejection created local state"
+    );
+}
+
+#[tokio::test]
+async fn clean_handle_base_is_protected_and_remains_readable_and_writable() {
+    const CHUNK: usize = 64 * 1024;
+
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("editor");
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let original = (0..CHUNK * 2 + 137)
+        .map(|position| (position % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = authority.prepare(&mut original.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut create = Planner::new(&snapshot, CommitId::generate());
+    let node = create
+        .create_file(authority.root(), "base.bin", prepared, false)
+        .await
+        .unwrap();
+    let CommitOutcome::Committed(receipt) =
+        authority.commit(&create.finish().unwrap()).await.unwrap()
+    else {
+        panic!("initial file commit must succeed");
+    };
+    let base = receipt.cursor.revision;
+
+    let file = runtime.open_node(node, true).await.unwrap();
+    let status = file.status().await.unwrap();
+    assert_eq!(status.remote_revision, base);
+    assert!(!status.pending);
+    let handle = file.release().unwrap();
+
+    runtime
+        .create_directory(authority.root(), "later-revision")
+        .await
+        .unwrap();
+    let plan = plan_managed_retention(authority.as_ref(), &staging, Some(1), &[], &[])
+        .await
+        .unwrap();
+    let decision = plan
+        .revisions
+        .iter()
+        .find(|revision| revision.revision == hex(base))
+        .expect("clean handle base decision");
+    assert!(decision.selected);
+    assert!(
+        decision.reasons.contains(&"staging_base"),
+        "clean handle base has unexpected reasons: {:?}",
+        decision.reasons
+    );
+
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    assert_eq!(recovered.read(0, original.len()).await.unwrap(), original);
+
+    let offset = CHUNK + 19;
+    let update = b"clean-handle-write";
+    recovered.write(offset as u64, update).await.unwrap();
+    let receipt = recovered.fsync().await.unwrap().unwrap();
+    assert_ne!(receipt.cursor.revision, base);
+    let mut expected = original;
+    expected[offset..offset + update.len()].copy_from_slice(update);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    recovered.close().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn partial_core_refusal_does_not_confirm_unlisted_candidates() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let inner: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(inner.clone(), temp.path().join("seed"))
+        .await
+        .unwrap();
+    for name in ["first", "second", "latest"] {
+        runtime.create_directory(inner.root(), name).await.unwrap();
+    }
+    drop(runtime);
+    let revisions = inner.retained_revisions().await.unwrap();
+    let latest = inner.observe_latest().await.unwrap().revision();
+    let authority: Arc<dyn Authority> = Arc::new(RefusedExpiryAuthority {
+        inner: inner.clone(),
+        latest,
+        already_expired: revisions[0],
+    });
+
+    let before = inner.observe_latest().await.unwrap().revision();
+    let report = expire_managed_retention(
+        authority.as_ref(),
+        &temp.path().join("absent"),
+        &[revisions[0], revisions[1]],
+        &[],
+        ExpiryId::from_bytes([43; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.state, ExpiryReportState::Refused);
+    assert_eq!(
+        report.revisions[0].state,
+        ExpiryDecisionState::AlreadyExpired
+    );
+    assert_eq!(report.revisions[1].state, ExpiryDecisionState::Eligible);
+    assert!(
+        report
+            .revisions
+            .iter()
+            .all(|decision| decision.state != ExpiryDecisionState::Expired),
+        "a partial Core refusal must not report a new expiry"
+    );
+    assert_eq!(inner.observe_latest().await.unwrap().revision(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_expiry_preserves_protected_staging_work_and_is_idempotent() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("editor");
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let original = b"version-zero".to_vec();
+    let prepared = authority.prepare(&mut original.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut create = Planner::new(&snapshot, CommitId::generate());
+    let node = create
+        .create_file(authority.root(), "protected.bin", prepared, false)
+        .await
+        .unwrap();
+    let CommitOutcome::Committed(zero) = authority.commit(&create.finish().unwrap()).await.unwrap()
+    else {
+        panic!("initial revision must commit");
+    };
+    let zero_revision = zero.cursor.revision;
+
+    let mut first = runtime.open_node(node, true).await.unwrap();
+    first.write(0, b"version-one").await.unwrap();
+    let one = first.fsync().await.unwrap().unwrap();
+    let one_revision = one.cursor.revision;
+    first.close().await.unwrap();
+    drop(first);
+
+    let mut protected = runtime.open_node(node, true).await.unwrap();
+    protected.write(4, b"protected-pending").await.unwrap();
+    let handle = protected.release().unwrap();
+    drop(runtime);
+
+    let report = expire_managed_retention(
+        authority.as_ref(),
+        &staging,
+        &[zero_revision],
+        &[],
+        ExpiryId::from_bytes([41; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.state, ExpiryReportState::Committed);
+    assert_eq!(report.revisions[0].state, ExpiryDecisionState::Expired);
+    assert_eq!(report.evidence_digest.len(), 64);
+    assert_eq!(
+        authority
+            .observe_revision(zero_revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired
+    );
+    assert!(authority.observe_revision(one_revision).await.is_ok());
+    let history = authority
+        .history_page(None, yinyang::core::RETAINED_REVISIONS_PAGE_MAX)
+        .await
+        .unwrap();
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == zero_revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+
+    let space = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
+        .await
+        .unwrap();
+    assert_eq!(space.logical.retained.state, MeasurementState::Available);
+    assert_eq!(space.logical.retained.expired_revision_count, Some(1));
+    assert_eq!(
+        space.logical.retained.expired_revisions,
+        [hex(zero_revision)]
+    );
+    assert!(!space.unresolved.iter().any(|unresolved| {
+        unresolved.subject == "retained-snapshot" || unresolved.subject == "retained-revisions"
+    }));
+
+    let keep_all = plan_managed_retention(authority.as_ref(), &staging, None, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(keep_all.state, MeasurementState::Available);
+    assert_eq!(
+        keep_all.readable_revision_count.unwrap() + keep_all.expired_revision_count.unwrap(),
+        keep_all.retained_revision_count.unwrap()
+    );
+    let expired = keep_all
+        .revisions
+        .iter()
+        .find(|revision| revision.revision == hex(zero_revision))
+        .unwrap();
+    assert_eq!(expired.state, RetentionRevisionState::Expired);
+    assert!(!expired.selected);
+    assert_eq!(expired.reasons, ["expired"]);
+    assert!(keep_all.revisions.iter().any(|revision| {
+        revision.revision == hex(one_revision)
+            && revision.state == RetentionRevisionState::Readable
+            && revision.selected
+            && revision.reasons.contains(&"keep_all")
+    }));
+
+    let expired_pin =
+        plan_managed_retention(authority.as_ref(), &staging, None, &[zero_revision], &[])
+            .await
+            .unwrap();
+    assert_eq!(expired_pin.state, MeasurementState::Partial);
+    assert_eq!(
+        expired_pin.policy.requested_pins[0].state,
+        RequestedPinState::Expired
+    );
+    assert!(expired_pin.unresolved.iter().any(|unresolved| {
+        unresolved.subject == "requested-pin" && unresolved.state == "expired"
+    }));
+
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    let mut expected = b"version-one".to_vec();
+    expected.resize(4 + b"protected-pending".len(), 0);
+    expected[4..4 + b"protected-pending".len()].copy_from_slice(b"protected-pending");
+    assert_eq!(recovered.read(0, expected.len()).await.unwrap(), expected);
+    let after = recovered.fsync().await.unwrap().unwrap();
+    assert!(after.cursor.revision > one_revision);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    recovered.close().await.unwrap();
+    drop(recovered);
+    drop(runtime);
+
+    let before = authority.observe_latest().await.unwrap().revision();
+    let repeated = expire_managed_retention(
+        authority.as_ref(),
+        &staging,
+        &[zero_revision],
+        &[],
+        ExpiryId::from_bytes([42; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated.state, ExpiryReportState::AlreadyExpired);
+    assert_eq!(
+        repeated.revisions[0].state,
+        ExpiryDecisionState::AlreadyExpired
+    );
+    assert_eq!(
+        authority.observe_latest().await.unwrap().revision(),
+        before,
+        "an idempotent already-expired request must not advance the head"
+    );
+    assert_eq!(
+        authority
+            .observe_revision(zero_revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired
+    );
 }
 
 #[tokio::test]

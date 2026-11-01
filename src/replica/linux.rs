@@ -213,6 +213,25 @@ pub struct ReplicaProtection {
     pub baseline: Option<ReplicaBaseline>,
 }
 
+/// Exclusive lease for the existing Managed Sync replica protocol.
+///
+/// Acquisition may create the configured state directory and `replica.lock`,
+/// but it never opens, creates, migrates, or recovers `replica.db`.
+pub(crate) struct ReplicaStateLease {
+    _file: std::fs::File,
+}
+
+impl ReplicaStateLease {
+    pub(crate) fn acquire(state: &Path) -> Result<Self> {
+        std::fs::create_dir_all(state).map_err(|error| Error::io("create state", state, error))?;
+        let state = std::fs::canonicalize(state)
+            .map_err(|error| Error::io("canonicalize", state, error))?;
+        let (state_fd, _) = open_bound_directory(&state, "open sync state")?;
+        let file = acquire_state_lease(&state_fd, &state)?;
+        Ok(Self { _file: file })
+    }
+}
+
 pub struct Replica {
     root: PathBuf,
     state: PathBuf,
@@ -2645,6 +2664,25 @@ mod tests {
     use super::*;
     use crate::replica::ErrorKind;
     use std::os::unix::fs::FileExt as _;
+
+    #[test]
+    fn state_lease_fences_replica_init_without_creating_a_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let root = temp.path().join("root");
+        let lease = ReplicaStateLease::acquire(&state).unwrap();
+        assert!(state.join("replica.lock").exists());
+        assert!(!state.join("replica.db").exists());
+
+        let error = Replica::init(&state, &root, NodeId::from_bytes([18; 16])).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert!(!state.join("replica.db").exists());
+
+        drop(lease);
+        let replica = Replica::init(&state, &root, NodeId::from_bytes([18; 16])).unwrap();
+        assert!(state.join("replica.db").exists());
+        drop(replica);
+    }
 
     #[test]
     fn rollback_retains_replacement_inode_after_second_exchange() {

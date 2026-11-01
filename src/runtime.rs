@@ -28,6 +28,8 @@ use yinyang_core::{
 };
 
 mod staging;
+#[cfg(target_os = "linux")]
+pub(crate) use staging::StagingLease;
 use staging::{CHUNK, Record, Stage, StagedRead};
 pub(crate) mod schema;
 

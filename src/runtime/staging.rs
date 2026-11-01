@@ -147,6 +147,49 @@ pub(super) struct Stage {
     db: Arc<Mutex<Connection>>,
     _lock: Arc<File>,
 }
+
+/// Exclusive process lease for one existing runtime staging protocol.
+///
+/// Acquisition may create the configured directory and `runtime.lock`, but it
+/// never opens, creates, migrates, or recovers `staging.db`.
+#[derive(Clone)]
+pub(crate) struct StagingLease {
+    lock: Arc<File>,
+}
+
+impl StagingLease {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) async fn acquire(path: PathBuf) -> Result<Self> {
+        tokio::task::spawn_blocking(move || Self::acquire_sync(&path))
+            .await
+            .map_err(local)?
+    }
+
+    fn acquire_sync(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path).map_err(local)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.join("runtime.lock"))
+            .map_err(local)?;
+        lock.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => {
+                Error::State(ErrorKind::Busy, "staging directory is already in use")
+            }
+            std::fs::TryLockError::Error(e) => local(e),
+        })?;
+        Ok(Self {
+            lock: Arc::new(lock),
+        })
+    }
+
+    fn file(&self) -> Arc<File> {
+        Arc::clone(&self.lock)
+    }
+}
+
 fn local(e: impl std::error::Error + 'static) -> Error {
     let cause: &dyn std::error::Error = &e;
     let kind = if let Some(error) = cause.downcast_ref::<rusqlite::Error>() {
@@ -794,19 +837,7 @@ impl Stage {
                     }
                 }
             }
-            let lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path.join("runtime.lock"))
-                .map_err(local)?;
-            lock.try_lock().map_err(|e| match e {
-                std::fs::TryLockError::WouldBlock => {
-                    Error::State(ErrorKind::Busy, "staging directory is already in use")
-                }
-                std::fs::TryLockError::Error(e) => local(e),
-            })?;
+            let lease = StagingLease::acquire_sync(&path)?;
             let exists = database.try_exists().map_err(local)?;
             let mut c = Connection::open_with_flags(
                 &database,
@@ -907,7 +938,7 @@ impl Stage {
                 .map_err(local)?;
             Ok(Self {
                 db: Arc::new(Mutex::new(c)),
-                _lock: Arc::new(lock),
+                _lock: lease.file(),
             })
         })
         .await
@@ -1259,6 +1290,27 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    #[tokio::test]
+    async fn lease_only_acquisition_fences_stage_open_without_creating_a_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        let lease = StagingLease::acquire(path.clone()).await.unwrap();
+        assert_eq!(names(&path), ["runtime.lock"]);
+        assert!(!path.join("staging.db").exists());
+
+        let filesystem = NodeId::from_bytes([17; 16]);
+        let Err(error) = Stage::open(path.clone(), filesystem).await else {
+            panic!("stage open must be fenced by the lease");
+        };
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert!(!path.join("staging.db").exists());
+
+        drop(lease);
+        let stage = Stage::open(path.clone(), filesystem).await.unwrap();
+        assert!(path.join("staging.db").exists());
+        drop(stage);
     }
 
     #[tokio::test]
