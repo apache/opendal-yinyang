@@ -1,23 +1,25 @@
 # Directory publication and restoration
 
 The `yinyang` crate provides one-shot directory transfer over the experimental
-object-storage `yinyang_core::Fs`. The runtime and CLI target native Linux,
-macOS, and Windows, not WebAssembly. License checks cover their native target
-graphs without enabling browser-only certificate bundles. This specification
-covers only the finite, caller-driven publication and restoration API: it does
-not define the Managed mount frontend ([Linux FUSE frontend](linux-fuse.md)),
-the durable file-operation runtime ([File-operation runtime](file-runtime.md)),
-or baseline-bound reconciliation ([Sync runtime](sync-runtime.md)). Those
-frontends and runtimes own their own contracts.
+`yinyang_core::Authority` interface. The same functions serve the object
+`Fs`, in-process `MetadataService`, and authenticated `ServiceClient`. The
+runtime and CLI target native Linux, macOS, and Windows, not WebAssembly.
+License checks cover their native target graphs without enabling browser-only
+certificate bundles. This specification covers only the finite, caller-driven
+publication and restoration API: it does not define the Managed mount frontend
+([Linux FUSE frontend](linux-fuse.md)), the durable file-operation runtime
+([File-operation runtime](file-runtime.md)), or baseline-bound reconciliation
+([Sync runtime](sync-runtime.md)). Those frontends and runtimes own their own
+contracts.
 
 ## Publication
 
 Transfer APIs reject snapshots from another filesystem before local IO.
-`prepare_directory(fs, snapshot, source, commit_id)` returns a frozen
+`prepare_directory(authority, snapshot, source, commit_id)` returns a frozen
 `Transaction`; `publish_directory` is its one-shot prepare-and-commit
-convenience. Retain the frozen transaction for exact `Fs::commit` retries.
-Replanning from another snapshot or changed local input is a new logical
-request and requires a new identity.
+convenience. Retain the frozen transaction for exact `Authority::commit`
+retries. Replanning from another snapshot or changed local input is a new
+logical request and requires a new identity.
 
 `DirectoryJournal` adds opt-in cross-process recovery for callers that cannot
 retain all in-process evidence. `prepare` accepts only a new identity and rejects
@@ -119,20 +121,20 @@ and must use a new identity for new intent.
 
 `DirectoryJournal::inspect` opens `directory.db` read-only and returns intents in
 CommitId order with original identity, baseline, digest, state, receipt and
-typed failure. It requires no `Fs`, remote credentials, network or writer lease.
-`DirectoryJournal::export(commit_id, destination)` requires the authority: it
-reads the prepared immutable content referenced by the frozen plan through
-authenticated content verification. It remains usable after source mutation or
-process restart, but it is not an offline export.
+typed failure. It requires no authority instance, remote credentials, network or
+writer lease. `DirectoryJournal::export(commit_id, destination)` requires the
+authority: it reads the prepared immutable content referenced by the frozen plan
+through authenticated content verification. It remains usable after source
+mutation or process restart, but it is not an offline export.
 
 ## Restoration
 
-`restore_directory(fs, snapshot, destination)` restores exactly that pinned
-revision, including after reopening the same filesystem.
-`restore_directory_revision(fs, revision, destination)` resolves one retained
-historical revision before applying the same rules. The destination must not
-exist and its parent must exist. An existing destination or symlink is rejected.
-After destination creation, prevent concurrent local mutation.
+`restore_directory(authority, snapshot, destination)` restores exactly that
+pinned revision, including after reopening the same filesystem.
+`restore_directory_revision(authority, revision, destination)` resolves one
+retained historical revision before applying the same rules. The destination
+must not exist and its parent must exist. An existing destination or symlink is
+rejected. After destination creation, prevent concurrent local mutation.
 
 Each file streams through authenticated verification units into a temporary
 file in its destination directory. After the full read, output is flushed and
