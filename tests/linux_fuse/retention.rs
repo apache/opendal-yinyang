@@ -470,7 +470,7 @@ fn assert_retention_plan(document: &Value) {
     assert_eq!(document["policy"]["mode"], "bounded");
     assert_eq!(document["policy"]["keep_last"], 1);
     assert_eq!(
-        document["policy"]["published_history"], "retained_by_default",
+        document["policy"]["published_history"], "readable_by_default",
         "bounded retention must not logically expire published history: {document}"
     );
     assert_eq!(

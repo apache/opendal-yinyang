@@ -1152,6 +1152,42 @@ fn explicit_expiry_case(publication: Publication) {
     assert_eq!(report["deletion_authorized"], false);
     assert!(report["reclaimable_bytes"].is_null());
     assert_eq!(report["physical_cleanup"], "not_performed");
+    let space = fixture.yy_ok(&["--volume", text(&config), "space", "report", "--json"]);
+    let space: serde_json::Value =
+        serde_json::from_slice(&space.stdout).expect("parse post-expiry space report");
+    assert_eq!(space["logical"]["retained"]["state"], "available");
+    assert_eq!(space["logical"]["retained"]["expired_revision_count"], 1);
+    assert!(
+        space["logical"]["retained"]["expired_revisions"]
+            .as_array()
+            .is_some_and(|revisions| {
+                revisions
+                    .iter()
+                    .any(|revision| revision == zero_text.as_str())
+            })
+    );
+    let plan = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "plan",
+        "--json",
+    ]);
+    let plan: serde_json::Value =
+        serde_json::from_slice(&plan.stdout).expect("parse post-expiry retention plan");
+    assert_eq!(plan["state"], "available");
+    assert_eq!(plan["policy"]["published_history"], "readable_by_default");
+    assert_eq!(plan["expired_revision_count"], 1);
+    let expired = plan["revisions"]
+        .as_array()
+        .expect("post-expiry plan revisions")
+        .iter()
+        .find(|revision| revision["revision"] == zero_text.as_str())
+        .expect("expired revision in plan");
+    assert_eq!(expired["state"], "expired");
+    assert_eq!(expired["selected"], false);
+    assert_eq!(expired["reasons"], serde_json::json!(["expired"]));
 
     let authority = fixture_authority(&fixture);
     assert_eq!(
@@ -1494,7 +1530,7 @@ fn assert_plan_boundaries(plan: &serde_json::Value) {
     assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v3");
     assert_eq!(plan["deletion_authorized"], false);
     assert!(plan["reclaimable_bytes"].is_null());
-    assert_eq!(plan["policy"]["published_history"], "retained_by_default");
+    assert_eq!(plan["policy"]["published_history"], "readable_by_default");
 }
 
 fn plan_decision<'a>(plan: &'a serde_json::Value, revision: &str) -> &'a serde_json::Value {

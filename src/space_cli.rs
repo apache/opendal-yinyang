@@ -24,7 +24,7 @@ use std::process::ExitCode;
 use yinyang::core::{ExpiryId, Revision};
 use yinyang::space::{
     ExpiryReportState, ListingConsistency, ManagedExpiryReport, ManagedRetentionPlan,
-    ManagedSpaceReport, MeasurementState, StagingState,
+    ManagedSpaceReport, MeasurementState, RetentionRevisionState, StagingState,
 };
 use yinyang::volume::{Model, Volume, VolumeConfig};
 
@@ -89,6 +89,19 @@ pub async fn run(
     if config.model != Model::Managed {
         return Err(
             "space inspection supports Managed volumes only; Direct namespace objects are excluded"
+                .into(),
+        );
+    }
+    if config.read_only
+        && matches!(
+            &command,
+            SpaceCommand::Retention {
+                command: RetentionCommand::Expire { .. }
+            }
+        )
+    {
+        return Err(
+            "space retention expire requires a writable Managed volume; read-only volumes support report and plan only"
                 .into(),
         );
     }
@@ -202,7 +215,13 @@ fn print_report(report: &ManagedSpaceReport) {
     );
     match report.logical.retained.state {
         MeasurementState::Available | MeasurementState::Partial => println!(
-            "logical retained: {} revisions observed, {} bytes across snapshots, {} unique-content bytes",
+            "logical retained: {} history identities ({} expired), {} readable revisions observed, {} bytes across readable snapshots, {} unique-content bytes",
+            report.logical.retained.revision_count.unwrap_or_default(),
+            report
+                .logical
+                .retained
+                .expired_revision_count
+                .unwrap_or_default(),
             report.logical.retained.observed_revisions.len(),
             report.logical.retained.observed_file_bytes,
             report.logical.retained.observed_unique_content_bytes
@@ -355,7 +374,22 @@ fn print_plan(plan: &ManagedRetentionPlan) {
             .unwrap_or_else(|| "not-set".to_owned()),
         plan.policy.requested_pins.len()
     );
+    for pin in &plan.policy.requested_pins {
+        println!("requested pin {}: {:?}", pin.revision, pin.state);
+    }
     println!("published history: {}", plan.policy.published_history);
+    println!(
+        "history identities: {} total, {} readable, {} expired",
+        plan.retained_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.readable_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.expired_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned())
+    );
     let selected = plan
         .revisions
         .iter()
@@ -373,8 +407,12 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     }
     for revision in &plan.revisions {
         println!(
-            "revision {}: {} [{}]",
+            "revision {}: {} {} [{}]",
             revision.revision,
+            match revision.state {
+                RetentionRevisionState::Readable => "readable",
+                RetentionRevisionState::Expired => "expired",
+            },
             if revision.selected {
                 "selected"
             } else {
@@ -481,7 +519,7 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     println!("deletion authorized: no");
     println!("reclaimable bytes: unknown; selection is not a cleanup estimate");
     println!(
-        "outside-policy revisions remain readable; --keep is not a persistent pin; planning never expires history"
+        "readable outside-policy revisions remain readable; expired identities stay expired; --keep is not a persistent pin"
     );
     if plan.protection.staging.state == StagingState::Unavailable {
         println!("local staging evidence is unavailable; do not infer that no pending work exists");

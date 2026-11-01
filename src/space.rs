@@ -207,6 +207,8 @@ pub struct LogicalRevision {
 pub struct RetainedLogicalSpace {
     pub state: MeasurementState,
     pub revision_count: Option<u64>,
+    pub expired_revision_count: Option<u64>,
+    pub expired_revisions: Vec<String>,
     pub observed_revisions: Vec<LogicalRevision>,
     pub observed_file_bytes: u64,
     pub observed_unique_content_bytes: u64,
@@ -483,6 +485,8 @@ pub struct ManagedRetentionPlan {
     pub state: MeasurementState,
     pub policy: RetentionPolicyReport,
     pub retained_revision_count: Option<u64>,
+    pub readable_revision_count: Option<u64>,
+    pub expired_revision_count: Option<u64>,
     pub revisions: Vec<RetentionRevision>,
     pub protection: RetentionProtection,
     pub unresolved: Vec<Unresolved>,
@@ -503,11 +507,29 @@ pub struct RetentionPolicyReport {
 pub struct RequestedPin {
     pub revision: String,
     pub retained: Option<bool>,
+    pub state: RequestedPinState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedPinState {
+    Readable,
+    Expired,
+    NotRetained,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionRevisionState {
+    Readable,
+    Expired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RetentionRevision {
     pub revision: String,
+    pub state: RetentionRevisionState,
     pub selected: bool,
     pub reasons: Vec<&'static str>,
     pub files: Option<u64>,
@@ -960,55 +982,89 @@ pub async fn plan_managed_retention(
             ),
         });
     }
-    let (revisions, retained_revision_count, state) = match authority.retained_revisions().await {
-        Ok(revisions) => {
-            let mut revisions = revisions;
-            revisions.sort();
-            revisions.dedup();
-            if revisions.binary_search(&latest.revision()).is_err() {
-                revisions.push(latest.revision());
-                revisions.sort();
+    let (history, retained_revision_count, readable_revisions, state) =
+        match collect_history(authority).await {
+            Ok(mut history) => {
+                if history
+                    .insert(latest.revision(), RevisionState::Readable)
+                    .is_none()
+                {
+                    unresolved.push(Unresolved {
+                        subject: "retained-revisions".to_owned(),
+                        state: "latest-not-listed".to_owned(),
+                        detail: revision_hex(latest.revision()),
+                    });
+                }
+                let count = history.len() as u64;
+                let readable = history
+                    .iter()
+                    .filter(|(_, state)| matches!(state, RevisionState::Readable))
+                    .map(|(revision, _)| *revision)
+                    .collect::<Vec<_>>();
+                (history, Some(count), readable, MeasurementState::Available)
             }
-            let count = revisions.len() as u64;
-            (revisions, Some(count), MeasurementState::Available)
-        }
-        Err(error) => {
-            unresolved.push(Unresolved {
-                subject: "retained-revisions".to_owned(),
-                state: "unavailable".to_owned(),
-                detail: error.to_string(),
-            });
-            (vec![latest.revision()], None, MeasurementState::Unavailable)
-        }
-    };
+            Err(error) => {
+                unresolved.push(Unresolved {
+                    subject: "retained-revisions".to_owned(),
+                    state: "unavailable".to_owned(),
+                    detail: error.to_string(),
+                });
+                (
+                    BTreeMap::from([(latest.revision(), RevisionState::Readable)]),
+                    None,
+                    vec![latest.revision()],
+                    MeasurementState::Unavailable,
+                )
+            }
+        };
 
-    let retained_set = revisions.iter().copied().collect::<BTreeSet<_>>();
+    let retained_set = history.keys().copied().collect::<BTreeSet<_>>();
     let pins = requested_pins.iter().copied().collect::<BTreeSet<_>>();
     let requested = requested_pins
         .iter()
         .map(|revision| RequestedPin {
             revision: revision_hex(*revision),
             retained: retained_revision_count.map(|_| retained_set.contains(revision)),
+            state: if retained_revision_count.is_none() {
+                RequestedPinState::Unknown
+            } else {
+                match history.get(revision) {
+                    Some(RevisionState::Readable) => RequestedPinState::Readable,
+                    Some(RevisionState::Expired(_)) => RequestedPinState::Expired,
+                    None => RequestedPinState::NotRetained,
+                }
+            },
         })
         .collect::<Vec<_>>();
     if retained_revision_count.is_some() {
         for revision in requested_pins {
-            if retained_set.contains(revision) {
-                continue;
+            match history.get(revision) {
+                Some(RevisionState::Readable) => continue,
+                Some(RevisionState::Expired(_)) => unresolved.push(Unresolved {
+                    subject: "requested-pin".to_owned(),
+                    state: "expired".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
+                None => unresolved.push(Unresolved {
+                    subject: "requested-pin".to_owned(),
+                    state: "not_retained".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
             }
-            unresolved.push(Unresolved {
-                subject: "requested-pin".to_owned(),
-                state: "not_retained".to_owned(),
-                detail: revision_hex(*revision),
-            });
         }
         for revision in staging.protected.keys() {
-            if !retained_set.contains(revision) {
-                unresolved.push(Unresolved {
+            match history.get(revision) {
+                Some(RevisionState::Readable) => {}
+                Some(RevisionState::Expired(_)) => unresolved.push(Unresolved {
+                    subject: "local-staging-pin".to_owned(),
+                    state: "protected-expired".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
+                None => unresolved.push(Unresolved {
                     subject: "local-staging-pin".to_owned(),
                     state: "not_retained".to_owned(),
                     detail: revision_hex(*revision),
-                });
+                }),
             }
         }
     }
@@ -1024,12 +1080,18 @@ pub async fn plan_managed_retention(
     }
     if retained_revision_count.is_some() {
         for revision in backup_protected.keys() {
-            if !retained_set.contains(revision) {
-                unresolved.push(Unresolved {
+            match history.get(revision) {
+                Some(RevisionState::Readable) => {}
+                Some(RevisionState::Expired(_)) => unresolved.push(Unresolved {
+                    subject: "backup-pin".to_owned(),
+                    state: "protected-expired".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
+                None => unresolved.push(Unresolved {
                     subject: "backup-pin".to_owned(),
                     state: "not_retained".to_owned(),
                     detail: revision_hex(*revision),
-                });
+                }),
             }
         }
     }
@@ -1038,20 +1100,34 @@ pub async fn plan_managed_retention(
     let keep_last_set = keep_last
         .map(|count| {
             let count = usize::try_from(count).unwrap_or(usize::MAX);
-            revisions
+            readable_revisions
                 .iter()
                 .copied()
-                .skip(revisions.len().saturating_sub(count))
+                .skip(readable_revisions.len().saturating_sub(count))
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
     let mut protected = staging.protected.clone();
     merge_protected(&mut protected, &backup_protected);
     let protected = &protected;
-    let mut decisions = Vec::with_capacity(revisions.len());
-    for revision in &revisions {
+    let mut decisions = Vec::with_capacity(history.len());
+    for (revision, history_state) in &history {
+        let revision = *revision;
+        if matches!(history_state, RevisionState::Expired(_)) {
+            decisions.push(RetentionRevision {
+                revision: revision_hex(revision),
+                state: RetentionRevisionState::Expired,
+                selected: false,
+                reasons: vec!["expired"],
+                files: None,
+                directories: None,
+                file_bytes: None,
+                unique_content_bytes: None,
+            });
+            continue;
+        }
         let reasons = selection_reasons(
-            *revision,
+            revision,
             latest.revision(),
             bounded,
             &keep_last_set,
@@ -1061,33 +1137,47 @@ pub async fn plan_managed_retention(
         let selected = reasons
             .iter()
             .any(|reason| *reason != "outside_bounded_policy");
-        let measured = if *revision == latest.revision() {
+        let measured = if revision == latest.revision() {
             Some(measure_snapshot(&latest).await?)
         } else {
-            match authority.observe_revision(*revision).await {
+            match authority.observe_revision(revision).await {
                 Ok(snapshot) => match measure_snapshot(&snapshot).await {
                     Ok(measured) => Some(measured),
                     Err(error) => {
                         unresolved.push(Unresolved {
                             subject: "retained-logical".to_owned(),
                             state: "unavailable".to_owned(),
-                            detail: format!("{}: {error}", revision_hex(*revision)),
+                            detail: format!("{}: {error}", revision_hex(revision)),
                         });
                         None
                     }
                 },
+                Err(error) if error.kind() == ErrorKind::Expired => {
+                    decisions.push(RetentionRevision {
+                        revision: revision_hex(revision),
+                        state: RetentionRevisionState::Expired,
+                        selected: false,
+                        reasons: vec!["expired"],
+                        files: None,
+                        directories: None,
+                        file_bytes: None,
+                        unique_content_bytes: None,
+                    });
+                    continue;
+                }
                 Err(error) => {
                     unresolved.push(Unresolved {
                         subject: "retained-snapshot".to_owned(),
                         state: "unavailable".to_owned(),
-                        detail: format!("{}: {error}", revision_hex(*revision)),
+                        detail: format!("{}: {error}", revision_hex(revision)),
                     });
                     None
                 }
             }
         };
         decisions.push(RetentionRevision {
-            revision: revision_hex(*revision),
+            revision: revision_hex(revision),
+            state: RetentionRevisionState::Readable,
             selected,
             reasons,
             files: measured.as_ref().map(|value| value.logical.files),
@@ -1124,6 +1214,18 @@ pub async fn plan_managed_retention(
     } else {
         state
     };
+    let readable_revision_count = retained_revision_count.map(|_| {
+        decisions
+            .iter()
+            .filter(|decision| decision.state == RetentionRevisionState::Readable)
+            .count() as u64
+    });
+    let expired_revision_count = retained_revision_count.map(|_| {
+        decisions
+            .iter()
+            .filter(|decision| decision.state == RetentionRevisionState::Expired)
+            .count() as u64
+    });
     let backup_evidence = backup_evidence_state(&backups);
     Ok(ManagedRetentionPlan {
         schema: RETENTION_PLAN_SCHEMA,
@@ -1134,9 +1236,11 @@ pub async fn plan_managed_retention(
             mode: if bounded { "bounded" } else { "keep_all" },
             keep_last,
             requested_pins: requested,
-            published_history: "retained_by_default",
+            published_history: "readable_by_default",
         },
         retained_revision_count,
+        readable_revision_count,
+        expired_revision_count,
         revisions: decisions,
         protection: RetentionProtection {
             current_revision: revision_hex(latest.revision()),
@@ -1203,7 +1307,14 @@ pub async fn expire_managed_retention(
     let expected_latest = observed.revision();
     let staging = inspect_bound_local_staging(staging_path, authority.filesystem()).await;
     let backups = inspect_backup_packages(backup_packages, authority.filesystem()).await;
-    let history = collect_expiry_history(authority, expected_latest).await?;
+    let history = collect_history(authority).await?;
+    if !history.contains_key(&expected_latest) {
+        return Err(Error::new(
+            ErrorKind::Corrupt,
+            "read expiry history",
+            "latest revision is absent from the history index",
+        ));
+    }
     let mut unresolved = staging
         .errors
         .iter()
@@ -1406,11 +1517,7 @@ pub async fn expire_managed_retention(
     ))
 }
 
-#[cfg(target_os = "linux")]
-async fn collect_expiry_history(
-    authority: &dyn Authority,
-    latest: Revision,
-) -> Result<BTreeMap<Revision, RevisionState>> {
+async fn collect_history(authority: &dyn Authority) -> Result<BTreeMap<Revision, RevisionState>> {
     let mut after = None;
     let mut history = BTreeMap::new();
     loop {
@@ -1444,13 +1551,6 @@ async fn collect_expiry_history(
             }
             None => break,
         }
-    }
-    if !history.contains_key(&latest) {
-        return Err(Error::new(
-            ErrorKind::Corrupt,
-            "read expiry history",
-            "latest revision is absent from the history index",
-        ));
     }
     Ok(history)
 }
@@ -2517,26 +2617,40 @@ async fn inspect_retained(
     latest: &Snapshot,
     unresolved: &mut Vec<Unresolved>,
 ) -> RetainedLogicalSpace {
-    match authority.retained_revisions().await {
-        Ok(mut revisions) => {
-            revisions.sort();
-            revisions.dedup();
-            if revisions.binary_search(&latest.revision()).is_err() {
-                revisions.push(latest.revision());
-                revisions.sort();
+    match collect_history(authority).await {
+        Ok(mut history) => {
+            let mut complete = true;
+            if history
+                .insert(latest.revision(), RevisionState::Readable)
+                .is_none()
+            {
+                complete = false;
+                unresolved.push(Unresolved {
+                    subject: "retained-revisions".to_owned(),
+                    state: "latest-not-listed".to_owned(),
+                    detail: revision_hex(latest.revision()),
+                });
             }
-            let revision_count = revisions.len() as u64;
-            let mut observed = Vec::with_capacity(revisions.len());
+            let revision_count = history.len() as u64;
+            let mut expired_revisions = Vec::new();
+            let mut observed = Vec::with_capacity(history.len());
             let mut observed_file_bytes = 0_u64;
             let mut unique = BTreeSet::new();
             let mut observed_unique_content_bytes = 0_u64;
-            let mut complete = true;
-            for revision in revisions {
+            for (revision, state) in history {
+                if matches!(state, RevisionState::Expired(_)) {
+                    expired_revisions.push(revision_hex(revision));
+                    continue;
+                }
                 let snapshot = if revision == latest.revision() {
                     latest.clone()
                 } else {
                     match authority.observe_revision(revision).await {
                         Ok(snapshot) => snapshot,
+                        Err(error) if error.kind() == ErrorKind::Expired => {
+                            expired_revisions.push(revision_hex(revision));
+                            continue;
+                        }
                         Err(error) => {
                             complete = false;
                             unresolved.push(Unresolved {
@@ -2599,6 +2713,8 @@ async fn inspect_retained(
                     MeasurementState::Partial
                 },
                 revision_count: Some(revision_count),
+                expired_revision_count: Some(expired_revisions.len() as u64),
+                expired_revisions,
                 observed_revisions: observed,
                 observed_file_bytes,
                 observed_unique_content_bytes,
@@ -2614,6 +2730,8 @@ async fn inspect_retained(
             RetainedLogicalSpace {
                 state: MeasurementState::Unavailable,
                 revision_count: None,
+                expired_revision_count: None,
+                expired_revisions: Vec::new(),
                 observed_revisions: Vec::new(),
                 observed_file_bytes: 0,
                 observed_unique_content_bytes: 0,
@@ -3107,7 +3225,8 @@ fn retention_limits() -> Vec<String> {
         "Noncurrent backend versions and shared pack extents remain unknown; no reclaimable-byte estimate is produced.",
         "Receipt records are namespace evidence, not a physical cleanup authorization.",
         "Quiescence is not observed; planning does not stop writers, readers, mounts, Sync processes, or backup activity.",
-        "Published history and receipts are retained by default; keep-last changes only the declarative selection, never removes or hides retained revisions, and outside_bounded_policy revisions remain readable.",
+        "Published readable history and receipts are retained by default; keep-last selects only among readable revisions and never makes an expired identity readable.",
+        "Expired history identities retain their explicit expired state and are never selected by keep-all or keep-last.",
         "Keep and keep-last apply only to this invocation; they are not persistent pins.",
         "No expiry command exists in this contract; expiry and physical deletion are separate future designs.",
         "Direct namespace objects are excluded.",

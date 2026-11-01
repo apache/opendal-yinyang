@@ -74,13 +74,16 @@ Logical live content is measured from that one immutable snapshot:
 - `unique_content_count` and `unique_content_bytes` deduplicate equal
   `ContentId` values in that snapshot.
 
-Logical retained content uses the authority's retained revision index. Each
-successfully observed revision has the same live-content fields.
-`observed_file_bytes` sums bytes across observed snapshots and therefore counts
-the same logical content more than once when it appears in more than one
-revision. `observed_unique_content_bytes` deduplicates equal content identities
-across those observed snapshots. A partial observation is explicit; unavailable
-revisions are not treated as empty.
+Logical retained content uses the authority's detailed history projection.
+Each readable revision has the same live-content fields; expired identities
+are listed separately with their revision IDs and do not receive fabricated
+zero-length snapshots. `observed_file_bytes` sums bytes across readable
+snapshots and therefore counts the same logical content more than once when it
+appears in more than one revision. `observed_unique_content_bytes`
+deduplicates equal content identities across those readable snapshots. A
+partial readable observation is explicit; unavailable revisions are not
+treated as empty. Known expired identities alone do not make readable-history
+observation partial or unavailable.
 
 Physical accounting lists current object keys below
 `.yinyang/v2/<filesystem>/packs/` and separates the current `.yinyang/head`
@@ -211,9 +214,10 @@ directory walk is non-atomic.
 
 Retention defaults to `keep_all`. Supplying `--keep-last N` and/or one or more
 `--keep REVISION` values selects the bounded policy. `N` must be at least one.
-Every plan reports `published_history: "retained_by_default"`. Bounded
-selection does not delete, expire, or hide retained revisions, receipts, or
-their metadata roots.
+Every plan reports `published_history: "readable_by_default"` and the separate
+readable/expired history counts. Bounded selection does not delete, expire, or
+hide readable revisions, expired identities, receipts, or their metadata
+roots.
 
 An explicit `--backup PATH` package is validated read-only with the existing
 backup manifest checksum, shape checks, and package validator. Validation does
@@ -225,9 +229,9 @@ revisions are not attributed to the volume.
 The selected set is the union of:
 
 - the latest observed revision;
-- the newest `N` revisions from the authority's retained-revision list, when
-  requested;
-- every requested revision that is present in the retained list; and
+- the newest `N` readable revisions from the authority's detailed history,
+  when requested;
+- every requested revision that remains readable; and
 - the base revision recorded by every ready durable staging handle, including
   clean handles that remain recoverable by UUID;
 - baselines recorded by Managed Sync namespace intents, including
@@ -239,20 +243,24 @@ The selected set is the union of:
   staging remote bases, namespace intent baselines, committed receipt
   revisions, replica conflict revisions, and replica baseline revisions.
 
-A requested revision absent from a successfully observed retained list is
-reported as `not_retained` and makes the plan partial. If the authority cannot
-list retained revisions, requested-pin membership is `null`, not `false`, and
-the plan cannot claim completeness.
+A requested revision absent from successfully observed history is reported as
+`not_retained`. A requested revision that is present but expired is reported
+with state `expired`: its identity is preserved, but it cannot satisfy a
+readable pin, so the plan is partial. If the authority cannot read detailed
+history, requested-pin membership is `null`, state is `unknown`, not `false`,
+and the plan cannot claim completeness.
 
 Each revision decision records whether it is selected and why. Reasons are
-declarative protection evidence, not deletion eligibility. Every revision
-outside a bounded selection remains visible with
-`outside_bounded_policy`; the plan never treats that reason as permission to
-remove data.
+declarative protection evidence, not deletion eligibility. Every readable
+revision outside a bounded selection remains visible with
+`outside_bounded_policy`. Every expired identity remains visible with state
+`expired` and reason `expired`, is not selected, and is never treated as
+permission to remove data.
 
 Selection reasons are drawn from:
 
 - `current`, `keep_all`, `keep_last`, and `requested_pin`;
+- `expired`;
 - `staging_base`;
 - `staging_pending`, `staging_frozen`, `staging_unknown`,
   `staging_conflict`, and `staging_failed`;
@@ -278,6 +286,7 @@ not disposable protection evidence while its UUID remains in durable staging.
 
 The plan also reports:
 
+- total, readable, and expired history-identity counts;
 - receipt evidence counted from the latest snapshot's retained change records;
 - staging pending/frozen/conflict/Unknown/failed evidence;
 - Managed Sync prepared/Unknown/committed/conflict/retryable/failed namespace
@@ -307,10 +316,11 @@ must be supplied as an explicit requested pin or via `--backup`, and quiescence
 must be established by the operator outside this command.
 
 `--keep` and `--keep-last` apply only to one invocation; they are not persistent
-pins and do not create a registry. Revisions outside a bounded policy remain
-readable with `outside_bounded_policy`. Planning, including a bounded selection,
-never makes a retained revision unreadable. Only the separate explicit expiry
-command can change a revision's readable state.
+pins and do not create a registry. Readable revisions outside a bounded policy
+remain readable with `outside_bounded_policy`; already expired identities stay
+expired. Planning, including a bounded selection, never makes a readable
+revision unreadable and never resurrects an expired one. Only the separate
+explicit expiry command can change a readable revision's state.
 
 Every plan has `deletion_authorized: false` and `reclaimable_bytes: null`.
 Selecting or excluding a revision does not prove that any extent or object is

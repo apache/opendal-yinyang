@@ -32,9 +32,9 @@ use yinyang::core::{
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
-    ExpiryDecisionState, ExpiryReportState, MeasurementState, StagingBindingState, StagingState,
-    expire_managed_retention, inspect_bound_local_staging, inspect_managed_space,
-    plan_managed_retention,
+    ExpiryDecisionState, ExpiryReportState, MeasurementState, RequestedPinState,
+    RetentionRevisionState, StagingBindingState, StagingState, expire_managed_retention,
+    inspect_bound_local_staging, inspect_managed_space, plan_managed_retention,
 };
 use yinyang::sync::Sync;
 
@@ -277,7 +277,7 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
         .unwrap();
 
     assert_eq!(plan.policy.mode, "bounded");
-    assert_eq!(plan.policy.published_history, "retained_by_default");
+    assert_eq!(plan.policy.published_history, "readable_by_default");
     assert_eq!(plan.retained_revision_count, Some(3));
     assert!(!plan.deletion_authorized);
     assert_eq!(plan.reclaimable_bytes, None);
@@ -306,6 +306,60 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
             && !revision.selected
             && revision.reasons == ["outside_bounded_policy"]
     }));
+}
+
+#[test]
+fn read_only_expire_is_rejected_before_storage_or_local_state_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let config = temp.path().join("read-only.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "read-only-expiry",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "service",
+            "service_address": "127.0.0.1:9",
+            "storage_profile": "minio",
+            "staging": state.clone(),
+            "read_only": true,
+            "require": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+        .args([
+            "--volume",
+            config.to_str().unwrap(),
+            "space",
+            "retention",
+            "expire",
+            "--revision",
+            "00112233445566778899aabbccddeeff0011223344556677",
+            "--json",
+        ])
+        .env("YINYANG_STORAGE_PROFILE", "minio")
+        .env("YINYANG_S3_BUCKET", "dummy")
+        .env("YINYANG_S3_REGION", "us-east-1")
+        .env("YINYANG_S3_ENDPOINT", "http://127.0.0.1:9")
+        .env("YINYANG_S3_ACCESS_KEY_ID", "dummy")
+        .env("YINYANG_S3_SECRET_ACCESS_KEY", "dummy")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires a writable Managed volume")
+            && stderr.contains("report and plan only"),
+        "unexpected readonly admission failure: {stderr}"
+    );
+    assert!(
+        !state.exists(),
+        "readonly expiry rejection created local state"
+    );
 }
 
 #[tokio::test]
@@ -502,6 +556,55 @@ async fn explicit_expiry_preserves_protected_staging_work_and_is_idempotent() {
         .unwrap();
     assert!(history.entries.iter().any(|entry| {
         entry.revision == zero_revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+
+    let space = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
+        .await
+        .unwrap();
+    assert_eq!(space.logical.retained.state, MeasurementState::Available);
+    assert_eq!(space.logical.retained.expired_revision_count, Some(1));
+    assert_eq!(
+        space.logical.retained.expired_revisions,
+        [hex(zero_revision)]
+    );
+    assert!(!space.unresolved.iter().any(|unresolved| {
+        unresolved.subject == "retained-snapshot" || unresolved.subject == "retained-revisions"
+    }));
+
+    let keep_all = plan_managed_retention(authority.as_ref(), &staging, None, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(keep_all.state, MeasurementState::Available);
+    assert_eq!(
+        keep_all.readable_revision_count.unwrap() + keep_all.expired_revision_count.unwrap(),
+        keep_all.retained_revision_count.unwrap()
+    );
+    let expired = keep_all
+        .revisions
+        .iter()
+        .find(|revision| revision.revision == hex(zero_revision))
+        .unwrap();
+    assert_eq!(expired.state, RetentionRevisionState::Expired);
+    assert!(!expired.selected);
+    assert_eq!(expired.reasons, ["expired"]);
+    assert!(keep_all.revisions.iter().any(|revision| {
+        revision.revision == hex(one_revision)
+            && revision.state == RetentionRevisionState::Readable
+            && revision.selected
+            && revision.reasons.contains(&"keep_all")
+    }));
+
+    let expired_pin =
+        plan_managed_retention(authority.as_ref(), &staging, None, &[zero_revision], &[])
+            .await
+            .unwrap();
+    assert_eq!(expired_pin.state, MeasurementState::Partial);
+    assert_eq!(
+        expired_pin.policy.requested_pins[0].state,
+        RequestedPinState::Expired
+    );
+    assert!(expired_pin.unresolved.iter().any(|unresolved| {
+        unresolved.subject == "requested-pin" && unresolved.state == "expired"
     }));
 
     let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
