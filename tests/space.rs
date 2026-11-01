@@ -244,6 +244,86 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
 }
 
 #[tokio::test]
+async fn clean_handle_base_is_protected_and_remains_readable_and_writable() {
+    const CHUNK: usize = 64 * 1024;
+
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("editor");
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let original = (0..CHUNK * 2 + 137)
+        .map(|position| (position % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = authority.prepare(&mut original.as_slice()).await.unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut create = Planner::new(&snapshot, CommitId::generate());
+    let node = create
+        .create_file(authority.root(), "base.bin", prepared, false)
+        .await
+        .unwrap();
+    let CommitOutcome::Committed(receipt) =
+        authority.commit(&create.finish().unwrap()).await.unwrap()
+    else {
+        panic!("initial file commit must succeed");
+    };
+    let base = receipt.cursor.revision;
+
+    let file = runtime.open_node(node, true).await.unwrap();
+    let status = file.status().await.unwrap();
+    assert_eq!(status.remote_revision, base);
+    assert!(!status.pending);
+    let handle = file.release().unwrap();
+
+    runtime
+        .create_directory(authority.root(), "later-revision")
+        .await
+        .unwrap();
+    let plan = plan_managed_retention(authority.as_ref(), &staging, Some(1), &[], &[])
+        .await
+        .unwrap();
+    let decision = plan
+        .revisions
+        .iter()
+        .find(|revision| revision.revision == hex(base))
+        .expect("clean handle base decision");
+    assert!(decision.selected);
+    assert!(
+        decision.reasons.contains(&"staging_base"),
+        "clean handle base has unexpected reasons: {:?}",
+        decision.reasons
+    );
+
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    assert_eq!(recovered.read(0, original.len()).await.unwrap(), original);
+
+    let offset = CHUNK + 19;
+    let update = b"clean-handle-write";
+    recovered.write(offset as u64, update).await.unwrap();
+    let receipt = recovered.fsync().await.unwrap().unwrap();
+    assert_ne!(receipt.cursor.revision, base);
+    let mut expected = original;
+    expected[offset..offset + update.len()].copy_from_slice(update);
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, expected.len())
+            .await
+            .unwrap(),
+        expected
+    );
+    recovered.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let backend = TestBackend::default();
     let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)

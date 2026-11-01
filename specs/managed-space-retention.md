@@ -219,8 +219,8 @@ The selected set is the union of:
 - the newest `N` revisions from the authority's retained-revision list, when
   requested;
 - every requested revision that is present in the retained list; and
-- remote base revisions recorded by existing pending, frozen, conflict,
-  Unknown, or failed staging handles;
+- the base revision recorded by every ready durable staging handle, including
+  clean handles that remain recoverable by UUID;
 - baselines recorded by Managed Sync namespace intents, including
   namespace-only intents without a content handle; and
 - receipt revisions recorded by committed Managed Sync namespace intents;
@@ -244,6 +244,7 @@ remove data.
 Selection reasons are drawn from:
 
 - `current`, `keep_all`, `keep_last`, and `requested_pin`;
+- `staging_base`;
 - `staging_pending`, `staging_frozen`, `staging_unknown`,
   `staging_conflict`, and `staging_failed`;
 - `sync_namespace_pending`, `sync_namespace_unknown`,
@@ -251,13 +252,20 @@ Selection reasons are drawn from:
   `sync_namespace_retryable`, and `sync_namespace_failed`;
 - `sync_receipt`; and
 - `replica_conflict` and `replica_baseline`; and
-- `backup_staging_pending`, `backup_staging_frozen`, `backup_staging_unknown`,
+- `backup_staging_base`, `backup_staging_pending`,
+  `backup_staging_frozen`, `backup_staging_unknown`,
   `backup_staging_conflict`, `backup_staging_failed`,
   `backup_sync_namespace_pending`, `backup_sync_namespace_unknown`,
   `backup_sync_namespace_receipt`, `backup_sync_namespace_conflict`,
   `backup_sync_namespace_retryable`, `backup_sync_namespace_failed`,
   `backup_sync_receipt`, `backup_replica_conflict`, and
   `backup_replica_baseline`.
+
+Every ready handle contributes `staging_base` because recovery can still read
+an uncovered range from that base and a later write continues to use it for
+publication predicates. Dirty, frozen, conflict, Unknown, or failed state adds
+the corresponding reason without replacing the base reason. A clean handle is
+not disposable protection evidence while its UUID remains in durable staging.
 
 The plan also reports:
 
@@ -276,6 +284,12 @@ The plan also reports:
 - `external_readers: "unknown"`;
 - `untracked_pins: "unknown"`; and
 - `quiescence: "not_observed"`.
+
+The generic receipt count is descriptive evidence, not a blanket revision
+pin. A snapshot is selected for `sync_receipt` or `backup_sync_receipt` only
+when an observed local or supplied backup namespace intent records that
+dependency. A receipt-only historical snapshot is not selected merely because
+the latest snapshot contains a receipt for it.
 
 Receipt records remain namespace evidence, not a physical cleanup
 authorization. Backup packages are not discovered automatically. A revision

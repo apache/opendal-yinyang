@@ -35,6 +35,7 @@ pub use directory::{
     RemoteEvidence, RemoteStatus, Resolution, RunOutcome, StatusSummary, export_conflict_local,
 };
 pub use error::{Error, ErrorKind, Result};
+pub(crate) use linux::ReplicaStateLease;
 pub use linux::{
     Artifact, ArtifactKind, CapturedContent, Conflict, ContentHash, Identity, InstallOutcome,
     LocalKind, LocalNode, LocalSnapshot, Replica, ReplicaBaseline, ReplicaProtection,

@@ -22,7 +22,9 @@
 //! opening a writer, acquiring a runtime lease, or migrating local databases.
 
 #[cfg(target_os = "linux")]
-use crate::replica::{Replica, ReplicaBaseline, inspect_backup_package};
+use crate::replica::{Replica, ReplicaBaseline, ReplicaStateLease, inspect_backup_package};
+#[cfg(target_os = "linux")]
+use crate::runtime::StagingLease;
 use crate::runtime::{ErrorKind as RuntimeErrorKind, Runtime};
 use crate::sync::{NamespaceState, NamespaceStatus, Sync};
 use opendal::{EntryMode, Operator};
@@ -38,6 +40,108 @@ pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v3";
 const HEAD_KEY: &str = ".yinyang/head";
 const PACK_ROOT: &str = ".yinyang/v2";
 const SCAN_LIMIT: usize = 4096;
+
+/// Local writer leases held by an explicit expiry operation.
+///
+/// Acquisition follows the existing Managed Sync startup order: replica state,
+/// Sync content runtime, then any Mount/file runtime. The guards fence all
+/// known configured writer entry points through the Core mutation.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) struct ExpiryLeases {
+    _replica: ReplicaStateLease,
+    _sync_content: StagingLease,
+    _runtime: StagingLease,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl ExpiryLeases {
+    pub(crate) async fn acquire(staging: &Path) -> std::result::Result<Self, ExpiryLeaseError> {
+        let replica = ReplicaStateLease::acquire(staging)
+            .map_err(|error| ExpiryLeaseError::from_replica(error))?;
+        let sync_content = StagingLease::acquire(staging.join("content"))
+            .await
+            .map_err(|error| ExpiryLeaseError::from_runtime("sync-content", error))?;
+        let runtime = StagingLease::acquire(staging.to_owned())
+            .await
+            .map_err(|error| ExpiryLeaseError::from_runtime("runtime", error))?;
+        Ok(Self {
+            _replica: replica,
+            _sync_content: sync_content,
+            _runtime: runtime,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpiryLeaseErrorKind {
+    Busy,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ExpiryLeaseError {
+    kind: ExpiryLeaseErrorKind,
+    subject: &'static str,
+    detail: String,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl ExpiryLeaseError {
+    fn from_replica(error: crate::replica::Error) -> Self {
+        let kind = if error.kind() == crate::replica::ErrorKind::Busy {
+            ExpiryLeaseErrorKind::Busy
+        } else {
+            ExpiryLeaseErrorKind::Unavailable
+        };
+        Self {
+            kind,
+            subject: "replica",
+            detail: error.to_string(),
+        }
+    }
+
+    fn from_runtime(subject: &'static str, error: crate::runtime::Error) -> Self {
+        let kind = if error.kind() == RuntimeErrorKind::Busy {
+            ExpiryLeaseErrorKind::Busy
+        } else {
+            ExpiryLeaseErrorKind::Unavailable
+        };
+        Self {
+            kind,
+            subject,
+            detail: error.to_string(),
+        }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.kind == ExpiryLeaseErrorKind::Busy
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ExpiryLeaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} local-state lease: {} ({})",
+            self.subject,
+            self.detail,
+            if self.is_busy() {
+                "busy"
+            } else {
+                "unavailable"
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for ExpiryLeaseError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -720,6 +824,7 @@ fn staging_protection(staging: &StagingSpace) -> StagingProtection {
 
 fn backup_reason(reason: &'static str) -> &'static str {
     match reason {
+        "staging_base" => "backup_staging_base",
         "staging_pending" => "backup_staging_pending",
         "staging_frozen" => "backup_staging_frozen",
         "staging_unknown" => "backup_staging_unknown",
@@ -1621,7 +1726,7 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
                     handle_revisions.insert(handle.id, handle.remote_revision);
                     handles.total = handles.total.saturating_add(1);
                     handles.handle_bytes = handles.handle_bytes.saturating_add(handle.length);
-                    let mut reasons = BTreeSet::new();
+                    let mut reasons = BTreeSet::from(["staging_base"]);
                     if handle.pending {
                         handles.pending = handles.pending.saturating_add(1);
                         reasons.insert("staging_pending");
@@ -1661,12 +1766,10 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
                     if failed {
                         handles.failed = handles.failed.saturating_add(1);
                     }
-                    if !reasons.is_empty() {
-                        protected
-                            .entry(handle.remote_revision)
-                            .or_default()
-                            .extend(reasons);
-                    }
+                    protected
+                        .entry(handle.remote_revision)
+                        .or_default()
+                        .extend(reasons);
                 }
                 handles.ledger_errors = handles
                     .ledger_errors
@@ -2509,5 +2612,59 @@ mod tests {
         }));
         assert!(!staging.join("runtime.lock").exists());
         assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expiry_leases_create_only_derived_state_and_fence_writer_entry_points() {
+        use crate::core::{BackendProfile, Fs};
+        use crate::support::TestBackend;
+        use std::sync::Arc;
+
+        let root = tempdir().unwrap();
+        let staging = root.path().join("staging");
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend.operator(), BackendProfile::AmazonS3)
+                .await
+                .unwrap(),
+        );
+
+        let leases = ExpiryLeases::acquire(&staging).await.unwrap();
+        assert!(staging.join("replica.lock").is_file());
+        assert!(staging.join("content/runtime.lock").is_file());
+        assert!(staging.join("runtime.lock").is_file());
+        for database in ["replica.db", "sync.db", "content/staging.db", "staging.db"] {
+            assert!(
+                !staging.join(database).exists(),
+                "derived lease unexpectedly created {database}"
+            );
+        }
+
+        let Err(error) = Runtime::open(authority.clone(), &staging).await else {
+            panic!("runtime open must be fenced by the expiry lease");
+        };
+        assert_eq!(error.kind(), RuntimeErrorKind::Busy);
+
+        let Err(error) = Sync::open(authority.clone(), &staging).await else {
+            panic!("Sync open must be fenced by the expiry lease");
+        };
+        assert_eq!(error.kind(), RuntimeErrorKind::Busy);
+
+        let replica_root = root.path().join("replica-root");
+        let error = Replica::init(&staging, &replica_root, authority.bucket()).unwrap_err();
+        assert_eq!(error.kind(), crate::replica::ErrorKind::Busy);
+
+        match ExpiryLeases::acquire(&staging).await {
+            Err(error) => assert!(error.is_busy()),
+            Ok(_) => panic!("second expiry lease acquisition must be busy"),
+        }
+        for database in ["replica.db", "sync.db", "content/staging.db", "staging.db"] {
+            assert!(
+                !staging.join(database).exists(),
+                "failed writer open unexpectedly created {database}"
+            );
+        }
+        drop(leases);
     }
 }
