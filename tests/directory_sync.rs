@@ -1142,7 +1142,7 @@ async fn managed_directory_sync_durability_benchmark() {
         );
         let temp = tempfile::Builder::new()
             .prefix(&format!("yinyang-directory-sync-bench-{sample}-"))
-            .tempdir_in(home)
+            .tempdir_in(&home)
             .unwrap();
         let root = temp.path().join("push-root");
         std::fs::create_dir(&root).unwrap();
