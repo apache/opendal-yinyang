@@ -247,10 +247,7 @@ fn application_rsync_mirror_survives_remount_both_publications() {
 
 fn tar_create(archive: &Path, source: &Path) -> AppOutput {
     let mut command = Command::new("tar");
-    // Managed mtimes are revision-derived. tar's warning does not describe
-    // changed bytes, and every archived byte is verified by extraction.
     command
-        .arg("--warning=no-file-changed")
         .arg("-cf")
         .arg(archive)
         .arg("-C")
@@ -270,7 +267,8 @@ fn tar_extract(archive: &Path, destination: &Path) -> AppOutput {
     run_application(command)
 }
 
-fn assert_tar_round_trip(root: &Path) {
+fn assert_tar_round_trip(root: &Path, expected_payload: &[u8]) {
+    assert_file(&root.join("assets/payload.bin"), expected_payload, 0o644);
     let script = root.join("bin/run.sh");
     assert_eq!(
         fs::read(&script).expect("read extracted script"),
@@ -293,7 +291,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         let source = fixture.temp.path().join("tar-source");
         let archive = fixture.temp.path().join("tar-source.tar");
         let roundtrip = fixture.temp.path().join("tar-roundtrip");
-        write_source_tree(&source);
+        let expected_payload = write_source_tree(&source);
         tar_create(&archive, &source).success_or("create source tar archive");
 
         let config =
@@ -308,18 +306,27 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         let mut mounted = fixture.mount(&config, &mountpoint);
         fs::create_dir(&extracted).expect("create mounted extraction root");
         tar_extract(&archive, &extracted).success_or("extract tar through FUSE");
-        assert_tar_round_trip(&extracted);
+        assert_tar_round_trip(&extracted, &expected_payload);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/notes/readme.txt", 64),
             b"YinYang application trial\n"
         );
 
         let mounted_archive = fixture.temp.path().join("mounted-tree.tar");
-        tar_create(&mounted_archive, &extracted).success_or("archive the mounted tar tree");
+        let archived = tar_create(&mounted_archive, &extracted);
+        if archived.status.code() == Some(1) {
+            let stderr = String::from_utf8_lossy(&archived.stderr);
+            assert!(
+                stderr.contains("file changed as we read it"),
+                "GNU tar exited 1 without its documented metadata-change diagnostic:\n{stderr}"
+            );
+        } else {
+            archived.success_or("archive the mounted tar tree");
+        }
         fs::create_dir(&roundtrip).expect("create local tar round-trip root");
         tar_extract(&mounted_archive, &roundtrip)
             .success_or("extract mounted-tree archive locally");
-        assert_tar_round_trip(&roundtrip);
+        assert_tar_round_trip(&roundtrip, &expected_payload);
 
         let symlink_source = fixture.temp.path().join("tar-symlink-source");
         let symlink_archive = fixture.temp.path().join("tar-symlink.tar");
@@ -348,7 +355,10 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         mounted.unmount();
         drop(mounted);
         let mut remounted = fixture.mount(&config, &mountpoint);
-        assert_tar_round_trip(&remounted.mountpoint().join("tar-tree").as_path());
+        assert_tar_round_trip(
+            &remounted.mountpoint().join("tar-tree").as_path(),
+            &expected_payload,
+        );
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/bin/run.sh", 64),
             b"#!/bin/sh\nprintf 'archive trial\\n'\n"
