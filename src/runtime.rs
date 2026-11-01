@@ -937,3 +937,162 @@ impl FileHandle {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn write_is_committed_but_only_sync_local_barriers_it() {
+        let backend = crate::support::TestBackend::default();
+        let authority = Arc::new(
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+        runtime.create_file(authority.root(), "file").await.unwrap();
+        let mut handle = runtime.open_file("file", true).await.unwrap();
+        handle.write(0, b"durable-at-barrier").await.unwrap();
+        assert_eq!(
+            runtime.inner.stage.barrier_counter().load(Ordering::SeqCst),
+            0
+        );
+
+        let connection = crate::local::store::open_read_only(&staging.join("staging.db")).unwrap();
+        let data: Vec<u8> = connection
+            .query_row(
+                "SELECT data FROM chunks WHERE handle=?1 AND position=0",
+                rusqlite::params![handle.id().as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(&data[..17], b"durable-at-barrier");
+
+        handle.sync_local().await.unwrap();
+        assert_eq!(
+            runtime.inner.stage.barrier_counter().load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[derive(Debug)]
+    struct CommitProbe {
+        inner: Arc<dyn Authority>,
+        staging: PathBuf,
+        barrier: Mutex<Arc<AtomicUsize>>,
+        observed_barrier: AtomicUsize,
+        observed_plan: AtomicBool,
+    }
+
+    impl Authority for CommitProbe {
+        fn data(&self) -> &yinyang_core::DataStore {
+            self.inner.data()
+        }
+
+        fn filesystem(&self) -> NodeId {
+            self.inner.filesystem()
+        }
+
+        fn root(&self) -> NodeId {
+            self.inner.root()
+        }
+
+        fn observe_latest(&self) -> BoxFuture<'_, yinyang_core::Result<Snapshot>> {
+            self.inner.observe_latest()
+        }
+
+        fn observe_revision(
+            &self,
+            revision: Revision,
+        ) -> BoxFuture<'_, yinyang_core::Result<Snapshot>> {
+            self.inner.observe_revision(revision)
+        }
+
+        fn commit_batch<'a>(
+            &'a self,
+            requests: &'a [yinyang_core::Transaction],
+        ) -> BoxFuture<'a, yinyang_core::Result<Vec<yinyang_core::object::Outcome>>> {
+            self.inner.commit_batch(requests)
+        }
+
+        fn commit<'a>(
+            &'a self,
+            _request: &'a yinyang_core::Transaction,
+        ) -> BoxFuture<'a, yinyang_core::Result<CommitOutcome>> {
+            Box::pin(async move {
+                let barrier = self.barrier.lock().unwrap().clone();
+                self.observed_barrier
+                    .store(barrier.load(Ordering::SeqCst), Ordering::SeqCst);
+                let connection = crate::local::store::open_read_only(
+                    &self.staging.join("staging.db"),
+                )
+                .map_err(|error| {
+                    yinyang_core::Error::new(
+                        yinyang_core::ErrorKind::Storage,
+                        "commit probe",
+                        error.to_string(),
+                    )
+                })?;
+                let record: Vec<u8> = connection
+                    .query_row("SELECT record FROM handles LIMIT 1", [], |row| row.get(0))
+                    .map_err(|error| {
+                        yinyang_core::Error::new(
+                            yinyang_core::ErrorKind::Storage,
+                            "commit probe",
+                            error.to_string(),
+                        )
+                    })?;
+                let record: Record = borsh::from_slice(&record).map_err(|error| {
+                    yinyang_core::Error::new(
+                        yinyang_core::ErrorKind::Corrupt,
+                        "commit probe",
+                        error.to_string(),
+                    )
+                })?;
+                self.observed_plan
+                    .store(record.plan.is_some(), Ordering::SeqCst);
+                Err(yinyang_core::Error::unsupported(
+                    "commit probe",
+                    "stop before dispatch",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_plan_is_checkpointed_before_commit_dispatch() {
+        let backend = crate::support::TestBackend::default();
+        let inner = Arc::new(
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        {
+            let bootstrap = Runtime::open(inner.clone(), &staging).await.unwrap();
+            bootstrap.create_file(inner.root(), "file").await.unwrap();
+        }
+
+        let probe = Arc::new(CommitProbe {
+            inner: inner.clone(),
+            staging: staging.clone(),
+            barrier: Mutex::new(Arc::new(AtomicUsize::new(0))),
+            observed_barrier: AtomicUsize::new(0),
+            observed_plan: AtomicBool::new(false),
+        });
+        let runtime = Runtime::open(probe.clone(), &staging).await.unwrap();
+        *probe.barrier.lock().unwrap() = runtime.inner.stage.barrier_counter();
+        let mut handle = runtime.open_file("file", true).await.unwrap();
+        handle.write(0, b"frozen").await.unwrap();
+        assert!(handle.fsync().await.is_err());
+        assert_eq!(probe.observed_barrier.load(Ordering::SeqCst), 2);
+        assert!(probe.observed_plan.load(Ordering::SeqCst));
+        assert!(handle.status().await.unwrap().frozen);
+    }
+}

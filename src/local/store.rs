@@ -39,8 +39,6 @@ pub(crate) struct Profile {
 pub(crate) enum BindingValue {
     Blob(Vec<u8>),
     Text(String),
-    Integer(i64),
-    Null,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,13 +59,6 @@ impl Binding {
         Self {
             column,
             value: BindingValue::Text(value.into()),
-        }
-    }
-
-    pub(crate) fn integer(column: &'static str, value: i64) -> Self {
-        Self {
-            column,
-            value: BindingValue::Integer(value),
         }
     }
 }
@@ -382,8 +373,6 @@ fn sql_value(value: &BindingValue) -> SqlValue {
     match value {
         BindingValue::Blob(value) => SqlValue::Blob(value.clone()),
         BindingValue::Text(value) => SqlValue::Text(value.clone()),
-        BindingValue::Integer(value) => SqlValue::Integer(*value),
-        BindingValue::Null => SqlValue::Null,
     }
 }
 
