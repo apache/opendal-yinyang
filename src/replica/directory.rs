@@ -2046,7 +2046,7 @@ impl<'a> Context<'a> {
         }
         let edits = pending.iter().map(|member| member.edit).collect::<Vec<_>>();
         let results = self.sync.publish_batch(&edits).await;
-        let mut parents = BTreeMap::<String, Revision>::new();
+        let mut parents = BTreeMap::<String, (String, Revision)>::new();
         for (member, result) in pending.drain(..).zip(results) {
             match result {
                 Ok(revision) => {
@@ -2058,7 +2058,9 @@ impl<'a> Context<'a> {
                     self.mark_parent_dirty(&member.path);
                     self.refresh_local_path(&member.path)?;
                     self.complete_work(member.edit, revision, Some(&member.upload_artifact))?;
-                    parents.entry(member.parent).or_insert(revision);
+                    parents
+                        .entry(member.parent)
+                        .or_insert((member.path, revision));
                     self.outcome.published_local += 1;
                 }
                 Err(error) if error.kind() == crate::runtime::ErrorKind::Conflict => {
@@ -2096,8 +2098,8 @@ impl<'a> Context<'a> {
                 }
             }
         }
-        for (parent, revision) in parents {
-            self.refresh_parent_baseline(&parent, revision).await?;
+        for (_, (path, revision)) in parents {
+            self.refresh_parent_baseline(&path, revision).await?;
         }
         Ok(())
     }
