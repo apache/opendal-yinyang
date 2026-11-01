@@ -18,7 +18,8 @@ ssh nier ~/Code/yinyang/devbox/experiments/yy-nier/status.sh <label> 80
 - Labels are unique, lowercase `[a-z0-9-]`; reuse is rejected so every log is
   fresh evidence. Logs: `~/.local/state/yinyang-nier/runs/<label>.{log,exit}`.
 - Each branch gets one worktree under `~/Code/yinyang/wt/`; runs on the same
-  branch serialize. At most three runs execute at once.
+  branch serialize. At most five runs execute at once (override with the
+  number in `~/.local/state/yinyang-nier/slots`).
 - The environment uses the mbx Cargo shim, cargo-deny 0.14.22, and the local
   Silo at `127.0.0.1:19000` with buckets `yinyang-test` and the versioned
   `yinyang-direct-versioned`.
@@ -27,5 +28,7 @@ ssh nier ~/Code/yinyang/devbox/experiments/yy-nier/status.sh <label> 80
   FUSE, Direct and operations acceptance. Any explicit step list also works,
   for example `suite.sh check linux-fuse`, or pass a direct command such as
   `cargo test -p yinyang --test sync some_filter`.
+- Short compile loops may call `run.sh` directly over SSH instead of `start.sh`;
+  the log is kept the same way, but an SSH disconnect stops the run.
 - `cargo x test-linux-recovery` needs passwordless sudo and the `sqlite3` CLI,
   which nier lacks; recovery acceptance is covered by GitHub CI only.

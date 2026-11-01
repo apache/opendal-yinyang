@@ -90,7 +90,8 @@ if [[ "$untracked" -ne 0 ]]; then
 fi
 
 # Bound concurrent heavy runs; mbx still schedules the builds themselves.
-slots=${YY_NIER_SLOTS:-3}
+slots=$(cat "$state/slots" 2>/dev/null || echo 5)
+[[ "$slots" =~ ^[1-9][0-9]*$ ]] || slots=5
 acquired=
 for i in $(seq 1 "$slots"); do
     exec 9> "$state/slot-$i.lock"
