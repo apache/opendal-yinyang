@@ -204,6 +204,14 @@ digest, resolution is `Invalid`. If no receipt exists, resolution returns
 This path is for replay and expired-base recovery. Successful ordinary fsync
 does not call it and performs no additional history or receipt RPC.
 
+The authenticated service transport applies the same rule without a new
+resolver RPC. `Get` and `Scan` for an already-issued lazy `Snapshot` reopen the
+retained record reader rather than running the fresh `Observe` expiry guard.
+`Command::Commit` attempts normal restore first; only an expired base triggers
+complete canonical-plan validation and local receipt resolution. Mixed batches
+retain input outcome order, original receipt cursors, and a missing receipt is
+never reported as committed.
+
 # Object Persistent State
 
 An authority that has never expired history remains exactly:

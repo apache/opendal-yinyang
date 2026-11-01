@@ -75,6 +75,20 @@ protected revision state. The first successful operation changes the schema
 profile inside the same `BEGIN IMMEDIATE` transaction that inserts all expiry
 records, the maintenance revision, and the new latest token.
 
+The authenticated `Get` and `Scan` commands for an already-issued lazy
+`Snapshot` use the retained record reader and do not re-run the fresh
+`observe_revision` expiry guard. A fresh `Observe(specific revision)` remains
+strict and returns `Expired`; this preserves the same held-observation
+semantics as object and embedded-service snapshots without a reader registry or
+an extra RPC.
+
+`Command::Commit` keeps the normal restore-before-publish path. Only when a
+frozen plan names an expired base does the server validate the complete
+canonical plan and resolve its original receipt locally. Already committed
+receipts retain their original cursor, while a missing receipt remains an
+expiry error; mixed batches retain input outcome order and do not call an extra
+resolver RPC on ordinary successful commits.
+
 In-process preparation carries trusted `DataStore` evidence and records
 readiness durably. A client uploads through OpenDAL, then registers its content
 descriptor. The service fully verifies an untrusted descriptor before recording
