@@ -36,9 +36,16 @@ use std::time::SystemTime;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 
-#[derive(Clone)]
 pub(super) struct Adapter<B: Backend> {
     inner: Arc<AdapterInner<B>>,
+}
+
+impl<B: Backend> Clone for Adapter<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 struct AdapterInner<B: Backend> {

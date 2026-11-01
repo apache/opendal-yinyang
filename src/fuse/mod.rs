@@ -52,7 +52,7 @@ mod frontend;
 mod inode;
 
 use crate::mount::Mount;
-use crate::volume::{Frontend, Model, Volume, VolumeConfig};
+use crate::volume::{Frontend, Model, VolumeConfig};
 use adapter::Adapter;
 use backend::Backend;
 use fuser::{Config, MountOption, Session, SessionACL};

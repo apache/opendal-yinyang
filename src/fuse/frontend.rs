@@ -60,7 +60,7 @@ impl ManagedBackend {
         config: VolumeConfig,
         operator: opendal::Operator,
         token: Option<String>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let read_only = config.read_only;
         let name = config.name.clone();
         let authority = Volume::connect(&config, operator, token).await?;
@@ -367,7 +367,9 @@ impl Backend for ManagedBackend {
                     return Err(BackendError::MutationUnsupported);
                 };
                 file.truncate(length).await?;
-                self.handle_attr(id, file).await?
+                self.shared_attr(id)
+                    .await?
+                    .ok_or(BackendError::MutationIo)?
             } else {
                 self.reclaim_clean_state(id).await?;
                 let file = self.mount.open_node(id, true).await?;
@@ -464,9 +466,11 @@ impl Backend for ManagedBackend {
         if has_open_flag(flags, nix::fcntl::OFlag::O_TRUNC) {
             file.truncate(0).await?;
         }
-        let attr = self.handle_attr(node, &ManagedFile::Staged(file)).await?;
-        let snapshot = self.fetch_snapshot().await?;
-        let _ = snapshot;
+        let attr = self
+            .shared_attr(node)
+            .await?
+            .ok_or(BackendError::MutationIo)?;
+        self.fetch_snapshot().await?;
         Ok(Created {
             id: node,
             attr,

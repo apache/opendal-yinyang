@@ -106,7 +106,7 @@ impl DirectBackend {
     pub(super) async fn open(
         config: VolumeConfig,
         operator: opendal::Operator,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let namespace = DirectNamespace::new(operator.clone())?;
         let (direct, pending) = if config.read_only {
             (None, Vec::new())

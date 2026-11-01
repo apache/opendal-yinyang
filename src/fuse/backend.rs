@@ -21,6 +21,7 @@ use super::attrs::ObservedAttr;
 use super::inode::InodeIdentity;
 use fuser::{BsdFileFlags, FileType, OpenFlags, TimeOrNow};
 use std::fmt;
+use std::future::Future;
 use std::time::{Duration, SystemTime};
 
 pub(super) type Result<T> = std::result::Result<T, BackendError>;
@@ -231,7 +232,6 @@ impl SetAttrRequest {
     }
 }
 
-#[allow(async_fn_in_trait)]
 pub(super) trait Backend: Send + Sync + 'static {
     type Inode: InodeIdentity;
     type File: Send + Sync + 'static;
@@ -243,61 +243,83 @@ pub(super) trait Backend: Send + Sync + 'static {
     fn attr_ttl(&self) -> Duration;
     fn file_matches(&self, file: &Self::File, id: Self::Inode) -> bool;
 
-    async fn lookup(&self, parent: Self::Inode, name: &str) -> Result<Option<Entry<Self::Inode>>>;
-    async fn getattr(&self, id: Self::Inode, file: Option<&Self::File>) -> Result<ObservedAttr>;
-    async fn open(&self, id: Self::Inode, flags: OpenFlags) -> Result<Opened<Self::File>>;
-    async fn read(&self, file: &Self::File, offset: u64, size: usize) -> Result<Vec<u8>>;
-    async fn write(
+    fn lookup(
+        &self,
+        parent: Self::Inode,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<Entry<Self::Inode>>>> + Send;
+    fn getattr(
+        &self,
+        id: Self::Inode,
+        file: Option<&Self::File>,
+    ) -> impl Future<Output = Result<ObservedAttr>> + Send;
+    fn open(
+        &self,
+        id: Self::Inode,
+        flags: OpenFlags,
+    ) -> impl Future<Output = Result<Opened<Self::File>>> + Send;
+    fn read(
+        &self,
+        file: &Self::File,
+        offset: u64,
+        size: usize,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send;
+    fn write(
         &self,
         file: &Self::File,
         offset: u64,
         data: &[u8],
         flags: OpenFlags,
-    ) -> Result<()>;
-    async fn flush(&self, file: &Self::File) -> Result<()>;
-    async fn fsync(&self, file: &Self::File) -> Result<()>;
-    async fn release(&self, id: Self::Inode, file: &Self::File, writable: bool) -> Result<()>;
-    async fn setattr(
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn flush(&self, file: &Self::File) -> impl Future<Output = Result<()>> + Send;
+    fn fsync(&self, file: &Self::File) -> impl Future<Output = Result<()>> + Send;
+    fn release(
+        &self,
+        id: Self::Inode,
+        file: &Self::File,
+        writable: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn setattr(
         &self,
         id: Self::Inode,
         file: Option<&Self::File>,
         request: SetAttrRequest,
-    ) -> Result<ObservedAttr>;
-    async fn create(
+    ) -> impl Future<Output = Result<ObservedAttr>> + Send;
+    fn create(
         &self,
         parent: Self::Inode,
         name: &str,
         mode: u32,
         umask: u32,
         flags: i32,
-    ) -> Result<Created<Self::Inode, Self::File>>;
-    async fn mkdir(
+    ) -> impl Future<Output = Result<Created<Self::Inode, Self::File>>> + Send;
+    fn mkdir(
         &self,
         parent: Self::Inode,
         name: &str,
         mode: u32,
         umask: u32,
-    ) -> Result<Entry<Self::Inode>>;
-    async fn unlink(&self, parent: Self::Inode, name: &str) -> Result<()>;
-    async fn rmdir(&self, parent: Self::Inode, name: &str) -> Result<()>;
-    async fn rename(
+    ) -> impl Future<Output = Result<Entry<Self::Inode>>> + Send;
+    fn unlink(&self, parent: Self::Inode, name: &str) -> impl Future<Output = Result<()>> + Send;
+    fn rmdir(&self, parent: Self::Inode, name: &str) -> impl Future<Output = Result<()>> + Send;
+    fn rename(
         &self,
         parent: Self::Inode,
         name: &str,
         new_parent: Self::Inode,
         new_name: &str,
         replace: bool,
-    ) -> Result<()>;
-    async fn open_directory(
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn open_directory(
         &self,
         id: Self::Inode,
-    ) -> Result<DirectoryOpen<Self::Inode, Self::Directory>>;
-    async fn read_directory(
+    ) -> impl Future<Output = Result<DirectoryOpen<Self::Inode, Self::Directory>>> + Send;
+    fn read_directory(
         &self,
         state: &mut Self::Directory,
         restart: bool,
-    ) -> Result<DirectoryPage<Self::Inode>>;
-    async fn refresh(&self, ids: &[Self::Inode]) -> Result<()>;
+    ) -> impl Future<Output = Result<DirectoryPage<Self::Inode>>> + Send;
+    fn refresh(&self, ids: &[Self::Inode]) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[cfg(test)]
@@ -307,13 +329,13 @@ mod tests {
     #[test]
     fn namespace_mutation_conflicts_use_eagain() {
         assert_eq!(
-            BackendError::NamespaceConflict.errno(),
-            fuser::Errno::EAGAIN
+            i32::from(BackendError::NamespaceConflict.errno()),
+            libc::EAGAIN
         );
-        assert_eq!(BackendError::MutationIo.errno(), fuser::Errno::EIO);
+        assert_eq!(i32::from(BackendError::MutationIo.errno()), libc::EIO);
         assert_eq!(
-            BackendError::MutationUnsupported.errno(),
-            fuser::Errno::EOPNOTSUPP
+            i32::from(BackendError::MutationUnsupported.errno()),
+            libc::EOPNOTSUPP
         );
     }
 }
