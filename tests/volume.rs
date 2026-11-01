@@ -436,7 +436,7 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
         let error = error
             .downcast_ref::<yinyang::replica::Error>()
             .expect("restore preserves the replica error kind");
-        assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert_eq!(error.kind(), ErrorKind::Invalid, "{error}");
         assert!(!state.exists());
         assert!(!root.exists());
     }
