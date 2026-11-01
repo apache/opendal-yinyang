@@ -1981,7 +1981,7 @@ impl Store {
                 "SELECT id,origin,name,kind,reason,remote_revision,phase,error,digest,length,
                         stat_dev,stat_ino,stat_mtime,stat_mtime_nsec,stat_ctime,stat_ctime_nsec,
                         settle_pending
-                 FROM artifacts ORDER BY id",
+                 FROM artifacts ORDER BY rowid,id",
             )
             .map_err(|e| Error::corrupt(format!("read retained artifacts: {e}")))?;
         query
