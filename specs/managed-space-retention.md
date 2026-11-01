@@ -336,8 +336,16 @@ Acquisition may create the configured directory, `content/`, and those derived
 lock files, but it never creates, migrates, or recovers `staging.db`, `sync.db`,
 `content/staging.db`, or `replica.db`. The guards remain held through the Core
 mutation. A held writer lease, malformed or foreign state, partial evidence, or
-unavailable state refuses the operation before mutation. SQLite `-wal`/`-shm`
-files and derived locks are not authoritative database bytes.
+unavailable state refuses the operation before mutation. Local-state inspection
+uses a SQLite-consistent view of the main database and any existing WAL, so
+committed state not yet checkpointed remains visible. Inspection does not
+rewrite those source bytes. SQLite `-shm` files and derived lock files are
+auxiliary state.
+
+A legitimate authority transaction or an old-binary connection close may
+checkpoint WAL pages into the main database. This is benign when the logical
+schema, expiry markers, and namespace remain the expected state; acceptance
+does not compare raw WAL/main-file bytes as an authorization boundary.
 
 These leases protect the configured local state only for the lifetime of the
 running command. They are not a durable or global fence across a crash,
