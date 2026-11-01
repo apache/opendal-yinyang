@@ -108,7 +108,7 @@ fn write_source_tree(source: &Path) -> Vec<u8> {
     bytes
 }
 
-fn rsync(source: &Path, destination: &Path, delete: bool) -> AppOutput {
+fn rsync(source: &Path, destination: &Path, delete: bool, inplace: bool) -> AppOutput {
     let mut command = Command::new("rsync");
     command.args([
         "-r",
@@ -117,8 +117,10 @@ fn rsync(source: &Path, destination: &Path, delete: bool) -> AppOutput {
         "--no-owner",
         "--no-group",
         "--omit-dir-times",
-        "--inplace",
     ]);
+    if inplace {
+        command.arg("--inplace");
+    }
     if delete {
         command.arg("--delete");
     }
@@ -147,6 +149,37 @@ fn seed_rsync_destination(target: &Path) {
     }
     fs::set_permissions(target.join("bin/run.sh"), fs::Permissions::from_mode(0o755))
         .expect("set seeded script mode");
+}
+
+fn assert_default_rsync_creation_rejected(source: &Path, target: &Path) {
+    fs::create_dir_all(source).expect("create rejected rsync source");
+    fs::create_dir(target).expect("create rejected rsync target");
+    fs::write(
+        source.join("created.txt"),
+        b"rsync cannot create this file\n",
+    )
+    .expect("write rejected rsync source");
+
+    let rejected = rsync(source, target, false, false);
+    assert_eq!(
+        rejected.status.code(),
+        Some(23),
+        "default rsync should report a partial transfer:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("mkstemp") && stderr.contains("operation not supported"),
+        "default rsync failed before reaching its private temporary-file boundary:\n{stderr}"
+    );
+    assert!(
+        fs::read_dir(target)
+            .expect("list rejected rsync target")
+            .next()
+            .is_none(),
+        "a rejected rsync temporary must not leave another destination entry"
+    );
 }
 
 fn assert_rsync_tree(target: &Path, expected_payload: &[u8]) {
@@ -188,7 +221,7 @@ fn application_rsync_mirror_survives_remount_both_publications() {
         let mut mounted = fixture.mount(&config, &mountpoint);
         let mount_root = mounted.mountpoint().to_path_buf();
         seed_rsync_destination(&target);
-        rsync(&source, &target, false).success_or("initial rsync");
+        rsync(&source, &target, false, true).success_or("initial rsync");
         assert_rsync_tree(&target, &initial_payload);
         assert_eq!(
             fixture.remote_read(
@@ -206,7 +239,7 @@ fn application_rsync_mirror_survives_remount_both_publications() {
         fs::remove_file(source.join("notes/remove.txt")).expect("remove source note");
         fs::write(source.join("notes/new.txt"), b"added by rsync\n").expect("add source note");
         fs::write(target.join("notes/new.txt"), b"").expect("seed added rsync destination");
-        rsync(&source, &target, true).success_or("updating rsync with deletion");
+        rsync(&source, &target, true, true).success_or("updating rsync with deletion");
         assert_file(&target.join("assets/payload.bin"), &updated_payload, 0o644);
         assert!(
             !target.join("notes/remove.txt").exists(),
@@ -216,6 +249,10 @@ fn application_rsync_mirror_survives_remount_both_publications() {
         assert_eq!(
             fixture.remote_read(&config, "rsync-target/notes/new.txt", 32),
             b"added by rsync\n"
+        );
+        assert_default_rsync_creation_rejected(
+            &fixture.temp.path().join("rsync-rejected-source"),
+            &mountpoint.join("rsync-rejected-target"),
         );
 
         mounted.unmount();
@@ -269,17 +306,31 @@ fn tar_extract(archive: &Path, destination: &Path) -> AppOutput {
 
 fn assert_tar_round_trip(root: &Path, expected_payload: &[u8]) {
     assert_file(&root.join("assets/payload.bin"), expected_payload, 0o644);
-    let script = root.join("bin/run.sh");
-    assert_eq!(
-        fs::read(&script).expect("read extracted script"),
-        b"#!/bin/sh\nprintf 'archive trial\\n'\n"
+    assert_file(
+        &root.join("notes/readme.txt"),
+        b"YinYang application trial\n",
+        0o644,
     );
-    assert_eq!(mode(&script), 0o755, "tar must restore executable mode");
-    assert_eq!(
-        fs::read(root.join("notes/readme.txt")).expect("read extracted note"),
-        b"YinYang application trial\n"
+    assert_file(
+        &root.join("notes/remove.txt"),
+        b"this file is removed by the second sync\n",
+        0o644,
     );
+    assert_file(
+        &root.join("bin/run.sh"),
+        b"#!/bin/sh\nprintf 'archive trial\\n'\n",
+        0o755,
+    );
+    for directory in ["", "assets", "bin", "notes"] {
+        let path = if directory.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(directory)
+        };
+        assert_eq!(mode(&path), 0o755, "directory mode for {}", path.display());
+    }
     assert!(root.join("empty").is_dir());
+    assert_eq!(mode(&root.join("empty")), 0o755);
 }
 
 #[test]
@@ -294,8 +345,8 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         let expected_payload = write_source_tree(&source);
         tar_create(&archive, &source).success_or("create source tar archive");
 
-        let config =
-            fixture.volume_config(&format!("application-tar-{suffix}"), Frontend::Fuse, false);
+        let config_name = format!("application-tar-{suffix}");
+        let config = fixture.volume_config(&config_name, Frontend::Fuse, false);
         let mountpoint = fixture
             .temp
             .path()
@@ -311,22 +362,6 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
             fixture.remote_read(&config, "tar-tree/notes/readme.txt", 64),
             b"YinYang application trial\n"
         );
-
-        let mounted_archive = fixture.temp.path().join("mounted-tree.tar");
-        let archived = tar_create(&mounted_archive, &extracted);
-        if archived.status.code() == Some(1) {
-            let stderr = String::from_utf8_lossy(&archived.stderr);
-            assert!(
-                stderr.contains("file changed as we read it"),
-                "GNU tar exited 1 without its documented metadata-change diagnostic:\n{stderr}"
-            );
-        } else {
-            archived.success_or("archive the mounted tar tree");
-        }
-        fs::create_dir(&roundtrip).expect("create local tar round-trip root");
-        tar_extract(&mounted_archive, &roundtrip)
-            .success_or("extract mounted-tree archive locally");
-        assert_tar_round_trip(&roundtrip, &expected_payload);
 
         let symlink_source = fixture.temp.path().join("tar-symlink-source");
         let symlink_archive = fixture.temp.path().join("tar-symlink.tar");
@@ -354,11 +389,19 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
 
         mounted.unmount();
         drop(mounted);
+        let config = fixture.volume_config(&config_name, Frontend::Fuse, true);
         let mut remounted = fixture.mount(&config, &mountpoint);
         assert_tar_round_trip(
             &remounted.mountpoint().join("tar-tree").as_path(),
             &expected_payload,
         );
+        let mounted_archive = fixture.temp.path().join("mounted-tree.tar");
+        tar_create(&mounted_archive, &remounted.mountpoint().join("tar-tree"))
+            .success_or("archive the read-only mounted tar tree");
+        fs::create_dir(&roundtrip).expect("create local tar round-trip root");
+        tar_extract(&mounted_archive, &roundtrip)
+            .success_or("extract mounted-tree archive locally");
+        assert_tar_round_trip(&roundtrip, &expected_payload);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/bin/run.sh", 64),
             b"#!/bin/sh\nprintf 'archive trial\\n'\n"
@@ -367,48 +410,105 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
     }
 }
 
+fn copy_representable_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create representable tree destination");
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o755))
+        .expect("set representable directory mode");
+    for entry in fs::read_dir(source).expect("read representable tree source") {
+        let entry = entry.expect("read representable tree entry");
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .unwrap_or_else(|error| panic!("stat {}: {error}", source_path.display()));
+        if metadata.file_type().is_symlink() {
+            panic!(
+                "test fixture unexpectedly contains a symlink: {}",
+                source_path.display()
+            );
+        }
+        if metadata.is_dir() {
+            copy_representable_tree(&source_path, &destination_path);
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path)
+                .unwrap_or_else(|error| panic!("copy {}: {error}", source_path.display()));
+            let file_mode = if metadata.permissions().mode() & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(&destination_path, fs::Permissions::from_mode(file_mode))
+                .expect("set representable file mode");
+        } else {
+            panic!(
+                "test fixture contains an unsupported file type: {}",
+                source_path.display()
+            );
+        }
+    }
+}
+
 #[test]
-#[ignore = "one-off fresh-main Git capability probe"]
-fn probe_git_loose_object_creation() {
+#[ignore = "requires /dev/fuse, git, and isolated S3; run with cargo x test-linux-applications"]
+fn application_git_loose_object_mode_is_rejected() {
     let fixture = Fixture::new(Publication::Object);
-    let config = fixture.volume_config("probe-git", Frontend::Fuse, false);
-    let mountpoint = fixture.temp.path().join("mnt-probe-git");
-    fs::create_dir(&mountpoint).expect("create Git probe mountpoint");
-    let mut mounted = fixture.mount(&config, &mountpoint);
-    let home = fixture.temp.path().join("git-home");
-    fs::create_dir(&home).expect("create isolated Git home");
+    let config = fixture.volume_config("application-git", Frontend::Fuse, false);
+    let mountpoint = fixture.temp.path().join("mnt-application-git");
+    let local_bare = fixture.temp.path().join("local-repository.git");
+    let blob = fixture.temp.path().join("git-blob.txt");
+    fs::create_dir(&mountpoint).expect("create Git mountpoint");
 
     let mut init = Command::new("git");
-    init.args(["init", "--template=", "repository"])
-        .current_dir(mounted.mountpoint());
-    let init = run_application(init);
-    eprintln!(
-        "git init: {}\nstdout:\n{}\nstderr:\n{}",
-        init.status,
-        String::from_utf8_lossy(&init.stdout),
-        String::from_utf8_lossy(&init.stderr)
-    );
-    if !init.status.success() {
-        mounted.unmount();
-        return;
-    }
-
-    let repository = mounted.mountpoint().join("repository");
-    fs::write(repository.join("tracked.txt"), b"probe\n").expect("write tracked Git file");
-    let mut add = Command::new("git");
-    add.args(["add", "tracked.txt"])
-        .current_dir(&repository)
-        .env("HOME", &home)
+    init.args(["init", "--bare"])
+        .arg(&local_bare)
         .env("GIT_CONFIG_NOSYSTEM", "1");
-    let add = run_application(add);
-    eprintln!(
-        "git add: {}\nstdout:\n{}\nstderr:\n{}",
-        add.status,
-        String::from_utf8_lossy(&add.stdout),
-        String::from_utf8_lossy(&add.stderr)
+    run_application(init).success_or("initialize local bare Git fixture");
+    fs::write(&blob, b"Git loose object mode probe\n").expect("write Git blob source");
+
+    let mut mounted = fixture.mount(&config, &mountpoint);
+    let mounted_bare = mounted.mountpoint().join("repository.git");
+    copy_representable_tree(&local_bare, &mounted_bare);
+
+    let mut hash = Command::new("git");
+    hash.args(["hash-object"]).arg(&blob);
+    let hash = run_application(hash);
+    hash.success_or("hash Git probe blob");
+    let object_id = String::from_utf8(hash.stdout)
+        .expect("Git object ID is UTF-8")
+        .trim()
+        .to_owned();
+    assert_eq!(object_id.len(), 40, "Git object ID length");
+
+    let mut write = Command::new("git");
+    write
+        .arg("--git-dir")
+        .arg(&mounted_bare)
+        .args(["hash-object", "-w"])
+        .arg(&blob)
+        .env("HOME", fixture.temp.path().join("git-home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let rejected = run_application(write);
+    assert_eq!(
+        rejected.status.code(),
+        Some(128),
+        "Git loose-object creation should fail explicitly:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("unable to create temporary file")
+            && stderr.contains("operation not supported"),
+        "Git failed before reaching its loose-object temporary file:\n{stderr}"
+    );
+    let object_path = mounted_bare
+        .join("objects")
+        .join(&object_id[..2])
+        .join(&object_id[2..]);
+    assert!(
+        fs::symlink_metadata(&object_path).is_err(),
+        "a rejected Git object must not exist at {}",
+        object_path.display()
     );
 
-    let objects = repository.join(".git/objects");
-    eprintln!("git objects directory: {}", objects.display());
     mounted.unmount();
 }
