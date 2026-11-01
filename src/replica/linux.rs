@@ -28,6 +28,8 @@ use rustix::fs::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use yinyang_core::{NodeId, Revision};
 
 /// Maximum number of non-conflict artifacts retained by one replica.
@@ -274,6 +276,8 @@ pub struct Replica {
     quarantine_fd: OwnedFd,
     _lease: Option<std::fs::File>,
     store: Store,
+    hash_bytes: Arc<AtomicU64>,
+    scan_cache: Mutex<BTreeMap<String, (Stat, LocalNode)>>,
 }
 
 fn baseline_from_store(store: &Store) -> Result<Option<ReplicaBaseline>> {
@@ -372,6 +376,8 @@ impl Replica {
             quarantine_fd,
             _lease: Some(lease),
             store,
+            hash_bytes: Arc::new(AtomicU64::new(0)),
+            scan_cache: Mutex::new(BTreeMap::new()),
         };
         replica.recover_incomplete()?;
         Ok(replica)
@@ -443,6 +449,8 @@ impl Replica {
             quarantine_fd,
             _lease: Some(lease),
             store,
+            hash_bytes: Arc::new(AtomicU64::new(0)),
+            scan_cache: Mutex::new(BTreeMap::new()),
         };
         manifest.apply(&mut replica, &binding)?;
         replica.verify_retained_artifacts()?;
@@ -526,6 +534,8 @@ impl Replica {
             quarantine_fd,
             _lease: Some(lease),
             store,
+            hash_bytes: Arc::new(AtomicU64::new(0)),
+            scan_cache: Mutex::new(BTreeMap::new()),
         };
         replica.recover_incomplete()?;
         Ok(replica)
@@ -541,6 +551,14 @@ impl Replica {
 
     pub fn filesystem(&self) -> NodeId {
         self.filesystem
+    }
+
+    pub fn hash_bytes_read(&self) -> u64 {
+        self.hash_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_hash_bytes_read(&self) {
+        self.hash_bytes.store(0, Ordering::Relaxed);
     }
 
     pub(super) fn store(&self) -> &Store {
@@ -660,6 +678,8 @@ impl Replica {
             quarantine_fd,
             _lease: None,
             store,
+            hash_bytes: Arc::new(AtomicU64::new(0)),
+            scan_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -805,6 +825,10 @@ impl Replica {
             },
         );
         self.scan_directory(&self.root_fd, "", self.root_identity, &mut nodes)?;
+        self.scan_cache
+            .lock()
+            .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
+            .retain(|path, _| nodes.contains_key(path));
         Ok(LocalSnapshot { nodes })
     }
 
@@ -855,15 +879,36 @@ impl Replica {
                 }))
             }
             FileType::RegularFile => {
-                let (length, digest, identity, executable) =
-                    hash_file_at(&parent_fd, name, &self.root.join(path))?;
-                Ok(Some(LocalNode {
+                let cached = self
+                    .scan_cache
+                    .lock()
+                    .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
+                    .get(path)
+                    .filter(|(cached_stat, _)| same_stable_stat(&stat, cached_stat))
+                    .map(|(_, node)| node.clone());
+                if let Some(mut node) = cached {
+                    node.path = path.to_owned();
+                    node.parent = Some(parent_identity);
+                    return Ok(Some(node));
+                }
+                let (length, digest, identity, executable) = hash_file_at_counted(
+                    &parent_fd,
+                    name,
+                    &self.root.join(path),
+                    Some(&self.hash_bytes),
+                )?;
+                let node = LocalNode {
                     path: path.to_owned(),
                     kind: LocalKind::File { length, digest },
                     executable,
                     identity,
                     parent: Some(parent_identity),
-                }))
+                };
+                self.scan_cache
+                    .lock()
+                    .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
+                    .insert(path.to_owned(), (stat, node.clone()));
+                Ok(Some(node))
             }
             FileType::Symlink => Err(Error::unsupported(format!(
                 "local symlink is not supported: {path}"
@@ -914,12 +959,18 @@ impl Replica {
                     root_identity,
                     &self.root,
                     self.root_identity.dev,
+                    Some(&self.hash_bytes),
+                    Some(&self.scan_cache),
                     &mut nodes,
                 )?;
             }
             FileType::RegularFile => {
-                let (length, digest, identity, executable) =
-                    hash_file_at(&parent_fd, name, &self.root.join(path))?;
+                let (length, digest, identity, executable) = hash_file_at_counted(
+                    &parent_fd,
+                    name,
+                    &self.root.join(path),
+                    Some(&self.hash_bytes),
+                )?;
                 nodes.insert(
                     path.to_owned(),
                     LocalNode {
@@ -1862,6 +1913,8 @@ impl Replica {
             directory_identity,
             &self.root,
             self.root_identity.dev,
+            Some(&self.hash_bytes),
+            Some(&self.scan_cache),
             nodes,
         )
     }
@@ -1896,6 +1949,8 @@ impl Replica {
                     identity,
                     &self.state,
                     self.state_identity.dev,
+                    Some(&self.hash_bytes),
+                    None,
                     &mut nodes,
                 )?;
             }
@@ -2763,7 +2818,16 @@ pub fn scan_path(path: &Path) -> Result<LocalSnapshot> {
                     parent: None,
                 },
             );
-            scan_directory(&fd, "", root_identity, path, root_identity.dev, &mut nodes)?;
+            scan_directory(
+                &fd,
+                "",
+                root_identity,
+                path,
+                root_identity.dev,
+                None,
+                None,
+                &mut nodes,
+            )?;
         }
         FileType::RegularFile => {
             let (length, digest, identity, executable) = hash_file_at(&parent_fd, name, path)?;
@@ -2800,6 +2864,8 @@ fn scan_directory(
     directory_identity: Identity,
     display_root: &Path,
     filesystem_dev: u64,
+    counter: Option<&AtomicU64>,
+    cache: Option<&Mutex<BTreeMap<String, (Stat, LocalNode)>>>,
     nodes: &mut BTreeMap<String, LocalNode>,
 ) -> Result<()> {
     let mut reader =
@@ -2859,21 +2925,47 @@ fn scan_directory(
                         parent: Some(directory_identity),
                     },
                 );
-                scan_directory(&fd, &path, identity, display_root, filesystem_dev, nodes)?;
+                scan_directory(
+                    &fd,
+                    &path,
+                    identity,
+                    display_root,
+                    filesystem_dev,
+                    counter,
+                    cache,
+                    nodes,
+                )?;
             }
             FileType::RegularFile => {
+                if let Some(cache) = cache
+                    && let Some((cached_stat, cached_node)) = cache
+                        .lock()
+                        .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
+                        .get(&path)
+                    && same_stable_stat(&stat, cached_stat)
+                {
+                    let mut node = cached_node.clone();
+                    node.path = path.clone();
+                    node.parent = Some(directory_identity);
+                    nodes.insert(path, node);
+                    continue;
+                }
                 let (length, digest, identity, executable) =
-                    hash_file_at(directory, name, &display)?;
-                nodes.insert(
-                    path.clone(),
-                    LocalNode {
-                        path,
-                        kind: LocalKind::File { length, digest },
-                        executable,
-                        identity,
-                        parent: Some(directory_identity),
-                    },
-                );
+                    hash_file_at_counted(directory, name, &display, counter)?;
+                let node = LocalNode {
+                    path: path.clone(),
+                    kind: LocalKind::File { length, digest },
+                    executable,
+                    identity,
+                    parent: Some(directory_identity),
+                };
+                if let Some(cache) = cache {
+                    cache
+                        .lock()
+                        .map_err(|_| Error::corrupt("local scan cache is poisoned"))?
+                        .insert(path.clone(), (stat, node.clone()));
+                }
+                nodes.insert(path, node);
             }
             FileType::Symlink => {
                 return Err(Error::unsupported(format!(
@@ -3120,6 +3212,15 @@ fn hash_file_at(
     name: &str,
     path: &Path,
 ) -> Result<(u64, ContentHash, Identity, bool)> {
+    hash_file_at_counted(parent, name, path, None)
+}
+
+fn hash_file_at_counted(
+    parent: &OwnedFd,
+    name: &str,
+    path: &Path,
+    counter: Option<&AtomicU64>,
+) -> Result<(u64, ContentHash, Identity, bool)> {
     let fd = openat(
         parent,
         name,
@@ -3149,6 +3250,9 @@ fn hash_file_at(
             .map_err(|e| Error::io("read local file", path, e))?;
         if count == 0 {
             break;
+        }
+        if let Some(counter) = counter {
+            counter.fetch_add(count as u64, Ordering::Relaxed);
         }
         hasher.update(&buffer[..count]);
     }

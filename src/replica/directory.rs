@@ -668,6 +668,14 @@ impl DirectorySync {
         self.replica.state()
     }
 
+    pub fn hash_bytes_read(&self) -> u64 {
+        self.replica.hash_bytes_read()
+    }
+
+    pub fn reset_hash_bytes_read(&self) {
+        self.replica.reset_hash_bytes_read();
+    }
+
     /// Retained-artifact export and conflict-side export share one path-based
     /// reader so late writers into a retained inode stay observable.
     pub fn export_artifact(&self, id: &str, output: &mut dyn Write) -> Result<()> {
