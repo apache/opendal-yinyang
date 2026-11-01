@@ -987,24 +987,6 @@ impl MetadataService {
         }
         Transaction::restore(bytes, &snapshot, &prepared).await
     }
-    async fn resolve_plan_receipt(&self, bytes: &[u8]) -> Result<Option<Receipt>> {
-        let identity = Transaction::inspect_replay_identity(bytes)?;
-        if identity.volume != self.filesystem {
-            return Err(Error::invalid(
-                "resolve receipt",
-                "request belongs to another volume",
-            ));
-        }
-        let latest = self.observe_latest().await?;
-        match latest.receipt(identity.id).await? {
-            Some(receipt) if receipt.request_digest == identity.digest => Ok(Some(receipt)),
-            Some(_) => Err(Error::invalid(
-                "resolve receipt",
-                "commit identity was reused with a different request digest",
-            )),
-            None => Ok(None),
-        }
-    }
     pub(crate) async fn commit_encoded(&self, plans: &[Vec<u8>]) -> Result<Vec<Outcome>> {
         if plans.len() > 4096 {
             return Err(Error::unsupported(
@@ -1024,7 +1006,7 @@ impl MetadataService {
                     pending.push((index, self.restore_from_snapshot(plan, snapshot).await?));
                 }
                 Err(error) if error.kind() == ErrorKind::Expired => {
-                    let Some(receipt) = self.resolve_plan_receipt(plan).await? else {
+                    let Some(receipt) = crate::Authority::resolve_receipt(self, plan).await? else {
                         return Err(error);
                     };
                     outcomes[index] = Some(Outcome::Committed(receipt));
