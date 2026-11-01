@@ -1930,13 +1930,14 @@ impl<'a> Context<'a> {
             .sync
             .stage_create_directory(parent_node, name, parent_revision)
             .await?;
+        let local = self.current.get(path).cloned();
         self.associate(
             edit,
             path,
             None,
             Some(path),
             "create-directory",
-            self.current.get(path),
+            local.as_ref(),
             Some(parent_node),
             parent_revision,
             None,
@@ -1949,8 +1950,8 @@ impl<'a> Context<'a> {
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
         self.mark_parent_dirty(path);
-        if let Some(local) = self.current.get(path) {
-            self.accept_local(path, local, node_id, revision).await?;
+        if let Some(local) = self.current.get(path).cloned() {
+            self.accept_local(path, &local, node_id, revision).await?;
         }
         self.refresh_parent_baseline(path, revision).await?;
         self.complete_work(edit, revision, None)?;
@@ -2750,7 +2751,9 @@ async fn canonical_local(
     remote: &Node,
 ) -> Result<Option<LocalNode>> {
     match (local.kind, remote.kind()) {
-        (LocalKind::Directory, NodeKind::Directory { .. }) => replica.observe_path(&local.path),
+        (LocalKind::Directory, NodeKind::Directory { .. }) => {
+            Ok(replica.observe_path(&local.path)?)
+        }
         (LocalKind::File { .. }, NodeKind::File(file)) => {
             let mut source =
                 tokio::fs::File::from_std(replica.open_observed_file(&local.path, local)?);

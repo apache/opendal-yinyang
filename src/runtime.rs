@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 use yinyang_core::{
     Authority, CommitId, CommitOutcome, ContentDescriptor, ContentEdit, FileVersion, NodeId,
-    Planner, PreparedContent, Receipt, Revision, Snapshot,
+    Planner, PreparedContent, Receipt, Revision, Snapshot, Transaction,
 };
 
 mod staging;
@@ -829,7 +829,8 @@ impl FileHandle {
 
     fn remember_prepared(&self, prepared: &PreparedContent) -> Result<()> {
         let descriptor = prepared.descriptor().to_bytes();
-        self.inner
+        self.runtime
+            .inner
             .prepared
             .lock()
             .map_err(Error::local)?
@@ -840,7 +841,7 @@ impl FileHandle {
     async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
         let (_, descriptors) = Transaction::inspect(bytes)?;
         let prepared = {
-            let cache = self.inner.prepared.lock().map_err(Error::local)?;
+            let cache = self.runtime.inner.prepared.lock().map_err(Error::local)?;
             descriptors
                 .iter()
                 .map(|descriptor| {
@@ -853,12 +854,14 @@ impl FileHandle {
         };
         match prepared {
             Ok(prepared) => self
+                .runtime
                 .inner
                 .authority
                 .restore_transaction_with(bytes, &prepared)
                 .await
                 .map_err(Error::from),
             Err(_) => self
+                .runtime
                 .inner
                 .authority
                 .restore_transaction(bytes)
@@ -870,7 +873,7 @@ impl FileHandle {
     fn forget_prepared(&self, request: &Transaction) -> Result<()> {
         let bytes = request.to_bytes()?;
         let (_, files) = Transaction::inspect(&bytes)?;
-        let mut cache = self.inner.prepared.lock().map_err(Error::local)?;
+        let mut cache = self.runtime.inner.prepared.lock().map_err(Error::local)?;
         for descriptor in files {
             cache.remove(&descriptor.to_bytes());
         }
@@ -890,7 +893,7 @@ impl FileHandle {
             return Err(Error::Conflict);
         }
         let request = if let Some(bytes) = &r.plan {
-            self.runtime.restore_transaction(bytes).await?
+            self.restore_transaction(bytes).await?
         } else {
             let prepared = self.prepare_publication(&r).await?;
             let snapshot = self
@@ -945,13 +948,13 @@ impl FileHandle {
                     if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
                         errors.remove(&self.id);
                     }
-                    self.runtime.forget_prepared(&request)?;
+                    self.forget_prepared(&request)?;
                     Ok(Some(receipt))
                 }
                 CommitOutcome::Conflict => {
                     r.conflict = true;
                     stage.save(r).await?;
-                    self.runtime.forget_prepared(&request)?;
+                    self.forget_prepared(&request)?;
                     Err(Error::Conflict)
                 }
                 CommitOutcome::Retryable => Err(Error::Retryable),

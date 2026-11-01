@@ -214,9 +214,10 @@ impl Transaction {
         ))
     }
 
-    pub(crate) fn inspect(
-        bytes: &[u8],
-    ) -> Result<(crate::Revision, Vec<crate::ContentDescriptor>)> {
+    /// Return the baseline revision and untrusted content descriptors carried
+    /// by a persisted request. Readiness is established only by restoring the
+    /// request through an authority.
+    pub fn inspect(bytes: &[u8]) -> Result<(crate::Revision, Vec<crate::ContentDescriptor>)> {
         let (_, _, _, revision, _, _, mutations) = Self::wire(bytes)?;
         let mut files = Vec::new();
         for bytes in mutations {

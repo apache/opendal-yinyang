@@ -3004,7 +3004,7 @@ fn remove_artifact_directory(parent: &OwnedFd, name: &str, display: &Path) -> Re
         let name = entry
             .file_name()
             .to_str()
-            .ok_or_else(|| Error::unsupported("retained artifact contains a non-UTF-8 name"))?;
+            .map_err(|_| Error::unsupported("retained artifact contains a non-UTF-8 name"))?;
         if name != "." && name != ".." {
             names.push(name.to_owned());
         }
@@ -3096,9 +3096,9 @@ fn artifact_stat(stat: &Stat) -> ArtifactStat {
         dev: stat.st_dev,
         ino: stat.st_ino,
         mtime: stat.st_mtime,
-        mtime_nsec: stat.st_mtime_nsec,
+        mtime_nsec: stat.st_mtime_nsec as i64,
         ctime: stat.st_ctime,
-        ctime_nsec: stat.st_ctime_nsec,
+        ctime_nsec: stat.st_ctime_nsec as i64,
     }
 }
 
@@ -3107,9 +3107,9 @@ fn artifact_stat_matches(record: &ArtifactRecord, stat: &Stat) -> bool {
         stored.dev == stat.st_dev
             && stored.ino == stat.st_ino
             && stored.mtime == stat.st_mtime
-            && stored.mtime_nsec == stat.st_mtime_nsec
+            && stored.mtime_nsec == stat.st_mtime_nsec as i64
             && stored.ctime == stat.st_ctime
-            && stored.ctime_nsec == stat.st_ctime_nsec
+            && stored.ctime_nsec == stat.st_ctime_nsec as i64
             && (FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
                 || stat.st_size as u64 == record.length)
     })
