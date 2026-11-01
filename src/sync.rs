@@ -308,7 +308,7 @@ impl Sync {
                     cache
                         .get(&descriptor.to_bytes())
                         .cloned()
-                        .ok_or_else(|| Error::Invalid("prepared content is unavailable"))
+                        .ok_or(Error::Invalid("prepared content is unavailable"))
                 })
                 .collect::<Result<Vec<_>>>()
         };
@@ -649,9 +649,7 @@ impl Sync {
                 .collect::<Vec<_>>();
             match self.authority().commit_batch(&batch).await {
                 Ok(outcomes) if outcomes.len() == requests.len() => {
-                    for ((index, edit, request), outcome) in
-                        requests.iter().zip(outcomes.into_iter())
-                    {
+                    for ((index, edit, request), outcome) in requests.iter().zip(outcomes) {
                         results[*index] =
                             Some(namespace::complete_batch(self, *edit, request, outcome).await);
                     }
@@ -677,7 +675,7 @@ impl Sync {
         }
         results
             .into_iter()
-            .map(|result| result.unwrap_or_else(|| Err(Error::Invalid("missing batch result"))))
+            .map(|result| result.unwrap_or(Err(Error::Invalid("missing batch result"))))
             .collect()
     }
     /// Export retained bytes without claiming remote completion.

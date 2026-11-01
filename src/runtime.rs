@@ -848,7 +848,7 @@ impl FileHandle {
                     cache
                         .get(&descriptor.to_bytes())
                         .cloned()
-                        .ok_or_else(|| Error::Invalid("prepared content is unavailable"))
+                        .ok_or(Error::Invalid("prepared content is unavailable"))
                 })
                 .collect::<Result<Vec<_>>>()
         };
