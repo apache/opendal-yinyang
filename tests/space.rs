@@ -18,6 +18,7 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 
+use futures_util::future::BoxFuture;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,7 +27,8 @@ use support::TestBackend;
 use yinyang::core::transaction::Planner;
 use yinyang::core::{
     Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind,
-    ExpiryId, Fs, NodeId, Revision, RevisionState, Snapshot, Transaction,
+    ExpiryConflict, ExpiryConflictKind, ExpiryId, ExpiryOutcome, ExpiryRefusal, ExpiryRequest, Fs,
+    HistoryPage, NodeId, Revision, RevisionState, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
@@ -95,6 +97,68 @@ impl Authority for LostResponseAuthority {
                 ));
             }
             Ok(outcomes)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct RefusedExpiryAuthority {
+    inner: Arc<dyn Authority>,
+    latest: Revision,
+    already_expired: Revision,
+}
+
+impl Authority for RefusedExpiryAuthority {
+    fn data(&self) -> &DataStore {
+        self.inner.data()
+    }
+
+    fn filesystem(&self) -> NodeId {
+        self.inner.filesystem()
+    }
+
+    fn root(&self) -> NodeId {
+        self.inner.root()
+    }
+
+    fn observe_latest(&self) -> BoxFuture<'_, yinyang::core::Result<Snapshot>> {
+        self.inner.observe_latest()
+    }
+
+    fn observe_revision(
+        &self,
+        revision: Revision,
+    ) -> BoxFuture<'_, yinyang::core::Result<Snapshot>> {
+        self.inner.observe_revision(revision)
+    }
+
+    fn commit_batch<'a>(
+        &'a self,
+        requests: &'a [Transaction],
+    ) -> BoxFuture<'a, yinyang::core::Result<Vec<CommitOutcome>>> {
+        self.inner.commit_batch(requests)
+    }
+
+    fn history_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, yinyang::core::Result<HistoryPage>> {
+        self.inner.history_page(after, limit)
+    }
+
+    fn expire_revisions<'a>(
+        &'a self,
+        _request: &'a ExpiryRequest,
+    ) -> BoxFuture<'a, yinyang::core::Result<ExpiryOutcome>> {
+        Box::pin(async move {
+            Ok(ExpiryOutcome::Refused(ExpiryRefusal {
+                current_latest: self.latest,
+                conflicts: vec![ExpiryConflict {
+                    revision: self.already_expired,
+                    kind: ExpiryConflictKind::AlreadyExpired,
+                }],
+            }))
         })
     }
 }
@@ -322,6 +386,56 @@ async fn clean_handle_base_is_protected_and_remains_readable_and_writable() {
         expected
     );
     recovered.close().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn partial_core_refusal_does_not_confirm_unlisted_candidates() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
+        .await
+        .unwrap();
+    let inner: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(inner.clone(), temp.path().join("seed"))
+        .await
+        .unwrap();
+    for name in ["first", "second", "latest"] {
+        runtime.create_directory(inner.root(), name).await.unwrap();
+    }
+    drop(runtime);
+    let revisions = inner.retained_revisions().await.unwrap();
+    let latest = inner.observe_latest().await.unwrap().revision();
+    let authority: Arc<dyn Authority> = Arc::new(RefusedExpiryAuthority {
+        inner: inner.clone(),
+        latest,
+        already_expired: revisions[0],
+    });
+
+    let before = inner.observe_latest().await.unwrap().revision();
+    let report = expire_managed_retention(
+        authority.as_ref(),
+        &temp.path().join("absent"),
+        &[revisions[0], revisions[1]],
+        &[],
+        ExpiryId::from_bytes([43; 16]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.state, ExpiryReportState::Refused);
+    assert_eq!(
+        report.revisions[0].state,
+        ExpiryDecisionState::AlreadyExpired
+    );
+    assert_eq!(report.revisions[1].state, ExpiryDecisionState::Eligible);
+    assert!(
+        report
+            .revisions
+            .iter()
+            .all(|decision| decision.state != ExpiryDecisionState::Expired),
+        "a partial Core refusal must not report a new expiry"
+    );
+    assert_eq!(inner.observe_latest().await.unwrap().revision(), before);
 }
 
 #[cfg(target_os = "linux")]

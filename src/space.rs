@@ -1372,11 +1372,7 @@ pub async fn expire_managed_retention(
             (ExpiryReportState::Committed, Some(receipt.after))
         }
         ExpiryOutcome::Refused(refusal) => {
-            let mut only_already = true;
             for conflict in &refusal.conflicts {
-                if conflict.kind != ExpiryConflictKind::AlreadyExpired {
-                    only_already = false;
-                }
                 if let Some(decision) = decisions
                     .iter_mut()
                     .find(|decision| decision.revision == revision_hex(conflict.revision))
@@ -1388,12 +1384,7 @@ pub async fn expire_managed_retention(
                         .unwrap_or_default();
                 }
             }
-            let state = if only_already {
-                ExpiryReportState::AlreadyExpired
-            } else {
-                ExpiryReportState::Refused
-            };
-            (state, None)
+            (ExpiryReportState::Refused, None)
         }
         ExpiryOutcome::Conflict => (ExpiryReportState::Conflict, None),
         ExpiryOutcome::Retryable => (ExpiryReportState::Retryable, None),
