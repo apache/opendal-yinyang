@@ -56,6 +56,9 @@ missing; ordinary workspace tests do not mount a filesystem. See the
 
 ## Prepare a change
 
+Read the [design principles](specs/design-principles.md) first. Each pull
+request answers their review checklist in its description.
+
 Keep runtime design, implementation, documentation, and repository tooling in
 separate commits when practical. Use semantic commit and pull request titles,
 for example `feat: add filesystem contract` or `ci: check dependency licenses`.
