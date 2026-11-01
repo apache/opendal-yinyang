@@ -1382,7 +1382,7 @@ fn run_write_latency_batch(
             .into_iter()
             .map(|(index, file)| (index, file, replacement.to_vec()))
             .collect();
-        let (outputs, _) = parallel_stage(values, |(index, file, bytes)| {
+        let (outputs, _) = parallel_stage(values, move |(_, file, bytes)| {
             write_all_at(&file, &bytes, offset);
             file
         });
@@ -1418,7 +1418,7 @@ fn run_write_latency_batch(
         }
         latencies
     } else {
-        let (outputs, _) = parallel_stage(std::mem::take(&mut files), |(index, file)| {
+        let (outputs, _) = parallel_stage(std::mem::take(&mut files), |(_, file)| {
             file.sync_all()
                 .expect("fsync concurrent write-latency file");
             file
