@@ -351,6 +351,17 @@ impl Mount {
         nodes.remove(&id);
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn reference_count(&self, id: NodeId) -> Option<usize> {
+        self.inner
+            .nodes
+            .lock()
+            .ok()?
+            .get(&id)
+            .map(|node| node.references.load(Ordering::Relaxed))
+    }
+
     /// Replace a clean local version with a fresh remote observation. Pending,
     /// frozen or failed versions are never rebased. Adapters must coordinate any
     /// OS cache invalidation outside this call; no OS callbacks run under locks.

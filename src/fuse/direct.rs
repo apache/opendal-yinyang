@@ -520,14 +520,8 @@ impl Backend for DirectBackend {
         self.flush_staged(file).await
     }
 
-    async fn release(
-        &self,
-        id: DirectId,
-        file: Arc<DirectOpenFile>,
-        _writable: bool,
-    ) -> Result<()> {
+    async fn release(&self, id: DirectId, _writable: bool) -> Result<()> {
         guard(&self.open_ids).remove(&id);
-        drop(file);
         {
             let mut views = guard(&self.views);
             prune_unreferenced_views(&mut views);

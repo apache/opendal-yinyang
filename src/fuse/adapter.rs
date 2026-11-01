@@ -213,8 +213,12 @@ impl<B: Backend> AdapterInner<B> {
             .cloned()
     }
 
-    fn detach_file(&self, fh: FileHandle) -> Option<Arc<OpenFile<B>>> {
-        guard(&self.files).remove(&fh.0)
+    fn detach_file(&self, fh: FileHandle) -> Option<(B::Inode, bool)> {
+        let open = guard(&self.files).remove(&fh.0)?;
+        let id = open.id;
+        let writable = open.writable;
+        drop(open);
+        Some((id, writable))
     }
 
     async fn serve_hup(
@@ -419,12 +423,8 @@ impl<B: Backend> AdapterInner<B> {
         }
     }
 
-    async fn release(&self, open: Arc<OpenFile<B>>, reply: ReplyEmpty) {
-        let file = Arc::clone(&open.file);
-        let id = open.id;
-        let writable = open.writable;
-        drop(open);
-        if let Err(error) = self.backend.release(id, file, writable).await {
+    async fn release(&self, id: B::Inode, writable: bool, reply: ReplyEmpty) {
+        if let Err(error) = self.backend.release(id, writable).await {
             eprintln!("yy: fuse release: {}: {error}", self.backend.name());
         }
         reply.ok();
@@ -832,10 +832,10 @@ impl<B: Backend> Filesystem for Adapter<B> {
         reply: ReplyEmpty,
     ) {
         let adapter = self.inner.clone();
-        let Some(open) = adapter.detach_file(fh) else {
+        let Some((id, writable)) = adapter.detach_file(fh) else {
             return reply.ok();
         };
-        self.spawn(async move { adapter.release(open, reply).await });
+        self.spawn(async move { adapter.release(id, writable, reply).await });
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -1120,4 +1120,67 @@ fn is_connection_ended(error: &std::io::Error) -> bool {
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BackendProfile, Fs};
+    use crate::fuse::frontend::{ManagedBackend, ManagedFile};
+    use crate::mount::Mount;
+    use crate::runtime::Runtime;
+    use crate::support::TestBackend;
+    use yinyang_core::Authority;
+
+    #[tokio::test]
+    async fn release_drops_the_last_mount_reference_on_the_dispatch_thread() {
+        let backend_state = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(
+            Fs::create(backend_state.operator(), BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let writer_temp = tempfile::tempdir().unwrap();
+        let writer = Runtime::open(authority.clone(), writer_temp.path())
+            .await
+            .unwrap();
+        let (id, _) = writer
+            .create_file_with_node(authority.root(), "file", false)
+            .await
+            .unwrap();
+        let mut file = writer.open_node(id, true).await.unwrap();
+        file.write(0, b"old-content").await.unwrap();
+        file.close().await.unwrap();
+        drop(writer);
+
+        let mount_temp = tempfile::tempdir().unwrap();
+        let mount = Mount::open(authority.clone(), mount_temp.path(), true)
+            .await
+            .unwrap();
+        let old = mount.open_read_only_node(id).await.unwrap();
+        assert_eq!(mount.reference_count(id), Some(1));
+        let backend = Arc::new(ManagedBackend::from_mount_for_test(mount.clone(), true).await);
+        let inner = AdapterInner::new(backend, Handle::current());
+        let fh = FileHandle(1);
+        guard(&inner.files).insert(
+            fh.0,
+            Arc::new(OpenFile {
+                id,
+                file: Arc::new(ManagedFile::ReadOnly(Box::new(old))),
+                writable: false,
+            }),
+        );
+
+        let update_temp = tempfile::tempdir().unwrap();
+        let updater = Runtime::open(authority, update_temp.path()).await.unwrap();
+        let mut file = updater.open_node(id, true).await.unwrap();
+        file.write(0, b"new-content").await.unwrap();
+        file.close().await.unwrap();
+        drop(updater);
+
+        assert_eq!(inner.detach_file(fh), Some((id, false)));
+        assert_eq!(mount.reference_count(id), Some(0));
+        let current = mount.open_read_only_node(id).await.unwrap();
+        assert_eq!(current.read(0, 11).await.unwrap(), b"new-content");
+    }
 }

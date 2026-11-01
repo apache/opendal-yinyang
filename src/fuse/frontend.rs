@@ -214,6 +214,25 @@ impl ManagedBackend {
     }
 }
 
+#[cfg(test)]
+impl ManagedBackend {
+    pub(super) async fn from_mount_for_test(mount: Mount, read_only: bool) -> Self {
+        let root = mount.authority().root();
+        let snapshot = mount.authority().observe_latest().await.unwrap();
+        Self {
+            mount,
+            name: "managed".to_owned(),
+            read_only,
+            root,
+            accepted: RwLock::new(Some(AcceptedSnapshot {
+                snapshot,
+                observed_at: Instant::now(),
+            })),
+            observe_gate: AsyncMutex::new(()),
+        }
+    }
+}
+
 pub(super) enum ManagedFile {
     Staged(MountFile),
     ReadOnly(Box<MountReadOnlyFile>),
@@ -333,15 +352,17 @@ impl Backend for ManagedBackend {
         Ok(())
     }
 
-    async fn release(&self, id: NodeId, file: Arc<ManagedFile>, _writable: bool) -> Result<()> {
-        let staged = matches!(&*file, ManagedFile::Staged(_));
-        drop(file);
-        if staged {
-            self.mount.reclaim(id).await?;
+    async fn release(&self, id: NodeId, _writable: bool) -> Result<()> {
+        let result = if self.read_only {
+            self.mount.reclaim_read_only(id)
         } else {
-            self.mount.reclaim_read_only(id)?;
+            self.mount.reclaim(id).await
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == crate::runtime::ErrorKind::Busy => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        Ok(())
     }
 
     async fn setattr(

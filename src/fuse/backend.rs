@@ -276,12 +276,7 @@ pub(super) trait Backend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send;
     fn flush(&self, file: &Self::File) -> impl Future<Output = Result<()>> + Send;
     fn fsync(&self, file: &Self::File) -> impl Future<Output = Result<()>> + Send;
-    fn release(
-        &self,
-        id: Self::Inode,
-        file: std::sync::Arc<Self::File>,
-        writable: bool,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn release(&self, id: Self::Inode, writable: bool) -> impl Future<Output = Result<()>> + Send;
     fn setattr(
         &self,
         id: Self::Inode,

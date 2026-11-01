@@ -162,16 +162,19 @@ clean reference is reclaimed, and a references-zero result left by an
 interrupted operation is reclaimed before a later open captures current remote
 metadata.
 
-FUSE RELEASE removal from the adapter's handle table happens on the dispatch
-thread before its asynchronous clean reclamation. Linux can process ordinary
-RELEASE work in the background, so an application close returning does not
-prove this callback has run. After the callback is dispatched, a request task
-that already cloned the handle still retains the existing Busy pin until that
-operation finishes. A later OPEN after reclamation observes current remote
-metadata. Before replying to a writable OPEN, after selecting the Mount handle
-and applying `O_TRUNC`, the adapter sends the same inode attribute invalidation
-used by read-only opens; notification failure fails OPEN rather than exposing a
-descriptor whose first fstat can use a cached old length.
+FUSE RELEASE removes the adapter handle and drops its backend file reference on
+the dispatch thread before its asynchronous clean reclamation. For a Managed
+volume this lowers the Mount reference count before the kernel can dispatch the
+next request, so a following OPEN reclaims the zero-reference observation and
+uses current remote metadata. Linux can process ordinary RELEASE work in the
+background, so an application close returning does not prove this callback has
+run. After the callback is dispatched, a request task that already cloned the
+handle still retains the existing Busy pin until that operation finishes. A
+later OPEN after reclamation observes current remote metadata. Before replying
+to a writable OPEN, after selecting the Mount handle and applying `O_TRUNC`, the
+adapter sends the same inode attribute invalidation used by read-only opens;
+notification failure fails OPEN rather than exposing a descriptor whose first
+fstat can use a cached old length.
 
 A clean node is only reclaimed when its last adapter reference is released. If
 an interrupted read still shares the node, reclaim reports busy and the pinned
