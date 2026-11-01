@@ -863,6 +863,50 @@ async fn object_expiry_lost_ack_is_resolved_and_replay_is_exact() {
 }
 
 #[tokio::test]
+async fn concurrent_object_expiry_same_request_resolves_committed() {
+    let backend = TestBackend::default();
+    let first = object_fs(&backend).await;
+    let initial = first.observe_latest().await.unwrap().revision();
+    let mut plan = Planner::new(&first.observe_latest().await.unwrap(), CommitId::generate());
+    plan.create_directory(first.root(), "collision")
+        .await
+        .unwrap();
+    committed(first.commit(&plan.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        first.filesystem(),
+        ExpiryId::generate(),
+        first.observe_latest().await.unwrap().revision(),
+        vec![initial],
+        Vec::new(),
+        [3; 32],
+    )
+    .unwrap();
+    let second = object_fs(&backend).await;
+    let (left, right) = tokio::join!(
+        first.expire_revisions(&request),
+        second.expire_revisions(&request)
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert!(matches!(left, ExpiryOutcome::Committed(_)));
+    assert_eq!(left, right);
+
+    let different = ExpiryRequest::new(
+        first.filesystem(),
+        request.id(),
+        first.observe_latest().await.unwrap().revision(),
+        vec![initial],
+        Vec::new(),
+        [4; 32],
+    )
+    .unwrap();
+    assert_eq!(
+        first.expire_revisions(&different).await.unwrap_err().kind(),
+        ErrorKind::Invalid
+    );
+}
+
+#[tokio::test]
 async fn indexed_delayed_and_lost_publication_results_remain_resolvable() {
     let backend = TestBackend::default();
     let fs = object_fs(&backend).await;

@@ -620,6 +620,31 @@ impl ObjectFs {
         }
         Ok(Some(ExpiryOutcome::Committed(request.receipt(marker))))
     }
+    async fn resolve_ambiguous_expiry(
+        &self,
+        request: &ExpiryRequest,
+        request_digest: [u8; 32],
+        no_marker: ExpiryOutcome,
+    ) -> Result<ExpiryOutcome> {
+        let current = match self.observe_state().await {
+            Ok(current) => current,
+            Err(error) if matches!(error.kind(), ErrorKind::Io | ErrorKind::Storage) => {
+                return Ok(ExpiryOutcome::Unknown(request.id()));
+            }
+            Err(error) => return Err(error),
+        };
+        match self
+            .committed_expiry(&current, request, request_digest)
+            .await
+        {
+            Ok(Some(outcome)) => Ok(outcome),
+            Ok(None) => Ok(no_marker),
+            Err(error) if matches!(error.kind(), ErrorKind::Io | ErrorKind::Storage) => {
+                Ok(ExpiryOutcome::Unknown(request.id()))
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub async fn expire_revisions(&self, request: &ExpiryRequest) -> Result<ExpiryOutcome> {
         request.validate_volume(self.filesystem)?;
         let request_digest = request.digest()?;
@@ -736,19 +761,17 @@ impl ObjectFs {
         {
             Ok(_) => Ok(ExpiryOutcome::Committed(request.receipt(marker))),
             Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {
-                Ok(ExpiryOutcome::Conflict)
-            }
-            Err(_) => match self.observe_state().await {
-                Ok(current) => match self
-                    .committed_expiry(&current, request, request_digest)
+                self.resolve_ambiguous_expiry(request, request_digest, ExpiryOutcome::Conflict)
                     .await
-                {
-                    Ok(Some(outcome)) => Ok(outcome),
-                    Ok(None) => Ok(ExpiryOutcome::Unknown(request.id())),
-                    Err(error) => Err(error),
-                },
-                Err(_) => Ok(ExpiryOutcome::Unknown(request.id())),
-            },
+            }
+            Err(_) => {
+                self.resolve_ambiguous_expiry(
+                    request,
+                    request_digest,
+                    ExpiryOutcome::Unknown(request.id()),
+                )
+                .await
+            }
         }
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {

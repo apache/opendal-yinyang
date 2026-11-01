@@ -617,23 +617,32 @@ impl ServiceClient {
         Ok(page)
     }
     pub async fn expire_revisions(&self, request: &ExpiryRequest) -> Result<ExpiryOutcome> {
+        request.validate_volume(self.filesystem)?;
         let request_digest = request.digest()?;
-        let Response::Expiry(bytes) =
-            rpc(self.addr, &self.token, Command::Expire(request.to_bytes()?)).await?
-        else {
+        let response = match rpc(self.addr, &self.token, Command::Expire(request.to_bytes()?)).await
+        {
+            Ok(response) => response,
+            Err(error) if matches!(error.kind(), ErrorKind::Io | ErrorKind::Storage) => {
+                return Ok(ExpiryOutcome::Unknown(request.id()));
+            }
+            Err(error) => return Err(error),
+        };
+        let Response::Expiry(bytes) = response else {
             return Err(protocol());
         };
         let outcome = ExpiryOutcome::decode(&bytes)?;
-        match &outcome {
-            ExpiryOutcome::Committed(receipt)
-                if receipt.id != request.id()
-                    || receipt.request_digest != request_digest
-                    || receipt.evidence_digest != request.evidence_digest()
-                    || receipt.before != request.expected_latest()
-                    || receipt.expired.as_slice() != request.candidates() =>
+        if let ExpiryOutcome::Committed(receipt) = &outcome {
+            receipt.validate()?;
+            if receipt.id != request.id()
+                || receipt.request_digest != request_digest
+                || receipt.evidence_digest != request.evidence_digest()
+                || receipt.before != request.expected_latest()
+                || receipt.expired.as_slice() != request.candidates()
             {
                 return Err(protocol());
             }
+        }
+        match &outcome {
             ExpiryOutcome::Unknown(id) if *id != request.id() => return Err(protocol()),
             _ => {}
         }

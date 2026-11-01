@@ -345,6 +345,19 @@ pub struct ExpiryReceipt {
 }
 
 impl ExpiryReceipt {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.after <= self.before
+            || self.expired.is_empty()
+            || self.expired.windows(2).any(|window| window[0] >= window[1])
+        {
+            return Err(Error::corrupt(
+                "decode expiry receipt",
+                "receipt ordering or candidate set is invalid",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         encode(&(
             EXPIRY_RECEIPT_MAGIC,
@@ -388,15 +401,16 @@ impl ExpiryReceipt {
                 "unknown expiry receipt profile",
             ));
         }
-        let expired = expired.into_iter().map(Revision::from_bytes).collect();
-        Ok(Self {
+        let receipt = Self {
             id: ExpiryId::from_bytes(id),
             request_digest,
             evidence_digest,
             before: Revision::from_bytes(before),
             after: Revision::from_bytes(after),
-            expired,
-        })
+            expired: expired.into_iter().map(Revision::from_bytes).collect(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
     }
 }
 
@@ -754,6 +768,24 @@ mod tests {
         assert_eq!(
             ExpiryOutcome::decode(&outcome.encode().unwrap()).unwrap(),
             outcome
+        );
+    }
+
+    #[test]
+    fn expiry_receipt_rejects_invalid_order() {
+        let receipt = ExpiryReceipt {
+            id: ExpiryId::generate(),
+            request_digest: [1; 32],
+            evidence_digest: [2; 32],
+            before: revision(5),
+            after: revision(5),
+            expired: vec![revision(1)],
+        };
+        assert_eq!(
+            ExpiryReceipt::decode(&receipt.encode().unwrap())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
         );
     }
 
