@@ -176,8 +176,10 @@ with open(path, encoding="utf-8") as source:
                 raise SystemExit(
                     f"{record.get('scenario')} did not retain multiple samples"
                 )
-        if expected_workload == "incremental" and record.get("scenario", "").startswith(
-            "fuse_write_latency_"
+        if (
+            expected_workload == "incremental"
+            and record.get("scenario", "").startswith("fuse_write_latency_")
+            and not record.get("scenario", "").endswith("_mount_ready")
         ):
             if record.get("iterations") != WRITE_LATENCY_TOTAL_FILES:
                 raise SystemExit(

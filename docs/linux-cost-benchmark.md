@@ -168,23 +168,41 @@ tradeoffs in the raw samples. Length-changing append or truncate behavior is
 covered by functional FUSE acceptance and is not included in the same-length
 fallback assertion.
 
+The same workload also runs a matched serial-versus-four-writer write latency
+probe. Each case uses three batches of four pre-created 8 MiB files. Every file
+has the same deterministic initial bytes and receives one 4 KiB overwrite at the
+same relative offset. The single-writer case completes one batch before starting
+the next. The four-writer case opens, mutates, and fsyncs four distinct files
+concurrently in each batch. Writable open, mutation, fsync, and whole-writer
+completion have separate latency samples. Complete remote bytes are checked
+after every batch outside all measured intervals.
+
+The counting proxies record request intervals independently of the configured
+writer count. The report exposes application-operation overlap, S3 request
+overlap, and metadata-service RPC overlap as separate observations. Four active
+application writers with maximum remote concurrency one is a valid serialized
+authority result. Concurrent network values remain whole-phase totals; the
+collector does not subtract global proxy counters around one writer and assign
+other writers' traffic to that sample.
+
 The accepted matched result and raw 16-row evidence are in
 [`linux-incremental-write-results.md`](linux-incremental-write-results.md).
 
-The `length-changing` workload records schema `yinyang.linux-cost.v6`, which
-adds `useful_bytes` to every row; it is the same collector shape for the
-matched baseline and optimized runs. The complete-source fallback in the
-baseline is expected to read and publish most of the file for each length
-change, while `required` mode rejects that behavior.
+The current writable workloads record schema `yinyang.linux-cost.v7`, which
+adds application and remote activity summaries to the v6 `useful_bytes`
+collector shape. The complete-source fallback in a pre-optimization baseline is
+expected to read and publish most of the file for each length change, while
+`required` mode rejects that behavior.
 
 The accepted matched result, binary identities, per-operation traffic, staging
 tradeoff, and negative observations are in
 [`linux-length-changing-write-results.md`](linux-length-changing-write-results.md).
 
-The first FUSE open materializes the complete file, so a cold 4 KiB read is
-expected to transfer much more than 4 KiB. A sparse update starts from the
-materialized staging file and publishes a new complete content version. These
-are current behavior boundaries, not benchmark assumptions.
+A Managed file open pins authenticated metadata without reading payload bytes.
+The first read of a missing verification unit authenticates and fetches that
+range from the pinned version. Writable staging records exact changed segments
+over that pinned base; publication advances the complete logical content
+descriptor without downloading unaffected bytes.
 
 `fuse_mount_ready` measures from before spawning `yy mount` until
 `/proc/mounts` reports `fuse.yinyang`, including daemon process I/O and proxy
@@ -210,6 +228,9 @@ Each JSONL record includes:
 - service TCP connections and raw framed bytes in both directions;
 - batch totals and per-sample network values, where per-sample divides only a
   sequential batch and explicitly notes that concurrent samples overlap;
+- application-operation overlap plus S3 request and metadata-service RPC
+  interval summaries, including maximum observed concurrency and in-flight
+  work at the end of each phase;
 - allocated local payload, Sync state, mount staging, SQLite database plus
   `-wal`/`-shm`, and persistent S3 object bytes and counts;
 - assertions that completed successfully and the failure count (zero for a
