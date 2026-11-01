@@ -669,11 +669,15 @@ async fn managed_sync_edit_benchmark() {
     reader.reset_hash_bytes_read();
     let before = Instant::now();
     assert!(reader.run().await.unwrap().in_sync);
+    let settled = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
     println!(
         "W2_EDITS edits={EDITS} writer_retained_bytes={} reader_retained_bytes={} \
-         noop_hashed_bytes={} noop_s={:.3} quarantine_bytes={}",
+         settled_retained_bytes={} noop_hashed_bytes={} noop_s={:.3} quarantine_bytes={}",
         writer_status.summary.retained_bytes,
         reader_status.summary.retained_bytes,
+        settled.summary.retained_bytes,
         reader.hash_bytes_read(),
         before.elapsed().as_secs_f64(),
         tree_bytes(&reader_state.join("quarantine"))
