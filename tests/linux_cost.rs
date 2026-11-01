@@ -34,7 +34,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ use fixture::{Fixture, Publication, SyncPaths};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v6";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v7";
 const CHUNK: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
@@ -227,13 +227,25 @@ impl NetworkMeter<'_> {
             snapshot.service_connections = service.connections;
             snapshot.service_request_bytes = service.request_bytes;
             snapshot.service_response_bytes = service.response_bytes;
+            snapshot.service_captured_ns = service.captured_ns;
+            snapshot.service_intervals = service.intervals;
+            snapshot.service_in_flight = service.in_flight;
         }
         snapshot
     }
 
     fn settle(&self) {
-        if matches!(self.storage, NetworkSource::Telemetry(_)) {
-            thread::sleep(Duration::from_millis(150));
+        match self.storage {
+            NetworkSource::Telemetry(_) => thread::sleep(Duration::from_millis(150)),
+            NetworkSource::Proxy(_) => {
+                for _ in 0..100 {
+                    let snapshot = self.snapshot();
+                    if snapshot.s3_in_flight == 0 && snapshot.service_in_flight == 0 {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
     }
 
@@ -489,6 +501,7 @@ fn linux_cost_benchmark() {
                 incremental_expectation,
                 &mut recorder,
             );
+            run_write_latency_matrix(&context, &proxy, publication, &mut recorder);
         }
         recorder.finish();
         return;
@@ -1151,6 +1164,506 @@ fn run_incremental_matrix(
         vec!["restarted mount returned the exact incremental bytes".to_owned()],
     );
     restarted.unmount();
+}
+
+const WRITE_LATENCY_BATCH_FILES: usize = 4;
+const WRITE_LATENCY_BATCHES: usize = 3;
+const WRITE_LATENCY_TOTAL_FILES: usize = WRITE_LATENCY_BATCH_FILES * WRITE_LATENCY_BATCHES;
+
+#[derive(Clone, Default)]
+struct StageBatch {
+    latencies: Vec<f64>,
+    wall_ms: f64,
+    io: IoSnapshot,
+    network: NetworkSnapshot,
+}
+
+fn merge_stage(total: &mut StageBatch, stage: StageBatch) {
+    total.latencies.extend(stage.latencies);
+    total.wall_ms += stage.wall_ms;
+    total.io.add(stage.io);
+    total.network.add(stage.network);
+}
+
+fn parallel_stage<T, U, F>(values: Vec<T>, operation: F) -> (Vec<(usize, U, f64)>, f64)
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: Fn(T) -> U + Send + Sync + 'static,
+{
+    let barrier = Arc::new(Barrier::new(values.len()));
+    let operation = Arc::new(operation);
+    let started = Instant::now();
+    let mut threads = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        let barrier = barrier.clone();
+        let operation = operation.clone();
+        threads.push(thread::spawn(move || {
+            barrier.wait();
+            let started = Instant::now();
+            let output = operation(value);
+            (index, output, started.elapsed().as_secs_f64() * 1000.0)
+        }));
+    }
+    let mut outputs = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("parallel benchmark stage panicked"))
+        .collect::<Vec<_>>();
+    outputs.sort_by_key(|(index, _, _)| *index);
+    (outputs, started.elapsed().as_secs_f64() * 1000.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_write_latency_stage(
+    recorder: &mut Recorder,
+    context: &RunContext,
+    publication: Publication,
+    scale: Scale,
+    dataset: Dataset,
+    scenario: &str,
+    completion: &str,
+    batch: StageBatch,
+    staging: &Path,
+    fixture: &Fixture,
+    invariants: Vec<String>,
+) {
+    assert_eq!(
+        batch.latencies.len(),
+        WRITE_LATENCY_TOTAL_FILES,
+        "{scenario} did not retain one phase sample per writer batch operation"
+    );
+    let mut invariants = invariants;
+    invariants.push(format!("phase_wall_ms={:.3}", batch.wall_ms));
+    invariants.push(format!(
+        "observed_s3_request_max_concurrency={}",
+        batch.network.s3_activity.max_concurrency
+    ));
+    invariants.push(format!(
+        "observed_service_rpc_max_concurrency={}",
+        batch.network.service_activity.max_concurrency
+    ));
+    invariants.push(format!(
+        "observed_s3_request_overlap_ms={:.3}",
+        batch.network.s3_activity.overlap_ms
+    ));
+    invariants.push(format!(
+        "observed_service_rpc_overlap_ms={:.3}",
+        batch.network.service_activity.overlap_ms
+    ));
+    let application_active_ms = batch.latencies.iter().sum::<f64>();
+    invariants.push(format!(
+        "observed_application_operation_overlap_ms={:.3}",
+        (application_active_ms - batch.wall_ms).max(0.0)
+    ));
+    invariants.push(format!(
+        "s3_in_flight_at_stage_end={}",
+        batch.network.s3_activity.in_flight_at_end
+    ));
+    invariants.push(format!(
+        "service_in_flight_at_stage_end={}",
+        batch.network.service_activity.in_flight_at_end
+    ));
+    invariants.push(
+        "network totals cover the complete phase; concurrent writer samples share rather than own those totals"
+            .to_owned(),
+    );
+    recorder.record(
+        context,
+        scenario,
+        publication,
+        scale,
+        dataset,
+        completion,
+        batch.latencies,
+        batch.io,
+        batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(staging)),
+        invariants,
+    );
+}
+
+fn run_write_latency_matrix(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    recorder: &mut Recorder,
+) {
+    for writers in [1, WRITE_LATENCY_BATCH_FILES] {
+        run_write_latency_case(context, proxy, publication, writers, recorder);
+    }
+}
+
+struct WriteLatencyBatch {
+    files: Vec<(usize, fs::File)>,
+    open: StageBatch,
+    mutation: StageBatch,
+    fsync: StageBatch,
+}
+
+fn run_write_latency_batch(
+    mounted: &FuseMount,
+    meter: &NetworkMeter<'_>,
+    paths: &[PathBuf],
+    writers: usize,
+    offset: u64,
+    replacement: &[u8],
+) -> WriteLatencyBatch {
+    assert_eq!(paths.len(), WRITE_LATENCY_BATCH_FILES);
+    let net_before = meter.snapshot();
+    let io_before = read_proc_io(mounted.pid());
+    let stage_started = Instant::now();
+    let (mut files, open_latencies) = if writers == 1 {
+        let mut files = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        for path in paths {
+            let started = Instant::now();
+            files.push(
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open matched write-latency file"),
+            );
+            latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        (
+            files
+                .into_iter()
+                .enumerate()
+                .map(|(index, file)| (index, file))
+                .collect::<Vec<_>>(),
+            latencies,
+        )
+    } else {
+        let (opened, _) = parallel_stage(paths.to_owned(), |path| {
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open concurrent write-latency file")
+        });
+        let mut files = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        for (index, file, elapsed) in opened {
+            files.push((index, file));
+            latencies.push(elapsed);
+        }
+        (files, latencies)
+    };
+    meter.settle();
+    let open = StageBatch {
+        latencies: open_latencies,
+        wall_ms: stage_started.elapsed().as_secs_f64() * 1000.0,
+        io: read_proc_io(mounted.pid()).since(io_before),
+        network: meter.snapshot().since(net_before),
+    };
+    files.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        open.network.s3_activity.in_flight_at_end, 0,
+        "S3 requests remained in flight after the open stage"
+    );
+    assert_eq!(
+        open.network.service_activity.in_flight_at_end, 0,
+        "service RPCs remained in flight after the open stage"
+    );
+
+    let net_before = meter.snapshot();
+    let io_before = read_proc_io(mounted.pid());
+    let stage_started = Instant::now();
+    let mutation_latencies = if writers == 1 {
+        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        for (_, file) in &files {
+            let started = Instant::now();
+            write_all_at(file, replacement, offset);
+            latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        latencies
+    } else {
+        let values = std::mem::take(&mut files)
+            .into_iter()
+            .map(|(index, file)| (index, file, replacement.to_vec()))
+            .collect();
+        let (outputs, _) = parallel_stage(values, |(index, file, bytes)| {
+            write_all_at(&file, &bytes, offset);
+            (index, file)
+        });
+        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        for (index, file, elapsed) in outputs {
+            files.push((index, file));
+            latencies.push(elapsed);
+        }
+        latencies
+    };
+    meter.settle();
+    let mutation = StageBatch {
+        latencies: mutation_latencies,
+        wall_ms: stage_started.elapsed().as_secs_f64() * 1000.0,
+        io: read_proc_io(mounted.pid()).since(io_before),
+        network: meter.snapshot().since(net_before),
+    };
+    files.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        mutation.network.put, 0,
+        "pwrite published before the explicit fsync phase"
+    );
+
+    let net_before = meter.snapshot();
+    let io_before = read_proc_io(mounted.pid());
+    let stage_started = Instant::now();
+    let fsync_latencies = if writers == 1 {
+        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        for (_, file) in &files {
+            let started = Instant::now();
+            file.sync_all().expect("fsync serial write-latency file");
+            latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        latencies
+    } else {
+        let (outputs, _) = parallel_stage(std::mem::take(&mut files), |(index, file)| {
+            file.sync_all()
+                .expect("fsync concurrent write-latency file");
+            (index, file)
+        });
+        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
+        for (index, file, elapsed) in outputs {
+            files.push((index, file));
+            latencies.push(elapsed);
+        }
+        latencies
+    };
+    meter.settle();
+    let fsync = StageBatch {
+        latencies: fsync_latencies,
+        wall_ms: stage_started.elapsed().as_secs_f64() * 1000.0,
+        io: read_proc_io(mounted.pid()).since(io_before),
+        network: meter.snapshot().since(net_before),
+    };
+    files.sort_by_key(|(index, _)| *index);
+    assert!(
+        fsync.network.put > 0,
+        "the fsync stage must publish content"
+    );
+    assert_eq!(
+        fsync.network.s3_activity.in_flight_at_end, 0,
+        "S3 requests remained in flight after the fsync stage"
+    );
+    assert_eq!(
+        fsync.network.service_activity.in_flight_at_end, 0,
+        "service RPCs remained in flight after the fsync stage"
+    );
+    WriteLatencyBatch {
+        files,
+        open,
+        mutation,
+        fsync,
+    }
+}
+
+fn run_write_latency_case(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    writers: usize,
+    recorder: &mut Recorder,
+) {
+    assert!(writers == 1 || writers == WRITE_LATENCY_FILES);
+    let scale = Scale::Small;
+    let size = scale.file_size();
+    let offset =
+        (size as u64 / 2 / BLOCK_BYTES as u64) * BLOCK_BYTES as u64 + BLOCK_BYTES as u64 / 4;
+    let replacement = payload(RANGE_BYTES, 0xd3);
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
+    fixture.remote_create_directory("write-latency");
+    let expected = (0..WRITE_LATENCY_TOTAL_FILES)
+        .map(|index| payload(size, 0x50 + u8::try_from(index).expect("small file set")))
+        .collect::<Vec<_>>();
+    for batch in 0..WRITE_LATENCY_BATCHES {
+        for index in 0..WRITE_LATENCY_BATCH_FILES {
+            let file_index = batch * WRITE_LATENCY_BATCH_FILES + index;
+            fixture.remote_create_file(
+                &format!("write-latency/batch-{batch}-file-{index:02}.bin"),
+                &expected[file_index],
+                false,
+            );
+        }
+    }
+    let (config, staging, mountpoint) = mount_paths(
+        fixture,
+        &format!("write-latency-{}-{writers}", publication.as_str()),
+        false,
+    );
+    fs::create_dir(&mountpoint).expect("create write-latency benchmark mountpoint");
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    let total_bytes = (WRITE_LATENCY_TOTAL_FILES * size) as u64;
+    let dataset = Dataset {
+        kind: if writers == 1 {
+            "matched_serial_four_files".to_owned()
+        } else {
+            "matched_concurrent_four_files".to_owned()
+        },
+        files: WRITE_LATENCY_TOTAL_FILES,
+        directories: 1,
+        logical_bytes: total_bytes,
+        file_size_bytes: Some(size as u64),
+        range_bytes: Some(RANGE_BYTES as u64),
+        writers: Some(writers),
+        read_pattern: Some(if writers == 1 {
+            format!(
+                "three batches; one writer opens, overwrites {RANGE_BYTES} bytes at offset {offset}, and fsyncs four files sequentially per batch"
+            )
+        } else {
+            format!(
+                "three batches; four writers concurrently open distinct files, overwrite {RANGE_BYTES} bytes at offset {offset}, and fsync"
+            )
+        }),
+        working_set_bytes: Some((WRITE_LATENCY_TOTAL_FILES * RANGE_BYTES) as u64),
+        random_seed: None,
+    };
+    recorder.record(
+        context,
+        &format!("fuse_write_latency_{writers}_mount_ready"),
+        publication,
+        scale,
+        Dataset {
+            working_set_bytes: Some(0),
+            ..dataset.clone()
+        },
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["writable mount type=fuse.yinyang".to_owned()],
+    );
+
+    let mut open_stage = StageBatch::default();
+    let mut mutation_stage = StageBatch::default();
+    let mut fsync_stage = StageBatch::default();
+    let mut files = Vec::with_capacity(WRITE_LATENCY_TOTAL_FILES);
+    let mut complete_latencies = Vec::with_capacity(WRITE_LATENCY_TOTAL_FILES);
+    let mut expected = expected;
+    for batch_index in 0..WRITE_LATENCY_BATCHES {
+        let paths = (0..WRITE_LATENCY_BATCH_FILES)
+            .map(|index| {
+                mountpoint.join(format!(
+                    "write-latency/batch-{batch_index}-file-{index:02}.bin"
+                ))
+            })
+            .collect::<Vec<_>>();
+        let batch =
+            run_write_latency_batch(&mounted, &meter, &paths, writers, offset, &replacement);
+        for index in 0..WRITE_LATENCY_BATCH_FILES {
+            let file_index = batch_index * WRITE_LATENCY_BATCH_FILES + index;
+            expected[file_index][offset as usize..offset as usize + RANGE_BYTES]
+                .copy_from_slice(&replacement);
+            assert_eq!(
+                remote_file_bytes(
+                    fixture,
+                    &format!("write-latency/batch-{batch_index}-file-{index:02}.bin"),
+                ),
+                expected[file_index],
+                "writer {file_index} remote bytes after the matched fsync stage"
+            );
+            complete_latencies.push(
+                batch.open.latencies[index]
+                    + batch.mutation.latencies[index]
+                    + batch.fsync.latencies[index],
+            );
+        }
+        merge_stage(&mut open_stage, batch.open);
+        merge_stage(&mut mutation_stage, batch.mutation);
+        merge_stage(&mut fsync_stage, batch.fsync);
+        files.extend(batch.files);
+    }
+    record_write_latency_stage(
+        recorder,
+        context,
+        publication,
+        scale,
+        Dataset {
+            working_set_bytes: Some(0),
+            ..dataset.clone()
+        },
+        &format!("fuse_write_latency_{writers}_open"),
+        "each batch opened four writable descriptors before its mutation; phase latency contains only open",
+        open_stage.clone(),
+        &staging,
+        fixture,
+        vec![
+            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
+            "writable descriptors opened successfully".to_owned(),
+        ],
+    );
+    record_write_latency_stage(
+        recorder,
+        context,
+        publication,
+        scale,
+        Dataset { ..dataset.clone() },
+        &format!("fuse_write_latency_{writers}_mutation"),
+        "each batch completed its pwrites before fsync; this phase contains only FUSE mutations",
+        mutation_stage.clone(),
+        &staging,
+        fixture,
+        vec![
+            format!("exact replacement bytes={}", replacement.len()),
+            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
+            "no backend PUT was accepted before fsync".to_owned(),
+        ],
+    );
+    record_write_latency_stage(
+        recorder,
+        context,
+        publication,
+        scale,
+        dataset.clone(),
+        &format!("fuse_write_latency_{writers}_fsync"),
+        "each batch returned from fsync after remote publication; complete bytes were verified outside every interval",
+        fsync_stage.clone(),
+        &staging,
+        fixture,
+        vec![
+            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
+            "every writer fsync returned successfully".to_owned(),
+            "every batch published at least one backend PUT".to_owned(),
+        ],
+    );
+    let mut complete = StageBatch {
+        latencies: complete_latencies,
+        wall_ms: open_stage.wall_ms + mutation_stage.wall_ms + fsync_stage.wall_ms,
+        ..StageBatch::default()
+    };
+    complete.io.add(open_stage.io);
+    complete.io.add(mutation_stage.io);
+    complete.io.add(fsync_stage.io);
+    complete.network.add(open_stage.network);
+    complete.network.add(mutation_stage.network);
+    complete.network.add(fsync_stage.network);
+    record_write_latency_stage(
+        recorder,
+        context,
+        publication,
+        scale,
+        dataset,
+        &format!("fuse_write_latency_{writers}_complete"),
+        "each phase completed in open, mutation, fsync order; complete bytes were verified before this record",
+        complete,
+        &staging,
+        fixture,
+        vec![
+            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
+            "all files had identical size and relative mutation offset".to_owned(),
+            format!(
+                "matched cases performed {WRITE_LATENCY_TOTAL_FILES} 4 KiB updates for {} total mutation bytes",
+                WRITE_LATENCY_TOTAL_FILES * RANGE_BYTES
+            ),
+            "complete remote bytes matched every file".to_owned(),
+        ],
+    );
+    drop(files);
+    mounted.unmount();
 }
 
 fn run_length_changing_matrix(
@@ -3271,10 +3784,54 @@ struct NetworkSnapshot {
     service_connections: u64,
     service_request_bytes: u64,
     service_response_bytes: u64,
+    s3_activity: ActivitySummary,
+    service_activity: ActivitySummary,
+    #[serde(skip)]
+    s3_captured_ns: u128,
+    #[serde(skip)]
+    s3_in_flight: u64,
+    #[serde(skip)]
+    s3_intervals: Vec<RequestInterval>,
+    #[serde(skip)]
+    service_captured_ns: u128,
+    #[serde(skip)]
+    service_in_flight: u64,
+    #[serde(skip)]
+    service_intervals: Vec<RequestInterval>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct ActivitySummary {
+    requests: u64,
+    active_ms: f64,
+    union_active_ms: f64,
+    overlap_ms: f64,
+    span_ms: f64,
+    max_concurrency: u64,
+    in_flight_at_end: u64,
+    crossed_window_start: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequestInterval {
+    start_ns: u128,
+    end_ns: u128,
 }
 
 impl NetworkSnapshot {
     fn since(self, before: Self) -> Self {
+        let s3_activity = summarize_activity(
+            &self.s3_intervals,
+            before.s3_captured_ns,
+            self.s3_captured_ns,
+            self.s3_in_flight,
+        );
+        let service_activity = summarize_activity(
+            &self.service_intervals,
+            before.service_captured_ns,
+            self.service_captured_ns,
+            self.service_in_flight,
+        );
         Self {
             connections: self.connections.saturating_sub(before.connections),
             requests: self.requests.saturating_sub(before.requests),
@@ -3301,6 +3858,9 @@ impl NetworkSnapshot {
             service_response_bytes: self
                 .service_response_bytes
                 .saturating_sub(before.service_response_bytes),
+            s3_activity,
+            service_activity,
+            ..Self::default()
         }
     }
 
@@ -3330,7 +3890,97 @@ impl NetworkSnapshot {
         self.service_response_bytes = self
             .service_response_bytes
             .saturating_add(other.service_response_bytes);
+        self.s3_activity.add(other.s3_activity);
+        self.service_activity.add(other.service_activity);
+        self.s3_captured_ns = 0;
+        self.s3_in_flight = 0;
+        self.s3_intervals.clear();
+        self.service_captured_ns = 0;
+        self.service_in_flight = 0;
+        self.service_intervals.clear();
     }
+}
+
+impl ActivitySummary {
+    fn add(&mut self, other: Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.active_ms += other.active_ms;
+        self.union_active_ms += other.union_active_ms;
+        self.overlap_ms += other.overlap_ms;
+        self.span_ms += other.span_ms;
+        self.max_concurrency = self.max_concurrency.max(other.max_concurrency);
+        self.in_flight_at_end = self.in_flight_at_end.max(other.in_flight_at_end);
+        self.crossed_window_start = self
+            .crossed_window_start
+            .saturating_add(other.crossed_window_start);
+    }
+}
+
+fn summarize_activity(
+    intervals: &[RequestInterval],
+    window_start_ns: u128,
+    window_end_ns: u128,
+    in_flight_at_end: u64,
+) -> ActivitySummary {
+    if window_start_ns > window_end_ns {
+        return ActivitySummary {
+            in_flight_at_end,
+            ..ActivitySummary::default()
+        };
+    }
+    let mut summary = ActivitySummary {
+        in_flight_at_end,
+        ..ActivitySummary::default()
+    };
+    let mut events = Vec::new();
+    let mut first = u128::MAX;
+    let mut last = 0;
+    for interval in intervals {
+        if interval.end_ns <= window_start_ns || interval.start_ns >= window_end_ns {
+            continue;
+        }
+        summary.requests = summary.requests.saturating_add(1);
+        if interval.start_ns < window_start_ns {
+            summary.crossed_window_start = summary.crossed_window_start.saturating_add(1);
+        }
+        let start = interval.start_ns.max(window_start_ns);
+        let end = interval.end_ns.min(window_end_ns);
+        if end <= start {
+            continue;
+        }
+        summary.active_ms += (end - start) as f64 / 1_000_000.0;
+        first = first.min(start);
+        last = last.max(end);
+        events.push((start, 1_u8));
+        events.push((end, 0_u8));
+    }
+    if summary.requests == 0 {
+        return summary;
+    }
+    summary.span_ms = last.saturating_sub(first) as f64 / 1_000_000.0;
+    events.sort_unstable_by_key(|(time, kind)| (*time, *kind));
+    let mut active = 0_u64;
+    let mut union_start = None;
+    let mut union_ns = 0_u128;
+    for (time, kind) in events {
+        if kind == 1 {
+            if active == 0 {
+                union_start = Some(time);
+            }
+            active += 1;
+            summary.max_concurrency = summary.max_concurrency.max(active);
+        } else {
+            active = active.saturating_sub(1);
+            if active == 0
+                && let Some(start) = union_start.take()
+            {
+                union_ns = union_ns.saturating_add(time.saturating_sub(start));
+            }
+        }
+    }
+    summary.union_active_ms = union_ns as f64 / 1_000_000.0;
+    summary.overlap_ms = (summary.active_ms - summary.union_active_ms).max(0.0);
+    summary
 }
 
 #[derive(Default)]
@@ -3347,10 +3997,13 @@ struct ProxyCounters {
     other: AtomicU64,
     get_response_body_bytes: AtomicU64,
     put_request_body_bytes: AtomicU64,
+    request_timings: Mutex<Vec<RequestInterval>>,
+    in_flight_requests: AtomicU64,
 }
 
 struct CountingProxy {
     address: SocketAddr,
+    origin: Instant,
     counters: Arc<ProxyCounters>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -3360,6 +4013,7 @@ impl CountingProxy {
     fn start(upstream: SocketAddr) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting S3 proxy");
         let address = listener.local_addr().expect("counting proxy address");
+        let origin = Instant::now();
         let counters = Arc::new(ProxyCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_counters = counters.clone();
@@ -3377,11 +4031,12 @@ impl CountingProxy {
                     .expect("disable Nagle on counting S3 client");
                 thread_counters.connections.fetch_add(1, Ordering::Relaxed);
                 let counters = thread_counters.clone();
-                thread::spawn(move || proxy_connection(client, upstream, counters));
+                thread::spawn(move || proxy_connection(client, upstream, counters, origin));
             }
         });
         Self {
             address,
+            origin,
             counters,
             stop,
             thread: Some(thread),
@@ -3393,6 +4048,12 @@ impl CountingProxy {
     }
 
     fn snapshot(&self) -> NetworkSnapshot {
+        let intervals = self
+            .counters
+            .request_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         NetworkSnapshot {
             connections: self.counters.connections.load(Ordering::Relaxed),
             requests: self.counters.requests.load(Ordering::Relaxed),
@@ -3412,6 +4073,10 @@ impl CountingProxy {
             service_connections: 0,
             service_request_bytes: 0,
             service_response_bytes: 0,
+            s3_captured_ns: self.origin.elapsed().as_nanos(),
+            s3_in_flight: self.counters.in_flight_requests.load(Ordering::Relaxed),
+            s3_intervals: intervals,
+            ..NetworkSnapshot::default()
         }
     }
 }
@@ -3426,11 +4091,15 @@ impl Drop for CountingProxy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct ServiceSnapshot {
     connections: u64,
     request_bytes: u64,
     response_bytes: u64,
+    captured_ns: u128,
+    in_flight: u64,
+    #[serde(skip)]
+    intervals: Vec<RequestInterval>,
 }
 
 #[derive(Default)]
@@ -3438,10 +4107,13 @@ struct ServiceProxyCounters {
     connections: AtomicU64,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
+    connection_timings: Mutex<Vec<RequestInterval>>,
+    in_flight_connections: AtomicU64,
 }
 
 struct CountingServiceProxy {
     address: SocketAddr,
+    origin: Instant,
     counters: Arc<ServiceProxyCounters>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -3453,6 +4125,7 @@ impl CountingServiceProxy {
         let address = listener
             .local_addr()
             .expect("counting service proxy address");
+        let origin = Instant::now();
         let counters = Arc::new(ServiceProxyCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_counters = counters.clone();
@@ -3469,12 +4142,19 @@ impl CountingServiceProxy {
                     .set_nodelay(true)
                     .expect("disable Nagle on counting service client");
                 thread_counters.connections.fetch_add(1, Ordering::Relaxed);
+                thread_counters
+                    .in_flight_connections
+                    .fetch_add(1, Ordering::Relaxed);
+                let started_ns = origin.elapsed().as_nanos();
                 let counters = thread_counters.clone();
-                thread::spawn(move || service_proxy_connection(client, upstream, counters));
+                thread::spawn(move || {
+                    service_proxy_connection(client, upstream, counters, origin, started_ns)
+                });
             }
         });
         Self {
             address,
+            origin,
             counters,
             stop,
             thread: Some(thread),
@@ -3486,10 +4166,19 @@ impl CountingServiceProxy {
     }
 
     fn snapshot(&self) -> ServiceSnapshot {
+        let intervals = self
+            .counters
+            .connection_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         ServiceSnapshot {
             connections: self.counters.connections.load(Ordering::Relaxed),
             request_bytes: self.counters.request_bytes.load(Ordering::Relaxed),
             response_bytes: self.counters.response_bytes.load(Ordering::Relaxed),
+            captured_ns: self.origin.elapsed().as_nanos(),
+            in_flight: self.counters.in_flight_connections.load(Ordering::Relaxed),
+            intervals,
         }
     }
 }
@@ -3508,8 +4197,13 @@ fn service_proxy_connection(
     client: TcpStream,
     upstream: SocketAddr,
     counters: Arc<ServiceProxyCounters>,
+    origin: Instant,
+    started_ns: u128,
 ) {
     let Ok(server) = TcpStream::connect(upstream) else {
+        counters
+            .in_flight_connections
+            .fetch_sub(1, Ordering::Relaxed);
         return;
     };
     server
@@ -3517,10 +4211,16 @@ fn service_proxy_connection(
         .expect("disable Nagle on counting service upstream");
     let (Ok(mut client_read), Ok(mut server_write)) = (client.try_clone(), server.try_clone())
     else {
+        counters
+            .in_flight_connections
+            .fetch_sub(1, Ordering::Relaxed);
         return;
     };
     let (Ok(mut server_read), Ok(mut client_write)) = (server.try_clone(), client.try_clone())
     else {
+        counters
+            .in_flight_connections
+            .fetch_sub(1, Ordering::Relaxed);
         return;
     };
     let request_counters = counters.clone();
@@ -3541,6 +4241,17 @@ fn service_proxy_connection(
     let _ = request.join();
     let _ = response.join();
     let _ = client.shutdown(Shutdown::Both);
+    counters
+        .connection_timings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(RequestInterval {
+            start_ns: started_ns,
+            end_ns: origin.elapsed().as_nanos(),
+        });
+    counters
+        .in_flight_connections
+        .fetch_sub(1, Ordering::Relaxed);
 }
 
 fn pump_service(reader: &mut TcpStream, writer: &mut TcpStream, counter: &AtomicU64) {
@@ -3560,7 +4271,12 @@ fn pump_service(reader: &mut TcpStream, writer: &mut TcpStream, counter: &Atomic
     let _ = writer.shutdown(Shutdown::Write);
 }
 
-fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<ProxyCounters>) {
+fn proxy_connection(
+    client: TcpStream,
+    upstream: SocketAddr,
+    counters: Arc<ProxyCounters>,
+    origin: Instant,
+) {
     let Ok(server) = TcpStream::connect(upstream) else {
         return;
     };
@@ -3584,10 +4300,17 @@ fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<Proxy
             &mut server_write,
             &request_counters,
             &request_methods,
+            origin,
         )
     });
     let response = thread::spawn(move || {
-        pump_response(&mut server_read, &mut client_write, &counters, &methods)
+        pump_response(
+            &mut server_read,
+            &mut client_write,
+            &counters,
+            &methods,
+            origin,
+        )
     });
     let _ = request.join();
     let _ = response.join();
@@ -3598,7 +4321,8 @@ fn pump_request(
     reader: &mut TcpStream,
     writer: &mut TcpStream,
     counters: &ProxyCounters,
-    methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+    methods: &Arc<Mutex<VecDeque<PendingResponse>>>,
+    origin: Instant,
 ) {
     let mut buffer = vec![0_u8; CHUNK];
     let mut scanner = RequestScanner::default();
@@ -3612,7 +4336,7 @@ fn pump_request(
         counters
             .request_bytes
             .fetch_add(count as u64, Ordering::Relaxed);
-        scanner.scan(&buffer[..count], counters, methods);
+        scanner.scan(&buffer[..count], counters, methods, origin);
         if writer.write_all(&buffer[..count]).is_err() {
             break;
         }
@@ -3624,10 +4348,11 @@ fn pump_response(
     reader: &mut TcpStream,
     writer: &mut TcpStream,
     counters: &ProxyCounters,
-    methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+    methods: &Arc<Mutex<VecDeque<PendingResponse>>>,
+    origin: Instant,
 ) {
     let mut buffer = vec![0_u8; CHUNK];
-    let mut scanner = ResponseScanner::new(methods.clone());
+    let mut scanner = ResponseScanner::new(methods.clone(), origin);
     loop {
         let count = match reader.read(&mut buffer) {
             Ok(0) => break,
@@ -3643,6 +4368,7 @@ fn pump_response(
             break;
         }
     }
+    scanner.finish(counters);
     let _ = writer.shutdown(Shutdown::Write);
 }
 
@@ -3654,6 +4380,12 @@ enum HttpMethod {
     Post,
     Delete,
     Other,
+}
+
+#[derive(Clone, Copy)]
+struct PendingResponse {
+    method: HttpMethod,
+    start_ns: u128,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3682,7 +4414,8 @@ impl RequestScanner {
         &mut self,
         bytes: &[u8],
         counters: &ProxyCounters,
-        methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+        methods: &Arc<Mutex<VecDeque<PendingResponse>>>,
+        origin: Instant,
     ) {
         let mut offset = 0;
         while offset < bytes.len() {
@@ -3733,7 +4466,7 @@ impl RequestScanner {
                         self.line.extend_from_slice(&bytes[offset..end]);
                         let line = std::mem::take(&mut self.line);
                         let line = line.strip_suffix(b"\r").unwrap_or(&line);
-                        self.process_line(line, counters, methods);
+                        self.process_line(line, counters, methods, origin);
                         offset = end + 1;
                     } else {
                         self.line.extend_from_slice(&bytes[offset..]);
@@ -3752,16 +4485,21 @@ impl RequestScanner {
         &mut self,
         line: &[u8],
         counters: &ProxyCounters,
-        methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+        methods: &Arc<Mutex<VecDeque<PendingResponse>>>,
+        origin: Instant,
     ) {
         match self.state {
             ScanState::RequestLine => {
                 if let Some(method) = count_request_line(line, counters) {
                     self.method = Some(method);
+                    counters.in_flight_requests.fetch_add(1, Ordering::Relaxed);
                     methods
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push_back(method);
+                        .push_back(PendingResponse {
+                            method,
+                            start_ns: origin.elapsed().as_nanos(),
+                        });
                 } else {
                     self.method = None;
                 }
@@ -3861,11 +4599,13 @@ struct ResponseScanner {
     chunked: bool,
     status: Option<u16>,
     method: Option<HttpMethod>,
-    methods: Arc<Mutex<VecDeque<HttpMethod>>>,
+    pending: Option<PendingResponse>,
+    methods: Arc<Mutex<VecDeque<PendingResponse>>>,
+    origin: Instant,
 }
 
 impl ResponseScanner {
-    fn new(methods: Arc<Mutex<VecDeque<HttpMethod>>>) -> Self {
+    fn new(methods: Arc<Mutex<VecDeque<PendingResponse>>>, origin: Instant) -> Self {
         Self {
             state: ResponseState::StatusLine,
             line: Vec::new(),
@@ -3873,7 +4613,9 @@ impl ResponseScanner {
             chunked: false,
             status: None,
             method: None,
+            pending: None,
             methods,
+            origin,
         }
     }
 
@@ -3887,7 +4629,7 @@ impl ResponseScanner {
                     offset += count;
                     if count as u64 == remaining {
                         self.state = if matches!(self.state, ResponseState::Body(_)) {
-                            self.reset_response();
+                            self.reset_response(counters);
                             ResponseState::StatusLine
                         } else {
                             ResponseState::ChunkCrlf(2)
@@ -3929,7 +4671,7 @@ impl ResponseScanner {
                         self.line.extend_from_slice(&bytes[offset..end]);
                         let line = std::mem::take(&mut self.line);
                         let line = line.strip_suffix(b"\r").unwrap_or(&line);
-                        self.process_line(line);
+                        self.process_line(line, counters);
                         offset = end + 1;
                     } else {
                         self.line.extend_from_slice(&bytes[offset..]);
@@ -3944,18 +4686,19 @@ impl ResponseScanner {
         }
     }
 
-    fn process_line(&mut self, line: &[u8]) {
+    fn process_line(&mut self, line: &[u8], counters: &ProxyCounters) {
         match self.state {
             ResponseState::StatusLine => {
                 if let Some(status) = parse_response_status(line)
                     && status >= 200
                 {
                     self.status = Some(status);
-                    self.method = self
+                    self.pending = self
                         .methods
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .pop_front();
+                    self.method = self.pending.map(|pending| pending.method);
                 }
                 self.content_length = None;
                 self.chunked = false;
@@ -3968,13 +4711,13 @@ impl ResponseScanner {
                     || status == 304
                     || self.method == Some(HttpMethod::Head);
                 self.state = if body_forbidden {
-                    self.reset_response();
+                    self.reset_response(counters);
                     ResponseState::StatusLine
                 } else if self.chunked {
                     ResponseState::ChunkSize
                 } else if let Some(length) = self.content_length {
                     if length == 0 {
-                        self.reset_response();
+                        self.reset_response(counters);
                         ResponseState::StatusLine
                     } else {
                         ResponseState::Body(length)
@@ -4004,7 +4747,7 @@ impl ResponseScanner {
                 };
             }
             ResponseState::Trailers if line.is_empty() => {
-                self.reset_response();
+                self.reset_response(counters);
                 self.state = ResponseState::StatusLine;
             }
             ResponseState::Trailers => {}
@@ -4025,7 +4768,27 @@ impl ResponseScanner {
         }
     }
 
-    fn reset_response(&mut self) {
+    fn finish(&mut self, counters: &ProxyCounters) {
+        self.finish_pending(counters);
+    }
+
+    fn finish_pending(&mut self, counters: &ProxyCounters) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        counters
+            .request_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(RequestInterval {
+                start_ns: pending.start_ns,
+                end_ns: self.origin.elapsed().as_nanos(),
+            });
+        counters.in_flight_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn reset_response(&mut self, counters: &ProxyCounters) {
+        self.finish_pending(counters);
         self.status = None;
         self.method = None;
         self.content_length = None;
