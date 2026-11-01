@@ -191,7 +191,7 @@ fn evict_one(
     } else {
         values.remove(&reference)
     };
-    if let Some(removed) = removed {
+    if removed.is_some() {
         *charged = charged.saturating_sub(length);
         true
     } else {

@@ -24,12 +24,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
 use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
 
-#[derive(Debug)]
 enum NodeState {
     Writable(Mutex<FileHandle>),
     ReadOnly(FileVersion),
 }
-#[derive(Debug)]
 struct Node {
     state: NodeState,
     references: AtomicUsize,
@@ -269,13 +267,13 @@ impl Mount {
                 }
             };
             if let Some(node) = existing {
-                let NodeState::ReadOnly(version) = &node.state else {
-                    unreachable!("the existing node variant was checked above");
+                let version = match &node.state {
+                    NodeState::ReadOnly(version) => version.clone(),
+                    NodeState::Writable(_) => {
+                        unreachable!("the existing node variant was checked above")
+                    }
                 };
-                return Ok(MountReadOnlyFile {
-                    node,
-                    version: version.clone(),
-                });
+                return Ok(MountReadOnlyFile { node, version });
             }
             let (ready, waiting) = gate.expect("a waiter or owner always carries the node gate");
             if waiting {
@@ -307,13 +305,13 @@ impl Mount {
                 node.references.fetch_add(1, Ordering::Relaxed);
             }
             drop(gate);
-            let NodeState::ReadOnly(version) = &node.state else {
-                unreachable!("the created node is a read-only observation");
+            let version = match &node.state {
+                NodeState::ReadOnly(version) => version.clone(),
+                NodeState::Writable(_) => {
+                    unreachable!("the created node is a read-only observation")
+                }
             };
-            return Ok(MountReadOnlyFile {
-                node,
-                version: version.clone(),
-            });
+            return Ok(MountReadOnlyFile { node, version });
         }
     }
     /// Return the currently pinned read-only observation for path metadata.
@@ -453,7 +451,6 @@ pub struct MountFile {
 /// A read-only reference to one authenticated pinned file version. Dropping it
 /// performs no I/O; the caller reclaims the observation when the last kernel
 /// handle is released.
-#[derive(Debug)]
 pub struct MountReadOnlyFile {
     node: Arc<Node>,
     version: FileVersion,
