@@ -1023,7 +1023,6 @@ fn explicit_expiry_case(publication: Publication) {
     )
     .unwrap();
     fixture.sync_run_ok(&backup_source);
-    let backup_baseline = fixture.remote_file_version("protected.txt").2;
     let backup = fixture.path("expiry-backup");
     fixture.yy_ok(&[
         "--volume",
@@ -1033,6 +1032,25 @@ fn explicit_expiry_case(publication: Publication) {
         "--output",
         text(&backup),
     ]);
+    let restored = fixture.sync_paths("expiry-backup-restore");
+    let moved_source_root = fixture.path("expiry-backup-source-root-moved");
+    fs::rename(&backup_source.directory, &moved_source_root).unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&restored.config),
+        "sync",
+        "restore",
+        "--backup",
+        text(&backup),
+        "--directory",
+        text(&restored.directory),
+    ]);
+    let restored_plan = retention_plan(&fixture, &restored.config, 1, &[], None);
+    let backup_baseline_text =
+        restored_plan["protection"]["staging"]["replica"]["baseline"]["revision"]
+            .as_str()
+            .expect("restored replica baseline revision")
+            .to_owned();
 
     let staging = fixture.path("expiry-staging");
     let config = fixture.path("expiry.json");
@@ -1082,11 +1100,10 @@ fn explicit_expiry_case(publication: Publication) {
     ]);
 
     let zero_text = revision_text(zero.cursor.revision);
-    let backup_baseline_text = revision_text(backup_baseline);
     let before_backup_refusal = fixture.remote_file_version("protected.txt").2;
     let backup_refusal = fixture.yy(&[
         "--volume",
-        text(&config),
+        text(&restored.config),
         "space",
         "retention",
         "expire",
@@ -1111,9 +1128,11 @@ fn explicit_expiry_case(publication: Publication) {
         backup_refusal["revisions"][0]["reasons"]
             .as_array()
             .is_some_and(|reasons| {
-                reasons
-                    .iter()
-                    .any(|reason| reason == "backup_replica_baseline")
+                reasons.iter().any(|reason| {
+                    reason
+                        .as_str()
+                        .is_some_and(|reason| reason.ends_with("replica_baseline"))
+                })
             })
     );
     assert_eq!(
