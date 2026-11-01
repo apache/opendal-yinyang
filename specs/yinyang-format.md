@@ -37,7 +37,13 @@ It loads only the snapshot descriptor, not the namespace. `Snapshot` provides
 identity lookup, path resolution, directory pagination, prepared published
 content, indexed receipt lookup, and ordered changes. `observe_revision` uses
 the retained-snapshot index. There is no listing-based discovery, implicit
-latest-cache substitution, expiry, garbage collection, or history replay.
+latest-cache substitution, automatic expiry, garbage collection, or history
+replay. An explicitly invoked maintenance operation may mark a retained
+revision expired without deleting it. `observe_revision` then returns
+`Expired` with the revision identity; a missing history identity remains
+`NotFound`. The detailed history API exposes `Readable` and `Expired(marker)`
+states, while the retained-identity page continues to enumerate every history
+identity.
 Revision tokens round-trip through 24-byte representations for persistence
 across process restarts. Decoding a token does not establish its validity:
 historical lookup checks membership in this filesystem's retained lineage.
@@ -126,13 +132,19 @@ Physical references never enter logical content identities or request digests.
   nonce and advances the sequence; a revision is not a count of transactions.
   Comparison is lexicographic over sequence and nonce. Index keys use
   big-endian sequence followed by nonce.
-- Head: `(YYHEAD02:[u8;8], mode:u8=0, filesystem:[u8;16], root:[u8;16],
+- Head: `(YYHEAD02:[u8;8], mode:u8, filesystem:[u8;16], root:[u8;16],
   revision:Revision, descriptor:Ref)`, followed by ordinary BLAKE3 of that tuple.
-  Maximum head size is 4 KiB. Unknown profiles/modes and legacy `YYHEAD01` are
-  rejected; creation never overwrites an existing unsupported head.
+  Mode 0 is the never-expired profile. Mode 1 is the one-way expiry-enabled
+  profile. Maximum head size is 4 KiB. Unknown profiles/modes and legacy
+  `YYHEAD01` are rejected; creation never overwrites an existing unsupported
+  head.
 - Descriptor: `(YYSNAP02:[u8;8], filesystem:[u8;16], root:[u8;16],
   revision:Revision, roots:[Option<Ref>;5])`, at most 4 KiB. Root order is nodes,
-  directory entries, receipts, changes, retained snapshots.
+  directory entries, receipts, changes, retained snapshots. The expiry-enabled
+  descriptor is `(YYSNAP03, filesystem, root, revision,
+  roots:[Option<Ref>;6])` with expiry appended as the sixth root. A mode-0 head
+  accepts only `YYSNAP02`; a mode-1 head accepts only `YYSNAP03`. Retained
+  descriptors may use either profile because history can cross the transition.
 - Node: `(id:[u8;16], generation:u64, executable:bool,
   link:Option<(parent:[u8;16],name:String)>, membership:u64,
   content:Option<Vec<u8>>)`. Directories have positive membership and no
@@ -148,6 +160,13 @@ Physical references never enter logical content identities or request digests.
   Reads are bounded by their pinned snapshot's change root.
 - Retained-snapshot value: a Ref keyed by prior revision index bytes. A
   successor records its predecessor descriptor; descriptors never hash themselves.
+- Expiry index key: `(tag:u8=0, revision:Revision)` for an expired revision, or
+  `(tag:u8=1, operation_id:[u8;16])` for a committed operation record.
+- Expiry value: `(YYEXP01:[u8;7], operation_id:[u8;16],
+  request_digest:[u8;32], evidence_digest:[u8;32], before:Revision,
+  after:Revision)`. A revision marker and its operation record must agree
+  exactly. `after` is the maintenance revision; the original snapshot Ref
+  remains in the history index and expiry never removes it.
 
 Every index is an immutable copy-on-write B+ tree with inclusive maximum-key
 separators. A page is `(YYINDEX2:[u8;8],level:u8,
@@ -201,31 +220,36 @@ no mutations, the request digest is
 
 ## Compatibility and admission
 
-The supported object profile is `YYHEAD02` mode 0 with root descriptor
-`YYSNAP02`, index pages `YYINDEX2`, content descriptors `YYFILE02`, and canonical
-requests `YYREQ002`. Frozen requests use `YYPLAN01`; node identities use the
-derive-key context `Apache OpenDAL YinYang node identity profile 2`.
+The supported object profile includes `YYHEAD02` mode 0 with root descriptor
+`YYSNAP02`, and mode 1 with `YYSNAP03` and the `YYEXP01` expiry record. Both
+profiles use `YYINDEX2` pages, `YYFILE02` content, and canonical requests
+`YYREQ002`. Frozen requests use `YYPLAN01`; node identities use the derive-key
+context `Apache OpenDAL YinYang node identity profile 2`.
 
-Readers reject `YYHEAD01`, `YYSERV01`, unknown head modes, and unknown snapshot,
-index, content, or plan identifiers with `Unsupported`. Head creation and
-replacement do not begin when an existing head is an unsupported profile.
-Malformed encodings carrying a supported identifier are `Corrupt` or `Invalid`.
-The object binding never opens a service authority, and the service binding never
-falls back to object publication.
+Readers reject `YYHEAD01`, `YYSERV01`, unknown head modes, unknown snapshot or
+expiry profiles, and unknown index, content, or plan identifiers with
+`Unsupported`. Head creation and replacement do not begin when an existing head
+is an unsupported profile. Malformed encodings carrying a supported identifier
+are `Corrupt` or `Invalid`. The object binding never opens a service authority,
+and the service binding never falls back to object publication.
 
 There is no in-place upgrade from `YYHEAD01`, automatic downgrade from this
-profile, or mixed old/new writer. A retained snapshot or receipt remains
-readable only while its head, descriptor, index, and content profiles are all in
-the supported matrix. See [Compatibility](compatibility.md) for the complete
-matrix and transition limits.
+profile, or mixed old/new writer. Mode 0 remains compatible until the first
+explicit expiry. That first expiry atomically publishes mode 1 and cannot be
+downgraded. Older readers reject mode 1 before opening or publishing. A
+retained snapshot or receipt remains readable according to its explicit
+history state only while its head, descriptor, index, and content profiles are
+all in the supported matrix. See [Compatibility](compatibility.md) for the
+complete matrix and transition limits.
 
 ## Verification and remaining limits
 
 Tests cover deterministic CAS races, logical conflicts, delayed/lost responses,
 batch ordering, pinned pagination/history, immutable preparation, range
-corruption, B+ tree splits/merges and lookup depth. Fixed-edit regression tests
-increase namespace and receipt counts while bounding bytes and requests; they
-are cost checks, not throughput benchmarks. A real MinIO test exercises
+corruption, B+ tree splits/merges, lookup depth, exact expiry replay, expired
+versus never-existing history, and profile admission. Fixed-edit regression
+tests increase namespace and receipt counts while bounding bytes and requests;
+they are cost checks, not throughput benchmarks. A real MinIO test exercises
 multipart preparation, range updates, publication, retries and reopen.
 
 There is no remote preparation-evidence protocol or general release support.

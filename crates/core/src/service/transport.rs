@@ -44,6 +44,8 @@ enum Command {
     PrepareOverwrite([u8; 24], [u8; 16], Vec<(u64, u64, Vec<u8>)>),
     PrepareUpdate([u8; 24], [u8; 16], u64, u64, Vec<(u64, u64, Vec<u8>)>),
     History(Option<[u8; 24]>, u32),
+    Expire(Vec<u8>),
+    HistoryStates(Option<[u8; 24]>, u32),
 }
 #[derive(BorshSerialize, BorshDeserialize)]
 enum Response {
@@ -55,6 +57,9 @@ enum Response {
     Error(u8, String),
     Prepared(Vec<u8>),
     Revisions(Vec<[u8; 24]>, Option<[u8; 24]>),
+    Expiry(Vec<u8>),
+    RevisionStates(Vec<([u8; 24], u8, Vec<u8>)>, Option<[u8; 24]>),
+    Expired([u8; 24], String),
 }
 fn io(e: std::io::Error) -> Error {
     Error::from_io("metadata RPC", e)
@@ -76,6 +81,7 @@ fn kind_tag(kind: ErrorKind) -> u8 {
         ErrorKind::IsDirectory => 9,
         ErrorKind::NotEmpty => 10,
         ErrorKind::PermissionDenied => 11,
+        ErrorKind::Expired => 12,
     }
 }
 fn tag_kind(tag: u8) -> Result<ErrorKind> {
@@ -92,6 +98,7 @@ fn tag_kind(tag: u8) -> Result<ErrorKind> {
         9 => ErrorKind::IsDirectory,
         10 => ErrorKind::NotEmpty,
         11 => ErrorKind::PermissionDenied,
+        12 => ErrorKind::Expired,
         _ => return Err(protocol()),
     })
 }
@@ -114,6 +121,7 @@ mod error_tests {
             ErrorKind::IsDirectory,
             ErrorKind::NotEmpty,
             ErrorKind::PermissionDenied,
+            ErrorKind::Expired,
         ];
         for (tag, kind) in kinds.into_iter().enumerate() {
             assert_eq!(kind_tag(kind), tag as u8);
@@ -135,6 +143,11 @@ mod error_tests {
             6
         );
         assert_eq!(borsh::to_vec(&Command::History(None, 1)).unwrap()[0], 7);
+        assert_eq!(borsh::to_vec(&Command::Expire(vec![])).unwrap()[0], 8);
+        assert_eq!(
+            borsh::to_vec(&Command::HistoryStates(None, 1)).unwrap()[0],
+            9
+        );
         assert_eq!(
             borsh::to_vec(&Response::Error(0, String::new())).unwrap()[0],
             5
@@ -143,6 +156,15 @@ mod error_tests {
         assert_eq!(
             borsh::to_vec(&Response::Revisions(vec![], None)).unwrap()[0],
             7
+        );
+        assert_eq!(borsh::to_vec(&Response::Expiry(vec![])).unwrap()[0], 8);
+        assert_eq!(
+            borsh::to_vec(&Response::RevisionStates(vec![], None)).unwrap()[0],
+            9
+        );
+        assert_eq!(
+            borsh::to_vec(&Response::Expired([0; 24], String::new())).unwrap()[0],
+            10
         );
     }
 }
@@ -221,9 +243,24 @@ pub async fn serve(listener: TcpListener, service: MetadataService, token: Strin
                         "invalid protocol or authentication",
                     )),
                 };
-                let response = response.unwrap_or_else(|e| {
-                    Response::Error(kind_tag(e.kind()), e.message().to_owned())
-                });
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error)
+                        if error.kind() == ErrorKind::Expired
+                            && error.expired_revision().is_some() =>
+                    {
+                        Response::Expired(
+                            error
+                                .expired_revision()
+                                .expect("checked expired identity")
+                                .to_bytes(),
+                            error.message().to_owned(),
+                        )
+                    }
+                    Err(error) => {
+                        Response::Error(kind_tag(error.kind()), error.message().to_owned())
+                    }
+                };
                 write_frame(&mut stream, &response).await
             })
             .await;
@@ -248,7 +285,7 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 return Err(protocol());
             }
             let snapshot = service
-                .observe_revision(Revision::from_bytes(revision))
+                .retained_snapshot(Revision::from_bytes(revision))
                 .await?;
             Response::Value(snapshot.reader.get(table(tag)?, &key).await?)
         }
@@ -262,7 +299,7 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 return Err(protocol());
             }
             let snapshot = service
-                .observe_revision(Revision::from_bytes(revision))
+                .retained_snapshot(Revision::from_bytes(revision))
                 .await?;
             Response::Rows(
                 snapshot
@@ -343,17 +380,38 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 page.next.map(Revision::to_bytes),
             )
         }
+        Command::Expire(bytes) => {
+            let request = ExpiryRequest::from_bytes(&bytes)?;
+            Response::Expiry(service.expire_revisions(&request).await?.encode()?)
+        }
+        Command::HistoryStates(after, limit) => {
+            if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+                return Err(protocol());
+            }
+            let page = service
+                .history_page(after.map(Revision::from_bytes), limit)
+                .await?;
+            let entries = page
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    Ok(match entry.state {
+                        RevisionState::Readable => (entry.revision.to_bytes(), 0, vec![]),
+                        RevisionState::Expired(marker) => {
+                            (entry.revision.to_bytes(), 1, marker.encode()?)
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Response::RevisionStates(entries, page.next.map(Revision::to_bytes))
+        }
         Command::Commit(plans) => {
             if plans.len() > 4096 {
                 return Err(protocol());
             }
-            let mut requests = Vec::new();
-            for plan in plans {
-                requests.push(service.restore_transaction(&plan).await?);
-            }
             Response::Outcomes(
                 service
-                    .commit_batch(&requests)
+                    .commit_encoded(&plans)
                     .await?
                     .into_iter()
                     .map(|outcome| {
@@ -403,6 +461,11 @@ async fn rpc(addr: SocketAddr, token: &str, command: Command) -> Result<Response
             Response::Error(tag, message) => {
                 Err(Error::new(tag_kind(tag)?, "metadata service", message))
             }
+            Response::Expired(revision, message) => Err(Error::expired(
+                "metadata service",
+                Revision::from_bytes(revision),
+                message,
+            )),
             response => Ok(response),
         }
     })
@@ -517,6 +580,73 @@ impl ServiceClient {
             return Err(protocol());
         }
         Ok(RevisionPage { revisions, next })
+    }
+    pub async fn history_page(&self, after: Option<Revision>, limit: u32) -> Result<HistoryPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(protocol());
+        }
+        let Response::RevisionStates(entries, next) = rpc(
+            self.addr,
+            &self.token,
+            Command::HistoryStates(after.map(Revision::to_bytes), limit),
+        )
+        .await?
+        else {
+            return Err(protocol());
+        };
+        if entries.len() > limit as usize {
+            return Err(protocol());
+        }
+        let entries = entries
+            .into_iter()
+            .map(|(revision, state, marker)| {
+                let revision = Revision::from_bytes(revision);
+                let state = match (state, marker.is_empty()) {
+                    (0, true) => RevisionState::Readable,
+                    (1, false) => RevisionState::Expired(ExpiryMarker::decode(&marker)?),
+                    _ => return Err(protocol()),
+                };
+                Ok(HistoryEntry { revision, state })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let page = HistoryPage {
+            entries,
+            next: next.map(Revision::from_bytes),
+        };
+        page.validate()?;
+        Ok(page)
+    }
+    pub async fn expire_revisions(&self, request: &ExpiryRequest) -> Result<ExpiryOutcome> {
+        request.validate_volume(self.filesystem)?;
+        let request_digest = request.digest()?;
+        let response = match rpc(self.addr, &self.token, Command::Expire(request.to_bytes()?)).await
+        {
+            Ok(response) => response,
+            Err(error) if matches!(error.kind(), ErrorKind::Io | ErrorKind::Storage) => {
+                return Ok(ExpiryOutcome::Unknown(request.id()));
+            }
+            Err(error) => return Err(error),
+        };
+        let Response::Expiry(bytes) = response else {
+            return Err(protocol());
+        };
+        let outcome = ExpiryOutcome::decode(&bytes)?;
+        if let ExpiryOutcome::Committed(receipt) = &outcome {
+            receipt.validate()?;
+            if receipt.id != request.id()
+                || receipt.request_digest != request_digest
+                || receipt.evidence_digest != request.evidence_digest()
+                || receipt.before != request.expected_latest()
+                || receipt.expired.as_slice() != request.candidates()
+            {
+                return Err(protocol());
+            }
+        }
+        match &outcome {
+            ExpiryOutcome::Unknown(id) if *id != request.id() => return Err(protocol()),
+            _ => {}
+        }
+        Ok(outcome)
     }
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
         let content = self.data.prepare(source).await?;

@@ -18,7 +18,9 @@
 mod support;
 use std::sync::Arc;
 use support::*;
-use yinyang_core::{Authority, CommitId, ContentEdit, ErrorKind, NodeId};
+use yinyang_core::{
+    Authority, CommitId, ContentEdit, ErrorKind, ExpiryId, ExpiryOutcome, ExpiryRequest, NodeId,
+};
 
 use yinyang_core::namespace::NodeKind as IndexedKind;
 use yinyang_core::object::{BackendProfile, ObjectFs, Outcome};
@@ -801,6 +803,106 @@ async fn indexed_prepared_commit_does_not_read_data_and_reopen_retains_history()
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn object_expiry_lost_ack_is_resolved_and_replay_is_exact() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let initial = fs.observe_latest().await.unwrap().revision();
+    let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    plan.create_directory(fs.root(), "one").await.unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+    let latest = fs.observe_latest().await.unwrap().revision();
+    let request = ExpiryRequest::new(
+        fs.filesystem(),
+        ExpiryId::generate(),
+        latest,
+        vec![initial],
+        Vec::new(),
+        [1; 32],
+    )
+    .unwrap();
+
+    backend.fail_next_head_write_after_success();
+    let ExpiryOutcome::Committed(first) = fs.expire_revisions(&request).await.unwrap() else {
+        panic!("ack loss after a durable head write still resolves to committed");
+    };
+    assert_eq!(
+        Authority::expire_revisions(&fs, &request).await.unwrap(),
+        ExpiryOutcome::Committed(first)
+    );
+
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let initial = fs.observe_latest().await.unwrap().revision();
+    let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    plan.create_directory(fs.root(), "two").await.unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+    let latest = fs.observe_latest().await.unwrap().revision();
+    let request = ExpiryRequest::new(
+        fs.filesystem(),
+        ExpiryId::generate(),
+        latest,
+        vec![initial],
+        Vec::new(),
+        [2; 32],
+    )
+    .unwrap();
+    backend.lose_next_head_response_and_go_offline();
+    assert_eq!(
+        fs.expire_revisions(&request).await.unwrap(),
+        ExpiryOutcome::Unknown(request.id())
+    );
+    backend.state.lock().unwrap().offline = false;
+    assert!(matches!(
+        Authority::expire_revisions(&fs, &request).await.unwrap(),
+        ExpiryOutcome::Committed(_)
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_object_expiry_same_request_resolves_committed() {
+    let backend = TestBackend::default();
+    let first = object_fs(&backend).await;
+    let initial = first.observe_latest().await.unwrap().revision();
+    let mut plan = Planner::new(&first.observe_latest().await.unwrap(), CommitId::generate());
+    plan.create_directory(first.root(), "collision")
+        .await
+        .unwrap();
+    committed(first.commit(&plan.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        first.filesystem(),
+        ExpiryId::generate(),
+        first.observe_latest().await.unwrap().revision(),
+        vec![initial],
+        Vec::new(),
+        [3; 32],
+    )
+    .unwrap();
+    let second = object_fs(&backend).await;
+    let (left, right) = tokio::join!(
+        first.expire_revisions(&request),
+        second.expire_revisions(&request)
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert!(matches!(left, ExpiryOutcome::Committed(_)));
+    assert_eq!(left, right);
+
+    let different = ExpiryRequest::new(
+        first.filesystem(),
+        request.id(),
+        first.observe_latest().await.unwrap().revision(),
+        vec![initial],
+        Vec::new(),
+        [4; 32],
+    )
+    .unwrap();
+    assert_eq!(
+        first.expire_revisions(&different).await.unwrap_err().kind(),
+        ErrorKind::Invalid
     );
 }
 

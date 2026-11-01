@@ -1280,6 +1280,7 @@ fn core_errno(error: &yinyang_core::Error) -> fuser::Errno {
         ErrorKind::PermissionDenied => fuser::Errno::EACCES,
         ErrorKind::Invalid | ErrorKind::InvalidName => fuser::Errno::EINVAL,
         ErrorKind::Unsupported => fuser::Errno::ENOSYS,
+        ErrorKind::Expired => fuser::Errno::EIO,
         ErrorKind::Corrupt | ErrorKind::Storage | ErrorKind::Io => fuser::Errno::EIO,
     }
 }

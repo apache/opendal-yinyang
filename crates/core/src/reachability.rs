@@ -19,6 +19,7 @@
 
 use crate::authority::{Authority, RETAINED_REVISIONS_PAGE_MAX};
 use crate::data::{ContentDescriptor, ContentReferenceKind, DataStore, PackedRef, RefWire};
+use crate::expiry::{ExpiryMarker, parse_operation_key, parse_revision_key};
 use crate::index::{Index, IndexCache, MetadataVisitor};
 use crate::namespace::{DirectoryEntry, Node, NodeKind, decode};
 use crate::object::ObjectState;
@@ -37,6 +38,7 @@ enum ObjectTable {
     Receipts,
     Changes,
     History,
+    Expiry,
 }
 
 impl ObjectTable {
@@ -450,7 +452,7 @@ pub(crate) async fn inspect_object_state(
     let mut pending = VecDeque::new();
     let mut seen_descriptors = BTreeMap::new();
     let mut seen_roots = BTreeSet::new();
-    let mut seen_pages: [HashSet<PackedRef>; 5] = Default::default();
+    let mut seen_pages: [HashSet<PackedRef>; 6] = Default::default();
     let cache = IndexCache::default();
     let mut observed_snapshots = 0_u64;
     seen_descriptors.insert(state.reference().clone(), state.revision());
@@ -464,6 +466,7 @@ pub(crate) async fn inspect_object_state(
             (ObjectTable::Receipts, state.receipts()),
             (ObjectTable::Changes, state.changes()),
             (ObjectTable::History, state.history()),
+            (ObjectTable::Expiry, state.expiry()),
         ],
         &mut inspection,
         &mut descriptors,
@@ -499,6 +502,7 @@ pub(crate) async fn inspect_object_state(
                         (ObjectTable::Receipts, retained.receipts()),
                         (ObjectTable::Changes, retained.changes()),
                         (ObjectTable::History, retained.history()),
+                        (ObjectTable::Expiry, retained.expiry()),
                     ],
                     &mut inspection,
                     &mut descriptors,
@@ -522,12 +526,12 @@ pub(crate) async fn inspect_object_state(
 
 async fn inspect_object_roots(
     state: &ObjectState,
-    roots: [(ObjectTable, &Index); 5],
+    roots: [(ObjectTable, &Index); 6],
     inspection: &mut PhysicalInspection,
     descriptors: &mut HashSet<ContentDescriptor>,
     pending: &mut VecDeque<(Revision, PackedRef)>,
     seen_roots: &mut BTreeSet<(ObjectTable, PackedRef)>,
-    seen_pages: &mut [HashSet<PackedRef>; 5],
+    seen_pages: &mut [HashSet<PackedRef>; 6],
     cache: &IndexCache,
 ) {
     for (table, index) in roots {
@@ -652,6 +656,44 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                     "invalid retained revision key",
                 )),
             },
+            ObjectTable::Expiry => ExpiryMarker::decode(bytes).and_then(|marker| {
+                if marker.after > self.revision {
+                    return Err(Error::corrupt(
+                        "inspect physical roots",
+                        "expiry marker was published after its containing snapshot",
+                    ));
+                }
+                match key.first() {
+                    Some(0) => {
+                        let revision = parse_revision_key(key)?;
+                        if revision >= self.revision
+                            || marker.before <= revision
+                            || marker.after <= revision
+                        {
+                            return Err(Error::corrupt(
+                                "inspect physical roots",
+                                "expiry marker disagrees with its revision key",
+                            ));
+                        }
+                    }
+                    Some(1) => {
+                        let operation = parse_operation_key(key)?;
+                        if operation != marker.operation_id {
+                            return Err(Error::corrupt(
+                                "inspect physical roots",
+                                "expiry operation key disagrees with its record",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::corrupt(
+                            "inspect physical roots",
+                            "unknown expiry metadata key",
+                        ));
+                    }
+                }
+                Ok(())
+            }),
         };
         if let Err(error) = result {
             self.inspection

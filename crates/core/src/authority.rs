@@ -19,8 +19,8 @@
 use crate::object::{ObjectFs, Outcome};
 use crate::reachability::PhysicalInspection;
 use crate::{
-    ContentEdit, DataStore, FileVersion, NodeId, PreparedContent, Result, Revision, Snapshot,
-    Transaction,
+    ContentEdit, DataStore, ExpiryOutcome, ExpiryRequest, FileVersion, HistoryPage, NodeId,
+    PreparedContent, Receipt, Result, Revision, Snapshot, Transaction,
 };
 use futures_util::future::BoxFuture;
 use std::collections::BTreeSet;
@@ -110,6 +110,18 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
             Ok(revisions)
         })
     }
+    /// List every history identity with its explicit readable or expired
+    /// projection. Backends without expiry remain readable by default.
+    fn history_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<HistoryPage>> {
+        Box::pin(async move {
+            let page = self.retained_revisions_page(after, limit).await?;
+            Ok(HistoryPage::readable(page.revisions, page.next))
+        })
+    }
     /// Traverse authenticated physical references reachable from this
     /// authority's observed metadata roots without reading leaf payloads.
     fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
@@ -119,6 +131,19 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
         &'a self,
         requests: &'a [Transaction],
     ) -> BoxFuture<'a, Result<Vec<Outcome>>>;
+    /// Explicitly expire retained histories under one authority-side CAS point.
+    /// Local evidence semantics and coordination remain owned by the caller.
+    fn expire_revisions<'a>(
+        &'a self,
+        _request: &'a ExpiryRequest,
+    ) -> BoxFuture<'a, Result<ExpiryOutcome>> {
+        Box::pin(async {
+            Err(crate::Error::unsupported(
+                "expire revisions",
+                "authority does not support logical history expiry",
+            ))
+        })
+    }
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.data().accept(content)?;
@@ -184,6 +209,28 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
                 .remove(0))
         })
     }
+    /// Resolve a committed frozen request from exact canonical bytes without
+    /// observing its base snapshot. A missing receipt remains unresolved.
+    fn resolve_receipt<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Option<Receipt>>> {
+        Box::pin(async move {
+            let identity = Transaction::inspect_replay_identity(bytes)?;
+            if identity.volume != self.filesystem() {
+                return Err(crate::Error::invalid(
+                    "resolve receipt",
+                    "request belongs to another volume",
+                ));
+            }
+            let latest = self.observe_latest().await?;
+            match latest.receipt(identity.id).await? {
+                Some(receipt) if receipt.request_digest == identity.digest => Ok(Some(receipt)),
+                Some(_) => Err(crate::Error::invalid(
+                    "resolve receipt",
+                    "commit identity was reused with a different request digest",
+                )),
+                None => Ok(None),
+            }
+        })
+    }
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(async move {
             let (revision, files) = Transaction::inspect(bytes)?;
@@ -219,6 +266,13 @@ impl Authority for ObjectFs {
     ) -> BoxFuture<'_, Result<RevisionPage>> {
         Box::pin(self.retained_revisions_page(after, limit))
     }
+    fn history_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<HistoryPage>> {
+        Box::pin(self.history_page(after, limit))
+    }
     fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
         Box::pin(async move {
             match self.observe_state().await {
@@ -238,6 +292,12 @@ impl Authority for ObjectFs {
         requests: &'a [Transaction],
     ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
         Box::pin(self.commit_batch(requests))
+    }
+    fn expire_revisions<'a>(
+        &'a self,
+        request: &'a ExpiryRequest,
+    ) -> BoxFuture<'a, Result<ExpiryOutcome>> {
+        Box::pin(self.expire_revisions(request))
     }
 }
 impl Authority for crate::service::MetadataService {
@@ -263,11 +323,24 @@ impl Authority for crate::service::MetadataService {
     ) -> BoxFuture<'_, Result<RevisionPage>> {
         Box::pin(self.retained_revisions_page(after, limit))
     }
+    fn history_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<HistoryPage>> {
+        Box::pin(self.history_page(after, limit))
+    }
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
     ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
         Box::pin(self.commit_batch(requests))
+    }
+    fn expire_revisions<'a>(
+        &'a self,
+        request: &'a ExpiryRequest,
+    ) -> BoxFuture<'a, Result<ExpiryOutcome>> {
+        Box::pin(self.expire_revisions(request))
     }
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.remember(content))
@@ -315,11 +388,24 @@ impl Authority for crate::service::ServiceClient {
     ) -> BoxFuture<'_, Result<RevisionPage>> {
         Box::pin(self.retained_revisions_page(after, limit))
     }
+    fn history_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<HistoryPage>> {
+        Box::pin(self.history_page(after, limit))
+    }
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
     ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
         Box::pin(self.commit_batch(requests))
+    }
+    fn expire_revisions<'a>(
+        &'a self,
+        request: &'a ExpiryRequest,
+    ) -> BoxFuture<'a, Result<ExpiryOutcome>> {
+        Box::pin(self.expire_revisions(request))
     }
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.register(content))

@@ -13,19 +13,24 @@ publication. Its filesystem must honor SQLite locking and synchronization;
 network-mounted database files are unsupported. Keep the database and its WAL
 together; copying only the live main database is not a backup procedure.
 
-The schema profile is `yinyang-sqlite-1`. The authority row retains filesystem
-and root identities plus the latest revision. Indexed valid-time records retain
-nodes, entries, receipts, and ordered changes. Each record has an inclusive
-start and exclusive end sequence. Revision tokens are retained separately and
-validated before reads. History is application data, not an expiring database
-MVCC window. There is no history deletion or garbage collection.
+The schema profile is `yinyang-sqlite-1` until the first explicit history
+expiry. That operation atomically adds the exact
+`expiry(key BLOB PRIMARY KEY, record BLOB NOT NULL)` table and advances the
+profile to `yinyang-sqlite-2`. The authority row retains filesystem and root
+identities plus the latest revision. Indexed valid-time records retain nodes,
+entries, receipts, and ordered changes. Each record has an inclusive start and
+exclusive end sequence. Revision tokens are retained separately and validated
+before reads. History is application data, not an expiring database MVCC
+window. Logical expiry records visibility; it does not delete history or
+garbage-collect metadata.
 
 Before changing the SQLite journal mode or creating tables, opening checks the
-schema profile, the retained `authority` manifest, the required tables, and the
-column order used by writes. An unknown profile returns `Unsupported`; a
-supported identifier with an incompatible schema or manifest returns `Corrupt`.
-Neither path modifies the database. This admission is a format check, not a scan
-of all historical records.
+schema profile, the retained `authority` manifest, the profile-specific required
+tables, and the column order used by writes. An unknown profile returns
+`Unsupported`; a supported identifier with an incompatible schema or manifest
+returns `Corrupt`. Profile 1 must not contain an expiry table; profile 2 must
+contain its exact columns. Neither path modifies the database. This admission
+is a format check, not a scan of all historical records.
 
 Writers serialize at the database boundary, but revalidate original logical
 predicates through the same transaction evaluator as object publication.
@@ -55,7 +60,34 @@ strict token order. A page is limited to 256 revisions and uses the last
 returned revision as its exclusive continuation. Embedded inspection opens the
 existing SQLite database read-only with `query_only` enabled; it does not
 migrate, recover, take the writer transaction, or infer retained revisions from
-content packs. `ServiceClient` exposes the same bounded page contract.
+content packs. The detailed history page adds `Readable` or
+`Expired(YYEXP01 marker)` state per identity. `ServiceClient` exposes both
+bounded page contracts. Profile 1 answers the detailed page without querying an
+expiry table. Profile 2 exposes expired revisions separately and never maps
+them to absent history.
+
+`Authority::expire_revisions` accepts a bounded request containing the volume,
+operation identity, expected latest revision, candidate revisions, protected
+revision IDs, and an opaque evidence digest. It first resolves an existing
+operation ID and exact digest, then checks the expected latest revision,
+candidate existence, current-revision exclusion, protection intersection, and
+protected revision state. The first successful operation changes the schema
+profile inside the same `BEGIN IMMEDIATE` transaction that inserts all expiry
+records, the maintenance revision, and the new latest token.
+
+The authenticated `Get` and `Scan` commands for an already-issued lazy
+`Snapshot` use the retained record reader and do not re-run the fresh
+`observe_revision` expiry guard. A fresh `Observe(specific revision)` remains
+strict and returns `Expired`; this preserves the same held-observation
+semantics as object and embedded-service snapshots without a reader registry or
+an extra RPC.
+
+`Command::Commit` keeps the normal restore-before-publish path. Only when a
+frozen plan names an expired base does the server validate the complete
+canonical plan and resolve its original receipt locally. Already committed
+receipts retain their original cursor, while a missing receipt remains an
+expiry error; mixed batches retain input outcome order and do not call an extra
+resolver RPC on ordinary successful commits.
 
 In-process preparation carries trusted `DataStore` evidence and records
 readiness durably. A client uploads through OpenDAL, then registers its content
@@ -120,14 +152,15 @@ length followed by Borsh, bounded to 16 MiB. Request fields are protocol version
 1, token string, and a tagged command. Commands observe latest/specific
 revision, read/scan records at a revision, register content, prepare same-length
 or length-changing trusted updates from an exact published revision and NodeId,
-enumerate retained revisions, or commit frozen requests. Responses carry
-observations, records, readiness, prepared descriptors, typed outcomes,
-bounded revision pages, or typed errors. Maximum commit batch size, overwrite
-edit count, update edit count, and update generated-unit count are 4096; scans
-request at most 4097 records; history requests return at most 256 revisions.
-The server handles at most 32 active connections, each with a 60-second
-timeout. This wire profile is experimental and is not a stable interoperability
-promise.
+enumerate retained or detailed history, explicitly expire revisions, or commit
+frozen requests. Responses carry observations, records, readiness, prepared
+descriptors, typed outcomes, bounded history pages, expiry outcomes, or typed
+errors. Maximum commit batch size, overwrite edit count, update edit count, and
+update generated-unit count are 4096; expiry candidate and protected sets are
+each limited to 4096; scans request at most 4097 records; history requests
+return at most 256 revisions. The server handles at most 32 active connections,
+each with a 60-second timeout. This wire profile is experimental and is not a
+stable interoperability promise.
 
 Protocol version 1 is the only supported request version. The server checks the
 token first, then returns `Unsupported` for a validly authenticated unknown
@@ -136,18 +169,20 @@ servers that implement different versions fail explicitly rather than
 negotiating down or sharing an authority.
 
 New command and response variants are appended to the version 1 tagged enums so
-existing variant tags do not change. The retained-history command and response
-follow the overwrite and update variants. Older servers do not understand the
-appended overwrite, update, or history commands and therefore require a
-matching server binary for these paths. Existing
-register/observe/read/scan/commit traffic retains its prior encoding.
+existing variant tags do not change. The retained-history, detailed-history,
+and expiry commands follow the existing history variant. Older servers do not
+understand appended commands and therefore require a matching server binary
+for these paths. Existing register/observe/read/scan/commit traffic retains its
+prior encoding.
 
 Error responses retain the existing tag order: Invalid=0, Corrupt=1,
 NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional
 domain tags are InvalidName=7, NotDirectory=8, IsDirectory=9, NotEmpty=10 and
-PermissionDenied=11. Diagnostics remain strings. Clients reject unknown tags;
-deploy matching client/server versions for these new categories. This extends
-error reporting, not the persisted metadata or transaction encoding.
+PermissionDenied=11. Expired=12 is appended and carries the exact revision
+identity. Diagnostics remain strings for the other categories. Clients reject
+unknown tags; pre-expiry clients therefore fail closed rather than report
+`NotFound`. Deploy matching client/server versions for these categories. This
+extends error reporting without changing existing tags.
 
 ## Failure and recovery
 
@@ -157,6 +192,13 @@ lost/timeout transport responses return `Unknown(commit_id)`. A timeout does
 not cancel or prove rollback of an in-flight durable transaction. Resolve via
 a retained receipt or retry the exact frozen request. Absent receipt is not
 proof that a delayed request cannot still commit.
+
+Expiry uses the same recovery boundary. Its operation identity and canonical
+request digest are resolved before checking a stale `expected_latest`. A
+successful marker set is therefore discoverable after a lost acknowledgement;
+the same request returns the original expiry receipt, while the same ID with a
+different digest is invalid without writes. A missing operation record remains
+`Unknown` for exact retry and does not mean that the operation failed.
 
 Duplicate identity/digest returns the original receipt. Identity reused with a
 different digest is invalid. Reopening the same database retains receipts,
@@ -175,8 +217,10 @@ service database and content marker must be restored together. See
 Shared integration tests run the same predicate and snapshot suite against
 object publication, embedded service, and authenticated RPC. Fault injection
 covers dropped and delayed acknowledgements, independent database connections,
-content-readiness rejection, omitted predicates, and restart. The S3 daemon
-test kills and restarts the real process against durable MinIO content.
+content-readiness rejection, omitted predicates, restart, exact expiry replay,
+expired versus never-existing revisions, and base-profile preservation before
+the first expiry. The S3 daemon test kills and restarts the real process
+against durable MinIO content.
 
 SQLite indexes provide incremental record access, but historical query cost
 depends on retained versions and query ranges; this profile does not promise
@@ -186,11 +230,14 @@ migration support.
 
 ## Compatibility
 
-The supported service profiles are `yinyang-sqlite-1`, `YYSERV01`, `YYPLAN01`,
-the shared `YYFILE02`/`YYHASH02` content profile, and loopback RPC version 1.
-There is no automatic schema upgrade or downgrade, no object-authority fallback,
-and no cross-profile read of local preparation evidence. A same-profile process
-restart retains published history, receipts, frozen requests, and readiness.
+The supported service profiles are `yinyang-sqlite-1`,
+`yinyang-sqlite-2`, `YYSERV01`, `YYPLAN01`, the shared
+`YYFILE02`/`YYHASH02` content profile, and loopback RPC version 1. Profile 1 is
+the unchanged never-expired path. The first explicit expiry performs a one-way
+profile-2 transition; there is no automatic downgrade, object-authority
+fallback, or cross-profile read of local preparation evidence. A same-profile
+process restart retains published history, receipts, frozen requests, expiry
+markers, and readiness.
 
 The independent SQLite and object vectors under
 [`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) are consumed
