@@ -39,6 +39,33 @@ use tokio::io::AsyncRead;
 mod transport;
 pub use transport::{ServiceClient, serve};
 
+#[cfg(test)]
+mod connection_tracking {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static OPENS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> = OnceLock::new();
+
+    pub(super) fn record(path: &Path) {
+        let mut opens = OPENS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("connection counter lock");
+        *opens.entry(path.to_owned()).or_default() += 1;
+    }
+
+    pub(super) fn count(path: &Path) -> u64 {
+        OPENS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("connection counter lock")
+            .get(path)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 type Db = Arc<Mutex<Connection>>;
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
@@ -192,6 +219,8 @@ async fn db_call<T: Send + 'static>(
     })?
 }
 async fn connect(path: &Path, create: bool) -> Result<Db> {
+    #[cfg(test)]
+    connection_tracking::record(path);
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
@@ -219,6 +248,8 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
 }
 
 async fn connect_read_only(path: &Path) -> Result<Db> {
+    #[cfg(test)]
+    connection_tracking::record(path);
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -883,5 +914,56 @@ mod admission_tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use std::time::Instant;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "measurement benchmark; run explicitly on nier"]
+    async fn metadata_service_connection_reuse_measurement() {
+        const CALLS: usize = 200;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metadata.db");
+        let backend = TestBackend::default();
+        let started = Instant::now();
+        let service = MetadataService::create(&path, backend.operator())
+            .await
+            .unwrap();
+        let open_elapsed = started.elapsed();
+        let after_open = connection_tracking::count(&path);
+
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            service.observe_latest().await.unwrap();
+        }
+        let observe_elapsed = started.elapsed();
+        let after_observe = connection_tracking::count(&path);
+
+        let content = service
+            .data()
+            .prepare(&mut b"measurement".as_slice())
+            .await
+            .unwrap();
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            service.remember(&content).await.unwrap();
+        }
+        let remember_elapsed = started.elapsed();
+        let after_remember = connection_tracking::count(&path);
+
+        println!(
+            "connection-reuse calls={CALLS} opens=create:{after_open} \
+             observe:{after_observe} remember:{after_remember} \
+             create_us={} observe_us_per_call={} remember_us_per_call={}",
+            open_elapsed.as_micros(),
+            observe_elapsed.as_micros() / CALLS as u128,
+            remember_elapsed.as_micros() / CALLS as u128,
+        );
     }
 }
