@@ -1016,6 +1016,9 @@ fn explicit_expiry_case(publication: Publication) {
     // the package records a real common baseline rather than an initial-sync
     // conflict.
     fixture.sync_run_ok(&backup_source);
+    let external_baseline =
+        fixture.remote_create_file("expiry-baseline-only.txt", b"external-baseline", false);
+    fixture.sync_run_ok(&backup_source);
     fs::write(
         backup_source.directory.join("backup-only.txt"),
         b"backup-baseline",
@@ -1045,11 +1048,17 @@ fn explicit_expiry_case(publication: Publication) {
         text(&restored.directory),
     ]);
     let restored_plan = retention_plan(&fixture, &restored.config, 1, &[], None);
-    let backup_baseline_text =
-        restored_plan["protection"]["staging"]["replica"]["baseline"]["revision"]
-            .as_str()
-            .unwrap_or_else(|| panic!("restored replica baseline revision: {restored_plan}"))
-            .to_owned();
+    let baseline_target_text = revision_text(external_baseline.cursor.revision);
+    let baseline_entries =
+        restored_plan["protection"]["staging"]["replica"]["baseline"]["entry_revisions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("restored replica baseline entries: {restored_plan}"));
+    assert!(
+        baseline_entries
+            .iter()
+            .any(|revision| revision == baseline_target_text.as_str()),
+        "restored replica baseline does not contain the external entry revision: {restored_plan}"
+    );
 
     fixture.remote_create_file("expiry-handle-base.txt", b"handle-base", false);
     let handle_base_text = revision_text(
@@ -1059,7 +1068,7 @@ fn explicit_expiry_case(publication: Publication) {
             .revision(),
     );
     assert_ne!(
-        backup_baseline_text, handle_base_text,
+        baseline_target_text, handle_base_text,
         "backup baseline must be distinct from the live file-handle base"
     );
 
@@ -1121,7 +1130,7 @@ fn explicit_expiry_case(publication: Publication) {
             .unwrap()
             .revision();
         assert_ne!(
-            backup_baseline_text,
+            baseline_target_text,
             revision_text(before),
             "baseline refusal target must not be the current revision"
         );
@@ -1132,7 +1141,7 @@ fn explicit_expiry_case(publication: Publication) {
             "retention",
             "expire",
             "--revision",
-            &backup_baseline_text,
+            &baseline_target_text,
         ];
         if let Some(backup) = backup {
             args.extend(["--backup", text(backup)]);
