@@ -17,6 +17,7 @@
 
 //! Durable namespace intents on top of the shared Authority/Planner contract.
 use super::{EditId, Sync};
+use crate::local::store;
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -47,19 +48,6 @@ pub(super) const COLUMNS: &[&str] = &[
     "receipt_ordinal",
     "failure",
 ];
-pub(super) const CREATE_TABLE: &str = "CREATE TABLE namespaces(
-    id BLOB PRIMARY KEY,
-    intent_key BLOB NOT NULL,
-    baseline BLOB NOT NULL,
-    commit_id BLOB NOT NULL UNIQUE,
-    request_digest BLOB NOT NULL,
-    operation BLOB NOT NULL,
-    request BLOB NOT NULL,
-    state INTEGER NOT NULL,
-    receipt_revision BLOB,
-    receipt_ordinal INTEGER,
-    failure BLOB
-);";
 
 /// Creation metadata represented by the current namespace contract.
 ///
@@ -310,10 +298,6 @@ impl OperationWire {
     }
 }
 
-pub(super) fn initialize(connection: &Connection) -> Result<()> {
-    connection.execute_batch(CREATE_TABLE).map_err(Error::local)
-}
-
 #[derive(Clone)]
 struct IntentRow {
     id: Vec<u8>,
@@ -495,7 +479,8 @@ async fn save_state_async(
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(Error::local)?;
         save_state(&tx, id, state, receipt.as_ref(), failure.as_ref())?;
-        tx.commit().map_err(Error::local)
+        tx.commit().map_err(Error::local)?;
+        store::barrier(connection).map_err(super::store_error)
     })
     .await
 }
@@ -608,7 +593,8 @@ async fn insert(
             ],
         )
         .map_err(Error::local)?;
-        tx.commit().map_err(Error::local)
+        tx.commit().map_err(Error::local)?;
+        store::barrier(connection).map_err(super::store_error)
     })
     .await
 }

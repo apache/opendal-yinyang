@@ -29,7 +29,6 @@ use yinyang_core::{
 
 mod staging;
 use staging::{CHUNK, Record, Stage, StagedRead};
-pub(crate) mod schema;
 
 mod error;
 pub use error::{Error, ErrorKind, Failure, Result};
@@ -670,7 +669,8 @@ impl FileHandle {
             ));
         }
         record.base = revision.to_bytes();
-        stage.save(record).await
+        stage.save(record).await?;
+        stage.barrier().await
     }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
@@ -689,9 +689,10 @@ impl FileHandle {
         }
         result
     }
-    /// Every successful write already commits a synchronous local SQLite
-    /// transaction. This reports its position without claiming remote durability.
+    /// Make every staged byte and local metadata change durable without
+    /// publishing to the authority.
     pub async fn sync_local(&self) -> Result<HandleStatus> {
+        self.runtime.inner.stage.barrier().await?;
         self.status().await
     }
     /// Explicitly acknowledge the handle's reported error, without changing its
@@ -820,6 +821,7 @@ impl FileHandle {
     }
     async fn publish(&mut self) -> Result<Option<Receipt>> {
         let stage = &self.runtime.inner.stage;
+        stage.barrier().await?;
         let mut r = stage.load(self.id).await?;
         if r.local == r.remote {
             if let Some(error) = self.status().await?.error {
@@ -849,6 +851,7 @@ impl FileHandle {
             stage.save(r.clone()).await?;
             request
         };
+        stage.barrier().await?;
         match self.runtime.authority().commit(&request).await {
             Err(error) => {
                 // The plan is already frozen and dispatch may still publish.
@@ -880,6 +883,7 @@ impl FileHandle {
                     r.conflict = false;
                     let descriptor = base.descriptor().to_bytes();
                     stage.complete_base(r, descriptor.clone()).await?;
+                    stage.barrier().await?;
                     *self.base.lock().await = HandleBase {
                         expected: Some(descriptor),
                         file: Some(base),

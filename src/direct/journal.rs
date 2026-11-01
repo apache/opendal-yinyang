@@ -18,13 +18,26 @@
 //! Durable Direct Mount object generations and mutation intents.
 
 use super::{DirectId, DirectStorageBinding, Error, ErrorKind, Result};
+use crate::local::store;
 use borsh::{BorshDeserialize, BorshSerialize};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub(super) const PROFILE: &str = "yinyang-direct-runtime-1";
+const SCHEMA: &[store::TableColumns<'static>] = &[
+    (
+        "authority",
+        &["singleton", "profile", "binding", "binding_diagnostic"],
+    ),
+    ("objects", &["id", "key", "record"]),
+    ("mutations", &["id", "record"]),
+];
+pub(super) const PROFILE: store::Profile = store::Profile {
+    name: "yinyang-direct-runtime-2",
+    table: "authority",
+    schema: SCHEMA,
+};
 
 pub(super) const OBJECT_STAGED: u8 = 1;
 pub(super) const OBJECT_PENDING: u8 = 2;
@@ -170,14 +183,7 @@ pub(super) fn inspect(
     database: &Path,
     binding: Option<&DirectStorageBinding>,
 ) -> Result<StoreInspection> {
-    let connection = Connection::open_with_flags(
-        database,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| sqlite("inspect Direct runtime database", error))?;
-    connection
-        .busy_timeout(Duration::from_secs(1))
-        .map_err(|error| sqlite("configure Direct runtime inspection", error))?;
+    let connection = store::open_read_only(database).map_err(store_error)?;
     let (binding_bytes, binding_description) = validate_schema(&connection, binding)?;
     let binding_id: [u8; 32] = binding_bytes.try_into().map_err(|_| {
         Error::new(
@@ -226,7 +232,7 @@ pub(super) fn inspect(
         *slot = slot.saturating_add(1);
     }
     Ok(StoreInspection {
-        profile: PROFILE.to_owned(),
+        profile: PROFILE.name.to_owned(),
         binding_id,
         binding_description,
         objects,
@@ -276,20 +282,7 @@ impl Store {
             }
         }
 
-        let mut connection = Connection::open_with_flags(
-            &database,
-            if nonempty {
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            } else {
-                OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_CREATE
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            },
-        )
-        .map_err(|error| sqlite("open Direct runtime database", error))?;
-        connection
-            .busy_timeout(Duration::from_secs(1))
-            .map_err(|error| sqlite("configure Direct runtime database", error))?;
+        let mut connection = store::open_read_write(&database, !nonempty).map_err(store_error)?;
 
         if nonempty {
             let _ = validate_schema(&connection, Some(binding))?;
@@ -297,31 +290,21 @@ impl Store {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite("begin Direct runtime initialization", error))?;
-            transaction
-                .execute_batch(CREATE_SCHEMA)
-                .map_err(|error| sqlite("initialize Direct runtime state", error))?;
-            transaction
-                .execute(
-                    "INSERT INTO authority(singleton,profile,binding,binding_diagnostic)
-                     VALUES(1,?1,?2,?3)",
-                    params![
-                        PROFILE,
-                        binding.namespace_id().as_slice(),
-                        binding.description()
-                    ],
-                )
-                .map_err(|error| sqlite("bind Direct runtime profile", error))?;
+            store::initialize(
+                &transaction,
+                &PROFILE,
+                CREATE_SCHEMA,
+                &[
+                    store::Binding::blob("binding", binding.namespace_id().to_vec()),
+                    store::Binding::text("binding_diagnostic", binding.description()),
+                ],
+            )
+            .map_err(store_error)?;
             transaction
                 .commit()
                 .map_err(|error| sqlite("commit Direct runtime initialization", error))?;
         }
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=FULL;
-                 PRAGMA foreign_keys=ON;",
-            )
-            .map_err(|error| sqlite("configure Direct runtime durability", error))?;
+        store::configure(&connection).map_err(store_error)?;
         let store = Self {
             connection,
             root: root.to_owned(),
@@ -329,6 +312,10 @@ impl Store {
         };
         store.recover_dispatching()?;
         Ok(store)
+    }
+
+    pub fn barrier(&self) -> Result<()> {
+        store::barrier(&self.connection).map_err(store_error)
     }
 
     pub fn object(&self, key: &str) -> Result<Option<ObjectRecord>> {
@@ -505,74 +492,20 @@ fn validate_schema(
     connection: &Connection,
     binding: Option<&DirectStorageBinding>,
 ) -> Result<(Vec<u8>, String)> {
-    let (profile, bound, diagnostic) = connection
+    let bindings = binding.map(|binding| {
+        [
+            store::Binding::blob("binding", binding.namespace_id().to_vec()),
+            store::Binding::text("binding_diagnostic", binding.description()),
+        ]
+    });
+    store::validate(connection, &PROFILE, bindings.as_deref()).map_err(store_error)?;
+    let (bound, diagnostic) = connection
         .query_row(
-            "SELECT profile,binding,binding_diagnostic FROM authority WHERE singleton=1",
+            "SELECT binding,binding_diagnostic FROM authority WHERE singleton=1",
             [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|error| sqlite("read Direct runtime profile", error))?;
-    if profile != PROFILE {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            format!("unsupported Direct runtime profile {profile:?}"),
-        ));
-    }
-    if let Some(binding) = binding
-        && bound.as_slice() != binding.namespace_id()
-    {
-        return Err(Error::new(
-            ErrorKind::Invalid,
-            format!(
-                "Direct runtime state is bound to {diagnostic:?}, not the selected storage namespace {:?}",
-                binding.description()
-            ),
-        ));
-    }
-    let mut tables = connection
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-        .and_then(|mut statement| {
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .map_err(|error| sqlite("inspect Direct runtime schema", error))?;
-    tables.sort();
-    if tables != ["authority", "mutations", "objects"] {
-        return Err(Error::new(
-            ErrorKind::Storage,
-            format!("Direct runtime profile has unexpected tables: {tables:?}"),
-        ));
-    }
-    for (table, columns) in [
-        (
-            "authority",
-            &["singleton", "profile", "binding", "binding_diagnostic"][..],
-        ),
-        ("objects", &["id", "key", "record"][..]),
-        ("mutations", &["id", "record"][..]),
-    ] {
-        let actual = connection
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(|error| sqlite("inspect Direct runtime columns", error))?;
-        if actual != columns {
-            return Err(Error::new(
-                ErrorKind::Storage,
-                format!("Direct runtime table {table:?} has unexpected columns: {actual:?}"),
-            ));
-        }
-    }
     Ok((bound, diagnostic))
 }
 
@@ -605,6 +538,22 @@ fn hex(bytes: [u8; 16]) -> String {
 fn local(context: &str, error: std::io::Error) -> Error {
     let kind = ErrorKind::Storage;
     Error::new(kind, format!("{context}: {error}"))
+}
+
+fn store_error(error: store::Error) -> Error {
+    let kind = match error.kind() {
+        store::ErrorKind::Invalid => ErrorKind::Invalid,
+        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
+        store::ErrorKind::Busy
+        | store::ErrorKind::AlreadyExists
+        | store::ErrorKind::NotFound
+        | store::ErrorKind::ReadOnly
+        | store::ErrorKind::PermissionDenied
+        | store::ErrorKind::NoSpace
+        | store::ErrorKind::Io => ErrorKind::Storage,
+    };
+    Error::new(kind, error.to_string())
 }
 
 fn sqlite(context: &str, error: rusqlite::Error) -> Error {

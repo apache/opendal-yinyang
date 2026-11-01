@@ -31,6 +31,7 @@ use crate::{
 use futures_util::future::BoxFuture;
 use opendal::Operator;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,14 +89,15 @@ fn check_columns(conn: &Connection, table: &str, expected: &[(&str, &str)]) -> R
         .map_err(|error| {
             corrupt_schema(format!("cannot inspect table {table} columns: {error}"))
         })?;
-    if columns.len() != expected.len()
-        || columns
-            .iter()
-            .zip(expected)
-            .any(|((name, kind), (expected_name, expected_kind))| {
-                name.as_str() != *expected_name || !kind.eq_ignore_ascii_case(expected_kind)
-            })
-    {
+    let actual = columns
+        .into_iter()
+        .map(|(name, kind)| (name, kind.to_ascii_lowercase()))
+        .collect::<BTreeMap<_, _>>();
+    let expected = expected
+        .iter()
+        .map(|(name, kind)| ((*name).to_owned(), kind.to_ascii_lowercase()))
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
         return Err(corrupt_schema(format!(
             "schema profile has an incompatible {table} table"
         )));
@@ -122,6 +124,14 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
         return Err(Error::unsupported(
             "open metadata authority",
             "database is not a YinYang authority",
+        ));
+    }
+    let profiles: i64 = conn
+        .query_row("SELECT count(*) FROM authority", [], |row| row.get(0))
+        .map_err(|error| corrupt_schema(format!("cannot inspect authority profiles: {error}")))?;
+    if profiles != 1 {
+        return Err(corrupt_schema(
+            "authority must contain exactly one profile row",
         ));
     }
     let profile: Option<String> = conn
@@ -209,7 +219,7 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
             ));
         }
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )
         .map_err(sql)?;
         Ok(Arc::new(Mutex::new(conn)))
@@ -236,6 +246,22 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
     })
     .await
     .map_err(|e| Error::new(ErrorKind::Storage, "open metadata worker", e.to_string()))?
+}
+fn barrier(conn: &Connection) -> Result<()> {
+    // A FULL checkpoint syncs the WAL and database after NORMAL commits.
+    let (busy, _, _): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(sql)?;
+    if busy != 0 {
+        return Err(Error::new(
+            ErrorKind::Storage,
+            "checkpoint metadata database",
+            "database is busy",
+        ));
+    }
+    Ok(())
 }
 fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
     let (profile, fs, root, revision): (String, Vec<u8>, Vec<u8>, Vec<u8>) = conn
@@ -300,13 +326,14 @@ impl MetadataService {
                 let fs = NodeId::generate();
                 let root = NodeId::generate();
                 let revision = Revision::new(0);
-                tx.execute("INSERT INTO authority VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
-                tx.execute("INSERT INTO revisions VALUES(?1,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
+                tx.execute("INSERT INTO authority(singleton,profile,filesystem,root,latest) VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
+                tx.execute("INSERT INTO revisions(token,sequence) VALUES(?1,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
                 let node = Node {id:root, generation:1, executable:false, link:None, kind:NodeKind::Directory{membership:1}};
-                tx.execute("INSERT INTO records VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
+                tx.execute("INSERT INTO records(family,key,start,end,value) VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
             }
             let result = manifest(&tx)?;
             tx.commit().map_err(sql)?;
+            barrier(conn)?;
             Ok(result)
         }).await?;
         let fs = Self {
@@ -594,11 +621,11 @@ impl MetadataService {
         let db = connect(&self.path, false).await?;
         db_call(&db, move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO prepared VALUES(?1)",
+                "INSERT OR IGNORE INTO prepared(descriptor) VALUES(?1)",
                 params![descriptor],
             )
             .map_err(sql)?;
-            Ok(())
+            barrier(c)
         })
         .await
     }
@@ -731,7 +758,8 @@ impl MetadataService {
                         .map_err(sql)?;
                         if let Some(value) = value {
                             c.execute(
-                                "INSERT INTO records VALUES(?1,?2,?3,NULL,?4)",
+                                "INSERT INTO records(family,key,start,end,value)
+                                 VALUES(?1,?2,?3,NULL,?4)",
                                 params![family, key, sequence as i64, value],
                             )
                             .map_err(sql)?;
@@ -754,7 +782,7 @@ impl MetadataService {
         }
         db_call(&db, move |c| {
             c.execute(
-                "INSERT INTO revisions VALUES(?1,?2)",
+                "INSERT INTO revisions(token,sequence) VALUES(?1,?2)",
                 params![revision.to_bytes().as_slice(), sequence as i64],
             )
             .map_err(sql)?;
@@ -769,7 +797,7 @@ impl MetadataService {
         // A failed durability acknowledgement is not proof of rollback.
         if db_call(&db, |c| {
             c.execute_batch("COMMIT").map_err(sql)?;
-            Ok(())
+            barrier(c)
         })
         .await
         .is_err()
