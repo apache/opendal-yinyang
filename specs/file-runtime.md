@@ -149,8 +149,9 @@ the authority's shared bounded-work rule caps the verification units the update
 may generate. If either bound is exceeded, the handle uses the explicit
 streaming `Authority::prepare` path. A preparation error is never converted
 into that fallback, so a corrupt, foreign or uncertain update cannot acquire a
-different request identity. Handles without a sparse `bases` row keep
-full-chunks reads and streaming publication.
+different request identity. An incomplete handle may temporarily lack a sparse
+`bases` row; it is never exposed and is discarded on reopen. A ready handle
+without that row is corrupt.
 
 Publication first checkpoints local writes, then plans a conditional content
 update against the original base revision and saves the exact frozen
@@ -206,23 +207,22 @@ The schema signature is the exact table set plus the exact column-name set for
 each table. SQLite internal tables are excluded; column order, primary-key
 definitions, declared types and other constraints are not part of the
 signature. Maintained inserts name their columns explicitly. The schema is
-`authority`, `handles`, `chunks`, `errors`, `bases` and `segments`.
+`authority`, `handles`, `errors`, `bases` and `segments`.
 
-A current handle with a `bases` row uses `segments`; missing segment rows mean
-"read the pinned base", never zero and never a freshly observed version.
-`prefix` is the durably valid immutable-base length and cannot exceed the
-descriptor length. Writes replace exact byte intervals and coalesce adjacent
-segments only inside one fixed 64 KiB verification unit. Every persisted
-segment row is therefore at most 64 KiB and never crosses a unit boundary;
-sequential writes cannot grow one SQLite BLOB without bound, and a small read
-loads at most the intersecting unit rows. A shrink lowers `prefix`; later
-extension therefore reads zeros in the removed interval instead of
-resurrecting base bytes. The `chunks` table remains part of the current schema,
-but a handle must not mix chunk and sparse-base semantics.
+Every current ready handle has exactly one `bases` row and uses `segments`;
+missing segment rows mean "read the pinned base", never zero and never a
+freshly observed version. A ready handle without that base is corrupt. `prefix`
+is the durably valid immutable-base length and cannot exceed the descriptor
+length. Writes replace exact byte intervals and coalesce adjacent segments only
+inside one fixed 64 KiB verification unit. Every persisted segment row is
+therefore at most 64 KiB and never crosses a unit boundary; sequential writes
+cannot grow one SQLite BLOB without bound, and a small read loads at most the
+intersecting unit rows. A shrink lowers `prefix`; later extension therefore
+reads zeros in the removed interval instead of resurrecting base bytes.
 
 A writer preflights an existing database read-only. Unknown or older profiles,
 partial schemas, a missing or duplicate profile row, malformed base descriptors,
-overlapping segments, mixed full/sparse state, empty segments, and segments
+overlapping segments, ready handles without a base, empty segments, and segments
 that cross a verification unit are rejected before journal-mode configuration,
 DDL, runtime-lock creation, or incomplete-open cleanup. SQLite's standard
 read-only WAL path may create an empty `-wal` and may create or update derived
