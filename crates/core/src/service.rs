@@ -834,33 +834,42 @@ impl MetadataService {
             Err(_) => return Ok(ExpiryOutcome::Unknown(request_id)),
         };
         let request = request.clone();
+        let expected_volume = self.filesystem;
+        let expected_root = self.root;
         let result = db_call(&db, move |conn| {
-            let (profile, _, _, _) = manifest(conn)?;
-            if profile != SchemaProfile::Expiry {
-                return Ok(None);
-            }
-            let Some(marker) = load_expiry(conn, &operation_key(request.id()))? else {
-                return Ok(None);
-            };
-            if marker.request_digest != request_digest {
-                return Err(Error::invalid(
-                    "resolve expiry",
-                    "operation identity was reused with a different request",
-                ));
-            }
-            request.validate_marker(&marker)?;
-            for candidate in request.candidates() {
-                let marker_for_revision = load_expiry(conn, &revision_key(*candidate))?
-                    .ok_or_else(|| {
-                        corrupt_schema("committed expiry operation is missing a revision marker")
-                    })?;
-                if marker_for_revision != marker {
-                    return Err(corrupt_schema(
-                        "expiry operation and revision markers disagree",
+            with_read_snapshot(conn, |conn| {
+                let (profile, volume, root, _) = manifest(conn)?;
+                if volume != expected_volume || root != expected_root {
+                    return Ok(None);
+                }
+                if profile != SchemaProfile::Expiry {
+                    return Ok(None);
+                }
+                let Some(marker) = load_expiry(conn, &operation_key(request.id()))? else {
+                    return Ok(None);
+                };
+                if marker.request_digest != request_digest {
+                    return Err(Error::invalid(
+                        "resolve expiry",
+                        "operation identity was reused with a different request",
                     ));
                 }
-            }
-            Ok(Some(ExpiryOutcome::Committed(request.receipt(marker))))
+                request.validate_marker(&marker)?;
+                for candidate in request.candidates() {
+                    let marker_for_revision = load_expiry(conn, &revision_key(*candidate))?
+                        .ok_or_else(|| {
+                            corrupt_schema(
+                                "committed expiry operation is missing a revision marker",
+                            )
+                        })?;
+                    if marker_for_revision != marker {
+                        return Err(corrupt_schema(
+                            "expiry operation and revision markers disagree",
+                        ));
+                    }
+                }
+                Ok(Some(ExpiryOutcome::Committed(request.receipt(marker))))
+            })
         })
         .await;
         match result {

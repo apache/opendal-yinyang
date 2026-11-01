@@ -736,7 +736,17 @@ impl ObjectFs {
         {
             Ok(_) => Ok(ExpiryOutcome::Committed(request.receipt(marker))),
             Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {
-                Ok(ExpiryOutcome::Conflict)
+                match self.observe_state().await {
+                    Ok(current) => match self
+                        .committed_expiry(&current, request, request_digest)
+                        .await
+                    {
+                        Ok(Some(outcome)) => Ok(outcome),
+                        Ok(None) => Ok(ExpiryOutcome::Conflict),
+                        Err(_) => Ok(ExpiryOutcome::Unknown(request.id())),
+                    },
+                    Err(_) => Ok(ExpiryOutcome::Unknown(request.id())),
+                }
             }
             Err(_) => match self.observe_state().await {
                 Ok(current) => match self

@@ -793,6 +793,30 @@ async fn lost_and_delayed_rpc_responses_resolve_the_original_request() {
     committed(service.commit(&next.finish().unwrap()).await.unwrap());
     release.notify_one();
     assert_eq!(committed(pending.await.unwrap().unwrap()), old);
+    let expiry_request = ExpiryRequest::new(
+        service.filesystem(),
+        ExpiryId::generate(),
+        service.observe_latest().await.unwrap().revision(),
+        vec![first.revision()],
+        Vec::new(),
+        [0x44; 32],
+    )
+    .unwrap();
+    mode.store(1, Ordering::SeqCst);
+    assert_eq!(
+        client.expire_revisions(&expiry_request).await.unwrap(),
+        ExpiryOutcome::Unknown(expiry_request.id())
+    );
+    let expiry_receipt = match client.expire_revisions(&expiry_request).await.unwrap() {
+        ExpiryOutcome::Committed(receipt) => receipt,
+        other => panic!("expected committed expiry replay: {other:?}"),
+    };
+    assert_eq!(expiry_receipt.id, expiry_request.id());
+    assert_eq!(expiry_receipt.before, expiry_request.expected_latest());
+    assert_eq!(
+        expiry_receipt.expired.as_slice(),
+        expiry_request.candidates()
+    );
     assert!(first.resolve("lost").await.unwrap().is_none());
     proxy.abort();
     server.abort();
