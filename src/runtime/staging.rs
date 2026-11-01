@@ -158,6 +158,7 @@ pub(crate) struct StagingLease {
 }
 
 impl StagingLease {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) async fn acquire(path: PathBuf) -> Result<Self> {
         tokio::task::spawn_blocking(move || Self::acquire_sync(&path))
             .await
