@@ -419,15 +419,12 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
     drop(sync);
 
     for root_inside_state in [false, true] {
-        let state = temp.path().join(if root_inside_state {
-            "restore-state-a"
+        let (state, root) = if root_inside_state {
+            let state = temp.path().join("restore-state-a");
+            (state.clone(), state.join("root"))
         } else {
-            "restore-root-b"
-        });
-        let root = if root_inside_state {
-            state.join("root")
-        } else {
-            state.join("state")
+            let root = temp.path().join("restore-root-b");
+            (root.join("state"), root)
         };
         if root_inside_state {
             std::fs::create_dir(&state).unwrap();

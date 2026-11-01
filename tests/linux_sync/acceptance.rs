@@ -154,15 +154,12 @@ fn write_sync_config(fixture: &Fixture, name: &str, state: &Path) -> PathBuf {
 fn managed_sync_containment_is_symmetric_for_init_and_restore() {
     let fixture = Fixture::new(Publication::Object);
     for root_inside_state in [false, true] {
-        let state = fixture.path(if root_inside_state {
-            "init-state-a"
+        let (state, root) = if root_inside_state {
+            let state = fixture.path("init-state-a");
+            (state.clone(), state.join("root"))
         } else {
-            "init-root-b"
-        });
-        let root = if root_inside_state {
-            state.join("root")
-        } else {
-            state.join("state")
+            let root = fixture.path("init-root-b");
+            (root.join("state"), root)
         };
         let config = write_sync_config(&fixture, "containment-init", &state);
         let output = fixture.yy(&[
@@ -198,15 +195,12 @@ fn managed_sync_containment_is_symmetric_for_init_and_restore() {
     ]);
 
     for root_inside_state in [false, true] {
-        let state = fixture.path(if root_inside_state {
-            "restore-state-a"
+        let (state, root) = if root_inside_state {
+            let state = fixture.path("restore-state-a");
+            (state.clone(), state.join("root"))
         } else {
-            "restore-root-b"
-        });
-        let root = if root_inside_state {
-            state.join("root")
-        } else {
-            state.join("state")
+            let root = fixture.path("restore-root-b");
+            (root.join("state"), root)
         };
         if root_inside_state {
             fs::create_dir(&state).unwrap();
