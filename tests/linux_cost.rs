@@ -1384,7 +1384,7 @@ fn run_write_latency_batch(
             .collect();
         let (outputs, _) = parallel_stage(values, |(index, file, bytes)| {
             write_all_at(&file, &bytes, offset);
-            (index, file)
+            file
         });
         let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
         for (index, file, elapsed) in outputs {
@@ -1421,7 +1421,7 @@ fn run_write_latency_batch(
         let (outputs, _) = parallel_stage(std::mem::take(&mut files), |(index, file)| {
             file.sync_all()
                 .expect("fsync concurrent write-latency file");
-            (index, file)
+            file
         });
         let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
         for (index, file, elapsed) in outputs {
@@ -1465,7 +1465,7 @@ fn run_write_latency_case(
     writers: usize,
     recorder: &mut Recorder,
 ) {
-    assert!(writers == 1 || writers == WRITE_LATENCY_FILES);
+    assert!(writers == 1 || writers == WRITE_LATENCY_BATCH_FILES);
     let scale = Scale::Small;
     let size = scale.file_size();
     let offset =
@@ -4231,11 +4231,12 @@ fn service_proxy_connection(
             &request_counters.request_bytes,
         )
     });
+    let response_counters = counters.clone();
     let response = thread::spawn(move || {
         pump_service(
             &mut server_read,
             &mut client_write,
-            &counters.response_bytes,
+            &response_counters.response_bytes,
         )
     });
     let _ = request.join();
@@ -5389,10 +5390,11 @@ fn path_str(path: &Path) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpMethod, ProxyCounters, RequestScanner, ResponseScanner};
+    use super::{HttpMethod, PendingResponse, ProxyCounters, RequestScanner, ResponseScanner};
     use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     #[test]
     fn request_scanner_skips_content_length_and_chunked_bodies() {
@@ -5411,8 +5413,9 @@ mod tests {
               HEAD /next HTTP/1.1\r\n\r\n",
         );
         let mut scanner = RequestScanner::default();
+        let origin = Instant::now();
         for byte in wire {
-            scanner.scan(&[byte], &counters, &methods);
+            scanner.scan(&[byte], &counters, &methods, origin);
         }
         assert_eq!(counters.requests.load(Ordering::Relaxed), 3);
         assert_eq!(counters.put.load(Ordering::Relaxed), 1);
@@ -5428,12 +5431,22 @@ mod tests {
     #[test]
     fn response_scanner_counts_get_body_bytes() {
         let counters = ProxyCounters::default();
+        counters.in_flight_requests.store(3, Ordering::Relaxed);
         let methods = Arc::new(Mutex::new(VecDeque::from([
-            HttpMethod::Get,
-            HttpMethod::Put,
-            HttpMethod::Head,
+            PendingResponse {
+                method: HttpMethod::Get,
+                start_ns: 0,
+            },
+            PendingResponse {
+                method: HttpMethod::Put,
+                start_ns: 0,
+            },
+            PendingResponse {
+                method: HttpMethod::Head,
+                start_ns: 0,
+            },
         ])));
-        let mut scanner = ResponseScanner::new(methods);
+        let mut scanner = ResponseScanner::new(methods, Instant::now());
         let wire = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nbody\
               HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nput\
               HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n";
