@@ -627,11 +627,11 @@ async fn inspect_backup_package_evidence(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = filesystem;
-        return unavailable_backup(
+        unavailable_backup(
             &path,
             None,
             "backup package inspection is available only on Linux".to_owned(),
-        );
+        )
     }
     #[cfg(target_os = "linux")]
     {
