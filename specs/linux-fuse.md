@@ -109,6 +109,11 @@ size, and revision-derived timestamps are synthesized. `getxattr`,
 `listxattr`, `readlink`, links and special nodes return explicit unsupported
 errors.
 
+The object authority's shared index cache charges index pages and external
+values against one 64 MiB byte bound and evicts the oldest-used entry. Cached
+entries are content-addressed `PackedRef` values, so a snapshot cannot consume
+bytes from another content identity. Writers do not use this shared cache.
+
 Direct has no persisted executable bit: writable Direct files remain `0644`
 and directories remain `0755`. Writable Direct uses a zero attribute TTL and
 explicit invalidation after publication so a dirty length cannot remain cached
