@@ -47,8 +47,6 @@ use yinyang::runtime::{Runtime, RuntimeStatus};
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 16 * 1024 * 1024;
-const OLD_YY_BIN: &str = "/home/ubuntu/Code/experiments/yinyang/managed-write-latency-20261101/base-3b5/mwlat-base-3b5-inc-r1.yy";
-const OLD_YY_SHA256: &str = "7c7669c676b2275ceec1a3c15a1b390293797265ee4f400466d2f3c3641ae0c9";
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
@@ -1010,16 +1008,7 @@ fn explicit_expiry_preserves_staged_and_backup_work_on_object_and_service() {
 }
 
 fn explicit_expiry_case(publication: Publication) {
-    let old_hash = run_external("sha256sum", &[OLD_YY_BIN], Duration::from_secs(30));
-    assert_eq!(
-        std::str::from_utf8(&old_hash.stdout)
-            .unwrap()
-            .split_ascii_whitespace()
-            .next(),
-        Some(OLD_YY_SHA256),
-        "old binary identity changed"
-    );
-
+    let legacy = legacy_yy_binary();
     let mut fixture = Fixture::new(publication);
     let zero = fixture.remote_create_file("protected.txt", b"version-zero", false);
     let backup_source = fixture.sync_client("expiry-backup-source");
@@ -1034,6 +1023,7 @@ fn explicit_expiry_case(publication: Publication) {
     )
     .unwrap();
     fixture.sync_run_ok(&backup_source);
+    let backup_baseline = fixture.remote_file_version("protected.txt").2;
     let backup = fixture.path("expiry-backup");
     fixture.yy_ok(&[
         "--volume",
@@ -1092,36 +1082,55 @@ fn explicit_expiry_case(publication: Publication) {
     ]);
 
     let zero_text = revision_text(zero.cursor.revision);
-    if publication == Publication::Object {
-        old_yy(&fixture, &["status", "--revision", &zero_text])
-            .success_or("old object status before expiry");
-        let old_read_path = fixture.path("old-pre-expiry-read");
-        old_yy(
-            &fixture,
-            &["restore", text(&old_read_path), "--revision", &zero_text],
-        )
-        .success_or("old object read before expiry");
-        assert_eq!(
-            fs::read(old_read_path.join("protected.txt")).unwrap(),
-            b"version-zero"
-        );
-    } else {
-        let old_service = old_yy(
-            &fixture,
-            &[
-                "--volume",
-                text(&config),
-                "receipt",
-                "00000000-0000-0000-0000-000000000000",
-            ],
-        );
-        assert_eq!(
-            old_service.status.code(),
-            Some(3),
-            "old service client did not open the pre-expiry authority:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&old_service.stdout),
-            String::from_utf8_lossy(&old_service.stderr)
-        );
+    let backup_baseline_text = revision_text(backup_baseline);
+    let before_backup_refusal = fixture.remote_file_version("protected.txt").2;
+    let backup_refusal = fixture.yy(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "expire",
+        "--revision",
+        &backup_baseline_text,
+        "--backup",
+        text(&backup),
+        "--json",
+    ]);
+    assert_eq!(
+        backup_refusal.status.code(),
+        Some(2),
+        "backup-only baseline refusal failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&backup_refusal.stdout),
+        String::from_utf8_lossy(&backup_refusal.stderr)
+    );
+    let backup_refusal: serde_json::Value =
+        serde_json::from_slice(&backup_refusal.stdout).expect("parse backup refusal JSON");
+    assert_eq!(backup_refusal["state"], "refused");
+    assert_eq!(backup_refusal["revisions"][0]["state"], "protected");
+    assert!(
+        backup_refusal["revisions"][0]["reasons"]
+            .as_array()
+            .is_some_and(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason == "backup_replica_baseline")
+            })
+    );
+    assert_eq!(
+        fixture.remote_file_version("protected.txt").2,
+        before_backup_refusal,
+        "backup-only refusal advanced the head"
+    );
+    assert!(
+        runtime()
+            .block_on(fixture_authority(&fixture).observe_revision(zero.cursor.revision),)
+            .is_ok(),
+        "backup-only refusal changed the unprotected target revision"
+    );
+
+    if let Some(binary) = &legacy {
+        let latest = fixture.remote_file_version("protected.txt").2;
+        legacy_pre_expiry(binary, &mut fixture, publication, zero.commit_id, latest);
     }
 
     let immutable_before = immutable_remote_identities(&fixture.operator());
@@ -1211,45 +1220,9 @@ fn explicit_expiry_case(publication: Publication) {
         entry.revision == zero.cursor.revision && matches!(entry.state, RevisionState::Expired(_))
     }));
 
-    let head_before_old = runtime()
-        .block_on(authority.observe_latest())
-        .unwrap()
-        .revision();
-    if publication == Publication::Object {
-        let old_post = old_yy(&fixture, &["status", "--revision", &zero_text]);
-        assert!(
-            !old_post.status.success(),
-            "old object binary accepted the activated expiry profile:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&old_post.stdout),
-            String::from_utf8_lossy(&old_post.stderr)
-        );
-        let old_post_read_path = fixture.path("old-post-expiry-read");
-        let old_post_read = old_yy(
-            &fixture,
-            &[
-                "restore",
-                text(&old_post_read_path),
-                "--revision",
-                &zero_text,
-            ],
-        );
-        assert!(
-            !old_post_read.status.success(),
-            "old object binary read the activated expired revision"
-        );
-        assert!(
-            !old_post_read_path.exists(),
-            "old binary created a restore destination after rejection"
-        );
+    if let Some(binary) = &legacy {
+        legacy_post_expiry(binary, &mut fixture, publication, &zero_text);
     }
-    assert_eq!(
-        runtime()
-            .block_on(authority.observe_latest())
-            .unwrap()
-            .revision(),
-        head_before_old,
-        "old binary mutated the activated head"
-    );
 
     let mut expected = b"version-one!".to_vec();
     expected[4..8].copy_from_slice(b"PEND");
@@ -1320,27 +1293,6 @@ fn explicit_expiry_case(publication: Publication) {
         before_repeat,
         "idempotent expiry advanced the head"
     );
-
-    if publication == Publication::Service {
-        fixture.stop_service();
-        let metadata = fixture.path("metadata.db");
-        let old_serve = old_yy(
-            &fixture,
-            &[
-                "serve",
-                "--database",
-                text(&metadata),
-                "--listen",
-                "127.0.0.1:0",
-            ],
-        );
-        assert!(
-            !old_serve.status.success(),
-            "old service binary accepted the activated expiry profile:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&old_serve.stdout),
-            String::from_utf8_lossy(&old_serve.stderr)
-        );
-    }
 }
 
 #[test]
@@ -2186,20 +2138,289 @@ fn revision_text(revision: Revision) -> String {
         .collect()
 }
 
-fn old_yy(fixture: &Fixture, args: &[&str]) -> Captured {
+fn legacy_yy_binary() -> Option<PathBuf> {
+    let Some(path) = std::env::var_os("YY_LEGACY_EXPIRY_BIN") else {
+        eprintln!("legacy expiry qualification: not run (YY_LEGACY_EXPIRY_BIN is unset)");
+        return None;
+    };
+    let path = PathBuf::from(path);
+    assert!(
+        path.is_file(),
+        "YY_LEGACY_EXPIRY_BIN must name the recorded legacy yy binary: {}",
+        path.display()
+    );
+    let hash = run_external("sha256sum", &[text(&path)], Duration::from_secs(30));
+    let hash = std::str::from_utf8(&hash.stdout)
+        .unwrap()
+        .split_ascii_whitespace()
+        .next()
+        .expect("sha256sum output");
+    eprintln!(
+        "legacy expiry qualification: running {} sha256={} source={}",
+        path.display(),
+        hash,
+        std::env::var("YY_LEGACY_EXPIRY_SOURCE").unwrap_or_else(|_| "unspecified".to_owned())
+    );
+    Some(path)
+}
+
+fn legacy_yy(binary: &Path, fixture: &Fixture, args: &[&str]) -> Captured {
+    run_command(
+        legacy_yy_command(binary, fixture, args),
+        Duration::from_secs(60),
+    )
+}
+
+fn legacy_pre_expiry(
+    binary: &Path,
+    fixture: &mut Fixture,
+    publication: Publication,
+    zero: Revision,
+    zero_commit: CommitId,
+    latest: Revision,
+) {
+    let head_before = runtime()
+        .block_on(fixture_authority(fixture).observe_latest())
+        .unwrap()
+        .revision();
+    let zero_text = revision_text(zero);
+    match publication {
+        Publication::Object => {
+            legacy_yy(binary, fixture, &["status", "--revision", &zero_text])
+                .success_or("legacy object status before expiry");
+            let read_path = fixture.path("legacy-pre-expiry-read");
+            legacy_yy(
+                binary,
+                fixture,
+                &["restore", text(&read_path), "--revision", &zero_text],
+            )
+            .success_or("legacy object read before expiry");
+            assert_eq!(
+                fs::read(read_path.join("protected.txt")).unwrap(),
+                b"version-zero"
+            );
+        }
+        Publication::Service => {
+            let original_address = fixture.service_address();
+            fixture.stop_service();
+            let metadata = fixture.path("metadata.db");
+            let mut service = legacy_service(binary, fixture, &metadata);
+            let config = fixture.path("legacy-service.json");
+            write_read_only_service_config(
+                &config,
+                &fixture.path("legacy-state"),
+                service.address(),
+            );
+            let receipt = legacy_yy(
+                binary,
+                fixture,
+                &[
+                    "--volume",
+                    text(&config),
+                    "receipt",
+                    &commit_text(zero_commit),
+                ],
+            );
+            receipt.success_or("legacy service receipt before expiry");
+            assert!(
+                String::from_utf8_lossy(&receipt.stdout).contains("revision:"),
+                "legacy service did not read the known receipt: {}",
+                String::from_utf8_lossy(&receipt.stdout)
+            );
+            let status = legacy_yy(binary, fixture, &["--volume", text(&config), "status"]);
+            status.success_or("legacy service status before expiry");
+            assert!(
+                String::from_utf8_lossy(&status.stdout)
+                    .contains(&format!("remote latest: {}", revision_text(latest))),
+                "legacy service did not read the known snapshot: {}",
+                String::from_utf8_lossy(&status.stdout)
+            );
+            service.stop();
+            fixture.restart_service();
+            assert_eq!(fixture.service_address(), original_address);
+        }
+    }
+    assert_eq!(
+        runtime()
+            .block_on(fixture_authority(fixture).observe_latest())
+            .unwrap()
+            .revision(),
+        head_before,
+        "legacy pre-expiry qualification mutated the head"
+    );
+}
+
+fn legacy_post_expiry(
+    binary: &Path,
+    fixture: &mut Fixture,
+    publication: Publication,
+    expired: &str,
+) {
+    let head_before = runtime()
+        .block_on(fixture_authority(fixture).observe_latest())
+        .unwrap()
+        .revision();
+    match publication {
+        Publication::Object => {
+            let status = legacy_yy(binary, fixture, &["status", "--revision", expired]);
+            assert!(
+                !status.status.success(),
+                "legacy object binary accepted the activated format"
+            );
+            let diagnostic = String::from_utf8_lossy(&status.stderr).to_ascii_lowercase();
+            assert!(
+                diagnostic.contains("head mode 1")
+                    || (diagnostic.contains("unsupported") && diagnostic.contains("format")),
+                "legacy object rejection lacked the exact format diagnostic: {diagnostic}"
+            );
+            let read_path = fixture.path("legacy-post-expiry-read");
+            let read = legacy_yy(
+                binary,
+                fixture,
+                &["restore", text(&read_path), "--revision", expired],
+            );
+            assert!(!read.status.success());
+            assert!(!read_path.exists());
+        }
+        Publication::Service => {
+            fixture.stop_service();
+            let metadata = fixture.path("metadata.db");
+            let serve = legacy_yy(
+                binary,
+                fixture,
+                &[
+                    "serve",
+                    "--database",
+                    text(&metadata),
+                    "--listen",
+                    "127.0.0.1:0",
+                ],
+            );
+            assert!(
+                !serve.status.success(),
+                "legacy service daemon accepted the activated profile"
+            );
+            let diagnostic = String::from_utf8_lossy(&serve.stderr).to_ascii_lowercase();
+            assert!(
+                diagnostic.contains("profile")
+                    && (diagnostic.contains("unsupported") || diagnostic.contains("unknown")),
+                "legacy service rejection lacked the exact profile diagnostic: {diagnostic}"
+            );
+            fixture.restart_service();
+        }
+    }
+    assert_eq!(
+        runtime()
+            .block_on(fixture_authority(fixture).observe_latest())
+            .unwrap()
+            .revision(),
+        head_before,
+        "legacy post-activation qualification mutated the head"
+    );
+}
+
+fn write_read_only_service_config(path: &Path, state: &Path, address: SocketAddr) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "legacy-service",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "service",
+            "service_address": address.to_string(),
+            "storage_profile": "minio",
+            "staging": state,
+            "read_only": true,
+            "require": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+struct LegacyService {
+    child: Child,
+    address: SocketAddr,
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+impl LegacyService {
+    fn stop(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(thread) = self.stdout.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn legacy_service(binary: &Path, fixture: &Fixture, metadata: &Path) -> LegacyService {
+    let mut command = legacy_yy_command(
+        binary,
+        fixture,
+        &[
+            "serve",
+            "--database",
+            text(metadata),
+            "--listen",
+            "127.0.0.1:0",
+        ],
+    );
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn legacy yy serve");
+    let stdout = child.stdout.take().expect("legacy service stdout");
+    let stderr = child.stderr.take().expect("legacy service stderr");
+    let (sender, receiver) = mpsc::channel();
+    let stdout_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let sent = reader.read_line(&mut line).is_ok();
+        let _ = sender.send((sent, line));
+        let mut rest = Vec::new();
+        let _ = reader.read_to_end(&mut rest);
+        rest
+    });
+    let stderr_thread = thread::spawn(move || read_all(stderr));
+    let (sent, line) = receiver
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("legacy yy serve did not report readiness: {error:?}");
+        });
+    assert!(sent, "legacy yy serve closed stdout before readiness");
+    let address = line
+        .trim()
+        .strip_prefix("metadata service listening on ")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected legacy service readiness line {line:?}"));
+    LegacyService {
+        child,
+        address,
+        stdout: Some(stdout_thread),
+        stderr: Some(stderr_thread),
+    }
+}
+
+fn legacy_yy_command(binary: &Path, fixture: &Fixture, args: &[&str]) -> Command {
     let source = fixture.yy_command(&[]);
     let envs = source
         .get_envs()
         .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
         .collect::<Vec<_>>();
-    let mut command = Command::new(OLD_YY_BIN);
+    let mut command = Command::new(binary);
     for (key, value) in envs {
         if let Some(value) = value {
             command.env(key, value);
         }
     }
     command.args(args);
-    run_command(command, Duration::from_secs(60))
+    command
 }
 
 fn fixture_authority(fixture: &Fixture) -> Arc<dyn Authority> {
