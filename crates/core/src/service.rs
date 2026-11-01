@@ -31,7 +31,7 @@ use crate::{
 use futures_util::future::BoxFuture;
 use opendal::Operator;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -85,11 +85,13 @@ const RECORDS_COLUMNS: [(&str, &str); 5] = [
 ];
 const REVISIONS_COLUMNS: [(&str, &str); 2] = [("token", "BLOB"), ("sequence", "INTEGER")];
 
-/// One durable filesystem authority. Clones and independent processes coordinate
-/// through SQLite; no process-local cache determines the latest revision.
+/// One durable filesystem authority. Clones share one writer and one reader
+/// connection; independent processes still coordinate through SQLite.
 #[derive(Clone, Debug)]
 pub struct MetadataService {
-    path: PathBuf,
+    writer: Db,
+    reader: Db,
+    write_gate: Arc<tokio::sync::Mutex<()>>,
     data: DataStore,
     filesystem: NodeId,
     root: NodeId,
@@ -319,8 +321,8 @@ impl MetadataService {
     /// Initialize a new local database or reopen its exact existing authority.
     pub async fn create(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let db = connect(&path, true).await?;
-        let (filesystem, root, _) = db_call(&db, |conn| {
+        let writer = connect(&path, true).await?;
+        let (filesystem, root, _) = db_call(&writer, |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
             tx.execute_batch("CREATE TABLE IF NOT EXISTS authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL, root BLOB NOT NULL, latest BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS revisions(token BLOB PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL);
@@ -340,8 +342,11 @@ impl MetadataService {
             tx.commit().map_err(sql)?;
             Ok(result)
         }).await?;
+        let reader = connect_read_only(&path).await?;
         let fs = Self {
-            path,
+            writer,
+            reader,
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
             data: DataStore::new(operator.clone(), filesystem)?,
             filesystem,
             root,
@@ -362,10 +367,13 @@ impl MetadataService {
     }
     pub async fn open(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let db = connect(&path, false).await?;
-        let (filesystem, root, _) = db_call(&db, |c| manifest(c)).await?;
+        let writer = connect(&path, false).await?;
+        let (filesystem, root, _) = db_call(&writer, |c| manifest(c)).await?;
+        let reader = connect_read_only(&path).await?;
         let fs = Self {
-            path,
+            writer,
+            reader,
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
             data: DataStore::new(operator.clone(), filesystem)?,
             filesystem,
             root,
@@ -416,12 +424,11 @@ impl MetadataService {
         }
     }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
-        let db = connect(&self.path, false).await?;
-        let (fs, root, revision) = db_call(&db, |c| manifest(c)).await?;
+        let (fs, root, revision) = db_call(&self.reader, |c| manifest(c)).await?;
         if fs != self.filesystem || root != self.root {
             return Err(Error::invalid("observe service", "authority changed"));
         }
-        Ok(self.snapshot(db, revision))
+        Ok(self.snapshot(self.reader.clone(), revision))
     }
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         if revision.sequence > i64::MAX as u64 {
@@ -431,8 +438,7 @@ impl MetadataService {
                 "revision not retained",
             ));
         }
-        let db = connect(&self.path, false).await?;
-        db_call(&db, move |c| {
+        db_call(&self.reader, move |c| {
             let exists: bool = c
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
@@ -450,7 +456,7 @@ impl MetadataService {
             Ok(())
         })
         .await?;
-        Ok(self.snapshot(db, revision))
+        Ok(self.snapshot(self.reader.clone(), revision))
     }
     /// Read a bounded page from the durable retained revision index without
     /// changing journal mode, taking the writer transaction, or recovering.
@@ -465,9 +471,8 @@ impl MetadataService {
                 format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
             ));
         }
-        let db = connect_read_only(&self.path).await?;
         let after = after.map(Revision::to_bytes);
-        let mut revisions = db_call(&db, move |conn| {
+        let mut revisions = db_call(&self.reader, move |conn| {
             let limit = i64::from(limit) + 1;
             let mut rows = Vec::new();
             if let Some(after) = after.as_ref() {
@@ -622,8 +627,8 @@ impl MetadataService {
     }
     pub(crate) async fn remember(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?.to_bytes();
-        let db = connect(&self.path, false).await?;
-        db_call(&db, move |c| {
+        let _guard = self.write_gate.lock().await;
+        db_call(&self.writer, move |c| {
             c.execute(
                 "INSERT OR IGNORE INTO prepared VALUES(?1)",
                 params![descriptor],
@@ -642,11 +647,10 @@ impl MetadataService {
     pub async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
         let (revision, files) = Transaction::inspect(bytes)?;
         let snapshot = self.observe_revision(revision).await?;
-        let db = connect(&self.path, false).await?;
         let mut prepared = Vec::new();
         for file in files {
             let descriptor = file.to_bytes();
-            let present = db_call(&db, move |c| {
+            let present = db_call(&self.reader, move |c| {
                 c.query_row(
                     "SELECT EXISTS(SELECT 1 FROM prepared WHERE descriptor=?1)",
                     params![descriptor],
@@ -681,6 +685,7 @@ impl MetadataService {
         if requests.is_empty() {
             return Ok(vec![]);
         }
+        let _guard = self.write_gate.lock().await;
         // Even an in-process caller must have registered durable readiness.
         let mut restored = Vec::new();
         for request in requests {
@@ -696,13 +701,24 @@ impl MetadataService {
         }
     }
     async fn publish(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
-        let db = connect(&self.path, false).await?;
-        db_call(&db, |c| {
+        let result = self.publish_inner(requests).await;
+        if result.is_err() {
+            let _ = db_call(&self.writer, |c| {
+                c.execute_batch("ROLLBACK").map_err(sql)?;
+                Ok(())
+            })
+            .await;
+        }
+        result
+    }
+    // The caller holds the writer gate for the complete SQLite transaction.
+    async fn publish_inner(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        db_call(&self.writer, |c| {
             c.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
             Ok(())
         })
         .await?;
-        let (_, _, old) = db_call(&db, |c| manifest(c)).await?;
+        let (_, _, old) = db_call(&self.writer, |c| manifest(c)).await?;
         let sequence = old
             .sequence
             .checked_add(1)
@@ -710,7 +726,7 @@ impl MetadataService {
             .ok_or_else(|| Error::unsupported("service commit", "revision exhausted"))?;
         let revision = Revision::new(sequence);
         // This view observes preceding accepted members inside this SQL transaction.
-        let candidate = self.snapshot(db.clone(), revision);
+        let candidate = self.snapshot(self.writer.clone(), revision);
         let mut outcomes = Vec::new();
         let mut ordinal = 0;
         for request in requests {
@@ -741,7 +757,7 @@ impl MetadataService {
             .encode()?;
             let id = *request.id().as_bytes();
             let key = receipt.cursor.key();
-            db_call(&db, move |c| {
+            db_call(&self.writer, move |c| {
                 for (family, rows) in [
                     (0, delta.nodes),
                     (1, delta.entries),
@@ -776,14 +792,14 @@ impl MetadataService {
             ordinal += 1;
         }
         if ordinal == 0 {
-            db_call(&db, |c| {
+            db_call(&self.writer, |c| {
                 c.execute_batch("ROLLBACK").map_err(sql)?;
                 Ok(())
             })
             .await?;
             return Ok(outcomes);
         }
-        db_call(&db, move |c| {
+        db_call(&self.writer, move |c| {
             c.execute(
                 "INSERT INTO revisions VALUES(?1,?2)",
                 params![revision.to_bytes().as_slice(), sequence as i64],
@@ -798,13 +814,18 @@ impl MetadataService {
         })
         .await?;
         // A failed durability acknowledgement is not proof of rollback.
-        if db_call(&db, |c| {
+        if db_call(&self.writer, |c| {
             c.execute_batch("COMMIT").map_err(sql)?;
             Ok(())
         })
         .await
         .is_err()
         {
+            let _ = db_call(&self.writer, |c| {
+                c.execute_batch("ROLLBACK").map_err(sql)?;
+                Ok(())
+            })
+            .await;
             return Ok(requests.iter().map(|r| Outcome::Unknown(r.id())).collect());
         }
         Ok(outcomes)
@@ -921,7 +942,37 @@ mod admission_tests {
 mod connection_tests {
     use super::*;
     use crate::support::TestBackend;
+    use crate::{CommitId, Planner};
     use std::time::Instant;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_service_reuses_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metadata.db");
+        let backend = TestBackend::default();
+        let service = MetadataService::create(&path, backend.operator())
+            .await
+            .unwrap();
+        assert_eq!(connection_tracking::count(&path), 2);
+
+        let observed = service.observe_latest().await.unwrap();
+        let content = service.prepare(&mut b"reused".as_slice()).await.unwrap();
+        let mut planner = Planner::new(&observed, CommitId::generate());
+        planner
+            .create_file(service.root(), "file", content, false)
+            .await
+            .unwrap();
+        let request = planner.finish().unwrap();
+        service.commit(&request).await.unwrap();
+        service.observe_revision(observed.revision()).await.unwrap();
+        service.retained_revisions_page(None, 2).await.unwrap();
+        service
+            .restore_transaction(&request.to_bytes().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(connection_tracking::count(&path), 2);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "measurement benchmark; run explicitly on nier"]

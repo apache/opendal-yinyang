@@ -13,6 +13,12 @@ publication. Its filesystem must honor SQLite locking and synchronization;
 network-mounted database files are unsupported. Keep the database and its WAL
 together; copying only the live main database is not a backup procedure.
 
+The service owns one long-lived writer connection and one long-lived read-only
+connection. Clones share both connections. Reads and writes run through the
+blocking database helper, and writer operations use a process-local gate so a
+publication transaction cannot interleave with another write on the same
+connection. Independent service processes still coordinate through SQLite.
+
 The schema profile is `yinyang-sqlite-1`. The authority row retains filesystem
 and root identities plus the latest revision. Indexed valid-time records retain
 nodes, entries, receipts, and ordered changes. Each record has an inclusive
@@ -27,8 +33,9 @@ supported identifier with an incompatible schema or manifest returns `Corrupt`.
 Neither path modifies the database. This admission is a format check, not a scan
 of all historical records.
 
-Writers serialize at the database boundary, but revalidate original logical
-predicates through the same transaction evaluator as object publication.
+Writers serialize through the process-local gate and at the database boundary,
+but revalidate original logical predicates through the same transaction
+evaluator as object publication.
 Disjoint name slots and file states can both succeed from one observation;
 membership scans, file state, emptiness, and ancestor predicates detect real
 conflicts. Every accepted batch member's namespace delta, receipt, and changes
