@@ -2652,7 +2652,7 @@ mod tests {
         assert_eq!(error.kind(), RuntimeErrorKind::Busy);
 
         let replica_root = root.path().join("replica-root");
-        let error = Replica::init(&staging, &replica_root, authority.bucket()).unwrap_err();
+        let error = Replica::init(&staging, &replica_root, authority.filesystem()).unwrap_err();
         assert_eq!(error.kind(), crate::replica::ErrorKind::Busy);
 
         match ExpiryLeases::acquire(&staging).await {

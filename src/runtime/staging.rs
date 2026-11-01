@@ -1300,7 +1300,9 @@ mod tests {
         assert!(!path.join("staging.db").exists());
 
         let filesystem = NodeId::from_bytes([17; 16]);
-        let error = Stage::open(path.clone(), filesystem).await.unwrap_err();
+        let Err(error) = Stage::open(path.clone(), filesystem).await else {
+            panic!("stage open must be fenced by the lease");
+        };
         assert_eq!(error.kind(), ErrorKind::Busy);
         assert!(!path.join("staging.db").exists());
 
