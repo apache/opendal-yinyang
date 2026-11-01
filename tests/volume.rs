@@ -135,20 +135,19 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
         read_only: true,
         ..config(temp.path().join("state"))
     };
-    let caps = ro.validate(&backend.operator()).unwrap();
-    let expected: CapabilitySet = [
-        Capability::Read,
-        Capability::List,
-        Capability::StableIdentity,
-        Capability::PinnedReads,
-        Capability::RetainedUnlinkRead,
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(caps.admitted, expected);
-    assert!(!caps.admitted.contains(&Capability::RecoverableStaging));
     if cfg!(target_os = "linux") {
-        assert!(ro.validate(&backend.operator()).is_ok());
+        let caps = ro.validate(&backend.operator()).unwrap();
+        let expected: CapabilitySet = [
+            Capability::Read,
+            Capability::List,
+            Capability::StableIdentity,
+            Capability::PinnedReads,
+            Capability::RetainedUnlinkRead,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(caps.admitted, expected);
+        assert!(!caps.admitted.contains(&Capability::RecoverableStaging));
         let rw = VolumeConfig {
             read_only: false,
             ..ro.clone()
@@ -157,16 +156,25 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
         assert!(caps.admitted.contains(&Capability::Write));
         assert!(caps.admitted.contains(&Capability::RemoteFsync));
         assert!(caps.admitted.contains(&Capability::RecoverableStaging));
-        assert!(rw.validate(&backend.operator()).is_ok());
     } else {
-        assert!(ro.validate(&backend.operator()).is_err());
+        let error = ro.validate(&backend.operator()).unwrap_err();
+        assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+        assert_eq!(
+            error.to_string(),
+            "volume admission: the fuse frontend is implemented only on Linux"
+        );
     }
     let invalid = VolumeConfig {
         service_address: Some("0.0.0.0:7447".parse().unwrap()),
         publication: Publication::Service,
         ..ro.clone()
     };
-    assert!(invalid.validate(&backend.operator()).is_err());
+    let error = invalid.validate(&backend.operator()).unwrap_err();
+    assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+    assert_eq!(
+        error.to_string(),
+        "volume admission: service publication requires a loopback service_address"
+    );
 }
 
 #[test]
