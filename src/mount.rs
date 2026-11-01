@@ -455,6 +455,14 @@ pub struct MountReadOnlyFile {
     node: Arc<Node>,
     version: FileVersion,
 }
+impl std::fmt::Debug for MountReadOnlyFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountReadOnlyFile")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
 impl Drop for MountReadOnlyFile {
     fn drop(&mut self) {
         self.node.references.fetch_sub(1, Ordering::Relaxed);

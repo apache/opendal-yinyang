@@ -174,26 +174,6 @@ pub struct DirectNode {
 }
 
 impl DirectNode {
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn for_test_file(
-        id: DirectId,
-        path: &str,
-        size: u64,
-        modified: Option<SystemTime>,
-    ) -> Self {
-        Self {
-            id,
-            parent: None,
-            name: path.rsplit('/').next().unwrap_or(path).to_owned(),
-            path: path.to_owned(),
-            key: Some(path.to_owned()),
-            kind: DirectKind::File,
-            size,
-            pin: None,
-            modified,
-        }
-    }
-
     pub fn id(&self) -> DirectId {
         self.id
     }
