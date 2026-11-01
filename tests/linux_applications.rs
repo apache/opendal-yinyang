@@ -414,7 +414,7 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
         fs::create_dir(&roundtrip).expect("create local tar round-trip root");
         tar_extract(&mounted_archive, &roundtrip)
             .success_or("extract mounted-tree archive locally");
-        assert_tar_round_trip(&roundtrip, &expected_payload, false);
+        assert_tar_round_trip(&roundtrip, &expected_payload, true);
         assert_eq!(
             fixture.remote_read(&config, "tar-tree/bin/run.sh", 64),
             b"#!/bin/sh\nprintf 'archive trial\\n'\n"
