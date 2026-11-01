@@ -422,6 +422,38 @@ async fn renamed_and_re_edited_local_file_converges() {
     .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn managed_sync_publishes_two_hundred_file_creates_in_one_commit() {
+    const FILES: usize = 200;
+
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..FILES {
+        std::fs::write(
+            root.join(format!("file-{index:03}")),
+            [u8::try_from(index).unwrap()],
+        )
+        .unwrap();
+    }
+    let mut sync = DirectorySync::init(authority, &temp.path().join("state"), &root)
+        .await
+        .unwrap();
+    let before = backend.state.lock().unwrap().head_conditional_writes;
+    assert!(sync.run().await.unwrap().in_sync);
+    let commits = backend.state.lock().unwrap().head_conditional_writes - before;
+    assert_eq!(
+        commits, 1,
+        "{FILES} file creates used {commits} head commits"
+    );
+}
+
 /// Delegating authority with two explicit hold points. The after-commit mode
 /// completes the real commit and then delays the successful response until the
 /// test releases it; the before-commit mode parks the request before the real
