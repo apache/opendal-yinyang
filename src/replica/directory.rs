@@ -2388,13 +2388,12 @@ impl<'a> Context<'a> {
             "remote deletion",
             Some(self.revision.to_bytes()),
         ) {
-            Ok(artifact) => {
+            Ok(_artifact) => {
                 self.current.remove_subtree(path);
                 self.nodes.remove(path);
                 self.revisions.remove(path);
                 self.remote.remove(path);
                 self.replica.store_mut().remove_baseline_path(path)?;
-                self.replica.release_artifact(&artifact.id)?;
                 self.outcome.materialized_remote += 1;
                 Ok(())
             }

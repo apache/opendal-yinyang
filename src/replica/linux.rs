@@ -1859,6 +1859,9 @@ impl Replica {
         }
         self.store
             .update_artifact(&record.id, &record.phase, record.error.as_deref())?;
+        if matches {
+            self.fresh_artifacts.insert(record.id.clone());
+        }
         Ok(self.artifact_from(record))
     }
 

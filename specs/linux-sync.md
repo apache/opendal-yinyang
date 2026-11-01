@@ -208,10 +208,12 @@ conflict and incomplete-install artifacts remain.
 
 Every artifact not held by unknown work, retryable work or an active conflict is
 limited to 64 artifacts and 256 MiB per replica. The run releases oldest rows
-first until both limits hold. Directory quarantine artifacts are removed
-recursively only after the creation-time tree check succeeded; a changed or
-ambiguous directory is retained and reported as a conflict. Status counts and
-byte summaries include every remaining artifact.
+first until both limits hold. Directory quarantine artifacts survive the same
+one-reconciliation evidence window as displaced files, then are removed
+recursively only after the creation-time tree check succeeded and their stat
+identity still matches; a changed or ambiguous directory is retained and
+reported as a conflict. Status counts and byte summaries include every remaining
+artifact.
 
 ## Example
 
