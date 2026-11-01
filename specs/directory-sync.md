@@ -140,9 +140,12 @@ Retained artifacts export their current bytes, including writes that landed
 after the exchange. A conflict side exports its retained artifact or live local
 bytes (`local`) or the recorded remote node version (`remote`). Directory
 artifacts expose their retained path; byte-stream export of a directory is
-unsupported. Upload, superseded and resolved-conflict artifacts are released at
-their durable release events. Active conflict material is never pruned; all
-other artifacts are bounded to 64 entries and 256 MiB, oldest first.
+unsupported. Upload and resolved-conflict artifacts are released at their
+durable release events. A displaced inode survives one reconciliation boundary
+so a late writer through the old inode is observable, then it is released if its
+stat identity still matches the accepted displacement. Active conflict material
+is never pruned; all other artifacts are bounded to 64 entries and 256 MiB,
+oldest first.
 
 ## Backup and isolated restore
 

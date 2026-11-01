@@ -498,13 +498,23 @@ async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
         let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
             .await
             .unwrap();
-        assert_eq!(
-            reader_status.summary.retained_bytes, 0,
-            "reader retained history after edit {edit}"
+        assert!(
+            reader_status.summary.retained_bytes <= LARGE as u64,
+            "reader retained more than one displaced version after edit {edit}: {}",
+            reader_status.summary.retained_bytes
         );
-        assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
+        assert!(
+            tree_bytes(&reader_state.join("quarantine")) <= (LARGE + 4096) as u64,
+            "reader quarantine grew after edit {edit}"
+        );
     }
 
+    assert!(reader.run().await.unwrap().in_sync);
+    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
+    assert_eq!(reader_status.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
     reader.reset_hash_bytes_read();
     assert!(reader.run().await.unwrap().in_sync);
     assert_eq!(

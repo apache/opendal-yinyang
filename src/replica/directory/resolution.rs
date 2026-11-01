@@ -909,7 +909,6 @@ impl DirectorySync {
             .await?
         {
             self.clear_resolved_conflict(&record.id)?;
-            self.replica.release_superseded(path)?;
             Ok(true)
         } else {
             Ok(false)

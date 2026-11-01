@@ -278,6 +278,7 @@ pub struct Replica {
     store: Store,
     hash_bytes: Arc<AtomicU64>,
     scan_cache: Mutex<BTreeMap<String, (Stat, LocalNode)>>,
+    fresh_artifacts: BTreeSet<String>,
 }
 
 fn baseline_from_store(store: &Store) -> Result<Option<ReplicaBaseline>> {
@@ -378,6 +379,7 @@ impl Replica {
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
             scan_cache: Mutex::new(BTreeMap::new()),
+            fresh_artifacts: BTreeSet::new(),
         };
         replica.recover_incomplete()?;
         Ok(replica)
@@ -451,6 +453,7 @@ impl Replica {
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
             scan_cache: Mutex::new(BTreeMap::new()),
+            fresh_artifacts: BTreeSet::new(),
         };
         manifest.apply(&mut replica, &binding)?;
         replica.verify_retained_artifacts()?;
@@ -536,6 +539,7 @@ impl Replica {
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
             scan_cache: Mutex::new(BTreeMap::new()),
+            fresh_artifacts: BTreeSet::new(),
         };
         replica.recover_incomplete()?;
         Ok(replica)
@@ -680,6 +684,7 @@ impl Replica {
             store,
             hash_bytes: Arc::new(AtomicU64::new(0)),
             scan_cache: Mutex::new(BTreeMap::new()),
+            fresh_artifacts: BTreeSet::new(),
         })
     }
 
@@ -848,7 +853,9 @@ impl Replica {
         }
         validate_path(path)?;
         let (parent, name) = split_path(path)?;
-        let parent_fd = self.open_relative_dir(parent)?;
+        let Some(parent_fd) = self.open_relative_dir_optional(parent)? else {
+            return Ok(None);
+        };
         let parent_identity = identity(&parent_fd, &self.root, "inspect observed parent")?;
         let Some(stat) = optional_stat(&parent_fd, name, &self.root.join(path))? else {
             return Ok(None);
@@ -1260,6 +1267,36 @@ impl Replica {
         Ok(())
     }
 
+    /// Verify artifacts created by the previous reconciliation and release
+    /// them if no old writer changed their bytes. This one-pass grace period
+    /// keeps late writes through a displaced inode observable.
+    pub fn settle_fresh_artifacts(&mut self) -> Result<()> {
+        let fresh = std::mem::take(&mut self.fresh_artifacts);
+        for id in fresh {
+            let Some(artifact) = self
+                .store
+                .artifacts()?
+                .into_iter()
+                .find(|artifact| artifact.id == id)
+            else {
+                continue;
+            };
+            if artifact.phase == "conflict" {
+                continue;
+            }
+            if self.artifact_matches_record(&artifact)? {
+                self.release_artifact(&id)?;
+            } else {
+                self.store.update_artifact(
+                    &id,
+                    "conflict",
+                    Some("retained artifact changed after its reconciliation"),
+                )?;
+            }
+        }
+        self.prune_artifacts()
+    }
+
     /// Apply the documented count and byte budget to release eligible
     /// artifacts oldest-first. Conflict material and referenced work are never
     /// candidates.
@@ -1306,8 +1343,10 @@ impl Replica {
             return Ok(true);
         }
         if self.store.work()?.iter().any(|work| {
-            work.source_artifact.as_deref() == Some(artifact.id.as_str())
-                || work.upload_artifact.as_deref() == Some(artifact.id.as_str())
+            work.state != "committed"
+                && work.state != "superseded"
+                && (work.source_artifact.as_deref() == Some(artifact.id.as_str())
+                    || work.upload_artifact.as_deref() == Some(artifact.id.as_str()))
         }) {
             return Ok(true);
         }
@@ -2022,6 +2061,46 @@ impl Replica {
         Ok(fd)
     }
 
+    fn open_relative_dir_optional(&self, relative: &str) -> Result<Option<OwnedFd>> {
+        if relative.is_empty() {
+            return self
+                .root_fd
+                .try_clone()
+                .map(Some)
+                .map_err(|error| Error::io("clone local root descriptor", &self.root, error));
+        }
+        validate_path(relative)?;
+        let mut fd = self
+            .root_fd
+            .try_clone()
+            .map_err(|error| Error::io("clone local root descriptor", &self.root, error))?;
+        for component in relative.split('/') {
+            fd = match openat(
+                &fd,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(next) => next,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => {
+                    return Err(Error::errno(
+                        "open local parent without following symlinks",
+                        &self.root.join(relative),
+                        error,
+                    ));
+                }
+            };
+            let stat = fstat(&fd).map_err(|error| {
+                Error::errno("inspect local parent", &self.root.join(relative), error)
+            })?;
+            if stat.st_dev != self.root_identity.dev {
+                return Err(Error::unsupported("local path crosses a volume boundary"));
+            }
+        }
+        Ok(Some(fd))
+    }
+
     fn open_journal_parent(&self, install: &InstallRecord) -> Result<OwnedFd> {
         if let Ok(parent) = self.open_relative_dir(&install.parent)
             && let Ok(current) = identity(&parent, &self.root, "inspect install parent")
@@ -2714,6 +2793,9 @@ impl PreparedInstall<'_> {
             },
             self.record.error.as_deref(),
         )?;
+        if phase == InstallPhase::Retained {
+            self.replica.fresh_artifacts.insert(self.record.id.clone());
+        }
         Ok(())
     }
 

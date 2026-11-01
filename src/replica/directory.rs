@@ -750,6 +750,7 @@ impl DirectorySync {
 
     pub async fn run(&mut self) -> Result<RunOutcome> {
         let mut outcome = RunOutcome::default();
+        self.replica.settle_fresh_artifacts()?;
         self.retry_associated(&mut outcome).await?;
 
         let observed = self.sync.authority().observe_latest().await?;
@@ -1023,7 +1024,6 @@ impl DirectorySync {
                             Some(revision),
                             None,
                         )?;
-                        self.replica.store_mut().remove_work(&record.id)?;
                         if let Some(artifact) = record.upload_artifact.as_deref() {
                             self.replica.release_artifact(artifact)?;
                         }
@@ -2371,7 +2371,6 @@ impl<'a> Context<'a> {
                 self.revisions.insert(path.to_owned(), self.revision);
                 self.outcome.materialized_remote += 1;
                 self.accept_remote(path, node).await?;
-                self.replica.release_superseded(path)?;
                 Ok(())
             }
             Err(_) => self.conflict(path, Some(path), Some(path)).await,
@@ -2637,7 +2636,6 @@ impl<'a> Context<'a> {
         self.replica
             .store_mut()
             .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
-        self.replica.store_mut().remove_work(edit.as_bytes())?;
         if let Some(artifact) = upload_artifact {
             self.replica.release_artifact(artifact)?;
         }

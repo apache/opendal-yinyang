@@ -1467,6 +1467,13 @@ impl Store {
                 ],
             )
             .map_err(|e| Error::corrupt(format!("write work association: {e}")))?;
+        self.connection
+            .execute(
+                "DELETE FROM work
+                 WHERE path=?1 AND id!=?2 AND state IN ('committed','superseded')",
+                params![work.path, work.id.as_slice()],
+            )
+            .map_err(|e| Error::corrupt(format!("prune terminal work: {e}")))?;
         Ok(())
     }
 
