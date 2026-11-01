@@ -250,9 +250,10 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
 fn barrier(conn: &Connection) -> Result<()> {
     // A FULL checkpoint syncs the WAL and database after NORMAL commits.
     for attempt in 0..100 {
-        let checkpoint = conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        });
+        let checkpoint: rusqlite::Result<(i64, i64, i64)> =
+            conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            });
         match checkpoint {
             Ok((0, _, _)) => return Ok(()),
             Ok(_) => {}

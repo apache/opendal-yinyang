@@ -202,9 +202,10 @@ pub(crate) fn barrier(connection: &Connection) -> Result<()> {
     // WAL before copying pages and syncs the database after, making every prior
     // commit durable without adding an fsync to each write.
     for attempt in 0..CHECKPOINT_ATTEMPTS {
-        let checkpoint = connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        });
+        let checkpoint: rusqlite::Result<(i64, i64, i64)> =
+            connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            });
         match checkpoint {
             Ok((0, _log, _checkpointed)) => return Ok(()),
             Ok(_) => {}
