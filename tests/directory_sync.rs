@@ -623,7 +623,10 @@ async fn managed_sync_publication_does_not_reimport_prepared_content() {
         service_publish < 64 * 1024,
         "service publication read {service_publish} bytes after preparation"
     );
-    assert!(service_stage <= SIZE as u64 + 64 * 1024);
+    assert!(
+        service_stage <= SIZE as u64 + 64 * 1024,
+        "service preparation read {service_stage} bytes"
+    );
     server.abort();
 }
 
