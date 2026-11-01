@@ -640,12 +640,18 @@ async fn managed_sync_scale_benchmark() {
         assert!(pull.run().await.unwrap().in_sync);
         let pull_seconds = before.elapsed().as_secs_f64();
         let pull_hashes = pull.hash_bytes_read();
+        assert!(pull.run().await.unwrap().in_sync);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        pull.reset_hash_bytes_read();
         let before = Instant::now();
         assert!(pull.run().await.unwrap().in_sync);
         let noop_seconds = before.elapsed().as_secs_f64();
+        let noop_hashes = pull.hash_bytes_read();
+        assert_eq!(noop_hashes, 0);
         println!(
             "W2_SCALE files={files} size={SIZE} push_s={push_seconds:.3} pull_s={pull_seconds:.3} \
-             noop_s={noop_seconds:.3} pull_hashed_bytes={pull_hashes} tree_bytes={}",
+             noop_s={noop_seconds:.3} pull_hashed_bytes={pull_hashes} \
+             noop_hashed_bytes={noop_hashes} tree_bytes={}",
             files * SIZE
         );
     }
@@ -690,12 +696,15 @@ async fn managed_sync_edit_benchmark() {
     let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
         .await
         .unwrap();
+    assert!(reader.run().await.unwrap().in_sync);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     reader.reset_hash_bytes_read();
     let before = Instant::now();
     assert!(reader.run().await.unwrap().in_sync);
     let settled = DirectorySync::inspect(authority.clone(), &reader_state)
         .await
         .unwrap();
+    assert_eq!(reader.hash_bytes_read(), 0);
     println!(
         "W2_EDITS edits={EDITS} writer_retained_bytes={} reader_retained_bytes={} \
          settled_retained_bytes={} noop_hashed_bytes={} noop_s={:.3} quarantine_bytes={}",
