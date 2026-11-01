@@ -269,6 +269,11 @@ fn application_rsync_mirror_survives_remount_both_publications() {
                 .join("rsync-target/notes/remove.txt")
                 .exists()
         );
+        assert_file(
+            &remounted.mountpoint().join("rsync-target/notes/new.txt"),
+            b"added by rsync\n",
+            0o644,
+        );
         assert_eq!(
             fixture.remote_read(
                 &config,
@@ -405,6 +410,10 @@ fn application_gnu_tar_extracts_reads_and_rejects_symlink_both_publications() {
             true,
         );
         let mounted_archive = fixture.temp.path().join("mounted-tree.tar");
+        assert!(
+            !mounted_archive.starts_with(remounted.mountpoint()),
+            "the backup archive must be written outside the mounted tree"
+        );
         tar_create(&mounted_archive, &remounted.mountpoint().join("tar-tree"))
             .success_or("archive the read-only mounted tar tree");
         fs::create_dir(&roundtrip).expect("create local tar round-trip root");
