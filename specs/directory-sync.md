@@ -29,15 +29,17 @@ required tables and positionally inserted columns have exact signatures. The
 historically additive columns remain supported upgrade inputs:
 
 - `baseline.remote_revision`;
-- `baseline.local_stat_size`, `baseline.local_stat_mtime`,
-  `baseline.local_stat_mtime_nsec`, `baseline.local_stat_ctime`,
-  `baseline.local_stat_ctime_nsec`, and `baseline.local_stat_recorded_ns`;
-- `artifacts.settle_pending`;
 - `work.seq`, `work.conflict`, `work.source_artifact`, `work.local_dev`,
   `work.local_ino`, `work.local_parent_dev`, `work.local_parent_ino`, and
   `work.commit_id`;
 - the historical absence of the `work` table before managed reconciliation was
   introduced.
+
+The current profile also requires `baseline.local_stat_size`,
+`baseline.local_stat_mtime`, `baseline.local_stat_mtime_nsec`,
+`baseline.local_stat_ctime`, `baseline.local_stat_ctime_nsec`,
+`baseline.local_stat_recorded_ns`, and `artifacts.settle_pending`. A database
+without those required columns is rejected rather than reinterpreted.
 
 `baseline` and `work` queries name their columns, so those two tables accept
 their historical column order. Every missing required base column or unknown
