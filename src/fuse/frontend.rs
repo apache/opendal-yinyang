@@ -27,7 +27,7 @@ use super::reject_unpublished_staging;
 use crate::mount::{Mount, MountFile, MountReadOnlyFile};
 use crate::volume::{Volume, VolumeConfig};
 use fuser::OpenFlags;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use yinyang_core::{FileVersion, Node, NodeId, ScanToken, Snapshot};
