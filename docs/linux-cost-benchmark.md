@@ -188,6 +188,9 @@ authority result. Concurrent network values remain whole-batch totals; the
 collector does not subtract global proxy counters around one writer and assign
 other writers' traffic to that sample.
 
+The accepted continuous lifecycle baseline and raw evidence are in
+[`linux-write-latency-results.md`](linux-write-latency-results.md).
+
 The accepted matched result and raw 16-row evidence are in
 [`linux-incremental-write-results.md`](linux-incremental-write-results.md).
 
