@@ -354,6 +354,7 @@ async fn explicit_expiry_preserves_protected_staging_work_and_is_idempotent() {
     let one = first.fsync().await.unwrap().unwrap();
     let one_revision = one.cursor.revision;
     first.close().await.unwrap();
+    drop(first);
 
     let mut protected = runtime.open_node(node, true).await.unwrap();
     protected.write(4, b"protected-pending").await.unwrap();
