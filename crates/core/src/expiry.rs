@@ -773,12 +773,13 @@ mod tests {
 
     #[test]
     fn expiry_receipt_rejects_invalid_order() {
+        let at = revision(5);
         let receipt = ExpiryReceipt {
             id: ExpiryId::generate(),
             request_digest: [1; 32],
             evidence_digest: [2; 32],
-            before: revision(5),
-            after: revision(5),
+            before: at,
+            after: at,
             expired: vec![revision(1)],
         };
         assert_eq!(
