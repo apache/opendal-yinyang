@@ -58,8 +58,8 @@ pub(crate) struct ExpiryLeases {
 #[allow(dead_code)]
 impl ExpiryLeases {
     pub(crate) async fn acquire(staging: &Path) -> std::result::Result<Self, ExpiryLeaseError> {
-        let replica = ReplicaStateLease::acquire(staging)
-            .map_err(|error| ExpiryLeaseError::from_replica(error))?;
+        let replica =
+            ReplicaStateLease::acquire(staging).map_err(ExpiryLeaseError::from_replica)?;
         let sync_content = StagingLease::acquire(staging.join("content"))
             .await
             .map_err(|error| ExpiryLeaseError::from_runtime("sync-content", error))?;
