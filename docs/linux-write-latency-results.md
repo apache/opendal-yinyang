@@ -91,6 +91,12 @@ Object publication reaches content and metadata-request concurrency four but
 individual fsyncs wait materially longer. Service publication overlaps more RPC
 work and has the larger whole-batch improvement.
 
+`observed_application_operation_overlap_ms` in the raw records is computed as
+the sum of worker file totals minus batch span. It measures concurrency excess,
+not the exact wall-clock duration in which at least two application operations
+were simultaneously active. The exact peak concurrency values in this table
+come from observed S3 and service request intervals.
+
 ## Attribution boundary
 
 Fsync owns most of the lifecycle in both authorities. Open performs metadata
@@ -104,14 +110,60 @@ The next attribution target is the repeated exact-base metadata observation in
 `FileHandle::publish`: preparation uses the handle's pinned `FileVersion`, then
 planning calls `observe_revision` for the same revision again. Retaining the
 open-time `Snapshot` for that exact revision can remove one observation without
-changing the original conditions or frozen transaction identity. This report
-does not claim an optimization result.
+changing the original conditions or frozen transaction identity.
+
+## Exact-base Snapshot reuse
+
+The optimized source is
+`8403d1815fab1682622148020cf46bbbefd0a059`. Its `tests/linux_cost.rs` collector
+blob is unchanged at `166a07400a61c74680b6865626532543bbb11916`, and the
+lifecycle workload is unchanged. The release ELF BLAKE3 is
+`0546ee2e83b2682cef00e159c43337d21b29b76c647b9cb252116a5fd6f7b462`;
+SHA-256 is
+`cfe5977d56f24246e5408cbd9ac3cbaaf794f520c4e86faeaaa9fa593c818c57`.
+
+A writable `HandleBase` retains the authenticated `Snapshot` selected by open.
+Planning reuses it only when its revision exactly equals the durable staged
+base. Frozen retry, recovery, revision advance, conflict, abort, and close clear
+or bypass the observation and retain the original fallback behavior.
+
+| Authority | Writers | p50 ms baseline -> optimized | p95 ms baseline -> optimized | Batch wall ms baseline -> optimized | S3 requests | Service RPCs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| object | 1 | 90.639 -> 85.357 | 96.762 -> 100.599 | 1,098.388 -> 1,054.363 | 608 -> 568 | 0 -> 0 |
+| object | 4 | 193.854 -> 191.509 | 283.066 -> 277.879 | 665.116 -> 647.623 | 614 -> 568 | 0 -> 0 |
+| service | 1 | 69.968 -> 68.895 | 73.973 -> 72.685 | 845.801 -> 823.910 | 156 -> 156 | 161 -> 149 |
+| service | 4 | 103.649 -> 96.264 | 164.944 -> 179.728 | 367.399 -> 374.405 | 156 -> 156 | 161 -> 149 |
+
+The deterministic effect is one fewer exact-base metadata observation per
+publication. Object publication removes 40 GET requests for one writer and 46
+for four writers across twelve files. Service publication removes one RPC per
+file, reducing 161 RPCs to 149 without changing its S3 request count or body
+bytes.
+
+Latency movement remains mixed. Object single-writer p50 improves 5.8%, while
+its p95 regresses 4.0%. Service four-writer p50 improves 7.1%, but batch wall
+regresses 1.9% and p95 regresses 9.0%. The run cannot distinguish scheduling and
+contention variation from a small regression in that cell, and does not
+establish a stable throughput gain.
+
+The process-wide terminal peak RSS changed from 20,560 to 20,516 KiB for object
+one-writer, 21,244 to 21,176 KiB for object four-writer, 18,056 to 18,148 KiB for
+service one-writer, and 17,892 to 18,608 KiB for service four-writer. These are
+process-wide observations after earlier scenarios, not an isolated snapshot
+cache delta. The retained observation keeps the existing bounded snapshot cache
+alive for one active writable handle; the theoretical combined cache ceiling is
+48 MiB only if it becomes maximally populated. Normal open and planning load
+only the file and predicate pages.
 
 ## Evidence
 
 - [Raw JSONL](benchmarks/linux-cost-write-latency-2026-11-01-baseline-783d332.jsonl):
   24 measured records, SHA-256
   `4ca7aac4abf2c970f4ecd0f4d7a430b55c7df45b7de0240bdae1daddd6705f6c`
+- [Optimized raw JSONL](benchmarks/linux-cost-write-latency-2026-11-01-optimized-8403d18.jsonl):
+  24 measured records, SHA-256
+  `751b0dffd93a13bf156787b6a486512cc8bf037413897561b4b996dd0cdfc778`
+- [Optimized binary identity](benchmarks/linux-cost-write-latency-2026-11-01-optimized-8403d18.binary.txt)
 
 The raw records retain source and binary identity, exact datasets, every
 end-to-end and phase sample, batch wall, process I/O, S3 and service request

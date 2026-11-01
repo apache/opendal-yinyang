@@ -1,0 +1,11 @@
+schema=yinyang-linux-incremental-binary.v1
+label=mwlat-lifecycle-8403d18-r1
+source_sha=8403d1815fab1682622148020cf46bbbefd0a059
+workload=incremental
+expectation=required
+measured_path=/home/ubuntu/Code/worktrees/mwlat-3fbc-20261101/target/release/yy
+preserved_path=/home/ubuntu/Code/experiments/yinyang/managed-write-latency-20261101/lifecycle-8403d18-r1/mwlat-lifecycle-8403d18-r1.yy
+binary_blake3=0546ee2e83b2682cef00e159c43337d21b29b76c647b9cb252116a5fd6f7b462
+binary_sha256=cfe5977d56f24246e5408cbd9ac3cbaaf794f520c4e86faeaaa9fa593c818c57
+jsonl=/home/ubuntu/Code/experiments/yinyang/managed-write-latency-20261101/lifecycle-8403d18-r1/mwlat-lifecycle-8403d18-r1.jsonl
+summary=/home/ubuntu/Code/experiments/yinyang/managed-write-latency-20261101/lifecycle-8403d18-r1/mwlat-lifecycle-8403d18-r1.md
