@@ -821,6 +821,19 @@ impl Stage {
     pub fn barrier_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.barrier_calls.clone()
     }
+    #[cfg(test)]
+    pub async fn set_synchronous(&self, synchronous: &'static str) -> Result<()> {
+        let pragma = match synchronous {
+            "NORMAL" => "PRAGMA synchronous=NORMAL",
+            "FULL" => "PRAGMA synchronous=FULL",
+            _ => return Err(Error::Invalid("unsupported synchronous mode")),
+        };
+        self.call(move |connection| {
+            connection.execute_batch(pragma).map_err(local)?;
+            Ok(())
+        })
+        .await
+    }
     pub async fn load(&self, id: [u8; 16]) -> Result<Record> {
         self.call(move |c| record(c, id)).await
     }
