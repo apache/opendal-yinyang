@@ -71,9 +71,13 @@ async fn exercise_authority_transfer(authority: Arc<dyn Authority>) {
     assert_eq!(committed(authority.commit(&frozen).await.unwrap()), receipt);
 
     let historical = temp.path().join("historical");
-    yinyang::restore_directory_revision(authority.as_ref(), first.revision(), &historical)
-        .await
-        .unwrap();
+    yinyang::restore_directory_revision(
+        authority.as_ref(),
+        first_receipt.cursor.revision,
+        &historical,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         tokio::fs::read(historical.join("nested/hello"))
             .await
