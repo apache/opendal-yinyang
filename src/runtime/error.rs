@@ -125,6 +125,9 @@ impl Error {
                 yinyang_core::ErrorKind::Unsupported => ErrorKind::Unsupported,
                 yinyang_core::ErrorKind::Storage => ErrorKind::Storage,
                 yinyang_core::ErrorKind::Io => ErrorKind::Io,
+                // Expired history is a distinct invariant violation at the
+                // runtime boundary; it must never collapse into NotFound.
+                yinyang_core::ErrorKind::Expired => ErrorKind::Invalid,
             },
             Self::Local(e) | Self::Retained(e) => e.kind(),
             Self::Invalid(_) => ErrorKind::Invalid,

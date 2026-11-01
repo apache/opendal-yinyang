@@ -21,7 +21,8 @@ use support::TestBackend;
 use yinyang_core::object::{BackendProfile, ObjectFs};
 use yinyang_core::service::{MetadataService, ServiceClient, serve};
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, Planner,
+    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, ExpiryConflictKind,
+    ExpiryId, ExpiryOutcome, ExpiryRequest, Planner, Revision, RevisionState,
 };
 
 fn committed(outcome: Outcome) -> yinyang_core::Receipt {
@@ -184,6 +185,145 @@ async fn suite(fs: &dyn Authority) {
     assert_eq!(bytes, expected);
 }
 
+async fn expiry_contract(fs: &dyn Authority) {
+    let initial = fs.observe_latest().await.unwrap();
+    let mut first = Planner::new(&initial, CommitId::generate());
+    first
+        .create_directory(fs.root(), "expired-name")
+        .await
+        .unwrap();
+    let first_plan = first.finish().unwrap();
+    let first_receipt = committed(fs.commit(&first_plan).await.unwrap());
+    let first_revision = first_receipt.cursor.revision;
+
+    let mut second = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    second
+        .create_directory(fs.root(), "current-name")
+        .await
+        .unwrap();
+    committed(fs.commit(&second.finish().unwrap()).await.unwrap());
+    let latest = fs.observe_latest().await.unwrap().revision();
+
+    let request = ExpiryRequest::new(
+        fs.filesystem(),
+        ExpiryId::generate(),
+        latest,
+        vec![first_revision],
+        Vec::new(),
+        [7; 32],
+    )
+    .unwrap();
+    let ExpiryOutcome::Committed(receipt) =
+        Authority::expire_revisions(fs, &request).await.unwrap()
+    else {
+        panic!("expected committed expiry");
+    };
+    assert_eq!(receipt.expired, vec![first_revision]);
+    assert_eq!(receipt.before, latest);
+    assert!(receipt.after > latest);
+
+    let expired = fs.observe_revision(first_revision).await.unwrap_err();
+    assert_eq!(expired.kind(), ErrorKind::Expired);
+    assert_eq!(expired.expired_revision(), Some(first_revision));
+    let absent = fs
+        .observe_revision(Revision::from_bytes([0xaa; 24]))
+        .await
+        .unwrap_err();
+    assert_eq!(absent.kind(), ErrorKind::NotFound);
+
+    let history = Authority::history_page(fs, None, 256).await.unwrap();
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == first_revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == receipt.after && matches!(entry.state, RevisionState::Readable)
+    }));
+
+    let replay = Authority::expire_revisions(fs, &request).await.unwrap();
+    assert_eq!(replay, ExpiryOutcome::Committed(receipt.clone()));
+    let resolved = Authority::resolve_receipt(fs, &first_plan.to_bytes().unwrap())
+        .await
+        .unwrap()
+        .expect("original receipt remains resolvable");
+    assert_eq!(resolved, first_receipt);
+
+    type Wire = (
+        [u8; 8],
+        [u8; 16],
+        [u8; 16],
+        [u8; 24],
+        [u8; 32],
+        Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        Vec<Vec<u8>>,
+    );
+    let mut tampered: Wire = borsh::from_slice(&first_plan.to_bytes().unwrap()).unwrap();
+    tampered.4 = [0; 32];
+    assert_eq!(
+        Authority::resolve_receipt(fs, &borsh::to_vec(&tampered).unwrap())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Invalid
+    );
+
+    let after = fs.observe_latest().await.unwrap().revision();
+    let protected = ExpiryRequest::new(
+        fs.filesystem(),
+        ExpiryId::generate(),
+        after,
+        vec![first_revision],
+        vec![first_revision],
+        [8; 32],
+    )
+    .unwrap();
+    let ExpiryOutcome::Refused(refusal) =
+        Authority::expire_revisions(fs, &protected).await.unwrap()
+    else {
+        panic!("expected protected refusal");
+    };
+    assert!(refusal.conflicts.iter().any(|conflict| {
+        conflict.revision == first_revision
+            && matches!(
+                conflict.kind,
+                ExpiryConflictKind::Protected | ExpiryConflictKind::AlreadyExpired
+            )
+    }));
+
+    let missing = ExpiryRequest::new(
+        fs.filesystem(),
+        ExpiryId::generate(),
+        after,
+        vec![Revision::from_bytes([0xbb; 24])],
+        Vec::new(),
+        [9; 32],
+    )
+    .unwrap();
+    let ExpiryOutcome::Refused(refusal) = Authority::expire_revisions(fs, &missing).await.unwrap()
+    else {
+        panic!("expected missing refusal");
+    };
+    assert!(
+        refusal
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.kind == ExpiryConflictKind::Missing)
+    );
+
+    let stale = ExpiryRequest::new(
+        fs.filesystem(),
+        ExpiryId::generate(),
+        latest,
+        vec![first_revision],
+        Vec::new(),
+        [10; 32],
+    )
+    .unwrap();
+    assert_eq!(
+        Authority::expire_revisions(fs, &stale).await.unwrap(),
+        ExpiryOutcome::Conflict
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_contract_object_and_metadata_service() {
     let object_backend = TestBackend::default();
@@ -197,6 +337,38 @@ async fn shared_contract_object_and_metadata_service() {
         .await
         .unwrap();
     suite(&service).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logical_expiry_contract_object_service_and_client() {
+    let object_backend = TestBackend::default();
+    let object = ObjectFs::create(object_backend.operator(), BackendProfile::Minio)
+        .await
+        .unwrap();
+    expiry_contract(&object).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    expiry_contract(&service).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    let token = "test-only-service-token-32-bytes-long";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, service.clone(), token.into()));
+    let client = ServiceClient::connect(addr, token.into(), backend.operator())
+        .await
+        .unwrap();
+    expiry_contract(&client).await;
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

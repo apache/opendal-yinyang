@@ -2265,6 +2265,7 @@ fn pack_object_id(path: &str, prefix: &str) -> Option<[u8; 16]> {
 
 fn physical_issue_state(kind: ErrorKind) -> &'static str {
     match kind {
+        ErrorKind::Expired => "expired",
         ErrorKind::NotFound => "missing",
         ErrorKind::Corrupt => "corrupt",
         ErrorKind::Invalid | ErrorKind::InvalidName => "invalid",

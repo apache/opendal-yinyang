@@ -166,6 +166,13 @@ type RequestWire = (
     Vec<Vec<u8>>,
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplayIdentity {
+    pub(crate) volume: NodeId,
+    pub(crate) id: CommitId,
+    pub(crate) digest: [u8; 32],
+}
+
 impl Transaction {
     /// Persist the exact plan, not permission to trust its content descriptors.
     /// Restore through the selected authority before submitting after a restart.
@@ -253,6 +260,49 @@ impl Transaction {
             crate::CommitId::from_bytes(id),
             digest,
         ))
+    }
+    /// Validate the complete canonical request and recompute its digest without
+    /// requiring the base snapshot or content preparation evidence.
+    pub(crate) fn inspect_replay_identity(bytes: &[u8]) -> Result<ReplayIdentity> {
+        let (_, volume, id, _, stored_digest, conditions, mutations) = Self::wire(bytes)?;
+        let mut seen = BTreeSet::new();
+        for (key, _) in &conditions {
+            if key.is_empty()
+                || key[0] > ENTRY
+                || (key[0] != ENTRY && key.len() != 17)
+                || (key[0] == ENTRY && key.len() < 18)
+                || !seen.insert(key.clone())
+            {
+                return Err(Error::invalid(
+                    "inspect transaction",
+                    "invalid or duplicate predicate",
+                ));
+            }
+        }
+        let volume = NodeId::from_bytes(volume);
+        let id = CommitId::from_bytes(id);
+        let logical = mutations
+            .iter()
+            .enumerate()
+            .map(|(ordinal, bytes)| logical_mutation(bytes, volume, id, ordinal))
+            .collect::<Result<Vec<_>>>()?;
+        let digest_input = encode(&(
+            REQUEST_MAGIC,
+            *volume.as_bytes(),
+            conditions
+                .iter()
+                .map(|(key, expected)| (key, expected))
+                .collect::<Vec<_>>(),
+            logical,
+        ))?;
+        let digest = blake3::derive_key(REQUEST_HASH_CONTEXT, &digest_input);
+        if digest != stored_digest {
+            return Err(Error::invalid(
+                "inspect transaction",
+                "stored request digest does not match canonical bytes",
+            ));
+        }
+        Ok(ReplayIdentity { volume, id, digest })
     }
     fn wire(bytes: &[u8]) -> Result<RequestWire> {
         if bytes.len() > 16 * 1024 * 1024 {
@@ -404,6 +454,84 @@ impl Transaction {
         };
         request.validate(snapshot.filesystem)?;
         Ok(request)
+    }
+}
+
+fn logical_mutation(bytes: &[u8], volume: NodeId, id: CommitId, ordinal: usize) -> Result<Vec<u8>> {
+    match bytes.first() {
+        Some(0) => {
+            let (_, node, parent, name, file, executable): (
+                u8,
+                [u8; 16],
+                [u8; 16],
+                String,
+                Option<Vec<u8>>,
+                bool,
+            ) = crate::namespace::decode(bytes)?;
+            let parent = NodeId::from_bytes(parent);
+            entry_key(parent, &name)?;
+            let seed = encode(&(*volume.as_bytes(), *id.as_bytes(), ordinal as u64))?;
+            let derived = blake3::derive_key(NODE_IDENTITY_CONTEXT, &seed);
+            if node != derived[..16] {
+                return Err(Error::invalid(
+                    "inspect transaction",
+                    "invalid creation identity",
+                ));
+            }
+            let file = file
+                .map(|bytes| crate::ContentDescriptor::from_bytes(&bytes))
+                .transpose()?;
+            if file
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.filesystem() != volume)
+            {
+                return Err(Error::invalid(
+                    "inspect transaction",
+                    "content descriptor belongs to another volume",
+                ));
+            }
+            encode(&(
+                0_u8,
+                node,
+                *parent.as_bytes(),
+                name,
+                file.as_ref().map(|file| {
+                    let content = file.content_id();
+                    (content.length(), *content.digest())
+                }),
+                executable,
+            ))
+        }
+        Some(1) => {
+            let (_, node, file): (u8, [u8; 16], Vec<u8>) = crate::namespace::decode(bytes)?;
+            let file = crate::ContentDescriptor::from_bytes(&file)?;
+            if file.filesystem() != volume {
+                return Err(Error::invalid(
+                    "inspect transaction",
+                    "content descriptor belongs to another volume",
+                ));
+            }
+            let content = file.content_id();
+            encode(&(1_u8, node, content.length(), *content.digest()))
+        }
+        Some(2) => {
+            let (tag, node, value): (u8, [u8; 16], bool) = crate::namespace::decode(bytes)?;
+            encode(&(tag, node, value))
+        }
+        Some(3) => {
+            let (tag, node, parent, name): (u8, [u8; 16], [u8; 16], String) =
+                crate::namespace::decode(bytes)?;
+            entry_key(NodeId::from_bytes(parent), &name)?;
+            encode(&(tag, node, parent, name))
+        }
+        Some(4) => {
+            let (tag, node): (u8, [u8; 16]) = crate::namespace::decode(bytes)?;
+            encode(&(tag, node))
+        }
+        _ => Err(Error::unsupported(
+            "inspect transaction",
+            "unknown mutation profile",
+        )),
     }
 }
 
