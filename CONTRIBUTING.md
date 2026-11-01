@@ -28,6 +28,8 @@ and CI. Run `cargo x --help` to list its commands.
 - `cargo x test` runs all workspace tests.
 - `cargo x test-linux-fuse` runs real Linux FUSE acceptance through `yy` and
   `/dev/fuse`.
+- `cargo x test-linux-applications` runs the tested rsync and GNU tar workflows
+  through a real Linux FUSE mount.
 - `cargo x test-linux-direct` runs deterministic read-only and writable Direct
   Mount plus Direct Sync acceptance against raw S3 keys and a real Linux FUSE
   mount.
