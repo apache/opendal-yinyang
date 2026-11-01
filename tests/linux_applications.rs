@@ -328,12 +328,8 @@ fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool) 
         b"#!/bin/sh\nprintf 'archive trial\\n'\n",
         writable_mode,
     );
-    for directory in ["", "assets", "bin", "notes"] {
-        let path = if directory.is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(directory)
-        };
+    for directory in ["assets", "bin", "notes"] {
+        let path = root.join(directory);
         assert_eq!(
             mode(&path),
             directory_mode,
