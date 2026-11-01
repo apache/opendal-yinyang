@@ -1424,7 +1424,7 @@ impl Store {
                             dev: identity.dev,
                             ino: identity.ino,
                             size: u64::try_from(size)
-                                .map_err(|_| corrupt_sql("negative local stat size"))?,
+                                .map_err(|_| Error::corrupt("negative local stat size"))?,
                             mtime,
                             mtime_nsec,
                             ctime,
@@ -1432,7 +1432,7 @@ impl Store {
                         })
                     }
                     (None, None, None, None, None) => None,
-                    _ => return Err(corrupt_sql("incomplete local scan stat evidence")),
+                    _ => return Err(Error::corrupt("incomplete local scan stat evidence")),
                 };
                 let local_node = LocalNode {
                     path: path.clone(),
@@ -1485,7 +1485,7 @@ impl Store {
             Option<i64>,
             Option<i64>,
         );
-        let row = self
+        let row: Option<RawHint> = self
             .connection
             .query_row(
                 "SELECT directory,local_digest,local_length,local_executable,
