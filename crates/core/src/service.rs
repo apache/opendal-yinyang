@@ -1000,8 +1000,14 @@ impl MetadataService {
         let mut outcomes = vec![None; plans.len()];
         let mut pending = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
-            let (base, _) = Transaction::inspect(plan)?;
-            match self.observe_revision(base).await {
+            let identity = Transaction::inspect_replay_identity(plan)?;
+            if identity.volume != self.filesystem {
+                return Err(Error::invalid(
+                    "service batch",
+                    "request belongs to another volume",
+                ));
+            }
+            match self.observe_revision(identity.base).await {
                 Ok(snapshot) => {
                     pending.push((index, self.restore_from_snapshot(plan, snapshot).await?));
                 }
@@ -1058,6 +1064,9 @@ impl MetadataService {
         }
         if requests.is_empty() {
             return Ok(vec![]);
+        }
+        for request in requests {
+            request.validate(self.filesystem)?;
         }
         let plans = requests
             .iter()
