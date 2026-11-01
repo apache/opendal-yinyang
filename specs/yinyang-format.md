@@ -16,14 +16,14 @@ record boundary. Evaluation produces changed node and directory records; the
 object authority applies those changes to its copy-on-write indexes. Physical
 index writes are not part of logical predicate validation. This separation does
 not change the object encoding or publication point.
-`create` and `open` require an explicit `BackendProfile`: Amazon S3 or MinIO.
-The endpoint must provide that deployment's durable immutable writes, strongly
-consistent reads and atomic conditional writes. Selecting a profile is an
-assertion about the configured endpoint, not a capability discovery mechanism.
-Other S3-compatible products are not automatically supported. Capability flags
-are additionally checked; the backend must support streaming writes,
-create-if-absent and if-match. The MinIO integration test exercises these
-operations against a real server. It does not prove every S3-compatible
+`create` and `open` accept only the configured operator. Deployment-specific
+Amazon S3 or MinIO selection belongs to the configuration layer that constructs
+that operator; core does not carry an unused profile parameter. The endpoint
+must provide durable immutable writes, strongly consistent reads and atomic
+conditional writes. Other S3-compatible products are not automatically
+supported. Capability flags are checked; the backend must support streaming
+writes, create-if-absent and if-match. The MinIO integration test exercises
+these operations against a real server. It does not prove every S3-compatible
 deployment has the same semantics.
 
 YinYang owns `.yinyang/` below the operator root. External replacement or

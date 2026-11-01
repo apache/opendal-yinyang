@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::transaction::Planner;
 use yinyang::core::{
-    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs,
-    NodeId, Revision, Snapshot, Transaction,
+    Authority, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs, NodeId,
+    Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
@@ -101,9 +101,7 @@ impl Authority for LostResponseAuthority {
 #[tokio::test]
 async fn namespace_only_unknown_protects_baseline_without_content_handle() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let inner: Arc<dyn Authority> = Arc::new(fs);
     let fault = Arc::new(LostResponseAuthority::new(inner));
     let authority: Arc<dyn Authority> = fault.clone();
@@ -153,9 +151,7 @@ async fn namespace_only_unknown_protects_baseline_without_content_handle() {
 #[tokio::test]
 async fn foreign_staging_is_unavailable_and_not_attributed() {
     let source_backend = TestBackend::default();
-    let source = Fs::create(source_backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let source = Fs::create(source_backend.operator()).await.unwrap();
     let source: Arc<dyn Authority> = Arc::new(source);
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("sync");
@@ -167,9 +163,7 @@ async fn foreign_staging_is_unavailable_and_not_attributed() {
     drop(sync);
 
     let target_backend = TestBackend::default();
-    let target = Fs::create(target_backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let target = Fs::create(target_backend.operator()).await.unwrap();
     assert_ne!(source.filesystem(), target.filesystem());
     let sync_database = state.join("sync.db");
     let before = std::fs::read(&sync_database).unwrap();
@@ -187,9 +181,7 @@ async fn foreign_staging_is_unavailable_and_not_attributed() {
 #[tokio::test]
 async fn keep_last_and_requested_pin_select_only_declared_revisions() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let authority: Arc<dyn Authority> = Arc::new(fs);
     let temp = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
@@ -246,9 +238,7 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
 #[tokio::test]
 async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let authority: Arc<dyn Authority> = Arc::new(fs);
     let content = authority
         .data()

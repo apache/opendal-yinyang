@@ -19,7 +19,7 @@
 mod support;
 use std::collections::BTreeSet;
 use support::TestBackend;
-use yinyang::core::{BackendProfile, Fs};
+use yinyang::core::Fs;
 use yinyang::volume::*;
 
 #[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
@@ -319,9 +319,7 @@ fn direct_sync_requires_conditional_delete_and_library_admission() {
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    Fs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    Fs::create(backend.operator()).await.unwrap();
     let cfg = config(temp.path().join("state"));
     let volume = Volume::open(cfg.clone(), backend.operator(), None)
         .await

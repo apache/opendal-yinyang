@@ -254,7 +254,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{VolumeConfig, reject_unpublished_staging, run};
-    use crate::core::{BackendProfile, Fs};
+    use crate::core::Fs;
     use crate::mount::Mount;
     use crate::runtime::Runtime;
     use crate::support;
@@ -321,14 +321,8 @@ mod tests {
     async fn read_only_mount_refuses_unpublished_staging() {
         let temp = tempfile::tempdir().unwrap();
         let backend = support::TestBackend::default();
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::open(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        Fs::create(backend.operator()).await.unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(Fs::open(backend.operator()).await.unwrap());
         let staging = temp.path().join("staging");
         let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
         runtime
@@ -348,14 +342,8 @@ mod tests {
     async fn read_only_mount_accepts_clean_staging() {
         let temp = tempfile::tempdir().unwrap();
         let backend = support::TestBackend::default();
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::open(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        Fs::create(backend.operator()).await.unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(Fs::open(backend.operator()).await.unwrap());
         let mount = Mount::open(authority, temp.path().join("staging"), true)
             .await
             .unwrap();

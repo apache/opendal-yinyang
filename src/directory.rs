@@ -565,14 +565,11 @@ fn io_error(path: &Path, error: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use crate::support::TestBackend;
-    use yinyang_core::BackendProfile;
 
     #[tokio::test]
     async fn install_rejects_noncanonical_paths_before_creating_the_destination() {
         let backend = TestBackend::default();
-        let fs = Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
+        let fs = Fs::create(backend.operator()).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         for (index, path) in [
             "/outside",

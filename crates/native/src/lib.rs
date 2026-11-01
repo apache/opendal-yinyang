@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, BackendProfile, Fs, Node, NodeId, NodeKind, Revision, Snapshot};
+use yinyang::core::{Authority, Fs, Node, NodeId, NodeKind, Revision, Snapshot};
 use yinyang::mount::{Mount, MountFile};
 use yinyang::runtime::{Error, ErrorKind, Result};
 use yinyang::sync::{EditId, Sync};
@@ -131,11 +131,10 @@ pub struct Session {
 }
 impl Session {
     pub async fn connect(config: Config, mode: Mode) -> Result<Self> {
-        let profile = match config.profile.as_str() {
-            "minio" => BackendProfile::Minio,
-            "amazon-s3" => BackendProfile::AmazonS3,
+        match config.profile.as_str() {
+            "minio" | "amazon-s3" => {}
             _ => return Err(Error::Invalid("unsupported native backend profile")),
-        };
+        }
         if !config.staging.is_absolute() {
             return Err(Error::Invalid("native staging must be absolute"));
         }
@@ -160,7 +159,7 @@ impl Session {
             if config.service_token.is_some() {
                 return Err(Error::Invalid("service token without service address"));
             }
-            Arc::new(Fs::open(operator, profile).await?)
+            Arc::new(Fs::open(operator).await?)
         };
         Self::open(authority, &config.staging, config.read_only, mode).await
     }

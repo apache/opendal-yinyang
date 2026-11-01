@@ -17,7 +17,7 @@
 
 use crate::data::{ContentDescriptor, DataStore};
 use crate::namespace::name_key;
-use crate::object::{BackendProfile, ObjectFs};
+use crate::object::ObjectFs;
 use crate::service::{MetadataService, ServiceClient, serve};
 use crate::support::{StoredObject, TestBackend};
 use crate::{CommitId, ErrorKind, NodeId, Transaction};
@@ -231,7 +231,7 @@ async fn assert_object_profile_open(head: &[u8], pack: &[u8], expected: Option<E
     insert_object(&backend, ".yinyang/head", head);
     seed_pack(&backend, pack);
     let before = backend.state.lock().unwrap().objects.clone();
-    let result = ObjectFs::open(backend.operator(), BackendProfile::Minio).await;
+    let result = ObjectFs::open(backend.operator()).await;
     match expected {
         Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
         None => {

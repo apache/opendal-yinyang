@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use yinyang::core::{BackendProfile, CommitId, Fs, Revision};
+use yinyang::core::{CommitId, Fs, Revision};
 #[cfg(target_os = "linux")]
 mod direct_sync_cli;
 mod directory_cli;
@@ -184,12 +184,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         _ => {}
     }
-    let profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
-        Ok("amazon-s3") => BackendProfile::AmazonS3,
-        Ok("minio") => BackendProfile::Minio,
-        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => BackendProfile::AmazonS3,
-        _ => return Err("set YINYANG_STORAGE_PROFILE to amazon-s3 or minio for the configured endpoint; other S3-compatible deployments are unsupported".into()),
-    };
+    validate_storage_profile()?;
     let config = std::env::vars()
         .filter_map(|(key, value)| {
             key.strip_prefix("YINYANG_S3_")
@@ -213,14 +208,14 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
     if matches!(cli.command, Command::Create) {
-        let fs = Fs::create(operator, profile).await?;
+        let fs = Fs::create(operator).await?;
         println!(
             "filesystem ready at revision {}",
             revision(fs.observe_latest().await?.revision())
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let fs = Fs::open(operator, profile).await?;
+    let fs = Fs::open(operator).await?;
     match cli.command {
         Command::Create
         | Command::Serve { .. }
@@ -349,6 +344,14 @@ fn parse_revision(value: &str) -> Result<Revision, String> {
         *byte = (hex_nibble(value[offset])? << 4) | hex_nibble(value[offset + 1])?;
     }
     Ok(Revision::from_bytes(bytes))
+}
+
+fn validate_storage_profile() -> Result<(), Box<dyn std::error::Error>> {
+    match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
+        Ok("amazon-s3" | "minio") => Ok(()),
+        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => Ok(()),
+        _ => Err("set YINYANG_STORAGE_PROFILE to amazon-s3 or minio for the configured endpoint; other S3-compatible deployments are unsupported".into()),
+    }
 }
 
 fn hex_nibble(value: u8) -> Result<u8, String> {

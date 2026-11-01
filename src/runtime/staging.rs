@@ -1424,11 +1424,7 @@ mod tests {
     async fn release_retains_typed_failure_when_the_ledger_is_unwritable() {
         let temp = tempfile::tempdir().unwrap();
         let backend = crate::support::TestBackend::default();
-        let authority = Arc::new(
-            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority = Arc::new(yinyang_core::Fs::create(backend.operator()).await.unwrap());
         let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
         runtime.create_file(authority.root(), "file").await.unwrap();
         let mut file = runtime.open_file("file", false).await.unwrap();
@@ -1602,10 +1598,7 @@ mod tests {
     #[tokio::test]
     async fn sparse_segments_overlay_only_dirty_bytes_and_keep_shrunk_extension_zero() {
         let backend = crate::support::TestBackend::default();
-        let authority =
-            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
-                .await
-                .unwrap();
+        let authority = yinyang_core::Fs::create(backend.operator()).await.unwrap();
         let base = b"0123456789abcdef";
         let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -1656,10 +1649,7 @@ mod tests {
     #[tokio::test]
     async fn sequential_sparse_writes_keep_rows_within_verification_chunks() {
         let backend = crate::support::TestBackend::default();
-        let authority =
-            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
-                .await
-                .unwrap();
+        let authority = yinyang_core::Fs::create(backend.operator()).await.unwrap();
         let length = CHUNK * 3;
         let base = vec![0_u8; length as usize];
         let prepared = authority.prepare(&mut base.as_slice()).await.unwrap();

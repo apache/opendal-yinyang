@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use yinyang_core::service::ServiceClient;
-use yinyang_core::{Authority, BackendProfile, ErrorKind as CoreErrorKind, Fs};
+use yinyang_core::{Authority, ErrorKind as CoreErrorKind, Fs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -146,14 +146,6 @@ pub enum Publication {
 pub enum StorageProfile {
     AmazonS3,
     Minio,
-}
-impl StorageProfile {
-    fn backend(self) -> BackendProfile {
-        match self {
-            Self::AmazonS3 => BackendProfile::AmazonS3,
-            Self::Minio => BackendProfile::Minio,
-        }
-    }
 }
 /// Strict configuration: unknown fields are errors, not ignored security policy.
 /// Storage credentials and RPC token are supplied separately, never serialized.
@@ -517,9 +509,7 @@ impl Volume {
             ));
         }
         let authority: Arc<dyn Authority> = match config.publication {
-            Publication::Object => {
-                Arc::new(Fs::open(operator, config.storage_profile.backend()).await?)
-            }
+            Publication::Object => Arc::new(Fs::open(operator).await?),
             Publication::Service => Arc::new(
                 ServiceClient::connect(
                     config.service_address.unwrap(),

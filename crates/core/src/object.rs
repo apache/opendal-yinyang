@@ -25,16 +25,6 @@ use crate::{Error, ErrorKind, NodeId, Result};
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
 
-/// Deployment semantics, not inferred from OpenDAL capability flags.
-/// The endpoint must implement the named provider's documented strong reads,
-/// durable immutable writes and atomic conditional writes. External mutations
-/// under the owned prefix invalidate these guarantees.
-#[derive(Clone, Copy, Debug)]
-pub enum BackendProfile {
-    AmazonS3,
-    Minio,
-}
-
 // Kept available here for existing object-profile callers.
 pub use crate::snapshot::{
     Change, ChangeRecord, Cursor, DirectoryPage, Outcome, Receipt, Revision, ScanToken, Snapshot,
@@ -212,8 +202,8 @@ struct Head {
     etag: String,
 }
 impl ObjectFs {
-    pub async fn create(operator: Operator, profile: BackendProfile) -> Result<Self> {
-        validate_backend(&operator, profile)?;
+    pub async fn create(operator: Operator) -> Result<Self> {
+        validate_backend(&operator)?;
         if let Some(head) = read_head(&operator).await? {
             return Self::from_head(operator, head).await;
         }
@@ -258,15 +248,15 @@ impl ObjectFs {
             .if_not_exists(true)
             .await
         {
-            Ok(_) => Self::open(operator, profile).await,
-            Err(error) => match Self::open(operator, profile).await {
+            Ok(_) => Self::open(operator).await,
+            Err(error) => match Self::open(operator).await {
                 Ok(fs) => Ok(fs),
                 Err(_) => Err(Error::from_storage("create filesystem head", error)),
             },
         }
     }
-    pub async fn open(operator: Operator, profile: BackendProfile) -> Result<Self> {
-        validate_backend(&operator, profile)?;
+    pub async fn open(operator: Operator) -> Result<Self> {
+        validate_backend(&operator)?;
         let head = read_head(&operator)
             .await?
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "open filesystem", "head is missing"))?;
@@ -587,7 +577,7 @@ async fn read_snapshot_roots(
         roots.next().unwrap()?,
     ])
 }
-fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()> {
+fn validate_backend(operator: &Operator) -> Result<()> {
     let info = operator.info();
     let cap = info.capability();
     if info.scheme() != "s3"

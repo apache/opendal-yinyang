@@ -19,14 +19,12 @@
 mod support;
 use std::path::Path;
 use support::TestBackend;
-use yinyang::core::{BackendProfile, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
+use yinyang::core::{CommitId, CommitOutcome, ErrorKind, Fs, Planner};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 use yinyang::{DirectoryJournal, DirectoryState};
 
 async fn filesystem(backend: &TestBackend) -> Fs {
-    Fs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap()
+    Fs::create(backend.operator()).await.unwrap()
 }
 fn committed(outcome: CommitOutcome) -> yinyang::core::Receipt {
     match outcome {
@@ -108,9 +106,7 @@ async fn round_trip_replacement_retry_and_pinned_restore() {
         receipt,
         "retry original plan after local mutation"
     );
-    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = Fs::open(backend.operator()).await.unwrap();
     let old_output = temp.path().join("old");
     yinyang::restore_directory_revision(&reopened, pinned.revision(), &old_output)
         .await
@@ -413,9 +409,7 @@ async fn journal_reopens_exact_intent_and_exports_without_the_source() {
 
     drop(journal);
     drop(fs);
-    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = Fs::open(backend.operator()).await.unwrap();
     let journal = DirectoryJournal::open(&reopened, &state).await.unwrap();
     let receipt = journal.publish(id).await.unwrap();
     assert_eq!(receipt.request_digest, prepared.intent.request_digest);
@@ -516,9 +510,7 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
     backend.state.lock().unwrap().offline = false;
     drop(journal);
     drop(fs);
-    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = Fs::open(backend.operator()).await.unwrap();
     let journal = DirectoryJournal::open(&reopened, &state).await.unwrap();
     let receipt = journal.publish(id).await.unwrap();
     assert_eq!(receipt.commit_id, id);

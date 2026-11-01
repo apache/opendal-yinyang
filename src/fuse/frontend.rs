@@ -1679,7 +1679,7 @@ impl Filesystem for FuseFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BackendProfile, Fs};
+    use crate::core::Fs;
     use crate::runtime::Runtime;
     use crate::support::TestBackend;
     use std::sync::Arc;
@@ -1707,11 +1707,7 @@ mod tests {
     async fn dirty_shared_node_reports_staged_size_in_path_attrs() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
         let mount = Mount::open(authority.clone(), temp.path(), false)
             .await
             .unwrap();
@@ -1738,11 +1734,7 @@ mod tests {
     async fn stale_clean_path_attr_reclaims_to_latest() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
         let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
             .await
             .unwrap();
@@ -1785,11 +1777,7 @@ mod tests {
     async fn release_detach_drops_last_mount_ref_and_preserves_inflight_pin() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
         let mount = Mount::open(authority.clone(), temp.path(), false)
             .await
             .unwrap();
@@ -1836,11 +1824,7 @@ mod tests {
     async fn open_reclaims_stale_clean_version_after_transient_busy() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
         let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
             .await
             .unwrap();
@@ -1884,11 +1868,7 @@ mod tests {
     async fn read_only_range_attributes_pin_executable_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
         let writer = Runtime::open(authority.clone(), temp.path().join("writer"))
             .await
             .unwrap();
