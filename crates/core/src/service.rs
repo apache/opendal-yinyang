@@ -133,20 +133,13 @@ fn with_read_snapshot<T>(
     conn: &Connection,
     read: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
-    let owns_snapshot = conn.is_autocommit();
-    if owns_snapshot {
-        conn.execute_batch("BEGIN DEFERRED").map_err(sql)?;
+    if !conn.is_autocommit() {
+        return read(conn);
     }
-    let result = read(conn);
-    if owns_snapshot {
-        match &result {
-            Ok(_) => conn.execute_batch("COMMIT").map_err(sql)?,
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
-        }
-    }
-    result
+    let tx = conn.unchecked_transaction().map_err(sql)?;
+    let result = read(&tx)?;
+    tx.commit().map_err(sql)?;
+    Ok(result)
 }
 
 fn inspect_schema(conn: &Connection) -> Result<Option<SchemaProfile>> {

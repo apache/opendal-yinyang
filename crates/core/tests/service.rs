@@ -782,7 +782,8 @@ async fn lost_and_delayed_rpc_responses_resolve_the_original_request() {
     let delayed = delayed.finish().unwrap();
     let id = delayed.id();
     mode.store(2, Ordering::SeqCst);
-    let pending = tokio::spawn(async move { client.commit(&delayed).await });
+    let pending_client = client.clone();
+    let pending = tokio::spawn(async move { pending_client.commit(&delayed).await });
     reached.notified().await;
     let intermediate = service.observe_latest().await.unwrap();
     let old = intermediate.receipt(id).await.unwrap().unwrap();
