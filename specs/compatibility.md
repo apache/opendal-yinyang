@@ -31,17 +31,21 @@ known profiles return `Corrupt` or `Invalid` as appropriate.
 | Family | Supported identifier | Reader | Writer | Older profiles | Newer profiles |
 | --- | --- | --- | --- | --- | --- |
 | Authenticated content | `YYFILE02` descriptor, `YYHASH02` index, 64 KiB logical units, content hash context 2 | Yes | Yes | No | Reject |
-| Object metadata | `YYHEAD02` mode 0, `YYSNAP02`, `YYINDEX2` | Yes | Yes | Reject `YYHEAD01` | Reject |
+| Object metadata | `YYHEAD02` mode 0 / `YYSNAP02`; mode 1 / `YYSNAP03` / `YYEXP01` | Yes | Yes | Mode 0 is readable; reject `YYHEAD01` | Reject |
 | Canonical request | `YYREQ002`, request hash context 2, node identity context 2 | Yes | Yes | No | Reject |
 | Frozen transaction | `YYPLAN01` | Yes | Yes | No | Reject |
 | Service binding | `YYSERV01` | Yes | Yes | No | Reject |
-| SQLite authority | `yinyang-sqlite-1` | Yes | Yes | No | Reject |
+| SQLite authority | `yinyang-sqlite-1`; one-way `yinyang-sqlite-2` with `expiry` | Yes | Yes | Profile 1 is readable; no other older schema | Reject |
 | Loopback RPC | Protocol version 1 | Yes | Yes | No | Reject |
 
-The current writer emits only the identifiers in this table. The current reader
-does not perform an in-place profile upgrade, downgrade, authority-mode switch,
-or mixed-profile write. A retained object, receipt, or frozen request remains
-readable only while every profile reached by that state is supported.
+The current writer emits the mode/profile selected by the authority. A
+never-expired object authority remains mode 0, and a never-expired service
+authority remains profile 1. The first successful explicit expiry performs the
+one-way transition to object mode 1 or SQLite profile 2. The current reader
+does not perform an in-place profile downgrade, authority-mode switch, or
+mixed-profile write. A retained object, receipt, or frozen request remains
+readable according to its explicit history state only while every profile
+reached by that state is supported.
 
 All rows are independently versioned. Implementing one row does not imply
 support for another. In particular, a valid service binding cannot be opened as
@@ -57,11 +61,11 @@ can mutate durable state:
 | --- | --- | --- | --- |
 | Content descriptor | Identifier and fixed field bounds | `Unsupported` before payload reads | `Corrupt` |
 | Content hash node | Identifier before tag decoding or payload output | `Unsupported` before bytes reach the destination | `Corrupt` |
-| Object head | Exact head bytes and profile/mode | `Unsupported` before head creation or replacement | `Corrupt` |
-| Object snapshot and index | Identifier before interpreting fields or child records | `Unsupported` before publication | `Corrupt` |
+| Object head | Exact head bytes and mode 0/1 | `Unsupported` before head creation or replacement | `Corrupt` |
+| Object snapshot and index | `YYSNAP02`/`YYSNAP03`, expiry record, and index identifiers before interpreting fields or child records | `Unsupported` before publication | `Corrupt` |
 | Frozen plan | Identifier before authority observation or content import | `Unsupported` | `Corrupt` or `Invalid` |
 | Service binding | Exact `YYSERV01` envelope before client acceptance | `Unsupported` | `Corrupt`; a different valid binding is `Invalid` |
-| SQLite authority | Schema profile, manifest, required tables, and column order before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
+| SQLite authority | Schema profile, manifest, profile-specific required tables, and column order before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
 | Loopback RPC | Frame decode and token authentication, then protocol version | `Unsupported` before command dispatch | `Invalid` |
 
 Authentication failures use the transport's existing `Invalid` response and do
@@ -79,13 +83,23 @@ There is no generic migration engine. The only guaranteed transitions are:
   its authority remains supported;
 - replaying the original frozen request and receiving its original receipt; and
 - opening immutable content whose descriptor and all reachable index nodes use
-  the supported content profile.
+  the supported content profile;
+- resolving a committed receipt after its base snapshot has been explicitly
+  expired, provided the frozen-plan bytes and current authority binding match
+  the preserved receipt metadata; and
+- performing the one-time mode-0 to mode-1 or profile-1 to profile-2 transition
+  during the first explicit expiry.
 
 Creating a new filesystem is not migration. Exporting and importing logical data
 through an application protocol is separate from opening the old persistent
 state. Automatic profile upgrades, downgrade after a newer writer has opened the
 state, and live authority-mode changes are unsupported unless another
 specification explicitly adds them.
+
+The first expiry transition is not an automatic upgrade of existing
+authorities. A never-expired authority remains on the old profile and stays
+readable by older supported readers. Once activated, older readers must fail
+closed at the head mode or SQLite profile before publishing.
 
 The 64 KiB content verification unit enters logical identity and remains fixed
 unless a new content profile is introduced. The merged
@@ -153,7 +167,10 @@ profile descriptions at source revision `fd1338c2`. Tests consume the committed
 bytes rather than regenerating them with the current writer. They cover content
 proofs and ranges, Unicode names and byte order, a frozen request digest,
 receipts, object profiles, SQLite manifest data, and malformed or unknown
-variants.
+variants. Expiry regressions additionally read and write both base profiles,
+exercise the one-way capture of `YYSNAP03`/`YYEXP01` and SQLite profile 2, and
+verify expired versus never-existing reads, detailed history, exact receipt
+resolution, and lost-ack retry.
 
 These vectors establish same-profile reader and writer agreement. Cross-binary
 qualification against the exact old source revision and recovery of retained
