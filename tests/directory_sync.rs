@@ -520,6 +520,44 @@ async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
     assert_eq!(reader_status.summary.retained_bytes, 0);
     assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
     tokio::time::sleep(Duration::from_millis(1100)).await;
+    {
+        let connection = rusqlite::Connection::open(reader_state.join("replica.db")).unwrap();
+        let row: (Vec<u8>, i64, i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT local_digest,local_length,local_stat_mtime,local_stat_mtime_nsec,
+                        local_stat_ctime,local_stat_ctime_nsec,local_stat_recorded_ns
+                 FROM baseline WHERE path='large'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let stat = std::fs::metadata(reader_root.join("large")).unwrap();
+        println!(
+            "W2_SCAN_EVIDENCE digest={} length={} stored_mtime={}.{} stored_ctime={}.{} \
+             recorded={} actual_mtime={}.{} actual_ctime={}.{}",
+            row.0.len(),
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            row.5,
+            row.6,
+            stat.st_mtime(),
+            stat.st_mtime_nsec(),
+            stat.st_ctime(),
+            stat.st_ctime_nsec(),
+        );
+    }
     reader.reset_hash_bytes_read();
     assert!(reader.run().await.unwrap().in_sync);
     assert_eq!(
