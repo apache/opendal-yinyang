@@ -589,7 +589,7 @@ fn validate_backend(operator: &Operator) -> Result<()> {
     {
         return Err(Error::unsupported(
             "open object authority",
-            "the selected S3 semantic profile and conditional streaming capabilities are required",
+            "the S3 transport and conditional streaming capabilities are required",
         ));
     }
     Ok(())
