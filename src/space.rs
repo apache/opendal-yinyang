@@ -2505,7 +2505,9 @@ mod tests {
         let inspection = inspect_local_staging(&staging).await;
         assert_eq!(inspection.state, StagingState::Unavailable);
         assert!(inspection.errors.iter().any(|error| {
-            error.contains("unknown staging profile") || error.contains("unsupported profile")
+            error.contains("unknown staging profile")
+                || error.contains("unsupported profile")
+                || error.contains("is not supported")
         }));
         assert!(!staging.join("runtime.lock").exists());
         assert_eq!(std::fs::read(&database).unwrap(), before);

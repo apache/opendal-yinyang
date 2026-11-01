@@ -3389,7 +3389,7 @@ mod tests {
             Ok(_) => panic!("partial Direct runtime database was accepted"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
         assert!(!state.path().join("runtime.lock").exists());
         assert!(!state.path().join("objects").exists());
         assert!(!state.path().join("inputs").exists());
@@ -3591,7 +3591,7 @@ mod tests {
         assert_eq!(inspection.mutations.staged, 0);
         assert_eq!(
             inspection.profile.as_deref(),
-            Some("yinyang-direct-runtime-1")
+            Some("yinyang-direct-runtime-2")
         );
         let error = DirectRuntime::inspect(&state, Some(&binding("other"))).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Invalid);

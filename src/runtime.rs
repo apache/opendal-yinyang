@@ -966,12 +966,12 @@ mod tests {
         let connection = crate::local::store::open_read_only(&staging.join("staging.db")).unwrap();
         let data: Vec<u8> = connection
             .query_row(
-                "SELECT data FROM chunks WHERE handle=?1 AND position=0",
+                "SELECT data FROM segments WHERE handle=?1 AND position=0",
                 rusqlite::params![handle.id().as_bytes()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(&data[..17], b"durable-at-barrier");
+        assert_eq!(data, b"durable-at-barrier");
 
         handle.sync_local().await.unwrap();
         assert_eq!(

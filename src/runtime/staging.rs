@@ -1510,9 +1510,11 @@ mod tests {
             waiting.await.unwrap();
             let writer = stage.clone();
             let mut submitted = Box::pin(writer.call(|c| {
+                let failure =
+                    borsh::to_vec(&Failure::capture(&Error::Invalid("accepted"))).unwrap();
                 c.execute(
-                    "INSERT INTO errors(handle,message) VALUES(?1,'accepted')",
-                    params![[0_u8; 16].as_slice()],
+                    "INSERT INTO errors(handle,message,failure) VALUES(?1,'accepted',?2)",
+                    params![[0_u8; 16].as_slice(), failure],
                 )
                 .map_err(local)?;
                 Ok(())
