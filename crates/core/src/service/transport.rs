@@ -285,7 +285,7 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 return Err(protocol());
             }
             let snapshot = service
-                .observe_revision(Revision::from_bytes(revision))
+                .retained_snapshot(Revision::from_bytes(revision))
                 .await?;
             Response::Value(snapshot.reader.get(table(tag)?, &key).await?)
         }
@@ -299,7 +299,7 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 return Err(protocol());
             }
             let snapshot = service
-                .observe_revision(Revision::from_bytes(revision))
+                .retained_snapshot(Revision::from_bytes(revision))
                 .await?;
             Response::Rows(
                 snapshot
@@ -409,13 +409,9 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
             if plans.len() > 4096 {
                 return Err(protocol());
             }
-            let mut requests = Vec::new();
-            for plan in plans {
-                requests.push(service.restore_transaction(&plan).await?);
-            }
             Response::Outcomes(
                 service
-                    .commit_batch(&requests)
+                    .commit_encoded(&plans)
                     .await?
                     .into_iter()
                     .map(|outcome| {

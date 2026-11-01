@@ -151,7 +151,18 @@ fn inspect_schema(conn: &Connection) -> Result<Option<SchemaProfile>> {
             "database is not a YinYang authority",
         ));
     }
-    let (profile, _, _, _) = manifest(conn)?;
+    let profile: Option<String> = conn
+        .query_row(
+            "SELECT profile FROM authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| corrupt_schema(format!("cannot read authority profile: {error}")))?;
+    let Some(profile) = profile else {
+        return Err(corrupt_schema("authority profile row is missing"));
+    };
+    let profile = SchemaProfile::parse(&profile)?;
     let required = match profile {
         SchemaProfile::Base => BASE_TABLES.as_slice(),
         SchemaProfile::Expiry => EXPIRY_TABLES.as_slice(),
@@ -302,13 +313,9 @@ fn parse_service_binding(bytes: &[u8]) -> Result<(NodeId, NodeId)> {
     Ok((NodeId::from_bytes(filesystem), NodeId::from_bytes(root)))
 }
 fn revision_exists(conn: &Connection, revision: Revision) -> Result<bool> {
-    let sequence = i64::try_from(revision.sequence).map_err(|_| {
-        Error::new(
-            ErrorKind::NotFound,
-            "observe service revision",
-            "revision not retained",
-        )
-    })?;
+    let Ok(sequence) = i64::try_from(revision.sequence) else {
+        return Ok(false);
+    };
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
         params![revision.to_bytes().as_slice(), sequence],
@@ -473,6 +480,38 @@ impl MetadataService {
                     "observe service revision",
                     revision,
                     "revision is logically expired",
+                ));
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(self.snapshot(db, revision))
+    }
+    /// Reopen records for an already-issued lazy observation. This validates
+    /// that the retained rows still exist, but deliberately does not re-check
+    /// expiry: logical expiry affects fresh observations, not immutable
+    /// observations already handed to a caller.
+    pub(crate) async fn retained_snapshot(&self, revision: Revision) -> Result<Snapshot> {
+        if revision.sequence > i64::MAX as u64 {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "observe service revision",
+                "revision not retained",
+            ));
+        }
+        let db = connect(&self.path, false).await?;
+        let expected_volume = self.filesystem;
+        let expected_root = self.root;
+        db_call(&db, move |c| {
+            let (_, volume, root, _) = manifest(c)?;
+            if volume != expected_volume || root != expected_root {
+                return Err(Error::invalid("observe service", "authority changed"));
+            }
+            if !revision_exists(c, revision)? {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "observe service revision",
+                    "revision not retained",
                 ));
             }
             Ok(())
@@ -921,10 +960,14 @@ impl MetadataService {
         self.remember(&content).await
     }
     pub async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
-        let (revision, files) = Transaction::inspect(bytes)?;
+        let (revision, _) = Transaction::inspect(bytes)?;
         let snapshot = self.observe_revision(revision).await?;
+        self.restore_from_snapshot(bytes, snapshot).await
+    }
+    async fn restore_from_snapshot(&self, bytes: &[u8], snapshot: Snapshot) -> Result<Transaction> {
         let db = connect(&self.path, false).await?;
         let mut prepared = Vec::new();
+        let (_, files) = Transaction::inspect(bytes)?;
         for file in files {
             let descriptor = file.to_bytes();
             let present = db_call(&db, move |c| {
@@ -946,6 +989,80 @@ impl MetadataService {
         }
         Transaction::restore(bytes, &snapshot, &prepared).await
     }
+    async fn resolve_plan_receipt(&self, bytes: &[u8]) -> Result<Option<Receipt>> {
+        let identity = Transaction::inspect_replay_identity(bytes)?;
+        if identity.volume != self.filesystem {
+            return Err(Error::invalid(
+                "resolve receipt",
+                "request belongs to another volume",
+            ));
+        }
+        let latest = self.observe_latest().await?;
+        match latest.receipt(identity.id).await? {
+            Some(receipt) if receipt.request_digest == identity.digest => Ok(Some(receipt)),
+            Some(_) => Err(Error::invalid(
+                "resolve receipt",
+                "commit identity was reused with a different request digest",
+            )),
+            None => Ok(None),
+        }
+    }
+    pub(crate) async fn commit_encoded(&self, plans: &[Vec<u8>]) -> Result<Vec<Outcome>> {
+        if plans.len() > 4096 {
+            return Err(Error::unsupported(
+                "service batch",
+                "more than 4096 requests",
+            ));
+        }
+        if plans.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut outcomes = vec![None; plans.len()];
+        let mut pending = Vec::new();
+        for (index, plan) in plans.iter().enumerate() {
+            let (base, _) = Transaction::inspect(plan)?;
+            match self.observe_revision(base).await {
+                Ok(snapshot) => {
+                    pending.push((index, self.restore_from_snapshot(plan, snapshot).await?));
+                }
+                Err(error) if error.kind() == ErrorKind::Expired => {
+                    let Some(receipt) = self.resolve_plan_receipt(plan).await? else {
+                        return Err(error);
+                    };
+                    outcomes[index] = Some(Outcome::Committed(receipt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !pending.is_empty() {
+            let requests = pending
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect::<Vec<_>>();
+            let published = match self.publish(&requests).await {
+                Ok(outcomes) => outcomes,
+                Err(error) if error.kind() == ErrorKind::Storage => {
+                    vec![Outcome::Retryable; requests.len()]
+                }
+                Err(error) => return Err(error),
+            };
+            for ((index, _), outcome) in pending.into_iter().zip(published) {
+                outcomes[index] = Some(outcome);
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Corrupt,
+                        "service batch",
+                        "missing outcome for an encoded request",
+                    )
+                })
+            })
+            .collect()
+    }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
             .commit_batch(std::slice::from_ref(request))
@@ -962,19 +1079,11 @@ impl MetadataService {
         if requests.is_empty() {
             return Ok(vec![]);
         }
-        // Even an in-process caller must have registered durable readiness.
-        let mut restored = Vec::new();
-        for request in requests {
-            request.validate(self.filesystem)?;
-            restored.push(self.restore_transaction(&request.to_bytes()?).await?);
-        }
-        let result = self.publish(&restored).await;
-        match result {
-            Err(e) if e.kind() == ErrorKind::Storage => {
-                Ok(requests.iter().map(|_| Outcome::Retryable).collect())
-            }
-            other => other,
-        }
+        let plans = requests
+            .iter()
+            .map(Transaction::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_encoded(&plans).await
     }
     async fn publish(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
         let db = connect(&self.path, false).await?;
