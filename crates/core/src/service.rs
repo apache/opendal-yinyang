@@ -119,7 +119,7 @@ impl Drop for SqliteTransaction {
 }
 
 fn rollback_sync(writer: &Db) {
-    let Ok(mut connection) = writer.lock() else {
+    let Ok(connection) = writer.lock() else {
         return;
     };
     let _ = connection.execute_batch("ROLLBACK");
