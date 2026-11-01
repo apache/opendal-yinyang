@@ -34,7 +34,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 
 mod transport;
@@ -42,6 +42,9 @@ pub use transport::{ServiceClient, serve};
 
 type Db = Arc<Mutex<Connection>>;
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
+const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const CHECKPOINT_RETRY: Duration = Duration::from_millis(10);
+const CHECKPOINT_BUDGET: Duration = Duration::from_secs(3);
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
     ("singleton", "INTEGER"),
     ("profile", "TEXT"),
@@ -209,7 +212,7 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
             flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
         }
         let conn = Connection::open_with_flags(path, flags).map_err(sql)?;
-        conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
         let existing = inspect_schema(&conn)?;
         if !existing && !create {
             return Err(Error::new(
@@ -233,7 +236,7 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
     tokio::task::spawn_blocking(move || {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(sql)?;
-        conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
         conn.execute_batch("PRAGMA query_only=ON;").map_err(sql)?;
         if !inspect_schema(&conn)? {
             return Err(Error::new(
@@ -248,8 +251,19 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
     .map_err(|e| Error::new(ErrorKind::Storage, "open metadata worker", e.to_string()))?
 }
 fn barrier(conn: &Connection) -> Result<()> {
-    // A FULL checkpoint syncs the WAL and database after NORMAL commits.
-    for attempt in 0..100 {
+    // A FULL checkpoint syncs the WAL and database after NORMAL commits. Disable
+    // SQLite's busy wait during the retry loop so a concurrent reader cannot
+    // extend this operation beyond the three-second wall-clock budget.
+    conn.busy_timeout(Duration::ZERO).map_err(sql)?;
+    let checkpoint = checkpoint_until(conn, Instant::now());
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
+    checkpoint
+}
+fn checkpoint_until(conn: &Connection, started: Instant) -> Result<()> {
+    loop {
+        if started.elapsed() >= CHECKPOINT_BUDGET {
+            break;
+        }
         let checkpoint: rusqlite::Result<(i64, i64, i64)> =
             conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -264,9 +278,11 @@ fn barrier(conn: &Connection) -> Result<()> {
                 ) => {}
             Err(error) => return Err(sql(error)),
         }
-        if attempt + 1 < 100 {
-            std::thread::sleep(Duration::from_millis(10));
+        let remaining = CHECKPOINT_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
         }
+        std::thread::sleep(CHECKPOINT_RETRY.min(remaining));
     }
     Err(Error::new(
         ErrorKind::Storage,

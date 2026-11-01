@@ -22,11 +22,11 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const CHECKPOINT_RETRY: Duration = Duration::from_millis(10);
-const CHECKPOINT_ATTEMPTS: usize = 100;
+const CHECKPOINT_BUDGET: Duration = Duration::from_secs(3);
 
 pub(crate) type TableColumns<'a> = (&'a str, &'a [&'a str]);
 
@@ -200,8 +200,24 @@ pub(crate) fn validate(
 pub(crate) fn barrier(connection: &Connection) -> Result<()> {
     // NORMAL commits may remain only in the WAL. A FULL checkpoint syncs the
     // WAL before copying pages and syncs the database after, making every prior
-    // commit durable without adding an fsync to each write.
-    for attempt in 0..CHECKPOINT_ATTEMPTS {
+    // commit durable without adding an fsync to each write. Checkpoint attempts
+    // disable SQLite's busy wait so the wall-clock retry budget remains bounded
+    // at three seconds even when another process holds a read lock.
+    connection
+        .busy_timeout(Duration::ZERO)
+        .map_err(|error| sqlite("disable local database busy wait for checkpoint", error))?;
+    let checkpoint = checkpoint_until(connection, Instant::now());
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| sqlite("restore local database busy timeout", error))?;
+    checkpoint
+}
+
+fn checkpoint_until(connection: &Connection, started: Instant) -> Result<()> {
+    loop {
+        if started.elapsed() >= CHECKPOINT_BUDGET {
+            break;
+        }
         let checkpoint: rusqlite::Result<(i64, i64, i64)> =
             connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -216,9 +232,11 @@ pub(crate) fn barrier(connection: &Connection) -> Result<()> {
                 ) => {}
             Err(error) => return Err(sqlite("checkpoint local database", error)),
         }
-        if attempt + 1 < CHECKPOINT_ATTEMPTS {
-            std::thread::sleep(CHECKPOINT_RETRY);
+        let remaining = CHECKPOINT_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
         }
+        std::thread::sleep(CHECKPOINT_RETRY.min(remaining));
     }
     Err(Error::new(
         ErrorKind::Busy,
