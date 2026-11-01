@@ -25,6 +25,8 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+const CHECKPOINT_RETRY: Duration = Duration::from_millis(10);
+const CHECKPOINT_ATTEMPTS: usize = 100;
 
 pub(crate) type TableColumns<'a> = (&'a str, &'a [&'a str]);
 
@@ -199,18 +201,28 @@ pub(crate) fn barrier(connection: &Connection) -> Result<()> {
     // NORMAL commits may remain only in the WAL. A FULL checkpoint syncs the
     // WAL before copying pages and syncs the database after, making every prior
     // commit durable without adding an fsync to each write.
-    let (busy, _log, _checkpointed): (i64, i64, i64) = connection
-        .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+    for attempt in 0..CHECKPOINT_ATTEMPTS {
+        let checkpoint = connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(|error| sqlite("checkpoint local database", error))?;
-    if busy != 0 {
-        return Err(Error::new(
-            ErrorKind::Busy,
-            "local database checkpoint could not complete",
-        ));
+        });
+        match checkpoint {
+            Ok((0, _log, _checkpointed)) => return Ok(()),
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) => {}
+            Err(error) => return Err(sqlite("checkpoint local database", error)),
+        }
+        if attempt + 1 < CHECKPOINT_ATTEMPTS {
+            std::thread::sleep(CHECKPOINT_RETRY);
+        }
     }
-    Ok(())
+    Err(Error::new(
+        ErrorKind::Busy,
+        "local database checkpoint could not complete",
+    ))
 }
 
 pub(crate) fn table_names(connection: &Connection) -> Result<BTreeSet<String>> {
@@ -360,7 +372,7 @@ fn validate_bindings(
             return Err(Error::new(
                 ErrorKind::Invalid,
                 format!(
-                    "local database binding {}.{} does not match this authority or root",
+                    "local database {}.{} is bound to a different value for this runtime",
                     profile.table, binding.column
                 ),
             ));

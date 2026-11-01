@@ -249,19 +249,29 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
 }
 fn barrier(conn: &Connection) -> Result<()> {
     // A FULL checkpoint syncs the WAL and database after NORMAL commits.
-    let (busy, _, _): (i64, i64, i64) = conn
-        .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+    for attempt in 0..100 {
+        let checkpoint = conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(sql)?;
-    if busy != 0 {
-        return Err(Error::new(
-            ErrorKind::Storage,
-            "checkpoint metadata database",
-            "database is busy",
-        ));
+        });
+        match checkpoint {
+            Ok((0, _, _)) => return Ok(()),
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) => {}
+            Err(error) => return Err(sql(error)),
+        }
+        if attempt + 1 < 100 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
-    Ok(())
+    Err(Error::new(
+        ErrorKind::Storage,
+        "checkpoint metadata database",
+        "database is busy",
+    ))
 }
 fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
     let (profile, fs, root, revision): (String, Vec<u8>, Vec<u8>, Vec<u8>) = conn
