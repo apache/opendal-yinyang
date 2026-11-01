@@ -393,6 +393,7 @@ async fn explicit_expiry_preserves_protected_staging_work_and_is_idempotent() {
     let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
     let mut recovered = runtime.recover(handle).await.unwrap();
     let mut expected = b"version-one".to_vec();
+    expected.resize(4 + b"protected-pending".len(), 0);
     expected[4..4 + b"protected-pending".len()].copy_from_slice(b"protected-pending");
     assert_eq!(recovered.read(0, expected.len()).await.unwrap(), expected);
     let after = recovered.fsync().await.unwrap().unwrap();
