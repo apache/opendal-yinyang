@@ -1216,11 +1216,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            Store::open_read_only(&path).unwrap_err().kind(),
+            Store::open_read_only(&path).err().unwrap().kind(),
             crate::replica::ErrorKind::Unsupported
         );
         assert_eq!(
-            Store::open(&path).unwrap_err().kind(),
+            Store::open(&path).err().unwrap().kind(),
             crate::replica::ErrorKind::Unsupported
         );
 
@@ -1232,7 +1232,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            Store::open_read_only(&path).unwrap_err().kind(),
+            Store::open_read_only(&path).err().unwrap().kind(),
             crate::replica::ErrorKind::Corrupt
         );
     }
