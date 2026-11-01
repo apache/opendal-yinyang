@@ -63,8 +63,8 @@
     },
     {
       "path": "object/object-volume.json",
-      "length": 273,
-      "sha256": "1f103038312fca0348fe29ea534196f08e836c404c57181d1ea3a422a14814ad"
+      "length": 257,
+      "sha256": "2ab37d9e70d51f48c849c77cf5e461ae52b1de3776b5518da45abf55dad4ff0d"
     },
     {
       "path": "object/source-v1/hello.txt",
@@ -448,8 +448,8 @@
     },
     {
       "path": "service/service-volume.json",
-      "length": 314,
-      "sha256": "1e969523caeb98e99d764b6626d390fa786d638bba3111f3b5e9fab6eb8c0424"
+      "length": 298,
+      "sha256": "2eca54eb4fd03f6c059cdd7a70118c7402add82ec96deef9005dcba04477f529"
     },
     {
       "path": "service/storage/.yinyang/head",
@@ -668,8 +668,8 @@
     },
     {
       "path": "sync/sync-volume.json",
-      "length": 254,
-      "sha256": "04c6dd14a40e984ce8c9adf1aa44ca537f118c3f57028c6aee159b589f51fb0f"
+      "length": 238,
+      "sha256": "c1aa0eb6e2621201383247e50aacfd358fd9ba365fd23e221468f9ea1b36bb99"
     }
   ]
 }
