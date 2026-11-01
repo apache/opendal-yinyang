@@ -32,6 +32,7 @@ pub enum ErrorKind {
     IsDirectory,
     NotEmpty,
     PermissionDenied,
+    Expired,
 }
 
 /// Error returned by the YinYang Format core.
@@ -40,6 +41,7 @@ pub struct Error {
     kind: ErrorKind,
     operation: &'static str,
     message: String,
+    expired_revision: Option<crate::Revision>,
 }
 
 impl Error {
@@ -48,6 +50,7 @@ impl Error {
             kind,
             operation,
             message: message.into(),
+            expired_revision: None,
         }
     }
 
@@ -61,6 +64,11 @@ impl Error {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Revision identity carried by an expired-history error.
+    pub const fn expired_revision(&self) -> Option<crate::Revision> {
+        self.expired_revision
     }
 
     pub(crate) fn invalid(operation: &'static str, message: impl Into<String>) -> Self {
@@ -85,6 +93,19 @@ impl Error {
 
     pub(crate) fn from_io(operation: &'static str, error: std::io::Error) -> Self {
         Self::new(ErrorKind::Io, operation, error.to_string())
+    }
+
+    pub(crate) fn expired(
+        operation: &'static str,
+        revision: crate::Revision,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ErrorKind::Expired,
+            operation,
+            message: message.into(),
+            expired_revision: Some(revision),
+        }
     }
 }
 

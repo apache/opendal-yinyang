@@ -19,7 +19,13 @@
 //! SQLite files must reside on a local filesystem that honors sync and locking.
 
 use crate::authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
-use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
+use crate::compatibility::{
+    SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE, SQLITE_SCHEMA_PROFILE_EXPIRY,
+};
+use crate::expiry::{
+    ExpiryConflictKind, ExpiryMarker, ExpiryOutcome, ExpiryRefusal, ExpiryRequest, HistoryEntry,
+    HistoryPage, RevisionState, operation_key, revision_key,
+};
 use crate::namespace::{Node, NodeKind, decode, encode};
 use crate::snapshot::{
     ChangeRecord, Cursor, FileVersion, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
@@ -40,7 +46,8 @@ mod transport;
 pub use transport::{ServiceClient, serve};
 
 type Db = Arc<Mutex<Connection>>;
-const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
+const BASE_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
+const EXPIRY_TABLES: [&str; 5] = ["authority", "expiry", "prepared", "records", "revisions"];
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
     ("singleton", "INTEGER"),
     ("profile", "TEXT"),
@@ -57,6 +64,26 @@ const RECORDS_COLUMNS: [(&str, &str); 5] = [
     ("value", "BLOB"),
 ];
 const REVISIONS_COLUMNS: [(&str, &str); 2] = [("token", "BLOB"), ("sequence", "INTEGER")];
+const EXPIRY_COLUMNS: [(&str, &str); 2] = [("key", "BLOB"), ("record", "BLOB")];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchemaProfile {
+    Base,
+    Expiry,
+}
+
+impl SchemaProfile {
+    fn parse(profile: &str) -> Result<Self> {
+        match profile {
+            SQLITE_SCHEMA_PROFILE => Ok(Self::Base),
+            SQLITE_SCHEMA_PROFILE_EXPIRY => Ok(Self::Expiry),
+            _ => Err(Error::unsupported(
+                "open metadata authority",
+                "unknown schema profile",
+            )),
+        }
+    }
+}
 
 /// One durable filesystem authority. Clones and independent processes coordinate
 /// through SQLite; no process-local cache determines the latest revision.
@@ -102,7 +129,7 @@ fn check_columns(conn: &Connection, table: &str, expected: &[(&str, &str)]) -> R
     }
     Ok(())
 }
-fn inspect_schema(conn: &Connection) -> Result<bool> {
+fn inspect_schema(conn: &Connection) -> Result<Option<SchemaProfile>> {
     let tables = conn
         .prepare(
             "SELECT name FROM sqlite_schema
@@ -116,7 +143,7 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
         })
         .map_err(|error| corrupt_schema(format!("cannot inspect SQLite schema: {error}")))?;
     if tables.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     if !tables.iter().any(|table| table == "authority") {
         return Err(Error::unsupported(
@@ -124,25 +151,12 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
             "database is not a YinYang authority",
         ));
     }
-    let profile: Option<String> = conn
-        .query_row(
-            "SELECT profile FROM authority WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| corrupt_schema(format!("cannot read authority profile: {error}")))?;
-    match profile.as_deref() {
-        Some(SQLITE_SCHEMA_PROFILE) => {}
-        Some(_) => {
-            return Err(Error::unsupported(
-                "open metadata authority",
-                "unknown schema profile",
-            ));
-        }
-        None => return Err(corrupt_schema("authority profile row is missing")),
-    }
-    for required in REQUIRED_TABLES {
+    let (profile, _, _, _) = manifest(conn)?;
+    let required = match profile {
+        SchemaProfile::Base => BASE_TABLES.as_slice(),
+        SchemaProfile::Expiry => EXPIRY_TABLES.as_slice(),
+    };
+    for required in required {
         if !tables.iter().any(|table| table.as_str() == required) {
             return Err(corrupt_schema(format!(
                 "schema profile is missing table {required}"
@@ -153,7 +167,14 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
     check_columns(conn, "prepared", &PREPARED_COLUMNS)?;
     check_columns(conn, "records", &RECORDS_COLUMNS)?;
     check_columns(conn, "revisions", &REVISIONS_COLUMNS)?;
-    let (_, _, revision) = manifest(conn)?;
+    if profile == SchemaProfile::Expiry {
+        check_columns(conn, "expiry", &EXPIRY_COLUMNS)?;
+    } else if tables.iter().any(|table| table == "expiry") {
+        return Err(corrupt_schema(
+            "base schema profile unexpectedly contains an expiry table",
+        ));
+    }
+    let (_, _, _, revision) = manifest(conn)?;
     let sequence: Option<i64> = conn
         .query_row(
             "SELECT sequence FROM revisions WHERE token=?1",
@@ -165,7 +186,7 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
     if sequence != Some(revision.sequence as i64) {
         return Err(corrupt_schema("latest manifest is not a retained revision"));
     }
-    Ok(true)
+    Ok(Some(profile))
 }
 async fn db_call<T: Send + 'static>(
     db: &Db,
@@ -201,7 +222,7 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
         let conn = Connection::open_with_flags(path, flags).map_err(sql)?;
         conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
         let existing = inspect_schema(&conn)?;
-        if !existing && !create {
+        if existing.is_none() && !create {
             return Err(Error::new(
                 ErrorKind::NotFound,
                 "open metadata authority",
@@ -225,7 +246,7 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
             .map_err(sql)?;
         conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
         conn.execute_batch("PRAGMA query_only=ON;").map_err(sql)?;
-        if !inspect_schema(&conn)? {
+        if inspect_schema(&conn)?.is_none() {
             return Err(Error::new(
                 ErrorKind::NotFound,
                 "open metadata authority",
@@ -237,7 +258,7 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
     .await
     .map_err(|e| Error::new(ErrorKind::Storage, "open metadata worker", e.to_string()))?
 }
-fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
+fn manifest(conn: &Connection) -> Result<(SchemaProfile, NodeId, NodeId, Revision)> {
     let (profile, fs, root, revision): (String, Vec<u8>, Vec<u8>, Vec<u8>) = conn
         .query_row(
             "SELECT profile, filesystem, root, latest FROM authority WHERE singleton=1",
@@ -245,17 +266,13 @@ fn manifest(conn: &Connection) -> Result<(NodeId, NodeId, Revision)> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(|error| corrupt_schema(format!("cannot read authority manifest: {error}")))?;
-    if profile != SQLITE_SCHEMA_PROFILE {
-        return Err(Error::unsupported(
-            "open metadata authority",
-            "unknown schema profile",
-        ));
-    }
+    let profile = SchemaProfile::parse(&profile)?;
     let revision = Revision::from_bytes(fixed(revision)?);
     if revision.sequence > i64::MAX as u64 {
         return Err(corrupt_schema("latest revision exceeds the SQLite domain"));
     }
     Ok((
+        profile,
         NodeId::from_bytes(fixed(fs)?),
         NodeId::from_bytes(fixed(root)?),
         revision,
@@ -283,6 +300,40 @@ fn parse_service_binding(bytes: &[u8]) -> Result<(NodeId, NodeId)> {
     let (magic, filesystem, root): ([u8; 8], [u8; 16], [u8; 16]) = decode(bytes)?;
     debug_assert_eq!(magic, SERVICE_BINDING_MAGIC);
     Ok((NodeId::from_bytes(filesystem), NodeId::from_bytes(root)))
+}
+fn revision_exists(conn: &Connection, revision: Revision) -> Result<bool> {
+    let sequence = i64::try_from(revision.sequence).map_err(|_| {
+        Error::new(
+            ErrorKind::NotFound,
+            "observe service revision",
+            "revision not retained",
+        )
+    })?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
+        params![revision.to_bytes().as_slice(), sequence],
+        |row| row.get(0),
+    )
+    .map_err(sql)
+}
+fn load_expiry(conn: &Connection, key: &[u8]) -> Result<Option<ExpiryMarker>> {
+    conn.query_row(
+        "SELECT record FROM expiry WHERE key=?1",
+        params![key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(sql)?
+    .map(|bytes| ExpiryMarker::decode(&bytes))
+    .transpose()
+}
+fn save_expiry(conn: &Connection, key: &[u8], marker: ExpiryMarker) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO expiry(key,record) VALUES(?1,?2)",
+        params![key, marker.encode()?],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 impl MetadataService {
     /// Initialize a new local database or reopen its exact existing authority.
@@ -332,7 +383,7 @@ impl MetadataService {
     pub async fn open(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
         let path = path.as_ref().to_owned();
         let db = connect(&path, false).await?;
-        let (filesystem, root, _) = db_call(&db, |c| manifest(c)).await?;
+        let (_, filesystem, root, _) = db_call(&db, |c| manifest(c)).await?;
         let fs = Self {
             path,
             data: DataStore::new(operator.clone(), filesystem)?,
@@ -386,7 +437,7 @@ impl MetadataService {
     }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
         let db = connect(&self.path, false).await?;
-        let (fs, root, revision) = db_call(&db, |c| manifest(c)).await?;
+        let (_, fs, root, revision) = db_call(&db, |c| manifest(c)).await?;
         if fs != self.filesystem || root != self.root {
             return Err(Error::invalid("observe service", "authority changed"));
         }
@@ -401,19 +452,27 @@ impl MetadataService {
             ));
         }
         let db = connect(&self.path, false).await?;
+        let expected_volume = self.filesystem;
+        let expected_root = self.root;
         db_call(&db, move |c| {
-            let exists: bool = c
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
-                    params![revision.to_bytes().as_slice(), revision.sequence as i64],
-                    |r| r.get(0),
-                )
-                .map_err(sql)?;
-            if !exists {
+            let (profile, volume, root, _) = manifest(c)?;
+            if volume != expected_volume || root != expected_root {
+                return Err(Error::invalid("observe service", "authority changed"));
+            }
+            if !revision_exists(c, revision)? {
                 return Err(Error::new(
                     ErrorKind::NotFound,
                     "observe service revision",
                     "revision not retained",
+                ));
+            }
+            if profile == SchemaProfile::Expiry
+                && load_expiry(c, &revision_key(revision))?.is_some()
+            {
+                return Err(Error::expired(
+                    "observe service revision",
+                    revision,
+                    "revision is logically expired",
                 ));
             }
             Ok(())
@@ -489,6 +548,259 @@ impl MetadataService {
         }
         let next = more.then(|| *revisions.last().expect("a nonempty page has a cursor"));
         Ok(RevisionPage { revisions, next })
+    }
+    pub async fn history_page(&self, after: Option<Revision>, limit: u32) -> Result<HistoryPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(Error::unsupported(
+                "read history",
+                format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
+            ));
+        }
+        let db = connect_read_only(&self.path).await?;
+        let after = after.map(Revision::to_bytes);
+        let expected_volume = self.filesystem;
+        let expected_root = self.root;
+        db_call(&db, move |conn| {
+            let (profile, volume, root, latest) = manifest(conn)?;
+            if volume != expected_volume || root != expected_root {
+                return Err(Error::invalid("read history", "authority changed"));
+            }
+            let sql_limit = i64::from(limit) + 1;
+            let mut rows = Vec::new();
+            if let Some(after) = after.as_ref() {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT token,sequence FROM revisions
+                         WHERE token>?1 ORDER BY token LIMIT ?2",
+                    )
+                    .map_err(sql)?;
+                let values = statement
+                    .query_map(params![after.as_slice(), sql_limit], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(sql)?;
+                for value in values {
+                    rows.push(value.map_err(sql)?);
+                }
+            } else {
+                let mut statement = conn
+                    .prepare("SELECT token,sequence FROM revisions ORDER BY token LIMIT ?1")
+                    .map_err(sql)?;
+                let values = statement
+                    .query_map(params![sql_limit], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(sql)?;
+                for value in values {
+                    rows.push(value.map_err(sql)?);
+                }
+            }
+            let more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            let mut entries = Vec::with_capacity(rows.len());
+            for (token, sequence) in rows {
+                let revision = Revision::from_bytes(fixed(token)?);
+                if sequence < 0 || revision.sequence != sequence as u64 {
+                    return Err(corrupt_schema(
+                        "retained revision token disagrees with its sequence",
+                    ));
+                }
+                let state = if profile == SchemaProfile::Expiry {
+                    match load_expiry(conn, &revision_key(revision))? {
+                        Some(marker) if marker.after > latest => {
+                            return Err(corrupt_schema(
+                                "expiry marker was published after the latest revision",
+                            ));
+                        }
+                        Some(marker) => RevisionState::Expired(marker),
+                        None => RevisionState::Readable,
+                    }
+                } else {
+                    RevisionState::Readable
+                };
+                entries.push(HistoryEntry { revision, state });
+            }
+            let next = more.then(|| entries.last().expect("nonempty history page").revision);
+            let page = HistoryPage { entries, next };
+            page.validate()?;
+            Ok(page)
+        })
+        .await
+    }
+    pub async fn expire_revisions(&self, request: &ExpiryRequest) -> Result<ExpiryOutcome> {
+        request.validate_volume(self.filesystem)?;
+        let request_digest = request.digest()?;
+        let request_for_write = request.clone();
+        let expected_volume = self.filesystem;
+        let expected_root = self.root;
+        let db = connect(&self.path, false).await?;
+        let result = db_call(&db, move |conn| {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let (profile, volume, root, latest) = manifest(&tx)?;
+            if volume != expected_volume || root != expected_root {
+                return Err(Error::invalid("expire revisions", "authority changed"));
+            }
+            if profile == SchemaProfile::Expiry {
+                if let Some(marker) = load_expiry(&tx, &operation_key(request_for_write.id()))? {
+                    if marker.request_digest != request_digest {
+                        return Err(Error::invalid(
+                            "expire revisions",
+                            "operation identity was reused with a different request",
+                        ));
+                    }
+                    request_for_write.validate_marker(&marker)?;
+                    for candidate in request_for_write.candidates() {
+                        let bytes = load_expiry(&tx, &revision_key(*candidate))?.ok_or_else(|| {
+                            corrupt_schema(
+                                "committed expiry operation is missing a revision marker",
+                            )
+                        })?;
+                        if bytes != marker {
+                            return Err(corrupt_schema(
+                                "expiry operation and revision markers disagree",
+                            ));
+                        }
+                    }
+                    return Ok(ExpiryOutcome::Committed(
+                        request_for_write.receipt(marker),
+                    ));
+                }
+            }
+            if latest != request_for_write.expected_latest() {
+                return Ok(ExpiryOutcome::Conflict);
+            }
+
+            let mut refusal = ExpiryRefusal::new(latest);
+            for candidate in request_for_write.candidates() {
+                if *candidate == latest {
+                    refusal.push(*candidate, ExpiryConflictKind::Current);
+                } else if !revision_exists(&tx, *candidate)? {
+                    refusal.push(*candidate, ExpiryConflictKind::Missing);
+                } else if profile == SchemaProfile::Expiry
+                    && load_expiry(&tx, &revision_key(*candidate))?.is_some()
+                {
+                    refusal.push(*candidate, ExpiryConflictKind::AlreadyExpired);
+                }
+            }
+            for protected in request_for_write.protected() {
+                if *protected == latest {
+                    continue;
+                }
+                if !revision_exists(&tx, *protected)? {
+                    refusal.push(*protected, ExpiryConflictKind::ProtectedMissing);
+                } else if profile == SchemaProfile::Expiry
+                    && load_expiry(&tx, &revision_key(*protected))?.is_some()
+                {
+                    refusal.push(*protected, ExpiryConflictKind::ProtectedExpired);
+                }
+            }
+            for candidate in request_for_write.candidates() {
+                if request_for_write.protected().binary_search(candidate).is_ok() {
+                    refusal.push(*candidate, ExpiryConflictKind::Protected);
+                }
+            }
+            if !refusal.is_empty() {
+                return Ok(ExpiryOutcome::Refused(refusal));
+            }
+
+            let sequence = latest
+                .sequence
+                .checked_add(1)
+                .filter(|sequence| *sequence <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    Error::unsupported("expire revisions", "revision space exhausted")
+                })?;
+            let after = Revision::new(sequence);
+            let marker = ExpiryMarker {
+                operation_id: request_for_write.id(),
+                request_digest,
+                evidence_digest: request_for_write.evidence_digest(),
+                before: latest,
+                after,
+            };
+            if profile == SchemaProfile::Base {
+                tx.execute_batch(&format!(
+                    "CREATE TABLE expiry(key BLOB PRIMARY KEY, record BLOB NOT NULL);
+                     UPDATE authority SET profile='{SQLITE_SCHEMA_PROFILE_EXPIRY}' WHERE singleton=1;"
+                ))
+                .map_err(sql)?;
+            }
+            save_expiry(&tx, &operation_key(request_for_write.id()), marker)?;
+            for candidate in request_for_write.candidates() {
+                save_expiry(&tx, &revision_key(*candidate), marker)?;
+            }
+            tx.execute(
+                "INSERT INTO revisions VALUES(?1,?2)",
+                params![after.to_bytes().as_slice(), sequence as i64],
+            )
+            .map_err(sql)?;
+            tx.execute(
+                "UPDATE authority SET latest=?1 WHERE singleton=1",
+                params![after.to_bytes().as_slice()],
+            )
+            .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok(ExpiryOutcome::Committed(
+                request_for_write.receipt(marker),
+            ))
+        })
+        .await;
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if error.kind() == ErrorKind::Storage => {
+                self.resolve_expiry_after_error(request, request_digest)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+    async fn resolve_expiry_after_error(
+        &self,
+        request: &ExpiryRequest,
+        request_digest: [u8; 32],
+    ) -> Result<ExpiryOutcome> {
+        let request_id = request.id();
+        let db = match connect_read_only(&self.path).await {
+            Ok(db) => db,
+            Err(_) => return Ok(ExpiryOutcome::Unknown(request_id)),
+        };
+        let request = request.clone();
+        let result = db_call(&db, move |conn| {
+            let (profile, _, _, _) = manifest(conn)?;
+            if profile != SchemaProfile::Expiry {
+                return Ok(None);
+            }
+            let Some(marker) = load_expiry(conn, &operation_key(request.id()))? else {
+                return Ok(None);
+            };
+            if marker.request_digest != request_digest {
+                return Err(Error::invalid(
+                    "resolve expiry",
+                    "operation identity was reused with a different request",
+                ));
+            }
+            request.validate_marker(&marker)?;
+            for candidate in request.candidates() {
+                let marker_for_revision = load_expiry(conn, &revision_key(*candidate))?
+                    .ok_or_else(|| {
+                        corrupt_schema("committed expiry operation is missing a revision marker")
+                    })?;
+                if marker_for_revision != marker {
+                    return Err(corrupt_schema(
+                        "expiry operation and revision markers disagree",
+                    ));
+                }
+            }
+            Ok(Some(ExpiryOutcome::Committed(request.receipt(marker))))
+        })
+        .await;
+        match result {
+            Ok(Some(outcome)) => Ok(outcome),
+            Ok(None) => Ok(ExpiryOutcome::Unknown(request_id)),
+            Err(error) => Err(error),
+        }
     }
     /// In-process preparation already carries this service's trusted evidence.
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
@@ -671,7 +983,7 @@ impl MetadataService {
             Ok(())
         })
         .await?;
-        let (_, _, old) = db_call(&db, |c| manifest(c)).await?;
+        let (_, _, _, old) = db_call(&db, |c| manifest(c)).await?;
         let sequence = old
             .sequence
             .checked_add(1)
