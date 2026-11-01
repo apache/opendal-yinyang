@@ -860,6 +860,9 @@ impl Replica {
             &mut nodes,
             Some(&hints),
         )?;
+        for node in nodes.values() {
+            self.store.save_local_scan_evidence(node)?;
+        }
         Ok(LocalSnapshot { nodes })
     }
 
@@ -1044,6 +1047,9 @@ impl Replica {
                     "local special file is not supported: {path}"
                 )));
             }
+        }
+        for node in nodes.values() {
+            self.store.save_local_scan_evidence(node)?;
         }
         Ok(LocalSnapshot::from_nodes(nodes))
     }
