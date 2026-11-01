@@ -34,6 +34,8 @@ struct PrepareCalls {
     stream: AtomicUsize,
     overwrite: AtomicUsize,
     update: AtomicUsize,
+    latest: AtomicUsize,
+    revision: AtomicUsize,
 }
 
 impl PrepareCalls {
@@ -41,6 +43,8 @@ impl PrepareCalls {
         self.stream.store(0, Ordering::SeqCst);
         self.overwrite.store(0, Ordering::SeqCst);
         self.update.store(0, Ordering::SeqCst);
+        self.latest.store(0, Ordering::SeqCst);
+        self.revision.store(0, Ordering::SeqCst);
     }
 }
 
@@ -77,6 +81,7 @@ impl Authority for RecordingAuthority {
     fn observe_latest(
         &self,
     ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.calls.latest.fetch_add(1, Ordering::SeqCst);
         self.inner.observe_latest()
     }
 
@@ -84,6 +89,7 @@ impl Authority for RecordingAuthority {
         &self,
         revision: Revision,
     ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + '_>> {
+        self.calls.revision.fetch_add(1, Ordering::SeqCst);
         self.inner.observe_revision(revision)
     }
 
@@ -792,6 +798,64 @@ async fn file_operations_share_object_and_service_contract() {
     )
     .await;
     server.abort();
+}
+
+#[tokio::test]
+async fn publication_reuses_only_its_matching_authenticated_base_snapshot() {
+    let backend = TestBackend::default();
+    let calls = Arc::new(PrepareCalls::default());
+    let inner: Arc<dyn Authority> = Arc::new(
+        Fs::create(backend.operator(), BackendProfile::Minio)
+            .await
+            .unwrap(),
+    );
+    let authority: Arc<dyn Authority> = Arc::new(RecordingAuthority::new(inner, calls.clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
+    runtime
+        .create_file(authority.root(), "reuse")
+        .await
+        .unwrap();
+    let mut first = runtime.open_file("reuse", true).await.unwrap();
+    let mut stale = runtime.open_file("reuse", true).await.unwrap();
+
+    calls.reset();
+    first.write(0, b"one").await.unwrap();
+    first.fsync().await.unwrap().unwrap();
+    assert_eq!(calls.latest.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.revision.load(Ordering::SeqCst), 1);
+
+    calls.reset();
+    first.write(0, b"two").await.unwrap();
+    first.fsync().await.unwrap().unwrap();
+    assert_eq!(calls.latest.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.revision.load(Ordering::SeqCst), 1);
+
+    // The stale handle reuses its original authenticated Snapshot for planning,
+    // but that snapshot still carries the original conditions and cannot rebase.
+    calls.reset();
+    stale.write(0, b"stale").await.unwrap();
+    assert!(matches!(stale.fsync().await, Err(Error::Conflict)));
+    assert_eq!(calls.latest.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.revision.load(Ordering::SeqCst), 0);
+    assert_eq!(stale.read(0, 10).await.unwrap(), b"stale");
+    stale.abort().await.unwrap();
+
+    let node = first.status().await.unwrap().node;
+    first.close().await.unwrap();
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .open_file(node)
+            .await
+            .unwrap()
+            .read(0, 10)
+            .await
+            .unwrap(),
+        b"two"
+    );
 }
 
 #[tokio::test]
