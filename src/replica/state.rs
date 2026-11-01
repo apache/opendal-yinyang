@@ -62,6 +62,7 @@ const REQUIRED_SCHEMA: &[schema::TableColumns<'static>] = &[
             "stat_mtime_nsec",
             "stat_ctime",
             "stat_ctime_nsec",
+            "settle_pending",
         ],
     ),
     (
