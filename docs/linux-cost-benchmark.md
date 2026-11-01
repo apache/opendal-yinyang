@@ -171,17 +171,20 @@ fallback assertion.
 The same workload also runs a matched serial-versus-four-writer write latency
 probe. Each case uses three batches of four pre-created 8 MiB files. Every file
 has the same deterministic initial bytes and receives one 4 KiB overwrite at the
-same relative offset. The single-writer case completes one batch before starting
-the next. The four-writer case opens, mutates, and fsyncs four distinct files
-concurrently in each batch. Writable open, mutation, fsync, and whole-writer
-completion have separate latency samples. Complete remote bytes are checked
-after every batch outside all measured intervals.
+same relative offset. The single writer completes open, mutation, fsync, and
+close for each file before starting the next. Four long-lived workers cross one
+start barrier, then each completes the same lifecycle for three files. Each
+end-to-end latency sample spans the continuous open, mutation, and fsync for one
+file. The record also retains separate open, mutation, and fsync duration
+arrays, but their sum is not substituted for the observed worker interval or
+the batch wall time. Complete remote bytes are checked after all workers finish,
+outside every measured interval.
 
 The counting proxies record request intervals independently of the configured
 writer count. The report exposes application-operation overlap, S3 request
 overlap, and metadata-service RPC overlap as separate observations. Four active
 application writers with maximum remote concurrency one is a valid serialized
-authority result. Concurrent network values remain whole-phase totals; the
+authority result. Concurrent network values remain whole-batch totals; the
 collector does not subtract global proxy counters around one writer and assign
 other writers' traffic to that sample.
 

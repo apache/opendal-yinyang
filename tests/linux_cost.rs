@@ -1170,117 +1170,51 @@ const WRITE_LATENCY_BATCH_FILES: usize = 4;
 const WRITE_LATENCY_BATCHES: usize = 3;
 const WRITE_LATENCY_TOTAL_FILES: usize = WRITE_LATENCY_BATCH_FILES * WRITE_LATENCY_BATCHES;
 
-#[derive(Clone, Default)]
-struct StageBatch {
-    latencies: Vec<f64>,
-    wall_ms: f64,
-    io: IoSnapshot,
-    network: NetworkSnapshot,
+#[derive(Clone)]
+struct FileTiming {
+    total_ms: f64,
+    open_ms: f64,
+    mutation_ms: f64,
+    fsync_ms: f64,
 }
 
-fn merge_stage(total: &mut StageBatch, stage: StageBatch) {
-    total.latencies.extend(stage.latencies);
-    total.wall_ms += stage.wall_ms;
-    total.io.add(stage.io);
-    total.network.add(stage.network);
+struct WorkerTiming {
+    start: Instant,
+    end: Instant,
+    files: Vec<FileTiming>,
 }
 
-fn parallel_stage<T, U, F>(values: Vec<T>, operation: F) -> (Vec<(usize, U, f64)>, f64)
-where
-    T: Send + 'static,
-    U: Send + 'static,
-    F: Fn(T) -> U + Send + Sync + 'static,
-{
-    let barrier = Arc::new(Barrier::new(values.len()));
-    let operation = Arc::new(operation);
-    let started = Instant::now();
-    let mut threads = Vec::with_capacity(values.len());
-    for (index, value) in values.into_iter().enumerate() {
-        let barrier = barrier.clone();
-        let operation = operation.clone();
-        threads.push(thread::spawn(move || {
-            barrier.wait();
-            let started = Instant::now();
-            let output = operation(value);
-            (index, output, started.elapsed().as_secs_f64() * 1000.0)
-        }));
+fn run_write_latency_worker(
+    paths: Vec<PathBuf>,
+    barrier: Arc<Barrier>,
+    offset: u64,
+    replacement: Arc<Vec<u8>>,
+) -> WorkerTiming {
+    barrier.wait();
+    let start = Instant::now();
+    let mut files = Vec::with_capacity(paths.len());
+    let mut end = start;
+    for path in paths {
+        let file_started = Instant::now();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open matched write-latency file");
+        let open_done = file_started.elapsed().as_secs_f64() * 1000.0;
+        write_all_at(&file, &replacement, offset);
+        let mutation_done = file_started.elapsed().as_secs_f64() * 1000.0;
+        file.sync_all().expect("fsync matched write-latency file");
+        let fsync_done = file_started.elapsed().as_secs_f64() * 1000.0;
+        end = Instant::now();
+        files.push(FileTiming {
+            total_ms: fsync_done,
+            open_ms: open_done,
+            mutation_ms: mutation_done - open_done,
+            fsync_ms: fsync_done - mutation_done,
+        });
+        drop(file);
     }
-    let mut outputs = threads
-        .into_iter()
-        .map(|thread| thread.join().expect("parallel benchmark stage panicked"))
-        .collect::<Vec<_>>();
-    outputs.sort_by_key(|(index, _, _)| *index);
-    (outputs, started.elapsed().as_secs_f64() * 1000.0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_write_latency_stage(
-    recorder: &mut Recorder,
-    context: &RunContext,
-    publication: Publication,
-    scale: Scale,
-    dataset: Dataset,
-    scenario: &str,
-    completion: &str,
-    batch: StageBatch,
-    staging: &Path,
-    fixture: &Fixture,
-    invariants: Vec<String>,
-) {
-    assert_eq!(
-        batch.latencies.len(),
-        WRITE_LATENCY_TOTAL_FILES,
-        "{scenario} did not retain one phase sample per writer batch operation"
-    );
-    let mut invariants = invariants;
-    invariants.push(format!("phase_wall_ms={:.3}", batch.wall_ms));
-    invariants.push(format!(
-        "observed_s3_request_max_concurrency={}",
-        batch.network.s3_activity.max_concurrency
-    ));
-    invariants.push(format!(
-        "observed_service_rpc_max_concurrency={}",
-        batch.network.service_activity.max_concurrency
-    ));
-    invariants.push(format!(
-        "observed_s3_request_overlap_ms={:.3}",
-        batch.network.s3_activity.overlap_ms
-    ));
-    invariants.push(format!(
-        "observed_service_rpc_overlap_ms={:.3}",
-        batch.network.service_activity.overlap_ms
-    ));
-    let application_active_ms = batch.latencies.iter().sum::<f64>();
-    invariants.push(format!(
-        "observed_application_operation_overlap_ms={:.3}",
-        (application_active_ms - batch.wall_ms).max(0.0)
-    ));
-    invariants.push(format!(
-        "s3_in_flight_at_stage_end={}",
-        batch.network.s3_activity.in_flight_at_end
-    ));
-    invariants.push(format!(
-        "service_in_flight_at_stage_end={}",
-        batch.network.service_activity.in_flight_at_end
-    ));
-    invariants.push(
-        "network totals cover the complete phase; concurrent writer samples share rather than own those totals"
-            .to_owned(),
-    );
-    recorder.record(
-        context,
-        scenario,
-        publication,
-        scale,
-        dataset,
-        completion,
-        batch.latencies,
-        batch.io,
-        batch.network,
-        vec![],
-        space_snapshot(fixture, None, None, Some(staging)),
-        invariants,
-    );
+    WorkerTiming { start, end, files }
 }
 
 fn run_write_latency_matrix(
@@ -1291,170 +1225,6 @@ fn run_write_latency_matrix(
 ) {
     for writers in [1, WRITE_LATENCY_BATCH_FILES] {
         run_write_latency_case(context, proxy, publication, writers, recorder);
-    }
-}
-
-struct WriteLatencyBatch {
-    files: Vec<(usize, fs::File)>,
-    open: StageBatch,
-    mutation: StageBatch,
-    fsync: StageBatch,
-}
-
-fn run_write_latency_batch(
-    mounted: &FuseMount,
-    meter: &NetworkMeter<'_>,
-    paths: &[PathBuf],
-    writers: usize,
-    offset: u64,
-    replacement: &[u8],
-) -> WriteLatencyBatch {
-    assert_eq!(paths.len(), WRITE_LATENCY_BATCH_FILES);
-    let net_before = meter.snapshot();
-    let io_before = read_proc_io(mounted.pid());
-    let stage_started = Instant::now();
-    let (mut files, open_latencies) = if writers == 1 {
-        let mut files = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        for path in paths {
-            let started = Instant::now();
-            files.push(
-                OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .expect("open matched write-latency file"),
-            );
-            latencies.push(started.elapsed().as_secs_f64() * 1000.0);
-        }
-        (
-            files
-                .into_iter()
-                .enumerate()
-                .map(|(index, file)| (index, file))
-                .collect::<Vec<_>>(),
-            latencies,
-        )
-    } else {
-        let (opened, _) = parallel_stage(paths.to_owned(), |path| {
-            OpenOptions::new()
-                .write(true)
-                .open(path)
-                .expect("open concurrent write-latency file")
-        });
-        let mut files = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        for (index, file, elapsed) in opened {
-            files.push((index, file));
-            latencies.push(elapsed);
-        }
-        (files, latencies)
-    };
-    meter.settle();
-    let open = StageBatch {
-        latencies: open_latencies,
-        wall_ms: stage_started.elapsed().as_secs_f64() * 1000.0,
-        io: read_proc_io(mounted.pid()).since(io_before),
-        network: meter.snapshot().since(net_before),
-    };
-    files.sort_by_key(|(index, _)| *index);
-    assert_eq!(
-        open.network.s3_activity.in_flight_at_end, 0,
-        "S3 requests remained in flight after the open stage"
-    );
-    assert_eq!(
-        open.network.service_activity.in_flight_at_end, 0,
-        "service RPCs remained in flight after the open stage"
-    );
-
-    let net_before = meter.snapshot();
-    let io_before = read_proc_io(mounted.pid());
-    let stage_started = Instant::now();
-    let mutation_latencies = if writers == 1 {
-        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        for (_, file) in &files {
-            let started = Instant::now();
-            write_all_at(file, replacement, offset);
-            latencies.push(started.elapsed().as_secs_f64() * 1000.0);
-        }
-        latencies
-    } else {
-        let values = std::mem::take(&mut files)
-            .into_iter()
-            .map(|(index, file)| (index, file, replacement.to_vec()))
-            .collect();
-        let (outputs, _) = parallel_stage(values, move |(_, file, bytes)| {
-            write_all_at(&file, &bytes, offset);
-            file
-        });
-        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        for (index, file, elapsed) in outputs {
-            files.push((index, file));
-            latencies.push(elapsed);
-        }
-        latencies
-    };
-    meter.settle();
-    let mutation = StageBatch {
-        latencies: mutation_latencies,
-        wall_ms: stage_started.elapsed().as_secs_f64() * 1000.0,
-        io: read_proc_io(mounted.pid()).since(io_before),
-        network: meter.snapshot().since(net_before),
-    };
-    files.sort_by_key(|(index, _)| *index);
-    assert_eq!(
-        mutation.network.put, 0,
-        "pwrite published before the explicit fsync phase"
-    );
-
-    let net_before = meter.snapshot();
-    let io_before = read_proc_io(mounted.pid());
-    let stage_started = Instant::now();
-    let fsync_latencies = if writers == 1 {
-        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        for (_, file) in &files {
-            let started = Instant::now();
-            file.sync_all().expect("fsync serial write-latency file");
-            latencies.push(started.elapsed().as_secs_f64() * 1000.0);
-        }
-        latencies
-    } else {
-        let (outputs, _) = parallel_stage(std::mem::take(&mut files), |(_, file)| {
-            file.sync_all()
-                .expect("fsync concurrent write-latency file");
-            file
-        });
-        let mut latencies = Vec::with_capacity(WRITE_LATENCY_BATCH_FILES);
-        for (index, file, elapsed) in outputs {
-            files.push((index, file));
-            latencies.push(elapsed);
-        }
-        latencies
-    };
-    meter.settle();
-    let fsync = StageBatch {
-        latencies: fsync_latencies,
-        wall_ms: stage_started.elapsed().as_secs_f64() * 1000.0,
-        io: read_proc_io(mounted.pid()).since(io_before),
-        network: meter.snapshot().since(net_before),
-    };
-    files.sort_by_key(|(index, _)| *index);
-    assert!(
-        fsync.network.put > 0,
-        "the fsync stage must publish content"
-    );
-    assert_eq!(
-        fsync.network.s3_activity.in_flight_at_end, 0,
-        "S3 requests remained in flight after the fsync stage"
-    );
-    assert_eq!(
-        fsync.network.service_activity.in_flight_at_end, 0,
-        "service RPCs remained in flight after the fsync stage"
-    );
-    WriteLatencyBatch {
-        files,
-        open,
-        mutation,
-        fsync,
     }
 }
 
@@ -1495,26 +1265,25 @@ fn run_write_latency_case(
     );
     fs::create_dir(&mountpoint).expect("create write-latency benchmark mountpoint");
     let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
-    let total_bytes = (WRITE_LATENCY_TOTAL_FILES * size) as u64;
     let dataset = Dataset {
         kind: if writers == 1 {
-            "matched_serial_four_files".to_owned()
+            "matched_serial_twelve_files".to_owned()
         } else {
-            "matched_concurrent_four_files".to_owned()
+            "matched_concurrent_twelve_files".to_owned()
         },
         files: WRITE_LATENCY_TOTAL_FILES,
         directories: 1,
-        logical_bytes: total_bytes,
+        logical_bytes: (WRITE_LATENCY_TOTAL_FILES * size) as u64,
         file_size_bytes: Some(size as u64),
         range_bytes: Some(RANGE_BYTES as u64),
         writers: Some(writers),
         read_pattern: Some(if writers == 1 {
             format!(
-                "three batches; one writer opens, overwrites {RANGE_BYTES} bytes at offset {offset}, and fsyncs four files sequentially per batch"
+                "one long-lived writer completes open, {RANGE_BYTES}-byte overwrite at offset {offset}, fsync, and close for each of twelve files before starting the next"
             )
         } else {
             format!(
-                "three batches; four writers concurrently open distinct files, overwrite {RANGE_BYTES} bytes at offset {offset}, and fsync"
+                "four long-lived writers cross one start barrier, then each completes open, {RANGE_BYTES}-byte overwrite at offset {offset}, fsync, and close for three files before starting its next file"
             )
         }),
         working_set_bytes: Some((WRITE_LATENCY_TOTAL_FILES * RANGE_BYTES) as u64),
@@ -1538,131 +1307,140 @@ fn run_write_latency_case(
         vec!["writable mount type=fuse.yinyang".to_owned()],
     );
 
-    let mut open_stage = StageBatch::default();
-    let mut mutation_stage = StageBatch::default();
-    let mut fsync_stage = StageBatch::default();
-    let mut files = Vec::with_capacity(WRITE_LATENCY_TOTAL_FILES);
-    let mut complete_latencies = Vec::with_capacity(WRITE_LATENCY_TOTAL_FILES);
-    let mut expected = expected;
-    for batch_index in 0..WRITE_LATENCY_BATCHES {
-        let paths = (0..WRITE_LATENCY_BATCH_FILES)
-            .map(|index| {
-                mountpoint.join(format!(
-                    "write-latency/batch-{batch_index}-file-{index:02}.bin"
-                ))
+    let all_paths = (0..WRITE_LATENCY_BATCHES)
+        .flat_map(|batch| {
+            (0..WRITE_LATENCY_BATCH_FILES).map(move |index| {
+                mountpoint.join(format!("write-latency/batch-{batch}-file-{index:02}.bin"))
             })
-            .collect::<Vec<_>>();
-        let batch =
-            run_write_latency_batch(&mounted, &meter, &paths, writers, offset, &replacement);
-        for index in 0..WRITE_LATENCY_BATCH_FILES {
-            let file_index = batch_index * WRITE_LATENCY_BATCH_FILES + index;
-            expected[file_index][offset as usize..offset as usize + RANGE_BYTES]
-                .copy_from_slice(&replacement);
-            assert_eq!(
-                remote_file_bytes(
-                    fixture,
-                    &format!("write-latency/batch-{batch_index}-file-{index:02}.bin"),
-                ),
-                expected[file_index],
-                "writer {file_index} remote bytes after the matched fsync stage"
-            );
-            complete_latencies.push(
-                batch.open.latencies[index]
-                    + batch.mutation.latencies[index]
-                    + batch.fsync.latencies[index],
-            );
-        }
-        merge_stage(&mut open_stage, batch.open);
-        merge_stage(&mut mutation_stage, batch.mutation);
-        merge_stage(&mut fsync_stage, batch.fsync);
-        files.extend(batch.files);
-    }
-    record_write_latency_stage(
-        recorder,
-        context,
-        publication,
-        scale,
-        Dataset {
-            working_set_bytes: Some(0),
-            ..dataset.clone()
-        },
-        &format!("fuse_write_latency_{writers}_open"),
-        "each batch opened four writable descriptors before its mutation; phase latency contains only open",
-        open_stage.clone(),
-        &staging,
-        fixture,
-        vec![
-            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
-            "writable descriptors opened successfully".to_owned(),
-        ],
-    );
-    record_write_latency_stage(
-        recorder,
-        context,
-        publication,
-        scale,
-        Dataset { ..dataset.clone() },
-        &format!("fuse_write_latency_{writers}_mutation"),
-        "each batch completed its pwrites before fsync; this phase contains only FUSE mutations",
-        mutation_stage.clone(),
-        &staging,
-        fixture,
-        vec![
-            format!("exact replacement bytes={}", replacement.len()),
-            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
-            "no backend PUT was accepted before fsync".to_owned(),
-        ],
-    );
-    record_write_latency_stage(
-        recorder,
-        context,
-        publication,
-        scale,
-        dataset.clone(),
-        &format!("fuse_write_latency_{writers}_fsync"),
-        "each batch returned from fsync after remote publication; complete bytes were verified outside every interval",
-        fsync_stage.clone(),
-        &staging,
-        fixture,
-        vec![
-            format!("completed_batches={WRITE_LATENCY_BATCHES}"),
-            "every writer fsync returned successfully".to_owned(),
-            "every batch published at least one backend PUT".to_owned(),
-        ],
-    );
-    let mut complete = StageBatch {
-        latencies: complete_latencies,
-        wall_ms: open_stage.wall_ms + mutation_stage.wall_ms + fsync_stage.wall_ms,
-        ..StageBatch::default()
+        })
+        .collect::<Vec<_>>();
+    let groups = if writers == 1 {
+        vec![all_paths.clone()]
+    } else {
+        (0..WRITE_LATENCY_BATCH_FILES)
+            .map(|index| {
+                (0..WRITE_LATENCY_BATCHES)
+                    .map(|batch| {
+                        mountpoint.join(format!("write-latency/batch-{batch}-file-{index:02}.bin"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
     };
-    complete.io.add(open_stage.io);
-    complete.io.add(mutation_stage.io);
-    complete.io.add(fsync_stage.io);
-    complete.network.add(open_stage.network);
-    complete.network.add(mutation_stage.network);
-    complete.network.add(fsync_stage.network);
-    record_write_latency_stage(
-        recorder,
+    let barrier = Arc::new(Barrier::new(groups.len()));
+    let replacement = Arc::new(replacement);
+    let net_before = meter.snapshot();
+    let io_before = read_proc_io(mounted.pid());
+    let mut threads = Vec::with_capacity(groups.len());
+    for (index, paths) in groups.into_iter().enumerate() {
+        let barrier = barrier.clone();
+        let replacement = replacement.clone();
+        threads.push(thread::spawn(move || {
+            (
+                index,
+                run_write_latency_worker(paths, barrier, offset, replacement),
+            )
+        }));
+    }
+    let mut workers = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("write-latency worker panicked"))
+        .collect::<Vec<_>>();
+    workers.sort_by_key(|(index, _)| *index);
+    let workers = workers
+        .into_iter()
+        .map(|(_, worker)| worker)
+        .collect::<Vec<_>>();
+    let batch_start = workers
+        .iter()
+        .map(|worker| worker.start)
+        .min()
+        .expect("write-latency workers are non-empty");
+    let batch_end = workers
+        .iter()
+        .map(|worker| worker.end)
+        .max()
+        .expect("write-latency workers are non-empty");
+    let batch_wall_ms = batch_end.duration_since(batch_start).as_secs_f64() * 1000.0;
+    meter.settle();
+    let network = meter.snapshot().since(net_before);
+    let io = read_proc_io(mounted.pid()).since(io_before);
+    assert!(
+        network.put > 0,
+        "the write-latency batch must publish content"
+    );
+    assert_eq!(
+        network.s3_activity.in_flight_at_end, 0,
+        "S3 requests remained in flight after the write-latency batch"
+    );
+    assert_eq!(
+        network.service_activity.in_flight_at_end, 0,
+        "service RPCs remained in flight after the write-latency batch"
+    );
+    for (index, bytes) in expected.iter().enumerate() {
+        let batch = index / WRITE_LATENCY_BATCH_FILES;
+        let file = index % WRITE_LATENCY_BATCH_FILES;
+        assert_eq!(
+            remote_file_bytes(
+                fixture,
+                &format!("write-latency/batch-{batch}-file-{file:02}.bin"),
+            ),
+            *bytes,
+            "writer {index} remote bytes after the lifecycle batch"
+        );
+    }
+
+    let samples = workers
+        .iter()
+        .flat_map(|worker| worker.files.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(samples.len(), WRITE_LATENCY_TOTAL_FILES);
+    let latencies = samples
+        .iter()
+        .map(|sample| sample.total_ms)
+        .collect::<Vec<_>>();
+    let observed_phases = PhaseSamples {
+        open_ms: samples.iter().map(|sample| sample.open_ms).collect(),
+        mutation_ms: samples.iter().map(|sample| sample.mutation_ms).collect(),
+        fsync_ms: samples.iter().map(|sample| sample.fsync_ms).collect(),
+    };
+    let application_active_ms = latencies.iter().sum::<f64>();
+    recorder.record_with_timing(
         context,
+        &format!("fuse_write_latency_{writers}"),
         publication,
         scale,
         dataset,
-        &format!("fuse_write_latency_{writers}_complete"),
-        "each phase completed in open, mutation, fsync order; complete bytes were verified before this record",
-        complete,
-        &staging,
-        fixture,
+        "each latency sample spans one worker's continuous open, mutation, and fsync for one file; close and the next file follow the fsync return",
+        latencies,
+        io,
+        network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
         vec![
+            format!("configured_writers={writers}"),
             format!("completed_batches={WRITE_LATENCY_BATCHES}"),
-            "all files had identical size and relative mutation offset".to_owned(),
+            format!("batch_wall_ms={batch_wall_ms:.3}"),
             format!(
-                "matched cases performed {WRITE_LATENCY_TOTAL_FILES} 4 KiB updates for {} total mutation bytes",
-                WRITE_LATENCY_TOTAL_FILES * RANGE_BYTES
+                "observed_application_operation_overlap_ms={:.3}",
+                (application_active_ms - batch_wall_ms).max(0.0)
             ),
-            "complete remote bytes matched every file".to_owned(),
+            format!(
+                "observed_s3_request_max_concurrency={}",
+                network.s3_activity.max_concurrency
+            ),
+            format!(
+                "observed_service_rpc_max_concurrency={}",
+                network.service_activity.max_concurrency
+            ),
+            "network totals cover the complete lifecycle batch; phase arrays are latency diagnostics, not network attribution"
+                .to_owned(),
+            "complete remote bytes matched every file after the batch"
+                .to_owned(),
         ],
+        observed_phases,
+        batch_wall_ms,
     );
-    drop(files);
     mounted.unmount();
 }
 
@@ -5022,8 +4800,10 @@ struct CostRecord {
     completion: String,
     iterations: usize,
     wall_ms: f64,
+    batch_wall_ms: Option<f64>,
     latency: LatencyStats,
     latency_samples_ms: Vec<f64>,
+    observed_phases: Option<PhaseSamples>,
     local_process_io: IoSnapshot,
     local_process_io_note: String,
     network: NetworkSnapshot,
@@ -5032,6 +4812,13 @@ struct CostRecord {
     space: SpaceSnapshot,
     failures: u64,
     invariants: Vec<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct PhaseSamples {
+    open_ms: Vec<f64>,
+    mutation_ms: Vec<f64>,
+    fsync_ms: Vec<f64>,
 }
 
 struct Recorder {
@@ -5091,6 +4878,78 @@ impl Recorder {
         space: SpaceSnapshot,
         invariants: Vec<String>,
     ) {
+        self.record_inner(
+            context,
+            scenario,
+            publication,
+            scale,
+            dataset,
+            completion,
+            latencies,
+            io,
+            network,
+            space_series,
+            space,
+            invariants,
+            None,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_with_timing(
+        &mut self,
+        context: &RunContext,
+        scenario: &str,
+        publication: Publication,
+        scale: Scale,
+        dataset: Dataset,
+        completion: &str,
+        latencies: Vec<f64>,
+        io: IoSnapshot,
+        network: NetworkSnapshot,
+        space_series: Vec<SpaceSnapshot>,
+        space: SpaceSnapshot,
+        invariants: Vec<String>,
+        observed_phases: PhaseSamples,
+        batch_wall_ms: f64,
+    ) {
+        self.record_inner(
+            context,
+            scenario,
+            publication,
+            scale,
+            dataset,
+            completion,
+            latencies,
+            io,
+            network,
+            space_series,
+            space,
+            invariants,
+            Some(observed_phases),
+            Some(batch_wall_ms),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_inner(
+        &mut self,
+        context: &RunContext,
+        scenario: &str,
+        publication: Publication,
+        scale: Scale,
+        dataset: Dataset,
+        completion: &str,
+        latencies: Vec<f64>,
+        io: IoSnapshot,
+        network: NetworkSnapshot,
+        space_series: Vec<SpaceSnapshot>,
+        space: SpaceSnapshot,
+        invariants: Vec<String>,
+        observed_phases: Option<PhaseSamples>,
+        batch_wall_ms: Option<f64>,
+    ) {
         assert!(!latencies.is_empty(), "{scenario} has no latency samples");
         let latency = LatencyStats::new(&latencies);
         let latency_samples_ms = latencies.clone();
@@ -5127,8 +4986,10 @@ impl Recorder {
             completion: completion.to_owned(),
             iterations: latencies.len(),
             wall_ms: latencies.iter().sum(),
+            batch_wall_ms,
             latency,
             latency_samples_ms,
+            observed_phases,
             local_process_io: io,
             local_process_io_note: PROCESS_IO_NOTE.to_owned(),
             network,
@@ -5213,6 +5074,7 @@ impl Recorder {
             completion: "not applicable".to_owned(),
             iterations: 0,
             wall_ms: 0.0,
+            batch_wall_ms: None,
             latency: LatencyStats {
                 p50_ms: 0.0,
                 p95_ms: 0.0,
@@ -5220,6 +5082,7 @@ impl Recorder {
                 max_ms: 0.0,
             },
             latency_samples_ms: Vec::new(),
+            observed_phases: None,
             local_process_io: IoSnapshot::default(),
             local_process_io_note: PROCESS_IO_NOTE.to_owned(),
             network: NetworkSnapshot::default(),

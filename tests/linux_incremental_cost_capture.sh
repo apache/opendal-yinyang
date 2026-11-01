@@ -203,11 +203,20 @@ with open(path, encoding="utf-8") as source:
                     raise SystemExit(
                         f"{record.get('scenario')} has invalid {key} concurrency"
                     )
+            phases = record.get("observed_phases")
+            if not isinstance(phases, dict):
+                raise SystemExit(f"{record.get('scenario')} has no observed_phases")
+            for key in ("open_ms", "mutation_ms", "fsync_ms"):
+                samples = phases.get(key)
+                if not isinstance(samples, list) or len(samples) != WRITE_LATENCY_TOTAL_FILES:
+                    raise SystemExit(
+                        f"{record.get('scenario')} has invalid {key} phase samples"
+                    )
+            if not isinstance(record.get("batch_wall_ms"), (int, float)):
+                raise SystemExit(f"{record.get('scenario')} has no batch wall time")
             scenario = record["scenario"]
             network = record.get("network") or {}
-            if scenario.endswith("_mutation") and network.get("put") != 0:
-                raise SystemExit(f"{scenario} published before fsync")
-            if scenario.endswith("_fsync") and not network.get("put", 0):
+            if not network.get("put", 0):
                 raise SystemExit(f"{scenario} published no content")
         records.append(record)
 
@@ -231,9 +240,7 @@ if expected_workload == "length-changing":
         raise SystemExit(f"length-changing workload is missing records: {missing}")
 if expected_workload == "incremental":
     required = {
-        f"fuse_write_latency_{writers}_{phase}"
-        for writers in (1, 4)
-        for phase in ("open", "mutation", "fsync", "complete")
+        f"fuse_write_latency_{writers}" for writers in (1, 4)
     }
     seen = {record.get("scenario") for record in records}
     missing = sorted(required - seen)
