@@ -2345,8 +2345,7 @@ fn legacy_post_expiry(
             );
             let diagnostic = String::from_utf8_lossy(&serve.stderr).to_ascii_lowercase();
             assert!(
-                diagnostic.contains("profile")
-                    && (diagnostic.contains("unsupported") || diagnostic.contains("unknown")),
+                diagnostic.trim().ends_with(": unknown schema profile"),
                 "legacy service rejection lacked the exact profile diagnostic: {diagnostic}"
             );
             fixture.restart_service();
