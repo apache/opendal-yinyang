@@ -36,7 +36,7 @@ use yinyang_core::{
     Authority, Error, ErrorKind, ExpiryId, NodeId, NodeKind, Result, Revision, Snapshot,
 };
 #[cfg(target_os = "linux")]
-use yinyang_core::{ExpiryConflictKind, ExpiryOutcome, HistoryEntry, RevisionState};
+use yinyang_core::{ExpiryConflictKind, ExpiryOutcome, ExpiryRequest, HistoryEntry, RevisionState};
 
 pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v3";
 pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v3";
@@ -1524,6 +1524,7 @@ fn expiry_report(
     revisions: Vec<ExpiryRevisionDecision>,
     unresolved: Vec<Unresolved>,
 ) -> ManagedExpiryReport {
+    let revision_count = revisions.len() as u64;
     ManagedExpiryReport {
         schema: RETENTION_EXPIRY_SCHEMA,
         filesystem: identity_hex(authority.filesystem()),
@@ -1542,8 +1543,34 @@ fn expiry_report(
         deletion_authorized: false,
         reclaimable_bytes: None,
         physical_cleanup: "not_performed",
-        limits: expiry_limits(protected.len() as u64, revisions.len() as u64),
+        limits: expiry_limits(protected.len() as u64, revision_count),
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(borsh::BorshSerialize)]
+struct ExpiryEvidenceDigestInput {
+    magic: [u8; 8],
+    volume: [u8; 16],
+    expected_latest: [u8; 24],
+    staging_state: u8,
+    staging_binding: u8,
+    staging_source: [u8; 32],
+    handle_total: u64,
+    handle_pending: u64,
+    handle_frozen: u64,
+    handle_conflict: u64,
+    handle_unknown: u64,
+    handle_failed: u64,
+    namespace_prepared: u64,
+    namespace_unknown: u64,
+    namespace_committed: u64,
+    namespace_conflict: u64,
+    namespace_retryable: u64,
+    namespace_failed: u64,
+    protected: Vec<([u8; 24], Vec<String>)>,
+    backups: Vec<(u8, Option<[u8; 16]>, [u8; 32], Vec<([u8; 24], Vec<String>)>)>,
+    unresolved: Vec<(String, String, String)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1603,29 +1630,29 @@ fn expiry_evidence_digest(
             )
         })
         .collect::<Vec<_>>();
-    let bytes = borsh::to_vec(&(
-        *b"YYMEXP01",
-        authority.filesystem().as_bytes(),
-        expected_latest.to_bytes(),
-        staging_state_tag(staging.state),
-        staging_binding_tag(staging.binding.state),
-        *blake3::hash(staging.path.as_bytes()).as_bytes(),
-        staging.handles.total,
-        staging.handles.pending,
-        staging.handles.frozen,
-        staging.handles.conflict,
-        staging.handles.unknown,
-        staging.handles.failed,
-        staging.sync.namespace_prepared,
-        staging.sync.namespace_unknown,
-        staging.sync.namespace_committed,
-        staging.sync.namespace_conflict,
-        staging.sync.namespace_retryable,
-        staging.sync.namespace_failed,
+    let bytes = borsh::to_vec(&ExpiryEvidenceDigestInput {
+        magic: *b"YYMEXP01",
+        volume: *authority.filesystem().as_bytes(),
+        expected_latest: expected_latest.to_bytes(),
+        staging_state: staging_state_tag(staging.state),
+        staging_binding: staging_binding_tag(staging.binding.state),
+        staging_source: *blake3::hash(staging.path.as_bytes()).as_bytes(),
+        handle_total: staging.handles.total,
+        handle_pending: staging.handles.pending,
+        handle_frozen: staging.handles.frozen,
+        handle_conflict: staging.handles.conflict,
+        handle_unknown: staging.handles.unknown,
+        handle_failed: staging.handles.failed,
+        namespace_prepared: staging.sync.namespace_prepared,
+        namespace_unknown: staging.sync.namespace_unknown,
+        namespace_committed: staging.sync.namespace_committed,
+        namespace_conflict: staging.sync.namespace_conflict,
+        namespace_retryable: staging.sync.namespace_retryable,
+        namespace_failed: staging.sync.namespace_failed,
         protected,
-        backup_rows,
+        backups: backup_rows,
         unresolved,
-    ))
+    })
     .map_err(|error| {
         Error::new(
             ErrorKind::Invalid,

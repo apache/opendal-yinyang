@@ -38,12 +38,17 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, CommitId, NodeId};
+use yinyang::core::{
+    Authority, BackendProfile, CommitId, ErrorKind as CoreErrorKind, Fs, NodeId, Revision,
+    RevisionState,
+};
 use yinyang::runtime::{Runtime, RuntimeStatus};
 
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 16 * 1024 * 1024;
+const OLD_YY_BIN: &str = "/home/ubuntu/Code/experiments/yinyang/managed-write-latency-20261101/base-3b5/mwlat-base-3b5-inc-r1.yy";
+const OLD_YY_SHA256: &str = "7c7669c676b2275ceec1a3c15a1b390293797265ee4f400466d2f3c3641ae0c9";
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
@@ -998,6 +1003,332 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
+fn explicit_expiry_preserves_staged_and_backup_work_on_object_and_service() {
+    for publication in [Publication::Object, Publication::Service] {
+        explicit_expiry_case(publication);
+    }
+}
+
+fn explicit_expiry_case(publication: Publication) {
+    const OPERATION_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    assert_eq!(
+        run_external("sha256sum", &[OLD_YY_BIN], Duration::from_secs(30))
+            .stdout
+            .split_ascii_whitespace()
+            .next(),
+        Some(OLD_YY_SHA256.as_bytes()),
+        "old binary identity changed"
+    );
+
+    let mut fixture = Fixture::new(publication);
+    let zero = fixture.remote_create_file("protected.txt", b"version-zero", false);
+    let backup_source = fixture.sync_client("expiry-backup-source");
+    fs::write(
+        backup_source.directory.join("protected.txt"),
+        b"version-zero",
+    )
+    .unwrap();
+    fs::write(
+        backup_source.directory.join("backup-only.txt"),
+        b"backup-baseline",
+    )
+    .unwrap();
+    fixture.sync_run_ok(&backup_source);
+    let backup = fixture.path("expiry-backup");
+    fixture.yy_ok(&[
+        "--volume",
+        text(&backup_source.config),
+        "sync",
+        "backup",
+        "--output",
+        text(&backup),
+    ]);
+
+    let staging = fixture.path("expiry-staging");
+    let config = fixture.path("expiry.json");
+    write_volume_config(
+        &config,
+        "expiry",
+        &staging,
+        publication == Publication::Object,
+        (publication == Publication::Service).then(|| fixture.service_address()),
+    );
+    let handle = parse_handle(&fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "open",
+        "protected.txt",
+        "--write",
+    ]));
+    let published = fixture.path("expiry-published");
+    fs::write(&published, b"version-one!").unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "write",
+        &handle.to_string(),
+        text(&published),
+    ]);
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "fsync",
+        &handle.to_string(),
+    ]);
+    let pending = fixture.path("expiry-pending");
+    fs::write(&pending, b"PEND").unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "write",
+        &handle.to_string(),
+        text(&pending),
+        "--offset",
+        "4",
+    ]);
+
+    let zero_text = revision_text(zero.cursor.revision);
+    if publication == Publication::Object {
+        old_yy(&fixture, &["status", "--revision", &zero_text])
+            .success_or("old object status before expiry");
+        let old_read_path = fixture.path("old-pre-expiry-read");
+        old_yy(
+            &fixture,
+            &["restore", text(&old_read_path), "--revision", &zero_text],
+        )
+        .success_or("old object read before expiry");
+        assert_eq!(
+            fs::read(old_read_path.join("protected.txt")).unwrap(),
+            b"version-zero"
+        );
+    } else {
+        let old_service = old_yy(
+            &fixture,
+            &[
+                "--volume",
+                text(&config),
+                "receipt",
+                "00000000-0000-0000-0000-000000000000",
+            ],
+        );
+        assert_eq!(
+            old_service.status.code(),
+            Some(3),
+            "old service client did not open the pre-expiry authority:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&old_service.stdout),
+            String::from_utf8_lossy(&old_service.stderr)
+        );
+    }
+
+    let immutable_before = immutable_remote_identities(&fixture.operator());
+    let expiry = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "expire",
+        "--revision",
+        &zero_text,
+        "--backup",
+        text(&backup),
+        "--operation-id",
+        OPERATION_ID,
+        "--json",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&expiry.stdout).expect("parse expiry JSON");
+    assert_eq!(report["schema"], "yinyang.managed-retention.expiry.v1");
+    assert_eq!(report["state"], "committed");
+    assert_eq!(report["revisions"][0]["state"], "expired");
+    assert_eq!(
+        report["evidence_digest"]
+            .as_str()
+            .expect("expiry evidence digest")
+            .len(),
+        64
+    );
+    assert_eq!(report["deletion_authorized"], false);
+    assert!(report["reclaimable_bytes"].is_null());
+    assert_eq!(report["physical_cleanup"], "not_performed");
+
+    let authority = fixture_authority(&fixture);
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_revision(zero.cursor.revision))
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired
+    );
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_revision(Revision::from_bytes([0x7f; 24])))
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::NotFound
+    );
+    let history = runtime()
+        .block_on(authority.history_page(None, yinyang::core::RETAINED_REVISIONS_PAGE_MAX))
+        .unwrap();
+    assert!(history.entries.iter().any(|entry| {
+        entry.revision == zero.cursor.revision && matches!(entry.state, RevisionState::Expired(_))
+    }));
+
+    let head_before_old = runtime()
+        .block_on(authority.observe_latest())
+        .unwrap()
+        .revision();
+    if publication == Publication::Object {
+        let old_post = old_yy(&fixture, &["status", "--revision", &zero_text]);
+        assert!(
+            !old_post.status.success(),
+            "old object binary accepted the activated expiry profile:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&old_post.stdout),
+            String::from_utf8_lossy(&old_post.stderr)
+        );
+        let old_post_read_path = fixture.path("old-post-expiry-read");
+        let old_post_read = old_yy(
+            &fixture,
+            &[
+                "restore",
+                text(&old_post_read_path),
+                "--revision",
+                &zero_text,
+            ],
+        );
+        assert!(
+            !old_post_read.status.success(),
+            "old object binary read the activated expired revision"
+        );
+        assert!(
+            !old_post_read_path.exists(),
+            "old binary created a restore destination after rejection"
+        );
+    } else {
+        let old_post = old_yy(
+            &fixture,
+            &[
+                "--volume",
+                text(&config),
+                "receipt",
+                "00000000-0000-0000-0000-000000000000",
+            ],
+        );
+        assert_ne!(
+            old_post.status.code(),
+            Some(3),
+            "old service client accepted the activated expiry profile:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&old_post.stdout),
+            String::from_utf8_lossy(&old_post.stderr)
+        );
+    }
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_latest())
+            .unwrap()
+            .revision(),
+        head_before_old,
+        "old binary mutated the activated head"
+    );
+
+    let mut expected = b"version-one!".to_vec();
+    expected[4..8].copy_from_slice(b"PEND");
+    let read = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "read",
+        &handle.to_string(),
+        "--length",
+        &expected.len().to_string(),
+    ]);
+    assert_eq!(read.stdout, expected);
+    fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "file",
+        "fsync",
+        &handle.to_string(),
+    ]);
+    assert_eq!(
+        fixture.remote_entry_bytes("protected.txt").as_deref(),
+        Some(expected.as_slice()),
+        "{publication:?} did not publish recovered protected work"
+    );
+
+    let authority = fixture_authority(&fixture);
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_revision(zero.cursor.revision))
+            .unwrap_err()
+            .kind(),
+        CoreErrorKind::Expired,
+        "{publication:?} lost the expiry marker after a normal commit"
+    );
+    let immutable_after = immutable_remote_identities(&fixture.operator());
+    for identity in &immutable_before {
+        assert!(
+            immutable_after.contains(identity),
+            "{publication:?} deleted or rewrote pre-existing immutable content: {identity:?}"
+        );
+    }
+
+    let before_repeat = runtime()
+        .block_on(authority.observe_latest())
+        .unwrap()
+        .revision();
+    let repeated = fixture.yy_ok(&[
+        "--volume",
+        text(&config),
+        "space",
+        "retention",
+        "expire",
+        "--revision",
+        &zero_text,
+        "--backup",
+        text(&backup),
+        "--json",
+    ]);
+    let repeated: serde_json::Value =
+        serde_json::from_slice(&repeated.stdout).expect("parse repeated expiry JSON");
+    assert_eq!(repeated["state"], "already_expired");
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_latest())
+            .unwrap()
+            .revision(),
+        before_repeat,
+        "idempotent expiry advanced the head"
+    );
+
+    if publication == Publication::Service {
+        fixture.stop_service();
+        let metadata = fixture.path("metadata.db");
+        let old_serve = old_yy(
+            &fixture,
+            &[
+                "serve",
+                "--database",
+                text(&metadata),
+                "--listen",
+                "127.0.0.1:0",
+            ],
+        );
+        assert!(
+            !old_serve.status.success(),
+            "old service binary accepted the activated expiry profile:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&old_serve.stdout),
+            String::from_utf8_lossy(&old_serve.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
 fn object_publication_journal_restore_preserves_history_and_unknown() {
     let fixture = Fixture::new(Publication::Object);
     let history = fixture.path("history-source");
@@ -1303,6 +1634,13 @@ fn remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
     });
     identities.sort();
     identities
+}
+
+fn immutable_remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
+    remote_identities(operator)
+        .into_iter()
+        .filter(|identity| identity.path != ".yinyang/head")
+        .collect()
 }
 
 fn remove_prefix(operator: &opendal::Operator) {
@@ -1822,6 +2160,51 @@ fn upstream_endpoint() -> SocketAddr {
 
 fn commit_text(commit: CommitId) -> String {
     uuid::Uuid::from_bytes(*commit.as_bytes()).to_string()
+}
+
+fn revision_text(revision: Revision) -> String {
+    revision
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn old_yy(fixture: &Fixture, args: &[&str]) -> Captured {
+    let source = fixture.yy_command(&[]);
+    let envs = source
+        .get_envs()
+        .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
+        .collect::<Vec<_>>();
+    let mut command = Command::new(OLD_YY_BIN);
+    for (key, value) in envs {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    command.args(args);
+    run_command(command, Duration::from_secs(60))
+}
+
+fn fixture_authority(fixture: &Fixture) -> Arc<dyn Authority> {
+    match fixture.publication {
+        Publication::Object => Arc::new(
+            runtime()
+                .block_on(Fs::open(fixture.operator(), BackendProfile::Minio))
+                .expect("open object authority"),
+        ),
+        Publication::Service => {
+            let command = fixture.yy_command(&[]);
+            let token = command
+                .get_envs()
+                .find(|(key, _)| *key == "YINYANG_SERVICE_TOKEN")
+                .and_then(|(_, value)| value)
+                .expect("fixture service token")
+                .to_string_lossy()
+                .into_owned();
+            service_authority(fixture.service_address(), &token, fixture.operator())
+        }
+    }
 }
 
 fn operator_for_root(root: &str) -> opendal::Operator {
