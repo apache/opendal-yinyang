@@ -861,8 +861,13 @@ impl Replica {
             Some(&hints),
         )?;
         if self._lease.is_some() {
-            for node in nodes.values() {
-                self.store.save_local_scan_evidence(node)?;
+            for (path, node) in &nodes {
+                if !hints
+                    .get(path)
+                    .is_some_and(|hint| scan_hint_matches_node(node, hint))
+                {
+                    self.store.save_local_scan_evidence(node)?;
+                }
             }
         }
         Ok(LocalSnapshot { nodes })
@@ -1038,9 +1043,6 @@ impl Replica {
                 node.path = path.to_owned();
                 node.parent = Some(parent_identity);
                 node.stat = Some(local_stat(&stat));
-                if self._lease.is_some() {
-                    self.store.save_local_scan_evidence(&node)?;
-                }
                 nodes.insert(path.to_owned(), node);
             }
             FileType::Symlink => {
@@ -1055,8 +1057,13 @@ impl Replica {
             }
         }
         if self._lease.is_some() {
-            for node in nodes.values() {
-                self.store.save_local_scan_evidence(node)?;
+            for (path, node) in &nodes {
+                if !hints
+                    .get(path)
+                    .is_some_and(|hint| scan_hint_matches_node(node, hint))
+                {
+                    self.store.save_local_scan_evidence(node)?;
+                }
             }
         }
         Ok(LocalSnapshot::from_nodes(nodes))
@@ -3428,23 +3435,33 @@ fn scan_hint_matches(current: &Stat, hint: &LocalScanHint) -> bool {
     let Some(stored) = hint.node.stat else {
         return false;
     };
-    stored.dev == current.st_dev
-        && stored.ino == current.st_ino
-        && stored.size == current.st_size as u64
-        && stored.mtime == current.st_mtime
-        && stored.mtime_nsec == current.st_mtime_nsec as i64
-        && stored.ctime == current.st_ctime
-        && stored.ctime_nsec == current.st_ctime_nsec as i64
-        && stat_is_racy_clean(current, hint.recorded_ns)
+    stored
+        == LocalStat {
+            dev: current.st_dev,
+            ino: current.st_ino,
+            size: current.st_size as u64,
+            mtime: current.st_mtime,
+            mtime_nsec: current.st_mtime_nsec as i64,
+            ctime: current.st_ctime,
+            ctime_nsec: current.st_ctime_nsec as i64,
+        }
+        && local_stat_is_racy_clean(&stored, hint.recorded_ns)
 }
 
-fn stat_is_racy_clean(stat: &Stat, recorded_ns: i64) -> bool {
+fn scan_hint_matches_node(node: &LocalNode, hint: &LocalScanHint) -> bool {
+    let (Some(stored), Some(current)) = (hint.node.stat, node.stat) else {
+        return false;
+    };
+    stored == current && local_stat_is_racy_clean(&current, hint.recorded_ns)
+}
+
+fn local_stat_is_racy_clean(stat: &LocalStat, recorded_ns: i64) -> bool {
     let timestamp_ns = |seconds: i64, nanos: i64| -> i128 {
         i128::from(seconds) * 1_000_000_000 + i128::from(nanos)
     };
     let cutoff = i128::from(recorded_ns) - 1_000_000_000;
-    timestamp_ns(stat.st_mtime, stat.st_mtime_nsec as i64) < cutoff
-        && timestamp_ns(stat.st_ctime, stat.st_ctime_nsec as i64) < cutoff
+    timestamp_ns(stat.mtime, stat.mtime_nsec) < cutoff
+        && timestamp_ns(stat.ctime, stat.ctime_nsec) < cutoff
 }
 
 fn same_tree(expected: &BTreeMap<String, LocalNode>, actual: &BTreeMap<String, LocalNode>) -> bool {
