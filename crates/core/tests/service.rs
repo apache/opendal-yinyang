@@ -233,6 +233,9 @@ async fn expiry_contract(fs: &dyn Authority, label: &str) {
     let expired = fs.observe_revision(first_revision).await.unwrap_err();
     assert_eq!(expired.kind(), ErrorKind::Expired);
     assert_eq!(expired.expired_revision(), Some(first_revision));
+    let held_expired = fs.observe_revision(held_revision).await.unwrap_err();
+    assert_eq!(held_expired.kind(), ErrorKind::Expired);
+    assert_eq!(held_expired.expired_revision(), Some(held_revision));
     assert!(held.resolve("held-file").await.unwrap().is_some());
     assert_eq!(held_version.read(0, 4).await.unwrap(), b"held");
     let absent = fs
@@ -264,6 +267,22 @@ async fn expiry_contract(fs: &dyn Authority, label: &str) {
     assert_eq!(
         committed(fs.commit(&first_plan).await.unwrap()),
         first_receipt
+    );
+    let mut next = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    next.create_directory(fs.root(), "after-expiry")
+        .await
+        .unwrap();
+    let next = next.finish().unwrap();
+    let batch = fs.commit_batch(&[first_plan.clone(), next]).await.unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0], Outcome::Committed(first_receipt.clone()));
+    assert!(matches!(batch[1], Outcome::Committed(_)));
+    assert_eq!(
+        fs.observe_revision(first_revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Expired
     );
 
     type Wire = (

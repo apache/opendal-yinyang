@@ -1007,7 +1007,7 @@ impl MetadataService {
             None => Ok(None),
         }
     }
-    pub async fn commit_encoded(&self, plans: &[Vec<u8>]) -> Result<Vec<Outcome>> {
+    pub(crate) async fn commit_encoded(&self, plans: &[Vec<u8>]) -> Result<Vec<Outcome>> {
         if plans.len() > 4096 {
             return Err(Error::unsupported(
                 "service batch",
@@ -1070,6 +1070,15 @@ impl MetadataService {
             .remove(0))
     }
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        if requests.len() > 4096 {
+            return Err(Error::unsupported(
+                "service batch",
+                "more than 4096 requests",
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(vec![]);
+        }
         let plans = requests
             .iter()
             .map(Transaction::to_bytes)

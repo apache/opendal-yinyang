@@ -637,7 +637,7 @@ impl HistoryPage {
         }
         for entry in &self.entries {
             if let RevisionState::Expired(marker) = entry.state
-                && (marker.before >= entry.revision || marker.after <= entry.revision)
+                && (marker.before <= entry.revision || marker.after <= entry.revision)
             {
                 return Err(Error::corrupt(
                     "read history",
