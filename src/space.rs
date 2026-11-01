@@ -1613,7 +1613,10 @@ fn expiry_evidence_digest(
                 .collect::<Vec<_>>();
             (
                 backup_state_tag(package.state),
-                package.filesystem.map(|volume| parse_identity_hex(&volume)),
+                package
+                    .filesystem
+                    .as_ref()
+                    .map(|volume| parse_identity_hex(volume)),
                 *blake3::hash(package.path.as_bytes()).as_bytes(),
                 protected,
             )
