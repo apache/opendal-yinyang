@@ -992,7 +992,7 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             "unknown service binding profile",
         ));
     }
-    if bytes.starts_with(b"YYHEAD01") {
+    if bytes.starts_with(b"YYHEAD01") || bytes.starts_with(b"YYHEAD02") {
         return Err(Error::unsupported(
             "open filesystem",
             "legacy format is not supported by the object authority",
