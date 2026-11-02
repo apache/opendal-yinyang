@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
+use crate::compatibility::{OBJECT_HEAD_MAGIC, OBJECT_SNAPSHOT_MAGIC, SERVICE_BINDING_MAGIC};
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::index::{Index, IndexCache};
 use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
@@ -22,16 +24,6 @@ use crate::transaction::Transaction;
 use crate::{Error, ErrorKind, NodeId, Result};
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
-
-/// Deployment semantics, not inferred from OpenDAL capability flags.
-/// The endpoint must implement the named provider's documented strong reads,
-/// durable immutable writes and atomic conditional writes. External mutations
-/// under the owned prefix invalidate these guarantees.
-#[derive(Clone, Copy, Debug)]
-pub enum BackendProfile {
-    AmazonS3,
-    Minio,
-}
 
 // Kept available here for existing object-profile callers.
 pub use crate::snapshot::{
@@ -49,13 +41,13 @@ type SnapshotWire = (
     [Option<RefWire>; 5],
 );
 #[derive(Clone, Debug)]
-struct ObjectState {
-    pub(crate) data: DataStore,
-    pub(crate) filesystem: NodeId,
-    pub(crate) root: NodeId,
-    pub(crate) revision: Revision,
-    pub(crate) nodes: Index,
-    pub(crate) entries: Index,
+pub(crate) struct ObjectState {
+    data: DataStore,
+    filesystem: NodeId,
+    root: NodeId,
+    revision: Revision,
+    nodes: Index,
+    entries: Index,
     receipts: Index,
     changes: Index,
     history: Index,
@@ -64,6 +56,10 @@ struct ObjectState {
 }
 impl ObjectState {
     fn view(&self) -> Snapshot {
+        self.view_cached(IndexCache::default())
+    }
+
+    fn view_cached(&self, cache: IndexCache) -> Snapshot {
         Snapshot {
             data: self.data.clone(),
             filesystem: self.filesystem,
@@ -71,7 +67,7 @@ impl ObjectState {
             revision: self.revision,
             reader: Arc::new(ObjectRecords {
                 data: self.data.clone(),
-                cache: IndexCache::default(),
+                cache,
                 indexes: [
                     self.nodes.clone(),
                     self.entries.clone(),
@@ -93,7 +89,7 @@ impl ObjectState {
         self.reference = self
             .data
             .put_metadata(&encode(&(
-                *b"YYSNAP02",
+                OBJECT_SNAPSHOT_MAGIC,
                 *self.filesystem.as_bytes(),
                 *self.root.as_bytes(),
                 self.revision.wire(),
@@ -101,6 +97,65 @@ impl ObjectState {
             ))?)
             .await?;
         Ok(())
+    }
+
+    pub(crate) fn data(&self) -> &DataStore {
+        &self.data
+    }
+
+    pub(crate) const fn filesystem(&self) -> NodeId {
+        self.filesystem
+    }
+
+    pub(crate) const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    pub(crate) const fn nodes(&self) -> &Index {
+        &self.nodes
+    }
+
+    pub(crate) const fn entries(&self) -> &Index {
+        &self.entries
+    }
+
+    pub(crate) const fn receipts(&self) -> &Index {
+        &self.receipts
+    }
+
+    pub(crate) const fn changes(&self) -> &Index {
+        &self.changes
+    }
+
+    pub(crate) const fn history(&self) -> &Index {
+        &self.history
+    }
+
+    pub(crate) const fn reference(&self) -> &PackedRef {
+        &self.reference
+    }
+
+    pub(crate) async fn load_retained(
+        &self,
+        revision: Revision,
+        reference: &PackedRef,
+    ) -> Result<Self> {
+        let [nodes, entries, receipts, changes, history] =
+            read_snapshot_roots(&self.data, reference, revision, self.filesystem, self.root)
+                .await?;
+        Ok(Self {
+            data: self.data.clone(),
+            filesystem: self.filesystem,
+            root: self.root,
+            revision,
+            nodes,
+            entries,
+            receipts,
+            changes,
+            history,
+            reference: reference.clone(),
+            etag: None,
+        })
     }
 }
 
@@ -136,8 +191,12 @@ impl RecordReader for ObjectRecords {
 pub struct ObjectFs {
     operator: Operator,
     data: DataStore,
+    cache: IndexCache,
     filesystem: NodeId,
     root: NodeId,
+    // Clones share a fair local publication gate; separate authorities retain
+    // CAS contention with one another.
+    commit_gate: Arc<tokio::sync::Mutex<()>>,
 }
 type HeadWire = ([u8; 8], u8, [u8; 16], [u8; 16], RevisionWire, RefWire);
 struct Head {
@@ -148,8 +207,8 @@ struct Head {
     etag: String,
 }
 impl ObjectFs {
-    pub async fn create(operator: Operator, profile: BackendProfile) -> Result<Self> {
-        validate_backend(&operator, profile)?;
+    pub async fn create(operator: Operator) -> Result<Self> {
+        validate_backend(&operator)?;
         if let Some(head) = read_head(&operator).await? {
             return Self::from_head(operator, head).await;
         }
@@ -194,15 +253,15 @@ impl ObjectFs {
             .if_not_exists(true)
             .await
         {
-            Ok(_) => Self::open(operator, profile).await,
-            Err(error) => match Self::open(operator, profile).await {
+            Ok(_) => Self::open(operator).await,
+            Err(error) => match Self::open(operator).await {
                 Ok(fs) => Ok(fs),
                 Err(_) => Err(Error::from_storage("create filesystem head", error)),
             },
         }
     }
-    pub async fn open(operator: Operator, profile: BackendProfile) -> Result<Self> {
-        validate_backend(&operator, profile)?;
+    pub async fn open(operator: Operator) -> Result<Self> {
+        validate_backend(&operator)?;
         let head = read_head(&operator)
             .await?
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "open filesystem", "head is missing"))?;
@@ -212,8 +271,10 @@ impl ObjectFs {
         let fs = Self {
             data: DataStore::new(operator.clone(), head.filesystem)?,
             operator,
+            cache: IndexCache::default(),
             filesystem: head.filesystem,
             root: head.root,
+            commit_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         let snapshot = fs
             .load(head.reference, head.revision, Some(head.etag))
@@ -231,9 +292,9 @@ impl ObjectFs {
         self.filesystem
     }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
-        Ok(self.observe_state().await?.view())
+        Ok(self.observe_state().await?.view_cached(self.cache.clone()))
     }
-    async fn observe_state(&self) -> Result<ObjectState> {
+    pub(crate) async fn observe_state(&self) -> Result<ObjectState> {
         let head = read_head(&self.operator)
             .await?
             .ok_or_else(|| corrupt("published head disappeared"))?;
@@ -249,28 +310,19 @@ impl ObjectFs {
         revision: Revision,
         etag: Option<String>,
     ) -> Result<ObjectState> {
-        let bytes = self.data.read_extent(&reference, 4096).await?;
-        let (magic, fs, root, rev, roots): SnapshotWire = decode(&bytes)?;
-        if magic != *b"YYSNAP02"
-            || fs != *self.filesystem.as_bytes()
-            || root != *self.root.as_bytes()
-            || Revision::from_wire(rev) != revision
-        {
-            return Err(corrupt("snapshot envelope disagrees with authority"));
-        }
-        let mut roots = roots
-            .into_iter()
-            .map(|r| r.map(PackedRef::from_wire).transpose().map(Index));
+        let [nodes, entries, receipts, changes, history] =
+            read_snapshot_roots(&self.data, &reference, revision, self.filesystem, self.root)
+                .await?;
         Ok(ObjectState {
             data: self.data.clone(),
             filesystem: self.filesystem,
             root: self.root,
             revision,
-            nodes: roots.next().unwrap()?,
-            entries: roots.next().unwrap()?,
-            receipts: roots.next().unwrap()?,
-            changes: roots.next().unwrap()?,
-            history: roots.next().unwrap()?,
+            nodes,
+            entries,
+            receipts,
+            changes,
+            history,
             reference,
             etag,
         })
@@ -278,7 +330,7 @@ impl ObjectFs {
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         let latest = self.observe_state().await?;
         if latest.revision == revision {
-            return Ok(latest.view());
+            return Ok(latest.view_cached(self.cache.clone()));
         }
         let bytes = latest
             .history
@@ -294,7 +346,60 @@ impl ObjectFs {
         Ok(self
             .load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
             .await?
-            .view())
+            .view_cached(self.cache.clone()))
+    }
+    pub(crate) async fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> Result<RevisionPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(Error::unsupported(
+                "list retained revisions",
+                format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
+            ));
+        }
+        let latest = self.observe_state().await?;
+        let after_key = after.map(|revision| revision.to_bytes().to_vec());
+        let rows = latest
+            .history
+            .scan(
+                &self.data,
+                None,
+                &[],
+                None,
+                after_key.as_deref(),
+                limit as usize + 1,
+            )
+            .await?;
+        let mut revisions = Vec::new();
+        for (key, value) in rows {
+            let key = key
+                .try_into()
+                .map_err(|_| corrupt("invalid retained revision key"))?;
+            let _: PackedRef = PackedRef::from_wire(decode(&value)?)?;
+            revisions.push(Revision::from_bytes(key));
+        }
+        if revisions.len() > limit as usize {
+            revisions.truncate(limit as usize);
+            let next = revisions.last().copied();
+            return Ok(RevisionPage { revisions, next });
+        }
+        if after < Some(latest.revision) {
+            revisions.push(latest.revision);
+        }
+        if revisions.len() > limit as usize {
+            revisions.truncate(limit as usize);
+            let next = revisions.last().copied();
+            return Ok(RevisionPage { revisions, next });
+        }
+        if revisions.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(corrupt("retained revisions are not strictly ordered"));
+        }
+        Ok(RevisionPage {
+            revisions,
+            next: None,
+        })
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
@@ -305,6 +410,7 @@ impl ObjectFs {
     /// Deterministic input order; rejected speculative members are not reported
     /// until the preceding accepted members become authoritative.
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        let _guard = self.commit_gate.lock().await;
         match self.commit_batch_inner(requests).await {
             Err(error) if error.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
@@ -440,7 +546,44 @@ impl ObjectFs {
         Ok(outcomes)
     }
 }
-fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()> {
+
+async fn read_snapshot_roots(
+    data: &DataStore,
+    reference: &PackedRef,
+    revision: Revision,
+    filesystem: NodeId,
+    root: NodeId,
+) -> Result<[Index; 5]> {
+    let bytes = data.read_extent(reference, 4096).await?;
+    if bytes.len() < OBJECT_SNAPSHOT_MAGIC.len() {
+        return Err(corrupt("truncated snapshot descriptor"));
+    }
+    if bytes[..OBJECT_SNAPSHOT_MAGIC.len()] != OBJECT_SNAPSHOT_MAGIC {
+        return Err(Error::unsupported(
+            "open snapshot",
+            "unknown snapshot profile",
+        ));
+    }
+    let (magic, fs, encoded_root, rev, roots): SnapshotWire = decode(&bytes)?;
+    if magic != OBJECT_SNAPSHOT_MAGIC
+        || fs != *filesystem.as_bytes()
+        || encoded_root != *root.as_bytes()
+        || Revision::from_wire(rev) != revision
+    {
+        return Err(corrupt("snapshot envelope disagrees with authority"));
+    }
+    let mut roots = roots
+        .into_iter()
+        .map(|entry| entry.map(PackedRef::from_wire).transpose().map(Index));
+    Ok([
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+        roots.next().unwrap()?,
+    ])
+}
+fn validate_backend(operator: &Operator) -> Result<()> {
     let info = operator.info();
     let cap = info.capability();
     if info.scheme() != "s3"
@@ -452,14 +595,14 @@ fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()>
     {
         return Err(Error::unsupported(
             "open object authority",
-            "the selected S3 semantic profile and conditional streaming capabilities are required",
+            "the S3 transport and conditional streaming capabilities are required",
         ));
     }
     Ok(())
 }
 fn head_bytes(snapshot: &ObjectState) -> Result<Vec<u8>> {
     let mut bytes = encode(&(
-        *b"YYHEAD02",
+        OBJECT_HEAD_MAGIC,
         0_u8,
         *snapshot.filesystem.as_bytes(),
         *snapshot.root.as_bytes(),
@@ -506,10 +649,16 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             bytes.extend_from_slice(&chunk);
         }
     }
-    if bytes.starts_with(b"YYSERV01") {
+    if bytes.starts_with(&SERVICE_BINDING_MAGIC) {
         return Err(Error::unsupported(
             "open filesystem",
             "metadata-service authority required",
+        ));
+    }
+    if bytes.starts_with(b"YYSERV") {
+        return Err(Error::unsupported(
+            "open filesystem",
+            "unknown service binding profile",
         ));
     }
     if bytes.starts_with(b"YYHEAD01") {
@@ -525,7 +674,7 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
     }
     let (magic, mode, fs, root, revision, reference): HeadWire =
         decode(&bytes[..bytes.len() - 32])?;
-    if magic != *b"YYHEAD02" || mode != 0 {
+    if magic != OBJECT_HEAD_MAGIC || mode != 0 {
         return Err(Error::unsupported(
             "open filesystem",
             "unknown profile or publication mode",
@@ -538,4 +687,43 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
         reference: PackedRef::from_wire(reference)?,
         etag,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use crate::{Authority, CommitId, Planner};
+
+    #[tokio::test]
+    async fn snapshots_share_the_content_addressed_index_cache() {
+        let backend = TestBackend::default();
+        let fs = ObjectFs::create(backend.operator()).await.unwrap();
+        let mut empty_source: &[u8] = b"";
+        let empty = fs.prepare(&mut empty_source).await.unwrap();
+        let base = fs.observe_latest().await.unwrap();
+        let mut plan = Planner::new(&base, CommitId::generate());
+        let bulk = plan.create_directory(fs.root(), "bulk").await.unwrap();
+        for index in 0..1000 {
+            plan.create_file(bulk, &format!("entry-{index:04}"), empty.clone(), false)
+                .await
+                .unwrap();
+        }
+        let request = plan.finish().unwrap();
+        fs.commit(&request).await.unwrap();
+
+        let first = fs.observe_latest().await.unwrap();
+        let first_entry = first.lookup(bulk, "entry-0500").await.unwrap().unwrap();
+        first.node(first_entry.node_id).await.unwrap().unwrap();
+
+        let second = fs.observe_latest().await.unwrap();
+        backend.state.lock().unwrap().data_reads = 0;
+        let second_entry = second.lookup(bulk, "entry-0500").await.unwrap().unwrap();
+        second.node(second_entry.node_id).await.unwrap().unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            0,
+            "a warm page cache was not shared across snapshots"
+        );
+    }
 }

@@ -59,6 +59,7 @@ impl Command {
             SubCommand::Macos(cmd) => cmd.run(),
             SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
+            SubCommand::TestLinuxDirect(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
             SubCommand::TestLinuxOperations(cmd) => cmd.run(),
             SubCommand::TestLinuxRecovery(cmd) => cmd.run(),
@@ -84,6 +85,10 @@ enum SubCommand {
         about = "Run real Linux Managed Sync acceptance through yy and ordinary directories (requires isolated S3 settings)."
     )]
     TestManagedSync(CommandTestManagedSync),
+    #[clap(
+        about = "Run deterministic Direct Mount and Sync acceptance through yy and /dev/fuse (requires isolated S3 settings)."
+    )]
+    TestLinuxDirect(CommandTestLinuxDirect),
     #[clap(
         about = "Run real Linux FUSE acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
@@ -297,6 +302,14 @@ enum BenchPublication {
 enum BenchWorkload {
     Full,
     ReadOnlyRange,
+    Incremental,
+    LengthChanging,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BenchIncrementalExpectation {
+    Baseline,
+    Required,
 }
 
 #[derive(Parser)]
@@ -315,9 +328,16 @@ struct CommandBenchLinuxCost {
         long,
         value_enum,
         default_value = "full",
-        help = "Select the complete product matrix or the matched read-only range workload."
+        help = "Select the complete product matrix, the matched read-only range workload, the same-length writable workload, or the length-changing writable workload."
     )]
     workload: BenchWorkload,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "baseline",
+        help = "For writable incremental workloads, record baseline behavior or reject payload traffic consistent with full-file fallback."
+    )]
+    incremental_expect: BenchIncrementalExpectation,
     #[arg(
         long,
         help = "Write JSONL evidence here; a Markdown summary uses the same path with .md."
@@ -348,7 +368,9 @@ impl CommandBenchLinuxCost {
             }
         }
         let profile = match self.workload {
-            BenchWorkload::ReadOnlyRange => "full",
+            BenchWorkload::ReadOnlyRange
+            | BenchWorkload::Incremental
+            | BenchWorkload::LengthChanging => "full",
             BenchWorkload::Full => match self.profile {
                 BenchProfile::Early => "early",
                 BenchProfile::Full => "full",
@@ -362,6 +384,12 @@ impl CommandBenchLinuxCost {
         let workload = match self.workload {
             BenchWorkload::Full => "full",
             BenchWorkload::ReadOnlyRange => "read-only-range",
+            BenchWorkload::Incremental => "incremental",
+            BenchWorkload::LengthChanging => "length-changing",
+        };
+        let incremental_expect = match self.incremental_expect {
+            BenchIncrementalExpectation::Baseline => "baseline",
+            BenchIncrementalExpectation::Required => "required",
         };
         let mut cmd = find_command("cargo");
         cmd.args([
@@ -380,6 +408,7 @@ impl CommandBenchLinuxCost {
         cmd.env("YINYANG_COST_PROFILE", profile);
         cmd.env("YINYANG_COST_WORKLOAD", workload);
         cmd.env("YINYANG_COST_PUBLICATION", publication);
+        cmd.env("YINYANG_COST_INCREMENTAL_EXPECT", incremental_expect);
         cmd.env("YINYANG_COST_OUTPUT", &self.output);
         cmd.env("YINYANG_COST_SUMMARY", self.output.with_extension("md"));
         cmd.env(
@@ -432,6 +461,24 @@ impl CommandTestManagedSync {
             "--test-threads=1",
         ]);
         run_command(cmd);
+    }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-direct")]
+struct CommandTestLinuxDirect {}
+
+impl CommandTestLinuxDirect {
+    fn run(self) {
+        require_linux("Direct acceptance");
+        require_fuse("Direct acceptance");
+        require_isolated_storage("Direct acceptance");
+        if std::env::var_os("YINYANG_DIRECT_VERSIONED_BUCKET").is_none() {
+            panic!(
+                "YINYANG_DIRECT_VERSIONED_BUCKET is unset; Direct acceptance must cover a true-versioning bucket"
+            );
+        }
+        run_ignored_test_skipping("linux_direct", Some("direct_"), &["direct_amazon_s3_"]);
     }
 }
 
@@ -593,12 +640,19 @@ fn require_isolated_storage(context: &str) {
 }
 
 fn run_ignored_test(target: &str, filter: Option<&str>) {
+    run_ignored_test_skipping(target, filter, &[]);
+}
+
+fn run_ignored_test_skipping(target: &str, filter: Option<&str>, skips: &[&str]) {
     let mut cmd = find_command("cargo");
     cmd.args(["test", "-p", "yinyang", "--test", target]);
     if let Some(filter) = filter {
         cmd.arg(filter);
     }
     cmd.args(["--", "--ignored", "--nocapture", "--test-threads=1"]);
+    for skip in skips {
+        cmd.args(["--skip", skip]);
+    }
     run_command(cmd);
 }
 

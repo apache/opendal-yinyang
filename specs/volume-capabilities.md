@@ -1,17 +1,18 @@
 # Volume admission and capabilities
 
 **Status: experimental Managed volume, Mount durability policy, library and
-Linux FUSE frontends, and Linux ordinary-directory Managed Sync.**
-Direct volumes and the macOS and Windows frontends are recognized configuration
-choices but are rejected as unimplemented before startup; read-only Managed Sync
-is rejected as unsupported. The Linux FUSE frontend is specified separately in
-[`linux-fuse.md`](linux-fuse.md), and Managed Sync in
-[`linux-sync.md`](linux-sync.md).
+Linux FUSE frontends, conditional-write S3 Direct, Direct Sync, and Linux
+ordinary-directory Managed Sync.**
+Writable Direct is opt-in and requires local staging. Direct Sync is a separate
+library workflow for the combinations admitted below. Read-only Managed Sync is
+rejected as unsupported. The Linux
+FUSE frontend is specified separately in [`linux-fuse.md`](linux-fuse.md), Direct in
+[`direct.md`](direct.md), and Managed Sync in [`linux-sync.md`](linux-sync.md).
 
 ## Configuration
 
-`VolumeConfig` is strict JSON. Unknown fields and unknown enum/capability names
-are rejected. A CLI configuration file contains:
+`VolumeConfig` is strict JSON. Unknown fields and unknown enum names are
+rejected. A CLI configuration file contains:
 
 ```json
 {
@@ -22,8 +23,7 @@ are rejected. A CLI configuration file contains:
   "publication": "object",
   "storage_profile": "minio",
   "staging": "./workspace-staging",
-  "read_only": false,
-  "require": ["read", "remote-fsync", "atomic-rename"]
+  "read_only": false
 }
 ```
 
@@ -31,6 +31,33 @@ The CLI resolves relative staging paths against the configuration file's parent.
 The storage profile is `amazon-s3` or `minio`; this is an explicit semantic
 deployment selection, not detection that any S3-compatible endpoint is safe.
 Storage connection/credentials remain in the existing `YINYANG_S3_*` settings.
+
+A Direct configuration uses the same strict document without `staging`:
+
+```json
+{
+  "name": "objects",
+  "model": "direct",
+  "access": "mount",
+  "frontend": "fuse",
+  "publication": "object",
+  "storage_profile": "amazon-s3",
+  "read_only": true
+}
+```
+
+Direct `read_only` defaults to `true`; Managed retains its explicit or default
+`false` write policy and required staging path. A read-only Direct mount
+permits only `access=mount`, object publication, `frontend=library`, or Linux
+`frontend=fuse`, and must omit staging. A writable Direct mount sets
+`read_only=false`, provides a staging path, and uses Linux `frontend=fuse`.
+Direct does not accept a service address or use a publication service.
+
+Direct Sync is `access=sync`, Linux `frontend=library`, object publication,
+`read_only=false` and a non-empty staging path. It requires the same conditional
+create/replace primitives as writable Direct plus conditional delete. The
+staging path is the Direct Sync state directory; the ordinary `file` runtime
+and `Volume::open` do not install Direct Sync handles.
 
 For service publication select `"publication": "service"` and
 `"service_address": "127.0.0.1:7447"`, and supply
@@ -46,51 +73,75 @@ installing a mount point. It does not claim an OS frontend or offline Sync.
 opens the shared Mount read-write; recovered pending/frozen/error state is
 served through the same handles and reported by flush/fsync rather than hidden.
 
-`access=sync` selects bidirectional ordinary-directory reconciliation and is
-admitted only with `frontend=library` and `read_only: false`. The
+Managed `access=sync` selects bidirectional ordinary-directory reconciliation
+and is admitted only with `frontend=library` and `read_only: false`. The
 [`sync` CLI](linux-sync.md) connects the authority through `Volume::connect`;
 the file-runtime opener `Volume::open` still rejects Sync volumes because it
 installs recoverable handles instead of reconciling a directory.
 
-## Negotiation and enforcement
+## Loading and admission
 
-The effective capability set is the intersection of:
+`VolumeContext::load` is the only file-based volume loader used by `yy
+--volume`. It reads the strict JSON document, resolves a non-empty relative
+`staging` against the configuration file's directory, applies `read_only`
+defaults, and runs the pure admission table. It does not require storage
+environment variables. The CLI and native bridge both obtain storage operators
+from `volume::StorageConnection`; the CLI reads `YINYANG_S3_*` and
+`YINYANG_SERVICE_TOKEN` once, while native configuration supplies the equivalent
+map and token explicitly. Building the operator does not contact storage.
+Authority connection remains on demand, so argument validation, local status
+and local export paths continue without storage configuration or connectivity.
 
-1. the implemented volume model;
-2. the storage prerequisites for that model and publication authority;
-3. the access model and read-only policy;
-4. the implemented frontend.
+Admission is one table over `model`, `access`, `frontend`, `publication`,
+`read_only`, staging presence and `service_address`. It returns the admitted
+capability set or one precise `Invalid` error. There is no second capability
+intersection and no configurable `require` field. Strict parsing rejects
+`require` as an unknown field, as it does every other unknown field.
 
-Startup also requires the intersection of the volume, access, and frontend
-contracts (the combination baseline) to survive the storage intersection, so a
-frontend cannot silently weaken the model. The library frontend claims the full
-implemented runtime set. A read-only Linux FUSE mount claims read, list,
-stable-identity, pinned-reads, and retained-unlink-read; a writable FUSE mount
-claims the full Managed set, including write, append, truncate, atomic rename,
-remote fsync, and recoverable staging.
-A read-only Sync configuration is rejected before startup because
-reconciliation is bidirectional and the flag would otherwise be silently
-ignored while the volume still published writes. Direct volumes and
-macOS/Windows frontends claim an empty set and are rejected by their own
-admission rule.
+The admitted combinations are:
 
-The storage layer reports whether its primitives can support the Managed
-contract. It does not require raw S3 to implement filesystem rename. Read,
-immutable streaming writes, and conditional creation are required for content;
-object publication additionally requires conditional replacement. Service
-publication relies on the service transaction authority for metadata atomicity.
+| Model | Access | Frontend | Read-only | Staging | Publication |
+| --- | --- | --- | --- | --- | --- |
+| Managed | Mount | library | either | required | object or service |
+| Managed | Mount | fuse | either | required | object or service |
+| Managed | Sync | library | false | required | object or service |
+| Direct | Mount | library | true | absent | object |
+| Direct | Mount | fuse | either | only when writable | object |
+| Direct | Sync | library | false | required | object |
 
-Writable baseline capabilities are read, list, write, append, truncate,
-atomic-rename, stable-identity, pinned-reads, retained-unlink-read, remote-fsync,
-and recoverable-staging. The read-only baseline removes write, append,
-truncate, atomic-rename, and remote-fsync. The remaining operations preserve
-their definitions in the [file runtime](file-runtime.md); retained-unlink-read
-does not imply writable anonymous inodes or full POSIX behavior.
+FUSE combinations require Linux. Direct Sync also requires Linux. Managed Sync
+is bidirectional and rejects `read_only=true`. Direct never uses a publication
+service. Service publication requires a loopback `service_address`; object
+publication requires it to be absent.
 
-Startup validates the baseline and every explicit `require` before connecting
-the authority or creating/acquiring staging state. It then opens the selected
-authority and initializes the runtime. Missing capabilities and unimplemented
-combinations fail rather than silently downgrading.
+The admitted capability set is the user-visible contract:
+
+- Managed writable claims read, list, write, append, truncate, atomic rename,
+  stable identity, pinned reads, retained unlink reads, remote fsync, and
+  recoverable staging.
+- Read-only Managed Mount removes write, append, truncate, atomic rename and
+  remote fsync. Read-only FUSE also omits recoverable staging.
+- Read-only Direct claims read, list and pinned reads. Writable Direct adds
+  write, append, truncate, remote fsync and recoverable staging. Direct never
+  claims Managed stable identity, atomic rename, retained unlink reads or
+  Managed receipts.
+
+After the table admits a combination, storage checks its declared primitives.
+Managed content requires read, write, multi-write and conditional create;
+object publication additionally requires conditional replace. Service
+publication relies on the service transaction authority for metadata
+atomicity. Read-only Direct requires stat, read, recursive list, version reads
+and conditional ETag reads. Writable Direct adds write, whole-file multi-write,
+empty writes, conditional create and conditional ETag replace. Direct Sync also
+requires conditional ETag delete.
+
+`yy --volume volume.json capabilities` reports `admitted` and the raw storage
+capability flags. The raw storage object remains useful for qualification and
+diagnosis. Missing storage primitives or unimplemented combinations fail before
+the authority is connected or staging state is created.
+
+The mount entry point requires `frontend=fuse` before starting the kernel
+session. A valid library configuration therefore cannot be mounted by mistake.
 
 Read-only is enforced by runtime operations, including writable open, namespace
 mutations, and writes/publication through recovered handles. It is an operation
@@ -116,6 +167,12 @@ yy --volume volume.json file fsync HANDLE
 yy --volume volume.json file close HANDLE
 ```
 
+Direct Mount uses `mount`, `capabilities`, `doctor`, and `status`; `file` and
+Managed `receipt` reject it. Direct Sync uses `sync` with
+`frontend=library`, while its `status` command reports the binding and
+convergence state. A Direct `capabilities` or `doctor` call never creates
+storage metadata.
+
 `file read HANDLE` emits bytes to stdout; `--offset` and `--length` select
 a range. Reads stream in bounded chunks. `file write` streams its source in
 64 KiB writes, so a later local-source I/O failure can leave an acknowledged
@@ -137,18 +194,27 @@ An absent receipt never proves a delayed request cannot complete. One-shot
 
 `doctor` is the non-destructive operator-readiness projection. It reads the
 strict volume document, reports whether the current host is the tested
-operational combination, checks FUSE device/helper access, performs one
-owner-only temporary state-path write probe and removes it, inspects persisted
-Mount records read-only, validates admission, and observes the selected
-authority. It does not create the configured staging directory, initialize
-`staging.db` or `sync.db`, run recovery, acquire a runtime or publication
-lease, or publish. Its JSON form and exit codes are specified in
+operational combination, checks FUSE device/helper access, and validates
+admission. Managed performs one owner-only temporary state-path write probe,
+removes it, inspects persisted Mount records read-only, and observes the selected
+authority. Read-only Direct performs no state probe. Writable Direct Mount
+probes the configured staging directory with one temporary owner-only file,
+then validates the retained Direct runtime profile, storage binding and
+object/mutation state read-only. Direct Sync probes its state directory and
+inspects the shared Sync engine profile, binding, pending, Unknown, conflict
+and retained artifact state read-only. Direct policies report a recursive
+namespace observation. Doctor does not create staging, initialize `staging.db`,
+`sync-engine.db`, `sync.db` or `runtime.db`, run recovery, acquire a runtime or
+publication lease, or publish.
+Its JSON form and exit codes are specified in
 [`linux-operations.md`](linux-operations.md).
 
 `doctor` reports readiness, not reconciliation convergence. In particular, a
 successful finite `sync run` and a successful `doctor` check do not establish
 that local and remote state match; only `sync status --json` with
-`summary.in_sync=true` and an available remote does.
+`summary.in_sync=true` and an available remote does. The Direct Sync doctor
+check exposes persisted pending, Unknown and conflict counts without acquiring
+the writer lease.
 
 ## Status and limits
 
@@ -158,6 +224,13 @@ state without acquiring the runtime lease. It then reports latest remote
 revision or explicit unavailability. Local status remains inspectable when
 the service or credentials are unavailable. The status command creates no
 staging state and performs no publication.
+
+Read-only Direct `status` reports the namespace observation digest and root
+entry counts without local state. Writable Direct Mount inspects its runtime
+database read-only and reports object/mutation state before attempting network
+access; it does not acquire the runtime lease or run recovery. Direct Sync
+reports its binding and convergence through the existing `sync status` rather
+than the Managed or Direct Mount status path.
 
 A live in-process status additionally includes non-persisted errors when the
 local disk could not save them. Another process can report only durable errors.

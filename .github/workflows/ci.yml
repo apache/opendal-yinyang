@@ -54,6 +54,9 @@ jobs:
       - name: Check targets
         run: cargo x check
 
+      - name: Run operating-envelope policy injection
+        run: python3 tests/linux_operating_envelope_fault_test.py
+
   msrv:
     name: MSRV
     runs-on: ubuntu-24.04
@@ -118,6 +121,8 @@ jobs:
       YINYANG_STORAGE_PROFILE: minio
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install recovery tools
         run: |
@@ -142,7 +147,8 @@ jobs:
           cargo test --workspace --all-targets s3_ -- \
             --ignored --nocapture \
             --skip isolated_s3_cli_smoke \
-            --skip real_amazon_s3_cli_smoke
+            --skip real_amazon_s3_cli_smoke \
+            --skip direct_amazon_s3_
 
       - name: Run isolated recovery acceptance
         run: cargo x test-linux-recovery
@@ -202,6 +208,7 @@ jobs:
       YINYANG_S3_ACCESS_KEY_ID: yinyang-test
       YINYANG_S3_SECRET_ACCESS_KEY: yinyang-test-only
       YINYANG_STORAGE_PROFILE: minio
+      YINYANG_DIRECT_VERSIONED_BUCKET: yinyang-direct-versioned
     steps:
       - uses: actions/checkout@v7
 
@@ -223,9 +230,14 @@ jobs:
           curl --fail http://127.0.0.1:9000/minio/health/ready
           docker exec yinyang-linux-fuse-silo mcli alias set local http://127.0.0.1:9000 yinyang-test yinyang-test-only
           docker exec yinyang-linux-fuse-silo mcli mb local/yinyang-test
+          docker exec yinyang-linux-fuse-silo mcli mb local/yinyang-direct-versioned
+          docker exec yinyang-linux-fuse-silo mcli version enable local/yinyang-direct-versioned
 
       - name: Run real Linux FUSE acceptance
         run: cargo x test-linux-fuse
+
+      - name: Run deterministic Direct Mount and Sync acceptance
+        run: cargo x test-linux-direct
 
       - name: Run installed CLI operations acceptance
         run: cargo x test-linux-operations

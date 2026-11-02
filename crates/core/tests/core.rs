@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod support;
 use std::sync::Arc;
 use support::*;
-use yinyang_core::{CommitId, ErrorKind, NodeId};
+use yinyang_core::{Authority, CommitId, ContentEdit, ErrorKind, NodeId};
+use yinyang_test_support as support;
 
 use yinyang_core::namespace::NodeKind as IndexedKind;
-use yinyang_core::object::{BackendProfile, ObjectFs, Outcome};
+use yinyang_core::object::{ObjectFs, Outcome};
 use yinyang_core::transaction::Planner;
 
 #[tokio::test]
@@ -47,8 +47,9 @@ async fn indexed_disjoint_files_and_fenced_delayed_attempts() {
     right.set_executable(b, true).await.unwrap();
     let left = left.finish().unwrap();
     let right = right.finish().unwrap();
+    let competing = object_fs(&backend).await;
     backend.state.lock().unwrap().head_barrier = Some((Arc::new(tokio::sync::Barrier::new(2)), 2));
-    let (left, right) = tokio::join!(fs.commit(&left), fs.commit(&right));
+    let (left, right) = tokio::join!(fs.commit(&left), competing.commit(&right));
     committed(left.unwrap());
     committed(right.unwrap());
     let old = fs.observe_latest().await.unwrap();
@@ -69,6 +70,42 @@ async fn indexed_disjoint_files_and_fenced_delayed_attempts() {
     assert_ne!(
         pending_condition,
         Some(state.objects[".yinyang/head"].etag.clone())
+    );
+}
+
+#[tokio::test]
+async fn cloned_disjoint_commits_serialize_within_one_authority() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut seed = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let empty = fs.data().prepare(&mut b"".as_slice()).await.unwrap();
+    let a = seed
+        .create_file(fs.root(), "a", empty.clone(), false)
+        .await
+        .unwrap();
+    let b = seed
+        .create_file(fs.root(), "b", empty, false)
+        .await
+        .unwrap();
+    committed(fs.commit(&seed.finish().unwrap()).await.unwrap());
+
+    let old = fs.observe_latest().await.unwrap();
+    let mut left = Planner::new(&old, CommitId::generate());
+    left.set_executable(a, true).await.unwrap();
+    let mut right = Planner::new(&old, CommitId::generate());
+    right.set_executable(b, true).await.unwrap();
+    let left = left.finish().unwrap();
+    let right = right.finish().unwrap();
+    let clone = fs.clone();
+    let before = backend.state.lock().unwrap().head_conditional_writes;
+    backend.state.lock().unwrap().head_read_yield = 1;
+
+    let (left, right) = tokio::join!(fs.commit(&left), clone.commit(&right));
+    committed(left.unwrap());
+    committed(right.unwrap());
+    assert_eq!(
+        backend.state.lock().unwrap().head_conditional_writes - before,
+        2
     );
 }
 
@@ -194,6 +231,158 @@ async fn object_snapshot_reuses_authenticated_index_reads() {
 }
 
 #[tokio::test]
+async fn retained_revisions_are_sorted_deduplicated_and_metadata_authenticated() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut expected =
+        std::collections::BTreeSet::from([fs.observe_latest().await.unwrap().revision()]);
+    for index in 0..4 {
+        let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        plan.create_directory(fs.root(), &format!("revision-{index}"))
+            .await
+            .unwrap();
+        let receipt = committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+        expected.insert(receipt.cursor.revision);
+    }
+    assert_eq!(
+        fs.retained_revisions().await.unwrap(),
+        expected.into_iter().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let bytes = (0..65_536 * 3 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
+    let snapshot = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&snapshot, CommitId::generate());
+    let id = plan
+        .create_file(fs.root(), "ranges", prepared, false)
+        .await
+        .unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+
+    let snapshot = fs.observe_latest().await.unwrap();
+    let first = snapshot.open_file(id).await.unwrap();
+    let second = snapshot.open_file(id).await.unwrap();
+    let range = 65_525..65_539;
+    backend.state.lock().unwrap().data_reads = 0;
+    let mut output = Vec::new();
+    first.read_range(range.clone(), &mut output).await.unwrap();
+    assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+    assert!(backend.state.lock().unwrap().data_reads > 0);
+
+    backend.state.lock().unwrap().data_reads = 0;
+    output.clear();
+    second.read_range(range.clone(), &mut output).await.unwrap();
+    assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+    assert_eq!(
+        backend.state.lock().unwrap().data_reads,
+        0,
+        "separate descriptors for one immutable version may reuse verified ranges"
+    );
+
+    let replacement = vec![0x5a; 65_536 * 3];
+    let prepared = fs
+        .data()
+        .prepare(&mut replacement.as_slice())
+        .await
+        .unwrap();
+    let latest = fs.observe_latest().await.unwrap();
+    let mut plan = Planner::new(&latest, CommitId::generate());
+    plan.set_content(id, prepared).await.unwrap();
+    committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+
+    let fresh = fs.observe_latest().await.unwrap();
+    let file = fresh.open_file(id).await.unwrap();
+    backend.state.lock().unwrap().data_reads = 0;
+    output.clear();
+    file.read_range(range.clone(), &mut output).await.unwrap();
+    assert_eq!(
+        output,
+        replacement[range.start as usize..range.end as usize]
+    );
+    assert!(
+        backend.state.lock().unwrap().data_reads > 0,
+        "a fresh logical version must not reuse the previous version's ranges"
+    );
+}
+
+#[tokio::test]
+async fn exact_published_overwrite_rejects_cross_binding_and_affected_corruption() {
+    use yinyang_core::data::BLOCK_BYTES;
+
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let bytes = (0..BLOCK_BYTES * 8 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
+    let mut create = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let node = create
+        .create_file(fs.root(), "file", prepared, false)
+        .await
+        .unwrap();
+    let receipt = committed(fs.commit(&create.finish().unwrap()).await.unwrap());
+    let base = fs
+        .observe_revision(receipt.cursor.revision)
+        .await
+        .unwrap()
+        .open_file(node)
+        .await
+        .unwrap();
+
+    // Advancing latest does not redirect preparation to a freshly observed base.
+    let mut unrelated = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    unrelated
+        .create_directory(fs.root(), "later")
+        .await
+        .unwrap();
+    committed(fs.commit(&unrelated.finish().unwrap()).await.unwrap());
+
+    let range = BLOCK_BYTES as u64 - 3..BLOCK_BYTES as u64 + 5;
+    let edits = [ContentEdit::new(range.clone(), b"selected").unwrap()];
+    let reopened = ObjectFs::open(backend.operator()).await.unwrap();
+    backend.state.lock().unwrap().data_reads = 0;
+    assert_eq!(
+        reopened
+            .prepare_overwrite(&base, &edits)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Invalid
+    );
+    assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+    let changed = fs.prepare_overwrite(&base, &edits).await.unwrap();
+    let mut output = Vec::new();
+    fs.data()
+        .read_range(changed.descriptor(), range, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, b"selected");
+
+    for object in backend.state.lock().unwrap().objects.values_mut() {
+        if let Some(first) = object.bytes.first_mut() {
+            *first ^= 1;
+        }
+    }
+    backend.state.lock().unwrap().data_reads = 0;
+    assert_eq!(
+        fs.prepare_overwrite(&base, &edits)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corrupt
+    );
+    assert!(backend.state.lock().unwrap().data_reads > 0);
+}
+
+#[tokio::test]
 async fn indexed_deep_paths_names_and_invalid_profiles() {
     use yinyang_core::namespace::name_key;
     for name in [
@@ -233,13 +422,10 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
         parent
     );
     assert_eq!(
-        ObjectFs::open(
-            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
-            BackendProfile::Minio
-        )
-        .await
-        .unwrap_err()
-        .kind(),
+        ObjectFs::open(opendal::Operator::new(opendal::services::Memory::default()).unwrap())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::Unsupported
     );
     let legacy = TestBackend::default();
@@ -251,7 +437,7 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
         },
     );
     assert_eq!(
-        ObjectFs::create(legacy.operator(), BackendProfile::Minio)
+        ObjectFs::create(legacy.operator())
             .await
             .unwrap_err()
             .kind(),
@@ -272,9 +458,7 @@ async fn s3_indexed_publication_and_reopen() {
         })
         .collect::<Vec<_>>();
     let operator = opendal::Operator::via_iter("s3", config).unwrap();
-    let fs = ObjectFs::create(operator.clone(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let fs = ObjectFs::create(operator.clone()).await.unwrap();
     let old = fs.observe_latest().await.unwrap();
     let bytes = vec![37; 12 * 1024 * 1024 + 17];
     let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
@@ -291,9 +475,7 @@ async fn s3_indexed_publication_and_reopen() {
         .unwrap();
     let request = plan.finish().unwrap();
     let receipt = committed(fs.commit(&request).await.unwrap());
-    let reopened = ObjectFs::open(operator, BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = ObjectFs::open(operator).await.unwrap();
     assert_eq!(committed(reopened.commit(&request).await.unwrap()), receipt);
     let file = reopened
         .observe_latest()
@@ -322,9 +504,7 @@ async fn s3_indexed_publication_and_reopen() {
 }
 
 async fn object_fs(backend: &TestBackend) -> ObjectFs {
-    ObjectFs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap()
+    ObjectFs::create(backend.operator()).await.unwrap()
 }
 fn committed(outcome: Outcome) -> yinyang_core::object::Receipt {
     match outcome {
@@ -344,8 +524,9 @@ async fn indexed_disjoint_creates_survive_cas_race_and_preserve_snapshots() {
     let mut right = Planner::new(&old, CommitId::generate());
     let b = right.create_directory(fs.root(), "b").await.unwrap();
     let right = right.finish().unwrap();
+    let competing = object_fs(&backend).await;
     backend.state.lock().unwrap().head_barrier = Some((Arc::new(tokio::sync::Barrier::new(2)), 2));
-    let (l, r) = tokio::join!(fs.commit(&left), fs.commit(&right));
+    let (l, r) = tokio::join!(fs.commit(&left), competing.commit(&right));
     let l = committed(l.unwrap());
     let r = committed(r.unwrap());
     assert_ne!(l.cursor, r.cursor);
@@ -574,9 +755,7 @@ async fn indexed_prepared_commit_does_not_read_data_and_reopen_retains_history()
             .iter()
             .any(|k| data_keys.contains(k))
     );
-    let reopened = ObjectFs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = ObjectFs::open(backend.operator()).await.unwrap();
     let saved_revision = yinyang_core::Revision::from_bytes(old.revision().to_bytes());
     assert_eq!(
         reopened
@@ -784,7 +963,8 @@ async fn canonical_content_range_reads_and_incremental_overwrites() {
 async fn content_corruption_is_rejected_before_releasing_its_unit() {
     use yinyang_core::data::{BLOCK_BYTES, DataStore};
     let backend = TestBackend::default();
-    let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    let id = NodeId::generate();
+    let store = DataStore::new(backend.operator(), id).unwrap();
     let bytes = vec![7; BLOCK_BYTES * 3];
     let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
     let key = backend
@@ -823,8 +1003,14 @@ async fn content_corruption_is_rejected_before_releasing_its_unit() {
         .await
         .unwrap();
     assert_eq!(output, vec![7]);
+    store.import(file.descriptor()).await.unwrap();
+    let restarted = DataStore::new(backend.operator(), id).unwrap();
     assert_eq!(
-        store.import(file.descriptor()).await.unwrap_err().kind(),
+        restarted
+            .import(file.descriptor())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::Corrupt
     );
 }

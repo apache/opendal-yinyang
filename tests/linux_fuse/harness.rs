@@ -31,8 +31,13 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
+use yinyang::core::{Authority, CommitId, CommitOutcome, Fs, Planner};
 use yinyang::runtime::Runtime as YinYangRuntime;
+pub use yinyang_test_support::fixture::Publication;
+use yinyang_test_support::fixture::{require_storage_environment, storage_environment};
+use yinyang_test_support::process::read_all;
+pub use yinyang_test_support::process::{Captured, run_external, run_timeout};
+use yinyang_test_support::yy;
 
 /// The kernel filesystem type advertised by the YinYang FUSE adapter.
 pub const MOUNT_TYPE: &str = "fuse.yinyang";
@@ -46,97 +51,6 @@ pub fn require_fuse() {
     for tool in ["fusermount3", "timeout", "python3"] {
         if Command::new(tool).arg("--version").output().is_err() {
             panic!("required tool {tool} is not available for Linux FUSE acceptance");
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Captured {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-impl Captured {
-    pub fn success_or(&self, context: &str) {
-        assert!(
-            self.status.success(),
-            "{context} failed with {}:\nstdout:\n{}\nstderr:\n{}",
-            self.status,
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        );
-    }
-}
-
-pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to spawn command (format: {cmd:?}): {error}"));
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_thread = thread::spawn(move || read_all(stdout));
-    let stderr_thread = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let status = child.wait().expect("wait after kill");
-                    let stdout = stdout_thread.join().unwrap_or_default();
-                    let stderr = stderr_thread.join().unwrap_or_default();
-                    panic!(
-                        "command timed out after {timeout:?} with {status} (format: {cmd:?}):\nstdout:\n{}\nstderr:\n{}",
-                        String::from_utf8_lossy(&stdout),
-                        String::from_utf8_lossy(&stderr)
-                    );
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("failed to wait for command (format: {cmd:?}): {error}");
-            }
-        }
-    };
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
-    Captured {
-        status,
-        stdout,
-        stderr,
-    }
-}
-
-pub fn run_external(program: &str, args: &[&str], timeout: Duration) -> Captured {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    run_timeout(cmd, timeout)
-}
-
-fn read_all(mut reader: impl Read) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
-    bytes
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Publication {
-    Object,
-    Service,
-}
-
-impl Publication {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Object => "object",
-            Self::Service => "service",
         }
     }
 }
@@ -170,9 +84,17 @@ pub struct Fixture {
     last_service_address: Option<SocketAddr>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteObjectIdentity {
+    pub path: String,
+    pub length: u64,
+    pub etag: Option<String>,
+}
+
 impl Fixture {
     pub fn new(publication: Publication) -> Self {
         require_fuse();
+        require_storage_environment("minio", false, "Linux FUSE acceptance");
         let temp = tempfile::tempdir().expect("create temporary test directory");
         let root = format!(
             "fuse-{}-{}",
@@ -208,28 +130,11 @@ impl Fixture {
     }
 
     fn storage_env(&self) -> Vec<(&'static str, String)> {
-        let required = [
-            "YINYANG_S3_BUCKET",
-            "YINYANG_S3_ENDPOINT",
-            "YINYANG_S3_REGION",
-            "YINYANG_S3_ACCESS_KEY_ID",
-            "YINYANG_S3_SECRET_ACCESS_KEY",
-        ];
-        let mut env = Vec::new();
-        for name in required {
-            let value = std::env::var(name).unwrap_or_else(|_| {
-                panic!("set {name} before running Linux FUSE acceptance; missing configuration is a hard failure")
-            });
-            env.push((name, value));
-        }
-        env.push(("YINYANG_STORAGE_PROFILE", "minio".to_owned()));
-        env.push(("YINYANG_S3_ROOT", self.root.clone()));
-        env.push(("YINYANG_SERVICE_TOKEN", self.token.clone()));
-        env
+        storage_environment("minio", &self.root, &self.token, None, false)
     }
 
     pub fn yy_command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_yy"));
+        let mut cmd = Command::new(yy::binary(env!("CARGO_BIN_EXE_yy")));
         cmd.args(args);
         for (name, value) in self.storage_env() {
             cmd.env(name, value);
@@ -328,13 +233,68 @@ impl Fixture {
     }
 
     /// Polls the existing no-lease status entry until a handle reports the
-    /// frozen publication boundary. A hang is a hard failure, not a skip.
-    pub fn wait_for_frozen(&self, config: &Path) -> String {
+    /// frozen publication identity. A hang is a hard failure, not a skip.
+    pub fn wait_for_frozen(&self, config: &Path) -> (CommitId, String) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some((commit, text)) = self.inspect_frozen(config) {
+                return (commit, text);
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "fsync never saved a frozen publication identity within 30s; last yy status:\n{}",
+                    self.inspect_status(config)
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn frozen_commit(&self, config: &Path) -> Option<CommitId> {
+        self.inspect_frozen(config).map(|(commit, _)| commit)
+    }
+
+    fn inspect_frozen(&self, config: &Path) -> Option<(CommitId, String)> {
+        let (status, text) = self.inspect_status_with_text(config);
+        status
+            .handles
+            .iter()
+            .find_map(|handle| {
+                if handle.frozen {
+                    handle.frozen_commit_id
+                } else {
+                    None
+                }
+            })
+            .map(|commit| (commit, text))
+    }
+
+    fn inspect_status(&self, config: &Path) -> String {
+        self.inspect_status_with_text(config).1
+    }
+
+    fn inspect_status_with_text(&self, config: &Path) -> (yinyang::runtime::RuntimeStatus, String) {
         let staging = self
             .temp
             .path()
             .join(config.file_stem().expect("volume config has a file stem"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build status runtime");
+        let status = runtime
+            .block_on(YinYangRuntime::inspect(&staging))
+            .expect("inspect staging without the runtime lease");
+        let text = format!("{status:#?}");
+        (status, text)
+    }
+
+    /// Wait until dispatch-visible FUSE RELEASE callbacks have reclaimed every
+    /// staged writable handle. Whole-volume read-only mounts keep observations
+    /// outside Runtime staging and do not use this helper.
+    pub fn wait_for_no_staged_handles(&self, config: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let staging = self.staging_path(config);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -344,16 +304,22 @@ impl Fixture {
                 .block_on(YinYangRuntime::inspect(&staging))
                 .expect("inspect staging without the runtime lease");
             let text = format!("{status:#?}");
-            if status.handles.iter().any(|handle| handle.frozen) {
+            if status.handles.is_empty() {
                 return text;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "fsync never reached the frozen publication boundary within 30s; last yy status:\n{text}"
+                    "FUSE RELEASE callbacks did not reclaim all staged writable handles within 30s; last yy status:\n{text}"
                 );
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn staging_path(&self, config: &Path) -> PathBuf {
+        self.temp
+            .path()
+            .join(config.file_stem().expect("volume config has a file stem"))
     }
 
     /// Writes a strict volume config and returns its path. Rewriting the same
@@ -372,7 +338,7 @@ impl Fixture {
     ) -> PathBuf {
         let staging = self.temp.path().join(name);
         let mut json = format!(
-            "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {},\n  \"require\": []",
+            "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {}",
             json_string(name),
             frontend.as_str(),
             self.publication().as_str(),
@@ -406,7 +372,7 @@ impl Fixture {
         runtime.block_on(async move {
             let authority: Arc<dyn Authority> = match publication {
                 Publication::Object => Arc::new(
-                    Fs::open(operator, BackendProfile::Minio)
+                    Fs::open(operator)
                         .await
                         .expect("open object authority for batch seed"),
                 ),
@@ -465,7 +431,7 @@ impl Fixture {
         });
     }
 
-    fn operator(&self) -> opendal::Operator {
+    pub fn operator(&self) -> opendal::Operator {
         opendal::install_default();
         let config = self
             .storage_env()
@@ -822,7 +788,34 @@ impl Fixture {
         })
     }
 
-    fn in_process_authority(&self) -> Arc<dyn Authority> {
+    /// Lists the complete configured storage prefix for read-only
+    /// non-mutation assertions. This includes authority metadata objects.
+    pub fn remote_object_identities(&self) -> Vec<RemoteObjectIdentity> {
+        let operator = self.operator();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build remote identity runtime");
+        let mut objects = runtime.block_on(async move {
+            operator
+                .list_with("")
+                .recursive(true)
+                .await
+                .expect("list remote object identities")
+                .into_iter()
+                .filter(|entry| entry.metadata().is_file())
+                .map(|entry| RemoteObjectIdentity {
+                    path: entry.path().to_owned(),
+                    length: entry.metadata().content_length(),
+                    etag: entry.metadata().etag().map(str::to_owned),
+                })
+                .collect::<Vec<_>>()
+        });
+        objects.sort_by(|left, right| left.path.cmp(&right.path));
+        objects
+    }
+
+    pub fn in_process_authority(&self) -> Arc<dyn Authority> {
         let operator = self.operator();
         let publication = self.publication();
         let address = self.last_service_address;
@@ -834,7 +827,7 @@ impl Fixture {
         runtime.block_on(async move {
             let authority: Arc<dyn Authority> = match publication {
                 Publication::Object => Arc::new(
-                    Fs::open(operator, BackendProfile::Minio)
+                    Fs::open(operator)
                         .await
                         .expect("open in-process object authority"),
                 ),
@@ -1203,7 +1196,7 @@ fn read_all_logged(mut reader: impl Read, log: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
 pub struct ServiceGate {
     address: SocketAddr,
     release: Arc<(Mutex<bool>, Condvar)>,
-    ready: mpsc::Receiver<()>,
+    ready: mpsc::Receiver<CommitId>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1248,10 +1241,10 @@ impl ServiceGate {
         self.address
     }
 
-    pub fn wait_ready(&self, timeout: Duration) {
+    pub fn wait_ready(&self, timeout: Duration) -> CommitId {
         self.ready
             .recv_timeout(timeout)
-            .expect("service gate did not observe a frozen commit connection");
+            .expect("service gate did not observe a persisted frozen commit")
     }
 
     pub fn release(&self) {
@@ -1280,20 +1273,31 @@ fn handle_gate_connection(
     staging: PathBuf,
     release: Arc<(Mutex<bool>, Condvar)>,
     ready_sent: Arc<AtomicBool>,
-    sender: mpsc::Sender<()>,
+    sender: mpsc::Sender<CommitId>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build service gate runtime");
-    let frozen = staging.join("staging.db").exists()
-        && runtime
+    let frozen = if staging.join("staging.db").exists() {
+        runtime
             .block_on(YinYangRuntime::inspect(&staging))
             .ok()
-            .is_some_and(|status| status.handles.iter().any(|handle| handle.frozen));
-    if frozen {
+            .and_then(|status| {
+                status.handles.iter().find_map(|handle| {
+                    if handle.frozen {
+                        handle.frozen_commit_id
+                    } else {
+                        None
+                    }
+                })
+            })
+    } else {
+        None
+    };
+    if let Some(commit) = frozen {
         if !ready_sent.swap(true, Ordering::SeqCst) {
-            let _ = sender.send(());
+            let _ = sender.send(commit);
         }
         let (released, condvar) = &*release;
         let mut released = released

@@ -19,4 +19,6 @@
 
 mod acceptance;
 mod harness;
+mod incremental;
 mod read_only_range;
+mod retention;

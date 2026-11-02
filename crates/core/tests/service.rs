@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod support;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang_core::object::{BackendProfile, ObjectFs};
+use yinyang_core::object::ObjectFs;
 use yinyang_core::service::{MetadataService, ServiceClient, serve};
-use yinyang_core::{Authority, CommitId, CommitOutcome as Outcome, ErrorKind, Planner};
+use yinyang_core::{
+    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, Planner,
+};
+use yinyang_test_support as support;
 
 fn committed(outcome: Outcome) -> yinyang_core::Receipt {
     match outcome {
@@ -146,14 +148,46 @@ async fn suite(fs: &dyn Authority) {
         Some(receipt)
     );
     assert!(latest.changes(None, 4096).await.unwrap().len() >= 6);
+
+    // A same-length update reuses the exact selected published version.
+    let selected = latest.open_file(a).await.unwrap();
+    let update = [ContentEdit::new(0..4, b"1234").unwrap()];
+    let changed = fs.prepare_overwrite(&selected, &update).await.unwrap();
+    let mut rewrite = Planner::new(&latest, CommitId::generate());
+    rewrite.set_content(a, changed.clone()).await.unwrap();
+    committed(fs.commit(&rewrite.finish().unwrap()).await.unwrap());
+    let mut bytes = Vec::new();
+    fs.data()
+        .read_range(changed.descriptor(), 0..8, &mut bytes)
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"1234inal");
+
+    // A length-changing update preserves only the explicit base prefix.
+    let latest = fs.observe_latest().await.unwrap();
+    let selected = latest.open_file(a).await.unwrap();
+    let length_edits = [
+        ContentEdit::new(2..6, b"CDEF").unwrap(),
+        ContentEdit::new(9..13, b"tail").unwrap(),
+    ];
+    let extended = Authority::prepare_update(fs, &selected, 4, 13, &length_edits)
+        .await
+        .unwrap();
+    let expected = b"12CDEF\0\0\0tail";
+    let canonical = fs.data().prepare(&mut expected.as_slice()).await.unwrap();
+    assert_eq!(extended.content_id(), canonical.content_id());
+    let mut bytes = Vec::new();
+    fs.data()
+        .read_range(extended.descriptor(), 0..13, &mut bytes)
+        .await
+        .unwrap();
+    assert_eq!(bytes, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_contract_object_and_metadata_service() {
     let object_backend = TestBackend::default();
-    let object = ObjectFs::create(object_backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let object = ObjectFs::create(object_backend.operator()).await.unwrap();
     suite(&object).await;
     let dir = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
@@ -172,10 +206,7 @@ async fn authenticated_service_protocol_and_restart() {
         .await
         .unwrap();
     assert_eq!(
-        ObjectFs::open(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap_err()
-            .kind(),
+        ObjectFs::open(backend.operator()).await.unwrap_err().kind(),
         ErrorKind::Unsupported
     );
     let token = "test-only-service-token-32-bytes-long";
@@ -243,6 +274,164 @@ async fn authenticated_service_protocol_and_restart() {
     assert!(backend.state.lock().unwrap().fail_after_head_write);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_revision_history_is_paginated_through_the_service_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    for name in ["one", "two", "three"] {
+        let mut plan = Planner::new(
+            &service.observe_latest().await.unwrap(),
+            CommitId::generate(),
+        );
+        plan.create_directory(service.root(), name).await.unwrap();
+        committed(service.commit(&plan.finish().unwrap()).await.unwrap());
+    }
+    let expected = service.retained_revisions().await.unwrap();
+    assert_eq!(expected.len(), 4);
+
+    let token = "test-only-service-token-32-bytes-long";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, service.clone(), token.into()));
+    let client = ServiceClient::connect(addr, token.into(), backend.operator())
+        .await
+        .unwrap();
+
+    let first = client.retained_revisions_page(None, 2).await.unwrap();
+    assert_eq!(first.revisions, expected[..2]);
+    let cursor = first
+        .next
+        .expect("two of four revisions have a continuation");
+    let second = client
+        .retained_revisions_page(Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.revisions, expected[2..]);
+    assert_eq!(second.next, None);
+    assert_eq!(
+        client
+            .retained_revisions_page(None, 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_delta_preparation_reuses_the_exact_published_base() {
+    use yinyang_core::data::{BLOCK_BYTES, MAX_UPDATE_UNITS};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.db");
+    let backend = TestBackend::default();
+    let service = MetadataService::create(&path, backend.operator())
+        .await
+        .unwrap();
+    let token = "test-only-service-token-32-bytes-long";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, service.clone(), token.into()));
+    let client = ServiceClient::connect(addr, token.into(), backend.operator())
+        .await
+        .unwrap();
+
+    let snapshot = client.observe_latest().await.unwrap();
+    let bytes = (0..8 * 1024 * 1024 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = client.prepare(&mut bytes.as_slice()).await.unwrap();
+    let mut create = Planner::new(&snapshot, CommitId::generate());
+    let node = create
+        .create_file(client.root(), "large", prepared, false)
+        .await
+        .unwrap();
+    let created = committed(client.commit(&create.finish().unwrap()).await.unwrap());
+
+    let base = client
+        .observe_revision(created.cursor.revision)
+        .await
+        .unwrap()
+        .open_file(node)
+        .await
+        .unwrap();
+    let full_bytes = base.descriptor().content_id().length();
+    backend.state.lock().unwrap().data_reads = 0;
+    backend.state.lock().unwrap().written_bytes = 0;
+    assert_eq!(
+        client
+            .prepare_update(&base, 0, (MAX_UPDATE_UNITS + 1) * BLOCK_BYTES as u64, &[],)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    {
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.data_reads, 0);
+        assert_eq!(state.written_bytes, 0);
+    }
+
+    let mut later = Planner::new(
+        &client.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    later
+        .create_directory(client.root(), "later")
+        .await
+        .unwrap();
+    committed(client.commit(&later.finish().unwrap()).await.unwrap());
+
+    backend.state.lock().unwrap().data_read_bytes = 0;
+    backend.state.lock().unwrap().data_reads = 0;
+    let range = 4 * 1024 * 1024 - 7..4 * 1024 * 1024 + 9;
+    let change = [ContentEdit::new(range, b"delta-service-16").unwrap()];
+    let changed = Authority::prepare_overwrite(&client, &base, &change)
+        .await
+        .unwrap();
+    let (data_read_bytes, data_reads) = {
+        let state = backend.state.lock().unwrap();
+        (state.data_read_bytes, state.data_reads)
+    };
+    assert!(
+        data_read_bytes < full_bytes / 8,
+        "service delta preparation read {data_read_bytes} bytes in {data_reads} reads"
+    );
+    assert!(
+        data_reads <= 64,
+        "service delta preparation made {data_reads} reads"
+    );
+
+    let mut update = Planner::new(
+        &client.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    update.set_content(node, changed).await.unwrap();
+    let request = update.finish().unwrap();
+    let receipt = committed(client.commit(&request).await.unwrap());
+
+    server.abort();
+    let _ = server.await;
+    drop(service);
+    drop(client);
+    let reopened = MetadataService::open(&path, backend.operator())
+        .await
+        .unwrap();
+    let restored = reopened
+        .restore_transaction(&request.to_bytes().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        committed(reopened.commit(&restored).await.unwrap()),
+        receipt
+    );
+}
+
 #[tokio::test]
 async fn service_rejects_unregistered_content_and_missing_guards() {
     let dir = tempfile::tempdir().unwrap();
@@ -253,6 +442,10 @@ async fn service_rejects_unregistered_content_and_missing_guards() {
             .unwrap(),
     );
     let snapshot = service.observe_latest().await.unwrap();
+    assert_eq!(
+        service.retained_revisions().await.unwrap(),
+        vec![snapshot.revision()]
+    );
     let content = service
         .data()
         .prepare(&mut b"unregistered".as_slice())

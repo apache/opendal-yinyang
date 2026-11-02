@@ -34,10 +34,14 @@ rust-version.workspace = true
 name = "yy"
 path = "src/main.rs"
 
+[features]
+benchmark-telemetry = ["dep:metrics", "opendal/layers-metrics"]
+
 [dependencies]
 blake3.workspace = true
 borsh.workspace = true
 clap.workspace = true
+metrics = { version = "0.24", optional = true }
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -63,10 +67,12 @@ rustix = { version = "1.1.5", features = ["fs"] }
 [dev-dependencies]
 futures-util.workspace = true
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
+sha2 = "0.11.0"
 tempfile = "3"
+yinyang-test-support = { path = "crates/test-support" }
 
 [workspace]
-members = [".", "crates/core", "crates/native", "xtask"]
+members = [".", "crates/core", "crates/native", "crates/test-support", "xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -81,7 +87,7 @@ blake3 = "1"
 borsh = { version = "1.8.1", default-features = false, features = ["derive", "std"] }
 clap = { version = "4.6.5", features = ["derive"] }
 futures-util = "0.3"
-opendal = { version = "0.58.2", default-features = false }
+opendal = { version = "0.59.5", default-features = false }
 tokio = { version = "1", features = ["io-util"] }
 unicode-casefold = "=0.2.0"
 unicode-normalization = "=0.1.25"

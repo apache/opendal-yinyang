@@ -17,20 +17,29 @@
 
 //! Canonical, range-verifiable content and process-local preparation evidence.
 
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use crate::compatibility::{
+    CONTENT_DESCRIPTOR_MAGIC, CONTENT_HASH_CONTEXT, CONTENT_INDEX_MAGIC, CONTENT_UNIT_BYTES,
+};
 use crate::{Error, NodeId, Result};
 
-/// Fixed logical verification unit of the experimental content profile.
-pub const BLOCK_BYTES: usize = 64 * 1024;
-const FILE_MAGIC: [u8; 8] = *b"YYFILE02";
-const NODE_MAGIC: [u8; 8] = *b"YYHASH02";
+/// Fixed logical verification unit of the YYFILE02 content profile.
+pub const BLOCK_BYTES: usize = CONTENT_UNIT_BYTES;
+/// Maximum non-empty fixed-offset edits in one bounded preparation update.
+pub const MAX_UPDATE_EDITS: usize = 4096;
+/// Maximum verification units a bounded update may read or write.
+pub const MAX_UPDATE_UNITS: u64 = 4096;
 const MAX_NODE_BYTES: u32 = 512;
+const RANGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const RANGE_CACHE_ENTRIES: usize = 4096;
+const VERIFIED_DESCRIPTOR_ENTRIES: usize = 65_536;
 
 pub(crate) type RefWire = ([u8; 16], u64, u32, [u8; 32]);
 type ChildWire = ([u8; 32], RefWire);
@@ -47,13 +56,23 @@ impl ContentId {
     /// Identify unknown local bytes without uploading them. This shares the
     /// canonical hash profile with prepared content and uses bounded buffers.
     pub async fn calculate(source: &mut (impl AsyncRead + Unpin)) -> Result<Self> {
+        Ok(Self::calculate_with_raw_digest(source).await?.0)
+    }
+
+    /// Identify unknown bytes while also returning their flat BLAKE3 digest.
+    /// Callers that maintain both content and local fingerprints use one read.
+    pub async fn calculate_with_raw_digest(
+        source: &mut (impl AsyncRead + Unpin),
+    ) -> Result<(Self, [u8; 32])> {
         let mut frontier = Vec::<(u64, u64, [u8; 32])>::new();
+        let mut raw = blake3::Hasher::new();
         let mut length = 0_u64;
         loop {
             let bytes = read_unit(source).await?;
             if bytes.is_empty() {
                 break;
             }
+            raw.update(&bytes);
             let start = length / BLOCK_BYTES as u64;
             length = length
                 .checked_add(bytes.len() as u64)
@@ -79,10 +98,13 @@ impl ContentId {
         let mut hash = domain(b"file");
         hash.update(&length.to_le_bytes());
         hash.update(&subtree);
-        Ok(Self {
-            length,
-            digest: hash.finalize().into(),
-        })
+        Ok((
+            Self {
+                length,
+                digest: hash.finalize().into(),
+            },
+            raw.finalize().into(),
+        ))
     }
     pub const fn length(self) -> u64 {
         self.length
@@ -93,7 +115,7 @@ impl ContentId {
 }
 
 /// Untrusted serializable reference, not evidence that its bytes are ready.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ContentDescriptor {
     filesystem: NodeId,
     length: u64,
@@ -117,7 +139,7 @@ impl ContentDescriptor {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         encode(&(
-            FILE_MAGIC,
+            CONTENT_DESCRIPTOR_MAGIC,
             *self.filesystem.as_bytes(),
             self.length,
             self.root.as_ref().map(Child::wire),
@@ -129,13 +151,17 @@ impl ContentDescriptor {
         if bytes.len() > MAX_NODE_BYTES as usize {
             return Err(corrupt("descriptor is too large"));
         }
-        let (magic, filesystem, length, root): FileWire = decode(bytes)?;
-        if magic != FILE_MAGIC {
+        if bytes.len() < CONTENT_DESCRIPTOR_MAGIC.len() {
+            return Err(corrupt("truncated content descriptor"));
+        }
+        if bytes[..CONTENT_DESCRIPTOR_MAGIC.len()] != CONTENT_DESCRIPTOR_MAGIC {
             return Err(Error::unsupported(
                 "decode content",
                 "unknown content profile",
             ));
         }
+        let (magic, filesystem, length, root): FileWire = decode(bytes)?;
+        debug_assert_eq!(magic, CONTENT_DESCRIPTOR_MAGIC);
         if (length == 0) != root.is_none() {
             return Err(corrupt("empty content has an invalid root"));
         }
@@ -167,6 +193,122 @@ impl PreparedContent {
     }
 }
 
+/// One fixed-offset replacement in an authenticated immutable-base update.
+#[derive(Clone, Debug)]
+pub struct ContentEdit<'a> {
+    range: Range<u64>,
+    bytes: &'a [u8],
+}
+
+impl<'a> ContentEdit<'a> {
+    pub fn new(range: Range<u64>, bytes: &'a [u8]) -> Result<Self> {
+        let replacement_length = u64::try_from(bytes.len())
+            .map_err(|_| Error::invalid("define content edit", "length overflows"))?;
+        if range.start > range.end || range.end - range.start != replacement_length {
+            return Err(Error::invalid(
+                "define content edit",
+                "replacement range and byte length differ",
+            ));
+        }
+        Ok(Self { range, bytes })
+    }
+
+    pub fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+/// Count verification units a length-changing update must materialize.
+///
+/// The count is a conservative upper bound covering new zero units, partial
+/// boundary units, and every unit touched by an edit. `None` means the inputs
+/// violate `preserved_prefix <= final_length`.
+pub fn update_work_units(
+    preserved_prefix: u64,
+    final_length: u64,
+    edits: &[ContentEdit<'_>],
+) -> Option<u64> {
+    if preserved_prefix > final_length {
+        return None;
+    }
+    let mut units = leaves(final_length).saturating_sub(leaves(preserved_prefix));
+    if preserved_prefix != 0 && !preserved_prefix.is_multiple_of(BLOCK_BYTES as u64) {
+        units = units.saturating_add(1);
+    }
+    if final_length != 0 && !final_length.is_multiple_of(BLOCK_BYTES as u64) {
+        units = units.saturating_add(1);
+    }
+    let mut nonempty = edits
+        .iter()
+        .filter(|edit| !edit.range.is_empty())
+        .collect::<Vec<_>>();
+    nonempty.sort_by_key(|edit| edit.range.start);
+    let mut merged_start = None;
+    let mut merged_end = None;
+    for edit in nonempty {
+        let start = edit.range.start / BLOCK_BYTES as u64;
+        let end = (edit.range.end - 1) / BLOCK_BYTES as u64;
+        if merged_end.is_none_or(|current| start > current) {
+            if let (Some(start), Some(end)) = (merged_start, merged_end) {
+                units = units.saturating_add(end - start + 1);
+            }
+            merged_start = Some(start);
+            merged_end = Some(end);
+        } else {
+            merged_end = Some(merged_end.expect("merged edit interval").max(end));
+        }
+    }
+    if let (Some(start), Some(end)) = (merged_start, merged_end) {
+        units = units.saturating_add(end - start + 1);
+    }
+    Some(units)
+}
+
+/// Whether a length-changing update stays within the bounded work budget.
+///
+/// Callers use this rule before choosing `update_prepared` versus the explicit
+/// streaming `prepare` fallback; they never convert an update error into a
+/// different preparation request.
+pub fn update_is_bounded(
+    preserved_prefix: u64,
+    final_length: u64,
+    edits: &[ContentEdit<'_>],
+) -> bool {
+    let Some(units) = update_work_units(preserved_prefix, final_length, edits) else {
+        return false;
+    };
+    edits.iter().filter(|edit| !edit.range.is_empty()).count() <= MAX_UPDATE_EDITS
+        && units <= MAX_UPDATE_UNITS
+}
+
+#[derive(Debug, Default)]
+struct VerifiedDescriptors {
+    entries: HashSet<ContentDescriptor>,
+    order: VecDeque<ContentDescriptor>,
+}
+
+impl VerifiedDescriptors {
+    fn contains(&self, descriptor: &ContentDescriptor) -> bool {
+        self.entries.contains(descriptor)
+    }
+
+    fn insert(&mut self, descriptor: ContentDescriptor) {
+        if !self.entries.insert(descriptor.clone()) {
+            return;
+        }
+        self.order.push_back(descriptor);
+        while self.order.len() > VERIFIED_DESCRIPTOR_ENTRIES {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+}
+
 /// Immutable data binding for one filesystem and one storage operator.
 ///
 /// Clones share preparation authority. A separately constructed binding cannot
@@ -176,6 +318,8 @@ pub struct DataStore {
     operator: Operator,
     filesystem: NodeId,
     issuer: Arc<()>,
+    range_cache: RangeCache,
+    verified: Arc<Mutex<VerifiedDescriptors>>,
 }
 
 impl DataStore {
@@ -195,6 +339,8 @@ impl DataStore {
             operator,
             filesystem,
             issuer: Arc::new(()),
+            range_cache: RangeCache::default(),
+            verified: Arc::new(Mutex::new(VerifiedDescriptors::default())),
         })
     }
 
@@ -214,13 +360,16 @@ impl DataStore {
     ///
     /// This conservative binding verifies the acknowledged pack once during
     /// preparation: an OpenDAL writer-close acknowledgement alone does not
-    /// establish end-to-end integrity. Commit never repeats this read.
+    /// establish end-to-end integrity. Publication of the returned
+    /// `PreparedContent` does not repeat this read; restoring a serialized
+    /// descriptor after restart verifies it once again.
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
         let mut pack = Pack::new(self).await?;
         let result = self.prepare_into(source, &mut pack).await;
         match result {
             Ok(descriptor) => {
                 pack.finish().await?;
+                self.mark_verified(&descriptor);
                 Ok(self.seal(descriptor))
             }
             Err(error) => {
@@ -230,9 +379,33 @@ impl DataStore {
         }
     }
 
+    /// Prepare content for an authority that verifies the completed pack
+    /// before acknowledging registration. The caller must not trust the
+    /// returned evidence until that remote verification succeeds.
+    pub(crate) async fn prepare_for_remote_verification(
+        &self,
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
+    ) -> Result<PreparedContent> {
+        let mut pack = Pack::new(self).await?;
+        let result = self.prepare_into(source, &mut pack).await;
+        match result {
+            Ok(descriptor) => match pack.close().await {
+                Ok(()) => Ok(self.seal(descriptor)),
+                Err(error) => {
+                    pack.abort().await;
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                pack.abort().await;
+                Err(error)
+            }
+        }
+    }
+
     async fn prepare_into(
         &self,
-        source: &mut (impl AsyncRead + Unpin),
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
         pack: &mut Pack,
     ) -> Result<ContentDescriptor> {
         let mut frontier = Vec::<(u64, u64, Child)>::new();
@@ -276,10 +449,16 @@ impl DataStore {
         })
     }
 
-    /// Import untrusted references by verifying every logical unit.
+    /// Import untrusted references, verifying each descriptor once per
+    /// `DataStore` and its clones before reusing the bounded evidence set.
     pub async fn import(&self, descriptor: &ContentDescriptor) -> Result<PreparedContent> {
+        self.check(descriptor)?;
+        if self.is_verified(descriptor) {
+            return Ok(self.seal(descriptor.clone()));
+        }
         self.read_range(descriptor, 0..descriptor.length, &mut tokio::io::sink())
             .await?;
+        self.mark_verified(descriptor);
         Ok(self.seal(descriptor.clone()))
     }
 
@@ -292,6 +471,27 @@ impl DataStore {
         descriptor: &ContentDescriptor,
         range: Range<u64>,
         destination: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<()> {
+        self.read_range_inner(descriptor, range, destination, None)
+            .await
+    }
+
+    pub(crate) async fn read_range_cached(
+        &self,
+        descriptor: &ContentDescriptor,
+        range: Range<u64>,
+        destination: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<()> {
+        self.read_range_inner(descriptor, range, destination, Some(&self.range_cache))
+            .await
+    }
+
+    async fn read_range_inner(
+        &self,
+        descriptor: &ContentDescriptor,
+        range: Range<u64>,
+        destination: &mut (impl AsyncWrite + Unpin),
+        cache: Option<&RangeCache>,
     ) -> Result<()> {
         self.check(descriptor)?;
         if range.start > range.end || range.end > descriptor.length {
@@ -314,6 +514,8 @@ impl DataStore {
             descriptor.length,
             &range,
             destination,
+            descriptor,
+            cache,
         )
         .await
     }
@@ -326,10 +528,15 @@ impl DataStore {
         length: u64,
         range: &Range<u64>,
         destination: &mut (impl AsyncWrite + Unpin),
+        descriptor: &ContentDescriptor,
+        cache: Option<&RangeCache>,
     ) -> Result<()> {
-        match self.node(child, start, count).await? {
+        let scope = cache.map(|cache| (cache, descriptor));
+        match self.node(child, start, count, scope).await? {
             HashNode::Leaf(reference) => {
-                let bytes = self.unit(&reference, child.hash, start, length).await?;
+                let bytes = self
+                    .unit(&reference, child.hash, start, length, scope)
+                    .await?;
                 let offset = start * BLOCK_BYTES as u64;
                 let begin = range.start.saturating_sub(offset) as usize;
                 let end = (range.end - offset).min(bytes.len() as u64) as usize;
@@ -349,6 +556,8 @@ impl DataStore {
                         length,
                         range,
                         destination,
+                        descriptor,
+                        cache,
                     ))
                     .await?;
                 }
@@ -360,6 +569,8 @@ impl DataStore {
                         length,
                         range,
                         destination,
+                        descriptor,
+                        cache,
                     ))
                     .await?;
                 }
@@ -375,17 +586,42 @@ impl DataStore {
         range: Range<u64>,
         bytes: &[u8],
     ) -> Result<PreparedContent> {
+        let edit = ContentEdit::new(range, bytes)?;
+        self.overwrite_prepared_ranges(file, &[edit]).await
+    }
+
+    /// Apply bounded, non-overlapping fixed-offset updates to trusted content.
+    ///
+    /// The returned content has the same logical length as `file`. One new
+    /// immutable pack contains all replacement leaves and rebuilt hash paths.
+    pub async fn overwrite_prepared_ranges(
+        &self,
+        file: &PreparedContent,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
         let descriptor = self.accept(file)?;
-        if range.start > range.end
-            || range.end > descriptor.length
-            || range.end - range.start != bytes.len() as u64
-        {
+        if edits.iter().any(|edit| edit.range.end > descriptor.length) {
             return Err(Error::invalid(
                 "overwrite prepared content",
-                "invalid replacement range",
+                "edit exceeds logical length",
             ));
         }
-        if range.is_empty() {
+        let mut edits = edits
+            .iter()
+            .filter(|edit| !edit.range.is_empty())
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| edit.range.start);
+        let mut previous_end = None;
+        for edit in &edits {
+            if previous_end.is_some_and(|end| edit.range.start < end) {
+                return Err(Error::invalid(
+                    "overwrite prepared content",
+                    "edits overlap",
+                ));
+            }
+            previous_end = Some(edit.range.end);
+        }
+        if edits.is_empty() {
             return Ok(file.clone());
         }
         let mut pack = Pack::new(self).await?;
@@ -395,18 +631,19 @@ impl DataStore {
                 0,
                 leaves(descriptor.length),
                 descriptor.length,
-                &range,
-                bytes,
+                &edits,
                 &mut pack,
             )
             .await;
         match result {
             Ok(root) => {
                 pack.finish().await?;
-                Ok(self.seal(ContentDescriptor {
+                let descriptor = ContentDescriptor {
                     root: Some(root),
                     ..descriptor
-                }))
+                };
+                self.mark_verified(&descriptor);
+                Ok(self.seal(descriptor))
             }
             Err(error) => {
                 pack.abort().await;
@@ -415,14 +652,314 @@ impl DataStore {
         }
     }
 
+    /// Apply a bounded length-changing update to trusted content.
+    ///
+    /// Output starts with `preserved_prefix` bytes of `file`, continues with
+    /// zero bytes to `final_length`, and overlays non-overlapping fixed-offset
+    /// edits. Base bytes beyond the preserved prefix never reappear, so
+    /// shrink-then-extend cannot resurrect truncated data. Only affected units
+    /// and rebuilt hash paths are read or written; unchanged subtrees retain
+    /// their existing reference and readiness.
+    pub async fn update_prepared(
+        &self,
+        file: &PreparedContent,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        let descriptor = self.accept(file)?;
+        if preserved_prefix > descriptor.length || preserved_prefix > final_length {
+            return Err(Error::invalid(
+                "update prepared content",
+                "preserved prefix exceeds base or final length",
+            ));
+        }
+        if edits.iter().any(|edit| edit.range.end > final_length) {
+            return Err(Error::invalid(
+                "update prepared content",
+                "edit exceeds final length",
+            ));
+        }
+        if !update_is_bounded(preserved_prefix, final_length, edits) {
+            return Err(Error::unsupported(
+                "update prepared content",
+                "update exceeds bounded work budget",
+            ));
+        }
+        let mut edits = edits
+            .iter()
+            .filter(|edit| !edit.range.is_empty())
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| edit.range.start);
+        let mut previous_end = None;
+        for edit in &edits {
+            if previous_end.is_some_and(|end| edit.range.start < end) {
+                return Err(Error::invalid("update prepared content", "edits overlap"));
+            }
+            previous_end = Some(edit.range.end);
+        }
+        if edits.is_empty()
+            && preserved_prefix == descriptor.length
+            && final_length == descriptor.length
+        {
+            return Ok(file.clone());
+        }
+        if final_length == 0 {
+            let descriptor = ContentDescriptor {
+                length: 0,
+                root: None,
+                ..descriptor
+            };
+            self.mark_verified(&descriptor);
+            return Ok(self.seal(descriptor));
+        }
+        let mut pack = Pack::new(self).await?;
+        let result = self
+            .update_into(
+                &descriptor,
+                preserved_prefix,
+                final_length,
+                &edits,
+                &mut pack,
+            )
+            .await;
+        match result {
+            Ok(root) => {
+                pack.finish().await?;
+                let descriptor = ContentDescriptor {
+                    length: final_length,
+                    root,
+                    ..descriptor
+                };
+                self.mark_verified(&descriptor);
+                Ok(self.seal(descriptor))
+            }
+            Err(error) => {
+                pack.abort().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn update_into(
+        &self,
+        descriptor: &ContentDescriptor,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[&ContentEdit<'_>],
+        pack: &mut Pack,
+    ) -> Result<Option<Child>> {
+        let source_limit = leaves(preserved_prefix).min(leaves(final_length));
+        let output_count = leaves(final_length);
+        let mut stack = Vec::new();
+        if source_limit > 0 {
+            let root = descriptor
+                .root
+                .as_ref()
+                .expect("preserved prefix requires nonempty base");
+            self.push_base_prefix(
+                root,
+                0,
+                leaves(descriptor.length),
+                descriptor.length,
+                source_limit,
+                preserved_prefix,
+                final_length,
+                edits,
+                &mut stack,
+                pack,
+            )
+            .await?;
+        }
+        if output_count > source_limit {
+            self.push_zero_suffix(
+                source_limit,
+                output_count - source_limit,
+                final_length,
+                edits,
+                &mut stack,
+                pack,
+            )
+            .await?;
+        }
+        finish_update_frontier(&mut stack, pack).await
+    }
+
+    async fn push_base_prefix(
+        &self,
+        child: &Child,
+        start: u64,
+        count: u64,
+        old_length: u64,
+        limit: u64,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[&ContentEdit<'_>],
+        stack: &mut Vec<(u64, u64, Child)>,
+        pack: &mut Pack,
+    ) -> Result<()> {
+        if start >= limit {
+            return Ok(());
+        }
+        let needed = limit.min(start + count) - start;
+        let reusable = needed == count
+            && count.is_power_of_two()
+            && subtree_end(start, count).is_some_and(|end| {
+                end <= preserved_prefix
+                    && end <= final_length
+                    && !edits_intersect(edits, subtree_start(start), end)
+            });
+        if reusable {
+            self.push_update_component(stack, start, count, child.clone(), pack)
+                .await?;
+            return Ok(());
+        }
+        if count == 1 {
+            let replacement = self
+                .update_leaf(
+                    child,
+                    start,
+                    old_length,
+                    preserved_prefix,
+                    final_length,
+                    edits,
+                    pack,
+                )
+                .await?;
+            self.push_update_component(stack, start, 1, replacement, pack)
+                .await?;
+            return Ok(());
+        }
+        let HashNode::Branch(left, right) = self.node(child, start, count, None).await? else {
+            return Err(corrupt("update base tree has an unexpected leaf"));
+        };
+        let left_count = split(count);
+        if limit > start {
+            Box::pin(self.push_base_prefix(
+                &left,
+                start,
+                left_count,
+                old_length,
+                limit,
+                preserved_prefix,
+                final_length,
+                edits,
+                stack,
+                pack,
+            ))
+            .await?;
+        }
+        let right_start = start + left_count;
+        if limit > right_start {
+            Box::pin(self.push_base_prefix(
+                &right,
+                right_start,
+                count - left_count,
+                old_length,
+                limit,
+                preserved_prefix,
+                final_length,
+                edits,
+                stack,
+                pack,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn push_zero_suffix(
+        &self,
+        start: u64,
+        count: u64,
+        final_length: u64,
+        edits: &[&ContentEdit<'_>],
+        stack: &mut Vec<(u64, u64, Child)>,
+        pack: &mut Pack,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        if count == 1 {
+            let offset = subtree_start(start);
+            let length = (final_length - offset).min(BLOCK_BYTES as u64) as usize;
+            let mut bytes = vec![0; length];
+            apply_edits(&mut bytes, offset, edits);
+            let child = pack.leaf(start, &bytes).await?;
+            self.push_update_component(stack, start, 1, child, pack)
+                .await?;
+            return Ok(());
+        }
+        let left_count = split(count);
+        Box::pin(self.push_zero_suffix(start, left_count, final_length, edits, stack, pack))
+            .await?;
+        Box::pin(self.push_zero_suffix(
+            start + left_count,
+            count - left_count,
+            final_length,
+            edits,
+            stack,
+            pack,
+        ))
+        .await
+    }
+
+    async fn update_leaf(
+        &self,
+        child: &Child,
+        start: u64,
+        old_length: u64,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[&ContentEdit<'_>],
+        pack: &mut Pack,
+    ) -> Result<Child> {
+        let offset = subtree_start(start);
+        let output_length = (final_length - offset).min(BLOCK_BYTES as u64) as usize;
+        let mut bytes = vec![0; output_length];
+        let HashNode::Leaf(reference) = self.node(child, start, 1, None).await? else {
+            return Err(corrupt("update base leaf has an unexpected branch"));
+        };
+        let old = self
+            .unit(&reference, child.hash, start, old_length, None)
+            .await?;
+        if preserved_prefix > offset {
+            let copy = (old.len() as u64)
+                .min(preserved_prefix - offset)
+                .min(output_length as u64) as usize;
+            bytes[..copy].copy_from_slice(&old[..copy]);
+        }
+        apply_edits(&mut bytes, offset, edits);
+        pack.leaf(start, &bytes).await
+    }
+
+    async fn push_update_component(
+        &self,
+        stack: &mut Vec<(u64, u64, Child)>,
+        start: u64,
+        count: u64,
+        child: Child,
+        pack: &mut Pack,
+    ) -> Result<()> {
+        stack.push((start, count, child));
+        while stack.len() >= 2 && stack[stack.len() - 1].1 == stack[stack.len() - 2].1 {
+            let (right_start, right_count, right) = stack.pop().expect("right frontier");
+            let (left_start, left_count, left) = stack.pop().expect("left frontier");
+            debug_assert_eq!(right_start, left_start + left_count);
+            let count = left_count + right_count;
+            let child = pack.branch(left_start, count, left, right).await?;
+            stack.push((left_start, count, child));
+        }
+        Ok(())
+    }
+
     async fn patch(
         &self,
         child: &Child,
         start: u64,
         count: u64,
         length: u64,
-        range: &Range<u64>,
-        replacement: &[u8],
+        edits: &[&ContentEdit<'_>],
         pack: &mut Pack,
     ) -> Result<Child> {
         let offset = start * BLOCK_BYTES as u64;
@@ -431,38 +968,38 @@ impl DataStore {
             .and_then(|n| n.checked_mul(BLOCK_BYTES as u64))
             .unwrap_or(u64::MAX)
             .min(length);
-        if range.end <= offset || range.start >= subtree_end {
+        let first = edits.partition_point(|edit| edit.range.end <= offset);
+        let end = edits.partition_point(|edit| edit.range.start < subtree_end);
+        let edits = &edits[first..end];
+        if edits.is_empty() {
             return Ok(child.clone());
         }
-        match self.node(child, start, count).await? {
+        match self.node(child, start, count, None).await? {
             HashNode::Leaf(reference) => {
-                let mut bytes = self.unit(&reference, child.hash, start, length).await?;
-                let begin = range.start.max(offset);
-                let end = range.end.min(subtree_end);
-                bytes[(begin - offset) as usize..(end - offset) as usize].copy_from_slice(
-                    &replacement[(begin - range.start) as usize..(end - range.start) as usize],
-                );
+                let mut bytes = self
+                    .unit(&reference, child.hash, start, length, None)
+                    .await?
+                    .to_vec();
+                for edit in edits {
+                    let begin = edit.range.start.max(offset);
+                    let end = edit.range.end.min(subtree_end);
+                    bytes[(begin - offset) as usize..(end - offset) as usize].copy_from_slice(
+                        &edit.bytes[(begin - edit.range.start) as usize
+                            ..(end - edit.range.start) as usize],
+                    );
+                }
                 pack.leaf(start, &bytes).await
             }
             HashNode::Branch(left, right) => {
                 let left_count = split(count);
-                let left = Box::pin(self.patch(
-                    &left,
-                    start,
-                    left_count,
-                    length,
-                    range,
-                    replacement,
-                    pack,
-                ))
-                .await?;
+                let left =
+                    Box::pin(self.patch(&left, start, left_count, length, edits, pack)).await?;
                 let right = Box::pin(self.patch(
                     &right,
                     start + left_count,
                     count - left_count,
                     length,
-                    range,
-                    replacement,
+                    edits,
                     pack,
                 ))
                 .await?;
@@ -471,14 +1008,48 @@ impl DataStore {
         }
     }
 
-    async fn node(&self, child: &Child, start: u64, count: u64) -> Result<HashNode> {
-        let bytes = self.read_extent(&child.reference, MAX_NODE_BYTES).await?;
-        let node = HashNode::decode(&bytes)?;
+    async fn node(
+        &self,
+        child: &Child,
+        start: u64,
+        count: u64,
+        cache: Option<(&RangeCache, &ContentDescriptor)>,
+    ) -> Result<HashNode> {
+        let key = cache.map(|(cache, descriptor)| {
+            (
+                cache,
+                RangeCacheKey {
+                    descriptor: descriptor.clone(),
+                    reference: child.reference.clone(),
+                },
+            )
+        });
+        let bytes = match key.as_ref().and_then(|(cache, key)| cache.get(key)) {
+            Some(bytes) => bytes,
+            None => Arc::from(self.read_extent(&child.reference, MAX_NODE_BYTES).await?),
+        };
+        let node = match HashNode::decode(&bytes) {
+            Ok(node) => node,
+            Err(error) => {
+                if let Some((cache, key)) = &key {
+                    cache.remove(key);
+                }
+                return Err(error);
+            }
+        };
         match &node {
             HashNode::Leaf(_) if count == 1 => {}
             HashNode::Branch(left, right)
                 if count > 1 && branch_hash(start, count, left.hash, right.hash) == child.hash => {}
-            _ => return Err(corrupt("invalid hash tree shape or proof")),
+            _ => {
+                if let Some((cache, key)) = &key {
+                    cache.remove(key);
+                }
+                return Err(corrupt("invalid hash tree shape or proof"));
+            }
+        }
+        if let Some((cache, key)) = key {
+            cache.insert(key, bytes);
         }
         Ok(node)
     }
@@ -489,13 +1060,32 @@ impl DataStore {
         hash: [u8; 32],
         start: u64,
         length: u64,
-    ) -> Result<Vec<u8>> {
-        let bytes = self.read_extent(reference, BLOCK_BYTES as u32).await?;
+        cache: Option<(&RangeCache, &ContentDescriptor)>,
+    ) -> Result<Arc<[u8]>> {
+        let key = cache.map(|(cache, descriptor)| {
+            (
+                cache,
+                RangeCacheKey {
+                    descriptor: descriptor.clone(),
+                    reference: reference.clone(),
+                },
+            )
+        });
+        let bytes = match key.as_ref().and_then(|(cache, key)| cache.get(key)) {
+            Some(bytes) => bytes,
+            None => Arc::from(self.read_extent(reference, BLOCK_BYTES as u32).await?),
+        };
         let expected = (length - start * BLOCK_BYTES as u64).min(BLOCK_BYTES as u64);
         if bytes.len() as u64 != expected || leaf_hash(start, &bytes) != hash {
+            if let Some((cache, key)) = &key {
+                cache.remove(key);
+            }
             return Err(corrupt(
                 "verification unit does not match the pinned logical root",
             ));
+        }
+        if let Some((cache, key)) = key {
+            cache.insert(key, bytes.clone());
         }
         Ok(bytes)
     }
@@ -505,6 +1095,24 @@ impl DataStore {
             return Err(Error::invalid("use content", "filesystem does not match"));
         }
         Ok(())
+    }
+
+    fn is_verified(&self, descriptor: &ContentDescriptor) -> bool {
+        self.verified
+            .lock()
+            .expect("verified descriptor set poisoned")
+            .contains(descriptor)
+    }
+
+    fn mark_verified(&self, descriptor: &ContentDescriptor) {
+        self.verified
+            .lock()
+            .expect("verified descriptor set poisoned")
+            .insert(descriptor.clone());
+    }
+
+    pub(crate) fn record_verified(&self, descriptor: &ContentDescriptor) {
+        self.mark_verified(descriptor);
     }
 
     fn seal(&self, descriptor: ContentDescriptor) -> PreparedContent {
@@ -556,6 +1164,83 @@ impl DataStore {
         Ok(bytes)
     }
 
+    /// Authenticate the content tree without reading leaf payload bytes.
+    ///
+    /// Branch and leaf-index nodes are downloaded with their declared bound and
+    /// checksum. Leaf payload references are reported as coverage evidence, not
+    /// as proof that their bytes were read.
+    pub(crate) async fn inspect_content_references(
+        &self,
+        descriptor: &ContentDescriptor,
+        seen: &mut HashSet<PackedRef>,
+        visit: &mut (dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()> + Send),
+    ) -> Result<()> {
+        self.check(descriptor)?;
+        let Some(root) = &descriptor.root else {
+            return Ok(());
+        };
+        self.inspect_content_subtree(
+            root,
+            0,
+            leaves(descriptor.length),
+            descriptor.length,
+            seen,
+            visit,
+        )
+        .await
+    }
+
+    fn inspect_content_subtree<'a>(
+        &'a self,
+        child: &'a Child,
+        start: u64,
+        count: u64,
+        length: u64,
+        seen: &'a mut HashSet<PackedRef>,
+        visit: &'a mut (dyn FnMut(ContentReferenceKind, &PackedRef) -> Result<()> + Send),
+    ) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let node = self.node(child, start, count, None).await?;
+            visit(ContentReferenceKind::Index, &child.reference)?;
+            match node {
+                HashNode::Leaf(reference) => {
+                    let offset = start
+                        .checked_mul(BLOCK_BYTES as u64)
+                        .ok_or_else(|| corrupt("content position overflows"))?;
+                    let expected = length
+                        .checked_sub(offset)
+                        .ok_or_else(|| corrupt("content leaf starts beyond its length"))?
+                        .min(BLOCK_BYTES as u64);
+                    if u64::from(reference.length) != expected {
+                        return Err(corrupt(
+                            "leaf extent length disagrees with its logical unit",
+                        ));
+                    }
+                    visit(ContentReferenceKind::Payload, &reference)
+                }
+                HashNode::Branch(left, right) => {
+                    if !seen.insert(child.reference.clone()) {
+                        return Ok(());
+                    }
+                    let left_count = split(count);
+                    self.inspect_content_subtree(&left, start, left_count, length, seen, visit)
+                        .await?;
+                    self.inspect_content_subtree(
+                        &right,
+                        start
+                            .checked_add(left_count)
+                            .ok_or_else(|| corrupt("content position overflows"))?,
+                        count - left_count,
+                        length,
+                        seen,
+                        visit,
+                    )
+                    .await
+                }
+            }
+        })
+    }
+
     fn key(&self, object: [u8; 16]) -> String {
         format!(
             ".yinyang/v2/{}/packs/{}",
@@ -565,7 +1250,13 @@ impl DataStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContentReferenceKind {
+    Index,
+    Payload,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PackedRef {
     pub(crate) object: [u8; 16],
     pub(crate) offset: u64,
@@ -590,7 +1281,136 @@ impl PackedRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RangeCacheKey {
+    descriptor: ContentDescriptor,
+    reference: PackedRef,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RangeCache {
+    state: Arc<Mutex<RangeCacheState>>,
+    limits: RangeCacheLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RangeCacheLimits {
+    bytes: usize,
+    entries: usize,
+}
+
+impl Default for RangeCacheLimits {
+    fn default() -> Self {
+        Self {
+            bytes: RANGE_CACHE_BYTES,
+            entries: RANGE_CACHE_ENTRIES,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RangeCacheState {
+    entries: HashMap<RangeCacheKey, RangeCacheEntry>,
+    order: BTreeMap<u64, RangeCacheKey>,
+    bytes: usize,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct RangeCacheEntry {
+    sequence: u64,
+    bytes: Arc<[u8]>,
+}
+
+impl RangeCache {
+    fn get(&self, key: &RangeCacheKey) -> Option<Arc<[u8]>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = state.entries.get(key)?;
+        let bytes = entry.bytes.clone();
+        let previous = entry.sequence;
+        let sequence = state.next_sequence();
+        state.order.remove(&previous);
+        state.order.insert(sequence, key.clone());
+        state
+            .entries
+            .get_mut(key)
+            .expect("cache entry remains after lookup")
+            .sequence = sequence;
+        Some(bytes)
+    }
+
+    fn insert(&self, key: RangeCacheKey, bytes: Arc<[u8]>) {
+        if bytes.len() > self.limits.bytes {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.entries.contains_key(&key) {
+            return;
+        }
+        while state.entries.len() >= self.limits.entries
+            || state.bytes.saturating_add(bytes.len()) > self.limits.bytes
+        {
+            let Some((_, oldest)) = state.order.pop_first() else {
+                break;
+            };
+            if let Some(entry) = state.entries.remove(&oldest) {
+                state.bytes = state.bytes.saturating_sub(entry.bytes.len());
+            }
+        }
+        let sequence = state.next_sequence();
+        state.bytes = state.bytes.saturating_add(bytes.len());
+        state.order.insert(sequence, key.clone());
+        state
+            .entries
+            .insert(key, RangeCacheEntry { sequence, bytes });
+    }
+
+    fn remove(&self, key: &RangeCacheKey) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = state.entries.remove(key) {
+            state.order.remove(&entry.sequence);
+            state.bytes = state.bytes.saturating_sub(entry.bytes.len());
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(bytes: usize, entries: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RangeCacheState::default())),
+            limits: RangeCacheLimits { bytes, entries },
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .len()
+    }
+}
+
+impl RangeCacheState {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .expect("range cache recency sequence exhausted");
+        self.sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Child {
     hash: [u8; 32],
     reference: PackedRef,
@@ -616,14 +1436,22 @@ enum HashNode {
 impl HashNode {
     fn bytes(&self) -> Result<Vec<u8>> {
         match self {
-            Self::Leaf(reference) => encode(&(NODE_MAGIC, 0_u8, reference.wire())),
-            Self::Branch(left, right) => encode(&(NODE_MAGIC, 1_u8, left.wire(), right.wire())),
+            Self::Leaf(reference) => encode(&(CONTENT_INDEX_MAGIC, 0_u8, reference.wire())),
+            Self::Branch(left, right) => {
+                encode(&(CONTENT_INDEX_MAGIC, 1_u8, left.wire(), right.wire()))
+            }
         }
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
-        if !bytes.starts_with(&NODE_MAGIC) {
-            return Err(corrupt("invalid hash index profile"));
+        if bytes.len() < CONTENT_INDEX_MAGIC.len() {
+            return Err(corrupt("truncated hash index node"));
+        }
+        if bytes[..CONTENT_INDEX_MAGIC.len()] != CONTENT_INDEX_MAGIC {
+            return Err(Error::unsupported(
+                "decode content index",
+                "unknown content index profile",
+            ));
         }
         match bytes.get(8) {
             Some(0) => Ok(Self::Leaf(PackedRef::from_wire(decode(&bytes[9..])?)?)),
@@ -699,7 +1527,7 @@ impl Pack {
         Ok(Child { hash, reference })
     }
 
-    async fn finish(mut self) -> Result<()> {
+    async fn close(&mut self) -> Result<()> {
         if self.length == 0 {
             self.abort().await;
             return Ok(());
@@ -707,6 +1535,14 @@ impl Pack {
         if let Err(error) = self.writer.close().await {
             self.abort().await;
             return Err(Error::from_storage("finish immutable pack", error));
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.close().await?;
+        if self.length == 0 {
+            return Ok(());
         }
         let reader = self
             .store
@@ -742,7 +1578,48 @@ fn leaves(length: u64) -> u64 {
     length.div_ceil(BLOCK_BYTES as u64)
 }
 
-async fn read_unit(source: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+fn subtree_start(start: u64) -> u64 {
+    start.saturating_mul(BLOCK_BYTES as u64)
+}
+
+fn subtree_end(start: u64, count: u64) -> Option<u64> {
+    start.checked_add(count)?.checked_mul(BLOCK_BYTES as u64)
+}
+
+fn apply_edits(bytes: &mut [u8], offset: u64, edits: &[&ContentEdit<'_>]) {
+    let first = edits.partition_point(|edit| edit.range.end <= offset);
+    let end = edits.partition_point(|edit| edit.range.start < offset + bytes.len() as u64);
+    for edit in &edits[first..end] {
+        let begin = edit.range.start.max(offset);
+        let end = edit.range.end.min(offset + bytes.len() as u64);
+        let source = (begin - edit.range.start) as usize;
+        let target = (begin - offset) as usize;
+        let length = (end - begin) as usize;
+        bytes[target..target + length].copy_from_slice(&edit.bytes[source..source + length]);
+    }
+}
+
+fn edits_intersect(edits: &[&ContentEdit<'_>], start: u64, end: u64) -> bool {
+    let first = edits.partition_point(|edit| edit.range.end <= start);
+    first < edits.len() && edits[first].range.start < end
+}
+
+async fn finish_update_frontier(
+    stack: &mut Vec<(u64, u64, Child)>,
+    pack: &mut Pack,
+) -> Result<Option<Child>> {
+    let mut root = None;
+    if let Some((_, mut count, mut child)) = stack.pop() {
+        while let Some((start, left_count, left)) = stack.pop() {
+            count += left_count;
+            child = pack.branch(start, count, left, child).await?;
+        }
+        root = Some(child);
+    }
+    Ok(root)
+}
+
+async fn read_unit(source: &mut (impl AsyncRead + Unpin + ?Sized)) -> Result<Vec<u8>> {
     let mut bytes = vec![0; BLOCK_BYTES];
     let mut used = 0;
     while used < bytes.len() {
@@ -763,7 +1640,7 @@ fn split(count: u64) -> u64 {
 }
 
 fn domain(tag: &[u8]) -> blake3::Hasher {
-    let mut hash = blake3::Hasher::new_derive_key("Apache OpenDAL YinYang content profile 2");
+    let mut hash = blake3::Hasher::new_derive_key(CONTENT_HASH_CONTEXT);
     hash.update(tag);
     hash
 }
@@ -808,6 +1685,7 @@ fn storage_error(error: opendal::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::support::TestBackend;
 
     #[test]
     fn content_vectors() {
@@ -841,5 +1719,528 @@ mod tests {
             .as_str(),
             "4a9449de9b3ed735f25145e7ec1dbf209b8b698092e29a7f476215dcd1c8ced3"
         );
+        assert!(subtree_end(u64::MAX / BLOCK_BYTES as u64, 1).is_none());
+        assert!(ContentEdit::new(0..2, b"x").is_err());
+    }
+
+    #[tokio::test]
+    async fn reachability_rejects_a_leaf_extent_with_the_wrong_unit_length() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let root = store
+            .put_metadata(
+                &HashNode::Leaf(PackedRef {
+                    object: [9; 16],
+                    offset: 0,
+                    length: 2,
+                    digest: [3; 32],
+                })
+                .bytes()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let descriptor = ContentDescriptor {
+            filesystem: store.filesystem,
+            length: 1,
+            root: Some(Child {
+                hash: [7; 32],
+                reference: root,
+            }),
+        };
+        let error = store
+            .inspect_content_references(&descriptor, &mut HashSet::new(), &mut |_, _| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Corrupt);
+        assert!(error.to_string().contains("length"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_range_reuse_is_version_scoped_and_import_reuses_verified_evidence() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let bytes = (0..BLOCK_BYTES * 3 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+        let range = BLOCK_BYTES as u64 - 11..BLOCK_BYTES as u64 + 13;
+
+        let mut output = Vec::new();
+        store
+            .read_range_cached(file.descriptor(), range.clone(), &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+
+        backend.state.lock().unwrap().data_reads = 0;
+        output.clear();
+        store
+            .read_range_cached(file.descriptor(), range.clone(), &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, bytes[range.start as usize..range.end as usize]);
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            0,
+            "a repeated read of one immutable version must reuse verified ranges"
+        );
+
+        let other_bytes = vec![0x55; BLOCK_BYTES * 2];
+        let other = store.prepare(&mut other_bytes.as_slice()).await.unwrap();
+        backend.state.lock().unwrap().data_reads = 0;
+        output.clear();
+        store
+            .read_range_cached(other.descriptor(), 1..2, &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, [0x55]);
+        assert!(
+            backend.state.lock().unwrap().data_reads > 0,
+            "a different logical version must miss the cache"
+        );
+
+        backend.state.lock().unwrap().data_reads = 0;
+        output.clear();
+        store
+            .read_range(file.descriptor(), range, &mut output)
+            .await
+            .unwrap();
+        assert!(
+            backend.state.lock().unwrap().data_reads > 0,
+            "the trust-promotion read path must remain uncached"
+        );
+
+        let key = store.key(
+            file.descriptor()
+                .root
+                .as_ref()
+                .expect("nonempty cached content")
+                .reference
+                .object,
+        );
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .get_mut(&key)
+            .unwrap()
+            .bytes[0] ^= 1;
+        backend.state.lock().unwrap().data_reads = 0;
+        store.import(file.descriptor()).await.unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            0,
+            "a verified descriptor must publish without reading its pack again"
+        );
+        let restarted = DataStore::new(backend.operator(), store.filesystem).unwrap();
+        assert_eq!(
+            restarted
+                .import(file.descriptor())
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Corrupt,
+            "a fresh DataStore must verify an untrusted descriptor once"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_bounded_edits_reuse_the_trusted_base_and_reject_overlap() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let bytes = (0..BLOCK_BYTES * 64 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+        let edits = [
+            ContentEdit::new(3..7, b"abcd").unwrap(),
+            ContentEdit::new(BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3, b"01234").unwrap(),
+            ContentEdit::new(bytes.len() as u64 - 2..bytes.len() as u64, b"xy").unwrap(),
+        ];
+
+        backend.state.lock().unwrap().data_read_bytes = 0;
+        let patched = store
+            .overwrite_prepared_ranges(&file, &edits)
+            .await
+            .unwrap();
+        assert!(
+            backend.state.lock().unwrap().data_read_bytes < (BLOCK_BYTES * 8) as u64,
+            "multiple small edits must not read the complete base"
+        );
+        let mut expected = bytes.clone();
+        for (range, replacement) in [
+            (3..7, b"abcd".as_slice()),
+            (
+                BLOCK_BYTES as u64 - 2..BLOCK_BYTES as u64 + 3,
+                b"01234".as_slice(),
+            ),
+            (bytes.len() as u64 - 2..bytes.len() as u64, b"xy".as_slice()),
+        ] {
+            expected[range.start as usize..range.end as usize].copy_from_slice(replacement);
+        }
+        let complete = store.prepare(&mut expected.as_slice()).await.unwrap();
+        assert_eq!(patched.content_id(), complete.content_id());
+
+        backend.state.lock().unwrap().data_reads = 0;
+        let overlap = [
+            ContentEdit::new(1..4, b"abc").unwrap(),
+            ContentEdit::new(3..5, b"de").unwrap(),
+        ];
+        assert_eq!(
+            store
+                .overwrite_prepared_ranges(&file, &overlap)
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Invalid
+        );
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+        let past_end =
+            ContentEdit::new(bytes.len() as u64 + 1..bytes.len() as u64 + 1, b"").unwrap();
+        assert_eq!(
+            store
+                .overwrite_prepared_ranges(&file, &[past_end])
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Invalid
+        );
+    }
+
+    #[tokio::test]
+    async fn length_changing_updates_reuse_bounded_base_and_match_stream() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let base_length = BLOCK_BYTES as u64 * 64;
+        let bytes = (0..base_length as usize)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+
+        let mut expected = bytes.clone();
+        expected.resize(expected.len() + 11, 0);
+        expected[base_length as usize..].copy_from_slice(b"append-tail");
+        backend.state.lock().unwrap().data_read_bytes = 0;
+        backend.state.lock().unwrap().data_reads = 0;
+        backend.state.lock().unwrap().written_bytes = 0;
+        let appended = store
+            .update_prepared(
+                &file,
+                base_length,
+                base_length + 11,
+                &[ContentEdit::new(base_length..base_length + 11, b"append-tail").unwrap()],
+            )
+            .await
+            .unwrap();
+        let (read_bytes, written_bytes) = {
+            let state = backend.state.lock().unwrap();
+            (state.data_read_bytes, state.written_bytes)
+        };
+        assert!(
+            read_bytes < BLOCK_BYTES as u64 * 6,
+            "append read {read_bytes} bytes"
+        );
+        assert!(
+            written_bytes < BLOCK_BYTES as u64 * 6,
+            "append wrote {written_bytes} bytes"
+        );
+        let canonical = store.prepare(&mut expected.as_slice()).await.unwrap();
+        assert_eq!(appended.content_id(), canonical.content_id());
+
+        let truncated_length = base_length + 4;
+        expected.truncate(truncated_length as usize);
+        backend.state.lock().unwrap().data_read_bytes = 0;
+        backend.state.lock().unwrap().data_reads = 0;
+        backend.state.lock().unwrap().written_bytes = 0;
+        let truncated = store
+            .update_prepared(&appended, truncated_length, truncated_length, &[])
+            .await
+            .unwrap();
+        let (read_bytes, written_bytes) = {
+            let state = backend.state.lock().unwrap();
+            (state.data_read_bytes, state.written_bytes)
+        };
+        assert!(
+            read_bytes < BLOCK_BYTES as u64 * 6,
+            "truncate read {read_bytes} bytes"
+        );
+        assert!(
+            written_bytes < BLOCK_BYTES as u64 * 6,
+            "truncate wrote {written_bytes} bytes"
+        );
+        let canonical = store.prepare(&mut expected.as_slice()).await.unwrap();
+        assert_eq!(truncated.content_id(), canonical.content_id());
+    }
+
+    #[tokio::test]
+    async fn shrink_then_extend_zero_fills_instead_of_reviving_base_bytes() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        let bytes = (0..BLOCK_BYTES * 3 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+        let preserved = BLOCK_BYTES as u64 / 2;
+        let final_length = BLOCK_BYTES as u64 * 4 + 5;
+        let mut expected = bytes[..preserved as usize].to_vec();
+        expected.resize(final_length as usize, 0);
+        expected[final_length as usize - 3..].copy_from_slice(b"end");
+        backend.state.lock().unwrap().data_read_bytes = 0;
+        let extended = store
+            .update_prepared(
+                &file,
+                preserved,
+                final_length,
+                &[ContentEdit::new(final_length - 3..final_length, b"end").unwrap()],
+            )
+            .await
+            .unwrap();
+        let read_bytes = backend.state.lock().unwrap().data_read_bytes;
+        assert!(
+            read_bytes < BLOCK_BYTES as u64 * 6,
+            "shrink-extend read {read_bytes} bytes"
+        );
+        let canonical = store.prepare(&mut expected.as_slice()).await.unwrap();
+        assert_eq!(extended.content_id(), canonical.content_id());
+    }
+
+    #[tokio::test]
+    async fn update_tree_shapes_match_complete_stream_oracle() {
+        let backend = TestBackend::default();
+        let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+        for leaf_count in [2_u64, 3, 4, 5, 7, 8] {
+            let base_length = (leaf_count - 1) * BLOCK_BYTES as u64 + 37;
+            let bytes = (0..base_length as usize)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+
+            let append = vec![0xa5; BLOCK_BYTES + 29];
+            let mut appended_bytes = bytes.clone();
+            appended_bytes.extend_from_slice(&append);
+            let final_length = appended_bytes.len() as u64;
+            let appended = store
+                .update_prepared(
+                    &file,
+                    base_length,
+                    final_length,
+                    &[ContentEdit::new(base_length..final_length, &append).unwrap()],
+                )
+                .await
+                .unwrap();
+            let canonical = store.prepare(&mut appended_bytes.as_slice()).await.unwrap();
+            assert_eq!(
+                appended.content_id(),
+                canonical.content_id(),
+                "append tree with {leaf_count} leaves"
+            );
+
+            let shrink_length = (leaf_count - 2) * BLOCK_BYTES as u64 + 11;
+            let mut shrunk_bytes = bytes.clone();
+            shrunk_bytes.truncate(shrink_length as usize);
+            let shrunk = store
+                .update_prepared(&file, shrink_length, shrink_length, &[])
+                .await
+                .unwrap();
+            let canonical = store.prepare(&mut shrunk_bytes.as_slice()).await.unwrap();
+            assert_eq!(
+                shrunk.content_id(),
+                canonical.content_id(),
+                "shrink tree with {leaf_count} leaves"
+            );
+
+            if leaf_count == 5 {
+                let mut observed = Vec::new();
+                store
+                    .read_range(appended.descriptor(), 0..final_length, &mut observed)
+                    .await
+                    .unwrap();
+                assert_eq!(observed, appended_bytes);
+            }
+        }
+
+        let empty = store.prepare(&mut [].as_slice()).await.unwrap();
+        let one = store
+            .update_prepared(&empty, 0, 1, &[ContentEdit::new(0..1, b"x").unwrap()])
+            .await
+            .unwrap();
+        let canonical = store.prepare(&mut &b"x"[..]).await.unwrap();
+        assert_eq!(one.content_id(), canonical.content_id());
+        let zero = store.update_prepared(&one, 0, 0, &[]).await.unwrap();
+        assert_eq!(zero.content_id(), empty.content_id());
+
+        let same_leaf = store.prepare(&mut &b"abc"[..]).await.unwrap();
+        let extended = store
+            .update_prepared(&same_leaf, 3, 6, &[ContentEdit::new(3..6, b"def").unwrap()])
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        store
+            .read_range(extended.descriptor(), 0..6, &mut observed)
+            .await
+            .unwrap();
+        assert_eq!(observed, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn length_changing_updates_reject_invalid_and_untrusted_inputs() {
+        let backend = TestBackend::default();
+        let filesystem = NodeId::generate();
+        let store = DataStore::new(backend.operator(), filesystem).unwrap();
+        let bytes = b"0123456789abcdef";
+        let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
+
+        let empty = store.prepare(&mut [].as_slice()).await.unwrap();
+        let extended = store
+            .update_prepared(&empty, 0, 5, &[ContentEdit::new(0..5, b"abcde").unwrap()])
+            .await
+            .unwrap();
+        let canonical = store.prepare(&mut b"abcde".as_slice()).await.unwrap();
+        assert_eq!(extended.content_id(), canonical.content_id());
+
+        let no_op = store
+            .update_prepared(&file, bytes.len() as u64, bytes.len() as u64, &[])
+            .await
+            .unwrap();
+        assert_eq!(no_op.descriptor(), file.descriptor());
+        let emptied = store.update_prepared(&file, 0, 0, &[]).await.unwrap();
+        assert_eq!(emptied.content_id(), empty.content_id());
+
+        backend.state.lock().unwrap().data_reads = 0;
+        for (preserved, final_length, edits) in [
+            (bytes.len() as u64 + 1, bytes.len() as u64, vec![]),
+            (bytes.len() as u64, bytes.len() as u64 - 1, vec![]),
+            (
+                bytes.len() as u64,
+                bytes.len() as u64,
+                vec![ContentEdit::new(bytes.len() as u64..bytes.len() as u64 + 1, b"x").unwrap()],
+            ),
+            (
+                bytes.len() as u64,
+                bytes.len() as u64,
+                vec![
+                    ContentEdit::new(1..4, b"abc").unwrap(),
+                    ContentEdit::new(3..5, b"de").unwrap(),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .update_prepared(&file, preserved, final_length, &edits)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                crate::ErrorKind::Invalid
+            );
+        }
+        assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+        assert!(!update_is_bounded(
+            0,
+            (MAX_UPDATE_UNITS + 1) * BLOCK_BYTES as u64,
+            &[]
+        ));
+        backend.state.lock().unwrap().data_reads = 0;
+        backend.state.lock().unwrap().written_bytes = 0;
+        assert_eq!(
+            store
+                .update_prepared(&file, 0, (MAX_UPDATE_UNITS + 1) * BLOCK_BYTES as u64, &[],)
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Unsupported
+        );
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.data_reads, 0);
+            assert_eq!(state.written_bytes, 0);
+        }
+
+        let impostor = DataStore::new(backend.operator(), filesystem).unwrap();
+        assert_eq!(
+            impostor
+                .update_prepared(&file, 3, 3, &[])
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Invalid
+        );
+
+        let truncated = store.update_prepared(&file, 3, 3, &[]).await.unwrap();
+        let canonical = store.prepare(&mut &b"012"[..]).await.unwrap();
+        assert_eq!(truncated.content_id(), canonical.content_id());
+
+        let key = store.key(
+            file.descriptor()
+                .root
+                .as_ref()
+                .expect("nonempty test content")
+                .reference
+                .object,
+        );
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .get_mut(&key)
+            .unwrap()
+            .bytes[0] ^= 1;
+        assert_eq!(
+            store
+                .update_prepared(&file, 3, 3, &[])
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn range_cache_evicts_the_least_recently_used_verified_extent() {
+        let cache = RangeCache::with_limits(8, 4);
+        let descriptor = ContentDescriptor {
+            filesystem: NodeId::from_bytes([1; 16]),
+            length: 0,
+            root: None,
+        };
+        let first = RangeCacheKey {
+            descriptor: descriptor.clone(),
+            reference: PackedRef {
+                object: [1; 16],
+                offset: 0,
+                length: 4,
+                digest: [1; 32],
+            },
+        };
+        let second = RangeCacheKey {
+            descriptor: descriptor.clone(),
+            reference: PackedRef {
+                object: [2; 16],
+                offset: 0,
+                length: 4,
+                digest: [2; 32],
+            },
+        };
+        let third = RangeCacheKey {
+            descriptor,
+            reference: PackedRef {
+                object: [3; 16],
+                offset: 0,
+                length: 4,
+                digest: [3; 32],
+            },
+        };
+        cache.insert(first.clone(), Arc::from([1; 4]));
+        cache.insert(second.clone(), Arc::from([2; 4]));
+        assert!(cache.get(&first).is_some());
+        cache.insert(third.clone(), Arc::from([3; 4]));
+        assert!(cache.get(&second).is_none());
+        assert!(cache.get(&first).is_some());
+        assert!(cache.get(&third).is_some());
+        assert_eq!(cache.len(), 2);
     }
 }

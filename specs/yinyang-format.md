@@ -2,9 +2,11 @@
 
 Status: experimental implementation of the object-storage binding in
 [Transactional filesystem](transactional-filesystem.md). This replaces the
-materialized-version API and encoding. Metadata-service publication remains a
-target, not an available backend. The byte profile is not an interoperable
-release commitment.
+materialized-version API and encoding. The same core also implements
+[metadata-service publication](metadata-service.md); a filesystem selects one
+authority mode at creation and cannot switch modes in place. The byte identifiers
+below are supported as one experimental compatibility profile, not as a general
+release-support promise.
 
 ## Public boundary
 
@@ -14,14 +16,14 @@ record boundary. Evaluation produces changed node and directory records; the
 object authority applies those changes to its copy-on-write indexes. Physical
 index writes are not part of logical predicate validation. This separation does
 not change the object encoding or publication point.
-`create` and `open` require an explicit `BackendProfile`: Amazon S3 or MinIO.
-The endpoint must provide that deployment's durable immutable writes, strongly
-consistent reads and atomic conditional writes. Selecting a profile is an
-assertion about the configured endpoint, not a capability discovery mechanism.
-Other S3-compatible products are not automatically supported. Capability flags
-are additionally checked; the backend must support streaming writes,
-create-if-absent and if-match. The MinIO integration test exercises these
-operations against a real server. It does not prove every S3-compatible
+`create` and `open` accept only the configured operator. Deployment-specific
+Amazon S3 or MinIO selection belongs to the configuration layer that constructs
+that operator; core does not carry an unused profile parameter. The endpoint
+must provide durable immutable writes, strongly consistent reads and atomic
+conditional writes. Other S3-compatible products are not automatically
+supported. Capability flags are checked; the backend must support streaming
+writes, create-if-absent and if-match. The MinIO integration test exercises
+these operations against a real server. It does not prove every S3-compatible
 deployment has the same semantics.
 
 YinYang owns `.yinyang/` below the operator root. External replacement or
@@ -69,6 +71,13 @@ only after successful publication. CAS misses revalidate the original plan,
 without reuploading content or executing a callback. Eight failed publication
 opportunities return `Retryable`, with a final indexed receipt check.
 Transient failures before publication also return `Retryable`.
+Clones of one `ObjectFs` share a fair FIFO gate around the complete local
+observe, build and head-publication loop. This prevents disjoint commits from
+invalidating one another's observed head or consuming the bounded CAS retries
+within one client. Preparation and read-only observations do not take the gate.
+Separately opened `ObjectFs` clients do not share it and retain cross-client CAS
+contention. Cancellation releases the gate while preserving the existing
+uncertainty rules; the commit loop never reacquires it reentrantly.
 
 An ambiguous head replacement remains `Unknown` while its old conditional
 token might still succeed. A fresh observed token fences that attempt; retries
@@ -99,6 +108,11 @@ one of `1..9`, `¹`, `²`, `³`. Input spelling is validated, not silently
 normalized. Entries sort by unsigned UTF-8 bytes of the folded key.
 Directory continuation tokens bind descriptor reference, parent ID, and the
 last exclusive key; they cannot be reused with another observation.
+
+The profile freezes Unicode 17.0.0 normalization and the stated case-folding
+table. A change to either table, a reserved-name rule, a key encoding, or
+unsigned UTF-8 ordering is a new profile. It must not silently change existing
+directory keys or NodeIds.
 
 ## Persistent encoding
 
@@ -185,6 +199,26 @@ For filesystem ID consisting of sixteen bytes of value 1, no conditions and
 no mutations, the request digest is
 `811032fb290ade714ee0ca3d8716fabd1f7154e478ae5da1a8b822411513eb4d`.
 
+## Compatibility and admission
+
+The supported object profile is `YYHEAD02` mode 0 with root descriptor
+`YYSNAP02`, index pages `YYINDEX2`, content descriptors `YYFILE02`, and canonical
+requests `YYREQ002`. Frozen requests use `YYPLAN01`; node identities use the
+derive-key context `Apache OpenDAL YinYang node identity profile 2`.
+
+Readers reject `YYHEAD01`, `YYSERV01`, unknown head modes, and unknown snapshot,
+index, content, or plan identifiers with `Unsupported`. Head creation and
+replacement do not begin when an existing head is an unsupported profile.
+Malformed encodings carrying a supported identifier are `Corrupt` or `Invalid`.
+The object binding never opens a service authority, and the service binding never
+falls back to object publication.
+
+There is no in-place upgrade from `YYHEAD01`, automatic downgrade from this
+profile, or mixed old/new writer. A retained snapshot or receipt remains
+readable only while its head, descriptor, index, and content profiles are all in
+the supported matrix. See [Compatibility](compatibility.md) for the complete
+matrix and transition limits.
+
 ## Verification and remaining limits
 
 Tests cover deterministic CAS races, logical conflicts, delayed/lost responses,
@@ -194,7 +228,14 @@ increase namespace and receipt counts while bounding bytes and requests; they
 are cost checks, not throughput benchmarks. A real MinIO test exercises
 multipart preparation, range updates, publication, retries and reopen.
 
-There is no metadata-service engine or remote preparation-evidence protocol.
-There is no mount runtime, synchronization policy, garbage collection,
-compression, encryption or interoperable-profile release. These are not
-implicitly enabled by the object-storage implementation.
+There is no remote preparation-evidence protocol or general release support.
+The metadata-service engine described in its own specification is implemented
+by the same core but remains a separate authority mode. There is no mount
+policy, garbage collection, compression, or encryption implied by the object
+profile.
+
+## Conformance
+
+[`format`](../crates/core/tests/fixtures/format) contains independently encoded
+current content and frozen-request vectors. The tests read these committed
+bytes instead of regenerating them with the writer.

@@ -25,6 +25,7 @@
 //! Loopback counting proxies in front of Silo and the metadata service supply
 //! distinct request, connection, and byte counts without production hooks.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -37,20 +38,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[path = "linux_sync/harness.rs"]
-mod fixture;
+mod support;
+use support::linux_sync as fixture;
 
 use fixture::{Fixture, Publication, SyncPaths};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
-const RESULT_SCHEMA: &str = "yinyang.linux-cost.v3";
+const RESULT_SCHEMA: &str = "yinyang.linux-cost.v6";
 const CHUNK: usize = 64 * 1024;
 const BLOCK_BYTES: usize = 64 * 1024;
 const RANGE_BYTES: usize = 4096;
-const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io while alive; terminal increments can be missed, so values are lower bounds and character I/O includes sockets";
-const STORAGE_BACKEND: &str = "loopback Silo, MinIO-compatible S3 over HTTP";
-const METADATA_TRANSPORT: &str = "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC";
+const PROCESS_IO_NOTE: &str = "sampled from /proc/PID/io and /proc/PID/status while alive; terminal increments can be missed, so values are lower bounds, character I/O includes sockets, and RSS/HWM are process-wide rather than cache-only";
+const REPEATED_RANDOM_SAMPLES: usize = 32;
+const RANDOM_SEED: u64 = 0x79_59_4d_32_37_37_32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -62,6 +65,9 @@ enum Profile {
 enum Workload {
     Full,
     ReadOnlyRange,
+    RepeatedRandom,
+    Incremental,
+    LengthChanging,
 }
 
 impl Workload {
@@ -69,6 +75,24 @@ impl Workload {
         match self {
             Self::Full => "full",
             Self::ReadOnlyRange => "read-only-range",
+            Self::RepeatedRandom => "repeated-random",
+            Self::Incremental => "incremental",
+            Self::LengthChanging => "length-changing",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncrementalExpectation {
+    Baseline,
+    Required,
+}
+
+impl IncrementalExpectation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Required => "required",
         }
     }
 }
@@ -90,7 +114,7 @@ impl PublicationFilter {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Scale {
     Small,
     Medium,
@@ -137,6 +161,12 @@ struct RunContext {
     profile: Profile,
     workload: Workload,
     publication_filter: PublicationFilter,
+    storage_backend: String,
+    metadata_transport: String,
+    network_source: String,
+    range_cache_policy: String,
+    expect_range_reuse: bool,
+    incremental_expectation: String,
     source_sha: String,
     source_dirty: bool,
     binary_path: String,
@@ -168,20 +198,30 @@ impl BenchFixture {
 
     fn network<'a>(&'a self, storage: &'a CountingProxy) -> NetworkMeter<'a> {
         NetworkMeter {
-            storage,
+            storage: NetworkSource::Proxy(storage),
             service: self.service_proxy.as_ref(),
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum NetworkSource<'a> {
+    Proxy(&'a CountingProxy),
+    Telemetry(&'a TelemetryMeter),
+}
+
+#[derive(Clone, Copy)]
 struct NetworkMeter<'a> {
-    storage: &'a CountingProxy,
+    storage: NetworkSource<'a>,
     service: Option<&'a CountingServiceProxy>,
 }
 
 impl NetworkMeter<'_> {
     fn snapshot(&self) -> NetworkSnapshot {
-        let mut snapshot = self.storage.snapshot();
+        let mut snapshot = match self.storage {
+            NetworkSource::Proxy(proxy) => proxy.snapshot(),
+            NetworkSource::Telemetry(telemetry) => telemetry.snapshot(),
+        };
         if let Some(service) = self.service {
             let service = service.snapshot();
             snapshot.service_connections = service.connections;
@@ -190,6 +230,88 @@ impl NetworkMeter<'_> {
         }
         snapshot
     }
+
+    fn settle(&self) {
+        if matches!(self.storage, NetworkSource::Telemetry(_)) {
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    fn telemetry_path(&self) -> Option<&Path> {
+        match self.storage {
+            NetworkSource::Proxy(_) => None,
+            NetworkSource::Telemetry(telemetry) => Some(&telemetry.path),
+        }
+    }
+}
+
+struct TelemetryMeter {
+    path: PathBuf,
+}
+
+impl TelemetryMeter {
+    fn new(path: PathBuf) -> Self {
+        let meter = Self { path };
+        meter.reset();
+        meter
+    }
+
+    fn reset(&self) {
+        let snapshot = TelemetrySnapshot {
+            schema: "yinyang.benchmark-http.v1".to_owned(),
+            requests: 0,
+            request_bytes: 0,
+            response_bytes: 0,
+            read_requests: 0,
+        };
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).expect("create benchmark telemetry directory");
+        }
+        fs::write(
+            &self.path,
+            serde_json::to_vec(&snapshot).expect("serialize zero benchmark telemetry"),
+        )
+        .expect("reset benchmark telemetry");
+    }
+
+    fn snapshot(&self) -> NetworkSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = fs::read(&self.path)
+                && let Ok(snapshot) = serde_json::from_slice::<TelemetrySnapshot>(&bytes)
+            {
+                assert_eq!(
+                    snapshot.schema,
+                    "yinyang.benchmark-http.v1",
+                    "unexpected benchmark telemetry schema in {}",
+                    self.path.display()
+                );
+                return NetworkSnapshot {
+                    requests: snapshot.requests,
+                    request_bytes: snapshot.request_bytes,
+                    response_bytes: snapshot.response_bytes,
+                    get: snapshot.read_requests,
+                    other: snapshot.requests.saturating_sub(snapshot.read_requests),
+                    ..NetworkSnapshot::default()
+                };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "benchmark telemetry {} did not become readable",
+                self.path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct TelemetrySnapshot {
+    schema: String,
+    requests: u64,
+    request_bytes: u64,
+    response_bytes: u64,
+    read_requests: u64,
 }
 
 #[test]
@@ -204,7 +326,20 @@ fn linux_cost_benchmark() {
     let workload = match std::env::var("YINYANG_COST_WORKLOAD").as_deref() {
         Ok("full") | Err(_) => Workload::Full,
         Ok("read-only-range") => Workload::ReadOnlyRange,
-        value => panic!("YINYANG_COST_WORKLOAD must be full or read-only-range, got {value:?}"),
+        Ok("repeated-random") => Workload::RepeatedRandom,
+        Ok("incremental") => Workload::Incremental,
+        Ok("length-changing") => Workload::LengthChanging,
+        value => panic!(
+            "YINYANG_COST_WORKLOAD must be full, read-only-range, repeated-random, incremental, or length-changing, got {value:?}"
+        ),
+    };
+    let incremental_expectation = match std::env::var("YINYANG_COST_INCREMENTAL_EXPECT").as_deref()
+    {
+        Ok("required") => IncrementalExpectation::Required,
+        Ok("baseline") | Err(_) => IncrementalExpectation::Baseline,
+        value => {
+            panic!("YINYANG_COST_INCREMENTAL_EXPECT must be baseline or required, got {value:?}")
+        }
     };
     let publication_filter = match std::env::var("YINYANG_COST_PUBLICATION").as_deref() {
         Ok("all") | Err(_) => PublicationFilter::All,
@@ -212,8 +347,15 @@ fn linux_cost_benchmark() {
         Ok("service") => PublicationFilter::Service,
         value => panic!("YINYANG_COST_PUBLICATION must be all, object, or service, got {value:?}"),
     };
-    if matches!(workload, Workload::ReadOnlyRange) && profile != Profile::Full {
-        panic!("read-only-range workload requires YINYANG_COST_PROFILE=full");
+    if matches!(
+        workload,
+        Workload::ReadOnlyRange
+            | Workload::RepeatedRandom
+            | Workload::Incremental
+            | Workload::LengthChanging
+    ) && profile != Profile::Full
+    {
+        panic!("range and incremental workloads require YINYANG_COST_PROFILE=full");
     }
     if matches!(workload, Workload::Full)
         && matches!(profile, Profile::Early)
@@ -231,18 +373,86 @@ fn linux_cost_benchmark() {
     let source_sha = std::env::var("YINYANG_COST_SOURCE_SHA")
         .expect("set YINYANG_COST_SOURCE_SHA to the exact tested source commit");
     let source_dirty = std::env::var("YINYANG_COST_SOURCE_DIRTY").as_deref() == Ok("1");
-    let binary_path = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let compiled_binary = PathBuf::from(env!("CARGO_BIN_EXE_yy"));
+    let binary_path = std::env::var_os("YY_UPGRADE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| compiled_binary.clone());
+    let binary_blake3 = blake3_file(&binary_path);
+    if binary_path != compiled_binary {
+        assert_eq!(
+            binary_blake3,
+            blake3_file(&compiled_binary),
+            "YY_UPGRADE_BIN selects different bytes from the compiled benchmark binary"
+        );
+    }
+    let storage_backend = std::env::var("YINYANG_COST_STORAGE_LABEL").unwrap_or_else(|_| {
+        if std::env::var("YINYANG_S3_ENDPOINT")
+            .is_ok_and(|endpoint| endpoint.starts_with("https://"))
+        {
+            "non-loopback S3-compatible storage over HTTPS".to_owned()
+        } else {
+            "loopback Silo, MinIO-compatible S3 over HTTP".to_owned()
+        }
+    });
+    let network_source = if workload == Workload::RepeatedRandom {
+        "OpenDAL released MetricsLayer in the measured yy process; HTTP request count and body bytes only"
+            .to_owned()
+    } else {
+        "loopback HTTP/1 parser; total request/response bytes include headers, and GET/PUT body bytes are tracked separately"
+            .to_owned()
+    };
+    let metadata_transport = if workload == Workload::RepeatedRandom {
+        "object authority directly over HTTPS; no metadata service".to_owned()
+    } else {
+        "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC"
+            .to_owned()
+    };
+    let range_cache_policy = std::env::var("YINYANG_COST_RANGE_POLICY")
+        .unwrap_or_else(|_| "unspecified; select the exact measured binary policy".to_owned());
+    let expect_range_reuse = std::env::var("YINYANG_COST_EXPECT_RANGE_REUSE").as_deref() == Ok("1");
     let context = RunContext {
         profile,
         workload,
         publication_filter,
+        storage_backend,
+        metadata_transport,
+        network_source,
+        range_cache_policy,
+        expect_range_reuse,
+        incremental_expectation: incremental_expectation.as_str().to_owned(),
         source_sha,
         source_dirty,
-        binary_blake3: blake3_file(&binary_path),
+        binary_blake3,
         binary_path: binary_path.display().to_string(),
         host: host_identity(),
         rustc: command_line("rustc", &["--version"]),
     };
+    let mut recorder = Recorder::new(&context, &output, &summary);
+
+    if workload == Workload::RepeatedRandom {
+        assert!(
+            benchmark_telemetry_enabled(),
+            "repeated-random measurement requires --features benchmark-telemetry"
+        );
+        let publications = &[Publication::Object];
+        for &publication in publications {
+            for &scale in &[Scale::Small, Scale::Medium] {
+                run_repeated_random_matrix(
+                    &context,
+                    publication,
+                    scale,
+                    &output.with_extension(format!(
+                        "telemetry-{}-{}",
+                        publication.as_str(),
+                        scale.as_str()
+                    )),
+                    &mut recorder,
+                );
+            }
+        }
+        recorder.finish();
+        return;
+    }
 
     let upstream = s3_upstream();
     let proxy = Arc::new(CountingProxy::start(upstream));
@@ -269,14 +479,43 @@ fn linux_cost_benchmark() {
         (Profile::Full, PublicationFilter::Object) => &[Publication::Object],
         (Profile::Full, PublicationFilter::Service) => &[Publication::Service],
     };
+    if matches!(workload, Workload::Incremental) {
+        for &publication in publications {
+            run_incremental_matrix(
+                &context,
+                &proxy,
+                publication,
+                Scale::Medium,
+                incremental_expectation,
+                &mut recorder,
+            );
+        }
+        recorder.finish();
+        return;
+    }
+    if matches!(workload, Workload::LengthChanging) {
+        for &publication in publications {
+            run_length_changing_matrix(
+                &context,
+                &proxy,
+                publication,
+                Scale::Medium,
+                incremental_expectation,
+                &mut recorder,
+            );
+        }
+        recorder.finish();
+        return;
+    }
     let scales: &[Scale] = match (workload, profile) {
         (Workload::ReadOnlyRange, _) | (Workload::Full, Profile::Full) => {
             &[Scale::Small, Scale::Medium]
         }
         (Workload::Full, Profile::Early) => &[Scale::Small],
+        (Workload::RepeatedRandom | Workload::Incremental | Workload::LengthChanging, _) => {
+            unreachable!("specialized workloads return above")
+        }
     };
-    let mut recorder = Recorder::new(&context, &output, &summary);
-
     if matches!(workload, Workload::ReadOnlyRange) {
         for &publication in publications {
             for &scale in scales {
@@ -313,6 +552,10 @@ fn linux_cost_benchmark() {
     recorder.finish();
 }
 
+fn benchmark_telemetry_enabled() -> bool {
+    cfg!(feature = "benchmark-telemetry")
+}
+
 fn require_benchmark_environment() {
     if !Path::new("/dev/fuse").exists() {
         panic!("Linux cost benchmark requires /dev/fuse");
@@ -325,7 +568,6 @@ fn require_benchmark_environment() {
     }
     for name in [
         "YINYANG_S3_BUCKET",
-        "YINYANG_S3_ENDPOINT",
         "YINYANG_S3_REGION",
         "YINYANG_S3_ACCESS_KEY_ID",
         "YINYANG_S3_SECRET_ACCESS_KEY",
@@ -333,6 +575,12 @@ fn require_benchmark_environment() {
         assert!(
             std::env::var_os(name).is_some(),
             "{name} is unset; the benchmark fails hard instead of skipping"
+        );
+    }
+    if std::env::var("YINYANG_STORAGE_PROFILE").as_deref() == Ok("minio") {
+        assert!(
+            std::env::var_os("YINYANG_S3_ENDPOINT").is_some(),
+            "YINYANG_S3_ENDPOINT is unset for the MinIO benchmark profile"
         );
     }
 }
@@ -403,7 +651,7 @@ fn run_sync_matrix(
     for index in 0..3 {
         fs::write(
             &edit,
-            payload(1024, 0x40 + u8::try_from(index).expect("three edits")),
+            payload(256 * 1024, 0x40 + u8::try_from(index).expect("three edits")),
         )
         .expect("write one Sync edit");
         let measured = run_yy_operation(
@@ -506,6 +754,9 @@ fn run_fuse_matrix(
         file_size_bytes: Some(size as u64),
         range_bytes: Some(RANGE_BYTES as u64),
         writers: None,
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     };
     recorder.record(
         context,
@@ -662,6 +913,828 @@ fn run_fuse_matrix(
     restarted.unmount();
 }
 
+fn run_incremental_matrix(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    scale: Scale,
+    expectation: IncrementalExpectation,
+    recorder: &mut Recorder,
+) {
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
+    let size = scale.file_size();
+    let mut expected = payload(size, 0x3c);
+    fixture.remote_create_file("incremental.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        fixture,
+        &format!("incremental-{}-{}", publication.as_str(), scale.as_str()),
+        false,
+    );
+    fs::create_dir(&mountpoint).expect("create incremental benchmark mountpoint");
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    let base_dataset = Dataset {
+        kind: "single_large_file_incremental".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: Some(RANGE_BYTES as u64),
+        writers: Some(1),
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
+    };
+    recorder.record(
+        context,
+        "fuse_incremental_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["writable mount type=fuse.yinyang".to_owned()],
+    );
+
+    let path = mountpoint.join("incremental.bin");
+    let open = measure_mount_operation(&meter, mounted.pid(), || {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open incremental benchmark file")
+    });
+    let Measurement {
+        value: writer,
+        latency_ms: open_latency_ms,
+        io: open_io,
+        network: open_network,
+    } = open;
+    let open_get_body_bytes = open_network.get_response_body_bytes;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            open_get_body_bytes < size as u64 / 2,
+            "open materialized {} bytes of a {size}-byte file; this is consistent with a full-file fallback",
+            open_get_body_bytes
+        );
+    }
+    recorder.record(
+        context,
+        "fuse_incremental_open_materialization",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "open completed before a write or fsync; GET body bytes are HTTP entity bytes, excluding headers",
+        vec![open_latency_ms],
+        open_io,
+        open_network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "writable descriptor opened successfully".to_owned(),
+            format!("get_response_body_bytes={open_get_body_bytes}"),
+            format!("full_file_bytes={size}"),
+        ],
+    );
+
+    let unit_center =
+        (size as u64 / 2 / BLOCK_BYTES as u64) * BLOCK_BYTES as u64 + BLOCK_BYTES as u64 / 4;
+    let boundary_offset =
+        size as u64 - 2 * BLOCK_BYTES as u64 + BLOCK_BYTES as u64 - RANGE_BYTES as u64 / 2;
+    let updates = [
+        ("unit_center", unit_center, RANGE_BYTES, 0x91_u8),
+        ("unit_boundary", boundary_offset, RANGE_BYTES * 2, 0xa7_u8),
+        (
+            "eof_tail",
+            size as u64 - RANGE_BYTES as u64,
+            RANGE_BYTES,
+            0xb9_u8,
+        ),
+    ];
+    for (label, offset, length, seed) in updates {
+        let value = payload(length, seed);
+        expected[offset as usize..offset as usize + length].copy_from_slice(&value);
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            write_all_at(&writer, &value, offset);
+            writer
+                .sync_all()
+                .expect("fsync incremental benchmark overwrite");
+        });
+        assert_eq!(
+            remote_file_bytes(fixture, "incremental.bin"),
+            expected,
+            "{label}: remote bytes after incremental fsync"
+        );
+        assert!(
+            measured.network.put > 0,
+            "{label}: a successful fsync must publish at least one PUT"
+        );
+        let put_body_bytes = measured.network.put_request_body_bytes;
+        let get_body_bytes = measured.network.get_response_body_bytes;
+        if expectation == IncrementalExpectation::Required {
+            assert!(
+                put_body_bytes < size as u64 / 2,
+                "{label}: PUT request bodies were {put_body_bytes} bytes for a {length}-byte overwrite in a {size}-byte file; this is consistent with full-file fallback"
+            );
+            assert!(
+                get_body_bytes < size as u64 / 2,
+                "{label}: fsync preparation read {get_body_bytes} bytes for a {length}-byte overwrite in a {size}-byte file; service traffic did not hide a full-file fallback"
+            );
+        }
+        recorder.record(
+            context,
+            &format!("fuse_incremental_{label}"),
+            publication,
+            scale,
+            Dataset {
+                range_bytes: Some(length as u64),
+                read_pattern: Some(format!(
+                    "one {length}-byte overwrite at offset {offset}, followed by fsync"
+                )),
+                working_set_bytes: Some(length as u64),
+                ..base_dataset.clone()
+            },
+            "pwrite was accepted and fsync returned before the remote byte check; PUT body bytes are HTTP entity bytes, excluding headers",
+            vec![measured.latency_ms],
+            measured.io,
+            measured.network,
+            vec![],
+            space_snapshot(fixture, None, None, Some(&staging)),
+            vec![
+                "complete remote bytes matched the expected file".to_owned(),
+                format!("put_request_body_bytes={put_body_bytes}"),
+                format!("get_response_body_bytes={get_body_bytes}"),
+                format!("full_file_bytes={size}"),
+            ],
+        );
+    }
+
+    let unchanged_fsync = measure_mount_operation(&meter, mounted.pid(), || {
+        writer
+            .sync_all()
+            .expect("fsync an unchanged incremental descriptor");
+    });
+    assert_eq!(
+        unchanged_fsync.network.put, 0,
+        "an unchanged fsync must not upload another file version"
+    );
+    recorder.record(
+        context,
+        "fuse_incremental_unchanged_fsync",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "the descriptor was opened before measurement; only an unchanged fsync is timed",
+        vec![unchanged_fsync.latency_ms],
+        unchanged_fsync.io,
+        unchanged_fsync.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["unchanged fsync emitted no backend PUT".to_owned()],
+    );
+    drop(writer);
+    mounted.unmount();
+
+    let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_incremental_restart_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before the replacement yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["replacement writable mount type=fuse.yinyang".to_owned()],
+    );
+    let verify_offset = size as u64 - 2 * BLOCK_BYTES as u64;
+    let verify_length = 2 * BLOCK_BYTES;
+    let restart = measure_mount_operation(&meter, restarted.pid(), || {
+        let file = File::open(&path).expect("open incremental file after mount restart");
+        let mut value = vec![0_u8; verify_length];
+        read_exact_at(&file, &mut value, verify_offset);
+        drop(file);
+        value
+    });
+    assert_eq!(
+        restart.value,
+        expected[verify_offset as usize..verify_offset as usize + verify_length],
+        "restart did not preserve the boundary and EOF sparse overwrites"
+    );
+    recorder.record(
+        context,
+        "fuse_incremental_restart_boundary_eof_read",
+        publication,
+        scale,
+        Dataset {
+            range_bytes: Some(verify_length as u64),
+            read_pattern: Some(
+                "one read covering the boundary-crossing update and EOF update after restart"
+                    .to_owned(),
+            ),
+            working_set_bytes: Some(verify_length as u64),
+            ..base_dataset
+        },
+        "open and read complete after restart; bytes cover the boundary-crossing and EOF updates",
+        vec![restart.latency_ms],
+        restart.io,
+        restart.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["restarted mount returned the exact incremental bytes".to_owned()],
+    );
+    restarted.unmount();
+}
+
+fn run_length_changing_matrix(
+    context: &RunContext,
+    proxy: &Arc<CountingProxy>,
+    publication: Publication,
+    scale: Scale,
+    expectation: IncrementalExpectation,
+    recorder: &mut Recorder,
+) {
+    let bench = BenchFixture::new(publication, proxy.endpoint());
+    let fixture = &bench.fixture;
+    let meter = bench.network(proxy);
+    let size = scale.file_size();
+    let mut expected = payload(size, 0x4d);
+    fixture.remote_create_file("length-changing.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        fixture,
+        &format!(
+            "length-changing-{}-{}",
+            publication.as_str(),
+            scale.as_str()
+        ),
+        false,
+    );
+    fs::create_dir(&mountpoint).expect("create length-changing benchmark mountpoint");
+    let (mut mounted, mount_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    let base_dataset = Dataset {
+        kind: "single_large_file_length_changing".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: None,
+        writers: Some(1),
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
+    };
+    recorder.record(
+        context,
+        "fuse_length_changing_mount_ready",
+        publication,
+        scale,
+        Dataset {
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["writable mount type=fuse.yinyang".to_owned()],
+    );
+
+    let path = mountpoint.join("length-changing.bin");
+    let reader_measured = measure_mount_operation(&meter, mounted.pid(), || {
+        File::open(&path).expect("open shared length-changing reader")
+    });
+    let shared_reader = reader_measured.value;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            reader_measured.network.get_response_body_bytes < size as u64 / 2,
+            "shared reader open read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
+            reader_measured.network.get_response_body_bytes
+        );
+    }
+    assert_required_staging(context, &staging, size, "shared reader open");
+    recorder.record(
+        context,
+        "fuse_length_changing_open_shared_reader",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("one read-only descriptor open before any write".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the read-only descriptor opened before any write; GET body bytes are HTTP entity bytes",
+        vec![reader_measured.latency_ms],
+        reader_measured.io,
+        reader_measured.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "read-only descriptor shares the eventual writable node generation".to_owned(),
+            format!("logical_bytes={}", expected.len()),
+        ],
+    );
+
+    let writer_measured = measure_mount_operation(&meter, mounted.pid(), || {
+        OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .expect("open length-changing writer")
+    });
+    let mut writer = writer_measured.value;
+    if expectation == IncrementalExpectation::Required {
+        assert!(
+            writer_measured.network.get_response_body_bytes < size as u64 / 2,
+            "writable append open read {} bytes for a {size}-byte file; this is consistent with full-file materialization",
+            writer_measured.network.get_response_body_bytes
+        );
+    }
+    assert_required_staging(context, &staging, size, "writable append open");
+    recorder.record(
+        context,
+        "fuse_length_changing_open_writer",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("one writable append descriptor open before any write".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the writable append descriptor opened before any write; GET body bytes are HTTP entity bytes",
+        vec![writer_measured.latency_ms],
+        writer_measured.io,
+        writer_measured.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "read-only and writable descriptors share the same node generation".to_owned(),
+            format!("logical_bytes={}", expected.len()),
+        ],
+    );
+
+    let mut append_batch = OperationBatch::default();
+    for sample in 0..2 {
+        let value = payload(RANGE_BYTES, 0x51 + sample as u8);
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer.write_all(&value).expect("append through FUSE");
+            writer.sync_all().expect("fsync FUSE append");
+        });
+        append_batch.push(measured);
+        expected.extend_from_slice(&value);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "small append",
+        );
+    }
+    assert_length_batch(context, &append_batch, size, RANGE_BYTES, "small append");
+    assert_required_staging(context, &staging, size, "small append");
+    recorder.record(
+        context,
+        "fuse_length_changing_small_append",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some("two 4 KiB O_APPEND writes, each followed by fsync".to_owned()),
+            ..base_dataset.clone()
+        },
+        "each pwrite and fsync returned before complete remote bytes were verified outside the measured interval",
+        append_batch.latencies,
+        append_batch.io,
+        append_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both active descriptors observed each staged length".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut boundary_batch = OperationBatch::default();
+    for sample in 0..2 {
+        let value = payload(BLOCK_BYTES + RANGE_BYTES, 0x61 + sample as u8);
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .write_all(&value)
+                .expect("append across a verification-unit boundary");
+            writer
+                .sync_all()
+                .expect("fsync verification-unit boundary append");
+        });
+        boundary_batch.push(measured);
+        expected.extend_from_slice(&value);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "boundary append",
+        );
+    }
+    assert_length_batch(
+        context,
+        &boundary_batch,
+        size,
+        BLOCK_BYTES + RANGE_BYTES,
+        "boundary append",
+    );
+    assert_required_staging(context, &staging, size, "boundary append");
+    recorder.record(
+        context,
+        "fuse_length_changing_boundary_append",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_large_file_tree_shape_change".to_owned(),
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some((BLOCK_BYTES + RANGE_BYTES) as u64),
+            read_pattern: Some(
+                "two 68 KiB appends, each crossing an existing 64 KiB verification unit; append starts change the content tree shape"
+                    .to_owned(),
+            ),
+            ..base_dataset.clone()
+        },
+        "each append and fsync returned before complete remote bytes were verified outside the measured interval",
+        boundary_batch.latencies,
+        boundary_batch.io,
+        boundary_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "each sample appended past a 64 KiB unit boundary".to_owned(),
+            "the initial 32 MiB power-of-two tree gained a partial and then a complete leaf".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut truncate_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let length = expected.len() - RANGE_BYTES;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .set_len(length as u64)
+                .expect("shrink through an active FUSE descriptor");
+            writer.sync_all().expect("fsync FUSE shrink");
+        });
+        truncate_batch.push(measured);
+        expected.truncate(length);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "descriptor shrink",
+        );
+    }
+    assert_length_batch(
+        context,
+        &truncate_batch,
+        size,
+        RANGE_BYTES,
+        "descriptor shrink",
+    );
+    assert_required_staging(context, &staging, size, "descriptor shrink");
+    recorder.record(
+        context,
+        "fuse_length_changing_truncate",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some("two 4 KiB descriptor truncates, each followed by fsync".to_owned()),
+            ..base_dataset.clone()
+        },
+        "each ftruncate and fsync returned before complete remote bytes were verified outside the measured interval",
+        truncate_batch.latencies,
+        truncate_batch.io,
+        truncate_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both active descriptors observed each shortened length".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut extend_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let length = expected.len() + RANGE_BYTES;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .set_len(length as u64)
+                .expect("zero-extend through an active FUSE descriptor");
+            writer.sync_all().expect("fsync FUSE zero extension");
+        });
+        extend_batch.push(measured);
+        expected.resize(length, 0);
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "descriptor zero extension",
+        );
+    }
+    assert_length_batch(
+        context,
+        &extend_batch,
+        size,
+        RANGE_BYTES,
+        "descriptor zero extension",
+    );
+    assert_required_staging(context, &staging, size, "descriptor zero extension");
+    recorder.record(
+        context,
+        "fuse_length_changing_zero_extension",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some(
+                "two 4 KiB descriptor zero extensions, each followed by fsync".to_owned(),
+            ),
+            ..base_dataset.clone()
+        },
+        "each ftruncate and fsync returned before complete remote zero bytes were verified outside the measured interval",
+        extend_batch.latencies,
+        extend_batch.io,
+        extend_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both active descriptors observed each extended length".to_owned(),
+            "complete remote bytes, including inserted zeros, matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut shrink_extend_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let current = expected.len();
+        let shrunk = current - RANGE_BYTES;
+        let extended = current + RANGE_BYTES;
+        let measured = measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .set_len(shrunk as u64)
+                .expect("shrink before zero extension");
+            writer
+                .set_len(extended as u64)
+                .expect("extend after shrink");
+            writer.sync_all().expect("fsync shrink-then-extend");
+        });
+        shrink_extend_batch.push(measured);
+        expected.truncate(shrunk);
+        expected.resize(extended, 0);
+        let mut removed = vec![0xff_u8; 2 * RANGE_BYTES];
+        read_exact_at(&shared_reader, &mut removed, shrunk as u64);
+        assert!(
+            removed.iter().all(|byte| *byte == 0),
+            "shrink-then-extend resurrected bytes below the shortened EOF"
+        );
+        assert_shared_length_and_remote(
+            fixture,
+            &path,
+            &writer,
+            &shared_reader,
+            &expected,
+            "descriptor shrink-then-extend",
+        );
+    }
+    assert_length_batch(
+        context,
+        &shrink_extend_batch,
+        size,
+        2 * RANGE_BYTES,
+        "descriptor shrink-then-extend",
+    );
+    assert_required_staging(context, &staging, size, "descriptor shrink-then-extend");
+    recorder.record(
+        context,
+        "fuse_length_changing_shrink_then_extend",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some((2 * RANGE_BYTES) as u64),
+            read_pattern: Some(
+                "two rounds of a 4 KiB shrink followed by an 8 KiB zero extension and fsync"
+                    .to_owned(),
+            ),
+            ..base_dataset.clone()
+        },
+        "the shared reader and remote authority were checked after each publish; removed bytes read as zero",
+        shrink_extend_batch.latencies,
+        shrink_extend_batch.io,
+        shrink_extend_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "shrink-then-extend never resurrected removed base bytes".to_owned(),
+            "complete remote bytes matched after every sample".to_owned(),
+        ],
+    );
+
+    let mut unchanged_batch = OperationBatch::default();
+    for _ in 0..2 {
+        unchanged_batch.push(measure_mount_operation(&meter, mounted.pid(), || {
+            writer
+                .sync_all()
+                .expect("fsync unchanged length-changing descriptor");
+        }));
+    }
+    assert_eq!(
+        unchanged_batch.network.put, 0,
+        "an unchanged length-changing fsync emitted an unexpected backend PUT"
+    );
+    assert_eq!(
+        unchanged_batch.network.put_request_body_bytes, 0,
+        "an unchanged length-changing fsync uploaded bytes"
+    );
+    recorder.record(
+        context,
+        "fuse_length_changing_unchanged_fsync",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            read_pattern: Some("two unchanged fsync calls on the active descriptor".to_owned()),
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "the descriptor was fully published before measurement; only unchanged fsync calls are timed",
+        unchanged_batch.latencies,
+        unchanged_batch.io,
+        unchanged_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["unchanged fsync emitted zero backend PUT and zero PUT body bytes".to_owned()],
+    );
+
+    drop(writer);
+    drop(shared_reader);
+    mounted.unmount();
+
+    let (mut restarted, restart_ready) = FuseMount::start(fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_length_changing_restart_mount_ready",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            working_set_bytes: Some(0),
+            ..base_dataset.clone()
+        },
+        "interval begins before the replacement yy mount spawn and ends when fuse.yinyang appears in /proc/mounts",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec!["replacement writable mount type=fuse.yinyang".to_owned()],
+    );
+    let tail_offset = expected.len() - RANGE_BYTES;
+    let mut restart_batch = OperationBatch::default();
+    for _ in 0..2 {
+        let measured = measure_mount_operation(&meter, restarted.pid(), || {
+            let file = File::open(&path).expect("open length-changing file after restart");
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&file, &mut value, tail_offset as u64);
+            drop(file);
+            value
+        });
+        assert_eq!(
+            measured.value,
+            expected[tail_offset..tail_offset + RANGE_BYTES],
+            "restart did not return the final length-changing tail"
+        );
+        restart_batch.push(Measurement {
+            value: (),
+            latency_ms: measured.latency_ms,
+            io: measured.io,
+            network: measured.network,
+        });
+    }
+    assert_eq!(
+        remote_file_bytes(fixture, "length-changing.bin"),
+        expected,
+        "restart complete remote byte check"
+    );
+    recorder.record(
+        context,
+        "fuse_length_changing_restart_tail_read",
+        publication,
+        scale,
+        Dataset {
+            logical_bytes: expected.len() as u64,
+            range_bytes: Some(RANGE_BYTES as u64),
+            read_pattern: Some(
+                "two fresh opens and 4 KiB tail reads after remount".to_owned(),
+            ),
+            ..base_dataset
+        },
+        "open and read completed after remount; complete remote bytes were checked outside the measured interval",
+        restart_batch.latencies,
+        restart_batch.io,
+        restart_batch.network,
+        vec![],
+        space_snapshot(fixture, None, None, Some(&staging)),
+        vec![
+            "both restarted reads returned the final tail".to_owned(),
+            "complete remote bytes matched the final expected file".to_owned(),
+        ],
+    );
+    restarted.unmount();
+}
+
+fn assert_shared_length_and_remote(
+    fixture: &Fixture,
+    path: &Path,
+    writer: &File,
+    reader: &File,
+    expected: &[u8],
+    phase: &str,
+) {
+    let length = expected.len() as u64;
+    assert_eq!(
+        writer.metadata().expect("fstat active writer").len(),
+        length,
+        "{phase}: writer length"
+    );
+    assert_eq!(
+        reader.metadata().expect("fstat shared reader").len(),
+        length,
+        "{phase}: shared reader length"
+    );
+    assert_eq!(
+        fs::metadata(path).expect("stat length-changing path").len(),
+        length,
+        "{phase}: path length"
+    );
+    assert_eq!(
+        remote_file_bytes(fixture, "length-changing.bin"),
+        expected,
+        "{phase}: independent remote bytes"
+    );
+}
+
+fn assert_length_batch(
+    context: &RunContext,
+    batch: &OperationBatch,
+    file_size: usize,
+    useful_bytes: usize,
+    phase: &str,
+) {
+    assert!(
+        batch.network.put > 0,
+        "{phase}: a successful fsync did not publish backend bytes"
+    );
+    if context.incremental_expectation != "required" {
+        return;
+    }
+    let samples = batch.latencies.len() as u64;
+    let payload_limit = file_size as u64 / 2 * samples;
+    assert!(
+        batch.network.put_request_body_bytes < payload_limit,
+        "{phase}: PUT bodies were {} bytes for {samples} samples changing {useful_bytes} useful bytes in a {file_size}-byte file; this is consistent with full-file fallback",
+        batch.network.put_request_body_bytes
+    );
+    assert!(
+        batch.network.get_response_body_bytes < payload_limit,
+        "{phase}: GET bodies were {} bytes for {samples} samples changing {useful_bytes} useful bytes in a {file_size}-byte file; preparation imported the complete base",
+        batch.network.get_response_body_bytes
+    );
+}
+
+fn assert_required_staging(context: &RunContext, staging: &Path, file_size: usize, phase: &str) {
+    if context.incremental_expectation != "required" {
+        return;
+    }
+    let bytes = tree_bytes(staging);
+    assert!(
+        bytes < file_size as u64 / 2,
+        "{phase}: allocated staging was {bytes} bytes for a {file_size}-byte file; this is consistent with full local materialization"
+    );
+}
+
 fn run_read_only_range_matrix(
     context: &RunContext,
     proxy: &Arc<CountingProxy>,
@@ -694,6 +1767,9 @@ fn run_read_only_range_matrix(
         file_size_bytes: Some(size as u64),
         range_bytes: Some(RANGE_BYTES as u64),
         writers: None,
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     };
     recorder.record(
         context,
@@ -842,6 +1918,520 @@ fn run_read_only_range_matrix(
     restarted.unmount();
 }
 
+fn run_repeated_random_matrix(
+    context: &RunContext,
+    publication: Publication,
+    scale: Scale,
+    telemetry_base: &Path,
+    recorder: &mut Recorder,
+) {
+    assert_eq!(
+        publication,
+        Publication::Object,
+        "repeated-random measurement uses the object authority"
+    );
+    let fixture = Fixture::new_with_storage_endpoint(publication, None);
+    let size = scale.file_size();
+    let expected = payload(size, 0x6d);
+    fixture.remote_create_file("large.bin", &expected, false);
+    let (config, staging, mountpoint) = mount_paths(
+        &fixture,
+        &format!(
+            "repeated-random-{}-{}",
+            publication.as_str(),
+            scale.as_str()
+        ),
+        true,
+    );
+    fs::create_dir(&mountpoint).expect("create repeated-random benchmark mountpoint");
+    let telemetry_path = PathBuf::from(format!(
+        "{}-{}-{}.json",
+        telemetry_base.display(),
+        publication.as_str(),
+        scale.as_str()
+    ));
+    let telemetry = TelemetryMeter::new(telemetry_path);
+    let meter = NetworkMeter {
+        storage: NetworkSource::Telemetry(&telemetry),
+        service: None,
+    };
+    let (mut mounted, mount_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    let large = mountpoint.join("large.bin");
+    let base_dataset = Dataset {
+        kind: "single_large_read_only_file_repeated_random".to_owned(),
+        files: 1,
+        directories: 0,
+        logical_bytes: size as u64,
+        file_size_bytes: Some(size as u64),
+        range_bytes: Some(RANGE_BYTES as u64),
+        writers: None,
+        read_pattern: Some("cold and repeated same-offset reads".to_owned()),
+        working_set_bytes: Some(size as u64),
+        random_seed: Some(RANDOM_SEED),
+    };
+    recorder.record(
+        context,
+        "fuse_repeated_random_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before yy mount spawn and ends when fuse.yinyang appears in /proc/mounts; telemetry and RSS settle after latency stops",
+        vec![mount_ready.latency_ms],
+        mount_ready.io,
+        mount_ready.network,
+        vec![],
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["read-only mount type=fuse.yinyang".to_owned()],
+    );
+
+    let midpoint = (size / 2) as u64;
+    let (cold_file, cold) = measure_telemetry_single(&meter, mounted.pid(), || {
+        let file = File::open(&large).expect("cold open repeated-random FUSE file");
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&file, &mut value, midpoint);
+        assert_eq!(
+            value,
+            expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+        );
+        file
+    });
+    assert!(
+        cold.network.get > 0,
+        "cold read must not be satisfied by an application cache"
+    );
+    cold.record(
+        recorder,
+        context,
+        "fuse_repeated_random_same_range_cold_4k",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "cold open plus one 4 KiB pread at the midpoint",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["cold midpoint range verified".to_owned()],
+    );
+
+    let repeated = measure_telemetry_batch(&meter, mounted.pid(), REPEATED_RANDOM_SAMPLES, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&cold_file, &mut value, midpoint);
+        assert_eq!(
+            value,
+            expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+        );
+    });
+    if context.expect_range_reuse {
+        assert_eq!(
+            repeated.network.requests, 0,
+            "same-range warm reads must reuse the exact immutable version"
+        );
+    }
+    repeated.record(
+        recorder,
+        context,
+        "fuse_repeated_random_same_range_warm_4k",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some(format!(
+                "{REPEATED_RANDOM_SAMPLES} repeated 4 KiB reads at one offset"
+            )),
+            ..base_dataset.clone()
+        },
+        "all reads use one open descriptor and the same pinned version",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all repeated range bytes verified".to_owned()],
+    );
+    let boundary_offset = BLOCK_BYTES as u64 - RANGE_BYTES as u64 / 2;
+    let boundary_length = RANGE_BYTES * 2;
+    let (boundary_file, boundary_cold) = measure_telemetry_single(&meter, mounted.pid(), || {
+        let file = File::open(&large).expect("open repeated-random boundary-crossing FUSE file");
+        let mut value = vec![0_u8; boundary_length];
+        read_exact_at(&file, &mut value, boundary_offset);
+        assert_eq!(
+            value,
+            expected[boundary_offset as usize..boundary_offset as usize + boundary_length]
+        );
+        file
+    });
+    assert!(
+        boundary_cold.network.get > 0,
+        "cold boundary-crossing read must reach storage"
+    );
+    let boundary_dataset = Dataset {
+        range_bytes: Some(boundary_length as u64),
+        read_pattern: Some("one cold 8 KiB read spanning a 64 KiB unit boundary".to_owned()),
+        ..base_dataset.clone()
+    };
+    boundary_cold.record(
+        recorder,
+        context,
+        "fuse_repeated_random_boundary_cold_8k",
+        publication,
+        scale,
+        boundary_dataset.clone(),
+        "cold open plus one 8 KiB pread spanning a verification-unit boundary",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["boundary-crossing bytes verified".to_owned()],
+    );
+    let boundary_warm =
+        measure_telemetry_batch(&meter, mounted.pid(), REPEATED_RANDOM_SAMPLES, |_| {
+            let mut value = vec![0_u8; boundary_length];
+            read_exact_at(&boundary_file, &mut value, boundary_offset);
+            assert_eq!(
+                value,
+                expected[boundary_offset as usize..boundary_offset as usize + boundary_length]
+            );
+        });
+    if context.expect_range_reuse {
+        assert_eq!(
+            boundary_warm.network.requests, 0,
+            "warm boundary reads must reuse both immutable units and their proofs"
+        );
+    }
+    boundary_warm.record(
+        recorder,
+        context,
+        "fuse_repeated_random_boundary_warm_8k",
+        publication,
+        scale,
+        boundary_dataset,
+        "all reads use one open descriptor and the same pinned version",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all boundary-crossing range bytes verified".to_owned()],
+    );
+    drop(boundary_file);
+
+    let working_units = 8 * 1024 * 1024 / BLOCK_BYTES;
+    let fill_units = shuffled_units(working_units, RANDOM_SEED);
+    let fill = measure_telemetry_batch(&meter, mounted.pid(), fill_units.len(), |sample| {
+        let offset = unit_offset(fill_units[sample]);
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&cold_file, &mut value, offset);
+        assert_eq!(
+            value,
+            expected[offset as usize..offset as usize + RANGE_BYTES]
+        );
+    });
+    let hot_dataset = Dataset {
+        read_pattern: Some(format!(
+            "deterministic random 4 KiB reads across a {} byte hot working set",
+            8 * 1024 * 1024
+        )),
+        working_set_bytes: Some(8 * 1024 * 1024),
+        ..base_dataset.clone()
+    };
+    fill.record(
+        recorder,
+        context,
+        "fuse_repeated_random_hot_set_fill_4k",
+        publication,
+        scale,
+        hot_dataset.clone(),
+        "one read in each distinct hot-set verification unit, in deterministic random order",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all hot-set fill bytes verified".to_owned()],
+    );
+    let hot_units = shuffled_units(working_units, RANDOM_SEED ^ 0xa5a5_a5a5);
+    let hot_warm =
+        measure_telemetry_batch(&meter, mounted.pid(), REPEATED_RANDOM_SAMPLES, |sample| {
+            let offset = unit_offset(hot_units[sample]);
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&cold_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+    if context.expect_range_reuse {
+        assert_eq!(
+            hot_warm.network.requests, 0,
+            "the filled hot working set must remain within the configured reuse bound"
+        );
+    }
+    hot_warm.record(
+        recorder,
+        context,
+        "fuse_repeated_random_hot_set_warm_4k",
+        publication,
+        scale,
+        hot_dataset,
+        "deterministic random reads drawn from the filled hot working set",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["all warm hot-set range bytes verified".to_owned()],
+    );
+
+    if scale == Scale::Medium {
+        let units = size / BLOCK_BYTES;
+        let full_units = shuffled_units(units, RANDOM_SEED ^ 0x5a5a_5a5a);
+        let full_random = measure_telemetry_batch(&meter, mounted.pid(), 288, |sample| {
+            let offset = unit_offset(full_units[sample]);
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&cold_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+        full_random.record(
+            recorder,
+            context,
+            "fuse_repeated_random_over_capacity_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some(
+                    "288 deterministic random 4 KiB reads across the complete 32 MiB file"
+                        .to_owned(),
+                ),
+                working_set_bytes: Some(size as u64),
+                ..base_dataset.clone()
+            },
+            "random offsets exceed any intended bounded content-reuse working set",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["all over-capacity range bytes verified".to_owned()],
+        );
+    }
+    drop(cold_file);
+    mounted.unmount();
+
+    telemetry.reset();
+    let (mut restarted, restart_ready) = FuseMount::start(&fixture, &config, &mountpoint, &meter);
+    recorder.record(
+        context,
+        "fuse_repeated_random_restart_mount_ready",
+        publication,
+        scale,
+        base_dataset.clone(),
+        "interval begins before the replacement mount spawn and ends when fuse.yinyang appears; telemetry and RSS settle after latency stops",
+        vec![restart_ready.latency_ms],
+        restart_ready.io,
+        restart_ready.network,
+        vec![],
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["replacement read-only mount type=fuse.yinyang".to_owned()],
+    );
+    let (restart_file, restart_cold) = measure_telemetry_single(&meter, restarted.pid(), || {
+        let file = File::open(&large).expect("open after repeated-random restart");
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&file, &mut value, midpoint);
+        assert_eq!(
+            value,
+            expected[midpoint as usize..midpoint as usize + RANGE_BYTES]
+        );
+        file
+    });
+    assert!(
+        restart_cold.network.get > 0,
+        "restart cold read must not reuse a previous process's content"
+    );
+    restart_cold.record(
+        recorder,
+        context,
+        "fuse_repeated_random_restart_cold_4k",
+        publication,
+        scale,
+        Dataset {
+            read_pattern: Some("cold read in a replacement mount process".to_owned()),
+            ..base_dataset.clone()
+        },
+        "replacement mount observes the same immutable version from storage",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["restart cold range bytes verified".to_owned()],
+    );
+
+    if scale == Scale::Medium {
+        let sentinel = unit_offset(0);
+        let sentinel_file = File::open(&large).expect("open eviction sentinel file");
+        let before = measure_telemetry_batch(&meter, restarted.pid(), 8, |_| {
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&sentinel_file, &mut value, sentinel);
+            assert_eq!(
+                value,
+                expected[sentinel as usize..sentinel as usize + RANGE_BYTES]
+            );
+        });
+        before.record(
+            recorder,
+            context,
+            "fuse_repeated_random_eviction_sentinel_warm_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some("repeated sentinel reads before eviction pressure".to_owned()),
+                working_set_bytes: Some(BLOCK_BYTES as u64),
+                ..base_dataset.clone()
+            },
+            "sentinel is read before loading more unique units than the bounded reuse capacity",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["sentinel bytes verified before eviction pressure".to_owned()],
+        );
+
+        let pressure = measure_telemetry_batch(&meter, restarted.pid(), 272, |sample| {
+            let offset = unit_offset(sample + 1);
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&sentinel_file, &mut value, offset);
+            assert_eq!(
+                value,
+                expected[offset as usize..offset as usize + RANGE_BYTES]
+            );
+        });
+        pressure.record(
+            recorder,
+            context,
+            "fuse_repeated_random_eviction_pressure_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some(
+                    "272 distinct verification units loaded after the sentinel".to_owned(),
+                ),
+                working_set_bytes: Some(272 * BLOCK_BYTES as u64),
+                ..base_dataset.clone()
+            },
+            "the loaded units exceed a 16 MiB intended content bound before the sentinel is reread",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["all eviction-pressure range bytes verified".to_owned()],
+        );
+        let after = measure_telemetry_batch(&meter, restarted.pid(), 8, |_| {
+            let mut value = vec![0_u8; RANGE_BYTES];
+            read_exact_at(&sentinel_file, &mut value, sentinel);
+            assert_eq!(
+                value,
+                expected[sentinel as usize..sentinel as usize + RANGE_BYTES]
+            );
+        });
+        after.record(
+            recorder,
+            context,
+            "fuse_repeated_random_eviction_sentinel_reread_4k",
+            publication,
+            scale,
+            Dataset {
+                read_pattern: Some("repeated sentinel reads after eviction pressure".to_owned()),
+                working_set_bytes: Some(BLOCK_BYTES as u64),
+                ..base_dataset.clone()
+            },
+            "the first sample must observe the evicted sentinel again; later samples may reuse it",
+            space_snapshot(&fixture, None, None, Some(&staging)),
+            vec!["sentinel bytes verified after eviction pressure".to_owned()],
+        );
+        drop(sentinel_file);
+    }
+    drop(restart_file);
+
+    let old_bytes = payload(256 * 1024, 0x31);
+    let new_bytes = payload(256 * 1024 + 17, 0x71);
+    fixture.remote_create_file("replace.bin", &old_bytes, false);
+    let old = File::open(mountpoint.join("replace.bin")).expect("open old replacement descriptor");
+    let old_offset = 3 * RANGE_BYTES as u64;
+    let old_read = measure_telemetry_batch(&meter, restarted.pid(), 2, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&old, &mut value, old_offset);
+        assert_eq!(
+            value,
+            old_bytes[old_offset as usize..old_offset as usize + RANGE_BYTES]
+        );
+    });
+    old_read.record(
+        recorder,
+        context,
+        "fuse_repeated_random_old_descriptor_warm_4k",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_replaced_read_only_file".to_owned(),
+            logical_bytes: old_bytes.len() as u64,
+            file_size_bytes: Some(old_bytes.len() as u64),
+            read_pattern: Some("repeated old-version reads".to_owned()),
+            working_set_bytes: Some(BLOCK_BYTES as u64),
+            ..base_dataset.clone()
+        },
+        "the old descriptor remains pinned before the external replacement and refresh",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["old descriptor bytes verified".to_owned()],
+    );
+    fixture.remote_remove("replace.bin");
+    fixture.remote_create_file("replace.bin", &new_bytes, false);
+    restarted.refresh_sighup();
+    restarted.wait_for_output_line("yy: fuse refresh: done (", Duration::from_secs(30));
+    let fresh = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
+        let file = File::open(mountpoint.join("replace.bin")).expect("fresh replacement open");
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&file, &mut value, old_offset);
+        assert_eq!(
+            value,
+            new_bytes[old_offset as usize..old_offset as usize + RANGE_BYTES]
+        );
+    });
+    assert!(
+        fresh.network.get > 0,
+        "fresh replacement open must not reuse the old logical version"
+    );
+    fresh.record(
+        recorder,
+        context,
+        "fuse_repeated_random_fresh_descriptor_cold_4k",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_replaced_read_only_file".to_owned(),
+            logical_bytes: new_bytes.len() as u64,
+            file_size_bytes: Some(new_bytes.len() as u64),
+            read_pattern: Some("fresh open after replacement and SIGHUP".to_owned()),
+            working_set_bytes: Some(BLOCK_BYTES as u64),
+            ..base_dataset.clone()
+        },
+        "fresh path open observes the replacement version after explicit refresh",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["fresh replacement bytes verified".to_owned()],
+    );
+    let retained = measure_telemetry_batch(&meter, restarted.pid(), 1, |_| {
+        let mut value = vec![0_u8; RANGE_BYTES];
+        read_exact_at(&old, &mut value, old_offset);
+        assert_eq!(
+            value,
+            old_bytes[old_offset as usize..old_offset as usize + RANGE_BYTES]
+        );
+    });
+    retained.record(
+        recorder,
+        context,
+        "fuse_repeated_random_old_descriptor_after_refresh_4k",
+        publication,
+        scale,
+        Dataset {
+            kind: "single_replaced_read_only_file".to_owned(),
+            logical_bytes: old_bytes.len() as u64,
+            file_size_bytes: Some(old_bytes.len() as u64),
+            read_pattern: Some("old descriptor read after replacement and SIGHUP".to_owned()),
+            working_set_bytes: Some(BLOCK_BYTES as u64),
+            ..base_dataset
+        },
+        "the pre-replacement descriptor retains its exact immutable bytes",
+        space_snapshot(&fixture, None, None, Some(&staging)),
+        vec!["old descriptor bytes remained pinned after refresh".to_owned()],
+    );
+    drop(old);
+    restarted.unmount();
+}
+
+fn shuffled_units(count: usize, seed: u64) -> Vec<usize> {
+    let mut units = (0..count).collect::<Vec<_>>();
+    let mut state = seed | 1;
+    for index in (1..units.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let selected = (state as usize) % (index + 1);
+        units.swap(index, selected);
+    }
+    units
+}
+
+fn unit_offset(unit: usize) -> u64 {
+    unit as u64 * BLOCK_BYTES as u64 + 3 * RANGE_BYTES as u64
+}
+
 fn run_concurrent_matrix(
     context: &RunContext,
     proxy: &Arc<CountingProxy>,
@@ -870,6 +2460,9 @@ fn run_concurrent_matrix(
         file_size_bytes: Some(writer_bytes as u64),
         range_bytes: None,
         writers: Some(writers),
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     };
     let expected = (0..writers)
         .map(|index| {
@@ -957,7 +2550,7 @@ fn run_publish_restore_matrix(
 ) {
     let fixture = Fixture::new_with_storage_endpoint(Publication::Object, Some(proxy.endpoint()));
     let meter = NetworkMeter {
-        storage: proxy,
+        storage: NetworkSource::Proxy(proxy),
         service: None,
     };
     let source = fixture.path(format!("publish-source-{}", scale.as_str()));
@@ -1010,6 +2603,7 @@ fn run_publish_restore_matrix(
 }
 
 fn populate_small_tree(root: &Path, scale: Scale) {
+    const FILE_SIZE: usize = 256 * 1024;
     fs::create_dir_all(root).expect("create Sync benchmark root");
     for directory in 0..scale.directories() {
         fs::create_dir_all(root.join(format!("dir-{directory:04}")))
@@ -1020,7 +2614,10 @@ fn populate_small_tree(root: &Path, scale: Scale) {
         let path = root.join(format!("dir-{directory:04}/file-{index:04}"));
         fs::write(
             path,
-            payload(1024, 0x10 + u8::try_from(index % 16).expect("file pattern")),
+            payload(
+                FILE_SIZE,
+                0x10 + u8::try_from(index % 16).expect("file pattern"),
+            ),
         )
         .expect("write Sync benchmark file");
     }
@@ -1028,14 +2625,18 @@ fn populate_small_tree(root: &Path, scale: Scale) {
 
 fn tree_dataset(root: &Path) -> Dataset {
     let (files, directories, bytes) = tree_counts(root);
+    let file_size_bytes = (files > 0).then_some(bytes / files as u64);
     Dataset {
         kind: "small_file_tree".to_owned(),
         files,
         directories,
         logical_bytes: bytes,
-        file_size_bytes: Some(1024),
+        file_size_bytes,
         range_bytes: None,
         writers: None,
+        read_pattern: None,
+        working_set_bytes: None,
+        random_seed: None,
     }
 }
 
@@ -1101,16 +2702,20 @@ fn mount_paths(fixture: &Fixture, name: &str, read_only: bool) -> (PathBuf, Path
     let staging = fixture.path(format!("{name}-state"));
     let mountpoint = fixture.path(format!("{name}-mount"));
     let config = fixture.path(format!("{name}.json"));
+    let storage_profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
+        Ok("minio") => "minio",
+        Ok("amazon-s3") => "amazon-s3",
+        value => panic!("YINYANG_STORAGE_PROFILE must be minio or amazon-s3, got {value:?}"),
+    };
     let mut value = serde_json::json!({
         "name": name,
         "model": "managed",
         "access": "mount",
         "frontend": "fuse",
         "publication": fixture.publication.as_str(),
-        "storage_profile": "minio",
+        "storage_profile": storage_profile,
         "staging": staging,
         "read_only": read_only,
-        "require": [],
     });
     if fixture.publication == Publication::Service {
         value["service_address"] =
@@ -1128,6 +2733,7 @@ struct FuseMount {
     child: Child,
     stdout: Option<JoinHandle<Vec<u8>>>,
     stderr: Option<JoinHandle<Vec<u8>>>,
+    stderr_seen: Arc<Mutex<Vec<u8>>>,
     mountpoint: PathBuf,
     finished: bool,
 }
@@ -1143,14 +2749,22 @@ impl FuseMount {
         let started = Instant::now();
         let mut command =
             fixture.yy_command(&["--volume", path_str(config), "mount", path_str(mountpoint)]);
+        if let Some(path) = network.telemetry_path() {
+            command.env("YINYANG_BENCH_METRICS_FILE", path);
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn benchmark yy mount");
         let stdout = child.stdout.take().expect("mount stdout is piped");
         let stderr = child.stderr.take().expect("mount stderr is piped");
+        let stderr_seen = Arc::new(Mutex::new(Vec::new()));
+        let stderr_copy = stderr_seen.clone();
         let mut mounted = Self {
             child,
             stdout: Some(thread::spawn(move || read_all(stdout))),
-            stderr: Some(thread::spawn(move || read_all(stderr))),
+            stderr: Some(thread::spawn(move || {
+                read_all_observed(stderr, stderr_copy)
+            })),
+            stderr_seen,
             mountpoint: mountpoint.to_path_buf(),
             finished: false,
         };
@@ -1162,9 +2776,11 @@ impl FuseMount {
                 if current != IoSnapshot::default() {
                     io = current;
                 }
+                let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+                network.settle();
                 let measurement = Measurement {
                     value: (),
-                    latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    latency_ms,
                     io,
                     network: network.snapshot().since(network_before),
                 };
@@ -1196,6 +2812,35 @@ impl FuseMount {
         self.child.id()
     }
 
+    fn refresh_sighup(&self) {
+        kill(Pid::from_raw(self.pid() as i32), Signal::SIGHUP)
+            .expect("send SIGHUP to benchmark mount");
+    }
+
+    fn wait_for_output_line(&self, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = String::from_utf8_lossy(
+                &self
+                    .stderr_seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+            .into_owned();
+            if output
+                .lines()
+                .any(|line| line.contains(needle) && line.trim_end().ends_with(')'))
+            {
+                return output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "benchmark mount did not print {needle:?} within {timeout:?}:\n{output}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn unmount(&mut self) {
         if self.finished {
             return;
@@ -1222,10 +2867,15 @@ impl FuseMount {
     }
 
     fn join_stderr(&mut self) -> Vec<u8> {
-        self.stderr
+        let _ = self
+            .stderr
             .take()
             .and_then(|thread| thread.join().ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.stderr_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn join_stdout(&mut self) {
@@ -1319,6 +2969,59 @@ fn measure_mount_operation<T>(
     }
 }
 
+fn measure_telemetry_batch(
+    network: &NetworkMeter<'_>,
+    pid: u32,
+    samples: usize,
+    mut operation: impl FnMut(usize),
+) -> OperationBatch {
+    assert!(
+        samples > 0,
+        "telemetry batch must contain at least one sample"
+    );
+    network.settle();
+    let net_before = network.snapshot();
+    let io_before = read_proc_io(pid);
+    let mut latencies = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let started = Instant::now();
+        operation(sample);
+        latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let io = read_proc_io(pid).since(io_before);
+    network.settle();
+    let network = network.snapshot().since(net_before);
+    OperationBatch {
+        latencies,
+        io,
+        network,
+    }
+}
+
+fn measure_telemetry_single<T>(
+    network: &NetworkMeter<'_>,
+    pid: u32,
+    operation: impl FnOnce() -> T,
+) -> (T, OperationBatch) {
+    network.settle();
+    let net_before = network.snapshot();
+    let io_before = read_proc_io(pid);
+    let started = Instant::now();
+    let value = operation();
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let io = read_proc_io(pid).since(io_before);
+    network.settle();
+    let network = network.snapshot().since(net_before);
+    (
+        value,
+        OperationBatch {
+            latencies: vec![latency_ms],
+            io,
+            network,
+        },
+    )
+}
+
 fn run_yy_operation(
     network: &NetworkMeter<'_>,
     command: Command,
@@ -1388,6 +3091,26 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
     bytes
 }
 
+fn read_all_observed(mut reader: impl Read, observed: Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    bytes
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 struct IoSnapshot {
     rchar: u64,
@@ -1396,6 +3119,8 @@ struct IoSnapshot {
     syscw: u64,
     read_bytes: u64,
     write_bytes: u64,
+    rss_kib: u64,
+    peak_rss_kib: u64,
 }
 
 impl IoSnapshot {
@@ -1407,6 +3132,8 @@ impl IoSnapshot {
             syscw: self.syscw.saturating_sub(before.syscw),
             read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
             write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            rss_kib: self.rss_kib,
+            peak_rss_kib: self.peak_rss_kib,
         }
     }
 
@@ -1417,6 +3144,8 @@ impl IoSnapshot {
         self.syscw = self.syscw.saturating_add(other.syscw);
         self.read_bytes = self.read_bytes.saturating_add(other.read_bytes);
         self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
+        self.rss_kib = self.rss_kib.max(other.rss_kib);
+        self.peak_rss_kib = self.peak_rss_kib.max(other.peak_rss_kib);
     }
 }
 
@@ -1438,6 +3167,23 @@ fn read_proc_io(pid: u32) -> IoSnapshot {
             "read_bytes" => value.read_bytes = number,
             "write_bytes" => value.write_bytes = number,
             _ => {}
+        }
+    }
+    if let Ok(text) = fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in text.lines() {
+            let Some((key, raw)) = line.split_once(':') else {
+                continue;
+            };
+            let number = raw
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            match key {
+                "VmRSS" => value.rss_kib = number,
+                "VmHWM" => value.peak_rss_kib = number,
+                _ => {}
+            }
         }
     }
     value
@@ -1524,6 +3270,8 @@ struct NetworkSnapshot {
     post: u64,
     delete: u64,
     other: u64,
+    get_response_body_bytes: u64,
+    put_request_body_bytes: u64,
     service_connections: u64,
     service_request_bytes: u64,
     service_response_bytes: u64,
@@ -1542,6 +3290,12 @@ impl NetworkSnapshot {
             post: self.post.saturating_sub(before.post),
             delete: self.delete.saturating_sub(before.delete),
             other: self.other.saturating_sub(before.other),
+            get_response_body_bytes: self
+                .get_response_body_bytes
+                .saturating_sub(before.get_response_body_bytes),
+            put_request_body_bytes: self
+                .put_request_body_bytes
+                .saturating_sub(before.put_request_body_bytes),
             service_connections: self
                 .service_connections
                 .saturating_sub(before.service_connections),
@@ -1565,6 +3319,12 @@ impl NetworkSnapshot {
         self.post = self.post.saturating_add(other.post);
         self.delete = self.delete.saturating_add(other.delete);
         self.other = self.other.saturating_add(other.other);
+        self.get_response_body_bytes = self
+            .get_response_body_bytes
+            .saturating_add(other.get_response_body_bytes);
+        self.put_request_body_bytes = self
+            .put_request_body_bytes
+            .saturating_add(other.put_request_body_bytes);
         self.service_connections = self
             .service_connections
             .saturating_add(other.service_connections);
@@ -1589,6 +3349,8 @@ struct ProxyCounters {
     post: AtomicU64,
     delete: AtomicU64,
     other: AtomicU64,
+    get_response_body_bytes: AtomicU64,
+    put_request_body_bytes: AtomicU64,
 }
 
 struct CountingProxy {
@@ -1646,6 +3408,11 @@ impl CountingProxy {
             post: self.counters.post.load(Ordering::Relaxed),
             delete: self.counters.delete.load(Ordering::Relaxed),
             other: self.counters.other.load(Ordering::Relaxed),
+            get_response_body_bytes: self
+                .counters
+                .get_response_body_bytes
+                .load(Ordering::Relaxed),
+            put_request_body_bytes: self.counters.put_request_body_bytes.load(Ordering::Relaxed),
             service_connections: 0,
             service_request_bytes: 0,
             service_response_bytes: 0,
@@ -1812,23 +3579,33 @@ fn proxy_connection(client: TcpStream, upstream: SocketAddr, counters: Arc<Proxy
     else {
         return;
     };
+    let methods = Arc::new(Mutex::new(VecDeque::new()));
     let request_counters = counters.clone();
-    let request =
-        thread::spawn(move || pump(&mut client_read, &mut server_write, &request_counters, true));
-    let response =
-        thread::spawn(move || pump(&mut server_read, &mut client_write, &counters, false));
+    let request_methods = methods.clone();
+    let request = thread::spawn(move || {
+        pump_request(
+            &mut client_read,
+            &mut server_write,
+            &request_counters,
+            &request_methods,
+        )
+    });
+    let response = thread::spawn(move || {
+        pump_response(&mut server_read, &mut client_write, &counters, &methods)
+    });
     let _ = request.join();
     let _ = response.join();
     let _ = client.shutdown(Shutdown::Both);
 }
 
-fn pump(reader: &mut TcpStream, writer: &mut TcpStream, counters: &ProxyCounters, direction: bool) {
+fn pump_request(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    counters: &ProxyCounters,
+    methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+) {
     let mut buffer = vec![0_u8; CHUNK];
-    let mut scanner = if direction {
-        Some(RequestScanner::default())
-    } else {
-        None
-    };
+    let mut scanner = RequestScanner::default();
     loop {
         let count = match reader.read(&mut buffer) {
             Ok(0) => break,
@@ -1836,24 +3613,51 @@ fn pump(reader: &mut TcpStream, writer: &mut TcpStream, counters: &ProxyCounters
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        if direction {
-            counters
-                .request_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
-            scanner
-                .as_mut()
-                .expect("request scanner")
-                .scan(&buffer[..count], counters);
-        } else {
-            counters
-                .response_bytes
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
+        counters
+            .request_bytes
+            .fetch_add(count as u64, Ordering::Relaxed);
+        scanner.scan(&buffer[..count], counters, methods);
         if writer.write_all(&buffer[..count]).is_err() {
             break;
         }
     }
     let _ = writer.shutdown(Shutdown::Write);
+}
+
+fn pump_response(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    counters: &ProxyCounters,
+    methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+) {
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut scanner = ResponseScanner::new(methods.clone());
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        counters
+            .response_bytes
+            .fetch_add(count as u64, Ordering::Relaxed);
+        scanner.scan(&buffer[..count], counters);
+        if writer.write_all(&buffer[..count]).is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown(Shutdown::Write);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpMethod {
+    Get,
+    Head,
+    Put,
+    Post,
+    Delete,
+    Other,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1874,16 +3678,27 @@ struct RequestScanner {
     line: Vec<u8>,
     content_length: Option<u64>,
     chunked: bool,
+    method: Option<HttpMethod>,
 }
 
 impl RequestScanner {
-    fn scan(&mut self, bytes: &[u8], counters: &ProxyCounters) {
+    fn scan(
+        &mut self,
+        bytes: &[u8],
+        counters: &ProxyCounters,
+        methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+    ) {
         let mut offset = 0;
         while offset < bytes.len() {
             match self.state {
                 ScanState::Body(remaining) | ScanState::ChunkData(remaining) => {
                     let count = remaining.min((bytes.len() - offset) as u64) as usize;
                     offset += count;
+                    if self.method == Some(HttpMethod::Put) {
+                        counters
+                            .put_request_body_bytes
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                    }
                     if count as u64 == remaining {
                         self.state = if matches!(self.state, ScanState::Body(_)) {
                             ScanState::RequestLine
@@ -1922,7 +3737,7 @@ impl RequestScanner {
                         self.line.extend_from_slice(&bytes[offset..end]);
                         let line = std::mem::take(&mut self.line);
                         let line = line.strip_suffix(b"\r").unwrap_or(&line);
-                        self.process_line(line, counters);
+                        self.process_line(line, counters, methods);
                         offset = end + 1;
                     } else {
                         self.line.extend_from_slice(&bytes[offset..]);
@@ -1937,10 +3752,23 @@ impl RequestScanner {
         }
     }
 
-    fn process_line(&mut self, line: &[u8], counters: &ProxyCounters) {
+    fn process_line(
+        &mut self,
+        line: &[u8],
+        counters: &ProxyCounters,
+        methods: &Arc<Mutex<VecDeque<HttpMethod>>>,
+    ) {
         match self.state {
             ScanState::RequestLine => {
-                count_request_line(line, counters);
+                if let Some(method) = count_request_line(line, counters) {
+                    self.method = Some(method);
+                    methods
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push_back(method);
+                } else {
+                    self.method = None;
+                }
                 self.content_length = None;
                 self.chunked = false;
                 self.state = ScanState::Headers;
@@ -1985,20 +3813,20 @@ impl RequestScanner {
     }
 }
 
-fn count_request_line(line: &[u8], counters: &ProxyCounters) {
+fn count_request_line(line: &[u8], counters: &ProxyCounters) -> Option<HttpMethod> {
     if !line.windows(8).any(|window| window == b" HTTP/1.") {
-        return;
+        return None;
     }
-    let counter = if line.starts_with(b"GET ") {
-        &counters.get
+    let (method, counter) = if line.starts_with(b"GET ") {
+        (HttpMethod::Get, &counters.get)
     } else if line.starts_with(b"HEAD ") {
-        &counters.head
+        (HttpMethod::Head, &counters.head)
     } else if line.starts_with(b"PUT ") {
-        &counters.put
+        (HttpMethod::Put, &counters.put)
     } else if line.starts_with(b"POST ") {
-        &counters.post
+        (HttpMethod::Post, &counters.post)
     } else if line.starts_with(b"DELETE ") {
-        &counters.delete
+        (HttpMethod::Delete, &counters.delete)
     } else if [
         b"OPTIONS ".as_slice(),
         b"PATCH ".as_slice(),
@@ -2008,12 +3836,215 @@ fn count_request_line(line: &[u8], counters: &ProxyCounters) {
     .iter()
     .any(|method| line.starts_with(method))
     {
-        &counters.other
+        (HttpMethod::Other, &counters.other)
     } else {
-        return;
+        return None;
     };
     counter.fetch_add(1, Ordering::Relaxed);
     counters.requests.fetch_add(1, Ordering::Relaxed);
+    Some(method)
+}
+
+#[derive(Clone, Copy, Default)]
+enum ResponseState {
+    #[default]
+    StatusLine,
+    Headers,
+    Body(u64),
+    ChunkSize,
+    ChunkData(u64),
+    ChunkCrlf(u8),
+    Trailers,
+    UntilClose,
+}
+
+struct ResponseScanner {
+    state: ResponseState,
+    line: Vec<u8>,
+    content_length: Option<u64>,
+    chunked: bool,
+    status: Option<u16>,
+    method: Option<HttpMethod>,
+    methods: Arc<Mutex<VecDeque<HttpMethod>>>,
+}
+
+impl ResponseScanner {
+    fn new(methods: Arc<Mutex<VecDeque<HttpMethod>>>) -> Self {
+        Self {
+            state: ResponseState::StatusLine,
+            line: Vec::new(),
+            content_length: None,
+            chunked: false,
+            status: None,
+            method: None,
+            methods,
+        }
+    }
+
+    fn scan(&mut self, bytes: &[u8], counters: &ProxyCounters) {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match self.state {
+                ResponseState::Body(remaining) | ResponseState::ChunkData(remaining) => {
+                    let count = remaining.min((bytes.len() - offset) as u64) as usize;
+                    self.count_body(count, counters);
+                    offset += count;
+                    if count as u64 == remaining {
+                        self.state = if matches!(self.state, ResponseState::Body(_)) {
+                            self.reset_response();
+                            ResponseState::StatusLine
+                        } else {
+                            ResponseState::ChunkCrlf(2)
+                        };
+                    } else {
+                        self.state = match self.state {
+                            ResponseState::Body(_) => ResponseState::Body(remaining - count as u64),
+                            ResponseState::ChunkData(_) => {
+                                ResponseState::ChunkData(remaining - count as u64)
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                ResponseState::ChunkCrlf(remaining) => {
+                    let count = usize::from(remaining).min(bytes.len() - offset);
+                    offset += count;
+                    let remaining = remaining - count as u8;
+                    self.state = if remaining == 0 {
+                        ResponseState::ChunkSize
+                    } else {
+                        ResponseState::ChunkCrlf(remaining)
+                    };
+                }
+                ResponseState::UntilClose => {
+                    let count = bytes.len() - offset;
+                    self.count_body(count, counters);
+                    offset = bytes.len();
+                }
+                ResponseState::StatusLine
+                | ResponseState::Headers
+                | ResponseState::ChunkSize
+                | ResponseState::Trailers => {
+                    let end = bytes[offset..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map(|position| offset + position);
+                    if let Some(end) = end {
+                        self.line.extend_from_slice(&bytes[offset..end]);
+                        let line = std::mem::take(&mut self.line);
+                        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                        self.process_line(line);
+                        offset = end + 1;
+                    } else {
+                        self.line.extend_from_slice(&bytes[offset..]);
+                        offset = bytes.len();
+                        if self.line.len() > 16 * 1024 {
+                            self.line.clear();
+                            self.state = ResponseState::StatusLine;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_line(&mut self, line: &[u8]) {
+        match self.state {
+            ResponseState::StatusLine => {
+                if let Some(status) = parse_response_status(line)
+                    && status >= 200
+                {
+                    self.status = Some(status);
+                    self.method = self
+                        .methods
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front();
+                }
+                self.content_length = None;
+                self.chunked = false;
+                self.state = ResponseState::Headers;
+            }
+            ResponseState::Headers if line.is_empty() => {
+                let status = self.status.unwrap_or_default();
+                let body_forbidden = status < 200
+                    || status == 204
+                    || status == 304
+                    || self.method == Some(HttpMethod::Head);
+                self.state = if body_forbidden {
+                    self.reset_response();
+                    ResponseState::StatusLine
+                } else if self.chunked {
+                    ResponseState::ChunkSize
+                } else if let Some(length) = self.content_length {
+                    if length == 0 {
+                        self.reset_response();
+                        ResponseState::StatusLine
+                    } else {
+                        ResponseState::Body(length)
+                    }
+                } else {
+                    ResponseState::UntilClose
+                };
+            }
+            ResponseState::Headers => {
+                let header = String::from_utf8_lossy(line).to_ascii_lowercase();
+                if let Some(value) = header.strip_prefix("content-length:") {
+                    self.content_length = value.trim().parse().ok();
+                } else if header.starts_with("transfer-encoding:") && header.contains("chunked") {
+                    self.chunked = true;
+                }
+            }
+            ResponseState::ChunkSize => {
+                let size = std::str::from_utf8(line)
+                    .ok()
+                    .and_then(|line| line.split(';').next())
+                    .and_then(|size| u64::from_str_radix(size.trim(), 16).ok())
+                    .unwrap_or_else(|| panic!("invalid HTTP chunk size in benchmark response"));
+                self.state = if size == 0 {
+                    ResponseState::Trailers
+                } else {
+                    ResponseState::ChunkData(size)
+                };
+            }
+            ResponseState::Trailers if line.is_empty() => {
+                self.reset_response();
+                self.state = ResponseState::StatusLine;
+            }
+            ResponseState::Trailers => {}
+            ResponseState::Body(_)
+            | ResponseState::ChunkData(_)
+            | ResponseState::ChunkCrlf(_)
+            | ResponseState::UntilClose => {
+                unreachable!("fixed-width response states do not process lines")
+            }
+        }
+    }
+
+    fn count_body(&self, count: usize, counters: &ProxyCounters) {
+        if self.method == Some(HttpMethod::Get) {
+            counters
+                .get_response_body_bytes
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn reset_response(&mut self) {
+        self.status = None;
+        self.method = None;
+        self.content_length = None;
+        self.chunked = false;
+    }
+}
+
+fn parse_response_status(line: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(line).ok()?;
+    let status = if let Some(status) = line.strip_prefix("HTTP/1.1 ") {
+        status
+    } else {
+        line.strip_prefix("HTTP/1.0 ")?
+    };
+    status.get(..3)?.parse().ok()
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -2111,6 +4142,17 @@ struct Dataset {
     file_size_bytes: Option<u64>,
     range_bytes: Option<u64>,
     writers: Option<usize>,
+    read_pattern: Option<String>,
+    working_set_bytes: Option<u64>,
+    random_seed: Option<u64>,
+}
+
+impl Dataset {
+    fn useful_bytes(&self) -> u64 {
+        self.working_set_bytes
+            .or(self.range_bytes)
+            .unwrap_or(self.logical_bytes)
+    }
 }
 
 #[derive(Serialize)]
@@ -2145,6 +4187,8 @@ struct NetworkPerSample {
     s3_requests: f64,
     s3_request_bytes: f64,
     s3_response_bytes: f64,
+    get_response_body_bytes: f64,
+    put_request_body_bytes: f64,
     service_connections: f64,
     service_request_bytes: f64,
     service_response_bytes: f64,
@@ -2158,6 +4202,8 @@ impl NetworkPerSample {
             s3_requests: network.requests as f64 / samples,
             s3_request_bytes: network.request_bytes as f64 / samples,
             s3_response_bytes: network.response_bytes as f64 / samples,
+            get_response_body_bytes: network.get_response_body_bytes as f64 / samples,
+            put_request_body_bytes: network.put_request_body_bytes as f64 / samples,
             service_connections: network.service_connections as f64 / samples,
             service_request_bytes: network.service_request_bytes as f64 / samples,
             service_response_bytes: network.service_response_bytes as f64 / samples,
@@ -2166,13 +4212,17 @@ impl NetworkPerSample {
     }
 }
 
-fn cache_policy(scenario: &str) -> &'static str {
+fn cache_policy(context: &RunContext, scenario: &str) -> String {
+    if context.workload == Workload::RepeatedRandom && scenario.starts_with("fuse_") {
+        return context.range_cache_policy.clone();
+    }
     if scenario.starts_with("fuse_") {
-        "FUSE FOPEN_DIRECT_IO; no kernel page cache for file pages; clean nodes are reclaimed on last release"
+        "FUSE FOPEN_DIRECT_IO; no kernel page cache for file pages; clean nodes are reclaimed on last release".to_owned()
     } else if scenario.starts_with("sync_") {
         "one CLI process per finite run; no OS page-cache drop and no cross-run content cache state"
+            .to_owned()
     } else {
-        "one CLI process; no OS page-cache drop and no retained application cache"
+        "one CLI process; no OS page-cache drop and no retained application cache".to_owned()
     }
 }
 
@@ -2202,10 +4252,13 @@ struct CostRecord {
     binary_blake3: String,
     host: String,
     rustc: String,
-    storage_backend: &'static str,
-    metadata_transport: &'static str,
-    cache_policy: &'static str,
+    storage_backend: String,
+    metadata_transport: String,
+    network_source: String,
+    cache_policy: String,
+    incremental_expectation: String,
     dataset: Dataset,
+    useful_bytes: u64,
     completion: String,
     iterations: usize,
     wall_ms: f64,
@@ -2245,6 +4298,12 @@ impl Recorder {
                 profile: context.profile,
                 workload: context.workload,
                 publication_filter: context.publication_filter,
+                storage_backend: context.storage_backend.clone(),
+                metadata_transport: context.metadata_transport.clone(),
+                network_source: context.network_source.clone(),
+                range_cache_policy: context.range_cache_policy.clone(),
+                expect_range_reuse: context.expect_range_reuse,
+                incremental_expectation: context.incremental_expectation.clone(),
                 source_sha: context.source_sha.clone(),
                 source_dirty: context.source_dirty,
                 binary_path: context.binary_path.clone(),
@@ -2276,6 +4335,7 @@ impl Recorder {
         let latency = LatencyStats::new(&latencies);
         let latency_samples_ms = latencies.clone();
         let network_per_sample = NetworkPerSample::new(&network, latencies.len());
+        let useful_bytes = dataset.useful_bytes();
         let record = CostRecord {
             schema: RESULT_SCHEMA,
             scenario: scenario.to_owned(),
@@ -2297,10 +4357,13 @@ impl Recorder {
             binary_blake3: context.binary_blake3.clone(),
             host: context.host.clone(),
             rustc: context.rustc.clone(),
-            storage_backend: STORAGE_BACKEND,
-            metadata_transport: METADATA_TRANSPORT,
-            cache_policy: cache_policy(scenario),
+            storage_backend: context.storage_backend.clone(),
+            metadata_transport: context.metadata_transport.clone(),
+            network_source: context.network_source.clone(),
+            cache_policy: cache_policy(context, scenario),
+            incremental_expectation: context.incremental_expectation.clone(),
             dataset,
+            useful_bytes,
             completion: completion.to_owned(),
             iterations: latencies.len(),
             wall_ms: latencies.iter().sum(),
@@ -2321,15 +4384,18 @@ impl Recorder {
             .expect("terminate benchmark JSONL record");
         self.output.flush().expect("flush benchmark JSONL output");
         println!(
-            "linux-cost: {} publication={} scale={} samples={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
+            "linux-cost: {} publication={} scale={} samples={} useful_bytes={} p50={:.3}ms s3_requests={} s3_request_bytes={} s3_response_bytes={} get_response_body_bytes={} put_request_body_bytes={} service_connections={} service_request_bytes={} service_response_bytes={}",
             record.scenario,
             record.publication,
             record.scale,
             record.iterations,
+            record.useful_bytes,
             record.latency.p50_ms,
             record.network.requests,
             record.network.request_bytes,
             record.network.response_bytes,
+            record.network.get_response_body_bytes,
+            record.network.put_request_body_bytes,
             record.network.service_connections,
             record.network.service_request_bytes,
             record.network.service_response_bytes,
@@ -2366,9 +4432,11 @@ impl Recorder {
             binary_blake3: context.binary_blake3.clone(),
             host: context.host.clone(),
             rustc: context.rustc.clone(),
-            storage_backend: STORAGE_BACKEND,
-            metadata_transport: METADATA_TRANSPORT,
-            cache_policy: cache_policy(scenario),
+            storage_backend: context.storage_backend.clone(),
+            metadata_transport: context.metadata_transport.clone(),
+            network_source: context.network_source.clone(),
+            cache_policy: cache_policy(context, scenario),
+            incremental_expectation: context.incremental_expectation.clone(),
             dataset: Dataset {
                 kind: "not_run".to_owned(),
                 files: 0,
@@ -2377,7 +4445,11 @@ impl Recorder {
                 file_size_bytes: None,
                 range_bytes: None,
                 writers: None,
+                read_pattern: None,
+                working_set_bytes: None,
+                random_seed: None,
             },
+            useful_bytes: 0,
             completion: "not applicable".to_owned(),
             iterations: 0,
             wall_ms: 0.0,
@@ -2419,7 +4491,7 @@ impl Recorder {
         let mut markdown = String::new();
         markdown.push_str("# Linux cost baseline\n\n");
         markdown.push_str(&format!(
-            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Workload: `{}`\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
+            "- Source: `{}` (dirty: `{}`)\n- Binary: `{}`\n- Binary BLAKE3: `{}`\n- Host: {}\n- Rust: {}\n- Workload: `{}`\n- Incremental expectation: `{}`\n- Profile: {}\n- Publication filter: `{}`\n- Records: {} measured, {} unsupported\n\n",
             self.context.source_sha,
             self.context.source_dirty,
             self.context.binary_path,
@@ -2427,6 +4499,7 @@ impl Recorder {
             self.context.host,
             self.context.rustc,
             self.context.workload.as_str(),
+            self.context.incremental_expectation,
             match self.context.profile {
                 Profile::Early => "early",
                 Profile::Full => "full",
@@ -2436,15 +4509,15 @@ impl Recorder {
             unsupported,
         ));
         markdown.push_str(
-            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
+            "| Scenario | Workload | Volume | Publication | Scale | Status | Samples | Useful bytes | p50 ms | p95 ms | S3 requests total/sample | S3 request MiB total/sample | S3 response MiB total/sample | GET response body MiB total/sample | PUT request body MiB total/sample | Service conns total/sample | Service request KiB total/sample | Service response KiB total/sample | Remote MiB | Staging MiB |\n",
         );
         markdown.push_str(
-            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for record in &self.records {
             if !record.supported {
                 markdown.push_str(&format!(
-                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - |\n",
+                    "| {} | {} | {} | {} | {} | unsupported: {} | - | - | - | - | - | - | - | - | - | - | - | - | - | - |\n",
                     record.scenario,
                     record.workload,
                     record.volume_mode,
@@ -2459,13 +4532,14 @@ impl Recorder {
             }
             let network = &record.network_per_sample;
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {} | measured | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
+                "| {} | {} | {} | {} | {} | measured | {} | {} | {:.3} | {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {} / {:.1} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} | {:.3} |\n",
                 record.scenario,
                 record.workload,
                 record.volume_mode,
                 record.publication,
                 record.scale,
                 record.iterations,
+                record.useful_bytes,
                 record.latency.p50_ms,
                 record.latency.p95_ms,
                 record.network.requests,
@@ -2474,6 +4548,10 @@ impl Recorder {
                 network.s3_request_bytes / 1024.0 / 1024.0,
                 record.network.response_bytes as f64 / 1024.0 / 1024.0,
                 network.s3_response_bytes / 1024.0 / 1024.0,
+                record.network.get_response_body_bytes as f64 / 1024.0 / 1024.0,
+                network.get_response_body_bytes / 1024.0 / 1024.0,
+                record.network.put_request_body_bytes as f64 / 1024.0 / 1024.0,
+                network.put_request_body_bytes / 1024.0 / 1024.0,
                 record.network.service_connections,
                 network.service_connections,
                 record.network.service_request_bytes as f64 / 1024.0,
@@ -2552,12 +4630,15 @@ fn path_str(path: &Path) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyCounters, RequestScanner};
+    use super::{HttpMethod, ProxyCounters, RequestScanner, ResponseScanner};
+    use std::collections::VecDeque;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn request_scanner_skips_content_length_and_chunked_bodies() {
         let counters = ProxyCounters::default();
+        let methods = Arc::new(Mutex::new(VecDeque::new()));
         let body = b"PUT /not-a-request HTTP/1.1\r\n\r\n";
         let mut wire = format!(
             "PUT /object HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
@@ -2572,12 +4653,35 @@ mod tests {
         );
         let mut scanner = RequestScanner::default();
         for byte in wire {
-            scanner.scan(&[byte], &counters);
+            scanner.scan(&[byte], &counters, &methods);
         }
         assert_eq!(counters.requests.load(Ordering::Relaxed), 3);
         assert_eq!(counters.put.load(Ordering::Relaxed), 1);
         assert_eq!(counters.post.load(Ordering::Relaxed), 1);
         assert_eq!(counters.head.load(Ordering::Relaxed), 1);
         assert_eq!(counters.get.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counters.put_request_body_bytes.load(Ordering::Relaxed),
+            body.len() as u64
+        );
+    }
+
+    #[test]
+    fn response_scanner_counts_get_body_bytes() {
+        let counters = ProxyCounters::default();
+        let methods = Arc::new(Mutex::new(VecDeque::from([
+            HttpMethod::Get,
+            HttpMethod::Put,
+            HttpMethod::Head,
+        ])));
+        let mut scanner = ResponseScanner::new(methods);
+        let wire = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nbody\
+              HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nput\
+              HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n";
+        for byte in wire {
+            scanner.scan(&[*byte], &counters);
+        }
+        assert_eq!(counters.get_response_body_bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(counters.put.load(Ordering::Relaxed), 0);
     }
 }

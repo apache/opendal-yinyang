@@ -15,12 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
-use std::collections::BTreeSet;
 use support::TestBackend;
-use yinyang::core::{BackendProfile, Fs};
+use yinyang::core::Fs;
 use yinyang::volume::*;
+use yinyang_test_support as support;
+
+#[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
+fn direct_operator(backend: &TestBackend, conditional_delete: bool) -> opendal::Operator {
+    backend
+        .operator()
+        .layer(opendal::layers::CapabilityOverrideLayer::new(
+            move |mut capability| {
+                capability.stat = true;
+                capability.read = true;
+                capability.list = true;
+                capability.list_with_recursive = true;
+                capability.read_with_version = true;
+                capability.read_with_if_match = true;
+                capability.write = true;
+                capability.write_can_multi = true;
+                capability.write_can_empty = true;
+                capability.write_with_if_match = true;
+                capability.write_with_if_not_exists = true;
+                capability.delete = conditional_delete;
+                capability.delete_with_if_match = conditional_delete;
+                capability
+            },
+        ))
+}
+
+#[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
+fn direct_config(staging: std::path::PathBuf) -> VolumeConfig {
+    VolumeConfig {
+        name: "objects".into(),
+        model: Model::Direct,
+        access: Access::Mount,
+        frontend: Frontend::Fuse,
+        publication: Publication::Object,
+        storage_profile: StorageProfile::Minio,
+        staging,
+        read_only: false,
+        service_address: None,
+    }
+}
+
 fn config(path: std::path::PathBuf) -> VolumeConfig {
     VolumeConfig {
         name: "test".into(),
@@ -31,23 +69,17 @@ fn config(path: std::path::PathBuf) -> VolumeConfig {
         storage_profile: StorageProfile::Minio,
         staging: path,
         read_only: false,
-        require: [Capability::Read, Capability::RemoteFsync]
-            .into_iter()
-            .collect(),
         service_address: None,
     }
 }
 #[tokio::test]
-async fn capability_intersection_and_startup_rejection_precede_visibility() {
+async fn admission_precedes_side_effects_and_rejects_unknown_fields() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
     let cfg = config(temp.path().join("state"));
     let caps = cfg.validate(&backend.operator()).unwrap();
-    let mut frontend = caps.frontend.clone();
-    frontend.remove(&Capability::Append);
-    let intersection = Capabilities::intersect(caps.volume, caps.storage, caps.access, frontend);
-    assert!(!intersection.effective.contains(&Capability::Append));
-    assert!(intersection.effective.contains(&Capability::RemoteFsync));
+    assert!(caps.admitted.contains(&Capability::Append));
+    assert!(caps.admitted.contains(&Capability::RemoteFsync));
     for invalid in [
         VolumeConfig {
             model: Model::Direct,
@@ -58,11 +90,7 @@ async fn capability_intersection_and_startup_rejection_precede_visibility() {
             ..cfg.clone()
         },
         VolumeConfig {
-            frontend: Frontend::Macos,
-            ..cfg.clone()
-        },
-        VolumeConfig {
-            read_only: true,
+            name: " ".into(),
             ..cfg.clone()
         },
         VolumeConfig {
@@ -93,6 +121,9 @@ async fn capability_intersection_and_startup_rejection_precede_visibility() {
     let mut json = serde_json::to_value(&cfg).unwrap();
     json["ignore_conflicts"] = true.into();
     assert!(VolumeConfig::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
+    let mut json = serde_json::to_value(&cfg).unwrap();
+    json["require"] = serde_json::json!(["read"]);
+    assert!(VolumeConfig::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
 }
 #[tokio::test]
 async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
@@ -101,51 +132,189 @@ async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     let ro = VolumeConfig {
         frontend: Frontend::Fuse,
         read_only: true,
-        require: BTreeSet::new(),
         ..config(temp.path().join("state"))
     };
-    let caps = ro.capabilities(&backend.operator());
-    let expected: CapabilitySet = [
-        Capability::Read,
-        Capability::List,
-        Capability::StableIdentity,
-        Capability::PinnedReads,
-        Capability::RetainedUnlinkRead,
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(caps.frontend, expected);
-    assert_eq!(caps.effective, expected);
-    assert!(!caps.effective.contains(&Capability::RecoverableStaging));
     if cfg!(target_os = "linux") {
-        assert!(ro.validate(&backend.operator()).is_ok());
+        let caps = ro.validate(&backend.operator()).unwrap();
+        let expected: CapabilitySet = [
+            Capability::Read,
+            Capability::List,
+            Capability::StableIdentity,
+            Capability::PinnedReads,
+            Capability::RetainedUnlinkRead,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(caps.admitted, expected);
+        assert!(!caps.admitted.contains(&Capability::RecoverableStaging));
         let rw = VolumeConfig {
             read_only: false,
-            require: BTreeSet::new(),
             ..ro.clone()
         };
-        let caps = rw.capabilities(&backend.operator());
-        assert!(caps.effective.contains(&Capability::Write));
-        assert!(caps.effective.contains(&Capability::RemoteFsync));
-        assert!(caps.effective.contains(&Capability::RecoverableStaging));
-        assert!(rw.validate(&backend.operator()).is_ok());
+        let caps = rw.validate(&backend.operator()).unwrap();
+        assert!(caps.admitted.contains(&Capability::Write));
+        assert!(caps.admitted.contains(&Capability::RemoteFsync));
+        assert!(caps.admitted.contains(&Capability::RecoverableStaging));
     } else {
-        assert!(ro.validate(&backend.operator()).is_err());
+        let error = ro.validate(&backend.operator()).unwrap_err();
+        assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+        assert_eq!(
+            error.to_string(),
+            "volume admission: the fuse frontend is implemented only on Linux"
+        );
     }
     let invalid = VolumeConfig {
         service_address: Some("0.0.0.0:7447".parse().unwrap()),
         publication: Publication::Service,
         ..ro.clone()
     };
-    assert!(invalid.validate(&backend.operator()).is_err());
+    let error = invalid.validate(&backend.operator()).unwrap_err();
+    assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+    assert_eq!(
+        error.to_string(),
+        "volume admission: service publication requires a loopback service_address"
+    );
+}
+
+#[test]
+fn direct_defaults_to_read_only_and_does_not_require_staging() {
+    let direct: VolumeConfig = VolumeConfig::from_json(
+        br#"{
+            "name": "objects",
+            "model": "direct",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio"
+        }"#,
+    )
+    .unwrap();
+    assert!(direct.read_only, "Direct must default to read-only");
+    assert!(direct.staging.as_os_str().is_empty());
+    let serialized = serde_json::to_value(&direct).unwrap();
+    assert!(serialized.get("staging").is_none());
+
+    let managed = config(std::path::PathBuf::from("state"));
+    let managed = VolumeConfig::from_json(&serde_json::to_vec(&managed).unwrap()).unwrap();
+    assert!(
+        !managed.read_only,
+        "Managed must retain its existing writable default"
+    );
+
+    let with_staging: VolumeConfig = VolumeConfig::from_json(
+        br#"{
+            "name": "objects",
+            "model": "direct",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": "must-not-exist"
+        }"#,
+    )
+    .unwrap();
+    let backend = TestBackend::default();
+    let error = with_staging.validate(&backend.operator()).unwrap_err();
+    assert!(error.to_string().contains("do not use staging"));
+
+    let error = direct.validate(&backend.operator()).unwrap_err();
+    assert!(error.to_string().contains("direct admission"));
+    assert!(!error.to_string().contains("local staging"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_writable_admission_requires_staging_and_conditional_primitives() {
+    let backend = TestBackend::default();
+    let temp = tempfile::tempdir().unwrap();
+    let writable = direct_config(temp.path().join("direct-state"));
+
+    let missing_staging = VolumeConfig {
+        staging: std::path::PathBuf::new(),
+        ..writable.clone()
+    };
+    assert!(missing_staging.validate(&backend.operator()).is_err());
+
+    let read_only_with_staging = VolumeConfig {
+        read_only: true,
+        ..writable.clone()
+    };
+    assert!(
+        read_only_with_staging
+            .validate(&direct_operator(&backend, true))
+            .is_err()
+    );
+
+    let library = VolumeConfig {
+        frontend: Frontend::Library,
+        ..writable.clone()
+    };
+    assert!(library.validate(&direct_operator(&backend, true)).is_err());
+
+    let operator = direct_operator(&backend, false);
+    let caps = writable.validate(&operator).unwrap();
+    let expected: CapabilitySet = [
+        Capability::Read,
+        Capability::List,
+        Capability::Write,
+        Capability::Append,
+        Capability::Truncate,
+        Capability::PinnedReads,
+        Capability::RemoteFsync,
+        Capability::RecoverableStaging,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(caps.admitted, expected);
+    for unsupported in [
+        Capability::StableIdentity,
+        Capability::AtomicRename,
+        Capability::RetainedUnlinkRead,
+    ] {
+        assert!(!caps.admitted.contains(&unsupported));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_sync_requires_conditional_delete_and_library_admission() {
+    let backend = TestBackend::default();
+    let temp = tempfile::tempdir().unwrap();
+    let sync = VolumeConfig {
+        access: Access::Sync,
+        frontend: Frontend::Library,
+        ..direct_config(temp.path().join("direct-sync-state"))
+    };
+
+    let caps = sync.validate(&direct_operator(&backend, true)).unwrap();
+    assert!(caps.admitted.contains(&Capability::Write));
+    assert!(!caps.admitted.contains(&Capability::AtomicRename));
+    assert!(!caps.admitted.contains(&Capability::StableIdentity));
+
+    assert!(
+        sync.validate(&direct_operator(&backend, false)).is_err(),
+        "Direct Sync must reject a backend without conditional delete"
+    );
+    let read_only = VolumeConfig {
+        read_only: true,
+        ..sync.clone()
+    };
+    assert!(
+        read_only
+            .validate(&direct_operator(&backend, true))
+            .is_err()
+    );
+    let fuse = VolumeConfig {
+        frontend: Frontend::Fuse,
+        ..sync
+    };
+    assert!(fuse.validate(&direct_operator(&backend, true)).is_err());
 }
 #[tokio::test]
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    Fs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    Fs::create(backend.operator()).await.unwrap();
     let cfg = config(temp.path().join("state"));
     let volume = Volume::open(cfg.clone(), backend.operator(), None)
         .await
@@ -166,11 +335,10 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     drop(volume);
     let ro = VolumeConfig {
         read_only: true,
-        require: BTreeSet::new(),
         ..cfg.clone()
     };
     let volume = Volume::open(ro, backend.operator(), None).await.unwrap();
-    assert!(!volume.capabilities.effective.contains(&Capability::Write));
+    assert!(!volume.capabilities.admitted.contains(&Capability::Write));
     assert!(volume.runtime().open_file("file", true).await.is_err());
     assert!(
         volume
@@ -189,6 +357,105 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let mut handle = volume.runtime().recover(id).await.unwrap();
     handle.fsync().await.unwrap();
     handle.close().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn root_state_containment_rejects_both_directions() {
+    use yinyang::sync_engine::{ErrorKind, check_root_state};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let state = temp.path().join("state");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    check_root_state(&root, &state).unwrap();
+
+    let state_inside_root = root.join("state");
+    let error = check_root_state(&root, &state_inside_root).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+
+    let root_inside_state = state.join("root");
+    let error = check_root_state(&root_inside_state, &state).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_sync_init_rejects_both_containment_directions() {
+    use std::sync::Arc;
+    use yinyang::sync_engine::{ErrorKind, ManagedAdapter, SyncEngine};
+
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let authority: Arc<dyn yinyang::core::Authority> =
+        Arc::new(Fs::create(backend.operator()).await.unwrap());
+
+    let root = temp.path().join("root-a");
+    let state = root.join("state");
+    let error = SyncEngine::init(ManagedAdapter::new(authority.clone()), &state, &root)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+    assert!(!state.join("sync-engine.db").exists());
+
+    let state = temp.path().join("state-b");
+    let root = state.join("root");
+    let error = SyncEngine::init(ManagedAdapter::new(authority), &state, &root)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::Invalid);
+    assert!(!state.join("sync-engine.db").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_sync_restore_rejects_both_containment_directions_before_creation() {
+    use std::sync::Arc;
+    use yinyang::sync_engine::{ErrorKind, ManagedAdapter, SyncEngine};
+
+    let temp = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let authority: Arc<dyn yinyang::core::Authority> =
+        Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let source_root = temp.path().join("source-root");
+    let source_state = temp.path().join("source-state");
+    std::fs::create_dir(&source_root).unwrap();
+    let adapter = ManagedAdapter::new(authority.clone());
+    let mut sync = SyncEngine::init(adapter.clone(), &source_state, &source_root)
+        .await
+        .unwrap();
+    let backup = temp.path().join("backup");
+    sync.backup(&backup).await.unwrap();
+    drop(sync);
+
+    for root_inside_state in [false, true] {
+        let (state, root) = if root_inside_state {
+            let state = temp.path().join("restore-state-a");
+            (state.clone(), state.join("root"))
+        } else {
+            let root = temp.path().join("restore-root-b");
+            (root.join("state"), root)
+        };
+        if root_inside_state {
+            std::fs::create_dir(&state).unwrap();
+        } else {
+            std::fs::create_dir_all(&root).unwrap();
+        }
+        let error = SyncEngine::restore(
+            ManagedAdapter::new(authority.clone()),
+            &backup,
+            &root,
+            &state,
+        )
+        .await
+        .err()
+        .expect("containment must reject restore");
+        assert_eq!(error.kind(), ErrorKind::Invalid, "{error}");
+        assert!(!state.join("sync-engine.db").exists());
+    }
 }
 
 struct Daemon(std::process::Child);

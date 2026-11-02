@@ -6,12 +6,14 @@ uses a real `/dev/fuse` mount or the Managed Sync CLI. One-shot
 `yy publish`/`yy restore` scenarios use the object authority because that is the
 only authority supported by those commands.
 
-The benchmark uses isolated Silo (S3-compatible) settings, a unique remote root,
-and a new staging directory. A loopback HTTP counting proxy sits between YinYang
-and Silo. It parses HTTP/1 request framing before counting request methods, and
-counts request and response bytes without instrumenting production code. The
-proxy accepts connections without polling and disables Nagle on both relay
-sockets so collector delay does not dominate small range and proof requests.
+The default full and read-only matrices use isolated Silo (S3-compatible)
+settings, a unique remote root, and a new staging directory. A loopback HTTP
+counting proxy sits between YinYang and Silo. It parses HTTP/1 request framing
+before counting request methods, and counts request and response bytes without
+instrumenting production code. The proxy accepts connections without polling
+and disables Nagle on both relay sockets so collector delay does not dominate
+small range and proof requests. The real Amazon S3 repeated/random workload
+instead uses the benchmark-only in-process telemetry described below.
 
 Service publication uses a second transparent TCP proxy in front of the metadata
 service. The current transport creates one loopback TCP connection for each RPC,
@@ -57,6 +59,48 @@ range offsets, proxy chain, and read-only policy. Results from the earlier
 writable FUSE fixtures are not an equivalent control because the writable path
 also exercises publication-capable staging.
 
+Run the matched writable incremental workload for both authorities:
+
+```shell
+cargo x bench-linux-cost \
+  --workload incremental \
+  --incremental-expect baseline \
+  --output target/linux-cost/incremental-baseline.jsonl
+```
+
+Use the same command with `--incremental-expect required` on an implementation
+that must avoid full-file fallback for same-length updates. Required mode fails
+if writable open materializes more than half of the 32 MiB file, or if any
+same-length overwrite plus fsync reads or writes more than half of the file
+through S3. Both proxies stay outside the measured process, so service RPC
+aggregation cannot hide storage GET or PUT work.
+
+Run the matched length-changing workload for both authorities:
+
+```shell
+cargo x bench-linux-cost \
+  --workload length-changing \
+  --incremental-expect baseline \
+  --output target/linux-cost/length-changing-baseline.jsonl
+```
+
+Use the same command with `--incremental-expect required` on an implementation
+that must avoid complete-source fallback for length-changing writes. The
+workload uses one 32 MiB file, a shared read-only descriptor and an active
+append descriptor, two 4 KiB appends, two 68 KiB appends that each cross an
+existing 64 KiB verification-unit boundary, two 4 KiB truncates, two 4 KiB zero
+extensions, two shrink-then-extend rounds, unchanged fsync, and remount plus
+tail reads. Operation scenarios keep two latency samples; the read-only and
+writable descriptor opens are separate one-sample scenarios and are never
+merged into one p50/p95 distribution. Two samples are descriptive only; the
+summary p50/p95 is not a stable performance claim. Complete remote bytes are
+verified outside each measured interval. Required mode fails if
+writable open, preparation, or publication transfers at least half of the file
+through S3, or if allocated mount staging is at least half of the file. JSONL
+records retain `useful_bytes` per sample, raw latency samples, GET/PUT request
+and body counts, service RPC counts, staging series, retained storage series,
+and the negative unchanged-fsync observation.
+
 The `early` profile runs the small object-authority Sync, FUSE, concurrent-writer,
 and one-shot transfer scenarios. The `full` profile adds the service authority,
 the medium scale, and the explicit service-authority one-shot boundary. The
@@ -101,8 +145,48 @@ materialization even if a later release reclaims a clean staged file.
 Warm here means repeated reads through the same `FileVersion`; it does not imply
 local staging or a persistent content cache. The measured requests and bytes
 must determine whether those reads still fetch remote units or proofs.
-The bounded 2026-10-27 matched result is recorded in
-[`linux-range-cost-results.md`](linux-range-cost-results.md).
+The 2026-10-27 matched run kept cold 4 KiB reads on 8 MiB and 32 MiB files
+below 0.075 MiB of response payload and 0.090 MiB of mount staging on one
+loopback-Silo host; recorded in the pull request that introduced it (#101).
+
+The `repeated-random` workload measures one Managed object authority through a
+read-only FUSE mount against a direct Amazon S3 HTTPS endpoint. It adds
+same-offset repetition, an 8 MiB hot working set, over-capacity random access,
+restart, forced eviction, and replacement with an old descriptor. The optional
+`benchmark-telemetry` feature installs the released OpenDAL MetricsLayer in the
+measured `yy` process, so request counts and HTTP body bytes are collected
+without a proxy or TLS termination. On one us-east-2 Amazon S3 host, the
+verified 16 MiB cache bound reduced repeated 4 KiB reads from 217.853-291.127 ms
+to 0.053-0.054 ms with zero HTTP requests; a 32 MiB over-capacity batch retained
+a p95 improvement but regressed its maximum. These bounds are recorded in the
+pull request that introduced them (#111).
+
+The `incremental` workload uses one 32 MiB writable FUSE file and both object
+and service publication. It measures writable open separately from three
+same-length overwrites: one inside a verification unit, one crossing a 64 KiB
+unit boundary, and one at EOF. Each overwrite is followed by fsync and an
+independent exact-byte check. It also records unchanged fsync, remount plus a
+read spanning the final updates, local staging, retained storage, and negative
+tradeoffs in the raw samples. Length-changing append or truncate behavior is
+covered by functional FUSE acceptance and is not included in the same-length
+fallback assertion.
+
+On one loopback-Silo host, three same-length 4 KiB overwrites and fsync kept
+optimized S3 GET bodies at or below 272,988 bytes and PUT bodies at or below
+135,855 bytes per scenario across both authorities; these bounds are recorded
+in the pull request that introduced them (#122).
+
+The `length-changing` workload records schema `yinyang.linux-cost.v6`, which
+adds `useful_bytes` to every row; it is the same collector shape for the
+matched baseline and optimized runs. The complete-source fallback in the
+baseline is expected to read and publish most of the file for each length
+change, while `required` mode rejects that behavior.
+
+On one loopback-Silo host, append, truncate, zero-extension, and
+shrink-then-extend operations kept optimized S3 GET bodies at or below
+201,163 bytes and PUT bodies at or below 169,042 bytes per sample across both
+authorities; these bounds are recorded in the pull request that introduced them
+(#128).
 
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
@@ -129,6 +213,7 @@ Each JSONL record includes:
 - sampled process `rchar`, `wchar`, syscall counts, and block-layer read/write
   bytes from `/proc/<pid>/io`;
 - S3 requests by HTTP method, total request bytes, and total response bytes;
+- S3 GET response-body bytes and PUT request-body bytes, excluding HTTP headers;
 - service TCP connections and raw framed bytes in both directions;
 - batch totals and per-sample network values, where per-sample divides only a
   sequential batch and explicitly notes that concurrent samples overlap;
@@ -161,7 +246,10 @@ Linux benchmark.
 ## Limits
 
 The benchmark does not claim production capacity, cross-host performance, or a
-performance regression threshold. It measures one isolated loopback Silo on the
-recorded host. It does not replace the functional Linux acceptance suites. Do
-not commit generated datasets or large build artifacts; retain only bounded
-evidence and reusable tooling in the repository.
+performance regression threshold. Default matrices measure one isolated
+loopback Silo on the recorded host; the repeated/random report records its
+separate real Amazon S3 region, host and sampling limits. These measurements do
+not replace the functional Linux acceptance suites. Keep generated datasets,
+JSON and JSONL outputs, and result reports outside the repository; the default
+`target/linux-cost/` output is ephemeral. `docs/` documents how to run and
+interpret the benchmark, not collected results.

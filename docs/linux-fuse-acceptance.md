@@ -66,6 +66,26 @@ cargo x test-linux-fuse --read-only-range
   520-entry bulk directory that crosses the adapter's 512-entry readdir page.
 - Basic writable I/O: create, write, remote `fsync` verified through an
   independent authority, append, truncate, and multiple descriptors on one file.
+- Incremental descriptor contract: a 256 KiB file is updated across a 64 KiB
+  verification-unit boundary, through a second descriptor opened before the
+  first publication, by append, by shrink and zero extension, and at an
+  EOF-crossing write. Path truncate performs both shrink and extension. Every
+  successful publication is checked through the independent authority; path
+  and descriptor lengths, uid, gid and the managed `0644` mode stay coherent,
+  including on an older active reader. Reads at exact EOF, beyond EOF,
+  zero-length reads, and a read crossing EOF must return the correct empty or
+  partial result. A remount returns the exact final bytes.
+- Length-changing descriptor contract: a 32 MiB file is updated through one
+  shared read-only descriptor and one append descriptor. Small appends, appends
+  crossing 64 KiB verification-unit boundaries (which also change the content
+  tree shape), descriptor shrink, zero extension, and shrink-then-extend are
+  each published and checked through the independent authority. Both active
+  descriptors and path stat observe the same staged length at every step,
+  removed bytes read as zero after extension, allocated staging stays below
+  a small bound, and a remount returns the exact final bytes and zeros.
+- Length-changing dirty recovery: an un-fsynced zero extension plus tail write
+  survives daemon SIGKILL and remount for both authorities, and a new process
+  publishes the exact staged bytes to the independent authority.
 - Append flag toggling: one descriptor opened with `O_APPEND`, then cleared and
   restored via `fcntl(F_SETFL)`, must overwrite at an explicit offset while
   cleared and append only while restored; both remote results are verified.
@@ -106,9 +126,13 @@ cargo x test-linux-fuse --read-only-range
 - Unsupported operations: symlink and hard link return an explicit OS error
   instead of advertising POSIX links.
 - External changes and dirty refresh: a descriptor opened before an external
-  grow/shrink keeps its pinned size, EOF and pread results, a fresh reopen
-  reflects the authoritative size, and a dirty descriptor keeps its staged
-  bytes while `fsync` reports failure instead of silently rebasing.
+  grow/shrink keeps its pinned size, EOF and pread results, and a dirty
+  descriptor keeps its staged bytes while `fsync` reports failure instead of
+  silently rebasing. Linux may dispatch ordinary FUSE RELEASE in the
+  background, so the fresh-open assertion waits until the staged writable
+  handles have actually left the no-lease runtime status; it does not treat
+  close returning as RELEASE dispatch. That fresh open then reflects the
+  authoritative size.
 - Concurrent mounts: two live `yy mount` processes on separate staging
   directories publish distinct files concurrently under a barrier, then read
   across each other's mounts.
@@ -123,12 +147,36 @@ cargo x test-linux-fuse --read-only-range
   `frozen: true`. Killing the mount daemon then interrupts that pending
   publication, the authority is untouched, and a reopened mount replays the
   frozen request and publishes the staged bytes.
+- Frozen length-changing identity: the service gate now reports the exact
+  locally saved `CommitId` when it blocks. After daemon interruption the same
+  identity must remain in staging, and a reopened mount converges by the
+  original frozen request regardless of whether gate release already committed
+  it to the authority. The suite accepts either committed or uncommitted remote
+  state after release and never asserts a partial result.
 - Delayed completion with client interruption: a separate Python client opens
   and writes through `stdin`/`stdout` barriers, the gate blocks the frozen
   commit connection, and the client is SIGKILLed. After gate release the
   independent authority sees the delayed completion and the daemon remains
   usable and unmounts normally. This verifies the adapter's ignored
   interrupt/delayed completion behavior, not real cancellation.
+- Space and retention observation: the in-process contracts behind `space
+  report --json` and `space retention plan --keep-last 1 --json` run while a
+  dirty descriptor remains open. A helper subprocess is deliberately excluded
+  because exec-time close of a FUSE descriptor can issue `FLUSH` and publish
+  pending work. The test requires unchanged volume config, remote object
+  identities, staging database/WAL bytes, pending/frozen generations, and a
+  live mount, then proves the same descriptor still publishes after
+  observation. A second service scenario gates an fsync at the frozen
+  publication boundary and requires both library paths to count and protect
+  the frozen handle without releasing or publishing it. A separate clean-mount
+  test exercises the actual CLI spellings and versioned JSON documents. Report
+  assertions require `deletion_authorized=false`, `reclaimable_bytes=null`,
+  non-atomic inventory disclosure, and unknown noncurrent-version and
+  external-pin states. They also require complete authenticated root traversal,
+  at least one observed content extent, explicit payload-not-read coverage,
+  root-relative zero-reference pack classification, and retained service
+  history. Retention plans must state that published history remains retained
+  by default under a bounded selection.
 - Busy unmount: `fusermount3 -u` fails while a descriptor is open and succeeds
   after the descriptor is released.
 - Unmount lifecycle: after a successful external `fusermount3 -u`, `yy` exits

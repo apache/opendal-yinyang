@@ -1,0 +1,152 @@
+# Linux trial distribution contract
+
+**Status: experimental Ubuntu 24.04 x86_64 trial workflow.**
+This specification defines one directly runnable trial binary, one traceable
+local archive, verification, versioned-prefix installation, stopped activation
+and non-destructive retention-reporting boundary. It does not define an official
+release, signing, ASF vote, tag or stable external publication. The workflow
+uploads short-lived Actions artifacts, not an ASF release.
+
+## Direct trial binary
+
+The package command writes these files beside the archive:
+
+- `yy`;
+- `yy.sha256`, containing the lowercase binary SHA-256 and the file name `yy`;
+- `LICENSE` and `NOTICE`;
+- `BUILD-MANIFEST`, including the full source commit, target and `yy_sha256`.
+
+A consumer may run `yy` directly after verifying `yy.sha256` and setting the
+execute bit. This path does not require extracting or installing the archive,
+Cargo, Rust, Git or Python. The binary is built only for Ubuntu 24.04 x86_64 and
+carries the same experimental and unsigned status as the archive.
+
+The workflow uploads those five files as the `yinyang-linux-x86_64` Actions
+artifact with a 14-day retention period. GitHub presents the artifact as a ZIP,
+may require an authenticated GitHub session for browser download, and does not
+preserve the executable mode. The workflow creates the artifact only after the
+other trial checks succeed. GitHub is not a stable binary-download authority;
+the checksum detects byte mismatch with the sidecar and is not a signature.
+
+## Artifact identity
+
+The archive name is:
+
+```text
+yinyang-<cargo-version>-ubuntu-24.04-x86_64-<12-character-source-sha>.tar.gz
+```
+
+`BUILD-MANIFEST` schema `yinyang-linux-release-artifact.v1` contains exactly:
+
+- `schema`, `package`, `version`, `release`, `source_commit`;
+- `source_date_epoch`, `target`, `yy_sha256`;
+- `cargo` and `rustc` identity strings.
+
+`release` is `<version>+<12-character-source-sha>`. `target` is
+`ubuntu-24.04-x86_64`. The executable hash identifies the packaged `bin/yy`.
+The source commit identifies the clean checkout used to build it; the archive
+does not cryptographically prove that provenance.
+
+The archive inventory is fixed by schema v1:
+
+- `BUILD-MANIFEST`, `INSTALL`, `LICENSE`, `NOTICE`, `PREREQUISITES`;
+- `bin/yy`;
+- the three systemd user-unit templates;
+- the environment example;
+- `linux-operations.md`, `linux-qualification.md`,
+  `linux-operating-envelope.md`, `linux-backup-recovery.md` and
+  `linux-trial-distribution.md`;
+- `install-release.sh` and `verify-release.sh`.
+
+Every entry must be a regular file or directory. Absolute paths, `..`
+components, backslashes, duplicate entries, symlinks, links to other entries and
+entries outside the single archive root are rejected. New artifact content
+requires an explicit specification and verifier update.
+
+`LICENSE` and `NOTICE` must be present. `PREREQUISITES` schema
+`yinyang-linux-release-prerequisites.v1` binds the same release, source and
+target and states consumer packages and unsupported build-time requirements.
+
+## Verification
+
+`verify-release.sh` checks:
+
+1. the adjacent SHA-256 sidecar names the archive and matches its bytes;
+2. the exact safe inventory and manifest field set;
+3. archive name, release, version, source and target consistency;
+4. the packaged `bin/yy` SHA-256;
+5. execution of `bin/yy --help`;
+6. LICENSE, NOTICE and executable packaged scripts.
+
+The optional expected source commit must equal the manifest source. The
+checksum sidecar is an integrity input, not an authenticity or signature claim.
+
+## Installation and activation
+
+`install-release.sh install` verifies the archive again and creates exactly one
+immutable directory:
+
+```text
+<prefix>/<cargo-version>+<12-character-source-sha>/
+```
+
+It refuses to replace an existing directory. Staging extraction and the final
+release directory share the prefix filesystem. Installation does not modify the
+current symlink unless `--activate` is explicit.
+
+Activation requires the explicit `--quiesced` assertion that no `yy` writer uses
+the prefix. It validates the release's executable and, when present, its
+manifest release and binary SHA-256. It atomically replaces `current`. It does
+not create an automatic rollback pointer, pending operation or state monitor.
+
+The installer never invokes `systemctl`, starts a mount or service, modifies
+configuration or state, or infers compatibility from equal package versions.
+
+## Transition boundary
+
+The installer has no rollback or downgrade command. A newer binary with
+different local profiles cannot reopen older staging, Sync, journal, receipt or
+service state; admission returns `Unsupported` before mutation. A quiesced
+backup or isolated restore preserves evidence but does not convert old profiles
+into current ones.
+
+## Read-only accounting and retention
+
+`install-release.sh inspect` reads the versioned prefix and reports:
+
+- `current`;
+- every direct release directory and its `du -sb` size;
+- the retained release count;
+- accounting scope `installed-release-directories-only`.
+
+The report does not inspect or classify backend objects, retained versions,
+delete markers, non-atomic listings, staging, metadata, WAL, SHM, receipts,
+pending/frozen/Unknown work, external readers, shared physical packs, backups or
+archives. Missing evidence remains unknown rather than zero or reclaimable.
+
+No command in this contract deletes a release, state, archive or backend object.
+Physical reclamation, retention expiry and automatic garbage collection are
+outside this milestone. A known local size or backend byte total does not by
+itself authorize deletion.
+
+## Acceptance
+
+The fresh-runner workflow must:
+
+- build from a clean checkout, verify the direct binary checksum and `--help`,
+  and retain the binary, checksum, LICENSE, NOTICE and source manifest;
+- retain the archive, sidecar, manifest, source and binary SHA-256;
+- reject a changed archive checksum and an attempted immutable-directory
+  overwrite;
+- install the actual archive and perform only explicit quiesced activation;
+- exercise installed diagnostics and recovery through the real packaged binary,
+  using the shared native-acceptance binary selector and recording its SHA-256;
+- exercise the existing installed-operations foreground writable Mount, remount
+  and finite Sync entrypoint with the same packaged binary and selector;
+- retain installed diagnostics, finite Sync and recovery evidence;
+- upload the direct binary files and internal evidence only as normal
+  short-lived Actions artifacts.
+
+Hosted CI verifies the packaged unit files but does not create a systemd user
+manager or claim the explicit qualified-host systemd lifecycle. The workflow
+does not sign, tag or publish the artifact.

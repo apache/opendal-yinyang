@@ -1,7 +1,8 @@
 # Repository instructions for agents
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before planning or modifying this
-repository.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[design principles](specs/design-principles.md) before planning or modifying
+this repository. Every pull request answers the principles' review checklist.
 
 ## Repository workflow
 

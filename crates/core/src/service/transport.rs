@@ -41,6 +41,9 @@ enum Command {
     Scan([u8; 24], u8, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, u32),
     Register(Vec<u8>),
     Commit(Vec<Vec<u8>>),
+    PrepareOverwrite([u8; 24], [u8; 16], Vec<(u64, u64, Vec<u8>)>),
+    PrepareUpdate([u8; 24], [u8; 16], u64, u64, Vec<(u64, u64, Vec<u8>)>),
+    History(Option<[u8; 24]>, u32),
 }
 #[derive(BorshSerialize, BorshDeserialize)]
 enum Response {
@@ -50,6 +53,8 @@ enum Response {
     Registered,
     Outcomes(Vec<(u8, Vec<u8>)>),
     Error(u8, String),
+    Prepared(Vec<u8>),
+    Revisions(Vec<[u8; 24]>, Option<[u8; 24]>),
 }
 fn io(e: std::io::Error) -> Error {
     Error::from_io("metadata RPC", e)
@@ -94,6 +99,15 @@ fn tag_kind(tag: u8) -> Result<ErrorKind> {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    #[test]
+    fn service_token_length_has_one_boundary() {
+        assert!(!super::super::valid_service_token(&"x".repeat(31)));
+        assert!(super::super::valid_service_token(&"x".repeat(32)));
+        assert!(super::super::valid_service_token(&"x".repeat(1024)));
+        assert!(!super::super::valid_service_token(&"x".repeat(1025)));
+    }
+
     #[test]
     fn domain_error_tags_round_trip_without_changing_existing_tags() {
         let kinds = [
@@ -116,6 +130,30 @@ mod error_tests {
         }
         assert!(tag_kind(255).is_err());
     }
+
+    #[test]
+    fn appended_overwrite_variants_preserve_existing_wire_tags() {
+        assert_eq!(borsh::to_vec(&Command::Register(vec![])).unwrap()[0], 3);
+        assert_eq!(borsh::to_vec(&Command::Commit(vec![])).unwrap()[0], 4);
+        assert_eq!(
+            borsh::to_vec(&Command::PrepareOverwrite([0; 24], [0; 16], vec![])).unwrap()[0],
+            5
+        );
+        assert_eq!(
+            borsh::to_vec(&Command::PrepareUpdate([0; 24], [0; 16], 0, 0, vec![])).unwrap()[0],
+            6
+        );
+        assert_eq!(borsh::to_vec(&Command::History(None, 1)).unwrap()[0], 7);
+        assert_eq!(
+            borsh::to_vec(&Response::Error(0, String::new())).unwrap()[0],
+            5
+        );
+        assert_eq!(borsh::to_vec(&Response::Prepared(vec![])).unwrap()[0], 6);
+        assert_eq!(
+            borsh::to_vec(&Response::Revisions(vec![], None)).unwrap()[0],
+            7
+        );
+    }
 }
 async fn read_frame<T: BorshDeserialize>(stream: &mut TcpStream) -> Result<T> {
     let length = stream.read_u32().await.map_err(io)? as usize;
@@ -136,7 +174,7 @@ async fn write_frame(stream: &mut TcpStream, value: &impl BorshSerialize) -> Res
     stream.flush().await.map_err(io)
 }
 fn validate_endpoint(addr: SocketAddr, token: &str) -> Result<()> {
-    if !addr.ip().is_loopback() || token.len() < 32 || token.len() > 1024 {
+    if !addr.ip().is_loopback() || !super::valid_service_token(token) {
         return Err(Error::unsupported(
             "metadata RPC",
             "requires loopback and a 32..=1024 byte authentication token",
@@ -152,6 +190,9 @@ fn table(tag: u8) -> Result<Table> {
         3 => Table::Changes,
         _ => return Err(protocol()),
     })
+}
+fn token_matches(candidate: &str, expected: &str) -> bool {
+    blake3::hash(candidate.as_bytes()) == blake3::hash(expected.as_bytes())
 }
 
 /// Serve authenticated local clients. No object checkpoint can accept writes
@@ -174,12 +215,15 @@ pub async fn serve(listener: TcpListener, service: MetadataService, token: Strin
             // A timeout drops the connection, never claims to roll back a commit.
             let _ = tokio::time::timeout(TIMEOUT, async {
                 let response = match read_frame::<Request>(&mut stream).await {
-                    Ok(request)
-                        if request.version == 1
-                            && blake3::hash(request.token.as_bytes())
-                                == blake3::hash(token.as_bytes()) =>
-                    {
-                        dispatch(&service, request.command).await
+                    Ok(request) if token_matches(&request.token, &token) => {
+                        if request.version == crate::compatibility::RPC_PROTOCOL_VERSION {
+                            dispatch(&service, request.command).await
+                        } else {
+                            Err(Error::unsupported(
+                                "metadata RPC",
+                                "unknown protocol version",
+                            ))
+                        }
                     }
                     _ => Err(Error::invalid(
                         "metadata RPC",
@@ -248,6 +292,66 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 .await?;
             Response::Registered
         }
+        Command::PrepareOverwrite(revision, node, changes) => {
+            if changes.len() > 4096 {
+                return Err(protocol());
+            }
+            let changes = changes
+                .iter()
+                .map(|(start, end, bytes)| ContentEdit::new(*start..*end, bytes))
+                .collect::<Result<Vec<_>>>()?;
+            let content = service
+                .prepare_overwrite_version(
+                    Revision::from_bytes(revision),
+                    NodeId::from_bytes(node),
+                    &changes,
+                )
+                .await?;
+            Response::Prepared(content.descriptor().to_bytes())
+        }
+        Command::PrepareUpdate(revision, node, preserved_prefix, final_length, changes) => {
+            if changes.len() > 4096 {
+                return Err(protocol());
+            }
+            if preserved_prefix > final_length {
+                return Err(Error::invalid(
+                    "metadata RPC",
+                    "preserved prefix exceeds final length",
+                ));
+            }
+            let changes = changes
+                .iter()
+                .map(|(start, end, bytes)| ContentEdit::new(*start..*end, bytes))
+                .collect::<Result<Vec<_>>>()?;
+            if !crate::data::update_is_bounded(preserved_prefix, final_length, &changes) {
+                return Err(Error::unsupported(
+                    "metadata RPC",
+                    "update exceeds bounded work budget",
+                ));
+            }
+            let content = service
+                .prepare_update_version(
+                    Revision::from_bytes(revision),
+                    NodeId::from_bytes(node),
+                    preserved_prefix,
+                    final_length,
+                    &changes,
+                )
+                .await?;
+            Response::Prepared(content.descriptor().to_bytes())
+        }
+        Command::History(after, limit) => {
+            if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+                return Err(protocol());
+            }
+            let page = service
+                .retained_revisions_page(after.map(Revision::from_bytes), limit)
+                .await?;
+            Response::Revisions(
+                page.revisions.into_iter().map(Revision::to_bytes).collect(),
+                page.next.map(Revision::to_bytes),
+            )
+        }
         Command::Commit(plans) => {
             if plans.len() > 4096 {
                 return Err(protocol());
@@ -298,7 +402,7 @@ async fn rpc(addr: SocketAddr, token: &str, command: Command) -> Result<Response
         write_frame(
             &mut stream,
             &Request {
-                version: 1,
+                version: crate::compatibility::RPC_PROTOCOL_VERSION,
                 token: token.to_owned(),
                 command,
             },
@@ -325,7 +429,8 @@ impl ServiceClient {
             .read(".yinyang/head")
             .await
             .map_err(|e| Error::from_storage("verify service data binding", e))?;
-        if marker.to_vec() != encode(&(*b"YYSERV01", fs, root))? {
+        let (bound_filesystem, bound_root) = super::parse_service_binding(&marker.to_vec())?;
+        if bound_filesystem != NodeId::from_bytes(fs) || bound_root != NodeId::from_bytes(root) {
             return Err(Error::invalid(
                 "connect service",
                 "data binding disagrees with service",
@@ -382,10 +487,149 @@ impl ServiceClient {
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         self.observe(Some(revision)).await
     }
-    pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
-        let content = self.data.prepare(source).await?;
-        self.register(&content).await?;
-        Ok(content)
+    pub async fn retained_revisions_page(
+        &self,
+        after: Option<Revision>,
+        limit: u32,
+    ) -> Result<RevisionPage> {
+        if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+            return Err(Error::unsupported(
+                "list retained revisions",
+                format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
+            ));
+        }
+        let Response::Revisions(revisions, next) = rpc(
+            self.addr,
+            &self.token,
+            Command::History(after.map(Revision::to_bytes), limit),
+        )
+        .await?
+        else {
+            return Err(protocol());
+        };
+        if revisions.len() > limit as usize {
+            return Err(protocol());
+        }
+        let revisions = revisions
+            .into_iter()
+            .map(Revision::from_bytes)
+            .collect::<Vec<_>>();
+        if revisions.windows(2).any(|window| window[0] >= window[1])
+            || after.is_some_and(|cursor| revisions.iter().any(|revision| *revision <= cursor))
+        {
+            return Err(protocol());
+        }
+        let next = next.map(Revision::from_bytes);
+        if let Some(next) = next
+            && (revisions.len() != limit as usize || Some(next) != revisions.last().copied())
+        {
+            return Err(protocol());
+        }
+        Ok(RevisionPage { revisions, next })
+    }
+    pub async fn prepare(
+        &self,
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
+    ) -> Result<PreparedContent> {
+        let content = self.data.prepare_for_remote_verification(source).await?;
+        let descriptor = self.data.accept(&content)?;
+        match rpc(
+            self.addr,
+            &self.token,
+            Command::Register(descriptor.to_bytes()),
+        )
+        .await?
+        {
+            Response::Registered => {
+                self.data.record_verified(&descriptor);
+                self.data.published(descriptor)
+            }
+            _ => Err(protocol()),
+        }
+    }
+    pub async fn prepare_overwrite(
+        &self,
+        base: &FileVersion,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        if base.descriptor().filesystem() != self.filesystem {
+            return Err(Error::invalid(
+                "prepare service overwrite",
+                "base belongs to another filesystem",
+            ));
+        }
+        let changes = edits
+            .iter()
+            .map(|edit| {
+                let range = edit.range();
+                (range.start, range.end, edit.bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let response = rpc(
+            self.addr,
+            &self.token,
+            Command::PrepareOverwrite(
+                base.revision().to_bytes(),
+                *base.node().id().as_bytes(),
+                changes,
+            ),
+        )
+        .await?;
+        let Response::Prepared(bytes) = response else {
+            return Err(protocol());
+        };
+        let descriptor = ContentDescriptor::from_bytes(&bytes)?;
+        if descriptor.filesystem() != self.filesystem
+            || descriptor.content_id().length() != base.descriptor().content_id().length()
+        {
+            return Err(protocol());
+        }
+        self.data.record_verified(&descriptor);
+        self.data.published(descriptor)
+    }
+    pub async fn prepare_update(
+        &self,
+        base: &FileVersion,
+        preserved_prefix: u64,
+        final_length: u64,
+        edits: &[ContentEdit<'_>],
+    ) -> Result<PreparedContent> {
+        if base.descriptor().filesystem() != self.filesystem {
+            return Err(Error::invalid(
+                "prepare service update",
+                "base belongs to another filesystem",
+            ));
+        }
+        let changes = edits
+            .iter()
+            .map(|edit| {
+                let range = edit.range();
+                (range.start, range.end, edit.bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let response = rpc(
+            self.addr,
+            &self.token,
+            Command::PrepareUpdate(
+                base.revision().to_bytes(),
+                *base.node().id().as_bytes(),
+                preserved_prefix,
+                final_length,
+                changes,
+            ),
+        )
+        .await?;
+        let Response::Prepared(bytes) = response else {
+            return Err(protocol());
+        };
+        let descriptor = ContentDescriptor::from_bytes(&bytes)?;
+        if descriptor.filesystem() != self.filesystem
+            || descriptor.content_id().length() != final_length
+        {
+            return Err(protocol());
+        }
+        self.data.record_verified(&descriptor);
+        self.data.published(descriptor)
     }
     pub async fn register(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?;

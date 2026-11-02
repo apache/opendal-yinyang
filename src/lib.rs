@@ -17,16 +17,28 @@
 
 //! Apache OpenDAL™ YinYang.
 //!
-//! One-shot publication and restoration of local directories on a Managed filesystem.
+//! A filesystem engine over OpenDAL object storage. Managed volumes keep
+//! YinYang Format metadata; Direct volumes use an existing object namespace.
+//! Both are reachable through Linux FUSE Mount and ordinary-directory Sync, and
+//! Managed volumes also support one-shot directory transfer.
+//!
+//! See `specs/design-principles.md` for the rules every change follows.
 
+#[cfg(feature = "benchmark-telemetry")]
+#[doc(hidden)]
+pub mod benchmark;
+pub mod direct;
 mod directory;
 #[cfg(target_os = "linux")]
 pub mod fuse;
+mod intent;
+mod local;
 pub mod mount;
-#[cfg(target_os = "linux")]
-pub mod replica;
 pub mod runtime;
+pub mod space;
 pub mod sync;
+#[cfg(target_os = "linux")]
+pub mod sync_engine;
 pub mod volume;
 
 pub use directory::{
@@ -34,8 +46,12 @@ pub use directory::{
     directory_nodes, prepare_directory, publish_directory, restore_directory,
     restore_directory_revision,
 };
+pub use space::{
+    ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, Unresolved,
+    inspect_bound_local_staging, inspect_local_staging, inspect_managed_space,
+    plan_managed_retention,
+};
 pub use yinyang_core as core;
 
 #[cfg(test)]
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;

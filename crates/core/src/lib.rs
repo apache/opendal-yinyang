@@ -18,6 +18,7 @@
 //! Indexed transactional filesystem and authenticated immutable content.
 
 mod authority;
+mod compatibility;
 pub mod data;
 pub use authority::Authority;
 mod error;
@@ -25,20 +26,19 @@ mod identity;
 mod index;
 pub mod namespace;
 pub mod object;
+pub mod reachability;
 pub mod service;
 mod snapshot;
 pub mod transaction;
 
-pub use data::{ContentDescriptor, ContentId, DataStore, PreparedContent};
+pub use authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
+pub use data::{ContentDescriptor, ContentEdit, ContentId, DataStore, PreparedContent};
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{CommitId, NodeId};
 pub use namespace::{DirectoryEntry, Link, Node, NodeKind};
-pub use object::{
-    BackendProfile, Cursor, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot,
-};
+pub use object::{Cursor, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot};
 pub use snapshot::{DirectoryPage, FileVersion, ScanToken};
 pub use transaction::{Planner, Transaction};
 
 #[cfg(test)]
-#[path = "../tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;

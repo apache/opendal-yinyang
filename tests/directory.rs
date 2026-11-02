@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{BackendProfile, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
+use yinyang::core::service::MetadataService;
+use yinyang::core::{Authority, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 use yinyang::{DirectoryJournal, DirectoryState};
+use yinyang_test_support as support;
 
 async fn filesystem(backend: &TestBackend) -> Fs {
-    Fs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap()
+    Fs::create(backend.operator()).await.unwrap()
 }
 fn committed(outcome: CommitOutcome) -> yinyang::core::Receipt {
     match outcome {
@@ -45,6 +45,108 @@ async fn source(root: &Path) {
     tokio::fs::write(root.join("large"), vec![91; 700_000])
         .await
         .unwrap();
+}
+
+fn yy_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("YINYANG_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+async fn exercise_authority_transfer(authority: Arc<dyn Authority>) {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+
+    let first = authority.observe_latest().await.unwrap();
+    let first_receipt = committed(
+        yinyang::publish_directory(authority.as_ref(), &first, &input, CommitId::generate())
+            .await
+            .unwrap(),
+    );
+
+    let pinned = authority.observe_latest().await.unwrap();
+    tokio::fs::write(input.join("nested/hello"), b"changed")
+        .await
+        .unwrap();
+    let frozen =
+        yinyang::prepare_directory(authority.as_ref(), &pinned, &input, CommitId::generate())
+            .await
+            .unwrap();
+    let receipt = committed(authority.commit(&frozen).await.unwrap());
+    assert_eq!(committed(authority.commit(&frozen).await.unwrap()), receipt);
+
+    let historical = temp.path().join("historical");
+    yinyang::restore_directory_revision(
+        authority.as_ref(),
+        first_receipt.cursor.revision,
+        &historical,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::fs::read(historical.join("nested/hello"))
+            .await
+            .unwrap(),
+        b"hello"
+    );
+    let latest = authority.observe_latest().await.unwrap();
+    let current = temp.path().join("current");
+    yinyang::restore_directory(authority.as_ref(), &latest, &current)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read(current.join("nested/hello")).await.unwrap(),
+        b"changed",
+    );
+
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(authority.clone(), &state)
+        .await
+        .unwrap();
+    let observed = authority.observe_latest().await.unwrap();
+    let id = CommitId::generate();
+    journal.prepare(&observed, &input, id).await.unwrap();
+    tokio::fs::write(input.join("nested/hello"), b"after prepare")
+        .await
+        .unwrap();
+    let journal_receipt = journal.publish(id).await.unwrap();
+    assert_eq!(journal.publish(id).await.unwrap(), journal_receipt);
+    let exported = temp.path().join("exported");
+    journal.export(id, &exported).await.unwrap();
+    assert_eq!(
+        tokio::fs::read(exported.join("nested/hello"))
+            .await
+            .unwrap(),
+        b"changed",
+        "journal export must use the frozen request instead of the changed source"
+    );
+
+    assert_ne!(first_receipt.commit_id, receipt.commit_id);
+}
+
+#[tokio::test]
+async fn one_shot_transfer_supports_object_and_service_authorities() {
+    let object_backend = TestBackend::default();
+    let object = Fs::create(object_backend.operator()).await.unwrap();
+    exercise_authority_transfer(Arc::new(object)).await;
+
+    let service_backend = TestBackend::default();
+    let database = tempfile::tempdir().unwrap();
+    let service = MetadataService::create(
+        database.path().join("metadata.db"),
+        service_backend.operator(),
+    )
+    .await
+    .unwrap();
+    exercise_authority_transfer(Arc::new(service)).await;
 }
 
 #[tokio::test]
@@ -108,9 +210,7 @@ async fn round_trip_replacement_retry_and_pinned_restore() {
         receipt,
         "retry original plan after local mutation"
     );
-    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = Fs::open(backend.operator()).await.unwrap();
     let old_output = temp.path().join("old");
     yinyang::restore_directory_revision(&reopened, pinned.revision(), &old_output)
         .await
@@ -374,10 +474,12 @@ async fn journal_reopens_exact_intent_and_exports_without_the_source() {
     let backend = TestBackend::default();
     let fs = filesystem(&backend).await;
     let state = temp.path().join("journal");
-    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
     let foreign = filesystem(&TestBackend::default()).await;
     assert_eq!(
-        DirectoryJournal::open(&foreign, &state)
+        DirectoryJournal::open(Arc::new(foreign.clone()), &state)
             .await
             .unwrap_err()
             .kind(),
@@ -413,10 +515,10 @@ async fn journal_reopens_exact_intent_and_exports_without_the_source() {
 
     drop(journal);
     drop(fs);
-    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
+    let reopened = Fs::open(backend.operator()).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(reopened.clone()), &state)
         .await
         .unwrap();
-    let journal = DirectoryJournal::open(&reopened, &state).await.unwrap();
     let receipt = journal.publish(id).await.unwrap();
     assert_eq!(receipt.request_digest, prepared.intent.request_digest);
     let exported = temp.path().join("exported");
@@ -488,7 +590,9 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
     let backend = TestBackend::default();
     let fs = filesystem(&backend).await;
     let state = temp.path().join("journal");
-    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
     let id = CommitId::generate();
     let observed = fs.observe_latest().await.unwrap();
     let prepared = journal.prepare(&observed, &input, id).await.unwrap();
@@ -516,10 +620,10 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
     backend.state.lock().unwrap().offline = false;
     drop(journal);
     drop(fs);
-    let reopened = Fs::open(backend.operator(), BackendProfile::Minio)
+    let reopened = Fs::open(backend.operator()).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(reopened.clone()), &state)
         .await
         .unwrap();
-    let journal = DirectoryJournal::open(&reopened, &state).await.unwrap();
     let receipt = journal.publish(id).await.unwrap();
     assert_eq!(receipt.commit_id, id);
     assert_eq!(receipt.request_digest, prepared.intent.request_digest);
@@ -560,7 +664,9 @@ async fn journal_local_confirmation_failure_remains_typed_unknown() {
     let backend = TestBackend::default();
     let fs = filesystem(&backend).await;
     let state = temp.path().join("journal");
-    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
     let id = CommitId::generate();
     let observed = fs.observe_latest().await.unwrap();
     journal.prepare(&observed, &input, id).await.unwrap();
@@ -569,7 +675,7 @@ async fn journal_local_confirmation_failure_remains_typed_unknown() {
     database
         .execute_batch(
             "CREATE TRIGGER fail_local_confirmation
-             BEFORE UPDATE OF state ON publications
+             BEFORE UPDATE OF state ON intents
              WHEN NEW.state=2
              BEGIN
                  SELECT RAISE(ABORT, 'confirmation unavailable');
@@ -603,8 +709,12 @@ async fn separately_opened_journals_replay_one_exact_request_safely() {
     let backend = TestBackend::default();
     let fs = filesystem(&backend).await;
     let state = temp.path().join("journal");
-    let first = DirectoryJournal::open(&fs, &state).await.unwrap();
-    let second = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let first = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
+    let second = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
     let id = CommitId::generate();
     let observed = fs.observe_latest().await.unwrap();
     first.prepare(&observed, &input, id).await.unwrap();
@@ -628,7 +738,7 @@ async fn separately_opened_journals_replay_one_exact_request_safely() {
 }
 
 #[tokio::test]
-async fn journal_rejects_a_future_profile_before_changing_its_schema() {
+async fn journal_rejects_an_old_profile_before_changing_its_schema() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("journal");
     tokio::fs::create_dir(&state).await.unwrap();
@@ -642,16 +752,20 @@ async fn journal_rejects_a_future_profile_before_changing_its_schema() {
                      filesystem BLOB NOT NULL,
                      root BLOB NOT NULL
                  );
-                 INSERT INTO binding VALUES(1,'yinyang-directory-99',zeroblob(16),zeroblob(16));",
+                 INSERT INTO binding VALUES(1,'yinyang-directory-1',zeroblob(16),zeroblob(16));",
             )
             .unwrap();
     }
     let fs = filesystem(&TestBackend::default()).await;
     assert_eq!(
-        DirectoryJournal::open(&fs, &state)
+        DirectoryJournal::open(Arc::new(fs.clone()), &state)
             .await
             .unwrap_err()
             .kind(),
+        RuntimeErrorKind::Unsupported
+    );
+    assert_eq!(
+        DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
         RuntimeErrorKind::Unsupported
     );
     let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
@@ -659,19 +773,73 @@ async fn journal_rejects_a_future_profile_before_changing_its_schema() {
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
     assert_eq!(mode, "delete");
-    let publications: bool = database
+    let intents: bool = database
         .query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master WHERE type='table' AND name='publications'
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents'
              )",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
-        !publications,
-        "rejecting a future profile must not initialize the v1 schema"
+        !intents,
+        "rejecting an old profile must not initialize the current schema"
     );
+}
+
+#[tokio::test]
+async fn journal_rejects_a_partial_known_schema_without_repairing_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("journal");
+    tokio::fs::create_dir(&state).await.unwrap();
+    {
+        let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE binding(
+                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                     profile TEXT NOT NULL,
+                     filesystem BLOB NOT NULL,
+                     root BLOB NOT NULL
+                 );
+                 INSERT INTO binding VALUES(1,'yinyang-directory-3',zeroblob(16),zeroblob(16));
+                 CREATE TABLE intents(
+                     id BLOB PRIMARY KEY,
+                     request_id BLOB NOT NULL,
+                     request_digest BLOB NOT NULL,
+                     request BLOB NOT NULL,
+                     commit_id BLOB,
+                     state INTEGER NOT NULL,
+                     receipt_revision BLOB,
+                     receipt_ordinal INTEGER,
+                     failure BLOB
+                 );",
+            )
+            .unwrap();
+    }
+    let fs = filesystem(&TestBackend::default()).await;
+    assert_eq!(
+        DirectoryJournal::open(Arc::new(fs.clone()), &state)
+            .await
+            .unwrap_err()
+            .kind(),
+        RuntimeErrorKind::Corrupt
+    );
+    assert_eq!(
+        DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
+        RuntimeErrorKind::Corrupt
+    );
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    let columns: Vec<String> = {
+        let mut statement = database.prepare("PRAGMA table_info(intents)").unwrap();
+        statement
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(!columns.iter().any(|column| column == "metadata"));
 }
 
 #[tokio::test]
@@ -681,14 +849,16 @@ async fn journal_inspection_rejects_a_malformed_frozen_identity() {
     source(&input).await;
     let fs = filesystem(&TestBackend::default()).await;
     let state = temp.path().join("journal");
-    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
     let id = CommitId::generate();
     let observed = fs.observe_latest().await.unwrap();
     journal.prepare(&observed, &input, id).await.unwrap();
     rusqlite::Connection::open(state.join("directory.db"))
         .unwrap()
         .execute(
-            "UPDATE publications SET request=?2 WHERE commit_id=?1",
+            "UPDATE intents SET request=?2 WHERE request_id=?1",
             rusqlite::params![id.as_bytes().as_slice(), b"malformed"],
         )
         .unwrap();
@@ -721,7 +891,9 @@ async fn journal_rejects_canonical_source_containing_state_before_publication() 
         let backend = TestBackend::default();
         let fs = filesystem(&backend).await;
         let observed = fs.observe_latest().await.unwrap();
-        let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+        let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+            .await
+            .unwrap();
         for (source_kind, source_path) in [("direct", &input), ("alias", &alias)] {
             let before = backend.state.lock().unwrap().objects.len();
             let id = CommitId::generate();
@@ -749,7 +921,9 @@ async fn journal_rejects_canonical_source_containing_state_before_publication() 
         // Preserve the scanner's existing symlink-root rejection when the
         // journal itself does not trigger the containment guard.
         let outside = temp.path().join("outside-state");
-        let outside_journal = DirectoryJournal::open(&fs, &outside).await.unwrap();
+        let outside_journal = DirectoryJournal::open(Arc::new(fs.clone()), &outside)
+            .await
+            .unwrap();
         let before = backend.state.lock().unwrap().objects.len();
         let id = CommitId::generate();
         let error = outside_journal
@@ -773,7 +947,9 @@ async fn journal_allows_a_source_below_a_larger_state_directory() {
         .unwrap();
     let fs = filesystem(&TestBackend::default()).await;
     let observed = fs.observe_latest().await.unwrap();
-    let journal = DirectoryJournal::open(&fs, &state).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
     let id = CommitId::generate();
     let status = journal.prepare(&observed, &input, id).await.unwrap();
     assert_eq!(status.state, DirectoryState::Prepared);
@@ -838,13 +1014,12 @@ fn volume_status_rejects_historical_revision_selection() {
             "storage_profile": "minio",
             "staging": temp.path().join("state"),
             "read_only": false,
-            "require": [],
         }))
         .unwrap(),
     )
     .unwrap();
     let revision = "01".repeat(24);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+    let output = yy_command()
         .args([
             "--volume",
             config.to_str().unwrap(),
@@ -860,6 +1035,45 @@ fn volume_status_rejects_historical_revision_selection() {
         stderr.contains("--revision is only supported by object-storage `yy status`"),
         "{stderr}"
     );
+}
+
+#[test]
+fn volume_status_reports_local_state_without_storage_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("volume.json");
+    let staging = temp.path().join("state");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "name": "offline-status",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": staging.clone(),
+            "read_only": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = yy_command()
+        .args(["--volume", config.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("local staging: not initialized"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("remote: unavailable"), "{stdout}");
+    assert!(!staging.exists());
 }
 
 #[test]

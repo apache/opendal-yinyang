@@ -24,21 +24,16 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 > retained snapshots, and authenticated range-verifiable content. A durable
 > metadata service and recoverable Managed file handles share the transaction
 > contract. The `yy` CLI publishes and restores directories, operates configured
-> Managed volumes, and provides a Linux FUSE Managed Mount.
+> Managed and Direct volumes, and provides Linux FUSE Managed and Direct Mount.
 
 ## Current support
 
 - **Managed Mount:** The experimental Linux FUSE frontend supports read-only and
-  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`.
-  [PR #83](https://github.com/apache/opendal-yinyang/pull/83),
-  [PR #84](https://github.com/apache/opendal-yinyang/pull/84), and
-  [PR #85](https://github.com/apache/opendal-yinyang/pull/85) added the
-  frontend, writable callbacks, and native acceptance on 2026-10-27. The
-  [PR #85 record](https://github.com/apache/opendal-yinyang/pull/85) documents
-  all 22 real-mount scenarios passing on an isolated Ubuntu 24.04 AWS host;
-  the [GitHub Linux FUSE job](https://github.com/apache/opendal-yinyang/actions/runs/40312762537/job/121539655561)
-  also passed all 22. Both publication authorities are exercised, covering
-  saves, failure retention, refresh, crash recovery, and teardown. See the
+  writable configurations through `yy --volume CONFIG mount MOUNTPOINT`. The
+  native acceptance suite (`cargo x test-linux-fuse`) runs every real-mount
+  scenario in GitHub Linux CI against both publication authorities, covering
+  saves, failure retention, refresh, crash recovery, read-only range
+  hydration, incremental writes, retention and teardown. See the
   [frontend contract](specs/linux-fuse.md) and
   [acceptance guide](docs/linux-fuse-acceptance.md). This is experimental
   native validation, not release support.
@@ -52,13 +47,51 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
   isolated macOS 27 / Xcode 27 prototypes. They share the native bridge and
   runtimes, but ordinary volume CLI admission does not select them. See the
   [macOS frontend contract](specs/macos-frontends.md).
-- **Direct:** Direct volumes are not implemented in the current architecture.
+- **Direct:** The library and Linux FUSE frontend browse, read and
+  conditionally write an existing S3-compatible object namespace without
+  importing it into Managed metadata. Keys use a reversible Linux-name mapping,
+  recursive listing is an explicit SIGHUP-refreshed observation, and each
+  descriptor pins a real object version or uses conditional ETag ranges.
+  Writable Direct Mount publishes whole objects conditionally with retained
+  local generations and safe-save rename outcomes, and Direct Sync reconciles
+  an ordinary Linux directory with the namespace. See the
+  [Direct contract](specs/direct.md),
+  [mutation runtime](specs/direct-mutations.md) and
+  [Direct Sync contract](specs/direct-sync.md). The current MinIO-compatible
+  Silo qualification does not cover a namespace whose LIST hides a descendant
+  behind an existing file-prefix alias; the selected service must enumerate
+  every current key.
+
+Every change follows the [design principles](specs/design-principles.md).
 
 The [implementation roadmap](https://github.com/apache/opendal-yinyang/issues/67)
 tracks the remaining integration and platform work.
 The closed historical umbrella
 [PR #26](https://github.com/apache/opendal-yinyang/pull/26) explicitly was not
 intended to merge and is not the active implementation stack.
+
+## Try the Linux binary
+
+The [Linux trial distribution workflow](https://github.com/apache/opendal-yinyang/actions/workflows/linux-trial.yml)
+publishes an experimental Ubuntu 24.04 x86_64 `yy` binary as a short-lived
+GitHub Actions artifact. Choose a successful run and download
+`yinyang-linux-x86_64`:
+
+```shell
+mkdir -p yinyang-linux-x86_64
+unzip yinyang-linux-x86_64.zip -d yinyang-linux-x86_64
+cd yinyang-linux-x86_64
+
+sha256sum --check yy.sha256
+chmod +x yy
+./yy --help
+./yy --volume /absolute/path/to/volume.json doctor --json
+```
+
+GitHub requires a signed-in account for browser artifact downloads and expires
+the artifact after 14 days. See the
+[Linux trial distribution guide](docs/linux-trial-distribution.md) for the
+artifact contents, supported matrix and volume setup.
 
 ## Publish and restore a directory
 
@@ -125,7 +158,7 @@ SQLite authority with authenticated loopback RPC. Start it with
 
 The [file runtime](specs/file-runtime.md) supports pinned handles, durable local
 write/append/truncate, conditional remote fsync, and restart recovery over either
-publication authority. Configure the [volume and required capabilities](specs/volume-capabilities.md),
+publication authority. Configure [volume admission](specs/volume-capabilities.md),
 then use `yy --volume volume.json file ...` and `yy --volume volume.json status`.
 Local write acknowledgment and remote publication are reported separately.
 The file runtime's library frontend installs no mount; directory reconciliation

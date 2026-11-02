@@ -15,18 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Volume configuration and effective capability admission, before runtime exposure.
-use crate::runtime::{Error, Result, Runtime};
+//! Volume configuration loading, admission, and shared local-path validation.
+use crate::direct::{self, DirectNamespace, DirectStorageBinding};
+use crate::runtime::{Error, ErrorKind, Result, Runtime};
 use opendal::Operator;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
-use yinyang_core::service::ServiceClient;
-use yinyang_core::{Authority, BackendProfile, Fs};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use yinyang_core::service::{ServiceClient, valid_service_token};
+use yinyang_core::{Authority, ErrorKind as CoreErrorKind, Fs};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Capability {
     Read,
@@ -59,6 +60,38 @@ fn managed() -> CapabilitySet {
     ]
     .into_iter()
     .collect()
+}
+/// Read-only storage-native Direct namespace. There is no retained-unlink-read
+/// claim: an unversioned ETag-pinned descriptor becomes Stale after a delete.
+fn direct_read_only() -> CapabilitySet {
+    use Capability::*;
+    [Read, List, PinnedReads].into_iter().collect()
+}
+/// Whole-object staging over storage-native conditional replacements. Direct
+/// does not claim Managed stable identity, retained unlink reads, or atomic
+/// rename. `RemoteFsync` means the configured object write and its condition
+/// completed, not that a Managed receipt exists.
+fn direct_writable() -> CapabilitySet {
+    use Capability::*;
+    [
+        Read,
+        List,
+        Write,
+        Append,
+        Truncate,
+        PinnedReads,
+        RemoteFsync,
+        RecoverableStaging,
+    ]
+    .into_iter()
+    .collect()
+}
+fn direct_capabilities(read_only: bool) -> CapabilitySet {
+    if read_only {
+        direct_read_only()
+    } else {
+        direct_writable()
+    }
 }
 fn read_only() -> CapabilitySet {
     use Capability::*;
@@ -99,8 +132,6 @@ pub enum Access {
 pub enum Frontend {
     Library,
     Fuse,
-    Macos,
-    Windows,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -115,17 +146,16 @@ pub enum StorageProfile {
     Minio,
 }
 impl StorageProfile {
-    fn backend(self) -> BackendProfile {
+    const fn as_str(self) -> &'static str {
         match self {
-            Self::AmazonS3 => BackendProfile::AmazonS3,
-            Self::Minio => BackendProfile::Minio,
+            Self::AmazonS3 => "amazon-s3",
+            Self::Minio => "minio",
         }
     }
 }
 /// Strict configuration: unknown fields are errors, not ignored security policy.
 /// Storage credentials and RPC token are supplied separately, never serialized.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct VolumeConfig {
     pub name: String,
     pub model: Model,
@@ -133,161 +163,629 @@ pub struct VolumeConfig {
     pub frontend: Frontend,
     pub publication: Publication,
     pub storage_profile: StorageProfile,
+    #[serde(skip_serializing_if = "path_is_empty")]
     pub staging: PathBuf,
     #[serde(default)]
     pub read_only: bool,
-    #[serde(default)]
-    pub require: CapabilitySet,
     pub service_address: Option<SocketAddr>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVolumeConfig {
+    name: String,
+    model: Model,
+    access: Access,
+    frontend: Frontend,
+    publication: Publication,
+    storage_profile: StorageProfile,
+    #[serde(default)]
+    staging: PathBuf,
+    #[serde(default)]
+    read_only: Option<bool>,
+    #[serde(default)]
+    service_address: Option<SocketAddr>,
+}
+
+impl<'de> Deserialize<'de> for VolumeConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawVolumeConfig::deserialize(deserializer)?;
+        Ok(Self {
+            name: raw.name,
+            model: raw.model,
+            access: raw.access,
+            frontend: raw.frontend,
+            publication: raw.publication,
+            storage_profile: raw.storage_profile,
+            staging: raw.staging,
+            read_only: raw.read_only.unwrap_or(raw.model == Model::Direct),
+            service_address: raw.service_address,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageCapabilities {
+    pub scheme: String,
+    pub stat: bool,
+    pub read: bool,
+    pub list: bool,
+    pub list_with_recursive: bool,
+    pub read_with_version: bool,
+    pub read_with_if_match: bool,
+    pub write: bool,
+    pub write_can_multi: bool,
+    pub write_can_empty: bool,
+    pub write_with_if_match: bool,
+    pub write_with_if_not_exists: bool,
+    pub delete: bool,
+    pub delete_with_if_match: bool,
+}
+
+impl StorageCapabilities {
+    fn inspect(operator: &Operator) -> Self {
+        let capability = operator.info().capability();
+        Self {
+            scheme: operator.info().scheme().to_string(),
+            stat: capability.stat,
+            read: capability.read,
+            list: capability.list,
+            list_with_recursive: capability.list_with_recursive,
+            read_with_version: capability.read_with_version,
+            read_with_if_match: capability.read_with_if_match,
+            write: capability.write,
+            write_can_multi: capability.write_can_multi,
+            write_can_empty: capability.write_can_empty,
+            write_with_if_match: capability.write_with_if_match,
+            write_with_if_not_exists: capability.write_with_if_not_exists,
+            delete: capability.delete,
+            delete_with_if_match: capability.delete_with_if_match,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Capabilities {
-    pub volume: CapabilitySet,
-    pub storage: CapabilitySet,
-    pub access: CapabilitySet,
-    pub frontend: CapabilitySet,
-    pub effective: CapabilitySet,
+    pub admitted: CapabilitySet,
+    pub storage: StorageCapabilities,
 }
-impl Capabilities {
-    pub fn intersect(
-        volume: CapabilitySet,
-        storage: CapabilitySet,
-        access: CapabilitySet,
-        frontend: CapabilitySet,
-    ) -> Self {
-        let effective = volume
-            .iter()
-            .filter(|c| storage.contains(c) && access.contains(c) && frontend.contains(c))
-            .copied()
-            .collect();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageRequirement {
+    ManagedObject,
+    ManagedService,
+    DirectReadOnly,
+    DirectWritable,
+    DirectSync,
+}
+
+#[derive(Clone, Debug)]
+pub struct Admission {
+    capabilities: CapabilitySet,
+    storage: StorageRequirement,
+}
+
+impl Admission {
+    fn new(capabilities: CapabilitySet, storage: StorageRequirement) -> Self {
         Self {
-            volume,
+            capabilities,
             storage,
-            access,
-            frontend,
-            effective,
         }
     }
+
+    fn capabilities(&self, operator: &Operator) -> Result<Capabilities> {
+        self.storage.validate(operator)?;
+        Ok(Capabilities {
+            admitted: self.capabilities.clone(),
+            storage: StorageCapabilities::inspect(operator),
+        })
+    }
 }
+
 impl VolumeConfig {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| Error::local(format!("volume configuration: {e}")))
-    }
-    /// Negotiation is read-only. Storage capabilities are semantic prerequisites
-    /// for Managed operations, not claims that raw S3 implements atomic rename.
-    pub fn capabilities(&self, operator: &Operator) -> Capabilities {
-        let volume = self.volume_capabilities();
-        let cap = operator.info().capability();
-        let content = operator.info().scheme() == "s3"
-            && cap.read
-            && cap.write
-            && cap.write_can_multi
-            && cap.write_with_if_not_exists;
-        let publication = self.publication == Publication::Service || cap.write_with_if_match;
-        let storage = if content && publication {
-            managed()
-        } else {
-            CapabilitySet::new()
-        };
-        let access = self.access_capabilities();
-        let frontend = self.frontend_capabilities();
-        Capabilities::intersect(volume, storage, access, frontend)
-    }
-    fn volume_capabilities(&self) -> CapabilitySet {
-        if self.model == Model::Managed {
-            managed()
-        } else {
-            CapabilitySet::new()
-        }
-    }
-    fn access_capabilities(&self) -> CapabilitySet {
-        match self.access {
-            Access::Mount if self.read_only => read_only(),
-            Access::Mount => managed(),
-            Access::Sync => managed(),
-        }
-    }
-    fn frontend_capabilities(&self) -> CapabilitySet {
-        match self.frontend {
-            Frontend::Library => managed(),
-            Frontend::Fuse if self.read_only => fuse(),
-            Frontend::Fuse => managed(),
-            Frontend::Macos | Frontend::Windows => CapabilitySet::new(),
-        }
-    }
-    /// Capabilities the selected combination promises independent of storage
-    /// support. Startup requires this intersection to survive storage and
-    /// frontend negotiation, so a frontend cannot silently weaken the model.
-    fn baseline(&self) -> CapabilitySet {
-        let volume = self.volume_capabilities();
-        let access = self.access_capabilities();
-        let frontend = self.frontend_capabilities();
-        volume
-            .intersection(&access)
-            .filter(|capability| frontend.contains(capability))
-            .copied()
-            .collect()
+        serde_json::from_slice(bytes).map_err(|error| {
+            Error::Core(yinyang_core::Error::new(
+                CoreErrorKind::Invalid,
+                "volume configuration",
+                error.to_string(),
+            ))
+        })
     }
     pub fn validate(&self, operator: &Operator) -> Result<Capabilities> {
-        if self.name.trim().is_empty() || self.staging.as_os_str().is_empty() {
-            return Err(Error::Invalid("volume name and staging path are required"));
-        }
-        if self.model != Model::Managed {
-            return Err(Error::Invalid("Direct volumes are not implemented"));
-        }
-        match self.access {
-            Access::Mount => match self.frontend {
-                Frontend::Library => {}
-                Frontend::Fuse if !cfg!(target_os = "linux") => {
-                    return Err(Error::Invalid(
-                        "the fuse frontend is implemented only on Linux",
-                    ));
-                }
-                Frontend::Fuse => {}
-                Frontend::Macos | Frontend::Windows => {
-                    return Err(Error::Invalid(
-                        "macOS and Windows frontends are not implemented; select library or fuse",
-                    ));
-                }
-            },
-            Access::Sync => {
-                // Managed Sync installs an ordinary local directory itself; it
-                // never projects through an OS mount frontend.
-                if self.frontend != Frontend::Library {
-                    return Err(Error::Invalid(
-                        "managed sync uses the library frontend, not an OS mount frontend",
-                    ));
-                }
-                // The frontend implements bidirectional reconciliation. A
-                // read-only flag would be silently ignored while the volume
-                // still published writes, so refuse it explicitly.
-                if self.read_only {
-                    return Err(Error::Invalid(
-                        "managed sync is bidirectional; read_only must be false for access=sync",
-                    ));
-                }
-            }
-        }
-        match (self.publication, self.service_address) {
-            (Publication::Service, Some(addr)) if addr.ip().is_loopback() => {}
-            (Publication::Object, None) => {}
-            _ => {
-                return Err(Error::Invalid(
-                    "service publication requires a loopback address; object publication must omit it",
-                ));
-            }
-        }
-        let caps = self.capabilities(operator);
-        let baseline = self.baseline();
-        if !baseline.is_subset(&caps.effective) || !self.require.is_subset(&caps.effective) {
-            return Err(Error::Invalid(
-                "effective capability intersection is missing baseline or required operations",
-            ));
-        }
-        Ok(caps)
+        admit(self)?.capabilities(operator)
     }
 }
+
+impl StorageRequirement {
+    fn validate(self, operator: &Operator) -> Result<()> {
+        if operator.info().scheme() != "s3" {
+            return Err(Error::Core(yinyang_core::Error::new(
+                CoreErrorKind::Unsupported,
+                "volume admission",
+                format!(
+                    "volume storage requires scheme s3, not {}",
+                    operator.info().scheme()
+                ),
+            )));
+        }
+        let capability = operator.info().capability();
+        let mut missing = Vec::new();
+        match self {
+            Self::ManagedObject | Self::ManagedService => {
+                for (supported, name) in [
+                    (capability.read, "read"),
+                    (capability.write, "write"),
+                    (capability.write_can_multi, "multi-write"),
+                    (capability.write_with_if_not_exists, "conditional-create"),
+                ] {
+                    if !supported {
+                        missing.push(name);
+                    }
+                }
+                if self == Self::ManagedObject && !capability.write_with_if_match {
+                    missing.push("conditional-replace");
+                }
+            }
+            Self::DirectReadOnly | Self::DirectWritable | Self::DirectSync => {
+                direct::validate_operator(operator).map_err(direct_admission_error)?;
+                if self != Self::DirectReadOnly {
+                    for (supported, name) in [
+                        (capability.write, "write"),
+                        (capability.write_can_multi, "multi-write"),
+                        (capability.write_can_empty, "empty-write"),
+                        (capability.write_with_if_match, "conditional-replace"),
+                        (capability.write_with_if_not_exists, "conditional-create"),
+                    ] {
+                        if !supported {
+                            missing.push(name);
+                        }
+                    }
+                }
+                if self == Self::DirectSync {
+                    for (supported, name) in [
+                        (capability.delete, "delete"),
+                        (capability.delete_with_if_match, "conditional-delete"),
+                    ] {
+                        if !supported {
+                            missing.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Core(yinyang_core::Error::new(
+                CoreErrorKind::Unsupported,
+                "volume admission",
+                format!(
+                    "storage is missing required capabilities: {}",
+                    missing.join(", ")
+                ),
+            )))
+        }
+    }
+}
+
+/// The single admission table for every volume combination.
+pub fn admit(config: &VolumeConfig) -> Result<Admission> {
+    if config.name.trim().is_empty() {
+        return Err(invalid_admission("volume name is required"));
+    }
+    let has_staging = !config.staging.as_os_str().is_empty();
+    match (config.model, config.read_only, has_staging) {
+        (Model::Managed, _, false) => {
+            return Err(invalid_admission(
+                "the staging path is required for a Managed volume",
+            ));
+        }
+        (Model::Direct, true, true) => {
+            return Err(invalid_admission(
+                "read-only Direct volumes do not use staging; omit the staging field",
+            ));
+        }
+        (Model::Direct, false, false) => {
+            return Err(invalid_admission(
+                "writable Direct volumes require a staging path",
+            ));
+        }
+        _ => {}
+    }
+    let storage = match config.model {
+        Model::Managed => match (config.publication, config.service_address) {
+            (Publication::Object, None) => StorageRequirement::ManagedObject,
+            (Publication::Service, Some(address)) if address.ip().is_loopback() => {
+                StorageRequirement::ManagedService
+            }
+            (Publication::Service, Some(_)) => {
+                return Err(invalid_admission(
+                    "service publication requires a loopback service_address",
+                ));
+            }
+            (Publication::Service, None) => {
+                return Err(invalid_admission(
+                    "service publication requires service_address",
+                ));
+            }
+            (Publication::Object, Some(_)) => {
+                return Err(invalid_admission(
+                    "object publication must omit service_address",
+                ));
+            }
+        },
+        Model::Direct => {
+            if config.publication != Publication::Object || config.service_address.is_some() {
+                return Err(invalid_admission(
+                    "Direct reads and mutates the configured object namespace directly and does not use a publication service",
+                ));
+            }
+            match (config.access, config.read_only) {
+                (Access::Mount, true) => StorageRequirement::DirectReadOnly,
+                (Access::Mount, false) => StorageRequirement::DirectWritable,
+                (Access::Sync, false) => StorageRequirement::DirectSync,
+                (Access::Sync, true) => StorageRequirement::DirectWritable,
+            }
+        }
+    };
+    let capabilities = match (
+        config.model,
+        config.access,
+        config.frontend,
+        config.read_only,
+    ) {
+        (Model::Managed, Access::Mount, Frontend::Library, false)
+        | (Model::Managed, Access::Mount, Frontend::Fuse, false) => {
+            require_linux_if_fuse(config.frontend)?;
+            managed()
+        }
+        (Model::Managed, Access::Mount, Frontend::Library, true) => read_only(),
+        (Model::Managed, Access::Mount, Frontend::Fuse, true) => {
+            require_linux_if_fuse(config.frontend)?;
+            fuse()
+        }
+        (Model::Managed, Access::Sync, Frontend::Library, false) => managed(),
+        (Model::Managed, Access::Sync, _, true) => {
+            return Err(invalid_admission(
+                "managed sync is bidirectional; read_only must be false for access=sync",
+            ));
+        }
+        (Model::Managed, Access::Sync, _, false) => {
+            return Err(invalid_admission(
+                "managed sync uses the library frontend, not an OS mount frontend",
+            ));
+        }
+        (Model::Direct, Access::Mount, Frontend::Library, true) => direct_read_only(),
+        (Model::Direct, Access::Mount, Frontend::Fuse, _) => {
+            require_linux_if_fuse(config.frontend)?;
+            direct_capabilities(config.read_only)
+        }
+        (Model::Direct, Access::Mount, Frontend::Library, false) => {
+            return Err(invalid_admission(
+                "writable Direct mount uses the fuse frontend; the library frontend remains read-only",
+            ));
+        }
+        (Model::Direct, Access::Sync, Frontend::Library, false) => {
+            if !cfg!(target_os = "linux") {
+                return Err(invalid_admission(
+                    "Direct Sync is implemented only on Linux",
+                ));
+            }
+            direct_writable()
+        }
+        (Model::Direct, Access::Sync, _, true) => {
+            return Err(invalid_admission(
+                "Direct Sync is bidirectional; read_only must be false",
+            ));
+        }
+        (Model::Direct, Access::Sync, _, false) => {
+            return Err(invalid_admission(
+                "Direct Sync uses the library frontend, not an OS mount frontend",
+            ));
+        }
+    };
+    Ok(Admission::new(capabilities, storage))
+}
+
+fn require_linux_if_fuse(frontend: Frontend) -> Result<()> {
+    if frontend == Frontend::Fuse && !cfg!(target_os = "linux") {
+        return Err(invalid_admission(
+            "the fuse frontend is implemented only on Linux",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_admission(message: &'static str) -> Error {
+    Error::Core(yinyang_core::Error::new(
+        CoreErrorKind::Invalid,
+        "volume admission",
+        message,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeLoadStage {
+    Configuration,
+    Operator,
+    Admission,
+}
+
+#[derive(Clone, Debug)]
+pub struct VolumeLoadError {
+    stage: VolumeLoadStage,
+    kind: ErrorKind,
+    message: String,
+    config: Option<VolumeConfig>,
+}
+
+impl VolumeLoadError {
+    fn new(
+        stage: VolumeLoadStage,
+        kind: ErrorKind,
+        message: impl Into<String>,
+        config: Option<VolumeConfig>,
+    ) -> Self {
+        Self {
+            stage,
+            kind,
+            message: message.into(),
+            config,
+        }
+    }
+
+    fn from_runtime(stage: VolumeLoadStage, error: Error, config: Option<&VolumeConfig>) -> Self {
+        Self::new(stage, error.kind(), error.to_string(), config.cloned())
+    }
+
+    pub const fn stage(&self) -> VolumeLoadStage {
+        self.stage
+    }
+
+    pub const fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn config(&self) -> Option<&VolumeConfig> {
+        self.config.as_ref()
+    }
+
+    fn into_runtime(self) -> Error {
+        let kind = match self.kind {
+            ErrorKind::Invalid => CoreErrorKind::Invalid,
+            ErrorKind::InvalidName => CoreErrorKind::InvalidName,
+            ErrorKind::NotFound => CoreErrorKind::NotFound,
+            ErrorKind::AlreadyExists => CoreErrorKind::AlreadyExists,
+            ErrorKind::NotDirectory => CoreErrorKind::NotDirectory,
+            ErrorKind::IsDirectory => CoreErrorKind::IsDirectory,
+            ErrorKind::NotEmpty => CoreErrorKind::NotEmpty,
+            ErrorKind::PermissionDenied => CoreErrorKind::PermissionDenied,
+            ErrorKind::Corrupt => CoreErrorKind::Corrupt,
+            ErrorKind::Unsupported => CoreErrorKind::Unsupported,
+            ErrorKind::Storage => CoreErrorKind::Storage,
+            ErrorKind::Io => CoreErrorKind::Io,
+            _ => CoreErrorKind::Storage,
+        };
+        Error::Core(yinyang_core::Error::new(
+            kind,
+            "volume storage",
+            self.message,
+        ))
+    }
+}
+
+impl std::fmt::Display for VolumeLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VolumeLoadError {}
+
+struct StorageState {
+    connection: StorageConnection,
+    capabilities: Capabilities,
+}
+
+pub struct VolumeContext {
+    pub path: PathBuf,
+    pub config: VolumeConfig,
+    admission: Admission,
+    storage: OnceLock<std::result::Result<StorageState, VolumeLoadError>>,
+}
+
+impl VolumeContext {
+    /// Read, resolve, and validate configuration without contacting storage.
+    pub async fn load(path: &Path) -> std::result::Result<Self, VolumeLoadError> {
+        let config = Self::load_config(path).await?;
+        let admission = admit(&config).map_err(|error| {
+            VolumeLoadError::from_runtime(VolumeLoadStage::Admission, error, Some(&config))
+        })?;
+        Ok(Self {
+            path: path.to_owned(),
+            config,
+            admission,
+            storage: OnceLock::new(),
+        })
+    }
+
+    async fn load_config(path: &Path) -> std::result::Result<VolumeConfig, VolumeLoadError> {
+        let bytes = tokio::fs::read(path).await.map_err(|error| {
+            VolumeLoadError::new(
+                VolumeLoadStage::Configuration,
+                kind_from_io(&error),
+                format!("read volume configuration {}: {error}", path.display()),
+                None,
+            )
+        })?;
+        let mut config = VolumeConfig::from_json(&bytes).map_err(|error| {
+            VolumeLoadError::from_runtime(VolumeLoadStage::Configuration, error, None)
+        })?;
+        if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
+            config.staging = path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(&config.staging);
+        }
+        Ok(config)
+    }
+
+    fn storage(&self) -> std::result::Result<&StorageState, VolumeLoadError> {
+        match self.storage.get_or_init(|| {
+            let connection = storage_connection().map_err(|error| {
+                VolumeLoadError::from_runtime(VolumeLoadStage::Operator, error, Some(&self.config))
+            })?;
+            let capabilities =
+                self.admission
+                    .capabilities(&connection.operator)
+                    .map_err(|error| {
+                        VolumeLoadError::from_runtime(
+                            VolumeLoadStage::Admission,
+                            error,
+                            Some(&self.config),
+                        )
+                    })?;
+            Ok(StorageState {
+                connection,
+                capabilities,
+            })
+        }) {
+            Ok(storage) => Ok(storage),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    pub fn operator(&self) -> std::result::Result<Operator, VolumeLoadError> {
+        Ok(self.storage()?.connection.operator.clone())
+    }
+
+    pub fn storage_capabilities(&self) -> std::result::Result<Capabilities, VolumeLoadError> {
+        Ok(self.storage()?.capabilities.clone())
+    }
+
+    pub fn service_token(&self) -> std::result::Result<Option<String>, VolumeLoadError> {
+        Ok(self.storage()?.connection.service_token.clone())
+    }
+
+    pub async fn connect_authority(&self) -> Result<Arc<dyn Authority>> {
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
+        Volume::connect(
+            &self.config,
+            storage.connection.operator.clone(),
+            storage.connection.service_token.clone(),
+        )
+        .await
+    }
+
+    pub fn direct_namespace(&self) -> Result<DirectNamespace> {
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
+        direct_namespace(&self.config, storage.connection.operator.clone())
+    }
+
+    pub fn direct_storage_binding(&self) -> Result<DirectStorageBinding> {
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
+        direct_storage_binding(&self.config, &storage.connection.operator)
+    }
+
+    pub async fn open_file_volume(&self) -> Result<Volume> {
+        let storage = self.storage().map_err(VolumeLoadError::into_runtime)?;
+        Volume::open(
+            self.config.clone(),
+            storage.connection.operator.clone(),
+            storage.connection.service_token.clone(),
+        )
+        .await
+    }
+}
+
+pub struct StorageConnection {
+    operator: Operator,
+    service_token: Option<String>,
+}
+
+impl StorageConnection {
+    /// Build an operator from explicit OpenDAL S3 configuration.
+    pub fn from_config(
+        config: impl IntoIterator<Item = (String, String)>,
+        service_token: Option<String>,
+    ) -> Result<Self> {
+        let operator = Operator::via_iter("s3", config).map_err(operator_error)?;
+        #[cfg(feature = "benchmark-telemetry")]
+        let operator = crate::benchmark::instrument(operator);
+        Ok(Self {
+            operator,
+            service_token,
+        })
+    }
+
+    pub fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
+    pub fn service_token(&self) -> Option<&str> {
+        self.service_token.as_deref()
+    }
+
+    pub fn into_parts(self) -> (Operator, Option<String>) {
+        (self.operator, self.service_token)
+    }
+}
+
+/// Build the one storage operator and read the service token once.
+pub fn storage_connection() -> Result<StorageConnection> {
+    let config = std::env::vars()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("YINYANG_S3_")
+                .map(|key| (key.to_ascii_lowercase(), value))
+        })
+        .collect::<Vec<_>>();
+    StorageConnection::from_config(config, std::env::var("YINYANG_SERVICE_TOKEN").ok())
+}
+
+pub fn storage_profile_from_env() -> Result<StorageProfile> {
+    match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
+        Ok("amazon-s3") => Ok(StorageProfile::AmazonS3),
+        Ok("minio") => Ok(StorageProfile::Minio),
+        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => Ok(StorageProfile::AmazonS3),
+        _ => Err(Error::Core(yinyang_core::Error::new(
+            CoreErrorKind::Invalid,
+            "storage profile",
+            "set YINYANG_STORAGE_PROFILE to amazon-s3 or minio for the configured endpoint; other S3-compatible deployments are unsupported",
+        ))),
+    }
+}
+
+fn operator_error(error: opendal::Error) -> Error {
+    let kind = match error.kind() {
+        opendal::ErrorKind::ConfigInvalid => CoreErrorKind::Invalid,
+        opendal::ErrorKind::PermissionDenied => CoreErrorKind::PermissionDenied,
+        opendal::ErrorKind::Unsupported => CoreErrorKind::Unsupported,
+        _ => CoreErrorKind::Storage,
+    };
+    Error::Core(yinyang_core::Error::new(
+        kind,
+        "storage operator",
+        error.to_string(),
+    ))
+}
+
+fn kind_from_io(error: &std::io::Error) -> ErrorKind {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ErrorKind::NotFound,
+        std::io::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
+        std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+        _ => ErrorKind::Io,
+    }
+}
+
 pub struct Volume {
     pub config: VolumeConfig,
     pub capabilities: Capabilities,
@@ -301,6 +799,11 @@ impl Volume {
         operator: Operator,
         token: Option<String>,
     ) -> Result<Self> {
+        if config.model == Model::Direct {
+            return Err(Error::Invalid(
+                "Direct volumes use Direct Mount or Sync entry points; they do not install Managed file handles",
+            ));
+        }
         // The file runtime installs recoverable handles; it does not own the
         // ordinary-directory reconciliation of a Sync volume. Admission accepts
         // `access: sync` for `Volume::connect`, so reject it here before this
@@ -330,22 +833,91 @@ impl Volume {
         token: Option<String>,
     ) -> Result<Arc<dyn Authority>> {
         config.validate(&operator)?;
+        if config.model == Model::Direct {
+            return Err(Error::Invalid(
+                "Direct volumes do not connect to a Managed authority",
+            ));
+        }
         let authority: Arc<dyn Authority> = match config.publication {
-            Publication::Object => {
-                Arc::new(Fs::open(operator, config.storage_profile.backend()).await?)
-            }
-            Publication::Service => Arc::new(
-                ServiceClient::connect(
-                    config.service_address.unwrap(),
-                    token.ok_or(Error::Invalid("YINYANG_SERVICE_TOKEN is required"))?,
-                    operator,
+            Publication::Object => Arc::new(Fs::open(operator).await?),
+            Publication::Service => {
+                let token = token.ok_or_else(|| {
+                    Error::Core(yinyang_core::Error::new(
+                        CoreErrorKind::PermissionDenied,
+                        "connect service",
+                        "YINYANG_SERVICE_TOKEN is required",
+                    ))
+                })?;
+                if !valid_service_token(&token) {
+                    return Err(Error::Core(yinyang_core::Error::new(
+                        CoreErrorKind::PermissionDenied,
+                        "connect service",
+                        "YINYANG_SERVICE_TOKEN must contain 32..=1024 bytes",
+                    )));
+                }
+                Arc::new(
+                    ServiceClient::connect(config.service_address.unwrap(), token, operator)
+                        .await?,
                 )
-                .await?,
-            ),
+            }
         };
         Ok(authority)
     }
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
+}
+
+/// Construct the storage-native namespace for an admitted Direct volume.
+pub fn direct_namespace(config: &VolumeConfig, operator: Operator) -> Result<DirectNamespace> {
+    config.validate(&operator)?;
+    if config.model != Model::Direct {
+        return Err(Error::Invalid("volume model is not direct"));
+    }
+    DirectNamespace::new(operator).map_err(direct_admission_error)
+}
+
+/// Build the one non-secret storage binding shared by writable Direct Mount
+/// and Direct Sync. The endpoint comes from the existing operator construction
+/// environment rather than a second configuration field.
+pub fn direct_storage_binding(
+    config: &VolumeConfig,
+    operator: &Operator,
+) -> Result<DirectStorageBinding> {
+    if config.model != Model::Direct {
+        return Err(Error::Invalid(
+            "a Direct storage binding requires a direct volume",
+        ));
+    }
+    let endpoint = match std::env::var_os("YINYANG_S3_ENDPOINT") {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| Error::Invalid("YINYANG_S3_ENDPOINT is not valid UTF-8"))?,
+        None => "provider-default".to_owned(),
+    };
+    let profile = config.storage_profile.as_str();
+    DirectStorageBinding::new(
+        operator.info().scheme(),
+        profile,
+        operator.info().name(),
+        operator.info().root(),
+        endpoint,
+    )
+    .map_err(direct_admission_error)
+}
+
+fn path_is_empty(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
+fn direct_admission_error(error: direct::Error) -> Error {
+    let kind = match error.kind() {
+        direct::ErrorKind::Unsupported => CoreErrorKind::Unsupported,
+        _ => CoreErrorKind::Invalid,
+    };
+    Error::Core(yinyang_core::Error::new(
+        kind,
+        "direct admission",
+        error.to_string(),
+    ))
 }
