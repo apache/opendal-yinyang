@@ -701,7 +701,7 @@ async fn frozen_batch_preserves_input_order_for_mixed_receipt_states() {
         .await
         .unwrap();
     assert_eq!(outcomes.len(), 2);
-    let Outcome::Committed(pending_receipt) = outcomes[0] else {
+    let Outcome::Committed(pending_receipt) = &outcomes[0] else {
         panic!("pending request did not commit");
     };
     assert_eq!(pending_receipt.commit_id, pending.id());
