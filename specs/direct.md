@@ -113,7 +113,10 @@ transaction isolation.
 
 The FUSE adapter accepts one snapshot at startup and reuses it for LOOKUP,
 GETATTR and directory enumeration. `SIGHUP` observes and atomically replaces
-the cached snapshot, then invalidates known inodes and dentries. The adapter
+the cached snapshot, then invalidates known inodes and dentries. Unlike
+Managed, Direct does not refresh an accepted snapshot when the one-second
+metadata window expires: doing so would recursively list the whole namespace
+on a metadata path. This is the documented freshness exception. The adapter
 does not run a background watch and does not recursively list for every
 LOOKUP. Memory use is proportional to the accepted namespace and visited
 directories.

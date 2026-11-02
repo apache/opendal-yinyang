@@ -6,10 +6,13 @@ transport is the `fuser` 0.17 binding, not a YinYang FUSE implementation.**
 
 The Linux frontend mounts one Managed volume through the kernel FUSE ABI with
 `yy --volume CONFIG mount MOUNTPOINT` and keeps the process in the foreground.
-Managed uses the shared Authority, Mount and Runtime contracts directly.
-Direct uses a separate storage-native snapshot and file-pin contract rather
-than Managed NodeIds, proofs or staging. Neither initializes or reformats
-remote storage, and the macOS bridge crate is not part of the Linux path.
+One `Filesystem` adapter owns the session lifecycle, inode table, directory
+cursors, attribute synthesis, flag handling and errno mapping. Managed and
+Direct implement one backend contract for the operations that genuinely differ.
+Managed uses the shared Authority, Mount and Runtime contracts directly; Direct
+uses its storage-native snapshot and file-pin contract. Neither initializes or
+reformats remote storage, and the macOS bridge crate is not part of the Linux
+path.
 
 ## Startup and admission
 
@@ -43,7 +46,10 @@ observes the remote namespace and serves durable local-only, dirty, conflict
 and Unknown object states as an overlay. Opening or recovering a writable
 Direct mount does not create YinYang Managed metadata.
 
-LOOKUP and path GETATTR reuse the latest accepted snapshot plus that overlay.
+LOOKUP and path GETATTR reuse the accepted snapshot plus that overlay. Direct
+has no periodic re-listing: a recursive LIST of the whole namespace is too
+expensive to run on a metadata callback. Its accepted snapshot changes only at
+startup and on an explicit SIGHUP, which is the documented freshness exception.
 SIGHUP replaces the remote snapshot without rebasing open descriptors. Direct
 inode identity includes the accepted object version or ETag, size and
 whole-second mtime, so a later observation of replaced content receives a new
@@ -67,13 +73,14 @@ Only the read-only policy adds the kernel `ro` option.
 
 ## Identity and lookup references
 
-Inode numbers are deterministic functions of the core `NodeId`: the root is
-always 1 and every other node derives a 64-bit value from a domain-separated
-BLAKE3 digest of its identity, so numbers are stable across mounts and
-restarts. A derivation that collides with the root, zero, or an already mapped
-identity is an error (`EIO`) rather than an alias. The NodeId-inode map and the
-observed kind/executable cache live for the mount lifetime; memory is
-proportional to the visited tree, the same boundary as the macOS prototype.
+One inode table serves both backends. The root is always 1 and every other node
+derives a 64-bit value from a domain-separated BLAKE3 digest of the backend
+identity. Managed identity is a NodeId. Direct identity includes the accepted
+path, kind, version or ETag, size and whole-second mtime. The domains are
+different, so Managed and Direct inode numbers are stable across mounts without
+pretending the identities are interchangeable. A derivation that collides with
+the root, zero, or an already mapped identity is an error (`EIO`) rather than an
+alias. The table and observed kind/executable cache live for the mount lifetime.
 
 Each successful `LOOKUP` reply adds one kernel reference. `forget` subtracts
 the reported count with saturating arithmetic. Mappings are retained after the
@@ -87,15 +94,25 @@ Filesystem callbacks that can touch the authority or staging dispatch onto the
 process Tokio runtime, moving the reply into the task; the binding sends one
 reply per request and replaces a dropped unanswered reply with `EIO`.
 
-`lookup` and non-handle `getattr` observe the latest snapshot for metadata and
-use that same snapshot's revision for timestamps, so a reply never mixes
-metadata from two observations. Attributes are synthesized: read-only
+Managed `lookup` and non-handle `getattr` reuse one accepted snapshot for a
+one-second metadata staleness window. Repeated callbacks inside that window do
+not observe the authority head again, and a cached IndexCache page or external
+value may be shared across successive snapshots of the same immutable
+authority. `open` still observes the latest revision; a mutation through the
+mount installs its post-commit snapshot or invalidates the cached one so a
+following metadata callback observes the result. Direct uses its accepted
+snapshot until SIGHUP as described above. Attributes are synthesized: read-only
 directories are `0555` and files are `0444`; writable directories are `0755`
 and files are `0644` or `0755` according to the core executable bit. The
 mounting user's uid/gid, size from the content descriptor or a fixed directory
 size, and revision-derived timestamps are synthesized. `getxattr`,
 `listxattr`, `readlink`, links and special nodes return explicit unsupported
 errors.
+
+The object authority's shared index cache charges index pages and external
+values against one 64 MiB byte bound and evicts the oldest-used entry. Cached
+entries are content-addressed `PackedRef` values, so a snapshot cannot consume
+bytes from another content identity. Writers do not use this shared cache.
 
 Direct has no persisted executable bit: writable Direct files remain `0644`
 and directories remain `0755`. Writable Direct uses a zero attribute TTL and
@@ -145,16 +162,19 @@ clean reference is reclaimed, and a references-zero result left by an
 interrupted operation is reclaimed before a later open captures current remote
 metadata.
 
-FUSE RELEASE removal from the adapter's handle table happens on the dispatch
-thread before its asynchronous clean reclamation. Linux can process ordinary
-RELEASE work in the background, so an application close returning does not
-prove this callback has run. After the callback is dispatched, a request task
-that already cloned the handle still retains the existing Busy pin until that
-operation finishes. A later OPEN after reclamation observes current remote
-metadata. Before replying to a writable OPEN, after selecting the Mount handle
-and applying `O_TRUNC`, the adapter sends the same inode attribute invalidation
-used by read-only opens; notification failure fails OPEN rather than exposing a
-descriptor whose first fstat can use a cached old length.
+FUSE RELEASE removes the adapter handle and drops its backend file reference on
+the dispatch thread before its asynchronous clean reclamation. For a Managed
+volume this lowers the Mount reference count before the kernel can dispatch the
+next request, so a following OPEN reclaims the zero-reference observation and
+uses current remote metadata. Linux can process ordinary RELEASE work in the
+background, so an application close returning does not prove this callback has
+run. After the callback is dispatched, a request task that already cloned the
+handle still retains the existing Busy pin until that operation finishes. A
+later OPEN after reclamation observes current remote metadata. Before replying
+to a writable OPEN, after selecting the Mount handle and applying `O_TRUNC`, the
+adapter sends the same inode attribute invalidation used by read-only opens;
+notification failure fails OPEN rather than exposing a descriptor whose first
+fstat can use a cached old length.
 
 A clean node is only reclaimed when its last adapter reference is released. If
 an interrupted read still shares the node, reclaim reports busy and the pinned
@@ -261,10 +281,11 @@ as a cross-object atomic guarantee.
 
 ## Explicit refresh
 
-`SIGHUP` triggers one explicit refresh; this is a manual invalidation entry
-point, not an automatic change watch. There is no background polling, no
-change-feed watcher, and no whole-tree enumeration. The refresh observes the
-latest snapshot once and then:
+`SIGHUP` triggers one explicit refresh in the shared session lifecycle; this is
+a manual invalidation entry point, not an automatic change watch. There is no
+background polling and no change-feed watcher. Managed refresh performs one
+latest observation; Direct performs one recursive namespace observation because
+that is the only way to produce a new complete Direct snapshot. The refresh then:
 
 - reclaims every clean, unreferenced node through the shared `Mount` contract,
   including zero-reference read-only range observations, so the next open
@@ -303,11 +324,11 @@ dentry invalidation remain confined to the explicit SIGHUP path, outside a
 related mutation request.
 
 An `unlink` or `rename` precondition conflict does not install a refreshed
-remote snapshot and returns `EAGAIN`, not `ESTALE`. Linux namei automatically
-retries `ESTALE` once inside the same syscall; a concurrent global refresh
-could make that retry use the external source or destination pin as a new
-intent. `EAGAIN` prevents that implicit retry and leaves the decision to the
-caller.
+remote snapshot and returns `EAGAIN`, not `ESTALE`, for both backends. Linux
+namei automatically retries `ESTALE` once inside the same syscall; a concurrent
+global refresh could make that retry use the external source or destination pin
+as a new intent. `EAGAIN` prevents that implicit retry and leaves the decision
+to the caller.
 
 The pending Conflict observation remains visible, and the failed callback does
 not install a refreshed snapshot. A caller can explicitly refresh with `SIGHUP`
@@ -340,10 +361,11 @@ metadata reads are a future optimization, not a completeness requirement.
 ## statfs, capacity and errors
 
 `statfs` reports zero blocks, zero files and `bsize=4096` with `namelen=255`.
-A remote snapshot implies no local capacity claim. Core and runtime failures
-map to the narrow errno intended for each operation; unknown identity is
-`ESTALE`, read-only violations `EROFS`, unsupported operations `ENOSYS` or
-`EOPNOTSUPP`, and every other failure class degrades to `EIO` without guessing.
+A remote snapshot implies no local capacity claim. The adapter has one errno
+table for core, runtime and Direct failures. Unknown Direct identity is
+`ESTALE`; read-only violations are `EROFS`; unsupported operations are `ENOSYS`
+or `EOPNOTSUPP`; unlink/rename precondition conflicts are `EAGAIN`; and every
+other failure class degrades to `EIO` without guessing.
 
 ## Cancellation and exit
 
