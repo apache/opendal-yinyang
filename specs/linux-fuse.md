@@ -238,14 +238,15 @@ content revision, and advances only that clean handle to the receipt revision.
 An external content change therefore produces Conflict rather than rebasing
 old staged bytes onto new content. Managed chmod routes that Conflict, from
 either content publication or the metadata commit based on the recorded base,
-through the shared content-conflict result (`ESTALE`). Linux replays a
+through the shared content-conflict result (`ESTALE`). Linux can replay a
 pathname `chmod(2)` or `truncate(2)` once after an `ESTALE` returned by
-SETATTR. The retained handle keeps the original base, so a pathname truncate
-conflict continues to report `ESTALE` rather than changing to `EBUSY` on that
-replay. FLUSH, FSYNC, an `O_SYNC`/`O_DSYNC` write publication, and fd-based
-`fchmod(2)` or `ftruncate(2)` do not enter the pathname replay. Content
-publication conflicts leave local bytes retained for an explicit refresh or
-resolution. Ownership, timestamps and other mode bits are not persisted.
+SETATTR when `LOOKUP_REVAL` is not already set. The retained handle keeps
+the original base, so a pathname truncate conflict continues to report
+`ESTALE` rather than changing to `EBUSY` on that replay. FLUSH, FSYNC, an
+`O_SYNC`/`O_DSYNC` write publication, and fd-based `fchmod(2)` or
+`ftruncate(2)` do not enter the pathname replay. Content publication conflicts
+leave local bytes retained for an explicit refresh or resolution. Ownership,
+timestamps and other mode bits are not persisted.
 
 ### Direct writable callbacks
 
@@ -279,9 +280,9 @@ conflict or Unknown generation.
 
 `ESTALE` preserves the caller action that `EIO` would hide: the handle's
 accepted base no longer identifies the current remote object, so the caller
-must refresh and resolve the retained bytes explicitly. Linux namei
-automatically retries `ESTALE` for path lookups, not for FLUSH or FSYNC
-publication, so this result does not cause an implicit retry.
+must refresh and resolve the retained bytes explicitly. FLUSH and FSYNC return
+this result directly and do not enter the pathname replay. A pathname
+`truncate(2)` SETATTR can replay once as described above.
 
 `SETATTR` size with an open writable handle stages a truncate for that handle's
 later flush. Size without a handle opens the current object, stages the
@@ -346,10 +347,10 @@ related mutation request.
 
 An `unlink` or `rename` precondition conflict does not install a refreshed
 remote snapshot and returns `EAGAIN`, not `ESTALE`, for both backends. Linux
-namei automatically retries `ESTALE` once inside the same syscall; a concurrent
-global refresh could make that retry use the external source or destination pin
-as a new intent. `EAGAIN` prevents that implicit retry and leaves the decision
-to the caller.
+namei can retry `ESTALE` once inside the same syscall when `LOOKUP_REVAL` is
+not already set; a concurrent global refresh could make that retry use the
+external source or destination pin as a new intent. `EAGAIN` prevents that
+implicit retry and leaves the decision to the caller.
 
 The pending Conflict observation remains visible, and the failed callback does
 not install a refreshed snapshot. A caller can explicitly refresh with `SIGHUP`
