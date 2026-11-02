@@ -24,8 +24,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
 use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
 
+// NodeState is always owned by Arc<Node>; boxing a variant would add another allocation.
+#[allow(clippy::large_enum_variant)]
 enum NodeState {
-    Writable(Box<Mutex<FileHandle>>),
+    Writable(Mutex<FileHandle>),
     ReadOnly(FileVersion),
 }
 struct Node {
@@ -35,7 +37,7 @@ struct Node {
 impl Node {
     fn writable_handle(&self) -> Result<&Mutex<FileHandle>> {
         match &self.state {
-            NodeState::Writable(handle) => Ok(handle.as_ref()),
+            NodeState::Writable(handle) => Ok(handle),
             NodeState::ReadOnly(_) => Err(Error::State(
                 ErrorKind::Unsupported,
                 "node is a read-only observation",
@@ -119,9 +121,7 @@ impl Mount {
             nodes.insert(
                 state.node,
                 Arc::new(Node {
-                    state: NodeState::Writable(Box::new(Mutex::new(
-                        runtime.recover(state.id).await?,
-                    ))),
+                    state: NodeState::Writable(Mutex::new(runtime.recover(state.id).await?)),
                     references: AtomicUsize::new(0),
                 }),
             );
@@ -216,7 +216,7 @@ impl Mount {
                 .open_node(id, !self.inner.read_only)
                 .await?;
             let node = Arc::new(Node {
-                state: NodeState::Writable(Box::new(Mutex::new(handle))),
+                state: NodeState::Writable(Mutex::new(handle)),
                 references: AtomicUsize::new(0),
             });
             {
