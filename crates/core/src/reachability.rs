@@ -594,27 +594,28 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
             }
             ObjectTable::History => {
                 if key.len() != 25 || key[0] > 1 {
-                    return Err(Error::corrupt(
-                        "inspect physical roots",
-                        "invalid typed history key",
-                    ));
-                }
-                let revision = Revision::from_bytes(
-                    key[1..]
-                        .try_into()
-                        .expect("the typed history key was length checked"),
-                );
-                if revision > self.revision {
                     Err(Error::corrupt(
                         "inspect physical roots",
-                        "history key exceeds its containing snapshot revision",
+                        "invalid typed history key",
                     ))
                 } else {
-                    decode::<RefWire>(bytes)
-                        .and_then(PackedRef::from_wire)
-                        .map(|reference| {
-                            self.descriptors_pending.push_back((revision, reference));
-                        })
+                    let revision = Revision::from_bytes(
+                        key[1..]
+                            .try_into()
+                            .expect("the typed history key was length checked"),
+                    );
+                    if revision > self.revision {
+                        Err(Error::corrupt(
+                            "inspect physical roots",
+                            "history key exceeds its containing snapshot revision",
+                        ))
+                    } else {
+                        decode::<RefWire>(bytes)
+                            .and_then(PackedRef::from_wire)
+                            .map(|reference| {
+                                self.descriptors_pending.push_back((revision, reference));
+                            })
+                    }
                 }
             }
         };
