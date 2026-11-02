@@ -1180,7 +1180,7 @@ fn retention_plan(
 }
 
 fn assert_plan_boundaries(plan: &serde_json::Value) {
-    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v4");
+    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v5");
     assert_eq!(plan["deletion_authorized"], false);
     assert!(plan["reclaimable_bytes"].is_null());
     assert_eq!(plan["policy"]["published_history"], "retained_by_default");
