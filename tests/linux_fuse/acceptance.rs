@@ -41,6 +41,7 @@ const EINVAL: i32 = 22;
 const ENOTCONN: i32 = 107;
 const EIO: i32 = 5;
 const ENOENT: i32 = 2;
+const ESTALE: i32 = 116;
 const ATTR_TTL_WAIT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy)]
@@ -881,11 +882,10 @@ fn external_changes(fixture: &Fixture) {
         local, b"LOCALBBB",
         "an external change must not silently rebase a dirty descriptor"
     );
-    let conflict = dirty.sync_all();
-    assert!(
-        conflict.is_err(),
-        "fsync of a stale dirty base must report failure instead of claiming remote durability"
-    );
+    let conflict = dirty
+        .sync_all()
+        .expect_err("fsync of a stale dirty base must report failure");
+    assert_errno(conflict, &[ESTALE], "fsync of a stale dirty base");
     drop(dirty);
     mounted.unmount();
 

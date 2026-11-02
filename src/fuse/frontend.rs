@@ -327,7 +327,9 @@ impl Backend for ManagedBackend {
         if has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
             || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC)
         {
-            file.flush().await?;
+            file.flush()
+                .await
+                .map_err(BackendError::runtime_content_publication)?;
             self.invalidate_snapshot();
         }
         Ok(())
@@ -337,7 +339,9 @@ impl Backend for ManagedBackend {
         let ManagedFile::Staged(file) = file else {
             return Ok(());
         };
-        file.flush().await?;
+        file.flush()
+            .await
+            .map_err(BackendError::runtime_content_publication)?;
         self.invalidate_snapshot();
         Ok(())
     }
@@ -346,7 +350,9 @@ impl Backend for ManagedBackend {
         let ManagedFile::Staged(file) = file else {
             return Ok(());
         };
-        file.fsync().await?;
+        file.fsync()
+            .await
+            .map_err(BackendError::runtime_content_publication)?;
         self.invalidate_snapshot();
         Ok(())
     }
@@ -392,7 +398,9 @@ impl Backend for ManagedBackend {
                 self.reclaim_clean_state(id).await?;
                 let file = self.mount.open_node(id, true).await?;
                 file.truncate(length).await?;
-                file.flush().await?;
+                file.flush()
+                    .await
+                    .map_err(BackendError::runtime_content_publication)?;
                 let attr = self
                     .shared_attr(id)
                     .await?

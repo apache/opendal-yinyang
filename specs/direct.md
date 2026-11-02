@@ -192,6 +192,10 @@ Negotiating and listing the namespace do not modify storage.
 | `Unsupported` | `EOPNOTSUPP` | The backend lacks a required Direct primitive |
 | `Storage` | `EIO` | The storage request failed without a narrower mapping |
 
+`DirectFlushOutcome::Conflict` is a writable runtime result rather than a
+`Direct` error kind. Writable FUSE maps it to `ESTALE` through the shared
+content-publication rule in [linux-fuse.md](linux-fuse.md).
+
 If a refresh observation is rejected, the previous snapshot is not replaced.
 Namespace operations fail with `EIO` until a later `SIGHUP` succeeds, while
 already open descriptors retain their pinned reads. The rejection and original
