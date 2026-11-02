@@ -315,7 +315,10 @@ async fn clean_ready_handle_protects_its_base_for_recovery_and_publication() {
 
     let latest = authority.observe_latest().await.unwrap();
     let remote = latest.open_file(node).await.unwrap();
-    assert_eq!(remote.read(offset, update.len()).await.unwrap(), update);
+    assert_eq!(
+        remote.read(offset as u64, update.len()).await.unwrap(),
+        update
+    );
 }
 
 #[tokio::test]
