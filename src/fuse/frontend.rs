@@ -447,7 +447,7 @@ impl Backend for ManagedBackend {
                     }
                     result
                 };
-                result?;
+                result.map_err(BackendError::runtime_content_publication)?;
             }
             let snapshot = self.fetch_snapshot().await?;
             return self.snapshot_attr(&snapshot, id).await;

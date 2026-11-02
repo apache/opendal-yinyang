@@ -236,9 +236,11 @@ executable flag, the shared node lock
 publishes dirty content, commits a Planner based on the handle's recorded
 content revision, and advances only that clean handle to the receipt revision.
 An external content change therefore produces Conflict rather than rebasing
-old staged bytes onto new content. FLUSH, FSYNC, an `O_SYNC`/`O_DSYNC` write
-publication, or truncate-with-publication reports the shared content-conflict
-errno (`ESTALE`) and leaves the local bytes retained for an explicit refresh
+old staged bytes onto new content. Managed chmod routes that Conflict, from
+either content publication or the metadata commit based on the recorded base,
+through the shared content-conflict result (`ESTALE`). FLUSH, FSYNC, an
+`O_SYNC`/`O_DSYNC` write publication, or truncate-with-publication also
+reports this errno and leaves the local bytes retained for an explicit refresh
 or resolution. Ownership, timestamps and other mode bits are not persisted.
 
 ### Direct writable callbacks
