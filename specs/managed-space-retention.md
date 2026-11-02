@@ -1,11 +1,13 @@
-# Managed space reporting and retention planning
+# Managed space reporting, retention planning, and logical expiry
 
-**Status: experimental and non-destructive.**
+**Status: experimental. Reporting and planning are observation-only. Explicit
+expiry changes logical revision visibility and never performs physical
+deletion.**
 
 The `yy --volume CONFIG space` commands report observed Managed storage and
-build an explicit revision-protection plan. They do not delete data, run
-garbage collection, create a remote pin protocol, or estimate reclaimable
-bytes.
+build an explicit revision-protection plan. A separate explicit command can
+make selected historical revisions unavailable to fresh observations while
+retaining their history identity, receipts, and physical bytes.
 
 ## Commands
 
@@ -13,23 +15,29 @@ bytes.
 yy --volume CONFIG space report [--json]
 yy --volume CONFIG space retention plan \
   [--keep-last N] [--keep REVISION]... [--backup PATH]... [--json]
+yy --volume CONFIG space retention expire \
+  --revision REVISION [--revision REVISION]... [--backup PATH]... [--json]
 ```
 
-`--volume` is required. The configuration must use `model: managed`; Direct
-volumes and their namespace objects are rejected before authority connection.
-The command is observation-only even when the volume configuration is writable.
+`--volume` is required. Managed `report` and `plan` use the selected authority.
+Direct `report` and `plan` keep their existing local-state observation path and
+make no Managed authority or namespace-object claim. Direct and read-only
+volumes reject `expire` before authority or local-state side effects. `expire`
+requires a writable Managed volume. `report` and `plan` remain observation-only
+even when the volume configuration is writable.
 
-`space report --json` emits `yinyang.managed-space.report.v4`. `space retention
-plan --json` emits `yinyang.managed-retention.plan.v4`. Revisions are 24-byte
+`space report --json` emits `yinyang.managed-space.report.v5`. `space retention
+plan --json` emits `yinyang.managed-retention.plan.v5`. `space retention expire
+--json` emits `yinyang.managed-retention.expiry.v1`. Revisions are 24-byte
 hexadecimal strings, filesystem identities are 16-byte hexadecimal strings,
 and enum values are `snake_case`. Unknown values are `null`; optional evidence
 is not represented by fabricated zeroes.
 
 ## Admission and read-only effects
 
-The command performs the ordinary strict volume parse and capability admission,
-constructs the selected Managed authority, and observes existing state. It
-does not:
+Managed `report` and `plan` perform the ordinary strict volume parse and
+capability admission, construct the selected authority, and observe existing
+state. They do not:
 
 - create a filesystem or call `Fs::create`;
 - create, migrate, recover, or clean a local staging database;
@@ -38,13 +46,15 @@ does not:
 - publish, repair, acknowledge, or delete namespace or content records; or
 - change authoritative existing SQLite/WAL bytes.
 
-Appropriate `retained_revisions` support is authority-specific. The object
-authority returns metadata-authenticated revisions from its existing history
-index. The metadata service and authenticated service client enumerate the
-durable revision table with bounded pages of at most 256 revisions. Embedded
-service reads use a read-only SQLite connection; client pages remain inside the
-existing 16 MiB RPC frame. The implementation does not infer history from local
-staging, current physical objects, or service absence.
+`expire` uses the mutation admission and lease rules below.
+
+Appropriate typed history support is authority-specific. The object authority
+returns metadata-authenticated readable and expired revision identities from
+its history index. The metadata service and authenticated service client
+enumerate the durable revision table with bounded pages of at most 256
+revisions. Embedded service reads use a read-only SQLite connection; client
+pages remain inside the existing 16 MiB RPC frame. The implementation does not
+infer history from local staging, current physical objects, or service absence.
 
 Opening a known SQLite database read-only may create an empty WAL file or
 create/update derived `-shm` coordination files. Those files are observations,
@@ -65,13 +75,16 @@ Logical live content is measured from that one immutable snapshot:
 - `unique_content_count` and `unique_content_bytes` deduplicate equal
   `ContentId` values in that snapshot.
 
-Logical retained content uses the authority's retained revision index. Each
-successfully observed revision has the same live-content fields.
-`observed_file_bytes` sums bytes across observed snapshots and therefore counts
-the same logical content more than once when it appears in more than one
-revision. `observed_unique_content_bytes` deduplicates equal content identities
-across those observed snapshots. A partial observation is explicit; unavailable
-revisions are not treated as empty.
+Logical retained content uses the authority's typed revision history. Known
+expired identities contribute to `revision_count` and
+`expired_revision_count` but are not opened as snapshots. Each successfully
+observed readable revision has the same live-content fields.
+`readable_revision_count` counts readable identities.
+`observed_file_bytes` sums bytes across observed readable snapshots and
+therefore counts the same logical content more than once when it appears in
+more than one revision. `observed_unique_content_bytes` deduplicates equal
+content identities across those observed snapshots. A partial observation is
+explicit; unavailable revisions are not treated as empty or expired.
 
 Physical accounting lists current object keys below
 `.yinyang/v2/<filesystem>/packs/` and separates the current `.yinyang/head`
@@ -144,6 +157,11 @@ lengths, ledger error count, frozen commit identities, and the recorded remote
 base revisions. Handle lengths are local staged logical lengths, not directory
 allocation.
 
+Every ready durable handle protects its recorded base with `staging_base`,
+including a clean handle whose only remaining recovery evidence is its UUID.
+Dirty, frozen, conflict, Unknown, and failed state add their corresponding
+reasons without replacing the base reason.
+
 When `sync.db` exists, `Sync::inspect` reads its content intents without taking
 a writer lease. Intent evidence includes baseline revision, original CommitId,
 state (`prepared`, `unknown`, `committed`, `conflict`, `retryable`, or `failed`)
@@ -159,9 +177,10 @@ use `sync_engine_receipt`; conflict-recorded remote revisions use
 revisions to protect.
 
 The JSON document exposes these joins as `staging.sync` and `staging.engine`.
-Missing files report `missing`; malformed or unknown existing databases report
-`unavailable` with their error and are not repaired. `staging.databases` records
-each observed database role separately.
+An optional database that does not exist is absent, not malformed; a declared
+staging path with no component is `not_initialized`. Present malformed, foreign,
+or unknown databases report `unavailable` with their error and are not
+repaired. `staging.databases` records each observed database role separately.
 
 Volume-bound `space report` and `space retention plan` call
 `inspect_bound_local_staging` with the observed authority filesystem. Existing
@@ -198,7 +217,8 @@ Retention defaults to `keep_all`. Supplying `--keep-last N` and/or one or more
 `--keep REVISION` values selects the bounded policy. `N` must be at least one.
 Every plan reports `published_history: "retained_by_default"`. Bounded
 selection does not delete, expire, or hide retained revisions, receipts, or
-their metadata roots.
+their metadata roots. Known expired identities remain visible with state
+`expired`, are not selected, and are never treated as empty history.
 
 An explicit `--backup PATH` package is validated read-only with the existing
 backup manifest checksum, shape checks, and package validator. Validation does
@@ -210,11 +230,11 @@ revisions are not attributed to the volume.
 The selected set is the union of:
 
 - the latest observed revision;
-- the newest `N` revisions from the authority's retained-revision list, when
+- the newest `N` readable revisions from the authority's typed history, when
   requested;
-- every requested revision that is present in the retained list; and
-- remote base revisions recorded by existing pending, frozen, conflict,
-  Unknown, or failed staging handles;
+- every requested readable revision; and
+- the base revision recorded by every ready durable staging handle, including
+  clean handles that remain recoverable by UUID;
 - baselines recorded by content Sync intents; and
 - receipt revisions recorded by committed content Sync intents;
 - per-entry remote revisions recorded by the Sync engine common baseline and
@@ -223,33 +243,41 @@ The selected set is the union of:
   baselines, committed receipt revisions, engine conflict revisions, and engine
   baseline revisions.
 
-A requested revision absent from a successfully observed retained list is
-reported as `not_retained` and makes the plan partial. If the authority cannot
-list retained revisions, requested-pin membership is `null`, not `false`, and
-the plan cannot claim completeness.
+A requested revision has state `readable`, `expired`, or `not_retained`.
+Absent revisions make the plan partial. If the authority cannot list history,
+requested-pin membership is `null`, state is `unknown`, and the plan cannot
+claim completeness.
 
 Each revision decision records whether it is selected and why. Reasons are
 declarative protection evidence, not deletion eligibility. Every revision
 outside a bounded selection remains visible with
 `outside_bounded_policy`; the plan never treats that reason as permission to
-remove data.
+remove data. Expired decisions remain visible with reason `expired`.
 
 Selection reasons are drawn from:
 
 - `current`, `keep_all`, `keep_last`, and `requested_pin`;
+- `staging_base`;
 - `staging_pending`, `staging_frozen`, `staging_unknown`,
   `staging_conflict`, and `staging_failed`;
 - `sync_intent_prepared`, `sync_intent_unknown`, `sync_intent_receipt`,
   `sync_intent_conflict`, `sync_intent_retryable`, and `sync_intent_failed`;
 - `sync_receipt`;
 - `sync_engine_conflict`, `sync_engine_baseline`, and `sync_engine_receipt`; and
-- `backup_staging_pending`, `backup_staging_frozen`, `backup_staging_unknown`,
+- `backup_staging_base`, `backup_staging_pending`,
+  `backup_staging_frozen`, `backup_staging_unknown`,
   `backup_staging_conflict`, `backup_staging_failed`,
   `backup_sync_intent_prepared`, `backup_sync_intent_unknown`,
   `backup_sync_intent_receipt`, `backup_sync_intent_conflict`,
   `backup_sync_intent_retryable`, `backup_sync_intent_failed`,
   `backup_sync_receipt`, `backup_sync_engine_conflict`,
   `backup_sync_engine_baseline`, and `backup_sync_engine_receipt`.
+
+Every ready handle contributes `staging_base` because recovery can still read
+an uncovered range from that base and a later write continues to use it for
+publication predicates. Dirty, frozen, conflict, Unknown, or failed state adds
+the corresponding reason without replacing the base reason. A clean handle is
+not disposable protection evidence while its UUID remains in durable staging.
 
 The plan also reports:
 
@@ -270,22 +298,145 @@ The plan also reports:
 - `quiescence: "not_observed"`.
 
 Receipt records remain revision evidence, not a physical cleanup
-authorization. Backup packages are not discovered automatically. A revision
-needed by an undisclosed backup, external reader, or another unpinned workflow
-must be supplied as an explicit requested pin or via `--backup`, and quiescence
-must be established by the operator outside this command.
+authorization. The latest snapshot's total receipt count is descriptive and
+does not select every receipt revision. A snapshot is selected by
+`sync_receipt` or `backup_sync_receipt` only when an observed local or supplied
+backup intent records that exact dependency. Receipt identity, digest, and
+outcome remain replayable through Core even when their base snapshot becomes
+logically expired.
+
+Backup packages are not discovered automatically. A revision needed by an
+undisclosed backup, external reader, or another unpinned workflow must be
+supplied as an explicit requested pin or via `--backup`, and quiescence must be
+established by the operator outside this command.
 
 `--keep` and `--keep-last` apply only to one invocation; they are not persistent
 pins and do not create a registry. Revisions outside a bounded policy remain
-readable with `outside_bounded_policy`. This contract has no expiry command:
-selection, including `outside_bounded_policy`, never makes a retained revision
-unreadable or indistinguishable from a revision that never existed.
+readable with `outside_bounded_policy`. Planning never makes a retained
+revision unreadable; only the separate explicit `expire` command changes fresh
+lookup state.
 
 Every plan has `deletion_authorized: false` and `reclaimable_bytes: null`.
 Selecting or excluding a revision does not prove that any extent or object is
 unreachable. Shared packs, noncurrent backend versions, prepared orphans,
 metadata pages, external readers, and unobserved staging make a physical
 cleanup decision a separate future contract.
+
+## Explicit logical expiry
+
+Expiry requires every affected writer, reader, mount, Sync process, and backup
+activity for the volume to be stopped. The command's checkable scope is the
+configured `staging` path and every explicitly supplied `--backup` package.
+Other staging directories, external readers, untracked pins, and undisclosed
+backups remain unknown. The command reports `quiescence: "not_observed"` and
+does not claim global isolation.
+
+Admission order is fixed. Direct or read-only volumes are rejected before
+operator construction, credentials, authority connection, or local lease
+acquisition. A writable Managed command then acquires the existing configured
+writer leases in this order:
+
+1. `sync-engine.lock`;
+2. `sync.lock`;
+3. `content/runtime.lock`; and
+4. the Mount/file runtime `runtime.lock`.
+
+Lease acquisition may create the configured directories and lock files. It
+never creates, initializes, migrates, or recovers `sync-engine.db`, `sync.db`,
+`content/staging.db`, or `staging.db`. The leases remain held until the
+authority outcome is known. A held lease or lease error refuses mutation.
+
+After acquiring the leases, the command observes and freezes one exact
+`expected_latest` revision. It then validates the configured local state and
+supplied backups and keeps that revision fixed through dispatch. Core returns
+`Conflict` instead of rebasing if the authority changed.
+
+An optional component database that is absent is declared absent evidence, not
+an empty set inferred from a failed read. A present component that is corrupt,
+foreign, unreadable, or otherwise unverifiable refuses mutation. Every
+explicitly supplied backup must validate completely; missing, corrupt,
+foreign, partial, or unavailable supplied packages also refuse mutation.
+
+The protected set is the union of:
+
+- the fixed expected latest revision;
+- every ready durable handle base, including clean handles recoverable only by
+  UUID;
+- every content Sync intent baseline and committed receipt revision;
+- every Sync engine baseline entry revision, committed intent receipt, and
+  conflict-recorded remote revision; and
+- the same dependencies read from each validated supplied backup.
+
+The latest snapshot's generic receipt count is not a protection set. A
+committed receipt's identity, digest, and outcome are preserved by Core
+independently of whether its base snapshot remains readable.
+
+A protected revision that is missing, already expired, or cannot be verified
+blocks the operation. The maintenance command owns this gate; Core receives
+only the bounded eligible candidate set. No remote or local sidecar registry is
+created.
+
+Candidate classification reads only the deduplicated union of requested
+candidates, protected revisions, and the expected latest revision. The current
+latest snapshot is reused instead of fetched again. A fresh typed observation
+classifies each other identity as `readable`, `expired`, or missing; any other
+error is `unavailable` and refuses mutation. Expiry does not scan all history
+merely to expire a small candidate set.
+
+Candidate decisions are:
+
+- `eligible`: readable, retained, and outside the protected set;
+- `already_expired`: known expired and outside the protected set;
+- `current`, `missing`, or `unavailable`: invalid candidate state;
+- `protected`, `protected_missing`, or `protected_expired`: unsafe dependency.
+
+The input is deduplicated and bounded to Core's 256-candidate request limit.
+Any current, missing, unavailable, protected, incomplete-evidence, or
+unverifiable candidate refuses the whole invocation before mutation. If all
+requested candidates are confirmed already expired after every local and
+backup check succeeds, the command reports `already_expired` with exit code
+zero and issues no new mutation. If expired and eligible candidates are mixed,
+only the eligible identities are sent atomically.
+
+Each invocation generates a new operation identity and reports it as audit
+evidence. The public CLI has no operation-id option and creates no local retry
+journal. The authority request binds the volume, operation identity, exact
+`expected_latest`, and canonical candidate set. The report also contains a
+local `evidence_digest` over the observed maintenance evidence; it is audit
+evidence, not a Core request field or a global completeness claim.
+
+Exit and recovery behavior is:
+
+- `0`: `committed`, or all desired candidates were already expired;
+- `2`: `refused` or expected-latest `conflict`; no new expiry was published;
+- `3`: `retryable` or `unknown`; the request may still take effect.
+
+`conflict`, `refused`, `retryable`, and `unknown` emit the structured expiry
+document. Command, admission, lease, unreadable-history, or internal failures
+that prevent a trustworthy document return a non-zero ordinary error without
+inventing a refusal document.
+
+After `retryable`, `unknown`, or a process crash, every declared local and
+backup activity remains stopped. Rerun the same explicit candidates and
+backups under the leases and verify the monotonic desired candidate state.
+Absence of a marker on one read is not proof that an earlier delayed request
+failed, and the CLI does not claim to replay or find the original expiry
+receipt. Resume only after the desired revisions are confirmed expired, or a
+new operation has committed. Core retains exact `ExpiryRequest` byte replay
+for lower-level callers that store that request; that is separate from the
+CLI's same-candidate recovery.
+
+Fresh observation of a known expired revision returns `Expired`; a revision
+that never existed returns `NotFound`. Already-held immutable snapshots and
+file versions remain usable. Default keep-all and ordinary publication do not
+resurrect an expired revision. Original frozen requests, CommitIds, request
+digests, and committed receipt lookup remain replayable even when their base
+revision is expired.
+
+Every expiry report states `deletion_authorized: false`,
+`reclaimable_bytes: null`, and `physical_cleanup: "not_performed"`. Expiry may
+add metadata and advance mutable authority state, but it does not delete,
+rewrite, compact, or truncate pre-existing immutable content or packs.
 
 ## Report coverage
 
@@ -318,19 +469,23 @@ yy --volume notes.json space retention plan \
 yy --volume notes.json space retention plan \
   --backup /backups/notes-2026-11-01 \
   --json
+yy --volume notes.json space retention expire \
+  --revision 00112233445566778899aabbccddeeff0011223344556677 \
+  --backup /backups/notes-2026-11-01 \
+  --json
 ```
 
 ## Limits
 
 This contract does not provide physical garbage collection, deletion,
 compaction, repacking, a persistent remote pin registry, background scheduling,
-expiry, or a release-supported storage reclamation promise. `--keep` is a
-one-invocation declaration, not a persistent pin. Explicit backup packages are
-validated read-only and do not require the original local root; they remain
-protection evidence, not deletion or expiry authorization. A revision needed
-by an undisclosed backup, external reader, or unpinned workflow must still be
-supplied explicitly. It does not inspect Direct namespaces. It does not make
-SQLite sidecar files byte-identical or infer noncurrent backend versions that
-the configured backend does not return. Reachability does not scrub content
-payloads, and a complete observed root set does not prove global orphanhood,
-external-reader absence, or deletion eligibility.
+default expiry, or a release-supported storage reclamation promise. `--keep`
+is a one-invocation declaration, not a persistent pin. Explicit backup
+packages are validated read-only and do not require the original local root;
+they remain protection evidence, not deletion authorization. A revision
+needed by an undisclosed backup, external reader, or unpinned workflow must
+still be supplied explicitly. It does not inspect Direct namespaces. It does
+not make SQLite sidecar files byte-identical or infer noncurrent backend
+versions that the configured backend does not return. Reachability does not
+scrub content payloads, and a complete observed root set does not prove global
+orphanhood, external-reader absence, or deletion eligibility.

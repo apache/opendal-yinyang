@@ -357,36 +357,37 @@ impl DirectoryJournal {
                 }
             }
         }
-        let request = match self.inner.authority.restore_transaction(&row.request).await {
-            Ok(request) => request,
-            Err(error) => {
-                let error = Error::from(error);
-                if matches!(&status.state, DirectoryState::Unknown) {
-                    return Err(unknown_after_dispatch(self, commit_id, error).await);
-                }
-                let state = match error.kind() {
-                    ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
-                        intent::State::Failed.code()
+        let (_, frozen_id, frozen_digest) =
+            match Transaction::verify_identity(&row.request, self.inner.authority.filesystem()) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let error = Error::from(error);
+                    if matches!(&status.state, DirectoryState::Unknown) {
+                        return Err(unknown_after_dispatch(self, commit_id, error).await);
                     }
-                    _ => intent::State::Retryable.code(),
-                };
-                let failure = Failure::capture(&error);
-                save_state_async(
-                    self,
-                    commit_id,
-                    state,
-                    None,
-                    Some(failure.clone()),
-                    StateFilter::Local,
-                )
-                .await?;
-                return Err(Error::Retained(failure));
-            }
-        };
-        if request.id() != commit_id || request.digest() != row.digest() {
+                    let state = match error.kind() {
+                        ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
+                            intent::State::Failed.code()
+                        }
+                        _ => intent::State::Retryable.code(),
+                    };
+                    let failure = Failure::capture(&error);
+                    save_state_async(
+                        self,
+                        commit_id,
+                        state,
+                        None,
+                        Some(failure.clone()),
+                        StateFilter::Local,
+                    )
+                    .await?;
+                    return Err(Error::Retained(failure));
+                }
+            };
+        if frozen_id != commit_id || frozen_digest != row.digest() {
             let error = Error::local_kind(
                 ErrorKind::Corrupt,
-                "restored directory transaction identity disagrees",
+                "frozen directory transaction identity disagrees",
             );
             if matches!(&status.state, DirectoryState::Unknown) {
                 return Err(unknown_after_dispatch(self, commit_id, error).await);
@@ -419,7 +420,20 @@ impl DirectoryJournal {
                 return Err(error);
             }
         }
-        match self.inner.authority.commit(&request).await {
+        let outcome = match self
+            .inner
+            .authority
+            .commit_frozen_batch(std::slice::from_ref(&row.request))
+            .await
+        {
+            Ok(mut outcomes) if outcomes.len() == 1 => Ok(outcomes.remove(0)),
+            Ok(_) => Err(Error::local_kind(
+                ErrorKind::Corrupt,
+                "frozen directory batch returned an invalid outcome count",
+            )),
+            Err(error) => Err(Error::from(error)),
+        };
+        match outcome {
             Ok(CommitOutcome::Committed(receipt)) => {
                 if receipt.commit_id != commit_id || receipt.request_digest != row.digest() {
                     return Err(unknown_after_dispatch(

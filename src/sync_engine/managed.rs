@@ -197,14 +197,13 @@ impl RemoteAdapter for ManagedAdapter {
         &self,
         requests: &[PreparedRemoteRequest],
     ) -> Result<Vec<RemoteOutcome>> {
-        let mut transactions = Vec::with_capacity(requests.len());
-        for request in requests {
-            transactions
-                .push(super::managed_intent::prepare(&self.authority, &request.request).await?);
-        }
+        let frozen = requests
+            .iter()
+            .map(|request| request.request.bytes.clone())
+            .collect::<Vec<_>>();
         let results = self
             .authority
-            .commit_batch(&transactions)
+            .commit_frozen_batch(&frozen)
             .await
             .map_err(Error::from)?;
         if results.len() != requests.len() {

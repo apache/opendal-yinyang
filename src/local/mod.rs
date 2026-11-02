@@ -15,4 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod lease;
 pub(crate) mod store;

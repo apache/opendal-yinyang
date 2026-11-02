@@ -179,9 +179,12 @@ transaction with a `synchronous=FULL` commit. The full WAL sync also makes every
 earlier `NORMAL` write durable, so no second checkpoint is needed before
 dispatch. While frozen, new writes are rejected. Retry restores that same
 identity, digest, descriptor, and predicates, including after process restart;
-it does not reprepare or rebase. Success updates the sparse base to the
-receipt's revision with another `synchronous=FULL` commit before returning. It
-never silently observes a newer conflicting file.
+it does not reprepare or rebase. Recovery submits the original frozen bytes
+through the authority's receipt-first frozen batch. A committed receipt is
+resolved before base readiness; a pending request can restore its exact known
+base even when that revision is logically expired. Success updates the sparse
+base to the receipt's revision with another `synchronous=FULL` commit before
+returning. It never silently observes a newer conflicting file.
 
 A stale file generation, changed executable state, or unlink produces Conflict.
 Staged bytes remain readable for explicit recovery/export or abort. Retryable

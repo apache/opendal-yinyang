@@ -19,8 +19,8 @@
 use crate::object::{ObjectFs, Outcome};
 use crate::reachability::PhysicalInspection;
 use crate::{
-    ContentEdit, DataStore, FileVersion, NodeId, PreparedContent, Result, Revision, Snapshot,
-    Transaction,
+    ContentEdit, DataStore, ExpiryRequest, FileVersion, NodeId, PreparedContent, Result, Revision,
+    Snapshot, Transaction,
 };
 use futures_util::future::BoxFuture;
 use std::collections::BTreeSet;
@@ -29,12 +29,24 @@ use tokio::io::AsyncRead;
 /// Maximum number of retained revisions returned by one authority request.
 pub const RETAINED_REVISIONS_PAGE_MAX: u32 = 256;
 
-/// One strictly ordered page from an authority's retained revision index.
+/// Whether a known revision may still be opened by a fresh observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevisionStatus {
+    Readable,
+    Expired,
+}
+
+/// One known revision and its current fresh-lookup state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RevisionRecord {
+    pub revision: Revision,
+    pub status: RevisionStatus,
+}
+
+/// One strictly ordered page of known revision history.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RevisionPage {
-    /// Revisions returned by this request.
-    pub revisions: Vec<Revision>,
-    /// Exclusive continuation for the next page.
+pub struct RevisionHistoryPage {
+    pub revisions: Vec<RevisionRecord>,
     pub next: Option<Revision>,
 }
 
@@ -44,23 +56,7 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     fn root(&self) -> NodeId;
     fn observe_latest(&self) -> BoxFuture<'_, Result<Snapshot>>;
     fn observe_revision(&self, revision: Revision) -> BoxFuture<'_, Result<Snapshot>>;
-    /// List metadata-authenticated revisions retained by this authority.
-    ///
-    /// The default keeps backends without a revision index explicit rather
-    /// than inferring history from content or local staging.
-    fn retained_revisions_page(
-        &self,
-        _after: Option<Revision>,
-        _limit: u32,
-    ) -> BoxFuture<'_, Result<RevisionPage>> {
-        Box::pin(async {
-            Err(crate::Error::unsupported(
-                "list retained revisions",
-                "authority does not expose a revision index",
-            ))
-        })
-    }
-    /// List every retained revision using bounded authority pages.
+    /// List every currently readable revision using bounded typed history pages.
     fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
         Box::pin(async move {
             let mut after = None;
@@ -68,29 +64,24 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
             let mut seen = BTreeSet::new();
             loop {
                 let page = self
-                    .retained_revisions_page(after, RETAINED_REVISIONS_PAGE_MAX)
+                    .revision_history_page(after, RETAINED_REVISIONS_PAGE_MAX)
                     .await?;
-                if page.revisions.is_empty() {
-                    if page.next.is_some() {
+                let mut last = None;
+                for record in &page.revisions {
+                    if after.is_some_and(|cursor| record.revision <= cursor)
+                        || !seen.insert(record.revision)
+                    {
                         return Err(crate::Error::new(
                             crate::ErrorKind::Corrupt,
-                            "list retained revisions",
-                            "authority returned an empty non-terminal page",
-                        ));
-                    }
-                    break;
-                }
-                for revision in page.revisions {
-                    if after.is_some_and(|cursor| revision <= cursor) || !seen.insert(revision) {
-                        return Err(crate::Error::new(
-                            crate::ErrorKind::Corrupt,
-                            "list retained revisions",
+                            "list revision history",
                             "authority page is not strictly ordered",
                         ));
                     }
-                    revisions.push(revision);
+                    last = Some(record.revision);
+                    if record.status == RevisionStatus::Readable {
+                        revisions.push(record.revision);
+                    }
                 }
-                let last = revisions.last().copied();
                 match page.next {
                     Some(next)
                         if after.is_none_or(|cursor| next > cursor) && last == Some(next) =>
@@ -100,7 +91,72 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
                     Some(_) => {
                         return Err(crate::Error::new(
                             crate::ErrorKind::Corrupt,
-                            "list retained revisions",
+                            "list revision history",
+                            "authority continuation does not advance",
+                        ));
+                    }
+                    None => break,
+                }
+            }
+            Ok(revisions)
+        })
+    }
+    /// List known readable and expired revisions using bounded authority pages.
+    fn revision_history_page(
+        &self,
+        _after: Option<Revision>,
+        _limit: u32,
+    ) -> BoxFuture<'_, Result<RevisionHistoryPage>> {
+        Box::pin(async {
+            Err(crate::Error::unsupported(
+                "list revision history",
+                "authority does not expose revision history",
+            ))
+        })
+    }
+    /// List all known revisions, including their expiry state.
+    fn revision_history(&self) -> BoxFuture<'_, Result<Vec<RevisionRecord>>> {
+        Box::pin(async move {
+            let mut after = None;
+            let mut revisions = Vec::new();
+            let mut seen = BTreeSet::new();
+            loop {
+                let page = self
+                    .revision_history_page(after, RETAINED_REVISIONS_PAGE_MAX)
+                    .await?;
+                if page.revisions.is_empty() {
+                    if page.next.is_some() {
+                        return Err(crate::Error::new(
+                            crate::ErrorKind::Corrupt,
+                            "list revision history",
+                            "authority returned an empty non-terminal page",
+                        ));
+                    }
+                    break;
+                }
+                for record in page.revisions {
+                    if after.is_some_and(|cursor| record.revision <= cursor)
+                        || !seen.insert(record.revision)
+                    {
+                        return Err(crate::Error::new(
+                            crate::ErrorKind::Corrupt,
+                            "list revision history",
+                            "authority page is not strictly ordered",
+                        ));
+                    }
+                    revisions.push(record);
+                }
+                let last = revisions.last().map(|record| record.revision);
+                match page.next {
+                    Some(next)
+                        if after.is_none_or(|cursor| next > cursor) && last == Some(next) =>
+                    {
+                        after = Some(next);
+                    }
+                    Some(_) => {
+                        return Err(crate::Error::new(
+                            crate::ErrorKind::Corrupt,
+                            "list revision history",
                             "authority continuation does not advance",
                         ));
                     }
@@ -119,6 +175,35 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
         &'a self,
         requests: &'a [Transaction],
     ) -> BoxFuture<'a, Result<Vec<Outcome>>>;
+    /// Mark exact known revisions logically expired.
+    ///
+    /// Implementations must check an existing request receipt before consulting
+    /// expected-latest or candidate state so an exact retry can reuse its
+    /// original receipt after later publications.
+    fn expire<'a>(&'a self, _request: &'a ExpiryRequest) -> BoxFuture<'a, Result<Outcome>> {
+        Box::pin(async {
+            Err(crate::Error::unsupported(
+                "expire revisions",
+                "authority does not support explicit expiry",
+            ))
+        })
+    }
+    /// Replay exact frozen-plan bytes.
+    ///
+    /// The default preserves correctness for simple authorities. Authorities
+    /// that can resolve receipts without restoring content should override it.
+    fn commit_frozen_batch<'a>(
+        &'a self,
+        requests: &'a [Vec<u8>],
+    ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
+        Box::pin(async move {
+            let mut restored = Vec::with_capacity(requests.len());
+            for request in requests {
+                restored.push(self.restore_transaction(request).await?);
+            }
+            self.commit_batch(&restored).await
+        })
+    }
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.data().accept(content)?;
@@ -215,18 +300,30 @@ macro_rules! impl_authority_forwarding {
             fn observe_revision(&self, revision: Revision) -> BoxFuture<'_, Result<Snapshot>> {
                 Box::pin(self.observe_revision(revision))
             }
-            fn retained_revisions_page(
+            fn revision_history_page(
                 &self,
                 after: Option<Revision>,
                 limit: u32,
-            ) -> BoxFuture<'_, Result<RevisionPage>> {
-                Box::pin(self.retained_revisions_page(after, limit))
+            ) -> BoxFuture<'_, Result<RevisionHistoryPage>> {
+                Box::pin(self.revision_history_page(after, limit))
             }
             fn commit_batch<'a>(
                 &'a self,
                 requests: &'a [Transaction],
             ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
                 Box::pin(self.commit_batch(requests))
+            }
+            fn expire<'a>(
+                &'a self,
+                request: &'a ExpiryRequest,
+            ) -> BoxFuture<'a, Result<Outcome>> {
+                Box::pin(self.expire(request))
+            }
+            fn commit_frozen_batch<'a>(
+                &'a self,
+                requests: &'a [Vec<u8>],
+            ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
+                Box::pin(self.commit_frozen_batch(requests))
             }
             $($additional)*
         }
@@ -247,6 +344,9 @@ impl_authority_forwarding!(ObjectFs, {
                 }
             }
         })
+    }
+    fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
+        Box::pin(self.restore_transaction(bytes))
     }
 });
 

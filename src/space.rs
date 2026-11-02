@@ -21,25 +21,76 @@
 //! metadata, current backend objects, and existing local staging state without
 //! opening a writer, acquiring a runtime lease, or changing local databases.
 
+#[cfg(target_os = "linux")]
+use crate::runtime::StagingLease;
 use crate::runtime::{ErrorKind as RuntimeErrorKind, Runtime};
+#[cfg(target_os = "linux")]
+use crate::sync::StateLease as SyncStateLease;
 use crate::sync::{ContentStatus, IntentState, Sync};
 #[cfg(target_os = "linux")]
 use crate::sync_engine::{
-    EngineInspection, inspect_backup_package, inspect_protection, inspect_state,
+    EngineInspection, StateLease as EngineStateLease, inspect_backup_package, inspect_protection,
+    inspect_state,
 };
 use opendal::{EntryMode, Operator};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use yinyang_core::reachability::PhysicalReferenceKind;
-use yinyang_core::{Authority, Error, ErrorKind, NodeId, NodeKind, Result, Revision, Snapshot};
+use yinyang_core::{
+    Authority, CommitId, Error, ErrorKind, NodeId, NodeKind, Result, Revision, RevisionRecord,
+    RevisionStatus, Snapshot,
+};
+#[cfg(target_os = "linux")]
+use yinyang_core::{CommitOutcome, ExpiryRequest};
 
-pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v4";
-pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v4";
+pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v5";
+pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v5";
+pub const RETENTION_EXPIRY_SCHEMA: &str = "yinyang.managed-retention.expiry.v1";
 
 const HEAD_KEY: &str = ".yinyang/head";
 const PACK_ROOT: &str = ".yinyang/v2";
 const SCAN_LIMIT: usize = 4096;
+
+#[cfg(target_os = "linux")]
+struct ExpiryLeases {
+    _engine: EngineStateLease,
+    _sync: SyncStateLease,
+    _content: StagingLease,
+    _runtime: StagingLease,
+}
+
+#[cfg(target_os = "linux")]
+impl ExpiryLeases {
+    async fn acquire(staging: &Path) -> Result<Self> {
+        let engine = EngineStateLease::acquire(staging)
+            .map_err(|error| expiry_lease_error("Sync engine", error))?;
+        let sync = SyncStateLease::acquire(staging)
+            .await
+            .map_err(|error| expiry_lease_error("content Sync", error))?;
+        let content = StagingLease::acquire(staging.join("content"))
+            .await
+            .map_err(|error| expiry_lease_error("content runtime", error))?;
+        let runtime = StagingLease::acquire(staging.to_owned())
+            .await
+            .map_err(|error| expiry_lease_error("runtime", error))?;
+        Ok(Self {
+            _engine: engine,
+            _sync: sync,
+            _content: content,
+            _runtime: runtime,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_lease_error(subject: &'static str, error: impl std::fmt::Display) -> Error {
+    Error::new(
+        ErrorKind::Storage,
+        "acquire expiry maintenance leases",
+        format!("{subject} local-state lease is unavailable: {error}"),
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +169,8 @@ pub struct LogicalRevision {
 pub struct RetainedLogicalSpace {
     pub state: MeasurementState,
     pub revision_count: Option<u64>,
+    pub readable_revision_count: Option<u64>,
+    pub expired_revision_count: Option<u64>,
     pub observed_revisions: Vec<LogicalRevision>,
     pub observed_file_bytes: u64,
     pub observed_unique_content_bytes: u64,
@@ -385,6 +438,8 @@ pub struct ManagedRetentionPlan {
     pub state: MeasurementState,
     pub policy: RetentionPolicyReport,
     pub retained_revision_count: Option<u64>,
+    pub readable_revision_count: Option<u64>,
+    pub expired_revision_count: Option<u64>,
     pub revisions: Vec<RetentionRevision>,
     pub protection: RetentionProtection,
     pub unresolved: Vec<Unresolved>,
@@ -405,11 +460,29 @@ pub struct RetentionPolicyReport {
 pub struct RequestedPin {
     pub revision: String,
     pub retained: Option<bool>,
+    pub state: RequestedPinState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedPinState {
+    Readable,
+    Expired,
+    NotRetained,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionRevisionState {
+    Readable,
+    Expired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RetentionRevision {
     pub revision: String,
+    pub state: RetentionRevisionState,
     pub selected: bool,
     pub reasons: Vec<&'static str>,
     pub files: Option<u64>,
@@ -479,6 +552,60 @@ pub struct ReceiptEvidence {
     pub revisions: Option<u64>,
     pub treatment: &'static str,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedExpiryReport {
+    pub schema: &'static str,
+    pub filesystem: String,
+    pub operation_id: String,
+    pub observed_revision: String,
+    pub after_revision: Option<String>,
+    pub state: ExpiryReportState,
+    pub evidence_digest: String,
+    pub staging: StagingProtection,
+    pub backups: BackupProtection,
+    pub revisions: Vec<ExpiryRevisionDecision>,
+    pub unresolved: Vec<Unresolved>,
+    pub external_readers: &'static str,
+    pub untracked_pins: &'static str,
+    pub quiescence: &'static str,
+    pub deletion_authorized: bool,
+    pub reclaimable_bytes: Option<u64>,
+    pub physical_cleanup: &'static str,
+    pub limits: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryReportState {
+    Committed,
+    AlreadyExpired,
+    Refused,
+    Conflict,
+    Retryable,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryDecisionState {
+    Eligible,
+    Expired,
+    AlreadyExpired,
+    Current,
+    Missing,
+    Unavailable,
+    Protected,
+    ProtectedMissing,
+    ProtectedExpired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExpiryRevisionDecision {
+    pub revision: String,
+    pub state: ExpiryDecisionState,
+    pub reasons: Vec<&'static str>,
 }
 
 #[derive(Default)]
@@ -583,7 +710,7 @@ pub async fn inspect_managed_space(
         observed_revision: revision_hex(snapshot.revision()),
         measurement: SpaceMeasurement {
             logical_live: "latest_authority_snapshot",
-            logical_retained: "authority_retained_revision_metadata",
+            logical_retained: "authority_revision_history_metadata",
             physical_objects: "recursive_current_object_listing",
             referenced_extents: "authenticated_index_references_without_payload_reads",
             local_staging: "existing_database_read_only_plus_directory_metadata",
@@ -733,6 +860,7 @@ fn staging_protection(staging: &StagingSpace) -> StagingProtection {
 
 fn backup_reason(reason: &'static str) -> &'static str {
     match reason {
+        "staging_base" => "backup_staging_base",
         "staging_pending" => "backup_staging_pending",
         "staging_frozen" => "backup_staging_frozen",
         "staging_unknown" => "backup_staging_unknown",
@@ -814,55 +942,117 @@ pub async fn plan_managed_retention(
             ),
         });
     }
-    let (revisions, retained_revision_count, state) = match authority.retained_revisions().await {
-        Ok(revisions) => {
-            let mut revisions = revisions;
-            revisions.sort();
-            revisions.dedup();
-            if revisions.binary_search(&latest.revision()).is_err() {
-                revisions.push(latest.revision());
-                revisions.sort();
+    let (history, retained_revision_count, readable_revision_count, expired_revision_count, state) =
+        match authority.revision_history().await {
+            Ok(mut records) => {
+                records.sort_by_key(|record| record.revision);
+                let mut complete = true;
+                if !records
+                    .iter()
+                    .any(|record| record.revision == latest.revision())
+                {
+                    complete = false;
+                    unresolved.push(Unresolved {
+                        subject: "retained-revisions".to_owned(),
+                        state: "latest-not-listed".to_owned(),
+                        detail: revision_hex(latest.revision()),
+                    });
+                    records.push(RevisionRecord {
+                        revision: latest.revision(),
+                        status: RevisionStatus::Readable,
+                    });
+                    records.sort_by_key(|record| record.revision);
+                }
+                let history = records
+                    .into_iter()
+                    .map(|record| (record.revision, record.status))
+                    .collect::<BTreeMap<_, _>>();
+                let total = history.len() as u64;
+                let readable = history
+                    .values()
+                    .filter(|status| **status == RevisionStatus::Readable)
+                    .count() as u64;
+                let expired = total.saturating_sub(readable);
+                (
+                    history,
+                    Some(total),
+                    Some(readable),
+                    Some(expired),
+                    if complete {
+                        MeasurementState::Available
+                    } else {
+                        MeasurementState::Partial
+                    },
+                )
             }
-            let count = revisions.len() as u64;
-            (revisions, Some(count), MeasurementState::Available)
-        }
-        Err(error) => {
-            unresolved.push(Unresolved {
-                subject: "retained-revisions".to_owned(),
-                state: "unavailable".to_owned(),
-                detail: error.to_string(),
-            });
-            (vec![latest.revision()], None, MeasurementState::Unavailable)
-        }
-    };
+            Err(error) => {
+                unresolved.push(Unresolved {
+                    subject: "retained-revisions".to_owned(),
+                    state: "unavailable".to_owned(),
+                    detail: error.to_string(),
+                });
+                (
+                    BTreeMap::from([(latest.revision(), RevisionStatus::Readable)]),
+                    None,
+                    None,
+                    None,
+                    MeasurementState::Unavailable,
+                )
+            }
+        };
 
-    let retained_set = revisions.iter().copied().collect::<BTreeSet<_>>();
+    let revisions = history.keys().copied().collect::<Vec<_>>();
+    let readable_revisions = history
+        .iter()
+        .filter(|(_, status)| **status == RevisionStatus::Readable)
+        .map(|(revision, _)| *revision)
+        .collect::<Vec<_>>();
     let pins = requested_pins.iter().copied().collect::<BTreeSet<_>>();
     let requested = requested_pins
         .iter()
         .map(|revision| RequestedPin {
             revision: revision_hex(*revision),
-            retained: retained_revision_count.map(|_| retained_set.contains(revision)),
+            retained: retained_revision_count.map(|_| history.contains_key(revision)),
+            state: if retained_revision_count.is_none() {
+                RequestedPinState::Unknown
+            } else {
+                match history.get(revision) {
+                    Some(RevisionStatus::Readable) => RequestedPinState::Readable,
+                    Some(RevisionStatus::Expired) => RequestedPinState::Expired,
+                    None => RequestedPinState::NotRetained,
+                }
+            },
         })
         .collect::<Vec<_>>();
     if retained_revision_count.is_some() {
         for revision in requested_pins {
-            if retained_set.contains(revision) {
-                continue;
+            match history.get(revision) {
+                Some(RevisionStatus::Readable) => {}
+                Some(RevisionStatus::Expired) => unresolved.push(Unresolved {
+                    subject: "requested-pin".to_owned(),
+                    state: "expired".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
+                None => unresolved.push(Unresolved {
+                    subject: "requested-pin".to_owned(),
+                    state: "not_retained".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
             }
-            unresolved.push(Unresolved {
-                subject: "requested-pin".to_owned(),
-                state: "not_retained".to_owned(),
-                detail: revision_hex(*revision),
-            });
         }
         for revision in staging.protected.keys() {
-            if !retained_set.contains(revision) {
-                unresolved.push(Unresolved {
+            match history.get(revision) {
+                Some(RevisionStatus::Readable) => {}
+                Some(RevisionStatus::Expired) => unresolved.push(Unresolved {
+                    subject: "local-staging-pin".to_owned(),
+                    state: "protected-expired".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
+                None => unresolved.push(Unresolved {
                     subject: "local-staging-pin".to_owned(),
                     state: "not_retained".to_owned(),
                     detail: revision_hex(*revision),
-                });
+                }),
             }
         }
     }
@@ -878,12 +1068,18 @@ pub async fn plan_managed_retention(
     }
     if retained_revision_count.is_some() {
         for revision in backup_protected.keys() {
-            if !retained_set.contains(revision) {
-                unresolved.push(Unresolved {
+            match history.get(revision) {
+                Some(RevisionStatus::Readable) => {}
+                Some(RevisionStatus::Expired) => unresolved.push(Unresolved {
+                    subject: "backup-pin".to_owned(),
+                    state: "protected-expired".to_owned(),
+                    detail: revision_hex(*revision),
+                }),
+                None => unresolved.push(Unresolved {
                     subject: "backup-pin".to_owned(),
                     state: "not_retained".to_owned(),
                     detail: revision_hex(*revision),
-                });
+                }),
             }
         }
     }
@@ -892,10 +1088,10 @@ pub async fn plan_managed_retention(
     let keep_last_set = keep_last
         .map(|count| {
             let count = usize::try_from(count).unwrap_or(usize::MAX);
-            revisions
+            readable_revisions
                 .iter()
                 .copied()
-                .skip(revisions.len().saturating_sub(count))
+                .skip(readable_revisions.len().saturating_sub(count))
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
@@ -904,6 +1100,19 @@ pub async fn plan_managed_retention(
     let protected = &protected;
     let mut decisions = Vec::with_capacity(revisions.len());
     for revision in &revisions {
+        if history.get(revision) == Some(&RevisionStatus::Expired) {
+            decisions.push(RetentionRevision {
+                revision: revision_hex(*revision),
+                state: RetentionRevisionState::Expired,
+                selected: false,
+                reasons: vec!["expired"],
+                files: None,
+                directories: None,
+                file_bytes: None,
+                unique_content_bytes: None,
+            });
+            continue;
+        }
         let reasons = selection_reasons(
             *revision,
             latest.revision(),
@@ -930,6 +1139,19 @@ pub async fn plan_managed_retention(
                         None
                     }
                 },
+                Err(error) if error.kind() == ErrorKind::Expired => {
+                    decisions.push(RetentionRevision {
+                        revision: revision_hex(*revision),
+                        state: RetentionRevisionState::Expired,
+                        selected: false,
+                        reasons: vec!["expired"],
+                        files: None,
+                        directories: None,
+                        file_bytes: None,
+                        unique_content_bytes: None,
+                    });
+                    continue;
+                }
                 Err(error) => {
                     unresolved.push(Unresolved {
                         subject: "retained-snapshot".to_owned(),
@@ -942,6 +1164,7 @@ pub async fn plan_managed_retention(
         };
         decisions.push(RetentionRevision {
             revision: revision_hex(*revision),
+            state: RetentionRevisionState::Readable,
             selected,
             reasons,
             files: measured.as_ref().map(|value| value.logical.files),
@@ -991,6 +1214,8 @@ pub async fn plan_managed_retention(
             published_history: "retained_by_default",
         },
         retained_revision_count,
+        readable_revision_count,
+        expired_revision_count,
         revisions: decisions,
         protection: RetentionProtection {
             current_revision: revision_hex(latest.revision()),
@@ -1007,6 +1232,531 @@ pub async fn plan_managed_retention(
         reclaimable_bytes: None,
         limits: retention_limits(),
     })
+}
+
+/// Explicitly expire historical revisions after validating declared local and
+/// supplied backup dependencies under their existing writer leases.
+#[cfg(not(target_os = "linux"))]
+pub async fn expire_managed_retention(
+    _authority: &dyn Authority,
+    _staging: &Path,
+    _candidates: &[Revision],
+    _backup_packages: &[PathBuf],
+    _operation_id: CommitId,
+) -> Result<ManagedExpiryReport> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "expire managed retention",
+        "logical history expiry requires the Linux local-state lease protocol",
+    ))
+}
+
+/// Explicitly expire historical revisions after validating declared local and
+/// supplied backup dependencies under their existing writer leases.
+#[cfg(target_os = "linux")]
+pub async fn expire_managed_retention(
+    authority: &dyn Authority,
+    staging_path: &Path,
+    candidates: &[Revision],
+    backup_packages: &[PathBuf],
+    operation_id: CommitId,
+) -> Result<ManagedExpiryReport> {
+    let candidates = candidates.iter().copied().collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Invalid,
+            "expire managed retention",
+            "at least one revision is required",
+        ));
+    }
+    if candidates.len() > yinyang_core::EXPIRY_CANDIDATES_MAX {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "expire managed retention",
+            format!(
+                "more than {} unique candidates",
+                yinyang_core::EXPIRY_CANDIDATES_MAX
+            ),
+        ));
+    }
+    let backup_packages = backup_packages
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let leases = ExpiryLeases::acquire(staging_path).await?;
+    // Freeze the guard before collecting evidence. The authority mutation must
+    // either apply to exactly this head or return Conflict.
+    let observed = authority.observe_latest().await?;
+    let expected_latest = observed.revision();
+    let staging = inspect_bound_local_staging(staging_path, authority.filesystem()).await;
+    let backups = inspect_backup_packages(&backup_packages, authority.filesystem()).await;
+
+    let mut unresolved = staging
+        .errors
+        .iter()
+        .map(|detail| Unresolved {
+            subject: "local-staging".to_owned(),
+            state: "unavailable".to_owned(),
+            detail: detail.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut evidence_complete = match staging.state {
+        StagingState::Missing | StagingState::NotInitialized => true,
+        StagingState::Available => staging.binding.state == StagingBindingState::Verified,
+        StagingState::Partial | StagingState::Unavailable => false,
+    };
+    if !evidence_complete && unresolved.is_empty() {
+        unresolved.push(Unresolved {
+            subject: "local-staging".to_owned(),
+            state: "partial".to_owned(),
+            detail: format!(
+                "staging state {:?} with binding {:?}",
+                staging.state, staging.binding.state
+            ),
+        });
+    }
+    for package in &backups.packages {
+        if package.state == BackupPackageState::Validated {
+            continue;
+        }
+        evidence_complete = false;
+        let state = match package.state {
+            BackupPackageState::Validated => unreachable!(),
+            BackupPackageState::Partial => "partial",
+            BackupPackageState::Foreign => "foreign",
+            BackupPackageState::Unavailable => "unavailable",
+        };
+        unresolved.push(Unresolved {
+            subject: "backup-package".to_owned(),
+            state: state.to_owned(),
+            detail: format!(
+                "{}: {}",
+                package.path,
+                package
+                    .error
+                    .as_deref()
+                    .unwrap_or("package evidence is incomplete")
+            ),
+        });
+    }
+
+    let mut backup_protected = BTreeMap::<Revision, BTreeSet<&'static str>>::new();
+    for package in &backups.packages {
+        for (revision, reasons) in &package.protected {
+            let entry = backup_protected.entry(*revision).or_default();
+            for reason in reasons {
+                entry.insert(backup_reason(reason));
+            }
+        }
+    }
+    let mut protected = staging.protected.clone();
+    merge_protected(&mut protected, &backup_protected);
+    let mut targets = candidates.clone();
+    targets.extend(protected.keys().copied());
+    targets.insert(expected_latest);
+    let mut lookups = BTreeMap::new();
+    for revision in targets {
+        if revision == expected_latest {
+            lookups.insert(revision, ExpiryRevisionLookup::Readable);
+            continue;
+        }
+        let state = match authority.observe_revision(revision).await {
+            Ok(_) => ExpiryRevisionLookup::Readable,
+            Err(error) if error.kind() == ErrorKind::Expired => ExpiryRevisionLookup::Expired,
+            Err(error) if error.kind() == ErrorKind::NotFound => ExpiryRevisionLookup::Missing,
+            Err(error) => {
+                evidence_complete = false;
+                unresolved.push(Unresolved {
+                    subject: "revision-state".to_owned(),
+                    state: "unavailable".to_owned(),
+                    detail: format!("{}: {error}", revision_hex(revision)),
+                });
+                ExpiryRevisionLookup::Unavailable
+            }
+        };
+        lookups.insert(revision, state);
+    }
+    for (revision, reasons) in &protected {
+        if *revision == expected_latest {
+            continue;
+        }
+        let state = match lookups.get(revision) {
+            Some(ExpiryRevisionLookup::Readable) => continue,
+            Some(ExpiryRevisionLookup::Expired) => "protected-expired",
+            Some(ExpiryRevisionLookup::Missing) => "protected-missing",
+            Some(ExpiryRevisionLookup::Unavailable) => "protected-unavailable",
+            None => "protected-unavailable",
+        };
+        evidence_complete = false;
+        unresolved.push(Unresolved {
+            subject: "protected-revision".to_owned(),
+            state: state.to_owned(),
+            detail: format!(
+                "{} is protected by {}",
+                revision_hex(*revision),
+                reasons.iter().copied().collect::<Vec<_>>().join(",")
+            ),
+        });
+    }
+
+    let evidence_digest = expiry_evidence_digest(
+        authority,
+        expected_latest,
+        &candidates,
+        &staging,
+        &backups,
+        &protected,
+        &lookups,
+        &unresolved,
+    )?;
+    let mut decisions = candidates
+        .iter()
+        .map(|revision| classify_expiry_candidate(*revision, expected_latest, &lookups, &protected))
+        .collect::<Vec<_>>();
+    let has_refusal = !evidence_complete
+        || decisions.iter().any(|decision| {
+            !matches!(
+                decision.state,
+                ExpiryDecisionState::Eligible | ExpiryDecisionState::AlreadyExpired
+            )
+        });
+    if has_refusal {
+        drop(leases);
+        return Ok(expiry_report(
+            authority,
+            operation_id,
+            expected_latest,
+            None,
+            ExpiryReportState::Refused,
+            evidence_digest,
+            &staging,
+            &backups,
+            decisions,
+            unresolved,
+            protected.len(),
+        ));
+    }
+
+    let expire = decisions
+        .iter()
+        .filter(|decision| decision.state == ExpiryDecisionState::Eligible)
+        .filter_map(|decision| parse_revision_hex(&decision.revision))
+        .collect::<Vec<_>>();
+    if expire.is_empty() {
+        drop(leases);
+        return Ok(expiry_report(
+            authority,
+            operation_id,
+            expected_latest,
+            None,
+            ExpiryReportState::AlreadyExpired,
+            evidence_digest,
+            &staging,
+            &backups,
+            decisions,
+            unresolved,
+            protected.len(),
+        ));
+    }
+
+    let request = ExpiryRequest::new(
+        authority.filesystem(),
+        operation_id,
+        expected_latest,
+        expire,
+    )?;
+    let (state, after_revision) = match authority.expire(&request).await? {
+        CommitOutcome::Committed(receipt) => {
+            if receipt.commit_id != operation_id || receipt.request_digest != request.digest() {
+                return Err(Error::new(
+                    ErrorKind::Corrupt,
+                    "expire managed retention",
+                    "authority returned a receipt for another request",
+                ));
+            }
+            for decision in &mut decisions {
+                if decision.state == ExpiryDecisionState::Eligible {
+                    decision.state = ExpiryDecisionState::Expired;
+                }
+            }
+            (ExpiryReportState::Committed, Some(receipt.cursor.revision))
+        }
+        CommitOutcome::Conflict => (ExpiryReportState::Conflict, None),
+        CommitOutcome::Retryable => (ExpiryReportState::Retryable, None),
+        CommitOutcome::Unknown(commit) => {
+            if commit != operation_id {
+                return Err(Error::new(
+                    ErrorKind::Corrupt,
+                    "expire managed retention",
+                    "authority returned an unknown outcome for another request",
+                ));
+            }
+            (ExpiryReportState::Unknown, None)
+        }
+    };
+    drop(leases);
+    Ok(expiry_report(
+        authority,
+        operation_id,
+        expected_latest,
+        after_revision,
+        state,
+        evidence_digest,
+        &staging,
+        &backups,
+        decisions,
+        unresolved,
+        protected.len(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpiryRevisionLookup {
+    Readable,
+    Expired,
+    Missing,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_expiry_candidate(
+    revision: Revision,
+    latest: Revision,
+    lookups: &BTreeMap<Revision, ExpiryRevisionLookup>,
+    protected: &BTreeMap<Revision, BTreeSet<&'static str>>,
+) -> ExpiryRevisionDecision {
+    let reasons = protected
+        .get(&revision)
+        .map(|reasons| reasons.iter().copied().collect())
+        .unwrap_or_default();
+    let state = if revision == latest {
+        ExpiryDecisionState::Current
+    } else {
+        match lookups.get(&revision) {
+            Some(ExpiryRevisionLookup::Readable) if protected.contains_key(&revision) => {
+                ExpiryDecisionState::Protected
+            }
+            Some(ExpiryRevisionLookup::Readable) => ExpiryDecisionState::Eligible,
+            Some(ExpiryRevisionLookup::Expired) if protected.contains_key(&revision) => {
+                ExpiryDecisionState::ProtectedExpired
+            }
+            Some(ExpiryRevisionLookup::Expired) => ExpiryDecisionState::AlreadyExpired,
+            Some(ExpiryRevisionLookup::Missing) if protected.contains_key(&revision) => {
+                ExpiryDecisionState::ProtectedMissing
+            }
+            Some(ExpiryRevisionLookup::Missing) => ExpiryDecisionState::Missing,
+            Some(ExpiryRevisionLookup::Unavailable) | None => ExpiryDecisionState::Unavailable,
+        }
+    };
+    ExpiryRevisionDecision {
+        revision: revision_hex(revision),
+        state,
+        reasons,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn expiry_report(
+    authority: &dyn Authority,
+    operation_id: CommitId,
+    observed_revision: Revision,
+    after_revision: Option<Revision>,
+    state: ExpiryReportState,
+    evidence_digest: [u8; 32],
+    staging: &StagingSpace,
+    backups: &BackupProtection,
+    revisions: Vec<ExpiryRevisionDecision>,
+    unresolved: Vec<Unresolved>,
+    protected_revisions: usize,
+) -> ManagedExpiryReport {
+    let requested = revisions.len();
+    ManagedExpiryReport {
+        schema: RETENTION_EXPIRY_SCHEMA,
+        filesystem: identity_hex(authority.filesystem()),
+        operation_id: uuid::Uuid::from_bytes(*operation_id.as_bytes()).to_string(),
+        observed_revision: revision_hex(observed_revision),
+        after_revision: after_revision.map(revision_hex),
+        state,
+        evidence_digest: bytes_hex(&evidence_digest),
+        staging: staging_protection(staging),
+        backups: backups.clone(),
+        revisions,
+        unresolved,
+        external_readers: "unknown",
+        untracked_pins: "unknown",
+        quiescence: "not_observed",
+        deletion_authorized: false,
+        reclaimable_bytes: None,
+        physical_cleanup: "not_performed",
+        limits: expiry_limits(protected_revisions, requested),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn expiry_evidence_digest(
+    authority: &dyn Authority,
+    expected_latest: Revision,
+    candidates: &BTreeSet<Revision>,
+    staging: &StagingSpace,
+    backups: &BackupProtection,
+    protected: &BTreeMap<Revision, BTreeSet<&'static str>>,
+    lookups: &BTreeMap<Revision, ExpiryRevisionLookup>,
+    unresolved: &[Unresolved],
+) -> Result<[u8; 32]> {
+    let protected = protected
+        .iter()
+        .map(|(revision, reasons)| {
+            (
+                revision.to_bytes(),
+                reasons.iter().copied().collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let lookups = lookups
+        .iter()
+        .map(|(revision, state)| (revision.to_bytes(), expiry_lookup_tag(*state)))
+        .collect::<Vec<_>>();
+    let backups = backups
+        .packages
+        .iter()
+        .map(|package| {
+            (
+                backup_state_tag(package.state),
+                package.filesystem.clone(),
+                *blake3::hash(package.path.as_bytes()).as_bytes(),
+                package
+                    .protected
+                    .iter()
+                    .map(|(revision, reasons)| {
+                        (
+                            revision.to_bytes(),
+                            reasons.iter().copied().collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let unresolved = unresolved
+        .iter()
+        .map(|item| {
+            (
+                item.subject.as_str(),
+                item.state.as_str(),
+                item.detail.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let bytes = borsh::to_vec(&(
+        *b"YYMEXP01",
+        authority.filesystem().as_bytes(),
+        expected_latest.to_bytes(),
+        candidates
+            .iter()
+            .map(|revision| revision.to_bytes())
+            .collect::<Vec<_>>(),
+        staging_state_tag(staging.state),
+        staging_binding_tag(staging.binding.state),
+        *blake3::hash(staging.path.as_bytes()).as_bytes(),
+        staging.handles.total,
+        staging.handles.pending,
+        staging.handles.frozen,
+        staging.handles.conflict,
+        staging.handles.unknown,
+        staging.handles.failed,
+        protected,
+        lookups,
+        backups,
+        unresolved,
+    ))
+    .map_err(|error| {
+        Error::new(
+            ErrorKind::Invalid,
+            "encode expiry evidence",
+            error.to_string(),
+        )
+    })?;
+    Ok(blake3::derive_key(
+        "yinyang managed-retention expiry evidence v1",
+        &bytes,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_lookup_tag(state: ExpiryRevisionLookup) -> u8 {
+    match state {
+        ExpiryRevisionLookup::Readable => 0,
+        ExpiryRevisionLookup::Expired => 1,
+        ExpiryRevisionLookup::Missing => 2,
+        ExpiryRevisionLookup::Unavailable => 3,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn staging_state_tag(state: StagingState) -> u8 {
+    match state {
+        StagingState::Missing => 0,
+        StagingState::NotInitialized => 1,
+        StagingState::Available => 2,
+        StagingState::Partial => 3,
+        StagingState::Unavailable => 4,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn staging_binding_tag(state: StagingBindingState) -> u8 {
+    match state {
+        StagingBindingState::Unbound => 0,
+        StagingBindingState::Verified => 1,
+        StagingBindingState::Unavailable => 2,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn backup_state_tag(state: BackupPackageState) -> u8 {
+    match state {
+        BackupPackageState::Validated => 0,
+        BackupPackageState::Partial => 1,
+        BackupPackageState::Foreign => 2,
+        BackupPackageState::Unavailable => 3,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_revision_hex(value: &str) -> Option<Revision> {
+    if value.len() != 48 {
+        return None;
+    }
+    let mut bytes = [0_u8; 24];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(Revision::from_bytes(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn expiry_limits(protected: usize, requested: usize) -> Vec<String> {
+    vec![
+        format!(
+            "Observed {protected} protected revisions and requested {requested} explicit expiry candidates."
+        ),
+        "Logical expiry never authorizes physical deletion or estimates reclaimable bytes."
+            .to_owned(),
+        "External readers, untracked pins, other staging directories, and undisclosed backups remain unknown."
+            .to_owned(),
+        "Quiescence is not observed; every declared local and backup activity must remain stopped until the desired candidate state is confirmed."
+            .to_owned(),
+        "Configured writer entry points are leased through the Core mutation; optional absent component databases are not treated as unreadable evidence."
+            .to_owned(),
+        "Mutable authority metadata may advance while immutable physical content and packs are not deleted."
+            .to_owned(),
+    ]
 }
 
 /// Inspect existing content, Sync journal and shared Sync engine evidence
@@ -1601,7 +2351,9 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
                     handle_revisions.insert(handle.id, handle.remote_revision);
                     handles.total = handles.total.saturating_add(1);
                     handles.handle_bytes = handles.handle_bytes.saturating_add(handle.length);
-                    let mut reasons = BTreeSet::new();
+                    // Every ready handle remains recoverable by UUID and may
+                    // read untouched bytes or publish from this exact base.
+                    let mut reasons = BTreeSet::from(["staging_base"]);
                     if handle.pending {
                         handles.pending = handles.pending.saturating_add(1);
                         reasons.insert("staging_pending");
@@ -1641,12 +2393,10 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
                     if failed {
                         handles.failed = handles.failed.saturating_add(1);
                     }
-                    if !reasons.is_empty() {
-                        protected
-                            .entry(handle.remote_revision)
-                            .or_default()
-                            .extend(reasons);
-                    }
+                    protected
+                        .entry(handle.remote_revision)
+                        .or_default()
+                        .extend(reasons);
                 }
                 handles.ledger_errors = handles
                     .ledger_errors
@@ -1760,21 +2510,41 @@ async fn inspect_retained(
     latest: &Snapshot,
     unresolved: &mut Vec<Unresolved>,
 ) -> RetainedLogicalSpace {
-    match authority.retained_revisions().await {
+    match authority.revision_history().await {
         Ok(mut revisions) => {
-            revisions.sort();
-            revisions.dedup();
-            if revisions.binary_search(&latest.revision()).is_err() {
-                revisions.push(latest.revision());
-                revisions.sort();
+            revisions.sort_by_key(|record| record.revision);
+            let mut complete = true;
+            if !revisions
+                .iter()
+                .any(|record| record.revision == latest.revision())
+            {
+                complete = false;
+                unresolved.push(Unresolved {
+                    subject: "retained-revisions".to_owned(),
+                    state: "latest-not-listed".to_owned(),
+                    detail: revision_hex(latest.revision()),
+                });
+                revisions.push(RevisionRecord {
+                    revision: latest.revision(),
+                    status: RevisionStatus::Readable,
+                });
+                revisions.sort_by_key(|record| record.revision);
             }
             let revision_count = revisions.len() as u64;
-            let mut observed = Vec::with_capacity(revisions.len());
+            let readable_revision_count = revisions
+                .iter()
+                .filter(|record| record.status == RevisionStatus::Readable)
+                .count() as u64;
+            let expired_revision_count = revision_count.saturating_sub(readable_revision_count);
+            let mut observed = Vec::with_capacity(readable_revision_count as usize);
             let mut observed_file_bytes = 0_u64;
             let mut unique = BTreeSet::new();
             let mut observed_unique_content_bytes = 0_u64;
-            let mut complete = true;
-            for revision in revisions {
+            for record in revisions {
+                if record.status == RevisionStatus::Expired {
+                    continue;
+                }
+                let revision = record.revision;
                 let snapshot = if revision == latest.revision() {
                     latest.clone()
                 } else {
@@ -1842,6 +2612,8 @@ async fn inspect_retained(
                     MeasurementState::Partial
                 },
                 revision_count: Some(revision_count),
+                readable_revision_count: Some(readable_revision_count),
+                expired_revision_count: Some(expired_revision_count),
                 observed_revisions: observed,
                 observed_file_bytes,
                 observed_unique_content_bytes,
@@ -1857,6 +2629,8 @@ async fn inspect_retained(
             RetainedLogicalSpace {
                 state: MeasurementState::Unavailable,
                 revision_count: None,
+                readable_revision_count: None,
+                expired_revision_count: None,
                 observed_revisions: Vec::new(),
                 observed_file_bytes: 0,
                 observed_unique_content_bytes: 0,
@@ -2146,7 +2920,9 @@ fn physical_issue_state(kind: ErrorKind) -> &'static str {
         ErrorKind::Corrupt => "corrupt",
         ErrorKind::Invalid | ErrorKind::InvalidName => "invalid",
         ErrorKind::Unsupported => "unsupported",
-        ErrorKind::Storage | ErrorKind::Io | ErrorKind::PermissionDenied => "unavailable",
+        ErrorKind::Storage | ErrorKind::Io | ErrorKind::PermissionDenied | ErrorKind::Expired => {
+            "unavailable"
+        }
         ErrorKind::AlreadyExists
         | ErrorKind::NotDirectory
         | ErrorKind::IsDirectory
@@ -2326,18 +3102,6 @@ fn parse_node_id_hex(value: &str) -> Option<NodeId> {
     Some(NodeId::from_bytes(bytes))
 }
 
-#[cfg(target_os = "linux")]
-fn parse_revision_hex(value: &str) -> Option<Revision> {
-    if value.len() != 48 {
-        return None;
-    }
-    let mut bytes = [0_u8; 24];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
-    }
-    Some(Revision::from_bytes(bytes))
-}
-
 fn commit_hex(commit: yinyang_core::CommitId) -> String {
     bytes_hex(commit.as_bytes())
 }
@@ -2357,6 +3121,7 @@ fn space_limits() -> Vec<String> {
         "Recursive listing returns current object keys only and is not atomic; noncurrent backend versions are unknown.",
         "Referenced byte coverage is a union over authenticated extents per visible pack; uncovered bytes are not reclaimed and may belong to unobserved/unknown readers.",
         "External readers, untracked revision pins, other staging directories, backup packages, and quiescence are not discoverable by this inspection.",
+        "Known expired revisions remain history identities but are not measured as readable snapshots.",
         "Standalone inspect_local_staging is unbound; volume-bound report and retention planning require verified local filesystem attribution.",
         "Direct namespace objects are excluded; this module inspects only Managed authority metadata and Managed local staging.",
         "SQLite read-only inspection may create or update derived shared-memory or empty WAL files; authoritative database and existing WAL bytes are not migrated or modified by this code.",
@@ -2373,9 +3138,9 @@ fn retention_limits() -> Vec<String> {
         "Noncurrent backend versions and shared pack extents remain unknown; no reclaimable-byte estimate is produced.",
         "Receipt records are revision evidence, not a physical cleanup authorization.",
         "Quiescence is not observed; planning does not stop writers, readers, mounts, Sync processes, or backup activity.",
-        "Published history and receipts are retained by default; keep-last changes only the declarative selection, never removes or hides retained revisions, and outside_bounded_policy revisions remain readable.",
+        "Expiry is disabled by default; keep-last changes only the declarative selection, and outside_bounded_policy revisions remain readable.",
         "Keep and keep-last apply only to this invocation; they are not persistent pins.",
-        "No expiry command exists in this contract; expiry and physical deletion are separate future designs.",
+        "Only the explicit expire command changes fresh revision readability; planning never expires history and expiry never performs physical deletion.",
         "Direct namespace objects are excluded.",
     ]
     .into_iter()
@@ -2515,5 +3280,128 @@ mod tests {
         }));
         assert!(!staging.join("runtime.lock").exists());
         assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expiry_admits_empty_declared_state_and_reports_already_expired() {
+        use crate::support::TestBackend;
+        use std::sync::Arc;
+        use yinyang_core::{Fs, Planner};
+
+        let backend = TestBackend::default();
+        let fs = Fs::create(backend.operator()).await.unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(fs);
+        for name in ["one", "two"] {
+            let snapshot = authority.observe_latest().await.unwrap();
+            let mut planner = Planner::new(&snapshot, CommitId::generate());
+            planner
+                .create_directory(authority.root(), name)
+                .await
+                .unwrap();
+            assert!(matches!(
+                authority.commit(&planner.finish().unwrap()).await.unwrap(),
+                CommitOutcome::Committed(_)
+            ));
+        }
+        let candidate = authority.retained_revisions().await.unwrap()[0];
+
+        let temp = tempdir().unwrap();
+        let staging = temp.path().join("state");
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[candidate],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::Committed);
+        assert!(!staging.join("staging.db").exists());
+        assert!(matches!(
+            authority
+                .observe_revision(candidate)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Expired
+        ));
+
+        let latest = authority.observe_latest().await.unwrap().revision();
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[candidate],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::AlreadyExpired);
+        assert_eq!(authority.observe_latest().await.unwrap().revision(), latest);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expiry_refuses_a_clean_recoverable_handle_base() {
+        use crate::support::TestBackend;
+        use std::sync::Arc;
+        use yinyang_core::Fs;
+
+        let backend = TestBackend::default();
+        let fs = Fs::create(backend.operator()).await.unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(fs);
+        let temp = tempdir().unwrap();
+        let staging = temp.path().join("state");
+        let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+        let (node, receipt) = runtime
+            .create_file_with_node(authority.root(), "file", false)
+            .await
+            .unwrap();
+        let handle = runtime
+            .open_node(node, true)
+            .await
+            .unwrap()
+            .release()
+            .unwrap();
+        runtime
+            .create_directory(authority.root(), "later")
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let protected = receipt.cursor.revision;
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[protected],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::Refused);
+        assert!(report.revisions.iter().any(|decision| {
+            decision.revision == revision_hex(protected)
+                && decision.state == ExpiryDecisionState::Protected
+                && decision.reasons.contains(&"staging_base")
+        }));
+        assert!(authority.observe_revision(protected).await.is_ok());
+
+        let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+        let mut recovered = runtime.recover(handle).await.unwrap();
+        recovered.close().await.unwrap();
+        drop(runtime);
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[protected],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::Committed);
     }
 }

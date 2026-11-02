@@ -55,16 +55,17 @@ completion is pending work or the superseded conflict side, not in-sync input.
 ## Publication
 
 `publish` is serialized per Sync instance. `Prepared` and `Retryable` requests
-restore and dispatch the original transaction with the original CommitId.
-Before dispatch, state becomes durable `Unknown`. On a known `Conflict`,
-`Retryable` or `Failed` outcome, the corresponding terminal or retry state is
-stored with its typed failure.
+dispatch their original frozen bytes through the authority's receipt-first
+frozen batch with the original CommitId. Before dispatch, state becomes durable
+`Unknown`. On a known `Conflict`, `Retryable` or `Failed` outcome, the
+corresponding terminal or retry state is stored with its typed failure.
 
 An `Unknown` request first looks up the original CommitId. A receipt with the
 same request digest completes the intent without another dispatch. Absent
 receipt does not prove failure, so the exact request may be replayed. A
 post-dispatch authority error stays `Unknown` with the CommitId in its durable
-failure. No path replans against a newer baseline.
+failure. A pending exact request can restore its known base after that revision
+is logically expired. No path replans against a newer baseline.
 
 The `intents` state codec is shared by Sync, the Sync engine and
 `directory/journal.rs`:
@@ -87,11 +88,19 @@ and manifest there.
 
 ## Local profile
 
-The dedicated directory contains only `sync.db` with profile
-`yinyang-sync-4`. Its exact table set is `binding` and `intents`; the binding
-contains one filesystem identity. SQLite uses WAL with
+The dedicated directory contains `sync.db` with profile `yinyang-sync-4` and
+the process lease `sync.lock`. Its exact table set is `binding` and `intents`;
+the binding contains one filesystem identity. SQLite uses WAL with
 `synchronous=FULL`. Older, newer or unknown profiles and missing, extra or
 malformed tables/columns are rejected without repair or migration.
+
+One `Sync` instance owns `sync.lock` for its lifetime. A second process or
+instance fails with `Busy`; acquisition does not create or initialize
+`sync.db`. The writer preflights a present database read-only before creating
+the lease, then revalidates it after acquisition so state cannot change between
+the check and the locked open. Read-only inspection and restore validation do
+not acquire the lease. The lock file is ephemeral coordination state, not a
+logical intent and not backup data.
 
 Validation reads the profile and exact schema before journal-mode changes,
 DDL, recovery or dispatch. Read-only inspection may create an empty `-wal` and

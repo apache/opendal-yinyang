@@ -120,6 +120,36 @@ pub(super) struct Stage {
     #[cfg(test)]
     full_sync_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// Exclusive process lease for one existing runtime staging protocol.
+///
+/// Acquisition may create the configured directory and `runtime.lock`, but it
+/// never opens, creates, initializes, or recovers `staging.db`.
+#[derive(Clone)]
+pub(crate) struct StagingLease {
+    lock: Arc<File>,
+}
+
+impl StagingLease {
+    pub(crate) async fn acquire(path: PathBuf) -> Result<Self> {
+        tokio::task::spawn_blocking(move || Self::acquire_sync(&path))
+            .await
+            .map_err(local)?
+    }
+
+    fn acquire_sync(path: &Path) -> Result<Self> {
+        let lease =
+            crate::local::lease::StateLease::acquire(path, "runtime.lock").map_err(store_error)?;
+        Ok(Self {
+            lock: Arc::new(lease.into_file()),
+        })
+    }
+
+    fn file(&self) -> Arc<File> {
+        Arc::clone(&self.lock)
+    }
+}
+
 fn store_error(error: store::Error) -> Error {
     Error::local_kind(error.kind().into(), error)
 }
@@ -701,19 +731,7 @@ impl Stage {
                     validate_state(&snapshot)?;
                 }
             }
-            let lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path.join("runtime.lock"))
-                .map_err(local)?;
-            lock.try_lock().map_err(|e| match e {
-                std::fs::TryLockError::WouldBlock => {
-                    Error::State(ErrorKind::Busy, "staging directory is already in use")
-                }
-                std::fs::TryLockError::Error(e) => local(e),
-            })?;
+            let lease = StagingLease::acquire_sync(&path)?;
             let exists = database.try_exists().map_err(local)?;
             let mut c = store::open_read_write(&database, !exists).map_err(store_error)?;
             let empty = store::is_empty(&c).map_err(store_error)?;
@@ -759,7 +777,7 @@ impl Stage {
             store::configure(&c, store::Durability::Barrier).map_err(store_error)?;
             Ok(Self {
                 db: Arc::new(Mutex::new(c)),
-                _lock: Arc::new(lock),
+                _lock: lease.file(),
                 #[cfg(test)]
                 barrier_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 #[cfg(test)]

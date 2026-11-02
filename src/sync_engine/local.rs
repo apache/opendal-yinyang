@@ -53,6 +53,49 @@ pub(super) struct LocalTree {
     hash_bytes_read: AtomicU64,
 }
 
+/// Exclusive lease for an existing Sync-engine state protocol.
+///
+/// Acquisition may create the configured state directory and
+/// `sync-engine.lock`, but it never opens, creates, or recovers
+/// `sync-engine.db`.
+pub(crate) struct StateLease {
+    _file: std::fs::File,
+}
+
+impl StateLease {
+    pub(crate) fn acquire(state: &Path) -> Result<Self> {
+        prepare_lease_directory(state)?;
+        let state = std::fs::canonicalize(state)
+            .map_err(|error| Error::io("canonicalize Sync engine state", state, error))?;
+        let (state_fd, _) = open_bound_directory(&state, "open Sync engine state")?;
+        let file = acquire_lease(&state_fd, &state)?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn prepare_lease_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(Error::io("create Sync engine state", path, error)),
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| Error::io("inspect Sync engine state", path, error))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::unsupported(format!(
+            "{} must be an ordinary directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(super) struct ExistingBinding {
     pub root: PathBuf,
 }

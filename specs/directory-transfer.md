@@ -116,9 +116,9 @@ Publication state is reopen-safe:
 Before first dispatch, the journal synchronously changes the record to
 `Unknown`. A crash or lost response therefore cannot turn a possibly published
 request into a safe abort. On retry, `Unknown` first checks the original
-CommitId's receipt. If no receipt exists, the authority restores readiness and
-the original predicates from the retained transaction before the identical
-request is dispatched.
+CommitId's receipt. If no receipt exists, the original frozen bytes are
+dispatched through the authority's receipt-first frozen batch. The exact known
+base and predicates remain usable when that revision is logically expired.
 
 Once `Unknown` is durable, restore, readiness, network, and local receipt-
 persistence failures do not prove nonpublication. They retain `Unknown` and may

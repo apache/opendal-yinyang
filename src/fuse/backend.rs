@@ -165,6 +165,7 @@ fn runtime_errno(kind: crate::runtime::ErrorKind) -> fuser::Errno {
         | ErrorKind::Conflict
         | ErrorKind::Retryable
         | ErrorKind::Unknown
+        | ErrorKind::Expired
         | ErrorKind::Corrupt
         | ErrorKind::Storage
         | ErrorKind::Io => fuser::Errno::EIO,
@@ -182,7 +183,9 @@ fn core_errno(kind: yinyang_core::ErrorKind) -> fuser::Errno {
         ErrorKind::PermissionDenied => fuser::Errno::EACCES,
         ErrorKind::Invalid | ErrorKind::InvalidName => fuser::Errno::EINVAL,
         ErrorKind::Unsupported => fuser::Errno::ENOSYS,
-        ErrorKind::Corrupt | ErrorKind::Storage | ErrorKind::Io => fuser::Errno::EIO,
+        ErrorKind::Expired | ErrorKind::Corrupt | ErrorKind::Storage | ErrorKind::Io => {
+            fuser::Errno::EIO
+        }
     }
 }
 
