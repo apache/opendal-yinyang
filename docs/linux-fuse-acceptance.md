@@ -44,6 +44,17 @@ Run only the read-only range-hydration scenarios:
 cargo x test-linux-fuse --read-only-range
 ```
 
+Run the separate real-application workflows:
+
+```shell
+cargo x test-linux-applications
+```
+
+That entry point requires git, rsync and GNU tar in addition to FUSE and
+isolated storage. See the
+[application workflow guide](linux-applications.md) for the exact supported
+commands and exclusions.
+
 ## Scenarios
 
 - Read-only basic: mounted reads, and explicit rejection (`EROFS`/`EACCES`) of

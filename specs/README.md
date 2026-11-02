@@ -19,6 +19,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Sync runtime](sync-runtime.md) | Experimental content and namespace coordinator against an explicit remote baseline. |
 | [Linux ordinary-directory Sync](linux-sync.md) | The shared Managed/Direct `yy ... sync` engine: capabilities, baseline, typed intents, conflicts, backup, exit codes, and the `yinyang.sync.status.v1` document. |
 | [Linux operations](linux-operations.md) | Health diagnostics, user-service lifecycle and installed-prefix state boundaries. |
+| [Linux applications](linux-applications.md) | Tested rsync and GNU tar workflows, their mode/timestamp boundaries, and the observed Git exclusion. |
 | [Linux trial distribution](linux-trial-distribution.md) | Direct trial binary, traceable archive verification, versioned-prefix installation, stopped activation and non-destructive inventory boundaries. |
 | [Managed space and retention](managed-space-retention.md) | Read-only logical, object, and staging accounting plus bounded non-destructive retention planning. |
 | [Managed Sync acceptance](managed-sync-acceptance.md) | Real-process Linux acceptance for ordinary-directory reconciliation, conflicts, artifacts, and recovery. |
