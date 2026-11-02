@@ -121,9 +121,40 @@ observation starts cold and reflects its own head.
 
 Published observations, their referenced bytes, and successful commit identities
 are retained by default. Neither binding may silently expire them because an
-underlying database has a short MVCC retention window. Garbage collection and
-retention expiry require a separate explicit contract; they are not part of this
-target. Failed preparation or publication may leave unreferenced immutable data.
+underlying database has a short MVCC retention window. Explicit logical expiry
+of known revisions is the only exception; automatic expiry, physical garbage
+collection, and reclamation remain outside this target. Failed preparation or
+publication may leave unreferenced immutable data.
+
+### Explicit logical expiry
+
+An explicit expiry request names the observed latest revision, a bounded set of
+1 through 256 known candidate revisions, and a stable request identity. The
+canonical request digest binds the authority, expected latest revision, and
+sorted unique candidates. The current revision and any revision outside the
+expected-latest observation are refused before a candidate becomes unavailable.
+
+One successful expiry atomically publishes a fresh revision, records the
+original receipt identity and digest, appends an empty logical change record,
+and changes every candidate from readable to expired. All candidates are
+validated before any status changes. An expected-latest mismatch returns
+`Conflict`; an absent candidate is `NotFound`; an already expired candidate is
+`Expired`; an ambiguous publication is `Unknown(request_id)`.
+
+Expiry affects only a fresh `observe_revision`. A held `Snapshot` or
+`FileVersion` remains usable because its references are already authenticated.
+An exact frozen request is bound to its original encoded predicates and content
+descriptors. Before restoring it, an authority recomputes its canonical
+semantic digest without trusting a declared digest. If the request receipt
+exists, it returns that receipt without restoring content. Otherwise the
+request may restore from its exact known base even when fresh lookup of that
+base now returns `Expired`; it never reprepares or retargets the request.
+
+Expiry does not remove snapshot descriptors, receipts, change records, content
+packs, or other physical metadata. Same-request replay checks the receipt before
+expected-latest and candidate state, so a successful expiry remains replayable
+after later revisions and is never converted to failure by an absent or
+inaccessible content-preparation check.
 
 ## File content and physical storage
 
