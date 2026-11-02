@@ -25,7 +25,7 @@ A Direct volume uses this configuration shape:
   "frontend": "fuse",
   "publication": "object",
   "storage_profile": "minio",
-  "require": ["read", "list", "pinned-reads"]
+  "read_only": true
 }
 ```
 
@@ -66,8 +66,8 @@ The read-only frontend publishes the `read`, `list`, and `pinned-reads`
 capabilities only. It does not claim Managed `stable-identity`: replacement
 changes the file inode. It does not claim `retained-unlink-read`; retained reads
 after deletion depend on backend version history and are not a portable Direct
-guarantee. Writable admission requires the native primitive intersection
-documented in the mutation runtime specification.
+guarantee. Writable admission checks the native primitives through the shared
+admission table and the mutation runtime specification.
 
 ## Reversible key mapping
 
@@ -200,10 +200,11 @@ startup if the namespace is still invalid.
 
 ## CLI and doctor
 
-`yy --volume CONFIG capabilities` reports the four capability intersections
-without reading the namespace. `yy --volume CONFIG mount MOUNTPOINT` performs
-admission before observing storage. `yy --volume CONFIG status` reports a
-Direct observation summary without creating staging state.
+`yy --volume CONFIG capabilities` reports the admitted capability set and raw
+storage primitives without reading the namespace.
+`yy --volume CONFIG mount MOUNTPOINT` performs admission before observing
+storage. `yy --volume CONFIG status` reports a Direct observation summary
+without creating staging state.
 
 `yy --volume CONFIG doctor` validates admission, recursively observes the
 namespace, and reports `namespace` health. Writable Direct Mount additionally

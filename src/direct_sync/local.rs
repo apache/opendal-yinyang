@@ -64,13 +64,7 @@ fn open_existing_paths(root: &Path, state: &Path) -> Result<ExistingPaths> {
     let state = std::fs::canonicalize(state)
         .map_err(|error| Error::io("canonicalize Direct Sync state", state, error))?;
     validate_private_state(&state)?;
-    if root == state || root.starts_with(&state) || state.starts_with(&root) {
-        return Err(Error::invalid(format!(
-            "Direct Sync root {} and state {} must not contain one another",
-            root.display(),
-            state.display()
-        )));
-    }
+    crate::replica::check_root_state(&root, &state)?;
     let root_fd = open(
         &root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,

@@ -298,7 +298,6 @@ def write_config(path, name, access, frontend, publication, staging=None, servic
         "publication": publication,
         "storage_profile": "minio",
         "read_only": False,
-        "require": [],
     }
     if staging is not None:
         document["staging"] = str(staging)

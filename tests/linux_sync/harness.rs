@@ -644,7 +644,6 @@ impl Fixture {
             "storage_profile": "minio",
             "staging": state,
             "read_only": false,
-            "require": [],
         });
         if self.publication == Publication::Service {
             value["service_address"] = serde_json::Value::String(

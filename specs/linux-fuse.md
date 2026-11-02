@@ -27,7 +27,7 @@ frontend is rejected entirely on non-Linux targets.
 
 Managed startup order:
 
-1. validate the configuration and the storage capability intersection;
+1. run the shared admission table and validate the storage prerequisites;
 2. connect the object or service authority;
 3. open the shared [`Mount`](mount-runtime.md) using the configured write
    policy (acquires the staging lease and runs the existing recovery);

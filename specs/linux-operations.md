@@ -63,7 +63,9 @@ The command always emits a complete report for a readable configuration, even
 when a check fails. Exit code `0` means every check passed and every check not
 applicable to the selected combination was omitted. Exit code `1` means at
 least one check requires action or the report could not be written. Invalid
-CLI arguments remain Clap exit code `2`.
+CLI arguments remain Clap exit code `2`. Other CLI failures use the shared
+typed mapping: `Unknown` is exit code `3`, `Conflict` and `Retryable` are exit
+code `4`, and every other error kind is exit code `1`.
 
 Checks are ordered from local policy to remote observation:
 
@@ -105,8 +107,9 @@ Checks are ordered from local policy to remote observation:
   `yy --volume CONFIG file acknowledge-errors THROUGH`. Doctor `mount-state`
   health converges only after unresolved handles are resolved and reviewed
   ledger errors are acknowledged.
-- `admission`: construct the S3 operator and validate the effective
-  four-layer capability intersection.
+- `admission`: report the single admission-table result and the storage
+  prerequisites checked lazily by the same volume context used by every other
+  `--volume` command. There is no second capability negotiation path.
 - `authority`: Managed connects and observes the latest revision. Object mode checks the
   storage authority. Service mode uses the configured loopback address and
   separately supplied token; the check fails if either authentication or
@@ -124,6 +127,9 @@ The redactor removes configured authentication values as well as URL userinfo.
 Diagnostics may name environment variables and
 classify a 403, connection failure or state-write failure, but they do not
 prove which credential or policy caused a remote rejection.
+Classification uses `ErrorKind` plus the structured failing stage
+(`configuration`, `operator`, `connect`, `observe` or local state), never
+diagnostic message substrings.
 
 ## User-service lifecycle
 

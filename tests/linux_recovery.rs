@@ -1339,7 +1339,6 @@ fn write_sync_config(
         "storage_profile": "minio",
         "staging": state,
         "read_only": false,
-        "require": [],
     });
     if let Some(service) = service {
         value["service_address"] = serde_json::Value::String(service.to_string());
@@ -1491,7 +1490,6 @@ fn write_volume_config(
         "storage_profile": "minio",
         "staging": staging,
         "read_only": false,
-        "require": [],
     });
     if let Some(service) = service {
         value["service_address"] = serde_json::Value::String(service.to_string());

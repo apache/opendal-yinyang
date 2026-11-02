@@ -18,6 +18,7 @@
 //! CLI adapter for storage-native Direct Sync.
 
 use crate::sync_cli::{SyncCommand, SyncSide};
+use crate::{CliError, CliResult, CliStage};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::ExitCode;
@@ -27,142 +28,108 @@ use yinyang::direct_sync::{
     EvidenceKind, Inspection, InstallState, LocalScanState, RemoteAvailability, RemoteOperation,
     Resolution, RunOutcome, STATUS_SCHEMA, WorkState,
 };
-use yinyang::volume::{Access, Frontend, Model, VolumeConfig};
+use yinyang::volume::{Access, Frontend, Model, VolumeContext};
 
 const EXIT_UNBOUND: u8 = 3;
 const EXIT_INVALID_BINDING: u8 = 4;
 
-pub async fn run(
-    config_path: &Path,
-    command: SyncCommand,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let bytes = tokio::fs::read(config_path).await.map_err(|error| {
-        format!(
-            "read volume configuration {}: {error}",
-            config_path.display()
-        )
-    })?;
-    let raw: Value =
-        serde_json::from_slice(&bytes).map_err(|error| format!("volume configuration: {error}"))?;
-    match raw.get("model").and_then(Value::as_str) {
-        Some("managed") => return crate::sync_cli::run(config_path, command).await,
-        Some("direct") => {}
-        Some(other) => return Err(format!("unknown volume model {other:?}").into()),
-        None => return Err("volume configuration is missing model".into()),
+pub async fn run(context: VolumeContext, command: SyncCommand) -> CliResult<ExitCode> {
+    if context.config.model != Model::Direct
+        || context.config.access != Access::Sync
+        || context.config.frontend != Frontend::Library
+        || context.config.read_only
+    {
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            format!(
+                "Direct Sync requires model=direct, access=sync, frontend=library, read_only=false; found model={:?} access={:?} frontend={:?} read_only={}",
+                context.config.model,
+                context.config.access,
+                context.config.frontend,
+                context.config.read_only
+            ),
+        ));
     }
-
-    let mut config = VolumeConfig::from_json(&bytes)?;
-    resolve_staging(&mut config, config_path);
     match command {
-        SyncCommand::Init { directory } => init(&config, &directory).await,
-        SyncCommand::Run => reconcile(&config).await,
-        SyncCommand::Status { json } => status(&config, json).await,
+        SyncCommand::Init { directory } => init(&context, &directory).await,
+        SyncCommand::Run => reconcile(&context).await,
+        SyncCommand::Status { json } => status(&context, json).await,
         SyncCommand::Export {
             artifact,
             conflict,
             side,
             output,
-        } => export(&config, artifact, conflict, side, &output).await,
+        } => export(&context, artifact, conflict, side, &output).await,
         SyncCommand::Resolve {
             conflict,
             keep,
             content,
-        } => resolve(&config, &conflict, keep, content.as_deref()).await,
-        SyncCommand::Backup { .. } | SyncCommand::Restore { .. } => Err(
-            "Direct Sync has no backup/restore package; use `sync status --json`, `sync export`, and the state directory together"
-                .into(),
-        ),
+        } => resolve(&context, &conflict, keep, content.as_deref()).await,
+        SyncCommand::Backup { .. } | SyncCommand::Restore { .. } => Err(CliError::invalid(
+            CliStage::Argument,
+            "Direct Sync has no backup/restore package; use `sync status --json`, `sync export`, and the state directory together",
+        )),
     }
 }
 
-fn resolve_staging(config: &mut VolumeConfig, config_path: &Path) {
-    if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
-        config.staging = config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(&config.staging);
-    }
+fn admit(context: &VolumeContext) -> CliResult<DirectRemoteAdapter> {
+    remote_adapter(context)
 }
 
-fn operator() -> Result<opendal::Operator, opendal::Error> {
-    let config = std::env::vars()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("YINYANG_S3_")
-                .map(|key| (key.to_ascii_lowercase(), value))
-        })
-        .collect::<Vec<_>>();
-    opendal::Operator::via_iter("s3", config)
-}
-
-fn admit(config: &VolumeConfig) -> Result<DirectRemoteAdapter, Box<dyn std::error::Error>> {
-    let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
-    remote_adapter(config, operator)
-}
-
-pub(crate) fn remote_adapter(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-) -> Result<DirectRemoteAdapter, Box<dyn std::error::Error>> {
-    if config.model != Model::Direct
-        || config.access != Access::Sync
-        || config.frontend != Frontend::Library
-        || config.read_only
-    {
-        return Err(format!(
-            "Direct Sync requires model=direct, access=sync, frontend=library, read_only=false; found model={:?} access={:?} frontend={:?} read_only={}",
-            config.model, config.access, config.frontend, config.read_only
-        )
-        .into());
+pub(crate) fn remote_adapter(context: &VolumeContext) -> CliResult<DirectRemoteAdapter> {
+    if context.config.staging.as_os_str().is_empty() {
+        return Err(CliError::invalid(
+            CliStage::Admission,
+            "Direct Sync requires a non-empty staging path",
+        ));
     }
-    if config.staging.as_os_str().is_empty() {
-        return Err("Direct Sync requires a non-empty staging path".into());
-    }
-    config.validate(&operator)?;
-    let binding = storage_binding(config, &operator)?;
-    let namespace = yinyang::volume::direct_namespace(config, operator)?;
+    context.storage_capabilities()?;
+    let binding = storage_binding(context)?;
+    let namespace = context
+        .direct_namespace()
+        .map_err(|error| CliError::from_runtime(CliStage::Admission, error))?;
     Ok(DirectRemoteAdapter::open(
         namespace,
         hex(binding.namespace_id()),
     )?)
 }
 
-fn storage_binding(
-    config: &VolumeConfig,
-    operator: &opendal::Operator,
-) -> Result<DirectStorageBinding, Box<dyn std::error::Error>> {
-    Ok(yinyang::volume::direct_storage_binding(config, operator)?)
+fn storage_binding(context: &VolumeContext) -> CliResult<DirectStorageBinding> {
+    context
+        .direct_storage_binding()
+        .map_err(|error| CliError::from_runtime(CliStage::Admission, error))
 }
 
-async fn init(
-    config: &VolumeConfig,
-    directory: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let remote = admit(config)?;
-    DirectSync::init(remote, &config.staging, directory).await?;
+async fn init(context: &VolumeContext, directory: &Path) -> CliResult<ExitCode> {
+    let remote = admit(context)?;
+    DirectSync::init(remote, &context.config.staging, directory).await?;
     println!(
         "Direct Sync bound {} to state {}",
         directory.display(),
-        config.staging.display()
+        context.config.staging.display()
     );
     Ok(ExitCode::SUCCESS)
 }
 
-async fn reconcile(config: &VolumeConfig) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let remote = admit(config)?;
-    let mut sync = DirectSync::open(remote, &config.staging).await?;
+async fn reconcile(context: &VolumeContext) -> CliResult<ExitCode> {
+    let remote = admit(context)?;
+    let mut sync = DirectSync::open(remote, &context.config.staging).await?;
     let outcome = sync.run().await?;
     println!("{}", outcome_text("Direct Sync run", &outcome));
     Ok(ExitCode::SUCCESS)
 }
 
-async fn status(config: &VolumeConfig, json: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let (remote, remote_error) = match admit(config) {
+async fn status(context: &VolumeContext, json: bool) -> CliResult<ExitCode> {
+    let (remote, remote_error) = match admit(context) {
         Ok(remote) => (Some(remote), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    let inspection =
-        DirectSync::<DirectRemoteAdapter>::inspect(remote.as_ref(), &config.staging, remote_error)
-            .await;
+    let inspection = DirectSync::<DirectRemoteAdapter>::inspect(
+        remote.as_ref(),
+        &context.config.staging,
+        remote_error,
+    )
+    .await;
     let code = match inspection.binding.state {
         BindingState::Unbound => EXIT_UNBOUND,
         BindingState::Bound => 0,
@@ -171,7 +138,7 @@ async fn status(config: &VolumeConfig, json: bool) -> Result<ExitCode, Box<dyn s
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&status_document(&inspection, &config.staging))?
+            serde_json::to_string_pretty(&status_document(&inspection, &context.config.staging))?
         );
     } else {
         print_status(&inspection);
@@ -180,20 +147,31 @@ async fn status(config: &VolumeConfig, json: bool) -> Result<ExitCode, Box<dyn s
 }
 
 async fn export(
-    config: &VolumeConfig,
+    context: &VolumeContext,
     artifact: Option<String>,
     conflict: Option<String>,
     side: Option<SyncSide>,
     output: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> CliResult<ExitCode> {
     let side = match (&artifact, &conflict) {
         (Some(_), None) => None,
-        (None, Some(_)) => Some(side.ok_or("--conflict requires --side local|remote")?),
+        (None, Some(_)) => Some(side.ok_or_else(|| {
+            CliError::invalid(
+                CliStage::Argument,
+                "--conflict requires --side local|remote",
+            )
+        })?),
         (Some(_), Some(_)) => {
-            return Err("--artifact and --conflict are mutually exclusive".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "--artifact and --conflict are mutually exclusive",
+            ));
         }
         (None, None) => {
-            return Err("export requires exactly one of --artifact or --conflict".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "export requires exactly one of --artifact or --conflict",
+            ));
         }
     };
     let mut file = std::fs::OpenOptions::new()
@@ -201,16 +179,24 @@ async fn export(
         .create_new(true)
         .open(output)
         .map_err(|error| {
-            format!(
-                "create export {} (refusing to overwrite an existing path): {error}",
-                output.display()
+            CliError::new(
+                CliStage::Output,
+                crate::runtime_kind_from_io(error.kind()),
+                format!(
+                    "create export {} (refusing to overwrite an existing path): {error}",
+                    output.display()
+                ),
             )
         })?;
     let result = if let Some(id) = artifact {
-        DirectSync::<DirectRemoteAdapter>::export_artifact_local(&config.staging, &id, &mut file)
+        DirectSync::<DirectRemoteAdapter>::export_artifact_local(
+            &context.config.staging,
+            &id,
+            &mut file,
+        )
     } else {
         DirectSync::<DirectRemoteAdapter>::export_conflict_side_local(
-            &config.staging,
+            &context.config.staging,
             conflict.as_deref().expect("conflict selector present"),
             match side.expect("conflict side present") {
                 SyncSide::Local => "local",
@@ -228,20 +214,25 @@ async fn export(
 }
 
 async fn resolve(
-    config: &VolumeConfig,
+    context: &VolumeContext,
     conflict: &str,
     keep: Option<SyncSide>,
     content: Option<&Path>,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> CliResult<ExitCode> {
     if content.is_some() {
-        return Err(
-            "Direct Sync resolve does not accept --content; export/inspect both sides, edit the local directory explicitly, then use --keep local"
-                .into(),
-        );
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            "Direct Sync resolve does not accept --content; export/inspect both sides, edit the local directory explicitly, then use --keep local",
+        ));
     }
-    let keep = keep.ok_or("Direct Sync resolve requires --keep local|remote")?;
-    let remote = admit(config)?;
-    let mut sync = DirectSync::open(remote, &config.staging).await?;
+    let keep = keep.ok_or_else(|| {
+        CliError::invalid(
+            CliStage::Argument,
+            "Direct Sync resolve requires --keep local|remote",
+        )
+    })?;
+    let remote = admit(context)?;
+    let mut sync = DirectSync::open(remote, &context.config.staging).await?;
     let resolution = match keep {
         SyncSide::Local => Resolution::KeepLocal,
         SyncSide::Remote => Resolution::KeepRemote,

@@ -126,9 +126,9 @@
       "sha256": "f3efdbdaaebfde52b70a72764ec343c71c4c8376b0ab0c3a06515e61d0e71c9b"
     },
     {
-      "length": 218,
+      "length": 201,
       "path": "frozen/volume.json",
-      "sha256": "1ed557d87819d2dc2502abe85995abb6d75d5a547abe622d668ebf8ff79419cc"
+      "sha256": "e4af0e3051859c9011d2e4ea8f53727d51a04d6eb4598e9b52489dd4c17bcd42"
     },
     {
       "length": 253952,
@@ -216,9 +216,9 @@
       "sha256": "d833e751b82b29db2545897480c7f1f83b7faacccd75df2e123c42c3d6177f70"
     },
     {
-      "length": 218,
+      "length": 201,
       "path": "object/volume.json",
-      "sha256": "2b5f5f5dedc5357d13678da5d4e20467db7619a8aa390fb9712b4c18da491605"
+      "sha256": "b832fd76728a4aa0bda8580520f759f664aee5dc53cb451ac912da218b0de2fd"
     },
     {
       "length": 40960,
@@ -241,9 +241,9 @@
       "sha256": "3dbc4a1939d4ac4ff08d8f0f442fa674f2833989b39df9b1a114c989a62c644d"
     },
     {
-      "length": 267,
+      "length": 250,
       "path": "service/volume.json",
-      "sha256": "76b98247ccf9f91e8e4f9e79579f792d12d3b1958e547fbd69e1c4fe714fbe4d"
+      "sha256": "29b004b45c9649d7eab721e3247236f645bf96e3a33bf211498c30cbb9183963"
     },
     {
       "length": 253952,
@@ -361,9 +361,9 @@
       "sha256": "279bee5dea97c33280b75a307aac04f47a0b634c6c14496fe22933ef6f6b66eb"
     },
     {
-      "length": 219,
+      "length": 202,
       "path": "unknown/volume.json",
-      "sha256": "43158e79d1f56c7228f30d40cf29bcb3e465a759e33204a1b1ddd239ef8af6ef"
+      "sha256": "6af4cae1185d446b8c9e723f0e9dd9877ed1e9b9905e914779782176a3873ccb"
     }
   ],
   "fixture": {

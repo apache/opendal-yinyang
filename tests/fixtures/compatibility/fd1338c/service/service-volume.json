@@ -6,7 +6,6 @@
   "publication": "service",
   "storage_profile": "minio",
   "read_only": false,
-  "require": [],
   "staging": "tests/fixtures/compatibility/fd1338c/service/service-staging",
   "service_address": "<restart-address>"
 }

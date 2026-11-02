@@ -27,7 +27,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn for_each_authority(mut run: impl FnMut(Publication)) {
@@ -127,6 +127,100 @@ fn remote_file_bytes(fixture: &Fixture, path: &str) -> Vec<u8> {
 fn write_local(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes)
         .unwrap_or_else(|error| panic!("write local file {}: {error}", path.display()));
+}
+
+fn write_sync_config(fixture: &Fixture, name: &str, state: &Path) -> PathBuf {
+    let config = fixture.path(format!("{name}.json"));
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": name,
+            "model": "managed",
+            "access": "sync",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": state,
+            "read_only": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    config
+}
+
+#[test]
+#[ignore = "requires isolated S3 and the Managed Sync CLI; run with cargo x test-managed-sync"]
+fn managed_sync_containment_is_symmetric_for_init_and_restore() {
+    let fixture = Fixture::new(Publication::Object);
+    for root_inside_state in [false, true] {
+        let (state, root) = if root_inside_state {
+            let state = fixture.path("init-state-a");
+            (state.clone(), state.join("root"))
+        } else {
+            let root = fixture.path("init-root-b");
+            (root.join("state"), root)
+        };
+        let config = write_sync_config(&fixture, "containment-init", &state);
+        let output = fixture.yy(&[
+            "--volume",
+            config.to_str().unwrap(),
+            "sync",
+            "init",
+            "--directory",
+            root.to_str().unwrap(),
+        ]);
+        assert_failure(&output, "Managed Sync init containment");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = if root_inside_state {
+            "synchronized root must not be inside state"
+        } else {
+            "state must not be inside the synchronized root"
+        };
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!state.join("replica.db").exists());
+    }
+
+    let source = fixture.sync_paths("containment-source");
+    fs::create_dir(&source.directory).unwrap();
+    fixture.sync_init(&source);
+    let backup = fixture.path("containment-backup");
+    fixture.yy_ok(&[
+        "--volume",
+        source.config.to_str().unwrap(),
+        "sync",
+        "backup",
+        "--output",
+        backup.to_str().unwrap(),
+    ]);
+
+    for root_inside_state in [false, true] {
+        let (state, root) = if root_inside_state {
+            let state = fixture.path("restore-state-a");
+            (state.clone(), state.join("root"))
+        } else {
+            let root = fixture.path("restore-root-b");
+            (root.join("state"), root)
+        };
+        if root_inside_state {
+            fs::create_dir(&state).unwrap();
+        } else {
+            fs::create_dir_all(&root).unwrap();
+        }
+        let config = write_sync_config(&fixture, "containment-restore", &state);
+        let output = fixture.yy(&[
+            "--volume",
+            config.to_str().unwrap(),
+            "sync",
+            "restore",
+            "--backup",
+            backup.to_str().unwrap(),
+            "--directory",
+            root.to_str().unwrap(),
+        ]);
+        assert_failure(&output, "Managed Sync restore containment");
+        assert!(!state.join("replica.db").exists());
+    }
 }
 
 #[test]

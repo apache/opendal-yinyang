@@ -1346,7 +1346,6 @@ class Harness:
             ],
             "staging": str(self.state),
             "read_only": False,
-            "require": [],
         }
         write_private(self.config, json.dumps(document, indent=2).encode() + b"\n")
 
