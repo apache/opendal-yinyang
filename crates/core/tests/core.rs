@@ -758,22 +758,24 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
             .kind(),
         ErrorKind::Unsupported
     );
-    let legacy = TestBackend::default();
-    legacy.state.lock().unwrap().objects.insert(
-        ".yinyang/head".into(),
-        StoredObject {
-            bytes: b"YYHEAD01legacy".to_vec(),
-            etag: "legacy".into(),
-        },
-    );
-    assert_eq!(
-        ObjectFs::create(legacy.operator())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Unsupported
-    );
-    assert_eq!(legacy.state.lock().unwrap().objects.len(), 1);
+    for legacy_bytes in [b"YYHEAD01legacy".as_slice(), b"YYHEAD02legacy"] {
+        let legacy = TestBackend::default();
+        legacy.state.lock().unwrap().objects.insert(
+            ".yinyang/head".into(),
+            StoredObject {
+                bytes: legacy_bytes.to_vec(),
+                etag: "legacy".into(),
+            },
+        );
+        assert_eq!(
+            ObjectFs::create(legacy.operator())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(legacy.state.lock().unwrap().objects.len(), 1);
+    }
 }
 
 #[tokio::test]

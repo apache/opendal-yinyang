@@ -1329,7 +1329,7 @@ mod admission_tests {
         Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE authority SET profile='yinyang-sqlite-1' WHERE singleton=1",
+                "UPDATE authority SET profile='yinyang-sqlite-2' WHERE singleton=1",
                 [],
             )
             .unwrap();
@@ -1346,7 +1346,7 @@ mod admission_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-sqlite-1");
+        assert_eq!(profile, "yinyang-sqlite-2");
     }
 
     #[tokio::test]
