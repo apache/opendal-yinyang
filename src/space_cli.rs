@@ -26,13 +26,13 @@ use yinyang::core::Revision;
 use yinyang::space::{
     ListingConsistency, ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, StagingState,
 };
-use yinyang::volume::{Model, VolumeContext};
+use yinyang::volume::{Model, VolumeConfig, VolumeContext};
 
 #[derive(Subcommand)]
 pub enum SpaceCommand {
     /// Report logical, physical-object, and local-staging measurements.
     Report {
-        /// Emit the versioned `yinyang.managed-space.report.v3` document.
+        /// Emit the versioned `yinyang.managed-space.report.v4` document.
         #[arg(long)]
         json: bool,
     },
@@ -56,7 +56,7 @@ pub enum RetentionCommand {
         /// Protect revisions referenced by an explicit validated backup package.
         #[arg(long = "backup")]
         backup: Vec<PathBuf>,
-        /// Emit the versioned `yinyang.managed-retention.plan.v3` document.
+        /// Emit the versioned `yinyang.managed-retention.plan.v4` document.
         #[arg(long)]
         json: bool,
     },
@@ -64,11 +64,8 @@ pub enum RetentionCommand {
 
 pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<ExitCode> {
     let config = &context.config;
-    if config.model != Model::Managed {
-        return Err(CliError::invalid(
-            CliStage::Argument,
-            "space inspection supports Managed volumes only; Direct namespace objects are excluded",
-        ));
+    if config.model == Model::Direct {
+        return run_sync_space(config, command).await;
     }
     let operator = context.operator()?;
     let authority = context
@@ -118,6 +115,65 @@ pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<Exi
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+async fn run_sync_space(config: &VolumeConfig, command: SpaceCommand) -> CliResult<ExitCode> {
+    match command {
+        SpaceCommand::Report { json } => {
+            let report = yinyang::space::inspect_sync_space(&config.staging).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_sync_space(&report.staging);
+            }
+        }
+        SpaceCommand::Retention {
+            command: RetentionCommand::Plan { json, .. },
+        } => {
+            let plan = yinyang::space::plan_sync_retention(&config.staging).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print_sync_retention(&plan);
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_sync_space(staging: &yinyang::space::StagingSpace) {
+    println!(
+        "sync space: {} state {:?} files {} apparent bytes {}",
+        staging.path,
+        staging.state,
+        staging
+            .directory
+            .as_ref()
+            .map(|directory| directory.regular_files)
+            .unwrap_or(0),
+        staging
+            .directory
+            .as_ref()
+            .map(|directory| directory.apparent_bytes)
+            .unwrap_or(0),
+    );
+    println!(
+        "sync engine: {:?} pending-installs {} artifacts {} conflicts {}",
+        staging.engine.state,
+        staging.engine.pending_installs.unwrap_or_default(),
+        staging.engine.artifacts.unwrap_or_default(),
+        staging.engine.conflicts.unwrap_or_default(),
+    );
+    println!("protected revisions: {}", staging.protected_revisions.len());
+}
+
+fn print_sync_retention(plan: &yinyang::space::SyncRetentionPlan) {
+    println!(
+        "sync retention: state {:?}, {} protected revisions, deletion authorized: no",
+        plan.staging.state,
+        plan.staging.revisions.len()
+    );
+    println!("reclaimable bytes: unknown; no physical cleanup claim is made");
 }
 
 fn print_report(report: &ManagedSpaceReport) {
@@ -223,45 +279,44 @@ fn print_report(report: &ManagedSpaceReport) {
         );
     }
     println!(
-        "managed sync: {:?} ({} content edits, {} namespace intents: prepared {} unknown {} committed {} conflict {} retryable {} failed {})",
+        "managed sync: {:?} ({} content intents: prepared {} unknown {} committed {} conflict {} retryable {} failed {})",
         report.staging.sync.state,
-        report.staging.sync.content_edits,
-        report.staging.sync.namespace_intents,
-        report.staging.sync.namespace_prepared,
-        report.staging.sync.namespace_unknown,
-        report.staging.sync.namespace_committed,
-        report.staging.sync.namespace_conflict,
-        report.staging.sync.namespace_retryable,
-        report.staging.sync.namespace_failed
+        report.staging.sync.intents,
+        report.staging.sync.prepared,
+        report.staging.sync.unknown,
+        report.staging.sync.committed,
+        report.staging.sync.conflict,
+        report.staging.sync.retryable,
+        report.staging.sync.failed
     );
     println!(
-        "replica: {:?} pending-installs {} artifacts {} conflicts {}; baseline {}",
-        report.staging.replica.state,
+        "sync engine: {:?} pending-installs {} artifacts {} conflicts {}; baseline {}",
+        report.staging.engine.state,
         report
             .staging
-            .replica
+            .engine
             .pending_installs
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
         report
             .staging
-            .replica
+            .engine
             .artifacts
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
         report
             .staging
-            .replica
+            .engine
             .conflicts
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
-        match &report.staging.replica.baseline {
+        match &report.staging.engine.baseline {
             Some(baseline) => format!(
-                "{} (+{} entry revisions)",
-                baseline.revision,
-                baseline.entry_revisions.len()
+                "{} baseline revisions (+{} receipt revisions)",
+                baseline.revisions.len(),
+                baseline.receipt_revisions.len()
             ),
-            None => report.staging.replica.baseline_coverage.to_owned(),
+            None => report.staging.engine.baseline_coverage.to_owned(),
         }
     );
     for unresolved in &report.unresolved {
@@ -327,42 +382,42 @@ fn print_plan(plan: &ManagedRetentionPlan) {
         plan.protection.staging.ledger_errors
     );
     println!(
-        "protected sync evidence: namespace intents {} (prepared {} unknown {} committed {} conflict {} retryable {} failed {})",
-        plan.protection.staging.sync.namespace_intents,
-        plan.protection.staging.sync.namespace_prepared,
-        plan.protection.staging.sync.namespace_unknown,
-        plan.protection.staging.sync.namespace_committed,
-        plan.protection.staging.sync.namespace_conflict,
-        plan.protection.staging.sync.namespace_retryable,
-        plan.protection.staging.sync.namespace_failed
+        "protected sync evidence: content intents {} (prepared {} unknown {} committed {} conflict {} retryable {} failed {})",
+        plan.protection.staging.sync.intents,
+        plan.protection.staging.sync.prepared,
+        plan.protection.staging.sync.unknown,
+        plan.protection.staging.sync.committed,
+        plan.protection.staging.sync.conflict,
+        plan.protection.staging.sync.retryable,
+        plan.protection.staging.sync.failed
     );
     println!(
-        "replica evidence: pending-installs {} artifacts {} conflicts {}; baseline {}",
+        "sync engine evidence: pending-installs {} artifacts {} conflicts {}; baseline {}",
         plan.protection
             .staging
-            .replica
+            .engine
             .pending_installs
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
         plan.protection
             .staging
-            .replica
+            .engine
             .artifacts
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
         plan.protection
             .staging
-            .replica
+            .engine
             .conflicts
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
-        match &plan.protection.staging.replica.baseline {
+        match &plan.protection.staging.engine.baseline {
             Some(baseline) => format!(
-                "{} (+{} entry revisions)",
-                baseline.revision,
-                baseline.entry_revisions.len()
+                "{} baseline revisions (+{} receipt revisions)",
+                baseline.revisions.len(),
+                baseline.receipt_revisions.len()
             ),
-            None => plan.protection.staging.replica.baseline_coverage.to_owned(),
+            None => plan.protection.staging.engine.baseline_coverage.to_owned(),
         }
     );
     println!(

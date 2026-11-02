@@ -94,7 +94,7 @@ fn sync_rejects_a_mount_volume() {
     let config = write_config(temp.path(), "mount", "managed", "mount");
     let output = yy(&["--volume", config.to_str().unwrap(), "sync", "status"]);
     assert!(!output.status.success());
-    assert_stderr(&output, "requires a Managed volume with access=sync");
+    assert_stderr(&output, "requires access=sync, found Mount");
 }
 
 #[test]
@@ -110,8 +110,25 @@ fn sync_status_dispatches_a_direct_sync_volume() {
     ]);
     assert_eq!(output.status.code(), Some(3));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["schema"], "yinyang.direct-sync.status.v1");
+    assert_eq!(value["schema"], "yinyang.sync.status.v1");
     assert_eq!(value["binding"]["state"], "unbound");
+}
+
+#[test]
+fn direct_space_report_does_not_require_a_managed_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = write_config(temp.path(), "direct-space", "direct", "sync");
+    let output = yy_without_storage(&[
+        "--volume",
+        config.to_str().unwrap(),
+        "space",
+        "report",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], "yinyang.sync.space.v1");
+    assert_eq!(value["staging"]["engine"]["state"], "missing");
 }
 
 #[test]
@@ -279,6 +296,6 @@ fn direct_sync_init_rejects_both_containment_directions() {
             "state must not be inside the synchronized root"
         };
         assert_stderr(&output, expected);
-        assert!(!state.join("direct-sync.db").exists());
+        assert!(!state.join("sync-engine.db").exists());
     }
 }

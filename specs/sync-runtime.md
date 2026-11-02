@@ -1,212 +1,111 @@
-# Durable Sync intents
+# Durable content intents
 
-**Status: experimental content and namespace coordinator, independent of Mount.**
+**Status: experimental in-process content bridge.**
 
-`yinyang::sync::Sync` accepts content replacement and namespace operations
-against an explicit common remote baseline. It never substitutes a fresh
-observation after an offline edit. Downloads use `Snapshot::open_file` and its
-immutable verified ranges; enumeration uses the same Snapshot APIs. Ordinary
-local directories and OS-managed provider trees supply their own platform
-callbacks, local edit tracking and materialization.
+`yinyang::sync::Sync` is the final public content-only coordination API used by
+the in-process native frontend. Ordinary-directory reconciliation belongs to
+[`sync_engine::SyncEngine`](linux-sync.md); the Managed adapter plans namespace
+transactions internally. Sync no longer accepts namespace operations, owns a
+FileHandle staging runtime, or acts as a second reconciliation status
+authority.
 
-## Content edits
+## Public surface
 
-`stage` streams replacement bytes into FileHandle staging in 64 KiB chunks. It
-materializes the baseline before replacing it, makes the staged bytes durable,
-then commits the local journal mapping with `synchronous=FULL`. It returns only
-after both records are durable. The returned EditId is BLAKE3 with derive-key context
-`yinyang-sync-content-edit-1` over filesystem ID, node ID, 24-byte baseline
-revision and all replacement bytes. Repeating this exact intent returns the same
-local edit, including after restart. An empty replacement is still conditional
-even when the baseline was also empty.
-
-`publish` uses that edit's original staged baseline and frozen request. Remote
-success returns the revision that accepted the edit, never a later observation.
-Conflicts retain local bytes for export with `read`; Unknown/Retryable retain the
-exact request. Completed edits stay available for idempotent retry. The current
-experimental profile retains these records indefinitely; it has no automatic
-garbage collection or conflict-resolution policy.
-
-`publish_batch` prepares every namespace member independently, records each
-member's `Unknown` dispatch state before dispatch, and submits one
-`Authority::commit_batch`. Every member keeps its own frozen request, CommitId,
-receipt or Conflict/Retryable/Unknown result, so one rejected member cannot hide
-another member's accepted receipt. Requests are submitted in caller order and
-must be independent; Directory Sync uses one batch per directory depth.
-
-Local staging, remote completion and platform acknowledgment are separate.
-An adapter may mark a file in-sync only if the currently observed local version
-still matches the completed edit. Completion of v1 must not acknowledge a newer
-v2. In particular local fsync inside a File Provider domain is not remote fsync.
-
-## Namespace intents
-
-The namespace API accepts only operations expressible by the shared
-Authority/Planner contract:
+The complete public surface is:
 
 ```text
-stage_create_file(parent, name, baseline, FileMetadata, bytes)
-stage_create_directory(parent, name, baseline)
-stage_remove(node, baseline)
-stage_rename(node, baseline, new_parent, new_name, RenameMode)
-stage_set_executable(node, baseline, executable)
+Sync::open(authority, directory) -> Result<Sync>
+Sync::validate_restore(directory, filesystem) -> Result<()>
+Sync::stage(node, baseline, source) -> Result<EditId>
+Sync::publish(edit) -> Result<Revision>
+Sync::status(edit) -> Result<ContentStatus>
+Sync::inspect(directory) -> Result<SyncInspect>
 ```
 
-`RenameMode` is explicitly `NoReplace` or `Replace`. `NoReplace` rejects an
-occupied destination. `Replace` removes exactly the destination observed in
-the same baseline snapshot and requires the same kind; a directory destination
-must be empty. The source keeps its NodeId. Existing pinned versions and staged
-handles of the replaced node remain readable but cannot publish back to the
-removed identity.
+`ContentStatus` reports the edit and frozen CommitId, accepted baseline,
+`Prepared`, `Unknown`, `Committed`, `Conflict`, `Retryable` or `Failed` state,
+pending/frozen/conflict booleans, receipt or baseline revision, content length,
+and an optional durable `Failure`. `SyncInspect` returns those records
+read-only. `EditId` is the caller-visible local identity.
 
-Creation allocates its stable NodeId in the same Planner that produces the
-persisted transaction. The intent exposes that NodeId; callers must not resolve
-the path again and adopt a concurrent replacement. `CreateFile` also exposes
-the prepared `ContentDescriptor`, allowing a local adapter to compare its
-current bytes without a fresh remote lookup. `read` on that intent reads the
-verified immutable descriptor from the authority, including before publication;
-this requires authority access. Other namespace intents return `Unsupported`
-for `read`. An adapter that needs offline export of a creation conflict must
-keep its durable local input separately from Sync.
+The native frontend stages one exact local file, publishes it and polls status.
+It does not use FileHandle or Mount staging. A caller that needs a namespace
+mutation uses the shared Sync engine rather than this type.
 
-`FileMetadata` contains only the executable bit. File creation and subsequent
-`SetExecutable` support that bit. Directory modes, ownership, ACLs, timestamps,
-and other POSIX metadata are outside this contract; adapters must report them
-unsupported before creating an intent. There is no recursive removal. Removing
-a directory requires the observed empty directory and conflicts with a
-concurrent child creation.
+## Staging
 
-Every namespace intent is planned against `Authority::observe_revision` for its
-supplied baseline and persisted with `Transaction::to_bytes` before its first
-commit. Publication restores that exact transaction through the selected
-Authority. It does not call current-head Runtime namespace helpers, rerun a
-callback, choose a newer baseline, or allocate a different NodeId.
+`stage` observes the exact supplied baseline revision. It prepares replacement
+bytes once from the supplied `AsyncRead`; the resulting `ContentDescriptor` is
+the accepted content identity. The local EditId is BLAKE3 with derive-key
+context `yinyang-sync-content-edit-2` over filesystem ID, NodeId,
+24-byte baseline revision, replacement length and verified content digest.
+Repeating the exact intent returns the same row.
 
-The Planner guards each selected name, parent kind, source link, destination,
-and relevant ancestry. Rename additionally guards the complete logical state of
-the source and of an observed replacement target. Remove guards the complete
-source node, its link and directory membership. These dependencies distinguish
-destructive content or executable changes from a safe namespace-only move.
-The required interleavings are:
+The frozen `Transaction` bytes, request digest and deterministic CommitId are
+committed with `synchronous=FULL` before any dispatch. There is no separate
+FileHandle journal or mutable replacement copy. The frozen transaction restores
+the verified prepared descriptor; publication does not read the live local file
+again. The authority's bounded preparation cache may avoid a second payload
+read, and a cache miss imports and verifies the exact prepared bytes.
 
-- Concurrent creates of one name publish at most one intent; the other is
-  `Conflict`.
-- A delete or rename conflicts when a content/executable edit against its
-  baseline publishes first, because the edit changes the source node state the
-  namespace operation guards. The reverse order is safe for rename: the moved
-  identity keeps its content, so a same-baseline edit still commits under the
-  new name. Delete first makes the later edit conflict because its node is no
-  longer live.
-- Concurrent renames of one source publish at most one move.
-- Child creation and removal of its observed empty parent publish at most one
-  operation.
-- Replacing a destination conflicts with a concurrent edit, replacement, or new
-  child of that destination.
+The baseline local side is always the accepted input of the request. It is
+never taken from the live file at response time. A live file that differs after
+completion is pending work or the superseded conflict side, not in-sync input.
 
-## Durable state and resolution
+## Publication
 
-The dedicated directory contains `sync.db` and `content/` (the runtime staging
-directory and exclusive process lock). Both databases use SQLite WAL. Staging
-uses `synchronous=NORMAL` with explicit barriers; the journal uses
-`synchronous=FULL`, so every committed intent is durable before dispatch.
-Profile `yinyang-sync-3`
-binds the journal to one filesystem. Its exact schema is `binding`, `edits`,
-and `namespaces`. Schema admission compares exact table and column-name sets,
-not column order. Every insert names its target columns.
+`publish` is serialized per Sync instance. `Prepared` and `Retryable` requests
+restore and dispatch the original transaction with the original CommitId.
+Before dispatch, state becomes durable `Unknown`. On a known `Conflict`,
+`Retryable` or `Failed` outcome, the corresponding terminal or retry state is
+stored with its typed failure.
 
-A writer validates both the journal and existing staging database read-only
-before changing either component. Older, newer or unknown profiles and
-missing/extra columns fail before journal-mode configuration, DDL, recovery, or
-incomplete-content cleanup. There is no schema upgrade path. A read-only WAL
-open may create an empty `-wal` and may create or update derived `-shm`; the
-main database, any existing WAL/journal bytes, configured journal mode, logical
-rows, and recovery state remain unchanged. A missing filesystem binding or
-mismatched filesystem remains an error.
+An `Unknown` request first looks up the original CommitId. A receipt with the
+same request digest completes the intent without another dispatch. Absent
+receipt does not prove failure, so the exact request may be replayed. A
+post-dispatch authority error stays `Unknown` with the CommitId in its durable
+failure. No path replans against a newer baseline.
 
-Opening through `DirectorySync` preflights existing replica, Sync, and content
-staging state before recovery starts. Inspect and backup validation accept only
-the current profile without DDL or a writer lease. Keep both databases and their
-WALs together.
+The `intents` state codec is shared by Sync, the Sync engine and
+`directory/journal.rs`:
 
-The content edit table maps 32-byte EditIds to 16-byte staged handle IDs. A
-mapping is committed with `synchronous=FULL` only after all local bytes are made
-durable;
-publication is forbidden before that mapping. Interrupted staging can leave
-unreferenced, never-dispatched content, collected on restart or before the next
-stage. Missing referenced content is an error, not permission to replan.
-
-Each core `DataStore`, and all of its clones, owns one bounded set of verified
-`ContentDescriptor` values. Preparation records a descriptor only after the
-pack is verified; service preparation records it after the service answers
-`Registered`. Publication restores a frozen request through the normal
-`Authority::restore_transaction` path, and `DataStore::import` returns the
-prepared evidence without another read on a hit. The set is process-local and
-bounded at 65,536 entries, so a restarted or evicted descriptor falls back to
-one full verified import. A service client sends a completed pack descriptor to
-the service; the service verifies it once and records durable preparation
-evidence before acknowledging registration.
-
-The namespace table stores the logical operation, exact `CommitId`, canonical
-request digest, baseline, transaction bytes, durable state, receipt, and typed
-failure. One `EditId` identifies either a content edit or namespace intent.
-`namespace_status` and `namespace_intents` expose the retained logical intent;
-`edit_status` distinguishes the two edit families. Namespace state is:
-
-| State | Meaning |
+| Code | State |
 | --- | --- |
-| Prepared | Accepted locally and durable, with no dispatch recorded. |
-| Unknown | A dispatch may have published; receipt absence is not failure. |
-| Committed | The original receipt is attached. |
-| Conflict | The baseline-bound predicates no longer hold. |
-| Retryable | The attempt is known not to have published. |
-| Failed | Validation, readiness, corruption, or another definitive failure. |
+| 0 | Prepared |
+| 1 | Unknown |
+| 2 | Committed |
+| 3 | Conflict |
+| 4 | Retryable |
+| 5 | Failed |
 
-`Sync::inspect(directory)` provides the same durable view without opening a
-writer or acquiring the runtime lease. It opens `sync.db` and the content
-staging database read-only, returns each content EditId with its
-`HandleStatus`, and returns every namespace intent. This supports progress and
-failure inspection while another process or task holds the publication lease.
-It performs no recovery, logical mutation, or remote request. SQLite may create
-an empty `-wal` and may create or update derived `-shm`; existing WAL/journal
-bytes remain protected. Inspection reads the journal mappings before the
-staging database, relying on the existing invariant that a mapping is committed
-only after its staging record is durable; this ordering avoids a false
-missing-handle result during concurrent staging.
+The exact shared columns are `id`, `request_id`, `request_digest`, `request`,
+`commit_id`, `state`, `receipt_revision`, `receipt_ordinal`, `failure` and
+`metadata`. Each database supplies its own table definition and binding, but
+the state and receipt codec is one implementation. The engine uses `metadata`
+for its work association; Directory publication stores its diagnostic source
+and manifest there.
 
-The original namespace intent is committed durably when prepared. Before
-dispatch, Sync changes `Prepared`/`Retryable` to `Unknown` in a
-`synchronous=FULL` transaction. A crash or lost response therefore cannot turn a possibly
-published request into a safe abort. `publish` retries `Unknown` and `Retryable`
-with the same transaction and CommitId. It does not dispatch `Conflict` or
-`Failed` again, and never replans either one. A caller that wants a different
-intent must create a new baseline-bound EditId.
+## Local profile
 
-`resolve_namespace` checks only the original CommitId's receipt and verifies its
-request digest before attaching it. It never dispatches. Returning no receipt
-does not prove that a delayed attempt failed. Conflict resolution is explicit:
-keep or export the relevant local and pinned baseline bytes, then create a new
-intent with suitable current predicates.
+The dedicated directory contains only `sync.db` with profile
+`yinyang-sync-4`. Its exact table set is `binding` and `intents`; the binding
+contains one filesystem identity. SQLite uses WAL with
+`synchronous=FULL`. Older, newer or unknown profiles and missing, extra or
+malformed tables/columns are rejected without repair or migration.
 
-Recovery preserves what prior dispatch established. For `Unknown`, `publish`
-checks the original receipt first. If the authority is unavailable or restoring
-the retained transaction fails, the intent remains `Unknown` with the new
-diagnostic; failure to observe is not evidence that the commit failed. Once the
-authority recovers, receipt lookup can attach the original outcome without a
-second dispatch. A transient restore failure for `Prepared` or `Retryable`
-retains `Retryable`; only invalid, corrupt, or unsupported retained state becomes
-`Failed`.
+Validation reads the profile and exact schema before journal-mode changes,
+DDL, recovery or dispatch. Read-only inspection may create an empty `-wal` and
+update derived `-shm`, but does not change authoritative database bytes,
+logical rows or configured journal mode.
 
-Operations within one Sync instance serialize to protect intent creation,
-staging leases, and state transitions. This is not a background worker,
-directory reconciler, OS cache, or cross-process concurrent uploader. It does
-not implement the ordinary-directory scanner, materialization policy, CLI,
-File Provider callbacks, or a macOS frontend.
+Rows remain retained indefinitely in this experimental profile. There is no
+automatic garbage collection or conflict-resolution policy. A definitive
+`Conflict` or `Failed` intent is not redispatchable; a caller creates a new
+intent against suitable predicates.
 
 ## Validation
 
-Tests cover both publication authorities, repeated intent, empty replacement
-conflicts, pinned downloads, retained conflicting bytes, and Unknown recovery
-after restart. Namespace tests cover create file/directory, stable-identity
-rename, no-replace and replace, executable metadata, create/create,
-delete/edit, rename/edit, rename/rename, parent removal, and response-loss
-replay after process reopen.
+Tests cover conditional content replacement, terminal conflicts, exact
+prepared-byte replay after Unknown response loss, receipt attachment after
+restart without a second commit, typed status and inspection, and rejection of
+an unsupported profile without schema repair.

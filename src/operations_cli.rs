@@ -22,13 +22,13 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use yinyang::direct::{DirectRuntime, DirectRuntimeInspectionState};
-#[cfg(target_os = "linux")]
-use yinyang::direct_sync::{
-    BindingState, DirectRemote, DirectRemoteAdapter, DirectSync, LocalScanState,
-    validate_remote_namespace,
-};
 use yinyang::runtime::ErrorKind;
 use yinyang::runtime::Runtime;
+#[cfg(target_os = "linux")]
+use yinyang::sync_engine::{
+    BindingState as SyncBindingState, DirectAdapter, LocalScanState as SyncScanState,
+    RemoteAdapter, validate_namespace_entries,
+};
 use yinyang::volume::{
     Access, Frontend, Model, Publication, VolumeConfig, VolumeContext, VolumeLoadError,
     VolumeLoadStage,
@@ -684,24 +684,18 @@ async fn check_direct_sync_state(
     report: &mut DoctorReport,
 ) {
     let config_path = report.config.clone();
-    let (remote, remote_error) = match context {
-        Some(context) => match crate::direct_sync_cli::remote_adapter(context) {
-            Ok(remote) => (Some(remote), remote_error),
-            Err(error) => {
-                let detail = match remote_error {
-                    Some(previous) => format!("{previous}; {error}"),
-                    None => error.to_string(),
-                };
-                (None, Some(detail))
-            }
-        },
-        None => (None, remote_error),
+    let inspection = match context {
+        Some(context) => crate::sync_cli::inspect_document(context, remote_error).await,
+        None => yinyang::sync_engine::StatusDocument::empty(
+            match config.model {
+                Model::Managed => yinyang::sync_engine::SyncModel::Managed,
+                Model::Direct => yinyang::sync_engine::SyncModel::Direct,
+            },
+            config.staging.display().to_string(),
+        ),
     };
-    let inspection =
-        DirectSync::<DirectRemoteAdapter>::inspect(remote.as_ref(), &config.staging, remote_error)
-            .await;
     match inspection.binding.state {
-        BindingState::Unbound => report.push(
+        SyncBindingState::Unbound => report.push(
             "sync-state",
             Health::Info,
             "Direct Sync state is not initialized; doctor did not create it",
@@ -710,7 +704,7 @@ async fn check_direct_sync_state(
                 config_path
             )),
         ),
-        BindingState::Error => report.push(
+        SyncBindingState::Error => report.push(
             "sync-state",
             Health::ActionRequired,
             inspection
@@ -719,9 +713,9 @@ async fn check_direct_sync_state(
                 .unwrap_or_else(|| "Direct Sync state validation failed".to_owned()),
             Some("preserve the Direct Sync state directory and correct the binding or permissions"),
         ),
-        BindingState::Bound => {
+        SyncBindingState::Bound => {
             let summary = inspection.summary;
-            let lifecycle_failed = inspection.local.scan == LocalScanState::Failed;
+            let lifecycle_failed = inspection.local.scan == SyncScanState::Failed;
             let state_failed = summary.failed > 0;
             let detail = format!(
                 "Direct Sync state is readable; in_sync={} pending={} unknown={} conflicts={} failed={} retained_artifacts={}; remote={:?}",
@@ -843,7 +837,7 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
     let config = &context.config;
     #[cfg(target_os = "linux")]
     if config.access == Access::Sync {
-        let remote = match crate::direct_sync_cli::remote_adapter(context) {
+        let remote = match direct_sync_adapter(context) {
             Ok(remote) => remote,
             Err(error) => {
                 report.push(
@@ -855,25 +849,28 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
                 return;
             }
         };
-        match remote.observe().await {
-            Ok(snapshot) => {
-                let root_entries = snapshot
+        match remote.observe(None).await {
+            Ok(observation) => {
+                let root_entries = observation
                     .entries
                     .keys()
                     .filter(|path| !path.contains('/'))
                     .count();
-                let root_directories = snapshot
+                let root_directories = observation
                     .entries
                     .values()
-                    .filter(|entry| !entry.path.contains('/') && !entry.is_file())
+                    .filter(|entry| {
+                        !entry.path.contains('/')
+                            && entry.kind == yinyang::sync_engine::EntryKind::Directory
+                    })
                     .count();
-                match validate_remote_namespace(&snapshot) {
+                match validate_namespace_entries(&observation.entries) {
                     Ok(()) => report.push(
                         "namespace",
                         Health::Pass,
                         format!(
                             "Direct Sync namespace is readable at observation {} with {} root entries and {root_directories} root directories",
-                            snapshot.revision.as_deref().unwrap_or("<none>"),
+                            yinyang::sync_engine::hex(&observation.cursor.bytes),
                             root_entries
                         ),
                         None::<String>,
@@ -884,7 +881,7 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
                         error.to_string(),
                         Some(direct_remediation(
                             CliStage::Observe,
-                            runtime_kind_from_replica(error.kind()),
+                            error.kind(),
                         )),
                     ),
                 }
@@ -893,10 +890,7 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
                 "namespace",
                 Health::ActionRequired,
                 error.to_string(),
-                Some(direct_remediation(
-                    CliStage::Observe,
-                    runtime_kind_from_replica(error.kind()),
-                )),
+                Some(direct_remediation(CliStage::Observe, error.kind())),
             ),
         }
         return;
@@ -938,6 +932,28 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
             )),
         ),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn direct_sync_adapter(context: &VolumeContext) -> crate::CliResult<DirectAdapter> {
+    if context.config.staging.as_os_str().is_empty() {
+        return Err(CliError::invalid(
+            CliStage::Admission,
+            "Direct Sync requires a non-empty staging path",
+        ));
+    }
+    context.storage_capabilities()?;
+    let binding = context
+        .direct_storage_binding()
+        .map_err(|error| CliError::from_runtime(CliStage::Admission, error))?;
+    let namespace = context
+        .direct_namespace()
+        .map_err(|error| CliError::from_runtime(CliStage::Admission, error))?;
+    DirectAdapter::open(
+        namespace,
+        yinyang::sync_engine::hex(&binding.namespace_id()),
+    )
+    .map_err(|error| CliError::new(CliStage::Admission, error.kind(), error.to_string()))
 }
 
 fn direct_config_remediation(config: &VolumeConfig) -> &'static str {
@@ -1054,19 +1070,6 @@ fn direct_remediation(stage: CliStage, kind: ErrorKind) -> &'static str {
         (_, _) => {
             "inspect the S3 namespace and its read/list permissions; Direct never creates or repairs object metadata"
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_kind_from_replica(kind: yinyang::replica::ErrorKind) -> ErrorKind {
-    use yinyang::replica::ErrorKind as Kind;
-    match kind {
-        Kind::Invalid => ErrorKind::Invalid,
-        Kind::Unsupported => ErrorKind::Unsupported,
-        Kind::Conflict => ErrorKind::Conflict,
-        Kind::Corrupt => ErrorKind::Corrupt,
-        Kind::Busy => ErrorKind::Busy,
-        Kind::Io => ErrorKind::Io,
     }
 }
 

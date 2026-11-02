@@ -200,10 +200,10 @@ authority. Read-only Direct performs no state probe. Writable Direct Mount
 probes the configured staging directory with one temporary owner-only file,
 then validates the retained Direct runtime profile, storage binding and
 object/mutation state read-only. Direct Sync probes its state directory and
-inspects the Direct Sync SQLite profile, binding, pending, Unknown, conflict
+inspects the shared Sync engine profile, binding, pending, Unknown, conflict
 and retained artifact state read-only. Direct policies report a recursive
 namespace observation. Doctor does not create staging, initialize `staging.db`,
-`sync.db`, `direct-sync.db` or `runtime.db`, run recovery, acquire a runtime or
+`sync-engine.db`, `sync.db` or `runtime.db`, run recovery, acquire a runtime or
 publication lease, or publish.
 Its JSON form and exit codes are specified in
 [`linux-operations.md`](linux-operations.md).
