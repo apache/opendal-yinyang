@@ -18,7 +18,7 @@
 //! Accepted writable Direct admission and native mutation scenarios.
 
 use crate::harness::{
-    Fixture, Mounted, RequestCounter, assert_errno, effective_capabilities, local_paths, path_text,
+    Fixture, Mounted, RequestCounter, admitted_capabilities, assert_errno, local_paths, path_text,
     payload, run_timeout,
 };
 use crate::s3_gate::{CommitAction, S3Gate};
@@ -74,7 +74,7 @@ fn direct_write_admission_requires_staging_and_publishes_limited_capabilities() 
     let local_before = local_paths(fixture.temp.path());
 
     let output = fixture.yy_ok(&["--volume", path_text(&config), "capabilities"]);
-    let capabilities = effective_capabilities(&output.stdout);
+    let capabilities = admitted_capabilities(&output.stdout);
     assert_writable_capabilities(&capabilities);
 
     assert!(

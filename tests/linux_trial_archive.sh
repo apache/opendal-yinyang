@@ -99,7 +99,6 @@ cat >"$config" <<EOF
   "storage_profile": "minio",
   "staging": "$work/state",
   "read_only": false,
-  "require": [],
   "service_address": null
 }
 EOF

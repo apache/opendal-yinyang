@@ -32,5 +32,5 @@ pub(crate) const NODE_IDENTITY_CONTEXT: &str = "Apache OpenDAL YinYang node iden
 pub(crate) const TRANSACTION_PLAN_MAGIC: [u8; 8] = *b"YYPLAN01";
 
 pub(crate) const SERVICE_BINDING_MAGIC: [u8; 8] = *b"YYSERV01";
-pub(crate) const SQLITE_SCHEMA_PROFILE: &str = "yinyang-sqlite-1";
+pub(crate) const SQLITE_SCHEMA_PROFILE: &str = "yinyang-sqlite-2";
 pub(crate) const RPC_PROTOCOL_VERSION: u8 = 1;

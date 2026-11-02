@@ -75,6 +75,8 @@ pub enum ErrorKind {
     Stale,
     /// The storage lacks a required Direct primitive.
     Unsupported,
+    /// Stored Direct state is malformed.
+    Corrupt,
     /// The storage request failed.
     Storage,
 }

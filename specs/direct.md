@@ -1,15 +1,17 @@
 # Direct volumes
 
-**Status: experimental S3-compatible read-only library/Linux FUSE support and
-conditional mutation library runtime.**
+**Status: experimental S3-compatible read-only library and Linux FUSE support,
+writable Linux FUSE Mount, and Direct Sync over the conditional mutation
+runtime.**
 
 A Direct volume keeps the configured storage namespace authoritative. It lists
 and reads existing objects without creating YinYang metadata, Managed NodeIds,
 content proofs, transactions or Managed identities. This specification defines
 the read-only observation and FUSE contract. The separate
 [Direct mutation runtime](direct-mutations.md) defines conditional publication,
-retained local generations and safe-save namespace mutation. Writable FUSE
-admission is defined by the Linux FUSE frontend.
+retained local generations and safe-save namespace mutation;
+[Linux FUSE](linux-fuse.md) defines writable Direct Mount admission and
+[Direct Sync](direct-sync.md) defines ordinary-directory reconciliation.
 
 ## Configuration and admission
 
@@ -23,15 +25,17 @@ A Direct volume uses this configuration shape:
   "frontend": "fuse",
   "publication": "object",
   "storage_profile": "minio",
-  "require": ["read", "list", "pinned-reads"]
+  "read_only": true
 }
 ```
 
-`read_only` defaults to `true` for Direct and must be `true` when present.
-`staging` must be omitted. The existing Managed default remains
-`read_only=false` with a required staging path.
+`read_only` defaults to `true` for Direct. A read-only Direct volume omits
+`staging`. A writable Direct Mount (`read_only=false`, `frontend=fuse`) and a
+Direct Sync volume (`access=sync`, `frontend=library`) require a `staging`
+path. The Managed default remains `read_only=false` with a required staging
+path.
 
-Direct admission accepts only:
+Read-only Direct admission accepts only:
 
 - `access=mount`;
 - `publication=object` with no service address;
@@ -62,8 +66,8 @@ The read-only frontend publishes the `read`, `list`, and `pinned-reads`
 capabilities only. It does not claim Managed `stable-identity`: replacement
 changes the file inode. It does not claim `retained-unlink-read`; retained reads
 after deletion depend on backend version history and are not a portable Direct
-guarantee. Writable admission requires the native primitive intersection
-documented in the mutation runtime specification.
+guarantee. Writable admission checks the native primitives through the shared
+admission table and the mutation runtime specification.
 
 ## Reversible key mapping
 
@@ -109,7 +113,10 @@ transaction isolation.
 
 The FUSE adapter accepts one snapshot at startup and reuses it for LOOKUP,
 GETATTR and directory enumeration. `SIGHUP` observes and atomically replaces
-the cached snapshot, then invalidates known inodes and dentries. The adapter
+the cached snapshot, then invalidates known inodes and dentries. Unlike
+Managed, Direct does not refresh an accepted snapshot when the one-second
+metadata window expires: doing so would recursively list the whole namespace
+on a metadata path. This is the documented freshness exception. The adapter
 does not run a background watch and does not recursively list for every
 LOOKUP. Memory use is proportional to the accepted namespace and visited
 directories.
@@ -193,10 +200,11 @@ startup if the namespace is still invalid.
 
 ## CLI and doctor
 
-`yy --volume CONFIG capabilities` reports the four capability intersections
-without reading the namespace. `yy --volume CONFIG mount MOUNTPOINT` performs
-admission before observing storage. `yy --volume CONFIG status` reports a
-Direct observation summary without creating staging state.
+`yy --volume CONFIG capabilities` reports the admitted capability set and raw
+storage primitives without reading the namespace.
+`yy --volume CONFIG mount MOUNTPOINT` performs admission before observing
+storage. `yy --volume CONFIG status` reports a Direct observation summary
+without creating staging state.
 
 `yy --volume CONFIG doctor` validates admission, recursively observes the
 namespace, and reports `namespace` health. Writable Direct Mount additionally

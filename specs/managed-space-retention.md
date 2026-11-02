@@ -19,8 +19,8 @@ yy --volume CONFIG space retention plan \
 volumes and their namespace objects are rejected before authority connection.
 The command is observation-only even when the volume configuration is writable.
 
-`space report --json` emits `yinyang.managed-space.report.v3`. `space retention
-plan --json` emits `yinyang.managed-retention.plan.v3`. Revisions are 24-byte
+`space report --json` emits `yinyang.managed-space.report.v4`. `space retention
+plan --json` emits `yinyang.managed-retention.plan.v4`. Revisions are 24-byte
 hexadecimal strings, filesystem identities are 16-byte hexadecimal strings,
 and enum values are `snake_case`. Unknown values are `null`; optional evidence
 is not represented by fabricated zeroes.
@@ -134,9 +134,8 @@ observed by `space retention plan --backup`.
 Local staging uses only existing paths:
 
 - `<staging>/staging.db` denotes managed mount or file-runtime staging;
-- `<staging>/sync.db` denotes the Managed Sync namespace and content journal;
-- `<staging>/content/staging.db` denotes Managed Sync content staging; and
-- `<staging>/replica.db` denotes the Linux ordinary-directory replica.
+- `<staging>/sync-engine.db` denotes the shared Managed or Direct Sync engine;
+- `<staging>/sync.db` denotes the content-only library Sync intent journal.
 
 An absent staging database remains absent. A present database is inspected
 through the existing read-only runtime inspection API. The report exposes
@@ -145,26 +144,21 @@ lengths, ledger error count, frozen commit identities, and the recorded remote
 base revisions. Handle lengths are local staged logical lengths, not directory
 allocation.
 
-When `sync.db` exists, the existing `Sync::inspect` API joins content-edit
-records and namespace intents without taking the writer lease. Namespace
-evidence includes baseline revision, original CommitId, operation state
-(`prepared`, `unknown`, `committed`, `conflict`, `retryable`, or `failed`), and
-receipt revision when committed. A namespace-only pending or Unknown intent can
-therefore protect its baseline even when no content handle exists. Content
-handles already counted from content staging are not counted again from this
-join.
+When `sync.db` exists, `Sync::inspect` reads its content intents without taking
+a writer lease. Intent evidence includes baseline revision, original CommitId,
+state (`prepared`, `unknown`, `committed`, `conflict`, `retryable`, or `failed`)
+and receipt revision when committed. A pending or Unknown intent protects its
+baseline without requiring a staged FileHandle.
 
-When `replica.db` exists on Linux, the existing read-only `Replica::inspect`
-API reports incomplete installs, retained artifacts, exportability, conflicts,
-and the stored common baseline. The baseline evidence contains the global
-baseline revision plus the distinct per-entry remote revisions used as future
-staging predicates. Conflict-recorded and baseline-recorded remote revisions
-are protected with `replica_conflict` and `replica_baseline`. `baseline_coverage`
-is `observed_from_read_only_baseline` when the baseline is readable. A failure
-to open the bound local root marks replica evidence unavailable rather than
-fabricating zero.
+When `sync-engine.db` exists, the engine's read-only inspection path exposes the
+accepted baseline, typed intents, Unknown requests, conflicts and retained
+artifacts for the shipped `yy sync` frontend. Managed baseline pin revisions
+are protected with `sync_engine_baseline`; committed intent receipt revisions
+use `sync_engine_receipt`; conflict-recorded remote revisions use
+`sync_engine_conflict`. Direct engine state is valid evidence with no Managed
+revisions to protect.
 
-The JSON document exposes these joins as `staging.sync` and `staging.replica`.
+The JSON document exposes these joins as `staging.sync` and `staging.engine`.
 Missing files report `missing`; malformed or unknown existing databases report
 `unavailable` with their error and are not repaired. `staging.databases` records
 each observed database role separately.
@@ -174,16 +168,16 @@ Volume-bound `space report` and `space retention plan` call
 read-only binding validators are reused before any local evidence is
 attributed:
 
-- `Runtime::validate_staging` validates mount staging and standalone Sync
-  content staging;
-- `Sync::validate_restore` validates the Sync journal and its content staging;
+- `Runtime::validate_staging` validates mount staging;
+- `Sync::validate_restore` validates the content-only Sync journal;
   and
-- `Replica::inspect` supplies the replica's bound filesystem.
+- `sync_engine::inspect_state` validates the engine's root, state identity and
+  Managed namespace binding.
 
 `staging.binding.state` is `verified` after every present component validates
 for the observed authority filesystem. If any component is foreign, malformed,
 or cannot be verified, the state is `unavailable`, the binding error is
-reported, and all handles, namespace intents, artifacts, commit identities, and
+reported, and all handles, content intents, artifacts, commit identities, and
 protected revisions from that staging path are withheld. Foreign work must not
 protect revisions for the configured volume.
 
@@ -221,14 +215,13 @@ The selected set is the union of:
 - every requested revision that is present in the retained list; and
 - remote base revisions recorded by existing pending, frozen, conflict,
   Unknown, or failed staging handles;
-- baselines recorded by Managed Sync namespace intents, including
-  namespace-only intents without a content handle; and
-- receipt revisions recorded by committed Managed Sync namespace intents;
-- global and per-entry remote revisions recorded by the local replica common
-  baseline; and
-- revisions protected by an explicitly supplied backup package: content
-  staging remote bases, namespace intent baselines, committed receipt
-  revisions, replica conflict revisions, and replica baseline revisions.
+- baselines recorded by content Sync intents; and
+- receipt revisions recorded by committed content Sync intents;
+- per-entry remote revisions recorded by the Sync engine common baseline and
+  committed engine intent receipts; and
+- revisions protected by an explicitly supplied backup package: content intent
+  baselines, committed receipt revisions, engine conflict revisions, and engine
+  baseline revisions.
 
 A requested revision absent from a successfully observed retained list is
 reported as `not_retained` and makes the plan partial. If the authority cannot
@@ -246,27 +239,26 @@ Selection reasons are drawn from:
 - `current`, `keep_all`, `keep_last`, and `requested_pin`;
 - `staging_pending`, `staging_frozen`, `staging_unknown`,
   `staging_conflict`, and `staging_failed`;
-- `sync_namespace_pending`, `sync_namespace_unknown`,
-  `sync_namespace_receipt`, `sync_namespace_conflict`,
-  `sync_namespace_retryable`, and `sync_namespace_failed`;
-- `sync_receipt`; and
-- `replica_conflict` and `replica_baseline`; and
+- `sync_intent_prepared`, `sync_intent_unknown`, `sync_intent_receipt`,
+  `sync_intent_conflict`, `sync_intent_retryable`, and `sync_intent_failed`;
+- `sync_receipt`;
+- `sync_engine_conflict`, `sync_engine_baseline`, and `sync_engine_receipt`; and
 - `backup_staging_pending`, `backup_staging_frozen`, `backup_staging_unknown`,
   `backup_staging_conflict`, `backup_staging_failed`,
-  `backup_sync_namespace_pending`, `backup_sync_namespace_unknown`,
-  `backup_sync_namespace_receipt`, `backup_sync_namespace_conflict`,
-  `backup_sync_namespace_retryable`, `backup_sync_namespace_failed`,
-  `backup_sync_receipt`, `backup_replica_conflict`, and
-  `backup_replica_baseline`.
+  `backup_sync_intent_prepared`, `backup_sync_intent_unknown`,
+  `backup_sync_intent_receipt`, `backup_sync_intent_conflict`,
+  `backup_sync_intent_retryable`, `backup_sync_intent_failed`,
+  `backup_sync_receipt`, `backup_sync_engine_conflict`,
+  `backup_sync_engine_baseline`, and `backup_sync_engine_receipt`.
 
 The plan also reports:
 
 - receipt evidence counted from the latest snapshot's retained change records;
 - staging pending/frozen/conflict/Unknown/failed evidence;
-- Managed Sync prepared/Unknown/committed/conflict/retryable/failed namespace
+- content Sync prepared/Unknown/committed/conflict/retryable/failed intent
   evidence;
-- replica pending installs, retained artifacts, conflicts, and global/per-entry
-  baseline evidence;
+- engine pending installs, retained artifacts, conflicts and baseline/receipt
+  evidence;
 - `backups`, with each supplied package's state (`validated`, `partial`,
   `foreign`, or `unavailable`), filesystem binding, read-only staging evidence,
   and protected revisions; and
@@ -277,7 +269,7 @@ The plan also reports:
 - `untracked_pins: "unknown"`; and
 - `quiescence: "not_observed"`.
 
-Receipt records remain namespace evidence, not a physical cleanup
+Receipt records remain revision evidence, not a physical cleanup
 authorization. Backup packages are not discovered automatically. A revision
 needed by an undisclosed backup, external reader, or another unpinned workflow
 must be supplied as an explicit requested pin or via `--backup`, and quiescence

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -25,11 +23,11 @@ use support::TestBackend;
 use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
-    Authority, BackendProfile, CommitOutcome, DataStore, Fs, NodeId, Revision, Snapshot,
-    Transaction,
+    Authority, CommitOutcome, DataStore, Fs, NodeId, Revision, Snapshot, Transaction,
 };
 use yinyang::mount::Mount;
 use yinyang::runtime::{ErrorKind, Runtime};
+use yinyang_test_support as support;
 
 struct PausingObserveAuthority {
     inner: Arc<dyn Authority>,
@@ -221,12 +219,7 @@ async fn exercise(authority: Arc<dyn Authority>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_nodes_use_both_authorities() {
     let backend = TestBackend::default();
-    exercise(Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    ))
-    .await;
+    exercise(Arc::new(Fs::create(backend.operator()).await.unwrap())).await;
     let backend = TestBackend::default();
     let temp = tempfile::tempdir().unwrap();
     let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
@@ -246,11 +239,7 @@ async fn shared_nodes_use_both_authorities() {
 #[tokio::test]
 async fn frozen_mount_write_recovers_original_request() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let mount = Mount::open(authority.clone(), temp.path(), false)
         .await
@@ -288,11 +277,7 @@ async fn frozen_mount_write_recovers_original_request() {
 #[tokio::test]
 async fn flush_publishes_but_reference_release_does_not() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let mount = Mount::open(authority.clone(), temp.path(), false)
         .await
@@ -358,11 +343,7 @@ async fn flush_publishes_but_reference_release_does_not() {
 #[tokio::test]
 async fn set_executable_serializes_with_dirty_mount_handle() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let mount = Mount::open(authority.clone(), temp.path(), false)
         .await
@@ -505,11 +486,7 @@ async fn pausing_mount() -> (
     tempfile::TempDir,
 ) {
     let backend = TestBackend::default();
-    let inner: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let inner: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let setup_temp = tempfile::tempdir().unwrap();
     let setup = Runtime::open(inner.clone(), setup_temp.path())
         .await
@@ -635,11 +612,7 @@ async fn read_only_range_observations_pin_reads_without_staging() {
     const BLOCK: usize = 64 * 1024;
 
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let setup = tempfile::tempdir().unwrap();
     let writer = Runtime::open(authority.clone(), setup.path())
         .await
@@ -700,11 +673,7 @@ async fn read_only_range_observations_pin_reads_without_staging() {
 #[tokio::test]
 async fn writable_mount_rejects_unshared_range_observations() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let mount = Mount::open(authority, temp.path(), false).await.unwrap();
     assert_eq!(
@@ -725,11 +694,7 @@ async fn pausing_read_only_mount() -> (
     tempfile::TempDir,
 ) {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let setup_temp = tempfile::tempdir().unwrap();
     let setup = Runtime::open(authority.clone(), setup_temp.path())
         .await
