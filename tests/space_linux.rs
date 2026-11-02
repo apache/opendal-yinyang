@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use support::TestBackend;
 use yinyang::core::{Authority, Fs, NodeId, Revision};
+use yinyang::runtime::Runtime;
 use yinyang::space::{
     BackupPackageState, StagingBindingState, inspect_bound_local_staging, plan_managed_retention,
 };
@@ -119,6 +120,13 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
     .unwrap();
     drop(sync);
 
+    let runtime = Runtime::open(authority.clone(), state.join("content"))
+        .await
+        .unwrap();
+    let file = runtime.open_node(seeded.id(), true).await.unwrap();
+    file.release().unwrap();
+    drop(runtime);
+
     let backup = temp.path().join("backup");
     let mut directory = SyncEngine::open(ManagedAdapter::new(authority.clone()), &state)
         .await
@@ -158,6 +166,7 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
         .flat_map(|revision| revision.reasons.iter().copied())
         .collect::<BTreeSet<_>>();
     assert!(reasons.contains("backup_sync_intent_prepared"));
+    assert!(reasons.contains("backup_staging_base"));
     assert!(reasons.contains("backup_sync_engine_baseline"));
     assert!(plan.revisions.iter().any(|revision| {
         revision.revision == revision_hex(baseline)

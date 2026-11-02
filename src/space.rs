@@ -733,6 +733,7 @@ fn staging_protection(staging: &StagingSpace) -> StagingProtection {
 
 fn backup_reason(reason: &'static str) -> &'static str {
     match reason {
+        "staging_base" => "backup_staging_base",
         "staging_pending" => "backup_staging_pending",
         "staging_frozen" => "backup_staging_frozen",
         "staging_unknown" => "backup_staging_unknown",
