@@ -43,7 +43,9 @@ enum Command {
     Commit(Vec<Vec<u8>>),
     PrepareOverwrite([u8; 24], [u8; 16], Vec<(u64, u64, Vec<u8>)>),
     PrepareUpdate([u8; 24], [u8; 16], u64, u64, Vec<(u64, u64, Vec<u8>)>),
-    History(Option<[u8; 24]>, u32),
+    Expire(Vec<u8>),
+    ObserveHeld([u8; 24]),
+    RevisionHistory(Option<[u8; 24]>, u32),
 }
 #[derive(BorshSerialize, BorshDeserialize)]
 enum Response {
@@ -54,7 +56,7 @@ enum Response {
     Outcomes(Vec<(u8, Vec<u8>)>),
     Error(u8, String),
     Prepared(Vec<u8>),
-    Revisions(Vec<[u8; 24]>, Option<[u8; 24]>),
+    RevisionHistory(Vec<(u8, [u8; 24])>, Option<[u8; 24]>),
 }
 fn io(e: std::io::Error) -> Error {
     Error::from_io("metadata RPC", e)
@@ -76,6 +78,7 @@ fn kind_tag(kind: ErrorKind) -> u8 {
         ErrorKind::IsDirectory => 9,
         ErrorKind::NotEmpty => 10,
         ErrorKind::PermissionDenied => 11,
+        ErrorKind::Expired => 12,
     }
 }
 fn tag_kind(tag: u8) -> Result<ErrorKind> {
@@ -92,6 +95,7 @@ fn tag_kind(tag: u8) -> Result<ErrorKind> {
         9 => ErrorKind::IsDirectory,
         10 => ErrorKind::NotEmpty,
         11 => ErrorKind::PermissionDenied,
+        12 => ErrorKind::Expired,
         _ => return Err(protocol()),
     })
 }
@@ -123,6 +127,7 @@ mod error_tests {
             ErrorKind::IsDirectory,
             ErrorKind::NotEmpty,
             ErrorKind::PermissionDenied,
+            ErrorKind::Expired,
         ];
         for (tag, kind) in kinds.into_iter().enumerate() {
             assert_eq!(kind_tag(kind), tag as u8);
@@ -143,14 +148,19 @@ mod error_tests {
             borsh::to_vec(&Command::PrepareUpdate([0; 24], [0; 16], 0, 0, vec![])).unwrap()[0],
             6
         );
-        assert_eq!(borsh::to_vec(&Command::History(None, 1)).unwrap()[0], 7);
+        assert_eq!(borsh::to_vec(&Command::Expire(vec![])).unwrap()[0], 7);
+        assert_eq!(borsh::to_vec(&Command::ObserveHeld([0; 24])).unwrap()[0], 8);
+        assert_eq!(
+            borsh::to_vec(&Command::RevisionHistory(None, 1)).unwrap()[0],
+            9
+        );
         assert_eq!(
             borsh::to_vec(&Response::Error(0, String::new())).unwrap()[0],
             5
         );
         assert_eq!(borsh::to_vec(&Response::Prepared(vec![])).unwrap()[0], 6);
         assert_eq!(
-            borsh::to_vec(&Response::Revisions(vec![], None)).unwrap()[0],
+            borsh::to_vec(&Response::RevisionHistory(vec![], None)).unwrap()[0],
             7
         );
     }
@@ -257,7 +267,7 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 return Err(protocol());
             }
             let snapshot = service
-                .observe_revision(Revision::from_bytes(revision))
+                .observe_known_revision(Revision::from_bytes(revision))
                 .await?;
             Response::Value(snapshot.reader.get(table(tag)?, &key).await?)
         }
@@ -271,7 +281,7 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 return Err(protocol());
             }
             let snapshot = service
-                .observe_revision(Revision::from_bytes(revision))
+                .observe_known_revision(Revision::from_bytes(revision))
                 .await?;
             Response::Rows(
                 snapshot
@@ -340,29 +350,13 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                 .await?;
             Response::Prepared(content.descriptor().to_bytes())
         }
-        Command::History(after, limit) => {
-            if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
-                return Err(protocol());
-            }
-            let page = service
-                .retained_revisions_page(after.map(Revision::from_bytes), limit)
-                .await?;
-            Response::Revisions(
-                page.revisions.into_iter().map(Revision::to_bytes).collect(),
-                page.next.map(Revision::to_bytes),
-            )
-        }
         Command::Commit(plans) => {
             if plans.len() > 4096 {
                 return Err(protocol());
             }
-            let mut requests = Vec::new();
-            for plan in plans {
-                requests.push(service.restore_transaction(&plan).await?);
-            }
             Response::Outcomes(
                 service
-                    .commit_batch(&requests)
+                    .commit_frozen_batch(&plans)
                     .await?
                     .into_iter()
                     .map(|outcome| {
@@ -374,6 +368,49 @@ async fn dispatch(service: &MetadataService, command: Command) -> Result<Respons
                         })
                     })
                     .collect::<Result<_>>()?,
+            )
+        }
+        Command::Expire(bytes) => {
+            let request = ExpiryRequest::from_bytes(&bytes)?;
+            let outcome = service.expire(&request).await?;
+            Response::Outcomes(vec![match outcome {
+                Outcome::Committed(receipt) => (0, receipt.encode()?),
+                Outcome::Conflict => (1, vec![]),
+                Outcome::Retryable => (2, vec![]),
+                Outcome::Unknown(id) => (3, id.as_bytes().to_vec()),
+            }])
+        }
+        Command::ObserveHeld(revision) => {
+            let snapshot = service
+                .observe_known_revision(Revision::from_bytes(revision))
+                .await?;
+            Response::Observation(
+                *snapshot.filesystem().as_bytes(),
+                *snapshot.root().as_bytes(),
+                snapshot.revision().to_bytes(),
+            )
+        }
+        Command::RevisionHistory(after, limit) => {
+            if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
+                return Err(protocol());
+            }
+            let page = service
+                .revision_history_page(after.map(Revision::from_bytes), limit)
+                .await?;
+            Response::RevisionHistory(
+                page.revisions
+                    .into_iter()
+                    .map(|record| {
+                        (
+                            match record.status {
+                                RevisionStatus::Readable => 0,
+                                RevisionStatus::Expired => 1,
+                            },
+                            record.revision.to_bytes(),
+                        )
+                    })
+                    .collect(),
+                page.next.map(Revision::to_bytes),
             )
         }
     })
@@ -481,51 +518,88 @@ impl ServiceClient {
             }),
         })
     }
+    async fn observe_held(&self, revision: Revision) -> Result<Snapshot> {
+        let Response::Observation(fs, root, token) = rpc(
+            self.addr,
+            &self.token,
+            Command::ObserveHeld(revision.to_bytes()),
+        )
+        .await?
+        else {
+            return Err(protocol());
+        };
+        if fs != *self.filesystem.as_bytes()
+            || root != *self.root.as_bytes()
+            || token != revision.to_bytes()
+        {
+            return Err(protocol());
+        }
+        Ok(Snapshot {
+            data: self.data.clone(),
+            filesystem: self.filesystem,
+            root: self.root,
+            revision,
+            reader: Arc::new(RemoteRecords {
+                client: self.clone(),
+                revision,
+            }),
+        })
+    }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
         self.observe(None).await
     }
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         self.observe(Some(revision)).await
     }
-    pub async fn retained_revisions_page(
+    pub async fn revision_history_page(
         &self,
         after: Option<Revision>,
         limit: u32,
-    ) -> Result<RevisionPage> {
+    ) -> Result<RevisionHistoryPage> {
         if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
             return Err(Error::unsupported(
-                "list retained revisions",
+                "list revision history",
                 format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
             ));
         }
-        let Response::Revisions(revisions, next) = rpc(
+        let Response::RevisionHistory(records, next) = rpc(
             self.addr,
             &self.token,
-            Command::History(after.map(Revision::to_bytes), limit),
+            Command::RevisionHistory(after.map(Revision::to_bytes), limit),
         )
         .await?
         else {
             return Err(protocol());
         };
-        if revisions.len() > limit as usize {
+        if records.len() > limit as usize {
             return Err(protocol());
         }
-        let revisions = revisions
-            .into_iter()
-            .map(Revision::from_bytes)
-            .collect::<Vec<_>>();
-        if revisions.windows(2).any(|window| window[0] >= window[1])
-            || after.is_some_and(|cursor| revisions.iter().any(|revision| *revision <= cursor))
+        let mut revisions = Vec::with_capacity(records.len());
+        for (tag, token) in records {
+            revisions.push(RevisionRecord {
+                revision: Revision::from_bytes(token),
+                status: match tag {
+                    0 => RevisionStatus::Readable,
+                    1 => RevisionStatus::Expired,
+                    _ => return Err(protocol()),
+                },
+            });
+        }
+        if revisions
+            .windows(2)
+            .any(|window| window[0].revision >= window[1].revision)
+            || after.is_some_and(|cursor| revisions.iter().any(|record| record.revision <= cursor))
         {
             return Err(protocol());
         }
         let next = next.map(Revision::from_bytes);
         if let Some(next) = next
-            && (revisions.len() != limit as usize || Some(next) != revisions.last().copied())
+            && (revisions.len() != limit as usize
+                || Some(next) != revisions.last().map(|record| record.revision))
         {
             return Err(protocol());
         }
-        Ok(RevisionPage { revisions, next })
+        Ok(RevisionHistoryPage { revisions, next })
     }
     pub async fn prepare(
         &self,
@@ -645,8 +719,9 @@ impl ServiceClient {
         }
     }
     pub async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
-        let (revision, files) = Transaction::inspect(bytes)?;
-        let snapshot = self.observe_revision(revision).await?;
+        let (revision, _, _) = Transaction::verify_identity(bytes, self.filesystem)?;
+        let (_, files) = Transaction::inspect(bytes)?;
+        let snapshot = self.observe_held(revision).await?;
         let mut prepared = Vec::new();
         for file in files {
             prepared.push(self.data.import(&file).await?);
@@ -667,10 +742,23 @@ impl ServiceClient {
             .iter()
             .map(Transaction::to_bytes)
             .collect::<Result<Vec<_>>>()?;
-        let response = match rpc(self.addr, &self.token, Command::Commit(plans)).await {
+        self.commit_frozen_batch(&plans).await
+    }
+    pub async fn commit_frozen_batch(&self, requests: &[Vec<u8>]) -> Result<Vec<Outcome>> {
+        let identities = requests
+            .iter()
+            .map(|request| {
+                let (_, id, digest) = Transaction::verify_identity(request, self.filesystem)?;
+                Ok((id, digest))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let response = match rpc(self.addr, &self.token, Command::Commit(requests.to_vec())).await {
             Ok(response) => response,
             Err(e) if matches!(e.kind(), ErrorKind::Io | ErrorKind::Storage) => {
-                return Ok(requests.iter().map(|r| Outcome::Unknown(r.id())).collect());
+                return Ok(identities
+                    .into_iter()
+                    .map(|(id, _)| Outcome::Unknown(id))
+                    .collect());
             }
             Err(e) => return Err(e),
         };
@@ -682,25 +770,53 @@ impl ServiceClient {
         }
         outcomes
             .into_iter()
-            .zip(requests)
-            .map(|((tag, bytes), request)| {
+            .zip(identities)
+            .map(|((tag, bytes), (id, digest))| {
                 Ok(match tag {
                     0 => {
                         let receipt = Receipt::decode(&bytes)?;
-                        if receipt.commit_id != request.id()
-                            || receipt.request_digest != request.digest()
-                        {
+                        if receipt.commit_id != id || receipt.request_digest != digest {
                             return Err(protocol());
                         }
                         Outcome::Committed(receipt)
                     }
                     1 => Outcome::Conflict,
                     2 => Outcome::Retryable,
-                    3 if bytes == request.id().as_bytes() => Outcome::Unknown(request.id()),
+                    3 if bytes == id.as_bytes() => Outcome::Unknown(id),
                     _ => return Err(protocol()),
                 })
             })
             .collect()
+    }
+    pub async fn expire(&self, request: &ExpiryRequest) -> Result<Outcome> {
+        request.validate(self.filesystem)?;
+        let response = match rpc(self.addr, &self.token, Command::Expire(request.to_bytes()?)).await
+        {
+            Ok(response) => response,
+            Err(e) if matches!(e.kind(), ErrorKind::Io | ErrorKind::Storage) => {
+                return Ok(Outcome::Unknown(request.id()));
+            }
+            Err(e) => return Err(e),
+        };
+        let Response::Outcomes(outcomes) = response else {
+            return Err(protocol());
+        };
+        let [(tag, bytes)] = outcomes.as_slice() else {
+            return Err(protocol());
+        };
+        Ok(match *tag {
+            0 => {
+                let receipt = Receipt::decode(bytes)?;
+                if receipt.commit_id != request.id() || receipt.request_digest != request.digest() {
+                    return Err(protocol());
+                }
+                Outcome::Committed(receipt)
+            }
+            1 => Outcome::Conflict,
+            2 => Outcome::Retryable,
+            3 if bytes == request.id().as_bytes() => Outcome::Unknown(request.id()),
+            _ => return Err(protocol()),
+        })
     }
 }
 #[derive(Debug)]

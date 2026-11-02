@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
+use crate::authority::{
+    RETAINED_REVISIONS_PAGE_MAX, RevisionHistoryPage, RevisionRecord, RevisionStatus,
+};
 use crate::compatibility::{OBJECT_HEAD_MAGIC, OBJECT_SNAPSHOT_MAGIC, SERVICE_BINDING_MAGIC};
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::index::{Index, IndexCache};
 use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
 use crate::transaction::Transaction;
-use crate::{Error, ErrorKind, NodeId, Result};
+use crate::{Error, ErrorKind, ExpiryRequest, NodeId, Result};
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
 
@@ -32,6 +34,34 @@ pub use crate::snapshot::{
 use crate::snapshot::{RecordReader, RevisionWire, Rows, Table};
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
+
+const HISTORY_READABLE: u8 = 0;
+const HISTORY_EXPIRED: u8 = 1;
+
+fn history_key(status: RevisionStatus, revision: Revision) -> Vec<u8> {
+    let mut key = Vec::with_capacity(25);
+    key.push(match status {
+        RevisionStatus::Readable => HISTORY_READABLE,
+        RevisionStatus::Expired => HISTORY_EXPIRED,
+    });
+    key.extend(revision.to_bytes());
+    key
+}
+
+fn history_revision(key: &[u8], status: RevisionStatus) -> Result<Revision> {
+    let expected = match status {
+        RevisionStatus::Readable => HISTORY_READABLE,
+        RevisionStatus::Expired => HISTORY_EXPIRED,
+    };
+    if key.len() != 25 || key[0] != expected {
+        return Err(corrupt("invalid retained revision key"));
+    }
+    Ok(Revision::from_bytes(
+        key[1..]
+            .try_into()
+            .expect("the retained revision key was length checked"),
+    ))
+}
 
 type SnapshotWire = (
     [u8; 8],
@@ -332,15 +362,36 @@ impl ObjectFs {
         if latest.revision == revision {
             return Ok(latest.view_cached(self.cache.clone()));
         }
-        let bytes = latest
-            .history
-            .get(&self.data, None, &revision.to_bytes())
+        match self.revision_reference(&latest, revision).await? {
+            Some((RevisionStatus::Readable, bytes)) => Ok(self
+                .load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
+                .await?
+                .view_cached(self.cache.clone())),
+            Some((RevisionStatus::Expired, _)) => Err(Error::new(
+                ErrorKind::Expired,
+                "observe revision",
+                format!("revision {revision:?} is logically expired"),
+            )),
+            None => Err(Error::new(
+                ErrorKind::NotFound,
+                "observe revision",
+                "revision is not retained in this lineage",
+            )),
+        }
+    }
+    async fn observe_known_revision(&self, revision: Revision) -> Result<Snapshot> {
+        let latest = self.observe_state().await?;
+        if latest.revision == revision {
+            return Ok(latest.view_cached(self.cache.clone()));
+        }
+        let (_, bytes) = self
+            .revision_reference(&latest, revision)
             .await?
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NotFound,
-                    "observe revision",
-                    "revision is not retained in this lineage",
+                    "observe known revision",
+                    "revision is not known in this lineage",
                 )
             })?;
         Ok(self
@@ -348,58 +399,286 @@ impl ObjectFs {
             .await?
             .view_cached(self.cache.clone()))
     }
-    pub(crate) async fn retained_revisions_page(
+    async fn revision_reference(
+        &self,
+        latest: &ObjectState,
+        revision: Revision,
+    ) -> Result<Option<(RevisionStatus, Vec<u8>)>> {
+        let readable = latest
+            .history
+            .get(
+                &self.data,
+                None,
+                &history_key(RevisionStatus::Readable, revision),
+            )
+            .await?;
+        let expired = latest
+            .history
+            .get(
+                &self.data,
+                None,
+                &history_key(RevisionStatus::Expired, revision),
+            )
+            .await?;
+        match (readable, expired) {
+            (Some(_), Some(_)) => Err(corrupt(
+                "revision has both readable and expired history records",
+            )),
+            (Some(bytes), None) => Ok(Some((RevisionStatus::Readable, bytes))),
+            (None, Some(bytes)) => Ok(Some((RevisionStatus::Expired, bytes))),
+            (None, None) => Ok(None),
+        }
+    }
+    pub(crate) async fn revision_history_page(
         &self,
         after: Option<Revision>,
         limit: u32,
-    ) -> Result<RevisionPage> {
+    ) -> Result<RevisionHistoryPage> {
         if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
             return Err(Error::unsupported(
-                "list retained revisions",
+                "list revision history",
                 format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
             ));
         }
         let latest = self.observe_state().await?;
-        let after_key = after.map(|revision| revision.to_bytes().to_vec());
-        let rows = latest
-            .history
-            .scan(
-                &self.data,
-                None,
-                &[],
-                None,
-                after_key.as_deref(),
-                limit as usize + 1,
-            )
-            .await?;
-        let mut revisions = Vec::new();
-        for (key, value) in rows {
-            let key = key
-                .try_into()
-                .map_err(|_| corrupt("invalid retained revision key"))?;
-            let _: PackedRef = PackedRef::from_wire(decode(&value)?)?;
-            revisions.push(Revision::from_bytes(key));
-        }
-        if revisions.len() > limit as usize {
-            revisions.truncate(limit as usize);
-            let next = revisions.last().copied();
-            return Ok(RevisionPage { revisions, next });
+        let mut records = Vec::new();
+        for status in [RevisionStatus::Readable, RevisionStatus::Expired] {
+            let after_key = after.map(|revision| history_key(status, revision));
+            let upper = match status {
+                RevisionStatus::Readable => [HISTORY_EXPIRED],
+                RevisionStatus::Expired => [HISTORY_EXPIRED + 1],
+            };
+            let rows = latest
+                .history
+                .scan(
+                    &self.data,
+                    None,
+                    &[match status {
+                        RevisionStatus::Readable => HISTORY_READABLE,
+                        RevisionStatus::Expired => HISTORY_EXPIRED,
+                    }],
+                    Some(&upper),
+                    after_key.as_deref(),
+                    limit as usize + 1,
+                )
+                .await?;
+            for (key, value) in rows {
+                let revision = history_revision(&key, status)?;
+                let _: PackedRef = PackedRef::from_wire(decode(&value)?)?;
+                records.push(RevisionRecord { revision, status });
+            }
         }
         if after < Some(latest.revision) {
-            revisions.push(latest.revision);
+            records.push(RevisionRecord {
+                revision: latest.revision,
+                status: RevisionStatus::Readable,
+            });
         }
-        if revisions.len() > limit as usize {
-            revisions.truncate(limit as usize);
-            let next = revisions.last().copied();
-            return Ok(RevisionPage { revisions, next });
+        records.sort_by_key(|record| record.revision);
+        if records
+            .windows(2)
+            .any(|window| window[0].revision == window[1].revision)
+        {
+            return Err(corrupt(
+                "revision has duplicate history records in one page",
+            ));
         }
-        if revisions.windows(2).any(|window| window[0] >= window[1]) {
-            return Err(corrupt("retained revisions are not strictly ordered"));
-        }
-        Ok(RevisionPage {
-            revisions,
-            next: None,
+        let more = records.len() > limit as usize;
+        records.truncate(limit as usize);
+        let next = more.then(|| records.last().expect("nonempty history page").revision);
+        Ok(RevisionHistoryPage {
+            revisions: records,
+            next,
         })
+    }
+    pub async fn expire(&self, request: &ExpiryRequest) -> Result<Outcome> {
+        request.validate(self.filesystem)?;
+        let _guard = self.commit_gate.lock().await;
+        match self.expire_inner(request).await {
+            Err(error) if error.kind() == ErrorKind::Storage => Ok(Outcome::Retryable),
+            result => result,
+        }
+    }
+    async fn expire_inner(&self, request: &ExpiryRequest) -> Result<Outcome> {
+        for _ in 0..8 {
+            let base = self.observe_state().await?;
+            if let Some(receipt) = base.view().receipt(request.id()).await? {
+                if receipt.request_digest != request.digest() {
+                    return Err(Error::invalid(
+                        "expire revisions",
+                        "identity reused for a different request",
+                    ));
+                }
+                return Ok(Outcome::Committed(receipt));
+            }
+            if base.revision != request.expected_latest() {
+                return Ok(Outcome::Conflict);
+            }
+            let mut references = Vec::with_capacity(request.candidates().len());
+            for revision in request.candidates() {
+                if *revision == base.revision {
+                    return Err(Error::invalid(
+                        "expire revisions",
+                        "the current revision cannot expire",
+                    ));
+                }
+                let (status, bytes) = self
+                    .revision_reference(&base, *revision)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::NotFound,
+                            "expire revisions",
+                            format!("revision {revision:?} is unknown"),
+                        )
+                    })?;
+                if status == RevisionStatus::Expired {
+                    return Err(Error::new(
+                        ErrorKind::Expired,
+                        "expire revisions",
+                        format!("revision {revision:?} is already expired"),
+                    ));
+                }
+                let reference = PackedRef::from_wire(decode(&bytes)?)?;
+                self.load(reference, *revision, None).await?;
+                references.push((*revision, bytes));
+            }
+
+            let mut candidate = base.clone();
+            candidate.revision = Revision::new(
+                base.revision
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| Error::unsupported("expire revisions", "revision exhausted"))?,
+            );
+            candidate
+                .history
+                .set(
+                    &self.data,
+                    history_key(RevisionStatus::Readable, base.revision),
+                    Some(encode(&base.reference.wire())?),
+                )
+                .await?;
+            for (revision, bytes) in references {
+                candidate
+                    .history
+                    .set(
+                        &self.data,
+                        history_key(RevisionStatus::Readable, revision),
+                        None,
+                    )
+                    .await?;
+                candidate
+                    .history
+                    .set(
+                        &self.data,
+                        history_key(RevisionStatus::Expired, revision),
+                        Some(bytes),
+                    )
+                    .await?;
+            }
+            let receipt = Receipt {
+                commit_id: request.id(),
+                request_digest: request.digest(),
+                cursor: Cursor {
+                    revision: candidate.revision,
+                    ordinal: 0,
+                },
+            };
+            candidate
+                .receipts
+                .set(
+                    &self.data,
+                    request.id().as_bytes().to_vec(),
+                    Some(receipt.encode()?),
+                )
+                .await?;
+            candidate
+                .changes
+                .set(
+                    &self.data,
+                    receipt.cursor.key(),
+                    Some(
+                        ChangeRecord {
+                            receipt: receipt.clone(),
+                            changes: Vec::new(),
+                        }
+                        .encode()?,
+                    ),
+                )
+                .await?;
+            candidate.persist().await?;
+            let etag = base
+                .etag
+                .as_ref()
+                .expect("latest observation has a conditional token");
+            match self
+                .operator
+                .write_with(".yinyang/head", head_bytes(&candidate)?)
+                .if_match(etag)
+                .await
+            {
+                Ok(_) => return Ok(Outcome::Committed(receipt)),
+                Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => continue,
+                Err(_) => match self.observe_state().await {
+                    Ok(current) if current.etag.as_ref() != Some(etag) => continue,
+                    _ => return Ok(Outcome::Unknown(request.id())),
+                },
+            }
+        }
+        Ok(Outcome::Retryable)
+    }
+    pub(crate) async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
+        let (revision, _, _) = Transaction::verify_identity(bytes, self.filesystem)?;
+        let snapshot = self.observe_known_revision(revision).await?;
+        let (_, files) = Transaction::inspect(bytes)?;
+        let mut prepared = Vec::new();
+        for file in files {
+            prepared.push(self.data.import(&file).await?);
+        }
+        Transaction::restore(bytes, &snapshot, &prepared).await
+    }
+    pub(crate) async fn commit_frozen_batch(&self, requests: &[Vec<u8>]) -> Result<Vec<Outcome>> {
+        if requests.len() > 4096 {
+            return Err(Error::unsupported(
+                "commit frozen batch",
+                "batch exceeds 4096 requests",
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let latest = self.observe_latest().await?;
+        let mut outcomes = vec![None; requests.len()];
+        let mut pending = Vec::new();
+        for (index, bytes) in requests.iter().enumerate() {
+            let (_, id, digest) = Transaction::verify_identity(bytes, self.filesystem)?;
+            if let Some(receipt) = latest.receipt(id).await? {
+                if receipt.request_digest != digest {
+                    return Err(Error::invalid(
+                        "commit frozen batch",
+                        "identity reused for different request",
+                    ));
+                }
+                outcomes[index] = Some(Outcome::Committed(receipt));
+            } else {
+                pending.push((index, bytes));
+            }
+        }
+        if !pending.is_empty() {
+            let mut restored = Vec::with_capacity(pending.len());
+            for (_, bytes) in &pending {
+                restored.push(self.restore_transaction(bytes).await?);
+            }
+            let committed = self.commit_batch(&restored).await?;
+            for ((index, _), outcome) in pending.into_iter().zip(committed) {
+                outcomes[index] = Some(outcome);
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every frozen request is resolved"))
+            .collect())
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self

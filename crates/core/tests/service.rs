@@ -289,8 +289,13 @@ async fn retained_revision_history_is_paginated_through_the_service_protocol() {
         plan.create_directory(service.root(), name).await.unwrap();
         committed(service.commit(&plan.finish().unwrap()).await.unwrap());
     }
-    let expected = service.retained_revisions().await.unwrap();
+    let expected = service.revision_history().await.unwrap();
     assert_eq!(expected.len(), 4);
+    assert!(
+        expected
+            .iter()
+            .all(|record| record.status == yinyang_core::RevisionStatus::Readable)
+    );
 
     let token = "test-only-service-token-32-bytes-long";
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -300,20 +305,17 @@ async fn retained_revision_history_is_paginated_through_the_service_protocol() {
         .await
         .unwrap();
 
-    let first = client.retained_revisions_page(None, 2).await.unwrap();
+    let first = client.revision_history_page(None, 2).await.unwrap();
     assert_eq!(first.revisions, expected[..2]);
     let cursor = first
         .next
         .expect("two of four revisions have a continuation");
-    let second = client
-        .retained_revisions_page(Some(cursor), 2)
-        .await
-        .unwrap();
+    let second = client.revision_history_page(Some(cursor), 2).await.unwrap();
     assert_eq!(second.revisions, expected[2..]);
     assert_eq!(second.next, None);
     assert_eq!(
         client
-            .retained_revisions_page(None, 0)
+            .revision_history_page(None, 0)
             .await
             .unwrap_err()
             .kind(),

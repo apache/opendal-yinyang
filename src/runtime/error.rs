@@ -55,6 +55,7 @@ pub enum ErrorKind {
     Storage,
     Io,
     NoSpace,
+    Expired,
 }
 
 /// A durable failure, including the original uncertain publication identity.
@@ -148,6 +149,7 @@ impl From<yinyang_core::ErrorKind> for ErrorKind {
             Kind::Invalid => Self::Invalid,
             Kind::InvalidName => Self::InvalidName,
             Kind::NotFound => Self::NotFound,
+            Kind::Expired => Self::Expired,
             Kind::AlreadyExists => Self::AlreadyExists,
             Kind::NotDirectory => Self::NotDirectory,
             Kind::IsDirectory => Self::IsDirectory,

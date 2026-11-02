@@ -255,6 +255,62 @@ impl Transaction {
             digest,
         ))
     }
+    /// Verify the untrusted declared digest against the canonical logical
+    /// request. This performs no authority observation, content preparation, or
+    /// readiness check, so a committed request can be resolved from its receipt
+    /// before its base revision or prepared content is needed.
+    pub fn verify_identity(
+        bytes: &[u8],
+        filesystem: crate::NodeId,
+    ) -> Result<(crate::Revision, crate::CommitId, [u8; 32])> {
+        let (_, fs, id, revision, digest, mut conditions, mutations) = Self::wire(bytes)?;
+        if fs != *filesystem.as_bytes() {
+            return Err(Error::invalid(
+                "restore transaction",
+                "request belongs to another authority",
+            ));
+        }
+        conditions.sort_by(|left, right| left.0.cmp(&right.0));
+        if conditions.iter().any(|(key, _)| {
+            key.is_empty()
+                || key[0] > ENTRY
+                || (key[0] != ENTRY && key.len() != 17)
+                || (key[0] == ENTRY && key.len() < 18)
+        }) || conditions
+            .windows(2)
+            .any(|window| window[0].0 == window[1].0)
+        {
+            return Err(Error::invalid(
+                "restore transaction",
+                "invalid or duplicate predicate",
+            ));
+        }
+        let logical = mutations
+            .iter()
+            .map(|mutation| logical_mutation(mutation))
+            .collect::<Result<Vec<_>>>()?;
+        let canonical = encode(&(
+            REQUEST_MAGIC,
+            fs,
+            conditions
+                .iter()
+                .map(|(key, expected)| (key, expected))
+                .collect::<Vec<_>>(),
+            logical,
+        ))?;
+        let computed = blake3::derive_key(REQUEST_HASH_CONTEXT, &canonical);
+        if computed != digest {
+            return Err(Error::invalid(
+                "restore transaction",
+                "canonical request digest mismatch",
+            ));
+        }
+        Ok((
+            crate::Revision::from_bytes(revision),
+            crate::CommitId::from_bytes(id),
+            digest,
+        ))
+    }
     fn wire(bytes: &[u8]) -> Result<RequestWire> {
         if bytes.len() > 16 * 1024 * 1024 {
             return Err(Error::unsupported(
@@ -406,6 +462,55 @@ impl Transaction {
         request.validate(snapshot.filesystem)?;
         Ok(request)
     }
+}
+
+fn logical_mutation(bytes: &[u8]) -> Result<Vec<u8>> {
+    Ok(match bytes.first() {
+        Some(0) => {
+            let (_, id, parent, name, file, executable): (
+                u8,
+                [u8; 16],
+                [u8; 16],
+                String,
+                Option<Vec<u8>>,
+                bool,
+            ) = crate::namespace::decode(bytes)?;
+            let content_id = file
+                .map(|file| crate::ContentDescriptor::from_bytes(&file))
+                .transpose()?
+                .map(|file| (file.content_id().length(), *file.content_id().digest()));
+            encode(&(0_u8, id, parent, name, content_id, executable))?
+        }
+        Some(1) => {
+            let (_, id, file): (u8, [u8; 16], Vec<u8>) = crate::namespace::decode(bytes)?;
+            let file = crate::ContentDescriptor::from_bytes(&file)?;
+            encode(&(
+                1_u8,
+                id,
+                file.content_id().length(),
+                *file.content_id().digest(),
+            ))?
+        }
+        Some(2) => {
+            let (_, id, executable): (u8, [u8; 16], bool) = crate::namespace::decode(bytes)?;
+            encode(&(2_u8, id, executable))?
+        }
+        Some(3) => {
+            let (_, id, parent, name): (u8, [u8; 16], [u8; 16], String) =
+                crate::namespace::decode(bytes)?;
+            encode(&(3_u8, id, parent, name))?
+        }
+        Some(4) => {
+            let (_, id): (u8, [u8; 16]) = crate::namespace::decode(bytes)?;
+            encode(&(4_u8, id))?
+        }
+        _ => {
+            return Err(Error::unsupported(
+                "restore transaction",
+                "unknown mutation profile",
+            ));
+        }
+    })
 }
 
 /// Dependency-capturing operation planner; it never runs caller callbacks on retry.
