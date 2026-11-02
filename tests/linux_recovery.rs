@@ -945,7 +945,6 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
         Some("backup_"),
     );
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest_before_expiry,
         live_revision,
@@ -1020,7 +1019,6 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
     );
     assert_expiry_evidence_refusal(&corrupt_refused, Publication::Object, "backup-package");
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest_before_expiry,
         live_revision,
@@ -1038,7 +1036,6 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
     );
     assert_expiry_evidence_refusal(&missing_refused, Publication::Object, "backup-package");
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest_before_expiry,
         live_revision,
@@ -1265,7 +1262,7 @@ fn explicit_expiry_preserves_clean_ready_work_and_read_semantics() {
 }
 
 fn explicit_expiry_clean_ready_work(publication: Publication) {
-    let mut fixture = Fixture::new(publication);
+    let fixture = Fixture::new(publication);
     let expire = fixture.remote_create_file("expire.txt", b"expire-base", false);
     let clean = fixture.remote_create_file("clean.txt", b"clean-base", false);
 
@@ -1366,7 +1363,6 @@ fn explicit_expiry_clean_ready_work(publication: Publication) {
     let current_refused = run_expiry(&fixture, &clean_config, &[latest], &[], &[]);
     assert_expiry_refused(&current_refused, publication, "current", None);
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest,
         clean.cursor.revision,
@@ -1377,7 +1373,6 @@ fn explicit_expiry_clean_ready_work(publication: Publication) {
     let ready_refused = run_expiry(&fixture, &clean_config, &[clean.cursor.revision], &[], &[]);
     assert_expiry_refused(&ready_refused, publication, "protected", Some("staging_"));
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest,
         expire.cursor.revision,
@@ -1394,7 +1389,6 @@ fn explicit_expiry_clean_ready_work(publication: Publication) {
     );
     assert_expiry_evidence_refusal(&corrupt_refused, publication, "local-staging");
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest,
         expire.cursor.revision,
@@ -1411,7 +1405,6 @@ fn explicit_expiry_clean_ready_work(publication: Publication) {
     );
     assert_expiry_evidence_refusal(&foreign_refused, publication, "local-staging");
     assert_latest_and_candidate(
-        &fixture,
         &authority,
         latest,
         expire.cursor.revision,
@@ -1896,7 +1889,6 @@ fn assert_expiry_evidence_refusal(
 }
 
 fn assert_latest_and_candidate(
-    fixture: &Fixture,
     authority: &std::sync::Arc<dyn Authority>,
     expected_latest: Revision,
     candidate: Revision,
