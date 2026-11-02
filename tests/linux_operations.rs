@@ -787,7 +787,6 @@ fn write_config_with_profile(
         "storage_profile": profile,
         "staging": directory.join(format!("{name}-state")),
         "read_only": false,
-        "require": [],
     });
     if let Some(address) = service_address {
         value["service_address"] = address.into();

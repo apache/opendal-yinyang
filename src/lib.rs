@@ -33,6 +33,7 @@ pub mod direct_sync;
 mod directory;
 #[cfg(target_os = "linux")]
 pub mod fuse;
+mod local;
 pub mod mount;
 #[cfg(target_os = "linux")]
 pub mod replica;

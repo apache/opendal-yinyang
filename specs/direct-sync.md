@@ -31,8 +31,9 @@ Direct Sync requires a Linux host and this configuration combination:
 ```
 
 The existing `staging` field is the Direct Sync state directory. It is not
-object payload staging for a Managed runtime. It must be non-empty, outside the
-local root, on the same filesystem as the local root, and writable only as
+object payload staging for a Managed runtime. It must be non-empty, distinct
+from the local root, and neither path may contain the other. Both paths must be
+on the same filesystem, and the state directory must be writable only as
 required by the installing account. The state directory must not grant group or
 other permissions. It is dedicated to one Direct Sync binding and must not be
 shared with a writable Direct Mount runtime or another Sync root.
@@ -83,11 +84,14 @@ observation: a real version ID when both observations expose one, otherwise
 ETag, size and known whole-second mtime using the same fallback rule as Direct
 reads.
 
-The state database profile is `yinyang-direct-sync-1` with tables `binding`,
+The state database profile is `yinyang-direct-sync-2` with tables `binding`,
 `baseline`, `work`, `installs`, `artifacts` and `conflicts`. SQLite uses WAL and
-`synchronous=FULL`. An existing database is validated before journal-mode or
+`synchronous=FULL`; every work, install, artifact and completion transition is
+durable when committed. An existing database is validated before journal-mode or
 schema changes. Initialization rejects an existing database instead of
-migrating or reinterpreting it.
+migrating or reinterpreting it. Schema admission compares exact table and
+column-name sets, and older or unknown profile identifiers are rejected with
+`Unsupported`.
 
 ## Initialization
 
@@ -146,7 +150,7 @@ Before any remote request, Direct Sync:
    fingerprint;
 3. records the exact ETag or absence precondition;
 4. commits the work record as `Prepared`;
-5. durably changes it to `Unknown` before dispatch.
+5. changes it to `Unknown` and commits it before dispatch.
 
 The state is `Unknown` before the request because a process crash or lost
 response cannot prove that storage did not accept it.
@@ -172,7 +176,9 @@ The selected backend must provide a real conditional DELETE.
 
 Pulled bytes are written to a private temporary file under the state directory,
 validated against the accepted remote pin, fsynced and recorded in the local
-install journal.
+install journal. The journal row and its artifact record are durable
+`synchronous=FULL` commits before the local rename, exchange, or deletion that
+recovery must interpret.
 
 - Creation uses `RENAME_NOREPLACE`; an occupied local name is a conflict.
 - Replacement verifies the scanned inode, parent identity and bytes, then uses
@@ -263,9 +269,10 @@ may create an empty WAL or update derived shared-memory state, but existing
 logical rows and accepted bytes remain unchanged. A conflict's local and remote
 bytes are retained locally, so both sides can be exported offline.
 
-Exit code `0` means a valid status or completed finite command, `3` means the
-state is unbound, `4` means the binding is invalid, and `1` means an argument,
-admission or unexpected command failure.
+Exit code `0` means a valid status or completed finite command. Exit code `3`
+means the state is unbound or the operation ended `Unknown`; `4` means the
+binding is invalid or the operation ended `Conflict` or `Retryable`. `1` means
+an argument, admission or other command failure.
 
 ## Limits
 

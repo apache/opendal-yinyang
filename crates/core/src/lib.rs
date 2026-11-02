@@ -41,7 +41,5 @@ pub use snapshot::{DirectoryPage, FileVersion, ScanToken};
 pub use transaction::{Planner, Transaction};
 
 #[cfg(test)]
-mod compatibility_tests;
-#[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod support;

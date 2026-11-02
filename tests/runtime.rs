@@ -949,7 +949,6 @@ async fn sparse_runtime(
             .unwrap()
     };
     assert_eq!(counts("bases"), 1);
-    assert_eq!(counts("chunks"), 0);
     assert_eq!(counts("segments"), 0);
     assert!(file.read(BASE_BYTES as u64, 64).await.unwrap().is_empty());
     assert!(

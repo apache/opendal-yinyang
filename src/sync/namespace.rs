@@ -47,19 +47,6 @@ pub(super) const COLUMNS: &[&str] = &[
     "receipt_ordinal",
     "failure",
 ];
-pub(super) const CREATE_TABLE: &str = "CREATE TABLE namespaces(
-    id BLOB PRIMARY KEY,
-    intent_key BLOB NOT NULL,
-    baseline BLOB NOT NULL,
-    commit_id BLOB NOT NULL UNIQUE,
-    request_digest BLOB NOT NULL,
-    operation BLOB NOT NULL,
-    request BLOB NOT NULL,
-    state INTEGER NOT NULL,
-    receipt_revision BLOB,
-    receipt_ordinal INTEGER,
-    failure BLOB
-);";
 
 /// Creation metadata represented by the current namespace contract.
 ///
@@ -308,10 +295,6 @@ impl OperationWire {
             }),
         }
     }
-}
-
-pub(super) fn initialize(connection: &Connection) -> Result<()> {
-    connection.execute_batch(CREATE_TABLE).map_err(Error::local)
 }
 
 #[derive(Clone)]

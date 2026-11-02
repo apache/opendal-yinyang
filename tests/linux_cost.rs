@@ -2711,7 +2711,6 @@ fn mount_paths(fixture: &Fixture, name: &str, read_only: bool) -> (PathBuf, Path
         "storage_profile": storage_profile,
         "staging": staging,
         "read_only": read_only,
-        "require": [],
     });
     if fixture.publication == Publication::Service {
         value["service_address"] =

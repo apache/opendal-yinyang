@@ -25,15 +25,16 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
 ```
 
 - `init` binds `ROOT` to the volume's remote root. It creates the local root and
-  the state directory when missing, rejects a state directory that contains the
-  root (or the reverse), and requires root and state on the same filesystem.
+  the state directory when missing, rejects equal paths or either containment
+  direction, and requires root and state on the same filesystem.
 - `backup` writes one experimental quiesced package containing the bound root,
   `replica.db`, `sync.db`, content staging, retained artifacts, and a manifest
   binding their filesystem identities and current content hashes. It requires
   exclusive Sync/runtime leases and refuses incomplete local installs.
 - `restore` validates a backup package and the configured authority before
-  creating absent destination root/state paths. It copies the package, then
-  rebinds root/quarantine inode identities in one SQLite transaction. It
+  creating absent destination root/state paths. It applies the same equality,
+  containment and same-filesystem check as `init`, then copies the package
+  and rebinds root/quarantine inode identities in one SQLite transaction. It
   preserves accepted fingerprints, commit identities, Unknown work, and
   historical artifact digests.
 - `run` performs one finite reconciliation pass: it retries any associated
@@ -66,8 +67,8 @@ yy --volume CONFIG sync resolve CONFLICT --content PATH
 }
 ```
 
-It runs the shared four-layer capability admission as every other volume
-command and additionally pins this Managed + Sync combination, so a valid Mount
+It runs the shared single-table admission as every other volume command and
+additionally pins this Managed + Sync command applicability, so a valid Mount
 package or a Direct volume is rejected rather than silently reinterpreted. The
 frontend is the library frontend, not an OS mount. The frontend performs
 bidirectional reconciliation, so `read_only: true` is rejected for `access:
@@ -80,8 +81,8 @@ the other volume commands; the JSON document never carries secrets.
 | Code | Meaning |
 | --- | --- |
 | 0 | Success, or a valid bound `status` document (including pending, conflict or unknown entries). |
-| 3 | `status` found no binding. The command still prints a valid document. |
-| 4 | `status` found an invalid binding, such as a missing bound root. The command still prints a valid document. |
+| 3 | `status` found no binding, or an operation ended `Unknown`. Status commands still print a valid document. |
+| 4 | `status` found an invalid binding, or an operation ended `Conflict` or `Retryable`. Status commands still print a valid document. |
 | 1 | Argument, configuration, admission or other unexpected failure. |
 
 `run` and `resolve` succeed whenever a finite pass completed, even if work is
@@ -123,16 +124,14 @@ records. It rejects malformed
 checksums, unsafe/duplicate paths or artifact names, wrong profiles, incomplete
 installs, and ambiguous old-to-new identity collisions before creating or
 rebinding destinations. The package format is experimental and is not an
-online snapshot or migration contract. See
+online snapshot contract or a local-profile migration mechanism. See
 [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
 
 Before package copy, restore validates `replica.db`, `sync.db`, and
 `content/staging.db` read-only and binds the manifest to the replica binding.
-The package container remains `YYBK0001`. Supported `fd1338c2` local profiles
-may be restored and are upgraded only by the normal writer open after the
-isolated destinations exist; unknown profiles or partial known schemas fail
-without creating either destination. Other cross-version restore combinations
-remain unsupported.
+The package container remains `YYBK0001`. Restore accepts only the current
+replica, Sync and content-staging profiles. Older, newer, unknown or partial
+schemas fail without creating either destination; there is no upgrade path.
 
 ## Status document
 
@@ -203,8 +202,7 @@ cat > sync.json <<'JSON'
   "publication": "object",
   "storage_profile": "minio",
   "staging": "/var/lib/yinyang/notes-state",
-  "read_only": false,
-  "require": []
+  "read_only": false
 }
 JSON
 

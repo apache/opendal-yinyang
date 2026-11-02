@@ -452,7 +452,7 @@ impl Fixture {
     ) -> PathBuf {
         let staging = self.temp.path().join(name);
         let mut json = format!(
-            "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {},\n  \"require\": []",
+            "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {}",
             json_string(name),
             frontend.as_str(),
             self.publication().as_str(),

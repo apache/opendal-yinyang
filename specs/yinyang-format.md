@@ -236,7 +236,6 @@ profile.
 
 ## Conformance
 
-[`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) contains an
-independently encoded current head, snapshot, root index, frozen request,
-receipt, and rejection vectors. The tests read these committed bytes instead of
-regenerating them with the writer.
+[`format`](../crates/core/tests/fixtures/format) contains independently encoded
+current content and frozen-request vectors. The tests read these committed
+bytes instead of regenerating them with the writer.

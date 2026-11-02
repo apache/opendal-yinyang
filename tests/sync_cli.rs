@@ -26,9 +26,22 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+fn yy_command(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
+    command.args(args);
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("YINYANG_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 fn yy(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_yy"))
-        .args(args)
+    yy_command(args)
         // Dummy S3 settings are enough for admission: capability negotiation
         // reads declared operator capabilities and never contacts storage.
         .env("YINYANG_S3_BUCKET", "cli-admission")
@@ -37,6 +50,10 @@ fn yy(args: &[&str]) -> Output {
         .env("YINYANG_STORAGE_PROFILE", "minio")
         .output()
         .expect("run yy")
+}
+
+fn yy_without_storage(args: &[&str]) -> Output {
+    yy_command(args).output().expect("run yy without storage")
 }
 
 fn write_config(dir: &Path, name: &str, model: &str, access: &str) -> PathBuf {
@@ -51,7 +68,6 @@ fn write_config(dir: &Path, name: &str, model: &str, access: &str) -> PathBuf {
         "storage_profile": "minio",
         "staging": staging,
         "read_only": false,
-        "require": [],
     });
     std::fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
     config
@@ -85,7 +101,7 @@ fn sync_rejects_a_mount_volume() {
 fn sync_status_dispatches_a_direct_sync_volume() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path(), "direct", "direct", "sync");
-    let output = yy(&[
+    let output = yy_without_storage(&[
         "--volume",
         config.to_str().unwrap(),
         "sync",
@@ -111,7 +127,6 @@ fn sync_rejects_a_read_only_volume() {
         "storage_profile": "minio",
         "staging": temp.path().join("read-only-state"),
         "read_only": true,
-        "require": [],
     });
     std::fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
     let output = yy(&["--volume", config.to_str().unwrap(), "sync", "status"]);
@@ -123,7 +138,7 @@ fn sync_rejects_a_read_only_volume() {
 fn unbound_status_is_schema_valid_and_exits_three() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path(), "unbound", "managed", "sync");
-    let output = yy(&[
+    let output = yy_without_storage(&[
         "--volume",
         config.to_str().unwrap(),
         "sync",
@@ -166,4 +181,104 @@ fn resolve_requires_a_decision() {
     ]);
     assert!(!output.status.success());
     assert_stderr(&output, "requires exactly one of --keep or --content");
+}
+
+#[test]
+fn missing_managed_staging_is_rejected_before_every_command_side_effect() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("sync.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "nostaging",
+            "model": "managed",
+            "access": "sync",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root = temp.path().join("root");
+    let config_text = config.to_str().unwrap();
+    let root_text = root.to_str().unwrap();
+    let commands = [
+        vec!["capabilities"],
+        vec!["status"],
+        vec!["sync", "status"],
+        vec!["sync", "init", "--directory", root_text],
+        vec!["sync", "run"],
+        vec!["space", "report"],
+    ];
+    for command in commands {
+        let mut args = vec!["--volume", config_text];
+        args.extend(command);
+        let output = yy(&args);
+        assert!(!output.status.success(), "{args:?}");
+        assert_stderr(&output, "staging path is required");
+        assert!(!root.exists(), "{args:?} created the local root");
+        assert_eq!(
+            std::fs::read_dir(temp.path()).unwrap().count(),
+            1,
+            "{args:?} created files beside the configuration"
+        );
+    }
+
+    let output = yy(&["--volume", config_text, "doctor", "--json"]);
+    assert!(!output.status.success());
+    let doctor: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doctor["status"], "action_required");
+    assert!(!root.exists());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn direct_sync_init_rejects_both_containment_directions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for root_inside_state in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (root, state) = if root_inside_state {
+            (state.join("root"), state)
+        } else {
+            let root = temp.path().join("root");
+            (root.clone(), root.join("state"))
+        };
+        let config = temp.path().join("direct-sync.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "direct-sync",
+                "model": "direct",
+                "access": "sync",
+                "frontend": "library",
+                "publication": "object",
+                "storage_profile": "minio",
+                "staging": state,
+                "read_only": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = yy(&[
+            "--volume",
+            config.to_str().unwrap(),
+            "sync",
+            "init",
+            "--directory",
+            root.to_str().unwrap(),
+        ]);
+        assert!(!output.status.success());
+        let expected = if root_inside_state {
+            "synchronized root must not be inside state"
+        } else {
+            "state must not be inside the synchronized root"
+        };
+        assert_stderr(&output, expected);
+        assert!(!state.join("direct-sync.db").exists());
+    }
 }

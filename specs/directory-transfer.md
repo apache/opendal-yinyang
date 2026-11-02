@@ -63,25 +63,30 @@ generations. Receipt lookup alone is not publication of a newly scanned source.
 ## Durable publication recovery
 
 The caller supplies a dedicated local state directory. It contains
-`directory.db`, an experimental SQLite WAL database using `synchronous=FULL`,
-bound to exactly one filesystem and root. Keep the database and WAL together.
-Profile `yinyang-directory-1` stores the exact serialized `Transaction`, its
+`directory.db`, an experimental SQLite WAL database using
+`synchronous=FULL`, bound to exactly one filesystem and root. Keep the
+database and WAL together. Profile `yinyang-directory-2` stores the exact
+serialized `Transaction`, its
 CommitId, baseline revision, request digest, diagnostic source path, and a
 directory manifest derived during that same successful preparation. Unknown or
 mismatched profiles and filesystem bindings are rejected. This local format has
-no stable released migration promise.
+no migration path.
 
 The supported schema signature is the exact table set `binding` and
-`publications` with their ordered columns; positional inserts make that order
-part of the local contract. A writer validates an existing database before
-PRAGMA journal-mode configuration or DDL. A missing or zero-table database may
-be initialized after the journal's SQLite write transaction starts; an existing
-known profile with a missing, extra, or reordered maintained column is
-corruption, not a migration input. Read-only inspect performs the same profile
-and schema validation without creating tables, changing authoritative
-database/WAL bytes, or changing journal mode. SQLite may create an empty `-wal`
-and may create or update derived `-shm`; existing WAL/journal bytes remain
-protected.
+`publications` with their exact column-name sets. Maintained inserts name their
+columns explicitly, so column order is not part of the signature. A writer
+validates an existing database before journal-mode configuration or DDL. A
+missing or zero-table database may be initialized after the journal's SQLite
+write transaction starts; an older or unknown profile returns `Unsupported`,
+and a current profile with a missing or extra column is `Corrupt`. Read-only
+inspect performs the same profile and schema validation without creating
+tables, changing authoritative database/WAL bytes, or changing journal mode.
+SQLite may create an empty `-wal` and may create or update derived `-shm`;
+existing WAL/journal bytes remain protected.
+
+The frozen publication row is committed durably before the function returns.
+`Prepared` is therefore durable before dispatch, and the `Unknown` claim is also
+durable before every commit request.
 
 The canonical journal directory must be outside the canonical source tree. A
 preparation that would publish the journal's own `directory.db` or WAL files is

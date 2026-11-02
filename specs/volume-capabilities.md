@@ -4,16 +4,15 @@
 Linux FUSE frontends, conditional-write S3 Direct, Direct Sync, and Linux
 ordinary-directory Managed Sync.**
 Writable Direct is opt-in and requires local staging. Direct Sync is a separate
-library workflow for the combinations admitted below. macOS and Windows
-frontends are recognized configuration choices but rejected as unimplemented
-before startup; read-only Managed Sync is rejected as unsupported. The Linux
+library workflow for the combinations admitted below. Read-only Managed Sync is
+rejected as unsupported. The Linux
 FUSE frontend is specified separately in [`linux-fuse.md`](linux-fuse.md), Direct in
 [`direct.md`](direct.md), and Managed Sync in [`linux-sync.md`](linux-sync.md).
 
 ## Configuration
 
-`VolumeConfig` is strict JSON. Unknown fields and unknown enum/capability names
-are rejected. A CLI configuration file contains:
+`VolumeConfig` is strict JSON. Unknown fields and unknown enum names are
+rejected. A CLI configuration file contains:
 
 ```json
 {
@@ -24,8 +23,7 @@ are rejected. A CLI configuration file contains:
   "publication": "object",
   "storage_profile": "minio",
   "staging": "./workspace-staging",
-  "read_only": false,
-  "require": ["read", "remote-fsync", "atomic-rename"]
+  "read_only": false
 }
 ```
 
@@ -44,7 +42,7 @@ A Direct configuration uses the same strict document without `staging`:
   "frontend": "fuse",
   "publication": "object",
   "storage_profile": "amazon-s3",
-  "require": ["read", "list", "pinned-reads"]
+  "read_only": true
 }
 ```
 
@@ -81,64 +79,68 @@ and is admitted only with `frontend=library` and `read_only: false`. The
 the file-runtime opener `Volume::open` still rejects Sync volumes because it
 installs recoverable handles instead of reconciling a directory.
 
-## Negotiation and enforcement
+## Loading and admission
 
-The effective capability set is the intersection of:
+`VolumeContext::load` is the only volume loader used by `yy --volume`. It reads
+the strict JSON document, resolves a non-empty relative `staging` against the
+configuration file's directory, applies `read_only` defaults, and runs the pure
+admission table. It does not require storage environment variables. The S3
+operator and `YINYANG_SERVICE_TOKEN` are built and read once, lazily, by the
+first storage-dependent operation. Building the operator does not contact
+storage. Authority connection remains on demand, so argument validation, local
+status and local export paths continue without storage configuration or
+connectivity.
 
-1. the implemented volume model;
-2. the storage prerequisites for that model and publication authority;
-3. the access model and read-only policy;
-4. the implemented frontend.
+Admission is one table over `model`, `access`, `frontend`, `publication`,
+`read_only`, staging presence and `service_address`. It returns the admitted
+capability set or one precise `Invalid` error. There is no second capability
+intersection and no configurable `require` field. Strict parsing rejects
+`require` as an unknown field, as it does every other unknown field.
 
-Startup also requires the intersection of the volume, access, and frontend
-contracts (the combination baseline) to survive the storage intersection, so a
-frontend cannot silently weaken the model. The library frontend claims the full
-implemented Managed runtime set. A read-only Managed Linux FUSE mount claims
-read, list, stable-identity, pinned-reads, and retained-unlink-read; a writable
-FUSE mount claims the full Managed set, including write, append, truncate,
-atomic rename, remote fsync, and recoverable staging.
-A read-only Managed Sync configuration is rejected before startup because
-reconciliation is bidirectional and the flag would otherwise be silently
-ignored while the volume still published writes. Read-only Direct claims read,
-list, and pinned-reads. Writable Direct adds write, append, truncate,
-remote-fsync and recoverable-staging. Direct never claims Managed
-stable-identity, atomic-rename, retained-unlink-read, or Managed receipts.
-macOS/Windows frontends claim an empty set and are rejected by their own
-admission rule.
+The admitted combinations are:
 
-The storage layer reports whether its primitives can support the Managed
-contract. It does not require raw S3 to implement filesystem rename. Read,
-immutable streaming writes, and conditional creation are required for content;
-object publication additionally requires conditional replacement. Service
-publication relies on the service transaction authority for metadata atomicity.
-Read-only Direct requires stat, read, recursive list, version reads, and
-conditional ETag reads. Writable Direct additionally requires write, whole-file
-multi-write support, empty writes, conditional create, and conditional ETag
-replace. Direct Sync additionally requires conditional ETag delete. Direct never
-negotiates Managed transaction primitives. The selected service must also enumerate current keys exactly:
-capability flags cannot repair a lossy LIST that hides `a/b` when file key `a`
-exists, because the mount layer cannot read a key name it never receives.
-The current Silo/MinIO qualification does not cover that file-prefix-alias
-namespace combination; observed collisions still reject, and ordinary
-namespaces that LIST completely remain supported.
+| Model | Access | Frontend | Read-only | Staging | Publication |
+| --- | --- | --- | --- | --- | --- |
+| Managed | Mount | library | either | required | object or service |
+| Managed | Mount | fuse | either | required | object or service |
+| Managed | Sync | library | false | required | object or service |
+| Direct | Mount | library | true | absent | object |
+| Direct | Mount | fuse | either | only when writable | object |
+| Direct | Sync | library | false | required | object |
 
-Managed writable baseline capabilities are read, list, write, append, truncate,
-atomic-rename, stable-identity, pinned-reads, retained-unlink-read, remote-fsync,
-and recoverable-staging. The read-only Managed baseline removes write, append,
-truncate, atomic-rename, and remote-fsync. The remaining operations preserve
-their definitions in the [file runtime](file-runtime.md); retained-unlink-read
-does not imply writable anonymous inodes or full POSIX behavior. Direct has the
-separate capability projection above and never inherits the Managed baseline.
+FUSE combinations require Linux. Direct Sync also requires Linux. Managed Sync
+is bidirectional and rejects `read_only=true`. Direct never uses a publication
+service. Service publication requires a loopback `service_address`; object
+publication requires it to be absent.
 
-Startup validates the baseline and every explicit `require` before connecting
-the authority or creating/acquiring staging state. It then opens the selected
-authority and initializes the runtime. Missing capabilities and unimplemented
-combinations fail rather than silently downgrading.
+The admitted capability set is the user-visible contract:
 
-The mount entry point independently requires `frontend=fuse` and repeats full
-admission before observation. A valid library configuration therefore cannot
-be mounted by mistake, and a Direct mount cannot bypass writable, Sync, service
-or required-capability rejection.
+- Managed writable claims read, list, write, append, truncate, atomic rename,
+  stable identity, pinned reads, retained unlink reads, remote fsync, and
+  recoverable staging.
+- Read-only Managed Mount removes write, append, truncate, atomic rename and
+  remote fsync. Read-only FUSE also omits recoverable staging.
+- Read-only Direct claims read, list and pinned reads. Writable Direct adds
+  write, append, truncate, remote fsync and recoverable staging. Direct never
+  claims Managed stable identity, atomic rename, retained unlink reads or
+  Managed receipts.
+
+After the table admits a combination, storage checks its declared primitives.
+Managed content requires read, write, multi-write and conditional create;
+object publication additionally requires conditional replace. Service
+publication relies on the service transaction authority for metadata
+atomicity. Read-only Direct requires stat, read, recursive list, version reads
+and conditional ETag reads. Writable Direct adds write, whole-file multi-write,
+empty writes, conditional create and conditional ETag replace. Direct Sync also
+requires conditional ETag delete.
+
+`yy capabilities` reports `admitted` and the raw storage capability flags. The
+raw storage object remains useful for qualification and diagnosis. Missing
+storage primitives or unimplemented combinations fail before the authority is
+connected or staging state is created.
+
+The mount entry point requires `frontend=fuse` before starting the kernel
+session. A valid library configuration therefore cannot be mounted by mistake.
 
 Read-only is enforced by runtime operations, including writable open, namespace
 mutations, and writes/publication through recovered handles. It is an operation

@@ -35,7 +35,7 @@ known profiles return `Corrupt` or `Invalid` as appropriate.
 | Canonical request | `YYREQ002`, request hash context 2, node identity context 2 | Yes | Yes | No | Reject |
 | Frozen transaction | `YYPLAN01` | Yes | Yes | No | Reject |
 | Service binding | `YYSERV01` | Yes | Yes | No | Reject |
-| SQLite authority | `yinyang-sqlite-1` | Yes | Yes | No | Reject |
+| SQLite authority | `yinyang-sqlite-2` | Yes | Yes | No | Reject |
 | Loopback RPC | Protocol version 1 | Yes | Yes | No | Reject |
 
 The current writer emits only the identifiers in this table. The current reader
@@ -61,7 +61,7 @@ can mutate durable state:
 | Object snapshot and index | Identifier before interpreting fields or child records | `Unsupported` before publication | `Corrupt` |
 | Frozen plan | Identifier before authority observation or content import | `Unsupported` | `Corrupt` or `Invalid` |
 | Service binding | Exact `YYSERV01` envelope before client acceptance | `Unsupported` | `Corrupt`; a different valid binding is `Invalid` |
-| SQLite authority | Schema profile, manifest, required tables, and column order before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
+| SQLite authority | Schema profile, manifest, required tables, and exact column set before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
 | Loopback RPC | Frame decode and token authentication, then protocol version | `Unsupported` before command dispatch | `Invalid` |
 
 Authentication failures use the transport's existing `Invalid` response and do
@@ -69,52 +69,52 @@ not reveal whether an unauthenticated version would otherwise be supported.
 An absent receipt remains distinct from an unknown profile and must not be used
 as proof that an uncertain request did not commit.
 
-## Upgrade and downgrade limits
+## Transition limits
 
-There is no generic migration engine. The only guaranteed transitions are:
+The current build has no persistent-state upgrade or downgrade path. A process
+may reopen state only when every profile reached by that state is current.
+Replaying a retained frozen request and reading its receipt is not a profile
+transition. Exporting logical data through an application protocol is separate
+from opening old local state.
 
-- reopening a current-profile authority by the same or another implementation
-  that advertises every profile reached by the retained state;
-- reading a retained current-profile snapshot, receipt, or frozen request while
-  its authority remains supported;
-- replaying the original frozen request and receiving its original receipt; and
-- opening immutable content whose descriptor and all reachable index nodes use
-  the supported content profile.
-
-Creating a new filesystem is not migration. Exporting and importing logical data
-through an application protocol is separate from opening the old persistent
-state. Automatic profile upgrades, downgrade after a newer writer has opened the
-state, and live authority-mode changes are unsupported unless another
-specification explicitly adds them.
+An older or newer local profile identifier is rejected with `Unsupported`.
+A current identifier with a different schema is rejected with `Corrupt`.
+No writer performs partial migration, column addition, shape detection, or
+profile dispatch.
 
 The 64 KiB content verification unit enters logical identity and remains fixed
 unless a new content profile is introduced. The merged
 [Linux read-only range results](../docs/linux-range-cost-results.md) observed
-bounded payloads for 4 KiB reads and a two-unit boundary crossing, together
-with 9-11 storage requests and 7.4-9.2 ms p50 for repeated warm reads over one
-immutable version. The study did not compare other unit sizes and does not make
-64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry
+9-11 storage requests and 7.4-9.2 ms p50 for repeated warm range reads over one
+immutable version; those numbers describe content-range reads, not metadata
+LOOKUP. Managed FUSE metadata now reuses an accepted snapshot for one second,
+and the object authority shares a byte-bounded content-addressed page cache
+across snapshots. The range study did not compare other unit sizes and does not
+make 64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry
 counts, and other requested-range policy are tunable without changing logical
 identity when the authenticated bytes and identities remain unchanged.
 
 ## Local state
 
-Local staging, Sync, directory-journal, replica, and backup state have separate
-owners and schemas. Their specifications remain authoritative for supported
-transitions. The current repository accepts this bounded matrix:
+Local staging, Sync, directory-journal, replica, Direct runtime and Direct Sync
+state each have one current identifier:
 
-| Local state | Current identifiers | Existing transition boundary |
-| --- | --- | --- |
-| File staging | `yinyang-stage-1`, `yinyang-stage-2`, `yinyang-stage-3` | Exact stage-1/2 schemas upgrade transactionally to stage-3; stage-3 bases/segments carry same-length and bounded length-changing publication without a new profile; old handles retain full-chunks semantics and read-only inspection accepts all three. |
-| Sync journal | `yinyang-sync-1`, `yinyang-sync-2` | Exact sync-1 schema upgrades once to sync-2 in a SQLite transaction; read-only inspection accepts both. |
-| Directory publication | `yinyang-directory-1` | The exact schema is read; there is no journal schema migration. Retained intents remain replayable. |
-| Directory replica | `yinyang-directory-replica-1` | Known base schemas and additive columns upgrade transactionally; required/unknown shapes are rejected. |
-| Direct mutation runtime | `yinyang-direct-runtime-1` | The exact schema and Borsh records are read; partial/unknown profiles reject before runtime files or recovery. There is no migration. |
-| Backup manifest | `YYBK0001` version 1 | Package restore validates component profiles before creating destinations; only listed local transitions may run afterward. |
+| Local state | Current identifier |
+| --- | --- |
+| File staging | `yinyang-stage-4` |
+| Sync journal | `yinyang-sync-3` |
+| Directory publication | `yinyang-directory-2` |
+| Directory replica | `yinyang-directory-replica-2` |
+| Direct mutation runtime | `yinyang-direct-runtime-2` |
+| Direct Sync | `yinyang-direct-sync-2` |
+| Backup manifest | `YYBK0001` version 1 |
 
-This table inventories names only. It does not convert a local implementation
-gap into a core compatibility promise. A local format change must update its
-authoritative specification and this table in the same change.
+Every local database contains exactly one profile row with `singleton=1`.
+The shared local store validates the current identifier and the exact table and
+column sets before journal-mode changes, recovery, or external effects. Stores
+whose acknowledgements precede a barrier use SQLite WAL with
+`synchronous=NORMAL`; journals whose records precede effects use
+`synchronous=FULL`.
 
 The authoritative local details are in
 [file operation](file-runtime.md), [Sync](sync-runtime.md), [directory
@@ -129,34 +129,17 @@ existing WAL/journal bytes, configured journal mode, logical rows, and recovery
 state must remain unchanged. `immutable=1` cannot replace this path because it
 disables SQLite locking and concurrent change detection.
 
-The local regression fixtures downgrade current databases to known older shapes
-with explicit SQL. They prove the current reader/writer transitions and
-no-mutation rejection behavior, but they are not evidence produced by an old
-binary. Actual `fd1338c2` binary cross-read/recovery remains separate
-qualification; no result from these synthetic fixtures expands that boundary.
-
-The immutable `546f419` corpus is separate stage-3 evidence produced by the
-accepted `546f419` trial archive binary. It contains a sparse pending handle, a
-request dropped before commit, a committed request whose response was lost, and
-a service metadata database copied with its non-empty WAL. The installed-target
-acceptance must preserve the exact pending bytes, frozen and Unknown
-CommitIds/digests, service WAL result and target publication behavior. This is
-one exact producer/target pair; it does not turn synthetic stage-1/2 fixtures or
-an equal source tree into broader cross-version support.
+Focused tests malform current-profile state in place to prove that stale
+identifiers return `Unsupported` and current identifiers with missing or extra
+columns return `Corrupt`. These tests assert that rejection happens before
+journal-mode configuration, schema repair, recovery, or lock creation.
 
 ## Conformance evidence
 
 The committed vectors under
-[`crates/core/tests/fixtures/compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2)
-were produced by an encoder independent of the Rust implementation from the
-profile descriptions at source revision `fd1338c2`. Tests consume the committed
-bytes rather than regenerating them with the current writer. They cover content
-proofs and ranges, Unicode names and byte order, a frozen request digest,
-receipts, object profiles, SQLite manifest data, and malformed or unknown
-variants.
+[`crates/core/tests/fixtures/format`](../crates/core/tests/fixtures/format)
+cover current content proofs and a frozen transaction encoding. Tests consume
+the committed bytes rather than regenerating them with the current writer.
 
-These vectors establish same-profile reader and writer agreement. Cross-binary
-qualification against the exact old source revision and recovery of retained
-history is recorded separately in #79 evidence. Passing a fixture does not
-expand the matrix or turn an experimental platform combination into a released
-product.
+These vectors establish current-profile reader and writer agreement. They are
+not old-version fixtures and do not establish cross-version compatibility.

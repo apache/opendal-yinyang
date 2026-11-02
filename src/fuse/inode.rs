@@ -17,10 +17,9 @@
 
 //! Volume-lifetime numeric inode mapping for the Linux FUSE boundary.
 //!
-//! Inode numbers are deterministic functions of the core [`NodeId`], so they
-//! are stable across mounts and restarts. The root is always 1. Identities
-//! with a colliding derivation are rejected instead of aliased; collisions
-//! are astronomically unlikely for 128-bit node identities.
+//! Backends define their own identity domain: Managed uses a [`NodeId`], while
+//! Direct includes the accepted object version in its identity. Both use this
+//! one table, derivation and collision policy.
 //!
 //! The map and the cached kind/executable observations live for the whole
 //! mount, mirroring the macOS prototype's identity-map lifetime. Lookup
@@ -34,8 +33,19 @@ use yinyang_core::NodeId;
 /// The FUSE inode reserved for the volume root.
 pub const ROOT_INODE: u64 = 1;
 
-/// Domain separation keeps the derivation independent of content hashes.
-const INODE_DOMAIN: &[u8] = b"yinyang fuse inode v1";
+pub(super) trait InodeIdentity: Copy + Eq + Ord + Send + Sync + 'static {
+    const DOMAIN: &'static [u8];
+
+    fn identity_bytes(self) -> [u8; 16];
+}
+
+impl InodeIdentity for NodeId {
+    const DOMAIN: &'static [u8] = b"yinyang fuse inode v1";
+
+    fn identity_bytes(self) -> [u8; 16] {
+        *self.as_bytes()
+    }
+}
 
 /// Kind-adjacent metadata observed from an authority snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,15 +56,15 @@ pub struct CachedInfo {
 }
 
 /// Stable NodeId <-> inode mapping with kernel lookup counters.
-pub struct InodeTable {
-    by_inode: BTreeMap<u64, NodeId>,
-    by_node: BTreeMap<NodeId, u64>,
+pub struct InodeTable<I: InodeIdentity> {
+    by_inode: BTreeMap<u64, I>,
+    by_node: BTreeMap<I, u64>,
     lookups: BTreeMap<u64, u64>,
-    info: BTreeMap<NodeId, CachedInfo>,
+    info: BTreeMap<I, CachedInfo>,
 }
 
-impl InodeTable {
-    pub fn new(root: NodeId) -> Self {
+impl<I: InodeIdentity> InodeTable<I> {
+    pub fn new(root: I) -> Self {
         Self {
             by_inode: [(ROOT_INODE, root)].into_iter().collect(),
             by_node: [(root, ROOT_INODE)].into_iter().collect(),
@@ -64,11 +74,11 @@ impl InodeTable {
     }
 
     /// Resolve or allocate the deterministic inode for a node identity.
-    pub fn inode(&mut self, id: NodeId) -> Result<u64, &'static str> {
+    pub fn inode(&mut self, id: I) -> Result<u64, &'static str> {
         if let Some(inode) = self.by_node.get(&id) {
             return Ok(*inode);
         }
-        let inode = derive(id)?;
+        let inode = derive::<I>(id)?;
         if let Some(existing) = self.by_inode.get(&inode) {
             return Err(if *existing == id {
                 "inode already mapped to another identity"
@@ -82,7 +92,7 @@ impl InodeTable {
     }
 
     /// Resolve an inode number to a node identity.
-    pub fn node(&self, inode: u64) -> Option<NodeId> {
+    pub fn node(&self, inode: u64) -> Option<I> {
         self.by_inode.get(&inode).copied()
     }
 
@@ -109,11 +119,11 @@ impl InodeTable {
     }
 
     /// Cache kind-adjacent metadata observed from a snapshot.
-    pub fn cache(&mut self, id: NodeId, info: CachedInfo) {
+    pub fn cache(&mut self, id: I, info: CachedInfo) {
         self.info.insert(id, info);
     }
 
-    pub fn cached(&self, id: NodeId) -> Option<CachedInfo> {
+    pub fn cached(&self, id: I) -> Option<CachedInfo> {
         self.info.get(&id).copied()
     }
 
@@ -122,12 +132,16 @@ impl InodeTable {
     pub fn inodes(&self) -> Vec<u64> {
         self.by_inode.keys().copied().collect()
     }
+
+    pub fn nodes(&self) -> Vec<I> {
+        self.by_node.keys().copied().collect()
+    }
 }
 
-fn derive(id: NodeId) -> Result<u64, &'static str> {
+fn derive<I: InodeIdentity>(id: I) -> Result<u64, &'static str> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(INODE_DOMAIN);
-    hasher.update(id.as_bytes());
+    hasher.update(I::DOMAIN);
+    hasher.update(&id.identity_bytes());
     let hash = hasher.finalize();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&hash.as_bytes()[..8]);

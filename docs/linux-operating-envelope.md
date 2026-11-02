@@ -311,18 +311,11 @@ AWS repository gates passed at this source: `cargo x lint`, `cargo x check`,
 `cargo x test`, `cargo x licenses`, and Rust 1.91.0 locked all-target check.
 The accepted Core115 native proof at
 `b630ef2` covers Managed FUSE 27 tests, operations 1, Managed Sync 12,
-compatibility 8, recovery 4, and Direct 30 passed plus 8 filtered tests.
+recovery 4, and Direct 30 passed plus 8 filtered tests.
 The subsequent A revision changed only the doctor remediation text in
 `operations_cli.rs`; later harness/procedure and Python test-loader changes did
 not alter native contracts. Those native workloads were not repeated at
 `1736197`.
-
-The installed-prefix upgrade
-`o-pin-1736197-upgrade` passed against the immutable
-`fd1338c2f924a90e9da752b9158e748d1d3acaf4` producer. It retained a
-`74,192`-byte service WAL with SHA-256
-`c5c186dba36d6b2fc866243f46541bf7c1f2a108f065164686c67b5cf122ad60`,
-then converged target file bytes, Sync, service, receipt and doctor state.
 
 ### Earlier operating envelope
 
@@ -365,9 +358,6 @@ Public raw evidence:
 - [accepted operating-envelope JSON](benchmarks/linux-envelope-amazon-s3-2026-10-28-1736197.json),
   SHA-256
   `858a7dd40e3662b536bef7206ead861ee6261580ef18d2b2893fc01a4d089c0e`;
-- [installed-upgrade JSON](benchmarks/linux-prefix-upgrade-2026-10-28-1736197.json),
-  SHA-256
-  `403bbcddbd6aac3cb5f6c1a5eae42d8b04b7720f7305b72a670ca7b56ff6b656`;
 - [release build manifest](benchmarks/linux-release-manifest-2026-10-28-1736197.txt),
   SHA-256
   `d34e92efe67ac3e9b52d5574f5889c49e6c2b29e4fabe1b44b3fcda95343d37c`.

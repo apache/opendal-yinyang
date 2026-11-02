@@ -31,6 +31,7 @@ use crate::{
 use futures_util::future::BoxFuture;
 use opendal::Operator;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -167,6 +168,7 @@ fn ensure_writer_healthy(poisoned: &AtomicBool) -> Result<()> {
 }
 
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
+const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
     ("singleton", "INTEGER"),
     ("profile", "TEXT"),
@@ -217,14 +219,15 @@ fn check_columns(conn: &Connection, table: &str, expected: &[(&str, &str)]) -> R
         .map_err(|error| {
             corrupt_schema(format!("cannot inspect table {table} columns: {error}"))
         })?;
-    if columns.len() != expected.len()
-        || columns
-            .iter()
-            .zip(expected)
-            .any(|((name, kind), (expected_name, expected_kind))| {
-                name.as_str() != *expected_name || !kind.eq_ignore_ascii_case(expected_kind)
-            })
-    {
+    let actual = columns
+        .into_iter()
+        .map(|(name, kind)| (name, kind.to_ascii_lowercase()))
+        .collect::<BTreeMap<_, _>>();
+    let expected = expected
+        .iter()
+        .map(|(name, kind)| ((*name).to_owned(), kind.to_ascii_lowercase()))
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
         return Err(corrupt_schema(format!(
             "schema profile has an incompatible {table} table"
         )));
@@ -251,6 +254,14 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
         return Err(Error::unsupported(
             "open metadata authority",
             "database is not a YinYang authority",
+        ));
+    }
+    let profiles: i64 = conn
+        .query_row("SELECT count(*) FROM authority", [], |row| row.get(0))
+        .map_err(|error| corrupt_schema(format!("cannot inspect authority profiles: {error}")))?;
+    if profiles != 1 {
+        return Err(corrupt_schema(
+            "authority must contain exactly one profile row",
         ));
     }
     let profile: Option<String> = conn
@@ -330,7 +341,7 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
             flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
         }
         let conn = Connection::open_with_flags(path, flags).map_err(sql)?;
-        conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
         let existing = inspect_schema(&conn)?;
         if !existing && !create {
             return Err(Error::new(
@@ -356,8 +367,7 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
     tokio::task::spawn_blocking(move || {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(sql)?;
-        conn.busy_timeout(Duration::from_millis(250)).map_err(sql)?;
-        conn.execute_batch("PRAGMA query_only=ON;").map_err(sql)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
         if !inspect_schema(&conn)? {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -365,6 +375,10 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
                 "database is missing or uninitialized",
             ));
         }
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA query_only=ON;",
+        )
+        .map_err(sql)?;
         Ok(Arc::new(Mutex::new(conn)))
     })
     .await
@@ -433,10 +447,10 @@ impl MetadataService {
                 let fs = NodeId::generate();
                 let root = NodeId::generate();
                 let revision = Revision::new(0);
-                tx.execute("INSERT INTO authority VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
-                tx.execute("INSERT INTO revisions VALUES(?1,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
+                tx.execute("INSERT INTO authority(singleton,profile,filesystem,root,latest) VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
+                tx.execute("INSERT INTO revisions(token,sequence) VALUES(?1,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
                 let node = Node {id:root, generation:1, executable:false, link:None, kind:NodeKind::Directory{membership:1}};
-                tx.execute("INSERT INTO records VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
+                tx.execute("INSERT INTO records(family,key,start,end,value) VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
             }
             let result = manifest(&tx)?;
             tx.commit().map_err(sql)?;
@@ -733,7 +747,7 @@ impl MetadataService {
         ensure_writer_healthy(&self.writer_poisoned)?;
         db_call(&self.writer, move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO prepared VALUES(?1)",
+                "INSERT OR IGNORE INTO prepared(descriptor) VALUES(?1)",
                 params![descriptor],
             )
             .map_err(sql)?;
@@ -892,7 +906,8 @@ impl MetadataService {
                         .map_err(sql)?;
                         if let Some(value) = value {
                             c.execute(
-                                "INSERT INTO records VALUES(?1,?2,?3,NULL,?4)",
+                                "INSERT INTO records(family,key,start,end,value)
+                                 VALUES(?1,?2,?3,NULL,?4)",
                                 params![family, key, sequence as i64, value],
                             )
                             .map_err(sql)?;
@@ -915,7 +930,7 @@ impl MetadataService {
         }
         db_call(&self.writer, move |c| {
             c.execute(
-                "INSERT INTO revisions VALUES(?1,?2)",
+                "INSERT INTO revisions(token,sequence) VALUES(?1,?2)",
                 params![revision.to_bytes().as_slice(), sequence as i64],
             )
             .map_err(sql)?;
@@ -1044,6 +1059,79 @@ mod admission_tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn old_sqlite_profile_is_rejected_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE authority SET profile='yinyang-sqlite-1' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+
+        let error = MetadataService::open(&path, backend.operator())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let connection = Connection::open(&path).unwrap();
+        let profile: String = connection
+            .query_row(
+                "SELECT profile FROM authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(profile, "yinyang-sqlite-1");
+    }
+
+    #[tokio::test]
+    async fn partial_current_sqlite_schema_is_rejected_as_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE prepared")
+            .unwrap();
+
+        let error = MetadataService::open(&path, backend.operator())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
+    }
+
+    #[tokio::test]
+    async fn service_database_commits_with_full_synchronous_durability() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+
+        let db = connect(&path, false).await.unwrap();
+        let connection = db.lock().unwrap();
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
     }
 }
 

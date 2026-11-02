@@ -19,9 +19,9 @@
 use super::{
     DirectoryManifest, install_directory, prepare_directory_request, validate_install_entries,
 };
-use crate::runtime::schema;
+use crate::local::store;
 use crate::runtime::{Error, ErrorKind, Failure, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -29,8 +29,7 @@ use yinyang_core::{
     Authority, CommitId, CommitOutcome, NodeId, Receipt, Revision, Snapshot, Transaction,
 };
 
-const PROFILE: &str = "yinyang-directory-1";
-const SCHEMA: &[schema::TableColumns<'static>] = &[
+const SCHEMA: &[store::TableColumns<'static>] = &[
     ("binding", &["singleton", "profile", "filesystem", "root"]),
     (
         "publications",
@@ -48,6 +47,11 @@ const SCHEMA: &[schema::TableColumns<'static>] = &[
         ],
     ),
 ];
+const PROFILE: store::Profile = store::Profile {
+    name: "yinyang-directory-2",
+    table: "binding",
+    schema: SCHEMA,
+};
 const PREPARED: u8 = 0;
 const UNKNOWN: u8 = 1;
 const COMMITTED: u8 = 2;
@@ -183,27 +187,15 @@ impl DirectoryJournal {
         let root = *authority.root().as_bytes();
         let database = tokio::task::spawn_blocking(move || -> Result<_> {
             let exists = path.try_exists().map_err(local)?;
-            let mut connection = Connection::open_with_flags(
-                &path,
-                if exists {
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                } else {
-                    OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | OpenFlags::SQLITE_OPEN_CREATE
-                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                },
-            )
-            .map_err(sql)?;
-            connection
-                .busy_timeout(std::time::Duration::from_secs(1))
-                .map_err(sql)?;
+            let mut connection = store::open_read_write(&path, !exists).map_err(store_error)?;
+            let empty = store::is_empty(&connection).map_err(store_error)?;
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            if exists && !schema::matches(&tx, &[]).map_err(sql)? {
-                validate_binding(&tx, filesystem, root)?;
-            } else {
-                tx.execute_batch(
+            if empty {
+                store::initialize(
+                    &tx,
+                    &PROFILE,
                     "CREATE TABLE binding(
                          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                          profile TEXT NOT NULL,
@@ -222,19 +214,16 @@ impl DirectoryJournal {
                          receipt_ordinal INTEGER,
                          failure BLOB
                      );",
+                    &[
+                        store::Binding::blob("filesystem", filesystem.to_vec()),
+                        store::Binding::blob("root", root.to_vec()),
+                    ],
                 )
-                .map_err(sql)?;
-                tx.execute(
-                    "INSERT INTO binding VALUES(1,?1,?2,?3)",
-                    params![PROFILE, filesystem.as_slice(), root.as_slice()],
-                )
-                .map_err(sql)?;
+                .map_err(store_error)?;
             }
             validate_binding(&tx, filesystem, root)?;
             tx.commit().map_err(sql)?;
-            connection
-                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-                .map_err(sql)?;
+            store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
             Ok(connection)
         })
         .await
@@ -542,31 +531,21 @@ impl DirectoryJournal {
     pub async fn inspect(directory: impl AsRef<Path>) -> Result<DirectoryInspection> {
         let path = directory.as_ref().join("directory.db");
         tokio::task::spawn_blocking(move || -> Result<_> {
-            let connection = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(sql)?;
-            connection
-                .busy_timeout(std::time::Duration::from_secs(1))
+            let connection = store::open_read_only(&path).map_err(store_error)?;
+            let (filesystem, root): (Vec<u8>, Vec<u8>) = connection
+                .query_row(
+                    "SELECT filesystem,root FROM binding WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
                 .map_err(sql)?;
-            let (profile, filesystem, root): (String, Vec<u8>, Vec<u8>) = connection
-                .query_row("SELECT profile,filesystem,root FROM binding", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .map_err(sql)?;
-            if profile != PROFILE {
-                return Err(Error::local_kind(
-                    ErrorKind::Unsupported,
-                    "directory journal uses an unsupported profile",
-                ));
-            }
-            if !schema::matches(&connection, SCHEMA).map_err(sql)? {
-                return Err(Error::local_kind(
-                    ErrorKind::Corrupt,
-                    format!("directory journal profile {profile} has an unsupported schema"),
-                ));
-            }
+            let filesystem: [u8; 16] = filesystem
+                .try_into()
+                .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid directory filesystem"))?;
+            let root: [u8; 16] = root
+                .try_into()
+                .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid directory root"))?;
+            validate_binding(&connection, filesystem, root)?;
             let mut statement = connection
                 .prepare(
                     "SELECT commit_id,baseline,request_digest,source,request,manifest,
@@ -582,8 +561,8 @@ impl DirectoryJournal {
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(DirectoryInspection {
-                filesystem: node_id(filesystem, "filesystem")?,
-                root: node_id(root, "root")?,
+                filesystem: NodeId::from_bytes(filesystem),
+                root: NodeId::from_bytes(root),
                 intents,
             })
         })
@@ -740,30 +719,15 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
 }
 
 fn validate_binding(connection: &Connection, filesystem: [u8; 16], root: [u8; 16]) -> Result<()> {
-    let (profile, bound_filesystem, bound_root): (String, Vec<u8>, Vec<u8>) = connection
-        .query_row("SELECT profile,filesystem,root FROM binding", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(sql)?;
-    if profile != PROFILE {
-        return Err(Error::local_kind(
-            ErrorKind::Unsupported,
-            "directory journal uses an unsupported profile",
-        ));
-    }
-    if !schema::matches(connection, SCHEMA).map_err(sql)? {
-        return Err(Error::local_kind(
-            ErrorKind::Corrupt,
-            format!("directory journal profile {profile} has an unsupported schema"),
-        ));
-    }
-    if bound_filesystem != filesystem || bound_root != root {
-        return Err(Error::local_kind(
-            ErrorKind::Invalid,
-            "directory journal belongs to another filesystem",
-        ));
-    }
-    Ok(())
+    store::validate(
+        connection,
+        &PROFILE,
+        Some(&[
+            store::Binding::blob("filesystem", filesystem.to_vec()),
+            store::Binding::blob("root", root.to_vec()),
+        ]),
+    )
+    .map_err(store_error)
 }
 
 fn load(connection: &Connection, id: CommitId) -> Result<Option<StoredRow>> {
@@ -970,13 +934,6 @@ fn commit_id(row: &StoredRow) -> Result<CommitId> {
     Ok(CommitId::from_bytes(bytes))
 }
 
-fn node_id(bytes: Vec<u8>, field: &'static str) -> Result<NodeId> {
-    let bytes: [u8; 16] = bytes
-        .try_into()
-        .map_err(|_| Error::local_kind(ErrorKind::Corrupt, format!("invalid {field} identity")))?;
-    Ok(NodeId::from_bytes(bytes))
-}
-
 fn existing_identity(id: CommitId) -> Error {
     Error::local_kind(
         ErrorKind::AlreadyExists,
@@ -984,6 +941,22 @@ fn existing_identity(id: CommitId) -> Error {
             "directory publication {id:?} is already prepared; retry it without a source using this commit identity, and use a new identity for different content"
         ),
     )
+}
+
+fn store_error(error: store::Error) -> Error {
+    let kind = match error.kind() {
+        store::ErrorKind::Invalid => ErrorKind::Invalid,
+        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
+        store::ErrorKind::Busy => ErrorKind::Busy,
+        store::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
+        store::ErrorKind::NotFound => ErrorKind::NotFound,
+        store::ErrorKind::ReadOnly => ErrorKind::ReadOnly,
+        store::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+        store::ErrorKind::NoSpace => ErrorKind::NoSpace,
+        store::ErrorKind::Io => ErrorKind::Io,
+    };
+    Error::local_kind(kind, error)
 }
 
 fn local(error: impl std::error::Error + 'static) -> Error {
