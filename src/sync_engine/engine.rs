@@ -1429,9 +1429,10 @@ impl<R: RemoteAdapter> SyncEngine<R> {
         let mut virtual_conflicts = Vec::new();
         let mut virtual_conflicts_by_path = BTreeMap::new();
         let mut mutated_artifacts = BTreeSet::new();
+        let mut artifact_bytes_hashed = 0;
         if let Some(remote_entries) = &remote_entries {
             for artifact in &artifacts {
-                if !artifact_changed(state_path, artifact) {
+                if !artifact_changed_counted(state_path, artifact, &mut artifact_bytes_hashed) {
                     continue;
                 }
                 mutated_artifacts.insert(artifact.id.clone());
@@ -1718,6 +1719,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             entries,
             conflicts: conflict_status,
             artifacts: artifact_status,
+            artifact_bytes_hashed,
         })
     }
 
@@ -3092,6 +3094,15 @@ fn artifact_conflict_id(id: &str) -> String {
 }
 
 fn artifact_changed(state: &Path, artifact: &super::store::ArtifactRecord) -> bool {
+    let mut hashed = 0;
+    artifact_changed_counted(state, artifact, &mut hashed)
+}
+
+fn artifact_changed_counted(
+    state: &Path,
+    artifact: &super::store::ArtifactRecord,
+    hashed: &mut u64,
+) -> bool {
     if artifact.kind == super::store::ArtifactKind::QuarantinedDirectory {
         return false;
     }
@@ -3114,12 +3125,16 @@ fn artifact_changed(state: &Path, artifact: &super::store::ArtifactRecord) -> bo
         || metadata.ctime_nsec() != recorded.ctime_nsec
         || metadata.size() != artifact.length
     {
-        return !artifact_content_matches(&path, artifact);
+        return !artifact_content_matches(&path, artifact, hashed);
     }
     false
 }
 
-fn artifact_content_matches(path: &Path, artifact: &super::store::ArtifactRecord) -> bool {
+fn artifact_content_matches(
+    path: &Path,
+    artifact: &super::store::ArtifactRecord,
+    hashed: &mut u64,
+) -> bool {
     let Some(expected) = artifact.digest else {
         return false;
     };
@@ -3139,6 +3154,7 @@ fn artifact_content_matches(path: &Path, artifact: &super::store::ArtifactRecord
         }
         hasher.update(&buffer[..count]);
         length = length.saturating_add(count as u64);
+        *hashed = hashed.saturating_add(count as u64);
     }
     length == artifact.length && hasher.finalize().as_bytes() == &expected
 }

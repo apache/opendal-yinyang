@@ -237,6 +237,72 @@ async fn managed_sync_mixed_creates_and_content_edits_use_one_head_commit() {
     );
 }
 
+#[tokio::test]
+async fn restored_sync_status_does_not_rehash_retained_artifacts() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file"), b"baseline").unwrap();
+    let mut sync = ManagedHarness::init(authority.clone(), &state, &root).await;
+    assert!(sync.run().await.in_sync);
+
+    let snapshot = authority.observe_latest().await.unwrap();
+    let node = snapshot.resolve("file").await.unwrap().unwrap().id();
+    let prepared = authority
+        .data()
+        .prepare(&mut &b"remote change"[..])
+        .await
+        .unwrap();
+    let mut planner = Planner::new(&snapshot, CommitId::generate());
+    let _ = planner.node(node).await.unwrap();
+    planner.set_content(node, prepared).await.unwrap();
+    assert!(matches!(
+        authority.commit(&planner.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+    std::fs::write(root.join("file"), b"local change").unwrap();
+    assert!(!sync.run().await.in_sync);
+
+    let backup = temp.path().join("backup");
+    sync.engine.backup(&backup).await.unwrap();
+    drop(sync);
+
+    let restored_state = temp.path().join("restored-state");
+    let restored_root = temp.path().join("restored-root");
+    let restored = SyncEngine::restore(
+        ManagedAdapter::new(authority.clone()),
+        &backup,
+        &restored_root,
+        &restored_state,
+    )
+    .await
+    .unwrap();
+    drop(restored);
+    let adapter = ManagedAdapter::new(authority);
+    let first = SyncEngine::<ManagedAdapter>::inspect(
+        Some(&adapter),
+        &restored_state,
+        SyncModel::Managed,
+        None,
+    )
+    .await;
+    assert!(!first.artifacts.is_empty());
+    let second = SyncEngine::<ManagedAdapter>::inspect(
+        Some(&adapter),
+        &restored_state,
+        SyncModel::Managed,
+        None,
+    )
+    .await;
+    assert_eq!(
+        second.artifact_bytes_hashed, 0,
+        "restored status rehashed retained artifact bytes"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
     const SMALL: usize = 512 * 1024;

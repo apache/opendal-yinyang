@@ -521,7 +521,7 @@ impl BackupManifest {
             state_identity: identity(&state_metadata),
         };
         let mut store = Store::open(&state.join("sync-engine.db"))?;
-        store.rebind(&binding, &identities)?;
+        store.rebind(&binding, &identities, &state)?;
         for relative in ["artifacts", "content", "content/staging.db"] {
             let path = state.join(relative);
             if path.is_dir() {
