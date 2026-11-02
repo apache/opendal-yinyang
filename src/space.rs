@@ -3102,18 +3102,6 @@ fn parse_node_id_hex(value: &str) -> Option<NodeId> {
     Some(NodeId::from_bytes(bytes))
 }
 
-#[cfg(target_os = "linux")]
-fn parse_revision_hex(value: &str) -> Option<Revision> {
-    if value.len() != 48 {
-        return None;
-    }
-    let mut bytes = [0_u8; 24];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
-    }
-    Some(Revision::from_bytes(bytes))
-}
-
 fn commit_hex(commit: yinyang_core::CommitId) -> String {
     bytes_hex(commit.as_bytes())
 }
