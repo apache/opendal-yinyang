@@ -81,23 +81,21 @@ An archive containing a symlink is a required negative case. Extraction returns
 a nonzero status whose stderr names the symlink operation, and the destination
 must not contain a substituted regular file or directory at that path.
 
-## Git observation
+## Git boundary
 
-The fresh-main probe ran Git 2.43.0 in a writable Managed mount. This command
-failed before repository initialization completed:
+The writable Managed mount mode model does not provide the private temporary
+file mode Git requests for loose objects. The tested Git 2.43.0 regression
+prepares a bare repository whose files and directories already use
+representable modes, then runs:
 
 ```text
-git init --template= repository
+git --git-dir REPOSITORY.git hash-object -w BLOB
 ```
 
-Git attempted to create a private temporary file below `.git`; the mount
-returned `EOPNOTSUPP`, and Git exited 128 with
-`Unable to create temporary file ... Operation not supported`. A second
-regression prepares a bare repository skeleton with representable modes and
-runs `git hash-object -w`; Git's loose-object temporary file also requests a
-non-representable mode, so the command fails with the same diagnostic before
-an object exists. Git's private temporary and loose-object modes are outside
-the current representable mode contract. Git is therefore excluded from the
+The mount rejects the non-representable temporary-file request with
+`EOPNOTSUPP`. Git must fail before creating the loose object: the command exits
+128, stderr identifies the failure with `Operation not supported`, and the
+object path remains absent. Git workflows are therefore excluded from the
 supported application matrix; the trial does not hide this failure or broaden
 the product mode model.
 

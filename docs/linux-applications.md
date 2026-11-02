@@ -95,9 +95,9 @@ loopback service publication and uses `YY_UPGRADE_BIN` when set. The
 trial-distribution workflow sets that selector to the packaged archive's
 `bin/yy`.
 
-The fresh-main probe and committed regression record the Git negative boundary.
-`git init --template=` failed during the probe, and the suite repeats the
-equivalent `git hash-object -w` boundary against a representable bare-repository
-skeleton. Both fail with `EOPNOTSUPP` while creating private temporary or
-loose-object files. Git workflows are excluded rather than silently using a
-different mode model.
+The suite prepares a bare repository whose files and directories already use
+representable modes, then runs `git hash-object -w` against it. Git requests a
+non-representable mode for its loose-object temporary file, exits 128 with
+`Unable to create temporary file ... Operation not supported`, and leaves no
+object. Git workflows are excluded rather than silently using another mode
+model.
