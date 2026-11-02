@@ -655,6 +655,64 @@ async fn expired_base_still_restores_exact_frozen_plan_before_receipt_replay() {
 }
 
 #[tokio::test]
+async fn frozen_batch_preserves_input_order_for_mixed_receipt_states() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let prepared = fs.data().prepare(&mut b"first".as_slice()).await.unwrap();
+    let mut first = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    first
+        .create_file(fs.root(), "first", prepared, false)
+        .await
+        .unwrap();
+    let first = first.finish().unwrap();
+    let first_receipt = committed(fs.commit(&first).await.unwrap());
+
+    let pending_base = fs.observe_latest().await.unwrap();
+    let prepared = fs.data().prepare(&mut b"pending".as_slice()).await.unwrap();
+    let mut pending = Planner::new(&pending_base, CommitId::generate());
+    pending
+        .create_file(fs.root(), "pending", prepared, false)
+        .await
+        .unwrap();
+    let pending = pending.finish().unwrap();
+
+    let mut advance = Planner::new(&pending_base, CommitId::generate());
+    advance
+        .create_directory(fs.root(), "advance")
+        .await
+        .unwrap();
+    let current = committed(fs.commit(&advance.finish().unwrap()).await.unwrap());
+    committed(
+        fs.expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                current.cursor.revision,
+                vec![pending_base.revision()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let outcomes = fs
+        .commit_frozen_batch(&[pending.to_bytes().unwrap(), first.to_bytes().unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    let Outcome::Committed(pending_receipt) = outcomes[0] else {
+        panic!("pending request did not commit");
+    };
+    assert_eq!(pending_receipt.commit_id, pending.id());
+    assert_eq!(
+        outcomes[1],
+        Outcome::Committed(first_receipt),
+        "a mixed batch must retain input order instead of grouping receipts"
+    );
+}
+
+#[tokio::test]
 async fn indexed_deep_paths_names_and_invalid_profiles() {
     use yinyang_core::namespace::name_key;
     for name in [
