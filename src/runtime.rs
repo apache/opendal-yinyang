@@ -624,13 +624,6 @@ impl FileHandle {
         .await;
         self.report(result).await
     }
-    /// A Sync replacement is a conditional edit even when both versions are empty.
-    pub(crate) async fn reset_content(&mut self) -> Result<()> {
-        self.live()?;
-        self.runtime.require_write()?;
-        let result = self.runtime.inner.stage.reset_content(self.id).await;
-        self.report(result).await
-    }
     /// Publish dirty content, commit the executable flag, and advance this clean
     /// handle to the new metadata revision without restaging the unchanged bytes.
     pub(crate) async fn set_executable(&mut self, executable: bool) -> Result<Receipt> {

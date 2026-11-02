@@ -16,7 +16,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Direct conditional mutations](direct-mutations.md) | Conditional object publication/delete, durable whole-object staging, safe-save namespace mutation, and local state format. |
 | [Direct Sync](direct-sync.md) | Finite ordinary-directory reconciliation over storage-native Direct pins and conditional mutations. |
 | [Sync runtime](sync-runtime.md) | Experimental content and namespace coordinator against an explicit remote baseline. |
-| [Linux Managed Sync](linux-sync.md) | The `yy ... sync` ordinary-directory CLI: admission, exit codes, offline retained-byte export, and the `yinyang.sync.status.v1` document. |
+| [Linux ordinary-directory Sync](linux-sync.md) | The shared Managed/Direct `yy ... sync` engine: capabilities, baseline, typed intents, conflicts, backup, exit codes, and the `yinyang.sync.status.v1` document. |
 | [Linux operations](linux-operations.md) | Health diagnostics, user-service lifecycle and installed-prefix state boundaries. |
 | [Linux trial distribution](linux-trial-distribution.md) | Direct trial binary, traceable archive verification, versioned-prefix installation, stopped activation and non-destructive inventory boundaries. |
 | [Managed space and retention](managed-space-retention.md) | Read-only logical, object, and staging accounting plus bounded non-destructive retention planning. |

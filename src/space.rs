@@ -21,10 +21,12 @@
 //! metadata, current backend objects, and existing local staging state without
 //! opening a writer, acquiring a runtime lease, or changing local databases.
 
-#[cfg(target_os = "linux")]
-use crate::replica::{Replica, ReplicaBaseline, inspect_backup_package};
 use crate::runtime::{ErrorKind as RuntimeErrorKind, Runtime};
-use crate::sync::{NamespaceState, NamespaceStatus, Sync};
+use crate::sync::{ContentStatus, IntentState, Sync};
+#[cfg(target_os = "linux")]
+use crate::sync_engine::{
+    EngineInspection, inspect_backup_package, inspect_protection, inspect_state,
+};
 use opendal::{EntryMode, Operator};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,8 +34,8 @@ use std::path::{Path, PathBuf};
 use yinyang_core::reachability::PhysicalReferenceKind;
 use yinyang_core::{Authority, Error, ErrorKind, NodeId, NodeKind, Result, Revision, Snapshot};
 
-pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v3";
-pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v3";
+pub const SPACE_REPORT_SCHEMA: &str = "yinyang.managed-space.report.v4";
+pub const RETENTION_PLAN_SCHEMA: &str = "yinyang.managed-retention.plan.v4";
 
 const HEAD_KEY: &str = ".yinyang/head";
 const PACK_ROOT: &str = ".yinyang/v2";
@@ -67,6 +69,21 @@ pub struct ManagedSpaceReport {
     pub deletion_authorized: bool,
     pub reclaimable_bytes: Option<u64>,
     pub limits: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncSpaceReport {
+    pub schema: &'static str,
+    pub staging: StagingSpace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncRetentionPlan {
+    pub schema: &'static str,
+    pub staging: StagingProtection,
+    pub unresolved: Vec<Unresolved>,
+    pub deletion_authorized: bool,
+    pub reclaimable_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -192,7 +209,7 @@ pub struct StagingSpace {
     pub databases: Vec<StagingDatabase>,
     pub handles: StagingHandles,
     pub sync: SyncEvidence,
-    pub replica: ReplicaEvidence,
+    pub engine: EngineEvidence,
     pub protected_revisions: Vec<ProtectedRevision>,
     pub frozen_commits: Vec<String>,
     pub errors: Vec<String>,
@@ -278,26 +295,18 @@ pub struct StagingHandles {
     pub unknown: u64,
     pub failed: u64,
     pub ledger_errors: u64,
-    pub namespace_intents: u64,
-    pub namespace_prepared: u64,
-    pub namespace_unknown: u64,
-    pub namespace_committed: u64,
-    pub namespace_conflict: u64,
-    pub namespace_retryable: u64,
-    pub namespace_failed: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SyncEvidence {
     pub state: StagingState,
-    pub content_edits: u64,
-    pub namespace_intents: u64,
-    pub namespace_prepared: u64,
-    pub namespace_unknown: u64,
-    pub namespace_committed: u64,
-    pub namespace_conflict: u64,
-    pub namespace_retryable: u64,
-    pub namespace_failed: u64,
+    pub intents: u64,
+    pub prepared: u64,
+    pub unknown: u64,
+    pub committed: u64,
+    pub conflict: u64,
+    pub retryable: u64,
+    pub failed: u64,
     pub commit_ids: Vec<String>,
     pub error: Option<String>,
 }
@@ -306,14 +315,13 @@ impl SyncEvidence {
     fn missing() -> Self {
         Self {
             state: StagingState::Missing,
-            content_edits: 0,
-            namespace_intents: 0,
-            namespace_prepared: 0,
-            namespace_unknown: 0,
-            namespace_committed: 0,
-            namespace_conflict: 0,
-            namespace_retryable: 0,
-            namespace_failed: 0,
+            intents: 0,
+            prepared: 0,
+            unknown: 0,
+            committed: 0,
+            conflict: 0,
+            retryable: 0,
+            failed: 0,
             commit_ids: Vec::new(),
             error: None,
         }
@@ -321,18 +329,18 @@ impl SyncEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ReplicaEvidence {
+pub struct EngineEvidence {
     pub state: StagingState,
     pub pending_installs: Option<u64>,
     pub artifacts: Option<u64>,
     pub exportable_artifacts: Option<u64>,
     pub conflicts: Option<u64>,
     pub baseline_coverage: &'static str,
-    pub baseline: Option<ReplicaBaselineEvidence>,
+    pub baseline: Option<EngineBaselineEvidence>,
     pub error: Option<String>,
 }
 
-impl ReplicaEvidence {
+impl EngineEvidence {
     fn missing() -> Self {
         Self {
             state: StagingState::Missing,
@@ -348,17 +356,17 @@ impl ReplicaEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ReplicaBaselineEvidence {
-    pub revision: String,
-    pub entry_revisions: Vec<String>,
+pub struct EngineBaselineEvidence {
+    pub revisions: Vec<String>,
+    pub receipt_revisions: Vec<String>,
 }
 
-impl ReplicaBaselineEvidence {
+impl EngineBaselineEvidence {
     #[cfg(target_os = "linux")]
-    fn from_baseline(baseline: ReplicaBaseline) -> Self {
+    fn from_inspection(inspection: &EngineInspection) -> Self {
         Self {
-            revision: revision_hex(baseline.revision),
-            entry_revisions: baseline.entries.into_iter().map(revision_hex).collect(),
+            revisions: inspection.baseline_revisions.clone(),
+            receipt_revisions: inspection.intent_receipt_revisions.clone(),
         }
     }
 }
@@ -460,7 +468,7 @@ pub struct StagingProtection {
     pub failed: u64,
     pub ledger_errors: u64,
     pub sync: SyncEvidence,
-    pub replica: ReplicaEvidence,
+    pub engine: EngineEvidence,
     pub revisions: Vec<ProtectedRevision>,
 }
 
@@ -646,26 +654,31 @@ async fn inspect_backup_package_evidence(
                 return unavailable_backup(&path, None, format!("inspect backup package: {error}"));
             }
         };
-        let package_filesystem = inspection.filesystem;
-        let filesystem_hex = identity_hex(package_filesystem);
-        if package_filesystem != filesystem {
+        let package_filesystem = if inspection.model == crate::sync_engine::SyncModel::Managed {
+            inspection
+                .namespace
+                .split_once(':')
+                .and_then(|(authority, _)| parse_node_id_hex(authority))
+        } else {
+            None
+        };
+        let filesystem_hex = package_filesystem.map(identity_hex);
+        if package_filesystem != Some(filesystem) {
             let error = format!(
-                "backup filesystem {filesystem_hex} does not match volume filesystem {}",
+                "backup filesystem {:?} does not match volume filesystem {}",
+                filesystem_hex,
                 identity_hex(filesystem)
             );
             return BackupPackageEvidence {
                 path,
                 state: BackupPackageState::Foreign,
-                filesystem: Some(filesystem_hex),
+                filesystem: filesystem_hex,
                 staging: None,
                 error: Some(error),
                 protected: BTreeMap::new(),
             };
         }
         let state_directory = backup.join("state");
-        if let Err(error) = Sync::validate_restore(&state_directory, filesystem).await {
-            return unavailable_backup(&path, Some(filesystem_hex), error.to_string());
-        }
         let mut staging = inspect_package_staging(&state_directory).await;
         staging.binding = StagingBinding::verified(filesystem);
         let state = match staging.state {
@@ -679,7 +692,7 @@ async fn inspect_backup_package_evidence(
         BackupPackageEvidence {
             path,
             state,
-            filesystem: Some(filesystem_hex),
+            filesystem: filesystem_hex,
             staging: Some(staging_protection(&staging)),
             error,
             protected: staging.protected,
@@ -713,7 +726,7 @@ fn staging_protection(staging: &StagingSpace) -> StagingProtection {
         failed: staging.handles.failed,
         ledger_errors: staging.handles.ledger_errors,
         sync: staging.sync.clone(),
-        replica: staging.replica.clone(),
+        engine: staging.engine.clone(),
         revisions: staging.protected_revisions.clone(),
     }
 }
@@ -725,15 +738,16 @@ fn backup_reason(reason: &'static str) -> &'static str {
         "staging_unknown" => "backup_staging_unknown",
         "staging_conflict" => "backup_staging_conflict",
         "staging_failed" => "backup_staging_failed",
-        "sync_namespace_pending" => "backup_sync_namespace_pending",
-        "sync_namespace_unknown" => "backup_sync_namespace_unknown",
-        "sync_namespace_receipt" => "backup_sync_namespace_receipt",
-        "sync_namespace_conflict" => "backup_sync_namespace_conflict",
-        "sync_namespace_retryable" => "backup_sync_namespace_retryable",
-        "sync_namespace_failed" => "backup_sync_namespace_failed",
+        "sync_intent_prepared" => "backup_sync_intent_prepared",
+        "sync_intent_unknown" => "backup_sync_intent_unknown",
+        "sync_intent_receipt" => "backup_sync_intent_receipt",
+        "sync_intent_conflict" => "backup_sync_intent_conflict",
+        "sync_intent_retryable" => "backup_sync_intent_retryable",
+        "sync_intent_failed" => "backup_sync_intent_failed",
         "sync_receipt" => "backup_sync_receipt",
-        "replica_conflict" => "backup_replica_conflict",
-        "replica_baseline" => "backup_replica_baseline",
+        "sync_engine_conflict" => "backup_sync_engine_conflict",
+        "sync_engine_baseline" => "backup_sync_engine_baseline",
+        "sync_engine_receipt" => "backup_sync_engine_receipt",
         _ => "backup_unclassified",
     }
 }
@@ -995,15 +1009,41 @@ pub async fn plan_managed_retention(
     })
 }
 
-/// Inspect existing Managed content, Sync, and replica evidence without creating
-/// a directory or database, acquiring a runtime lease, changing state, or
-/// recovering records. Known SQLite read-only behavior may create or update
-/// derived WAL/SHM files.
+/// Inspect existing content, Sync journal and shared Sync engine evidence
+/// without creating a directory or database, acquiring a runtime lease,
+/// changing state or recovering records.
 pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
     let content = inspect_local_content_staging(staging).await;
     let sync = inspect_sync_evidence(staging).await;
-    let replica = inspect_replica_evidence(staging).await;
-    assemble_staging_space(staging, content, sync, replica)
+    let engine = inspect_engine_evidence(staging).await;
+    assemble_staging_space(staging, content, sync, engine)
+}
+
+pub async fn inspect_sync_space(staging: &Path) -> SyncSpaceReport {
+    SyncSpaceReport {
+        schema: "yinyang.sync.space.v1",
+        staging: inspect_local_staging(staging).await,
+    }
+}
+
+pub async fn plan_sync_retention(staging: &Path) -> SyncRetentionPlan {
+    let staging = inspect_local_staging(staging).await;
+    let unresolved = staging
+        .errors
+        .iter()
+        .map(|detail| Unresolved {
+            subject: "local-staging".to_owned(),
+            state: "unavailable".to_owned(),
+            detail: detail.clone(),
+        })
+        .collect();
+    SyncRetentionPlan {
+        schema: "yinyang.sync.retention.v1",
+        staging: staging_protection(&staging),
+        unresolved,
+        deletion_authorized: false,
+        reclaimable_bytes: None,
+    }
 }
 
 /// Inspect a validated backup package state directory. The package validator
@@ -1013,32 +1053,25 @@ pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
 async fn inspect_package_staging(staging: &Path) -> StagingSpace {
     let content = inspect_local_content_staging(staging).await;
     let sync = inspect_sync_evidence(staging).await;
-    let replica = inspect_replica_protection_evidence(staging).await;
-    assemble_staging_space(staging, content, sync, replica)
+    let engine = inspect_engine_protection_evidence(staging).await;
+    assemble_staging_space(staging, content, sync, engine)
 }
 
 fn assemble_staging_space(
     staging: &Path,
     mut content: StagingSpace,
     sync: SyncInspection,
-    replica: ReplicaInspection,
+    engine: EngineInspectionRecord,
 ) -> StagingSpace {
     merge_protected(&mut content.protected, &sync.protected);
-    merge_protected(&mut content.protected, &replica.protected);
+    merge_protected(&mut content.protected, &engine.protected);
     content
         .frozen_commits
         .extend(sync.frozen_commits.iter().cloned());
     content.frozen_commits.sort();
     content.frozen_commits.dedup();
-    content.handles.namespace_intents = sync.evidence.namespace_intents;
-    content.handles.namespace_prepared = sync.evidence.namespace_prepared;
-    content.handles.namespace_unknown = sync.evidence.namespace_unknown;
-    content.handles.namespace_committed = sync.evidence.namespace_committed;
-    content.handles.namespace_conflict = sync.evidence.namespace_conflict;
-    content.handles.namespace_retryable = sync.evidence.namespace_retryable;
-    content.handles.namespace_failed = sync.evidence.namespace_failed;
     push_unique(&mut content.errors, sync.evidence.error.clone());
-    push_unique(&mut content.errors, replica.evidence.error.clone());
+    push_unique(&mut content.errors, engine.evidence.error.clone());
     if sync.evidence.state != StagingState::Missing {
         content.databases.push(StagingDatabase {
             kind: "sync-journal",
@@ -1047,17 +1080,17 @@ fn assemble_staging_space(
             error: sync.evidence.error.clone(),
         });
     }
-    if replica.evidence.state != StagingState::Missing {
+    if engine.evidence.state != StagingState::Missing {
         content.databases.push(StagingDatabase {
-            kind: "replica",
-            path: display_path(&staging.join("replica.db")),
-            state: measurement_state(replica.evidence.state),
-            error: replica.evidence.error.clone(),
+            kind: "sync-engine",
+            path: display_path(&staging.join("sync-engine.db")),
+            state: measurement_state(engine.evidence.state),
+            error: engine.evidence.error.clone(),
         });
     }
     content.protected_revisions = protected_revisions(&content.protected);
     content.sync = sync.evidence;
-    content.replica = replica.evidence;
+    content.engine = engine.evidence;
     content.state = staging_state(&content.databases, &content.errors, content.state);
     content
 }
@@ -1115,20 +1148,23 @@ async fn validate_local_staging_binding(
             })?;
     }
 
-    let replica = staging.join("replica.db");
-    if path_exists(&replica)? {
+    let engine = staging.join("sync-engine.db");
+    if path_exists(&engine)? {
         #[cfg(target_os = "linux")]
         {
-            let status = Replica::inspect(staging).map_err(|error| {
+            let inspection = inspect_state(staging).map_err(|error| {
                 format!(
-                    "validate replica binding for filesystem {}: {error}",
+                    "validate Sync engine binding for filesystem {}: {error}",
                     identity_hex(filesystem)
                 )
             })?;
-            if status.filesystem != filesystem {
+            let prefix = format!("{}:", identity_hex(filesystem));
+            if inspection.model != crate::sync_engine::SyncModel::Managed
+                || !inspection.namespace.starts_with(&prefix)
+            {
                 return Err(format!(
-                    "replica filesystem {} does not match volume filesystem {}",
-                    identity_hex(status.filesystem),
+                    "sync engine namespace {} does not match volume filesystem {}",
+                    inspection.namespace,
                     identity_hex(filesystem)
                 ));
             }
@@ -1136,7 +1172,7 @@ async fn validate_local_staging_binding(
         #[cfg(not(target_os = "linux"))]
         {
             return Err(
-                "replica binding cannot be verified on this platform; foreign state is not attributed"
+                "Sync engine binding cannot be verified on this platform; foreign state is not attributed"
                     .to_owned(),
             );
         }
@@ -1170,7 +1206,7 @@ async fn unavailable_staging(
                 databases: Vec::new(),
                 handles: StagingHandles::default(),
                 sync: SyncEvidence::missing(),
-                replica: ReplicaEvidence::missing(),
+                engine: EngineEvidence::missing(),
                 protected_revisions: Vec::new(),
                 frozen_commits: Vec::new(),
                 errors: vec![error],
@@ -1186,7 +1222,7 @@ async fn unavailable_staging(
         databases: Vec::new(),
         handles: StagingHandles::default(),
         sync: SyncEvidence::missing(),
-        replica: ReplicaEvidence::missing(),
+        engine: EngineEvidence::missing(),
         protected_revisions: Vec::new(),
         frozen_commits: Vec::new(),
         errors: vec![binding_error],
@@ -1200,8 +1236,8 @@ struct SyncInspection {
     frozen_commits: BTreeSet<String>,
 }
 
-struct ReplicaInspection {
-    evidence: ReplicaEvidence,
+struct EngineInspectionRecord {
+    evidence: EngineEvidence,
     protected: BTreeMap<Revision, BTreeSet<&'static str>>,
 }
 
@@ -1227,10 +1263,9 @@ async fn inspect_sync_evidence(staging: &Path) -> SyncInspection {
     match Sync::inspect(staging).await {
         Ok(sync) => {
             inspection.evidence.state = StagingState::Available;
-            inspection.evidence.content_edits = sync.content.len() as u64;
             let mut commit_ids = BTreeSet::new();
-            for status in sync.namespace {
-                absorb_namespace(
+            for status in sync.intents {
+                absorb_intent(
                     status,
                     &mut inspection.evidence,
                     &mut inspection.protected,
@@ -1248,10 +1283,16 @@ async fn inspect_sync_evidence(staging: &Path) -> SyncInspection {
     inspection
 }
 
-async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
-    let database = staging.join("replica.db");
-    let mut inspection = ReplicaInspection {
-        evidence: ReplicaEvidence::missing(),
+async fn inspect_engine_evidence(staging: &Path) -> EngineInspectionRecord {
+    inspect_engine_database(staging, false).await
+}
+
+async fn inspect_engine_database(staging: &Path, protection_only: bool) -> EngineInspectionRecord {
+    #[cfg(not(target_os = "linux"))]
+    let _ = protection_only;
+    let database = staging.join("sync-engine.db");
+    let mut inspection = EngineInspectionRecord {
+        evidence: EngineEvidence::missing(),
         protected: BTreeMap::new(),
     };
     match database.try_exists() {
@@ -1260,7 +1301,7 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
             inspection.evidence.state = StagingState::Unavailable;
             inspection.evidence.baseline_coverage = "unavailable";
             inspection.evidence.error = Some(format!(
-                "inspect replica state {}: {error}",
+                "inspect Sync engine state {}: {error}",
                 database.display()
             ));
             return inspection;
@@ -1269,65 +1310,84 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
     }
     #[cfg(target_os = "linux")]
     {
-        match Replica::inspect(staging) {
-            Ok(status) => {
-                let pending = u64::try_from(status.pending_installs).unwrap_or(u64::MAX);
-                let baseline = status.baseline.clone();
-                inspection.evidence = ReplicaEvidence {
-                    state: if pending > 0 {
-                        StagingState::Partial
-                    } else {
-                        StagingState::Available
-                    },
-                    pending_installs: Some(pending),
-                    artifacts: Some(status.artifacts.len() as u64),
-                    exportable_artifacts: Some(
-                        status
-                            .artifacts
-                            .iter()
-                            .filter(|artifact| artifact.exportable)
-                            .count() as u64,
-                    ),
-                    conflicts: Some(status.conflicts.len() as u64),
-                    baseline_coverage: "observed_from_read_only_baseline",
-                    baseline: baseline
-                        .as_ref()
-                        .map(|value| ReplicaBaselineEvidence::from_baseline(value.clone())),
-                    error: None,
-                };
-                if pending > 0 {
-                    inspection.evidence.error = Some(format!(
-                        "replica has {pending} pending installs; retained artifacts, conflicts, and baseline revisions are observable"
-                    ));
-                }
-                if let Some(baseline) = baseline {
-                    inspection
-                        .protected
-                        .entry(baseline.revision)
-                        .or_default()
-                        .insert("replica_baseline");
-                    for revision in baseline.entries {
-                        inspection
-                            .protected
-                            .entry(revision)
-                            .or_default()
-                            .insert("replica_baseline");
-                    }
-                }
-                for conflict in status.conflicts {
-                    if let Some(revision) = conflict.remote_revision {
-                        inspection
-                            .protected
-                            .entry(Revision::from_bytes(revision))
-                            .or_default()
-                            .insert("replica_conflict");
-                    }
-                }
+        let state = staging.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            if protection_only {
+                inspect_protection(&state)
+            } else {
+                inspect_state(&state)
+            }
+        })
+        .await;
+        let engine = match result {
+            Ok(Ok(engine)) => engine,
+            Ok(Err(error)) => {
+                inspection.evidence.state = StagingState::Unavailable;
+                inspection.evidence.baseline_coverage = "unavailable";
+                inspection.evidence.error = Some(error.to_string());
+                return inspection;
             }
             Err(error) => {
                 inspection.evidence.state = StagingState::Unavailable;
                 inspection.evidence.baseline_coverage = "unavailable";
-                inspection.evidence.error = Some(error.to_string());
+                inspection.evidence.error = Some(format!("inspect Sync engine state: {error}"));
+                return inspection;
+            }
+        };
+        let pending = engine.pending_installs;
+        inspection.evidence = EngineEvidence {
+            state: if pending > 0 {
+                StagingState::Partial
+            } else {
+                StagingState::Available
+            },
+            pending_installs: Some(pending),
+            artifacts: Some(engine.artifacts.len() as u64),
+            exportable_artifacts: Some(
+                engine
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| artifact.exportable)
+                    .count() as u64,
+            ),
+            conflicts: Some(engine.conflicts.len() as u64),
+            baseline_coverage: "observed_from_read_only_baseline",
+            baseline: Some(EngineBaselineEvidence::from_inspection(&engine)),
+            error: (pending > 0).then(|| {
+                format!(
+                    "Sync engine has {pending} pending installs; retained artifacts, conflicts, and baseline revisions are observable"
+                )
+            }),
+        };
+        for revision in &engine.baseline_revisions {
+            if let Some(revision) = parse_revision_hex(revision) {
+                inspection
+                    .protected
+                    .entry(revision)
+                    .or_default()
+                    .insert("sync_engine_baseline");
+            }
+        }
+        for revision in &engine.intent_receipt_revisions {
+            if let Some(revision) = parse_revision_hex(revision) {
+                inspection
+                    .protected
+                    .entry(revision)
+                    .or_default()
+                    .insert("sync_engine_receipt");
+            }
+        }
+        for conflict in &engine.conflicts {
+            if let Some(revision) = conflict
+                .remote_revision
+                .as_deref()
+                .and_then(parse_revision_hex)
+            {
+                inspection
+                    .protected
+                    .entry(revision)
+                    .or_default()
+                    .insert("sync_engine_conflict");
             }
         }
     }
@@ -1336,145 +1396,65 @@ async fn inspect_replica_evidence(staging: &Path) -> ReplicaInspection {
         inspection.evidence.state = StagingState::Unavailable;
         inspection.evidence.baseline_coverage = "unavailable";
         inspection.evidence.error = Some(
-            "replica read-only inspection is available only on Linux; baseline and retained artifact coverage is unobserved"
+            "Sync engine read-only inspection is available only on Linux; baseline and retained artifact coverage is unobserved"
                 .to_owned(),
         );
     }
     inspection
 }
 
-/// Read replica revision-protection facts from validated package state without
-/// opening the recorded original root or revalidating retained artifact bytes.
+/// Read Sync engine revision-protection facts from validated package state
+/// without opening the recorded original root.
 #[cfg(target_os = "linux")]
-async fn inspect_replica_protection_evidence(staging: &Path) -> ReplicaInspection {
-    let database = staging.join("replica.db");
-    let mut inspection = ReplicaInspection {
-        evidence: ReplicaEvidence::missing(),
-        protected: BTreeMap::new(),
-    };
-    match database.try_exists() {
-        Ok(false) => return inspection,
-        Err(error) => {
-            inspection.evidence.state = StagingState::Unavailable;
-            inspection.evidence.baseline_coverage = "unavailable";
-            inspection.evidence.error = Some(format!(
-                "inspect replica state {}: {error}",
-                database.display()
-            ));
-            return inspection;
-        }
-        Ok(true) => {}
-    }
-    #[cfg(target_os = "linux")]
-    {
-        match Replica::inspect_protection(staging) {
-            Ok(status) => {
-                let pending = status.pending_installs;
-                inspection.evidence = ReplicaEvidence {
-                    state: if pending > 0 {
-                        StagingState::Partial
-                    } else {
-                        StagingState::Available
-                    },
-                    pending_installs: Some(status.pending_installs),
-                    artifacts: Some(status.artifacts),
-                    exportable_artifacts: Some(status.exportable_artifacts),
-                    conflicts: Some(status.conflicts.len() as u64),
-                    baseline_coverage: "observed_from_read_only_baseline",
-                    baseline: status
-                        .baseline
-                        .as_ref()
-                        .map(|value| ReplicaBaselineEvidence::from_baseline(value.clone())),
-                    error: (pending > 0).then(|| {
-                        format!(
-                            "package replica state has {pending} incomplete installs; protection evidence remains readable"
-                        )
-                    }),
-                };
-                if let Some(baseline) = status.baseline {
-                    inspection
-                        .protected
-                        .entry(baseline.revision)
-                        .or_default()
-                        .insert("replica_baseline");
-                    for revision in baseline.entries {
-                        inspection
-                            .protected
-                            .entry(revision)
-                            .or_default()
-                            .insert("replica_baseline");
-                    }
-                }
-                for revision in status.conflicts {
-                    inspection
-                        .protected
-                        .entry(revision)
-                        .or_default()
-                        .insert("replica_conflict");
-                }
-            }
-            Err(error) => {
-                inspection.evidence.state = StagingState::Unavailable;
-                inspection.evidence.baseline_coverage = "unavailable";
-                inspection.evidence.error = Some(error.to_string());
-            }
-        }
-    }
-    inspection
+async fn inspect_engine_protection_evidence(staging: &Path) -> EngineInspectionRecord {
+    inspect_engine_database(staging, true).await
 }
 
-fn absorb_namespace(
-    status: NamespaceStatus,
+fn absorb_intent(
+    status: ContentStatus,
     evidence: &mut SyncEvidence,
     protected: &mut BTreeMap<Revision, BTreeSet<&'static str>>,
     commit_ids: &mut BTreeSet<String>,
     frozen_commits: &mut BTreeSet<String>,
 ) {
-    evidence.namespace_intents = evidence.namespace_intents.saturating_add(1);
-    commit_ids.insert(commit_hex(status.intent.commit_id));
-    let reason = match &status.state {
-        NamespaceState::Prepared => {
-            evidence.namespace_prepared = evidence.namespace_prepared.saturating_add(1);
-            frozen_commits.insert(commit_hex(status.intent.commit_id));
-            "sync_namespace_pending"
+    evidence.intents = evidence.intents.saturating_add(1);
+    commit_ids.insert(commit_hex(status.commit_id));
+    let reason = match status.state {
+        IntentState::Prepared => {
+            evidence.prepared = evidence.prepared.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.commit_id));
+            "sync_intent_prepared"
         }
-        NamespaceState::Unknown => {
-            evidence.namespace_unknown = evidence.namespace_unknown.saturating_add(1);
-            frozen_commits.insert(commit_hex(status.intent.commit_id));
-            "sync_namespace_unknown"
+        IntentState::Unknown => {
+            evidence.unknown = evidence.unknown.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.commit_id));
+            "sync_intent_unknown"
         }
-        NamespaceState::Committed(receipt) => {
-            evidence.namespace_committed = evidence.namespace_committed.saturating_add(1);
+        IntentState::Committed => {
+            evidence.committed = evidence.committed.saturating_add(1);
             protected
-                .entry(receipt.cursor.revision)
+                .entry(status.remote_revision)
                 .or_default()
                 .insert("sync_receipt");
-            "sync_namespace_receipt"
+            "sync_intent_receipt"
         }
-        NamespaceState::Conflict => {
-            evidence.namespace_conflict = evidence.namespace_conflict.saturating_add(1);
-            frozen_commits.insert(commit_hex(status.intent.commit_id));
-            "sync_namespace_conflict"
+        IntentState::Conflict => {
+            evidence.conflict = evidence.conflict.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.commit_id));
+            "sync_intent_conflict"
         }
-        NamespaceState::Retryable => {
-            evidence.namespace_retryable = evidence.namespace_retryable.saturating_add(1);
-            frozen_commits.insert(commit_hex(status.intent.commit_id));
-            "sync_namespace_retryable"
+        IntentState::Retryable => {
+            evidence.retryable = evidence.retryable.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.commit_id));
+            "sync_intent_retryable"
         }
-        NamespaceState::Failed => {
-            evidence.namespace_failed = evidence.namespace_failed.saturating_add(1);
-            frozen_commits.insert(commit_hex(status.intent.commit_id));
-            "sync_namespace_failed"
+        IntentState::Failed => {
+            evidence.failed = evidence.failed.saturating_add(1);
+            frozen_commits.insert(commit_hex(status.commit_id));
+            "sync_intent_failed"
         }
     };
-    protected
-        .entry(status.intent.baseline)
-        .or_default()
-        .insert(reason);
-    if let Some(commit) = status.failure.and_then(|failure| failure.commit_id()) {
-        commit_ids.insert(commit_hex(commit));
-        frozen_commits.insert(commit_hex(commit));
-    }
+    protected.entry(status.baseline).or_default().insert(reason);
 }
 
 fn merge_protected(
@@ -1590,7 +1570,7 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
             databases: Vec::new(),
             handles: StagingHandles::default(),
             sync: SyncEvidence::missing(),
-            replica: ReplicaEvidence::missing(),
+            engine: EngineEvidence::missing(),
             protected_revisions: Vec::new(),
             frozen_commits: Vec::new(),
             errors,
@@ -1723,7 +1703,7 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
         databases,
         handles,
         sync: SyncEvidence::missing(),
-        replica: ReplicaEvidence::missing(),
+        engine: EngineEvidence::missing(),
         protected_revisions,
         frozen_commits: frozen_commits.into_iter().collect(),
         errors,
@@ -2221,7 +2201,7 @@ async fn inspect_receipts(
                     state: MeasurementState::Unavailable,
                     records: None,
                     revisions: None,
-                    treatment: "receipt records remain namespace evidence; they are not a deletion authorization",
+                    treatment: "receipt records remain revision evidence; they are not a deletion authorization",
                     error: Some(error.to_string()),
                 };
             }
@@ -2231,7 +2211,7 @@ async fn inspect_receipts(
         state: MeasurementState::Available,
         records: Some(records),
         revisions: Some(revisions.len() as u64),
-        treatment: "receipt records remain namespace evidence; they are not a deletion authorization",
+        treatment: "receipt records remain revision evidence; they are not a deletion authorization",
         error: None,
     }
 }
@@ -2334,6 +2314,30 @@ fn identity_hex(identity: NodeId) -> String {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn parse_node_id_hex(value: &str) -> Option<NodeId> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(NodeId::from_bytes(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_revision_hex(value: &str) -> Option<Revision> {
+    if value.len() != 48 {
+        return None;
+    }
+    let mut bytes = [0_u8; 24];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(Revision::from_bytes(bytes))
+}
+
 fn commit_hex(commit: yinyang_core::CommitId) -> String {
     bytes_hex(commit.as_bytes())
 }
@@ -2367,7 +2371,7 @@ fn retention_limits() -> Vec<String> {
         "A selected revision is a declarative protection request, not evidence that any physical object is unreachable or safe to delete.",
         "External readers, untracked revision pins, other staging directories, and undisclosed backup packages must be supplied as explicit requested pins; supplied backup packages are validated read-only.",
         "Noncurrent backend versions and shared pack extents remain unknown; no reclaimable-byte estimate is produced.",
-        "Receipt records are namespace evidence, not a physical cleanup authorization.",
+        "Receipt records are revision evidence, not a physical cleanup authorization.",
         "Quiescence is not observed; planning does not stop writers, readers, mounts, Sync processes, or backup activity.",
         "Published history and receipts are retained by default; keep-last changes only the declarative selection, never removes or hides retained revisions, and outside_bounded_policy revisions remain readable.",
         "Keep and keep-last apply only to this invocation; they are not persistent pins.",

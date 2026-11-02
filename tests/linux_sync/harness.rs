@@ -228,18 +228,15 @@ impl SyncStatus {
             let matches = self
                 .entries
                 .iter()
-                .filter(|entry| {
-                    entry
-                        .conflict
-                        .as_ref()
-                        .is_some_and(|nested| nested.id == conflict.id)
-                })
+                .filter(|entry| entry.conflict.as_deref() == Some(conflict.id.as_str()))
                 .collect::<Vec<_>>();
             assert_eq!(
                 matches.len(),
                 1,
-                "conflict {} must reference exactly one entry",
-                conflict.id
+                "conflict {} must reference exactly one entry; conflicts={:#?} entries={:#?}",
+                conflict.id,
+                self.conflicts,
+                self.entries
             );
             let entry = matches[0];
             assert_eq!(
@@ -248,11 +245,6 @@ impl SyncStatus {
                 "conflict {} entry must have state conflict",
                 conflict.id
             );
-            let nested = entry
-                .conflict
-                .as_ref()
-                .unwrap_or_else(|| panic!("conflict {} has no nested evidence", conflict.id));
-            assert_eq!(nested.id, conflict.id);
             assert_eq!(entry.original_path, conflict.original_path);
             assert_eq!(entry.desired_path, conflict.desired_path);
             match &conflict.original_path {
@@ -285,6 +277,7 @@ pub struct BindingStatus {
     pub state: BindingState,
     pub state_directory: String,
     pub root: Option<String>,
+    pub namespace: Option<String>,
     pub filesystem: Option<String>,
     pub same_filesystem: Option<bool>,
 }
@@ -300,6 +293,7 @@ pub enum BindingState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct RemoteStatus {
     pub availability: RemoteAvailability,
+    pub cursor: Option<String>,
     pub revision: Option<String>,
     pub error: Option<String>,
 }
@@ -349,7 +343,7 @@ pub struct SyncEntry {
     pub baseline: BaselineEvidence,
     pub intent: IntentStatus,
     pub outcome: OutcomeStatus,
-    pub conflict: Option<EntryConflict>,
+    pub conflict: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -379,6 +373,8 @@ pub struct RemoteEvidence {
     pub digest: Option<String>,
     pub executable: Option<bool>,
     pub presence: Presence,
+    pub identity: Option<String>,
+    pub pin: Option<String>,
     pub node: Option<String>,
     pub revision: Option<String>,
 }
@@ -400,6 +396,10 @@ pub enum Presence {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct BaselineEvidence {
+    pub local_digest: Option<String>,
+    pub local_length: Option<u64>,
+    pub remote_identity: Option<String>,
+    pub remote_pin: Option<String>,
     pub node: Option<String>,
     pub revision: Option<String>,
 }
@@ -414,13 +414,18 @@ pub struct IntentStatus {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
 pub enum IntentOperation {
+    #[serde(rename = "content")]
     Content,
+    #[serde(rename = "create-file")]
     CreateFile,
+    #[serde(rename = "create-directory")]
     CreateDirectory,
+    #[serde(rename = "remove")]
     Remove,
+    #[serde(rename = "rename")]
     Rename,
+    #[serde(rename = "set-executable")]
     SetExecutable,
 }
 
@@ -451,16 +456,6 @@ pub enum OutcomeState {
     Retryable,
     Failed,
     None,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct EntryConflict {
-    pub id: String,
-    pub local: ConflictSide,
-    pub remote: ConflictSide,
-    pub local_artifact: Option<String>,
-    pub remote_artifact: Option<String>,
-    pub remote_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -499,13 +494,23 @@ pub struct ArtifactRecord {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
+    #[serde(rename = "replaced-file")]
     ReplacedFile,
+    #[serde(rename = "rollback-displaced")]
     RollbackDisplaced,
+    #[serde(rename = "quarantined-file")]
     QuarantinedFile,
+    #[serde(rename = "quarantined-directory")]
     QuarantinedDirectory,
+    #[serde(rename = "upload-retained")]
     UploadRetained,
+    #[serde(rename = "conflict-local")]
+    ConflictLocal,
+    #[serde(rename = "conflict-remote")]
+    ConflictRemote,
+    #[serde(rename = "resolution")]
+    Resolution,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

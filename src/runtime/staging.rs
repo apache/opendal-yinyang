@@ -956,9 +956,6 @@ impl Stage {
     pub async fn truncate(&self, id: [u8; 16], length: u64) -> Result<()> {
         self.resize(id, length, false).await
     }
-    pub async fn reset_content(&self, id: [u8; 16]) -> Result<()> {
-        self.resize(id, 0, true).await
-    }
     async fn resize(&self, id: [u8; 16], length: u64, replacement: bool) -> Result<()> {
         self.call(move |c| {
             if length > i64::MAX as u64 {
@@ -1221,7 +1218,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!temp.path().join("runtime.lock").exists());
         let files = names(temp.path());
-        eprintln!("unknown-profile read-only rejection files: {:?}", files);
         assert!(
             files.iter().all(|name| matches!(
                 name.as_str(),

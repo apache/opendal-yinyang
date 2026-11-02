@@ -21,7 +21,18 @@ use yinyang_core::CommitId;
 
 /// Classify errors without parsing diagnostic text. This is not an errno or
 /// platform status: adapters still choose their operation-specific mapping.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    BorshSerialize,
+    BorshDeserialize,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     Invalid,
     InvalidName,

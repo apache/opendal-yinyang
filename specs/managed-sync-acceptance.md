@@ -58,7 +58,7 @@ cross-field invariants:
 - `summary.conflicts` equals `conflicts.length`.
 - `summary.retained_artifacts` equals `artifacts.length`.
 - `summary.retained_bytes` equals the sum of the retained artifact payload
-  lengths reported by the replica.
+  lengths reported by the shared Sync engine.
 - `summary.in_sync` requires an available remote and zero pending, unknown,
   conflict and failed counts.
 - Every top-level conflict references an entry with the same conflict ID.
@@ -103,7 +103,7 @@ the conflict explicitly, and verifies the resulting remote revision. It does
 not require a watcher or claim uninterrupted `in_sync` while the only local
 change exists in an artifact.
 
-The lifecycle test closes and reopens the reader replica before the settle run.
+The lifecycle test closes and reopens the reader engine before the settle run.
 The durable `artifacts.settle_pending` marker must release the unchanged
 displaced inode in that new process. After the racy-clean window, one run may
 refresh evidence for the most recently changed file; a following no-op must

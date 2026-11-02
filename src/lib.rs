@@ -28,18 +28,17 @@
 #[doc(hidden)]
 pub mod benchmark;
 pub mod direct;
-#[cfg(target_os = "linux")]
-pub mod direct_sync;
 mod directory;
 #[cfg(target_os = "linux")]
 pub mod fuse;
+mod intent;
 mod local;
 pub mod mount;
-#[cfg(target_os = "linux")]
-pub mod replica;
 pub mod runtime;
 pub mod space;
 pub mod sync;
+#[cfg(target_os = "linux")]
+pub mod sync_engine;
 pub mod volume;
 
 pub use directory::{

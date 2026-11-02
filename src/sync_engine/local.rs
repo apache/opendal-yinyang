@@ -15,22 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! fd-relative local storage for Direct Sync.
+//! fd-relative local storage shared by Managed and Direct Sync.
 
-use super::state::{
-    ArtifactKind, ArtifactPhase, ArtifactRecord, DesiredFile, InstallOperation, InstallRecord,
-    InstallState, LocalFingerprint, Store,
+use super::adapter::{RemoteEntry, SyncModel};
+use super::store::{
+    ArtifactKind, ArtifactPhase, ArtifactRecord, ArtifactRelease, Binding, InstallOperation,
+    InstallRecord, InstallState, LocalFingerprint, Store,
 };
-use crate::replica::{
-    ContentHash, Error, ErrorKind, Identity, LocalNode, LocalSnapshot, Result, scan_path,
+use super::types::{
+    ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, open_bound_directory,
+    same_stable_stat, scan_path_with_hints_counted, split_path, validate_path,
 };
+use super::{Error, ErrorKind, Result};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
     AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, flock, fstat, fsync,
-    mkdirat, open, openat, renameat_with, statat, unlinkat,
+    mkdirat, openat, renameat_with, statat, unlinkat,
 };
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub const ARTIFACT_BUDGET_COUNT: usize = 64;
+pub const ARTIFACT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) struct LocalTree {
     root: PathBuf,
@@ -41,76 +49,97 @@ pub(super) struct LocalTree {
     install_fd: OwnedFd,
     artifact_fd: OwnedFd,
     _lease: std::fs::File,
+    store: Store,
+    hash_bytes_read: AtomicU64,
 }
 
 pub(super) struct ExistingBinding {
     pub root: PathBuf,
-    pub root_identity: Identity,
-    pub state_identity: Identity,
-}
-
-struct ExistingPaths {
-    root: PathBuf,
-    state: PathBuf,
-    root_fd: OwnedFd,
-    state_fd: OwnedFd,
-    root_identity: Identity,
-    state_identity: Identity,
-}
-
-fn open_existing_paths(root: &Path, state: &Path) -> Result<ExistingPaths> {
-    let root = std::fs::canonicalize(root)
-        .map_err(|error| Error::io("canonicalize Direct Sync root", root, error))?;
-    let state = std::fs::canonicalize(state)
-        .map_err(|error| Error::io("canonicalize Direct Sync state", state, error))?;
-    validate_private_state(&state)?;
-    crate::replica::check_root_state(&root, &state)?;
-    let root_fd = open(
-        &root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| Error::errno("open Direct Sync root", &root, error))?;
-    let state_fd = open(
-        &state,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| Error::errno("open Direct Sync state", &state, error))?;
-    let root_identity = identity(&root_fd, &root, "inspect Direct Sync root")?;
-    let state_identity = identity(&state_fd, &state, "inspect Direct Sync state")?;
-    if root_identity.dev != state_identity.dev {
-        return Err(Error::unsupported(
-            "Direct Sync root and state must share a filesystem for atomic local installs",
-        ));
-    }
-    Ok(ExistingPaths {
-        root,
-        state,
-        root_fd,
-        state_fd,
-        root_identity,
-        state_identity,
-    })
 }
 
 impl LocalTree {
-    pub fn create(root: &Path, state: &Path) -> Result<Self> {
-        prepare_directory(root, "create Direct Sync root")?;
-        prepare_private_directory(state, "create Direct Sync state")?;
-        Self::open(root, state)
-    }
-
-    pub fn open(root: &Path, state: &Path) -> Result<Self> {
-        let ExistingPaths {
+    pub fn create(
+        root: &Path,
+        state: &Path,
+        model: SyncModel,
+        namespace: impl Into<String>,
+    ) -> Result<Self> {
+        prepare_directory(root, "create sync root")?;
+        prepare_private_directory(state, "create sync state")?;
+        let root = std::fs::canonicalize(root)
+            .map_err(|error| Error::io("canonicalize sync root", root, error))?;
+        let state = std::fs::canonicalize(state)
+            .map_err(|error| Error::io("canonicalize sync state", state, error))?;
+        check_root_state(&root, &state)?;
+        let (root_fd, root_identity) = open_bound_directory(&root, "open sync root")?;
+        let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
+        if root_identity.dev != state_identity.dev {
+            return Err(Error::unsupported(
+                "sync root and state must share a filesystem for atomic local installs",
+            ));
+        }
+        let lease = acquire_lease(&state_fd, &state)?;
+        let namespace = namespace.into();
+        let binding = Binding {
+            model,
+            namespace_digest: namespace_digest(&namespace),
+            namespace,
+            root: root.clone(),
+            root_identity,
+            state_identity,
+        };
+        let store = Store::create(&state.join("sync-engine.db"), &binding)?;
+        let install_fd = open_private_directory(&state_fd, "install", &state)?;
+        let artifact_fd = open_private_directory(&state_fd, "artifacts", &state)?;
+        Ok(Self {
             root,
             state,
             root_fd,
-            state_fd,
             root_identity,
             state_identity,
-        } = open_existing_paths(root, state)?;
+            install_fd,
+            artifact_fd,
+            _lease: lease,
+            store,
+            hash_bytes_read: AtomicU64::new(0),
+        })
+    }
+
+    pub fn open(state: &Path, model: SyncModel, namespace: impl Into<String>) -> Result<Self> {
+        let state = std::fs::canonicalize(state)
+            .map_err(|error| Error::io("canonicalize sync state", state, error))?;
+        let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
         let _lease = acquire_lease(&state_fd, &state)?;
+        let store = Store::open(&state.join("sync-engine.db"))?;
+        let binding = store.binding()?;
+        let namespace = namespace.into();
+        if binding.namespace_digest != namespace_digest(&namespace)
+            || binding.model != model
+            || binding.namespace != namespace
+        {
+            return Err(Error::invalid(format!(
+                "sync state is bound to {:?} namespace {:?}, not {:?} namespace {:?}",
+                binding.model, binding.namespace, model, namespace
+            )));
+        }
+        if binding.state_identity != state_identity {
+            return Err(Error::invalid(
+                "sync state identity changed since initialization",
+            ));
+        }
+        let root = binding.root.clone();
+        check_root_state(&root, &state)?;
+        let (root_fd, root_identity) = open_bound_directory(&root, "open bound sync root")?;
+        if root_identity != binding.root_identity {
+            return Err(Error::invalid(
+                "sync root identity changed since initialization",
+            ));
+        }
+        if root_identity.dev != state_identity.dev {
+            return Err(Error::unsupported(
+                "sync root and state no longer share a filesystem",
+            ));
+        }
         let install_fd = open_private_directory(&state_fd, "install", &state)?;
         let artifact_fd = open_private_directory(&state_fd, "artifacts", &state)?;
         Ok(Self {
@@ -122,18 +151,33 @@ impl LocalTree {
             install_fd,
             artifact_fd,
             _lease,
+            store,
+            hash_bytes_read: AtomicU64::new(0),
         })
     }
 
     /// Validate an existing root and state without acquiring the writer lease
     /// or creating any state subdirectories.
-    pub fn inspect_binding(root: &Path, state: &Path) -> Result<ExistingBinding> {
-        let paths = open_existing_paths(root, state)?;
-        Ok(ExistingBinding {
-            root: paths.root,
-            root_identity: paths.root_identity,
-            state_identity: paths.state_identity,
-        })
+    pub fn inspect(state: &Path) -> Result<(Store, Binding, ExistingBinding)> {
+        let state = std::fs::canonicalize(state)
+            .map_err(|error| Error::io("canonicalize sync state", state, error))?;
+        let (_state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
+        let store = Store::open_read_only(&state.join("sync-engine.db"))?;
+        let binding = store.binding()?;
+        if binding.state_identity != state_identity {
+            return Err(Error::invalid(
+                "sync state identity changed since initialization",
+            ));
+        }
+        let root = binding.root.clone();
+        check_root_state(&root, &state)?;
+        let (_root_fd, root_identity) = open_bound_directory(&root, "open bound sync root")?;
+        if root_identity != binding.root_identity {
+            return Err(Error::invalid(
+                "sync root identity changed since initialization",
+            ));
+        }
+        Ok((store, binding.clone(), ExistingBinding { root }))
     }
 
     pub fn root(&self) -> &Path {
@@ -144,17 +188,24 @@ impl LocalTree {
         &self.state
     }
 
-    pub fn root_identity(&self) -> Identity {
-        self.root_identity
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
-    pub fn state_identity(&self) -> Identity {
-        self.state_identity
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
     }
 
-    /// Scan through the existing fd-relative ordinary-directory scanner.
+    pub fn binding(&self) -> Result<Binding> {
+        self.store.binding()
+    }
+
+    /// Scan through the shared fd-relative scanner with persisted stat evidence.
     pub fn scan(&self) -> Result<LocalSnapshot> {
-        let snapshot = scan_path(&self.root)?;
+        let hints = self.scan_hints()?;
+        self.hash_bytes_read.store(0, Ordering::Relaxed);
+        let snapshot =
+            scan_path_with_hints_counted(&self.root, &hints, Some(&self.hash_bytes_read))?;
         let root = snapshot
             .get("")
             .ok_or_else(|| Error::corrupt("local scan omitted the synchronized root"))?;
@@ -163,11 +214,36 @@ impl LocalTree {
                 "Direct Sync root identity changed since the writer opened it",
             ));
         }
+        let updates = snapshot
+            .nodes()
+            .values()
+            .filter(|node| {
+                !hints
+                    .get(&node.path)
+                    .is_some_and(|hint| fingerprint_matches_node(hint, node))
+            })
+            .collect::<Vec<_>>();
+        self.store.save_scan_evidence(&updates)?;
         Ok(snapshot)
     }
 
-    pub fn scan_read_only(root: &Path) -> Result<LocalSnapshot> {
-        scan_path(root)
+    pub fn scan_read_only(
+        root: &Path,
+        hints: &BTreeMap<String, LocalFingerprint>,
+    ) -> Result<LocalSnapshot> {
+        scan_path_with_hints_counted(root, hints, None)
+    }
+
+    pub fn hash_bytes_read(&self) -> u64 {
+        self.hash_bytes_read.load(Ordering::Relaxed)
+    }
+
+    pub fn scan_hints(&self) -> Result<BTreeMap<String, LocalFingerprint>> {
+        Ok(self
+            .store
+            .baseline()?
+            .map(|baseline| baseline.local)
+            .unwrap_or_default())
     }
 
     pub fn artifact_path(&self, artifact: &ArtifactRecord) -> PathBuf {
@@ -178,17 +254,31 @@ impl LocalTree {
         self.state.join("install").join(temporary)
     }
 
-    pub fn install_desired_file(&self, temporary: &str) -> Result<DesiredFile> {
-        let (length, digest, _) =
-            hash_at(&self.install_fd, temporary, &self.install_path(temporary))?;
-        Ok(DesiredFile {
-            length,
-            digest: *digest.as_bytes(),
+    pub fn install_desired_file(&self, temporary: &str) -> Result<LocalFingerprint> {
+        let path = self.install_path(temporary);
+        let stat = statat(&self.install_fd, temporary, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| Error::errno("inspect sync download", &path, error))?;
+        let (length, digest, identity) = hash_at(&self.install_fd, temporary, &path)?;
+        let file_stat = fstat(
+            &openat(
+                &self.install_fd,
+                temporary,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| Error::errno("open sync download", &path, error))?,
+        )
+        .map_err(|error| Error::errno("inspect sync download", &path, error))?;
+        let executable =
+            Mode::from_raw_mode(file_stat.st_mode).intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
+        LocalFingerprint::from_node(&LocalNode {
+            path: String::new(),
+            kind: LocalKind::File { length, digest },
+            executable,
+            identity,
+            parent: Some(self.state_identity),
+            stat: Some(super::types::LocalStat::from_stat(&stat)),
         })
-    }
-
-    pub fn prune_parents_of(&self, path: &str) -> Result<()> {
-        self.prune_empty_ancestors(path)
     }
 
     pub fn create_install_file(&self, prefix: &str) -> Result<(String, PathBuf, std::fs::File)> {
@@ -242,14 +332,30 @@ impl LocalTree {
         fsync(&self.artifact_fd).map_err(|error| {
             Error::errno("persist Direct Sync artifact directory", &self.state, error)
         })?;
+        let stat = optional_stat(
+            &self.artifact_fd,
+            &name,
+            &self.state.join("artifacts").join(&name),
+        )?;
         Ok(ArtifactRecord {
             id,
             origin: origin.to_owned(),
+            release_event: kind.release_event(),
             kind,
-            digest: *digest.as_bytes(),
+            digest: Some(*digest.as_bytes()),
             length,
             phase: ArtifactPhase::Retained,
             name,
+            remote_revision: None,
+            stat: stat.map(|stat| super::store::ArtifactStat {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                mtime: stat.st_mtime,
+                mtime_nsec: stat.st_mtime_nsec as i64,
+                ctime: stat.st_ctime,
+                ctime_nsec: stat.st_ctime_nsec as i64,
+            }),
+            settle_pending: false,
             error: None,
         })
     }
@@ -263,6 +369,7 @@ impl LocalTree {
             ino,
             parent_dev,
             parent_ino,
+            ..
         } = LocalFingerprint::from_node(node)?;
         let (parent, name) = split_path(&node.path)?;
         let parent_fd = self.open_relative_dir(parent)?;
@@ -349,6 +456,8 @@ impl LocalTree {
             Error::io("persist Direct Sync upload artifact", &self.state, error)
         })?;
         let (length, digest) = hasher.finish();
+        let retained = fstat(&output)
+            .map_err(|error| Error::errno("inspect sync upload artifact", &self.state, error))?;
         drop(output);
         fsync(&self.artifact_fd).map_err(|error| {
             Error::errno("persist Direct Sync artifact directory", &self.state, error)
@@ -361,13 +470,68 @@ impl LocalTree {
         Ok(ArtifactRecord {
             id,
             origin: node.path.clone(),
+            release_event: kind.release_event(),
             kind,
-            digest: *digest.as_bytes(),
+            digest: Some(*digest.as_bytes()),
             length,
             phase: ArtifactPhase::Retained,
             name: artifact_name,
+            remote_revision: None,
+            stat: Some(super::store::ArtifactStat {
+                dev: retained.st_dev,
+                ino: retained.st_ino,
+                mtime: retained.st_mtime,
+                mtime_nsec: retained.st_mtime_nsec as i64,
+                ctime: retained.st_ctime,
+                ctime_nsec: retained.st_ctime_nsec as i64,
+            }),
+            settle_pending: false,
             error: None,
         })
+    }
+
+    pub fn retain_bytes(&self, origin: &str, bytes: &[u8]) -> Result<ArtifactRecord> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = format!("resolution-{id}");
+        let fd = openat(
+            &self.artifact_fd,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| Error::errno("create resolution artifact", &self.state, error))?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(bytes)
+            .map_err(|error| Error::io("write resolution artifact", &self.state, error))?;
+        file.sync_all()
+            .map_err(|error| Error::io("persist resolution artifact", &self.state, error))?;
+        let stat = fstat(&file)
+            .map_err(|error| Error::errno("inspect resolution artifact", &self.state, error))?;
+        fsync(&self.artifact_fd)
+            .map_err(|error| Error::errno("persist resolution directory", &self.state, error))?;
+        let artifact = ArtifactRecord {
+            id,
+            origin: origin.to_owned(),
+            name,
+            kind: ArtifactKind::Resolution,
+            phase: ArtifactPhase::Retained,
+            release_event: ArtifactKind::Resolution.release_event(),
+            remote_revision: None,
+            digest: Some(*blake3::hash(bytes).as_bytes()),
+            length: bytes.len() as u64,
+            stat: Some(super::store::ArtifactStat {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                mtime: stat.st_mtime,
+                mtime_nsec: stat.st_mtime_nsec as i64,
+                ctime: stat.st_ctime,
+                ctime_nsec: stat.st_ctime_nsec as i64,
+            }),
+            settle_pending: false,
+            error: None,
+        };
+        self.store.insert_artifact(&artifact)?;
+        Ok(artifact)
     }
 
     pub fn open_artifact(&self, name: &str) -> Result<std::fs::File> {
@@ -382,14 +546,17 @@ impl LocalTree {
     }
 
     pub fn verify_artifact(&self, artifact: &ArtifactRecord) -> Result<()> {
+        if self.artifact_matches_record(artifact)? {
+            return Ok(());
+        }
         let (length, digest, _) = hash_at(
             &self.artifact_fd,
             &artifact.name,
-            &self.state.join("artifacts").join(&artifact.name),
+            &self.artifact_path(artifact),
         )?;
-        if length != artifact.length || digest.as_bytes() != &artifact.digest {
+        if length != artifact.length || artifact.digest != Some(*digest.as_bytes()) {
             return Err(Error::corrupt(format!(
-                "retained Direct Sync artifact {} no longer matches its recorded bytes",
+                "retained sync artifact {} no longer matches its recorded bytes",
                 artifact.id
             )));
         }
@@ -397,6 +564,9 @@ impl LocalTree {
     }
 
     pub fn release_artifact(&self, artifact: &ArtifactRecord) -> Result<bool> {
+        if self.artifact_referenced(artifact)? {
+            return Ok(false);
+        }
         let Some(stat) = optional_stat(
             &self.artifact_fd,
             &artifact.name,
@@ -405,20 +575,122 @@ impl LocalTree {
         else {
             return Ok(true);
         };
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Ok(false);
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => {
+                unlinkat(&self.artifact_fd, artifact.name.as_str(), AtFlags::empty()).map_err(
+                    |error| {
+                        Error::errno(
+                            "release sync artifact",
+                            &self.artifact_path(artifact),
+                            error,
+                        )
+                    },
+                )?;
+            }
+            FileType::Directory => {
+                remove_artifact_directory(
+                    &self.artifact_fd,
+                    &artifact.name,
+                    &self.artifact_path(artifact),
+                )?;
+                unlinkat(
+                    &self.artifact_fd,
+                    artifact.name.as_str(),
+                    AtFlags::REMOVEDIR,
+                )
+                .map_err(|error| {
+                    Error::errno(
+                        "release sync directory artifact",
+                        &self.artifact_path(artifact),
+                        error,
+                    )
+                })?;
+            }
+            _ => return Ok(false),
         }
-        unlinkat(&self.artifact_fd, artifact.name.as_str(), AtFlags::empty()).map_err(|error| {
-            Error::errno(
-                "release Direct Sync artifact",
-                &self.artifact_path(artifact),
-                error,
-            )
-        })?;
         fsync(&self.artifact_fd).map_err(|error| {
             Error::errno("persist Direct Sync artifact release", &self.state, error)
         })?;
         Ok(true)
+    }
+
+    fn artifact_referenced(&self, artifact: &ArtifactRecord) -> Result<bool> {
+        if self.store.conflicts()?.iter().any(|conflict| {
+            conflict.local_artifact.as_deref() == Some(artifact.id.as_str())
+                || conflict.remote_artifact.as_deref() == Some(artifact.id.as_str())
+        }) {
+            return Ok(true);
+        }
+        if self
+            .store
+            .work()?
+            .iter()
+            .any(|work| work.source_artifact.as_deref() == Some(artifact.id.as_str()))
+        {
+            return Ok(true);
+        }
+        if self
+            .store
+            .installs()?
+            .iter()
+            .any(|install| install.artifact.as_deref() == Some(artifact.id.as_str()))
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn settle_fresh_artifacts(&mut self) -> Result<()> {
+        let pending = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .filter(|artifact| artifact.settle_pending)
+            .collect::<Vec<_>>();
+        for mut artifact in pending {
+            if artifact.phase == ArtifactPhase::Conflict {
+                continue;
+            }
+            if self.artifact_matches_record(&artifact)? {
+                if self.release_artifact(&artifact)? {
+                    self.store.remove_artifact(&artifact.id)?;
+                }
+            } else {
+                artifact.phase = ArtifactPhase::Conflict;
+                artifact.settle_pending = false;
+                artifact.error =
+                    Some("retained artifact changed after its reconciliation".to_owned());
+                self.store.update_artifact(&artifact)?;
+            }
+        }
+        self.prune_artifacts()
+    }
+
+    pub fn prune_artifacts(&mut self) -> Result<()> {
+        let artifacts = self.store.artifacts()?;
+        let mut count = artifacts
+            .iter()
+            .filter(|artifact| artifact.phase != ArtifactPhase::Conflict)
+            .count();
+        let mut bytes = artifacts
+            .iter()
+            .filter(|artifact| artifact.phase != ArtifactPhase::Conflict)
+            .map(|artifact| artifact.length)
+            .sum::<u64>();
+        for artifact in artifacts {
+            if count <= ARTIFACT_BUDGET_COUNT && bytes <= ARTIFACT_BUDGET_BYTES {
+                break;
+            }
+            if artifact.phase == ArtifactPhase::Conflict || self.artifact_referenced(&artifact)? {
+                continue;
+            }
+            if self.release_artifact(&artifact)? {
+                self.store.remove_artifact(&artifact.id)?;
+                count = count.saturating_sub(1);
+                bytes = bytes.saturating_sub(artifact.length);
+            }
+        }
+        Ok(())
     }
 
     pub fn open_live_file(&self, path: &str) -> Result<std::fs::File> {
@@ -441,8 +713,223 @@ impl LocalTree {
         Ok(std::fs::File::from(fd))
     }
 
-    pub fn recover_installs(&self, store: &mut Store) -> Result<()> {
-        for mut install in store.installs()? {
+    pub fn open_local_file(&self, path: &str) -> Result<std::fs::File> {
+        self.open_live_file(path)
+    }
+
+    pub fn create_directory_local(&self, path: &str) -> Result<()> {
+        validate_path(path)?;
+        if path.is_empty() {
+            return Err(Error::invalid("the synchronized root already exists"));
+        }
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        match mkdirat(&parent_fd, name, Mode::RWXU) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::EXIST) => {
+                return Err(Error::conflict(format!(
+                    "local directory already exists: {path}"
+                )));
+            }
+            Err(error) => {
+                return Err(Error::errno(
+                    "create local directory",
+                    &self.root.join(path),
+                    error,
+                ));
+            }
+        }
+        fsync(&parent_fd).map_err(|error| {
+            Error::errno("persist local directory", &self.root.join(parent), error)
+        })
+    }
+
+    pub fn rename_local(&self, source: &str, destination: &str) -> Result<()> {
+        validate_path(source)?;
+        validate_path(destination)?;
+        let (source_parent, source_name) = split_path(source)?;
+        let (destination_parent, destination_name) = split_path(destination)?;
+        let source_fd = self.open_relative_dir(source_parent)?;
+        let destination_fd = self.open_relative_dir(destination_parent)?;
+        renameat_with(
+            &source_fd,
+            source_name,
+            &destination_fd,
+            destination_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            Error::errno(
+                "rename local entry without replacement",
+                &self.root.join(source),
+                error,
+            )
+        })?;
+        fsync(&source_fd).map_err(|error| {
+            Error::errno(
+                "persist local rename",
+                &self.root.join(source_parent),
+                error,
+            )
+        })?;
+        fsync(&destination_fd).map_err(|error| {
+            Error::errno(
+                "persist local rename destination",
+                &self.root.join(destination_parent),
+                error,
+            )
+        })
+    }
+
+    pub fn quarantine(
+        &self,
+        path: &str,
+        expected: &LocalSnapshot,
+        reason: &str,
+        remote_revision: Option<[u8; 24]>,
+    ) -> Result<ArtifactRecord> {
+        if path.is_empty() {
+            return Err(Error::invalid(
+                "the synchronized root cannot be quarantined",
+            ));
+        }
+        validate_path(path)?;
+        let expected_node = expected
+            .get(path)
+            .ok_or_else(|| Error::invalid("quarantine target is absent from the observation"))?;
+        let (parent, name) = split_path(path)?;
+        let parent_fd = self.open_relative_dir(parent)?;
+        let parent_identity = identity(
+            &parent_fd,
+            &self.root.join(parent),
+            "inspect quarantine parent",
+        )?;
+        if let Some(expected_parent) = expected_node.parent
+            && parent_identity != expected_parent
+        {
+            return Err(Error::conflict("quarantine parent identity changed"));
+        }
+        let current = optional_stat(&parent_fd, name, &self.root.join(path))?
+            .ok_or_else(|| Error::conflict("quarantine target disappeared"))?;
+        let kind = match (FileType::from_raw_mode(current.st_mode), expected_node.kind) {
+            (FileType::RegularFile, LocalKind::File { .. }) => ArtifactKind::QuarantinedFile,
+            (FileType::Directory, LocalKind::Directory) => ArtifactKind::QuarantinedDirectory,
+            (FileType::Symlink, _) => {
+                return Err(Error::conflict(
+                    "quarantine target became a symlink; it was not followed",
+                ));
+            }
+            _ => return Err(Error::conflict("quarantine target changed kind")),
+        };
+        if current.st_dev != expected_node.identity.dev
+            || current.st_ino != expected_node.identity.ino
+        {
+            return Err(Error::conflict(
+                "quarantine target identity changed after observation",
+            ));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = format!("quarantine-{id}");
+        let mut artifact = ArtifactRecord {
+            id,
+            origin: path.to_owned(),
+            name: name.clone(),
+            kind,
+            phase: ArtifactPhase::Prepared,
+            release_event: kind.release_event(),
+            remote_revision,
+            digest: match expected_node.kind {
+                LocalKind::File { digest, .. } => Some(*digest.as_bytes()),
+                LocalKind::Directory => None,
+            },
+            length: expected
+                .subtree(path)
+                .values()
+                .map(|node| match node.kind {
+                    LocalKind::File { length, .. } => length,
+                    LocalKind::Directory => 0,
+                })
+                .sum(),
+            stat: None,
+            settle_pending: false,
+            error: Some(reason.to_owned()),
+        };
+        self.store.insert_artifact(&artifact)?;
+        if let Err(error) = renameat_with(
+            &parent_fd,
+            path.rsplit_once('/').map_or(path, |(_, name)| name),
+            &self.artifact_fd,
+            artifact.name.as_str(),
+            RenameFlags::NOREPLACE,
+        ) {
+            self.store.remove_artifact(&artifact.id)?;
+            return Err(Error::errno(
+                "quarantine local path",
+                &self.root.join(path),
+                error,
+            ));
+        }
+        fsync(&parent_fd).map_err(|error| {
+            Error::errno("persist quarantine source directory", &self.root, error)
+        })?;
+        fsync(&self.artifact_fd)
+            .map_err(|error| Error::errno("persist quarantine directory", &self.state, error))?;
+        artifact.phase = ArtifactPhase::Retained;
+        if let Some(stat) = optional_stat(
+            &self.artifact_fd,
+            &artifact.name,
+            &self.artifact_path(&artifact),
+        )? {
+            artifact.stat = Some(super::store::ArtifactStat {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                mtime: stat.st_mtime,
+                mtime_nsec: stat.st_mtime_nsec as i64,
+                ctime: stat.st_ctime,
+                ctime_nsec: stat.st_ctime_nsec as i64,
+            });
+        }
+        self.store.update_artifact(&artifact)?;
+        Ok(artifact)
+    }
+
+    pub fn artifact_matches_record(&self, artifact: &ArtifactRecord) -> Result<bool> {
+        let Some(stat) = optional_stat(
+            &self.artifact_fd,
+            &artifact.name,
+            &self.artifact_path(artifact),
+        )?
+        else {
+            return Ok(false);
+        };
+        if let Some(recorded) = artifact.stat
+            && recorded.dev == stat.st_dev
+            && recorded.ino == stat.st_ino
+            && recorded.mtime == stat.st_mtime
+            && recorded.mtime_nsec == stat.st_mtime_nsec as i64
+            && recorded.ctime == stat.st_ctime
+            && recorded.ctime_nsec == stat.st_ctime_nsec as i64
+            && (FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || artifact.length == stat.st_size as u64)
+        {
+            return Ok(true);
+        }
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Ok(false);
+        }
+        let Some(expected) = artifact.digest else {
+            return Ok(false);
+        };
+        let (length, digest, _) = hash_at(
+            &self.artifact_fd,
+            &artifact.name,
+            &self.artifact_path(artifact),
+        )?;
+        Ok(length == artifact.length && digest.as_bytes() == &expected)
+    }
+
+    pub fn recover_installs(&mut self) -> Result<()> {
+        for mut install in self.store.installs()? {
             match install.state {
                 InstallState::Prepared => {
                     if install.operation != InstallOperation::Delete
@@ -475,7 +962,7 @@ impl LocalTree {
                                 )
                             })?;
                         }
-                        store.remove_install(&install.id)?;
+                        self.store.remove_install(&install.id)?;
                         continue;
                     }
                     if install.operation != InstallOperation::Delete {
@@ -489,7 +976,7 @@ impl LocalTree {
                                 install.error = Some(format!(
                                     "prepared Direct Sync download is unavailable: {error}"
                                 ));
-                                store.update_install(&install)?;
+                                self.store.update_install(&install)?;
                                 continue;
                             }
                         };
@@ -499,11 +986,11 @@ impl LocalTree {
                                 "prepared Direct Sync download no longer matches its accepted bytes"
                                     .to_owned(),
                             );
-                            store.update_install(&install)?;
+                            self.store.update_install(&install)?;
                             continue;
                         }
                     }
-                    if let Err(error) = self.apply_install(store, &mut install)
+                    if let Err(error) = self.apply_install(&mut install)
                         && error.kind() != ErrorKind::Conflict
                     {
                         return Err(error);
@@ -530,7 +1017,7 @@ impl LocalTree {
                                     "a different local inode was quarantined during delete recovery"
                                         .to_owned(),
                                 );
-                                store.update_install(&install)?;
+                                self.store.update_install(&install)?;
                                 continue;
                             }
                             unlinkat(
@@ -554,35 +1041,43 @@ impl LocalTree {
                             })?;
                             self.prune_empty_ancestors(&install.path)?;
                         }
-                        self.settle_displaced_artifact(store, &install)?;
+                        self.settle_displaced_artifact(&install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
-                        store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
-                        self.release_completed_artifact(store, &install)?;
+                        let baseline_ref = baseline
+                            .as_ref()
+                            .map(|(remote, local, keep_local)| (remote, *local, *keep_local));
+                        self.store
+                            .complete_install(&install.id, baseline_ref, &install.path)?;
+                        self.mark_settled_artifact(&install)?;
                     } else if self.local_matches_expected(&install)? {
                         install.state = InstallState::Prepared;
-                        store.update_install(&install)?;
+                        self.store.update_install(&install)?;
                     } else {
                         install.state = InstallState::Conflict;
                         install.error = Some(
                             "local install outcome is not safely inferable after restart"
                                 .to_owned(),
                         );
-                        store.update_install(&install)?;
+                        self.store.update_install(&install)?;
                     }
                 }
                 InstallState::Applied => {
                     let fingerprint = self.local_fingerprint(&install.path)?;
                     if desired_matches(install.desired_local, Some(fingerprint)) {
-                        self.settle_displaced_artifact(store, &install)?;
+                        self.settle_displaced_artifact(&install)?;
                         let baseline = build_baseline(&install, fingerprint)?;
-                        store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
-                        self.release_completed_artifact(store, &install)?;
+                        let baseline_ref = baseline
+                            .as_ref()
+                            .map(|(remote, local, keep_local)| (remote, *local, *keep_local));
+                        self.store
+                            .complete_install(&install.id, baseline_ref, &install.path)?;
+                        self.mark_settled_artifact(&install)?;
                     } else {
                         install.state = InstallState::Conflict;
                         install.error = Some(
                             "applied local install no longer matches its accepted bytes".to_owned(),
                         );
-                        store.update_install(&install)?;
+                        self.store.update_install(&install)?;
                     }
                 }
                 InstallState::Conflict | InstallState::Failed => {}
@@ -591,12 +1086,10 @@ impl LocalTree {
         Ok(())
     }
 
-    pub fn apply_install(&self, store: &mut Store, install: &mut InstallRecord) -> Result<()> {
+    pub fn apply_install(&mut self, install: &mut InstallRecord) -> Result<()> {
         match install.operation {
-            InstallOperation::Create | InstallOperation::Replace => {
-                self.install_file(store, install)
-            }
-            InstallOperation::Delete => self.delete_file(store, install),
+            InstallOperation::Create | InstallOperation::Replace => self.install_file(install),
+            InstallOperation::Delete => self.delete_file(install),
         }
     }
 
@@ -609,14 +1102,28 @@ impl LocalTree {
             &self.root.join(parent),
             "inspect local file parent",
         )?;
-        let (length, digest, identity) = hash_at(&parent_fd, name, &self.root.join(path))?;
-        Ok(LocalFingerprint {
-            length,
-            digest: *digest.as_bytes(),
-            dev: identity.dev,
-            ino: identity.ino,
-            parent_dev: parent_identity.dev,
-            parent_ino: parent_identity.ino,
+        let target = self.root.join(path);
+        let stat = statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| Error::errno("inspect sync local file", &target, error))?;
+        let (length, digest, identity) = hash_at(&parent_fd, name, &target)?;
+        let file = openat(
+            &parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::errno("open sync local file", &target, error))?;
+        let opened = fstat(&file)
+            .map_err(|error| Error::errno("inspect sync local file", &target, error))?;
+        let executable =
+            Mode::from_raw_mode(opened.st_mode).intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
+        LocalFingerprint::from_node(&LocalNode {
+            path: path.to_owned(),
+            kind: LocalKind::File { length, digest },
+            executable,
+            identity,
+            parent: Some(parent_identity),
+            stat: Some(super::types::LocalStat::from_stat(&stat)),
         })
     }
 
@@ -625,7 +1132,7 @@ impl LocalTree {
         if path.is_empty() {
             return Ok(Some(LocalNode {
                 path: String::new(),
-                kind: crate::replica::LocalKind::Directory,
+                kind: LocalKind::Directory,
                 executable: false,
                 identity: self.root_identity,
                 parent: None,
@@ -659,7 +1166,7 @@ impl LocalTree {
                 })?;
                 Ok(Some(LocalNode {
                     path: path.to_owned(),
-                    kind: crate::replica::LocalKind::Directory,
+                    kind: LocalKind::Directory,
                     executable: false,
                     identity: identity(
                         &fd,
@@ -667,14 +1174,14 @@ impl LocalTree {
                         "inspect Direct Sync local directory",
                     )?,
                     parent: Some(parent_identity),
-                    stat: Some(crate::replica::LocalStat::from_stat(&stat)),
+                    stat: Some(super::types::LocalStat::from_stat(&stat)),
                 }))
             }
             FileType::RegularFile => {
                 let fingerprint = self.local_fingerprint(path)?;
                 Ok(Some(LocalNode {
                     path: path.to_owned(),
-                    kind: crate::replica::LocalKind::File {
+                    kind: LocalKind::File {
                         length: fingerprint.length,
                         digest: ContentHash::from_bytes(fingerprint.digest),
                     },
@@ -685,7 +1192,7 @@ impl LocalTree {
                         dev: fingerprint.parent_dev,
                         ino: fingerprint.parent_ino,
                     }),
-                    stat: Some(crate::replica::LocalStat::from_stat(&stat)),
+                    stat: Some(super::types::LocalStat::from_stat(&stat)),
                 }))
             }
             FileType::Symlink => Err(Error::unsupported(format!(
@@ -697,7 +1204,7 @@ impl LocalTree {
         }
     }
 
-    fn install_file(&self, store: &mut Store, install: &mut InstallRecord) -> Result<()> {
+    fn install_file(&mut self, install: &mut InstallRecord) -> Result<()> {
         let desired = install
             .desired_local
             .ok_or_else(|| Error::corrupt("file install has no desired content"))?;
@@ -714,6 +1221,21 @@ impl LocalTree {
 
         let (parent, name) = split_path(&install.path)?;
         self.ensure_directory(parent)?;
+        let temporary_path = self.install_path(&install.temporary);
+        let temporary = openat(
+            &self.install_fd,
+            install.temporary.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::errno("open sync download", &temporary_path, error))?;
+        let mode = if desired.executable {
+            Mode::RUSR | Mode::WUSR | Mode::XUSR
+        } else {
+            Mode::RUSR | Mode::WUSR
+        };
+        rustix::fs::fchmod(&temporary, mode)
+            .map_err(|error| Error::errno("set sync download mode", &temporary_path, error))?;
         let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(
             &parent_fd,
@@ -729,11 +1251,7 @@ impl LocalTree {
                     || stat.st_dev != expected.dev
                     || stat.st_ino != expected.ino
                 {
-                    return self.install_conflict(
-                        store,
-                        install,
-                        "local target changed before install",
-                    );
+                    return self.install_conflict(install, "local target changed before install");
                 }
                 let (length, digest, identity) =
                     hash_at(&parent_fd, name, &self.root.join(&install.path))?;
@@ -742,22 +1260,15 @@ impl LocalTree {
                     || length != expected.length
                     || digest.as_bytes() != &expected.digest
                 {
-                    return self.install_conflict(
-                        store,
-                        install,
-                        "local target bytes changed before install",
-                    );
+                    return self
+                        .install_conflict(install, "local target bytes changed before install");
                 }
             }
             (InstallOperation::Create, None, Some(_)) => {
-                return self.install_conflict(store, install, "local create target already exists");
+                return self.install_conflict(install, "local create target already exists");
             }
             (InstallOperation::Replace, Some(_), None) => {
-                return self.install_conflict(
-                    store,
-                    install,
-                    "local replacement target disappeared",
-                );
+                return self.install_conflict(install, "local replacement target disappeared");
             }
             _ => {
                 return Err(Error::corrupt(
@@ -773,19 +1284,26 @@ impl LocalTree {
             let artifact = ArtifactRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 origin: install.path.clone(),
-                kind: ArtifactKind::DisplacedLocal,
-                digest: expected.digest,
+                kind: ArtifactKind::ReplacedFile,
+                release_event: ArtifactRelease::NextReconciliation,
+                digest: Some(expected.digest),
                 length: expected.length,
                 phase: ArtifactPhase::Preparing,
                 name: format!("artifact-{}", uuid::Uuid::new_v4()),
+                remote_revision: install
+                    .desired_remote
+                    .as_ref()
+                    .and_then(|remote| remote.pin.revision()),
+                stat: None,
+                settle_pending: false,
                 error: None,
             };
-            store.insert_artifact(&artifact)?;
+            self.store.insert_artifact(&artifact)?;
             install.artifact = Some(artifact.id);
         }
 
         install.state = InstallState::Dispatched;
-        store.update_install(install)?;
+        self.store.update_install(install)?;
         let exchange = install.operation == InstallOperation::Replace;
         let flags = if exchange {
             RenameFlags::EXCHANGE
@@ -803,11 +1321,7 @@ impl LocalTree {
                 error,
                 rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY
             ) {
-                return self.install_conflict(
-                    store,
-                    install,
-                    "local target appeared before install",
-                );
+                return self.install_conflict(install, "local target appeared before install");
             }
             return Err(Error::errno(
                 "install Direct Sync remote file",
@@ -862,7 +1376,6 @@ impl LocalTree {
                     })?;
                 }
                 return self.install_conflict(
-                    store,
                     install,
                     "local target changed concurrently; replacement was rolled back",
                 );
@@ -871,7 +1384,8 @@ impl LocalTree {
                 .artifact
                 .as_deref()
                 .ok_or_else(|| Error::corrupt("replacement artifact disappeared"))?;
-            let artifact = store
+            let artifact = self
+                .store
                 .artifacts()?
                 .into_iter()
                 .find(|artifact| artifact.id == artifact_id)
@@ -896,26 +1410,48 @@ impl LocalTree {
             fsync(&self.artifact_fd).map_err(|error| {
                 Error::errno("persist Direct Sync artifact directory", &self.state, error)
             })?;
-            store.update_artifact(artifact_id, ArtifactPhase::Retained, None)?;
+            let mut artifact = artifact;
+            artifact.phase = ArtifactPhase::Retained;
+            artifact.release_event = ArtifactRelease::NextReconciliation;
+            artifact.settle_pending = true;
+            if let Some(stat) = optional_stat(
+                &self.artifact_fd,
+                &artifact.name,
+                &self.artifact_path(&artifact),
+            )? {
+                artifact.length = stat.st_size as u64;
+                artifact.stat = Some(super::store::ArtifactStat {
+                    dev: stat.st_dev,
+                    ino: stat.st_ino,
+                    mtime: stat.st_mtime,
+                    mtime_nsec: stat.st_mtime_nsec as i64,
+                    ctime: stat.st_ctime,
+                    ctime_nsec: stat.st_ctime_nsec as i64,
+                });
+            }
+            self.store.update_artifact(&artifact)?;
         }
 
         install.state = InstallState::Applied;
-        store.update_install(install)?;
+        self.store.update_install(install)?;
         let fingerprint = self.local_fingerprint(&install.path)?;
         if !desired_matches(install.desired_local, Some(fingerprint)) {
             return self.install_conflict(
-                store,
                 install,
                 "installed local bytes changed before baseline acceptance",
             );
         }
         let baseline = build_baseline(install, fingerprint)?;
-        store.complete_install(&install.id, baseline.as_ref(), &install.path)?;
-        self.release_completed_artifact(store, install)?;
+        let baseline_ref = baseline
+            .as_ref()
+            .map(|(remote, local, keep_local)| (remote, *local, *keep_local));
+        self.store
+            .complete_install(&install.id, baseline_ref, &install.path)?;
+        self.mark_settled_artifact(install)?;
         Ok(())
     }
 
-    fn delete_file(&self, store: &mut Store, install: &mut InstallRecord) -> Result<()> {
+    fn delete_file(&mut self, install: &mut InstallRecord) -> Result<()> {
         let expected = install
             .expected_local
             .ok_or_else(|| Error::corrupt("local delete has no expected file"))?;
@@ -928,20 +1464,20 @@ impl LocalTree {
         )?;
         if parent_identity.dev != expected.parent_dev || parent_identity.ino != expected.parent_ino
         {
-            return self.install_conflict(store, install, "local delete parent changed");
+            return self.install_conflict(install, "local delete parent changed");
         }
         if optional_stat(&parent_fd, name, &self.root.join(&install.path))?.is_none() {
-            return self.install_conflict(store, install, "local delete target disappeared");
+            return self.install_conflict(install, "local delete target disappeared");
         }
         let (length, digest, identity) = hash_at(&parent_fd, name, &self.root.join(&install.path))?;
         if identity != expected.identity()
             || length != expected.length
             || digest.as_bytes() != &expected.digest
         {
-            return self.install_conflict(store, install, "local delete target changed");
+            return self.install_conflict(install, "local delete target changed");
         }
         install.state = InstallState::Dispatched;
-        store.update_install(install)?;
+        self.store.update_install(install)?;
         if let Err(error) = renameat_with(
             &parent_fd,
             name,
@@ -950,11 +1486,8 @@ impl LocalTree {
             RenameFlags::NOREPLACE,
         ) {
             if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::EXIST) {
-                return self.install_conflict(
-                    store,
-                    install,
-                    "local delete target changed before quarantine",
-                );
+                return self
+                    .install_conflict(install, "local delete target changed before quarantine");
             }
             return Err(Error::errno(
                 "quarantine Direct Sync local file",
@@ -985,11 +1518,7 @@ impl LocalTree {
                 name,
                 RenameFlags::NOREPLACE,
             );
-            return self.install_conflict(
-                store,
-                install,
-                "local delete target changed during quarantine",
-            );
+            return self.install_conflict(install, "local delete target changed during quarantine");
         }
         unlinkat(
             &self.install_fd,
@@ -1007,30 +1536,27 @@ impl LocalTree {
             Error::errno("persist Direct Sync delete quarantine", &self.state, error)
         })?;
         self.prune_empty_ancestors(&install.path)?;
-        store.complete_install(&install.id, None, &install.path)?;
+        self.store
+            .complete_install(&install.id, None, &install.path)?;
         Ok(())
     }
 
-    fn install_conflict(
-        &self,
-        store: &mut Store,
-        install: &mut InstallRecord,
-        reason: &str,
-    ) -> Result<()> {
+    fn install_conflict(&mut self, install: &mut InstallRecord, reason: &str) -> Result<()> {
         install.state = InstallState::Conflict;
         install.error = Some(reason.to_owned());
-        store.update_install(install)?;
+        self.store.update_install(install)?;
         Err(Error::conflict(reason))
     }
 
-    fn settle_displaced_artifact(&self, store: &mut Store, install: &InstallRecord) -> Result<()> {
+    fn settle_displaced_artifact(&mut self, install: &InstallRecord) -> Result<()> {
         if install.operation != InstallOperation::Replace {
             return Ok(());
         }
         let Some(id) = install.artifact.as_deref() else {
             return Ok(());
         };
-        let artifact = store
+        let artifact = self
+            .store
             .artifacts()?
             .into_iter()
             .find(|artifact| artifact.id == id)
@@ -1068,28 +1594,31 @@ impl LocalTree {
             fsync(&self.artifact_fd).map_err(|error| {
                 Error::errno("persist Direct Sync artifact directory", &self.state, error)
             })?;
-            store.update_artifact(id, ArtifactPhase::Retained, None)?;
+            let mut artifact = artifact;
+            artifact.phase = ArtifactPhase::Retained;
+            artifact.settle_pending = true;
+            self.store.update_artifact(&artifact)?;
         }
         Ok(())
     }
 
-    fn release_completed_artifact(&self, store: &mut Store, install: &InstallRecord) -> Result<()> {
+    fn mark_settled_artifact(&mut self, install: &InstallRecord) -> Result<()> {
         if install.operation != InstallOperation::Replace {
             return Ok(());
         }
         let Some(id) = install.artifact.as_deref() else {
             return Ok(());
         };
-        let Some(artifact) = store
+        let Some(mut artifact) = self
+            .store
             .artifacts()?
             .into_iter()
             .find(|artifact| artifact.id == id)
         else {
             return Ok(());
         };
-        if self.release_artifact(&artifact)? {
-            store.remove_artifact(id)?;
-        }
+        artifact.settle_pending = true;
+        self.store.update_artifact(&artifact)?;
         Ok(())
     }
 
@@ -1139,10 +1668,14 @@ impl LocalTree {
                 Ok(Some(LocalFingerprint {
                     length: 0,
                     digest: [0; 32],
+                    remote_digest: None,
+                    executable: false,
                     dev: 0,
                     ino: 0,
                     parent_dev: 0,
                     parent_ino: 0,
+                    stat: None,
+                    recorded_ns: 0,
                 }))
             }
         }
@@ -1184,10 +1717,22 @@ impl LocalTree {
         Ok(Some(LocalFingerprint {
             length,
             digest: *digest.as_bytes(),
+            remote_digest: None,
+            executable: Mode::from_raw_mode(stat.st_mode)
+                .intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH),
             dev: identity.dev,
             ino: identity.ino,
             parent_dev: 0,
             parent_ino: 0,
+            stat: Some(super::store::ArtifactStat {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                mtime: stat.st_mtime,
+                mtime_nsec: stat.st_mtime_nsec as i64,
+                ctime: stat.st_ctime,
+                ctime_nsec: stat.st_ctime_nsec as i64,
+            }),
+            recorded_ns: super::store::recorded_now()?,
         }))
     }
 
@@ -1333,39 +1878,10 @@ impl LocalTree {
     }
 }
 
-pub(super) fn validate_path(path: &str) -> Result<()> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    if path.starts_with('/') || path.ends_with('/') {
-        return Err(Error::invalid(format!(
-            "Direct Sync path must be relative without a trailing slash: {path:?}"
-        )));
-    }
-    for component in path.split('/') {
-        if component.is_empty() || component == "." || component == ".." || component.contains('\0')
-        {
-            return Err(Error::invalid(format!(
-                "unsafe Direct Sync path component in {path:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn split_path(path: &str) -> Result<(&str, &str)> {
-    validate_path(path)?;
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    if name.is_empty() {
-        return Err(Error::invalid("Direct Sync file path has no file name"));
-    }
-    Ok((parent, name))
-}
-
 fn build_baseline(
     install: &InstallRecord,
     local: LocalFingerprint,
-) -> Result<Option<super::state::BaselineEntry>> {
+) -> Result<Option<(RemoteEntry, LocalFingerprint, bool)>> {
     let remote = match install.operation {
         InstallOperation::Create | InstallOperation::Replace => install
             .desired_remote
@@ -1373,20 +1889,104 @@ fn build_baseline(
             .ok_or_else(|| Error::corrupt("file install has no remote pin"))?,
         InstallOperation::Delete => return Ok(None),
     };
-    Ok(Some(super::state::BaselineEntry {
-        path: install.path.clone(),
-        remote,
-        local,
-    }))
+    Ok(Some((remote, local, true)))
 }
 
-fn desired_matches(desired: Option<DesiredFile>, fingerprint: Option<LocalFingerprint>) -> bool {
+fn desired_matches(
+    desired: Option<LocalFingerprint>,
+    fingerprint: Option<LocalFingerprint>,
+) -> bool {
     match (desired, fingerprint) {
         (Some(desired), Some(fingerprint)) => {
-            desired.length == fingerprint.length && desired.digest == fingerprint.digest
+            desired.length == fingerprint.length
+                && desired.digest == fingerprint.digest
+                && desired.executable == fingerprint.executable
         }
         _ => false,
     }
+}
+
+pub fn check_root_state(root: &Path, state: &Path) -> Result<()> {
+    let root = canonical_target(root, "root")?;
+    let state = canonical_target(state, "state")?;
+    if root == state {
+        return Err(Error::invalid("root and state must be different"));
+    }
+    if state.starts_with(&root) {
+        return Err(Error::invalid(
+            "state must not be inside the synchronized root",
+        ));
+    }
+    if root.starts_with(&state) {
+        return Err(Error::invalid(
+            "the synchronized root must not be inside state",
+        ));
+    }
+    let root_device = device_of(&root)?;
+    let state_device = device_of(&state)?;
+    if root_device != state_device {
+        return Err(Error::unsupported(
+            "root and state must be on the same filesystem",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_target(path: &Path, label: &str) -> Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .map_err(|error| Error::io(&format!("canonicalize {label}"), path, error));
+    }
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    loop {
+        match std::fs::metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    Error::invalid(format!("{label} path has no existing ancestor"))
+                })?;
+                missing.push(name.to_owned());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    Error::invalid(format!("{label} path has no existing ancestor"))
+                })?;
+            }
+            Err(error) => {
+                return Err(Error::io("inspect root/state path", ancestor, error));
+            }
+        }
+    }
+    let mut canonical = std::fs::canonicalize(ancestor)
+        .map_err(|error| Error::io(&format!("canonicalize {label} ancestor"), ancestor, error))?;
+    for component in missing.into_iter().rev() {
+        if component == std::ffi::OsStr::new(".") || component == std::ffi::OsStr::new("..") {
+            return Err(Error::invalid(format!(
+                "{label} path must not contain unresolved . or .. components"
+            )));
+        }
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+fn device_of(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut candidate = path;
+    loop {
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => return Ok(metadata.dev()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = candidate
+                    .parent()
+                    .ok_or_else(|| Error::invalid("root/state path has no existing ancestor"))?;
+            }
+            Err(error) => return Err(Error::io("inspect root/state device", candidate, error)),
+        }
+    }
+}
+
+pub fn namespace_digest(namespace: &str) -> [u8; 32] {
+    *blake3::hash(namespace.as_bytes()).as_bytes()
 }
 
 fn prepare_directory(path: &Path, operation: &str) -> Result<()> {
@@ -1479,7 +2079,7 @@ fn open_private_directory(parent: &OwnedFd, name: &str, state: &Path) -> Result<
 fn acquire_lease(state_fd: &OwnedFd, state: &Path) -> Result<std::fs::File> {
     let fd = openat(
         state_fd,
-        "direct-sync.lock",
+        "sync-engine.lock",
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
@@ -1502,6 +2102,14 @@ fn acquire_lease(state_fd: &OwnedFd, state: &Path) -> Result<std::fs::File> {
     }
 }
 
+fn optional_stat(parent: &OwnedFd, name: &str, path: &Path) -> Result<Option<Stat>> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(Error::errno("inspect Direct Sync local entry", path, error)),
+    }
+}
+
 fn identity(fd: &OwnedFd, path: &Path, operation: &str) -> Result<Identity> {
     let stat = fstat(fd).map_err(|error| Error::errno(operation, path, error))?;
     Ok(Identity {
@@ -1510,12 +2118,51 @@ fn identity(fd: &OwnedFd, path: &Path, operation: &str) -> Result<Identity> {
     })
 }
 
-fn optional_stat(parent: &OwnedFd, name: &str, path: &Path) -> Result<Option<Stat>> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(stat)),
-        Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(error) => Err(Error::errno("inspect Direct Sync local entry", path, error)),
+fn remove_artifact_directory(parent: &OwnedFd, name: &str, display: &Path) -> Result<()> {
+    let directory = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::errno("open retained directory artifact", display, error))?;
+    let mut names = Vec::new();
+    let mut reader = rustix::fs::Dir::read_from(&directory)
+        .map_err(|error| Error::errno("read retained directory artifact", display, error))?;
+    while let Some(entry) = reader.read() {
+        let entry = entry
+            .map_err(|error| Error::errno("read retained directory artifact", display, error))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| Error::unsupported("retained artifact contains a non-UTF-8 name"))?;
+        if name != "." && name != ".." {
+            names.push(name.to_owned());
+        }
     }
+    for child in names {
+        let stat = statat(&directory, child.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| Error::errno("inspect retained directory artifact", display, error))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => {
+                unlinkat(&directory, child.as_str(), AtFlags::empty()).map_err(|error| {
+                    Error::errno("remove retained artifact file", display, error)
+                })?;
+            }
+            FileType::Directory => {
+                remove_artifact_directory(&directory, &child, &display.join(&child))?;
+                unlinkat(&directory, child.as_str(), AtFlags::REMOVEDIR).map_err(|error| {
+                    Error::errno("remove retained artifact directory", display, error)
+                })?;
+            }
+            _ => {
+                return Err(Error::unsupported(
+                    "retained directory artifact contains a symlink or special file",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hash_at(parent: &OwnedFd, name: &str, path: &Path) -> Result<(u64, ContentHash, Identity)> {
@@ -1565,14 +2212,32 @@ fn hash_at(parent: &OwnedFd, name: &str, path: &Path) -> Result<(u64, ContentHas
     ))
 }
 
-fn same_stable_stat(left: &Stat, right: &Stat) -> bool {
-    left.st_dev == right.st_dev
-        && left.st_ino == right.st_ino
-        && left.st_size == right.st_size
-        && left.st_mtime == right.st_mtime
-        && left.st_mtime_nsec == right.st_mtime_nsec
-        && left.st_ctime == right.st_ctime
-        && left.st_ctime_nsec == right.st_ctime_nsec
+fn fingerprint_matches_node(hint: &LocalFingerprint, node: &LocalNode) -> bool {
+    let LocalKind::File { length, digest } = node.kind else {
+        return false;
+    };
+    let Some(stat) = node.stat else {
+        return false;
+    };
+    hint.length == length
+        && hint.digest == *digest.as_bytes()
+        && hint.executable == node.executable
+        && hint.identity() == node.identity
+        && hint.stat.is_some_and(|recorded| {
+            recorded.dev == stat.dev
+                && recorded.ino == stat.ino
+                && recorded.mtime == stat.mtime
+                && recorded.mtime_nsec == stat.mtime_nsec
+                && recorded.ctime == stat.ctime
+                && recorded.ctime_nsec == stat.ctime_nsec
+                && super::types::local_stat_is_racy_clean(
+                    recorded.mtime,
+                    recorded.mtime_nsec,
+                    recorded.ctime,
+                    recorded.ctime_nsec,
+                    hint.recorded_ns,
+                )
+        })
 }
 
 #[derive(Default)]
@@ -1606,5 +2271,29 @@ mod tests {
         for path in ["", "a", "a/b", "%2E/%2E%2E", "space name"] {
             validate_path(path).unwrap();
         }
+    }
+
+    #[test]
+    fn artifact_budget_releases_oldest_unreferenced_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = temp.path().join("state");
+        let mut tree = LocalTree::create(&root, &state, SyncModel::Managed, "test").unwrap();
+        for index in 0..ARTIFACT_BUDGET_COUNT + 6 {
+            tree.retain_bytes(&format!("artifact-{index}"), &[index as u8; 16])
+                .unwrap();
+        }
+        assert_eq!(
+            tree.store().artifacts().unwrap().len(),
+            ARTIFACT_BUDGET_COUNT + 6
+        );
+        tree.prune_artifacts().unwrap();
+        let artifacts = tree.store().artifacts().unwrap();
+        assert_eq!(artifacts.len(), ARTIFACT_BUDGET_COUNT);
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact.origin != "artifact-0")
+        );
     }
 }

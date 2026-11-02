@@ -23,11 +23,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use yinyang::core::{CommitId, Fs, Revision};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
-#[cfg(target_os = "linux")]
-use yinyang::volume::Model;
 use yinyang::volume::{VolumeContext, VolumeLoadError, VolumeLoadStage};
-#[cfg(target_os = "linux")]
-mod direct_sync_cli;
 mod directory_cli;
 mod file_cli;
 mod operations_cli;
@@ -124,10 +120,6 @@ fn classify_boxed_error(error: &(dyn StdError + 'static)) -> RuntimeErrorKind {
     if let Some(error) = error.downcast_ref::<yinyang::direct::Error>() {
         return runtime_kind_from_direct(error.kind());
     }
-    #[cfg(target_os = "linux")]
-    if let Some(error) = error.downcast_ref::<yinyang::replica::Error>() {
-        return runtime_kind_from_replica(error.kind());
-    }
     if let Some(error) = error.downcast_ref::<opendal::Error>() {
         return runtime_kind_from_opendal(error.kind());
     }
@@ -195,19 +187,6 @@ pub(crate) fn runtime_kind_from_direct(kind: yinyang::direct::ErrorKind) -> Runt
     }
 }
 
-#[cfg(target_os = "linux")]
-fn runtime_kind_from_replica(kind: yinyang::replica::ErrorKind) -> RuntimeErrorKind {
-    use yinyang::replica::ErrorKind as Kind;
-    match kind {
-        Kind::Invalid => RuntimeErrorKind::Invalid,
-        Kind::Unsupported => RuntimeErrorKind::Unsupported,
-        Kind::Conflict => RuntimeErrorKind::Conflict,
-        Kind::Corrupt => RuntimeErrorKind::Corrupt,
-        Kind::Busy => RuntimeErrorKind::Busy,
-        Kind::Io => RuntimeErrorKind::Io,
-    }
-}
-
 impl From<VolumeLoadError> for CliError {
     fn from(error: VolumeLoadError) -> Self {
         let stage = match error.stage() {
@@ -236,17 +215,6 @@ impl From<yinyang::direct::Error> for CliError {
         Self::new(
             CliStage::Operation,
             runtime_kind_from_direct(error.kind()),
-            error.to_string(),
-        )
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl From<yinyang::replica::Error> for CliError {
-    fn from(error: yinyang::replica::Error) -> Self {
-        Self::new(
-            CliStage::Operation,
-            runtime_kind_from_replica(error.kind()),
             error.to_string(),
         )
     }
@@ -456,10 +424,7 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
             #[cfg(target_os = "linux")]
-            Command::Sync { command } => match context.config.model {
-                Model::Managed => sync_cli::run(context, command).await,
-                Model::Direct => direct_sync_cli::run(context, command).await,
-            },
+            Command::Sync { command } => sync_cli::run(context, command).await,
             Command::Space { command } => space_cli::run(context, command).await,
             command => file_cli::run(context, command).await,
         };
