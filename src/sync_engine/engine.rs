@@ -3098,18 +3098,47 @@ fn artifact_changed(state: &Path, artifact: &super::store::ArtifactRecord) -> bo
     let path = state.join("artifacts").join(&artifact.name);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(_) => return artifact.stat.is_some(),
+        Err(_) => return artifact.stat.is_some() || artifact.digest.is_some(),
     };
     let Some(recorded) = artifact.stat else {
         return false;
     };
-    metadata.dev() != recorded.dev
+    if !metadata.file_type().is_file()
+        || metadata.dev() != recorded.dev
         || metadata.ino() != recorded.ino
         || metadata.mtime() != recorded.mtime
         || metadata.mtime_nsec() != recorded.mtime_nsec
         || metadata.ctime() != recorded.ctime
         || metadata.ctime_nsec() != recorded.ctime_nsec
         || metadata.size() != artifact.length
+    {
+        return !artifact_content_matches(&path, artifact);
+    }
+    false
+}
+
+fn artifact_content_matches(path: &Path, artifact: &super::store::ArtifactRecord) -> bool {
+    let Some(expected) = artifact.digest else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Ok(count) => count,
+            Err(_) => return false,
+        };
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        length = length.saturating_add(count as u64);
+    }
+    length == artifact.length && hasher.finalize().as_bytes() == &expected
 }
 
 fn conflict_status(conflict: &ConflictRecord) -> ConflictStatus {
