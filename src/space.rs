@@ -1601,7 +1601,9 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
                     handle_revisions.insert(handle.id, handle.remote_revision);
                     handles.total = handles.total.saturating_add(1);
                     handles.handle_bytes = handles.handle_bytes.saturating_add(handle.length);
-                    let mut reasons = BTreeSet::new();
+                    // Every ready handle remains recoverable by UUID and may
+                    // read untouched bytes or publish from this exact base.
+                    let mut reasons = BTreeSet::from(["staging_base"]);
                     if handle.pending {
                         handles.pending = handles.pending.saturating_add(1);
                         reasons.insert("staging_pending");
@@ -1641,12 +1643,10 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
                     if failed {
                         handles.failed = handles.failed.saturating_add(1);
                     }
-                    if !reasons.is_empty() {
-                        protected
-                            .entry(handle.remote_revision)
-                            .or_default()
-                            .extend(reasons);
-                    }
+                    protected
+                        .entry(handle.remote_revision)
+                        .or_default()
+                        .extend(reasons);
                 }
                 handles.ledger_errors = handles
                     .ledger_errors

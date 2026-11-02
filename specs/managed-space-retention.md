@@ -213,8 +213,8 @@ The selected set is the union of:
 - the newest `N` revisions from the authority's retained-revision list, when
   requested;
 - every requested revision that is present in the retained list; and
-- remote base revisions recorded by existing pending, frozen, conflict,
-  Unknown, or failed staging handles;
+- the base revision recorded by every ready durable staging handle, including
+  clean handles that remain recoverable by UUID;
 - baselines recorded by content Sync intents; and
 - receipt revisions recorded by committed content Sync intents;
 - per-entry remote revisions recorded by the Sync engine common baseline and
@@ -237,19 +237,27 @@ remove data.
 Selection reasons are drawn from:
 
 - `current`, `keep_all`, `keep_last`, and `requested_pin`;
+- `staging_base`;
 - `staging_pending`, `staging_frozen`, `staging_unknown`,
   `staging_conflict`, and `staging_failed`;
 - `sync_intent_prepared`, `sync_intent_unknown`, `sync_intent_receipt`,
   `sync_intent_conflict`, `sync_intent_retryable`, and `sync_intent_failed`;
 - `sync_receipt`;
 - `sync_engine_conflict`, `sync_engine_baseline`, and `sync_engine_receipt`; and
-- `backup_staging_pending`, `backup_staging_frozen`, `backup_staging_unknown`,
+- `backup_staging_base`, `backup_staging_pending`,
+  `backup_staging_frozen`, `backup_staging_unknown`,
   `backup_staging_conflict`, `backup_staging_failed`,
   `backup_sync_intent_prepared`, `backup_sync_intent_unknown`,
   `backup_sync_intent_receipt`, `backup_sync_intent_conflict`,
   `backup_sync_intent_retryable`, `backup_sync_intent_failed`,
   `backup_sync_receipt`, `backup_sync_engine_conflict`,
   `backup_sync_engine_baseline`, and `backup_sync_engine_receipt`.
+
+Every ready handle contributes `staging_base` because recovery can still read
+an uncovered range from that base and a later write continues to use it for
+publication predicates. Dirty, frozen, conflict, Unknown, or failed state adds
+the corresponding reason without replacing the base reason. A clean handle is
+not disposable protection evidence while its UUID remains in durable staging.
 
 The plan also reports:
 
