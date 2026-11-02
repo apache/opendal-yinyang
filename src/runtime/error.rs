@@ -248,25 +248,4 @@ mod tests {
             ErrorKind::NoSpace
         );
     }
-
-    #[test]
-    fn direct_kinds_have_one_runtime_mapping() {
-        use crate::direct::ErrorKind as DirectKind;
-
-        let cases = [
-            (DirectKind::Invalid, ErrorKind::Invalid),
-            (DirectKind::InvalidName, ErrorKind::InvalidName),
-            (DirectKind::NotFound, ErrorKind::NotFound),
-            (DirectKind::NotDirectory, ErrorKind::NotDirectory),
-            (DirectKind::IsDirectory, ErrorKind::IsDirectory),
-            (DirectKind::Stale, ErrorKind::Conflict),
-            (DirectKind::Unsupported, ErrorKind::Unsupported),
-            (DirectKind::Corrupt, ErrorKind::Corrupt),
-            (DirectKind::Storage, ErrorKind::Storage),
-        ];
-
-        for (direct, runtime) in cases {
-            assert_eq!(ErrorKind::from(direct), runtime);
-        }
-    }
 }

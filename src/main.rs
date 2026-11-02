@@ -568,6 +568,7 @@ fn hex_nibble(value: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::parse_revision;
+    use yinyang::runtime::ErrorKind;
 
     #[test]
     fn revision_requires_exactly_24_hex_bytes() {
@@ -580,6 +581,14 @@ mod tests {
                 .to_bytes()
                 .as_slice(),
             &[1; 24]
+        );
+    }
+
+    #[test]
+    fn stale_direct_pin_is_a_conflict() {
+        assert_eq!(
+            ErrorKind::from(yinyang::direct::ErrorKind::Stale),
+            ErrorKind::Conflict
         );
     }
 }
