@@ -31,6 +31,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use yinyang_test_support::s3_gate::{CommitAction, S3Gate};
 
 const EACCES: i32 = 13;
 const ENOSYS: i32 = 38;
@@ -41,6 +42,7 @@ const EINVAL: i32 = 22;
 const ENOTCONN: i32 = 107;
 const EIO: i32 = 5;
 const ENOENT: i32 = 2;
+const ESTALE: i32 = 116;
 const ATTR_TTL_WAIT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy)]
@@ -578,6 +580,130 @@ fn fuse_path_truncate_commits_both_publications() {
     }
 }
 
+enum PathTruncateGate {
+    Object(S3Gate),
+    Service(ServiceGate),
+}
+
+impl PathTruncateGate {
+    fn wait_blocked(&self) {
+        match self {
+            Self::Object(gate) => {
+                gate.wait_intercepted_for(Duration::from_secs(30));
+            }
+            Self::Service(gate) => {
+                gate.wait_ready(Duration::from_secs(30));
+            }
+        }
+    }
+
+    fn release(&self) {
+        match self {
+            Self::Object(gate) => gate.release(),
+            Self::Service(gate) => gate.release(),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
+fn fuse_path_truncate_conflict_replay_stays_estale_both_publications() {
+    let results = [Publication::Object, Publication::Service]
+        .into_iter()
+        .map(|publication| {
+            let code = exercise_path_truncate_conflict(publication);
+            println!(
+                "{} pathname truncate conflict returned errno {code}",
+                publication.as_str()
+            );
+            (publication, code)
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        results.iter().all(|(_, code)| *code == ESTALE),
+        "VFS replay of a pathname truncate content conflict must remain ESTALE: {results:?}"
+    );
+}
+
+fn exercise_path_truncate_conflict(publication: Publication) -> i32 {
+    const ORIGINAL: &[u8] = b"0123456789";
+    const EXTERNAL: &[u8] = b"external-content";
+    const LOCAL: &[u8] = b"0123";
+
+    let fixture = Fixture::new(publication);
+    let suffix = fixture.publication().as_str();
+    let library = fixture.volume_config(
+        &format!("lib-truncate-conflict-{suffix}"),
+        Frontend::Library,
+        false,
+    );
+    fixture.library_seed(&library, "truncate-conflict.txt", ORIGINAL);
+
+    let name = format!("stage-truncate-conflict-{suffix}");
+    let (config, gate) = match publication {
+        Publication::Object => {
+            let config = fixture.volume_config(&name, Frontend::Fuse, false);
+            (
+                config,
+                PathTruncateGate::Object(S3Gate::start(CommitAction::HoldBeforeCommit)),
+            )
+        }
+        Publication::Service => {
+            let staging = fixture.temp.path().join(&name);
+            let gate = ServiceGate::new(staging, fixture.service_address());
+            let config = fixture.volume_config_with_service(
+                &name,
+                Frontend::Fuse,
+                false,
+                Some(gate.address()),
+            );
+            (config, PathTruncateGate::Service(gate))
+        }
+    };
+    let mountpoint = fixture.temp.path().join(format!("mnt-{name}"));
+    fs::create_dir(&mountpoint).expect("create pathname truncate conflict mountpoint");
+    let mut mounted = match &gate {
+        PathTruncateGate::Object(gate) => {
+            fixture.mount_with_s3_endpoint(&config, &mountpoint, &gate.endpoint())
+        }
+        PathTruncateGate::Service(_) => fixture.mount(&config, &mountpoint),
+    };
+    let path = mounted.mountpoint().join("truncate-conflict.txt");
+
+    let (sender, receiver) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let _ = sender.send(truncate(&path, LOCAL.len() as i64));
+    });
+    gate.wait_blocked();
+    fixture.remote_write(&library, "truncate-conflict.txt", EXTERNAL);
+    gate.release();
+
+    let result = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("pathname truncate did not finish after its commit conflict");
+    caller.join().expect("pathname truncate caller panicked");
+    let code = result.expect_err("pathname truncate conflict must not report success") as i32;
+    assert_eq!(
+        fixture.remote_read(&library, "truncate-conflict.txt", 64),
+        EXTERNAL,
+        "failed pathname truncate overwrote the external authority content"
+    );
+
+    mounted.unmount();
+    let recovered_mountpoint = fixture.temp.path().join(format!("mnt-{name}-recovered"));
+    fs::create_dir(&recovered_mountpoint).expect("create recovered conflict mountpoint");
+    let mut recovered = fixture.mount(&config, &recovered_mountpoint);
+    assert_eq!(
+        fs::read(recovered.mountpoint().join("truncate-conflict.txt"))
+            .expect("read retained pathname truncate bytes"),
+        LOCAL,
+        "the failed pathname truncate did not retain its local bytes"
+    );
+    recovered.unmount();
+    code
+}
+
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
 fn fuse_chmod_limits_to_executable_bit_both_publications() {
@@ -881,11 +1007,10 @@ fn external_changes(fixture: &Fixture) {
         local, b"LOCALBBB",
         "an external change must not silently rebase a dirty descriptor"
     );
-    let conflict = dirty.sync_all();
-    assert!(
-        conflict.is_err(),
-        "fsync of a stale dirty base must report failure instead of claiming remote durability"
-    );
+    let conflict = dirty
+        .sync_all()
+        .expect_err("fsync of a stale dirty base must report failure");
+    assert_errno(conflict, &[ESTALE], "fsync of a stale dirty base");
     drop(dirty);
     mounted.unmount();
 

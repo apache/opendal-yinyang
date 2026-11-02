@@ -59,6 +59,25 @@ local dirty ranges or returning no bytes does not authenticate the base; a read
 that needs untouched ranges authenticates it lazily, and any failure follows the
 normal retained-handle error path.
 
+A writable handle retains the authenticated `Snapshot` selected by its open
+while the local durable record still names that exact revision. An unfrozen
+publication may reuse that observation for planner conditions only when
+`snapshot.revision == record.base`. The optimization never repoints a handle at
+a newer revision. Recovery starts without the in-memory observation, revision
+advance after a metadata-only commit drops it, and freezing a request drops it
+before dispatch. A successful content commit replaces it with the receipt
+revision's authenticated observation when advancing the in-memory base after
+the durable staging update. Conflict, abort, and close clear it. A revision
+that does not exactly match therefore uses the normal `observe_revision` path.
+
+Object snapshots share the authority-lifetime, content-addressed index cache
+instead of owning a per-handle cache. Retaining the observation keeps that
+shared reference and the snapshot's compact record roots alive. An in-process
+metadata-service snapshot retains a clone of the shared read connection and its
+records reader; neither holds an active read transaction between calls. A
+remote service client retains no database transaction. Releasing or closing the
+handle releases its retained snapshot.
+
 A handle is uniquely leased in a runtime and is not cloneable. Its UUID can be
 recovered after drop or process restart. Rename does not change its node
 identity or invalidate content publication. Unlink does not invalidate staged

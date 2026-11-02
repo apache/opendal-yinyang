@@ -78,6 +78,8 @@ struct Inner {
 struct HandleBase {
     expected: Option<Vec<u8>>,
     file: Option<FileVersion>,
+    // Exact original observation for planner reuse; never a newer base.
+    snapshot: Option<Snapshot>,
 }
 /// One staging directory per active runtime. Different clients may have separate
 /// staging directories against the same authority; generation checks arbitrate.
@@ -176,6 +178,7 @@ impl Runtime {
                 .await?
                 .map(|base| base.descriptor),
             file: None,
+            snapshot: None,
         };
         self.claim(r.id, base)
     }
@@ -274,6 +277,7 @@ impl Runtime {
             HandleBase {
                 expected: Some(descriptor),
                 file: Some(file),
+                snapshot: writable.then_some(snapshot),
             },
         )
     }
@@ -542,13 +546,12 @@ impl FileHandle {
                 "staging base descriptor changed during recovery",
             ));
         }
-        let file = self
+        let snapshot = self
             .runtime
             .authority()
             .observe_revision(Revision::from_bytes(record.base))
-            .await?
-            .open_file(NodeId::from_bytes(record.node))
             .await?;
+        let file = snapshot.open_file(NodeId::from_bytes(record.node)).await?;
         if file.descriptor().to_bytes() != expected {
             return Err(Error::State(
                 ErrorKind::Corrupt,
@@ -556,7 +559,16 @@ impl FileHandle {
             ));
         }
         base.file = Some(file.clone());
+        base.snapshot = record.writable.then_some(snapshot);
         Ok(Some(file))
+    }
+    async fn base_snapshot(&self, revision: Revision) -> Result<Option<Snapshot>> {
+        let base = self.base.lock().await;
+        Ok(base
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.revision() == revision)
+            .cloned())
     }
     pub async fn status(&self) -> Result<HandleStatus> {
         self.live()?;
@@ -662,7 +674,9 @@ impl FileHandle {
             ));
         }
         record.base = revision.to_bytes();
-        stage.save_durable(record).await
+        stage.save_durable(record).await?;
+        self.base.lock().await.snapshot = None;
+        Ok(())
     }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
@@ -842,11 +856,11 @@ impl FileHandle {
                 .map_err(Error::from)?
         } else {
             let prepared = self.prepare_publication(&r).await?;
-            let snapshot = self
-                .runtime
-                .authority()
-                .observe_revision(Revision::from_bytes(r.base))
-                .await?;
+            let revision = Revision::from_bytes(r.base);
+            let snapshot = match self.base_snapshot(revision).await? {
+                Some(snapshot) => snapshot,
+                None => self.runtime.authority().observe_revision(revision).await?,
+            };
             let mut plan = Planner::new(&snapshot, CommitId::generate());
             plan.set_content(NodeId::from_bytes(r.node), prepared)
                 .await?;
@@ -856,6 +870,7 @@ impl FileHandle {
             stage.save_durable(r.clone()).await?;
             request
         };
+        self.base.lock().await.snapshot = None;
         match self.runtime.authority().commit(&request).await {
             Err(error) => {
                 // The plan is already frozen and dispatch may still publish.
@@ -866,13 +881,12 @@ impl FileHandle {
             Ok(outcome) => match outcome {
                 CommitOutcome::Committed(receipt) => {
                     let node = NodeId::from_bytes(r.node);
-                    let base = self
+                    let snapshot = self
                         .runtime
                         .authority()
                         .observe_revision(receipt.cursor.revision)
-                        .await?
-                        .open_file(node)
                         .await?;
+                    let base = snapshot.open_file(node).await?;
                     if base.descriptor().content_id().length() != r.length {
                         return Err(Error::State(
                             ErrorKind::Corrupt,
@@ -890,6 +904,7 @@ impl FileHandle {
                     *self.base.lock().await = HandleBase {
                         expected: Some(descriptor),
                         file: Some(base),
+                        snapshot: Some(snapshot),
                     };
                     if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
                         errors.remove(&self.id);
@@ -899,6 +914,7 @@ impl FileHandle {
                 CommitOutcome::Conflict => {
                     r.conflict = true;
                     stage.save(r).await?;
+                    self.base.lock().await.snapshot = None;
                     Err(Error::Conflict)
                 }
                 CommitOutcome::Retryable => Err(Error::Retryable),
@@ -919,6 +935,7 @@ impl FileHandle {
         }
         let result = self.runtime.inner.stage.remove(self.id).await;
         self.report(result).await?;
+        self.base.lock().await.snapshot = None;
         self.closed = true;
         Ok(())
     }
@@ -936,6 +953,7 @@ impl FileHandle {
         self.fsync().await?;
         let result = self.runtime.inner.stage.remove(self.id).await;
         self.report(result).await?;
+        self.base.lock().await.snapshot = None;
         self.closed = true;
         Ok(())
     }
