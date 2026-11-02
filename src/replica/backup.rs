@@ -502,22 +502,13 @@ impl BackupManifest {
             .map_err(|error| Error::io("canonicalize backup package", backup, error))?;
         let root = canonical_target(root)?;
         let state = canonical_target(state)?;
-        if root == state {
-            return Err(Error::invalid(
-                "restore root and state destinations must be different",
-            ));
-        }
         if root.starts_with(&backup) || backup.starts_with(&root) {
             return Err(Error::invalid("restore root overlaps the backup package"));
         }
         if state.starts_with(&backup) || backup.starts_with(&state) {
             return Err(Error::invalid("restore state overlaps the backup package"));
         }
-        if root.starts_with(&state) || state.starts_with(&root) {
-            return Err(Error::invalid(
-                "restore root and state must not contain each other",
-            ));
-        }
+        super::check_root_state(&root, &state)?;
         if root.exists() {
             return Err(Error::invalid(format!(
                 "restore root {} already exists",

@@ -196,29 +196,44 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
         })
     }
 }
-impl Authority for ObjectFs {
-    fn data(&self) -> &DataStore {
-        self.data()
-    }
-    fn filesystem(&self) -> NodeId {
-        self.filesystem()
-    }
-    fn root(&self) -> NodeId {
-        self.root()
-    }
-    fn observe_latest(&self) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(self.observe_latest())
-    }
-    fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(self.observe_revision(r))
-    }
-    fn retained_revisions_page(
-        &self,
-        after: Option<Revision>,
-        limit: u32,
-    ) -> BoxFuture<'_, Result<RevisionPage>> {
-        Box::pin(self.retained_revisions_page(after, limit))
-    }
+
+macro_rules! impl_authority_forwarding {
+    ($authority:ty, { $($additional:item)* }) => {
+        impl Authority for $authority {
+            fn data(&self) -> &DataStore {
+                self.data()
+            }
+            fn filesystem(&self) -> NodeId {
+                self.filesystem()
+            }
+            fn root(&self) -> NodeId {
+                self.root()
+            }
+            fn observe_latest(&self) -> BoxFuture<'_, Result<Snapshot>> {
+                Box::pin(self.observe_latest())
+            }
+            fn observe_revision(&self, revision: Revision) -> BoxFuture<'_, Result<Snapshot>> {
+                Box::pin(self.observe_revision(revision))
+            }
+            fn retained_revisions_page(
+                &self,
+                after: Option<Revision>,
+                limit: u32,
+            ) -> BoxFuture<'_, Result<RevisionPage>> {
+                Box::pin(self.retained_revisions_page(after, limit))
+            }
+            fn commit_batch<'a>(
+                &'a self,
+                requests: &'a [Transaction],
+            ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
+                Box::pin(self.commit_batch(requests))
+            }
+            $($additional)*
+        }
+    };
+}
+
+impl_authority_forwarding!(ObjectFs, {
     fn inspect_physical<'a>(&'a self, snapshot: &'a Snapshot) -> BoxFuture<'a, PhysicalInspection> {
         Box::pin(async move {
             match self.observe_state().await {
@@ -233,42 +248,9 @@ impl Authority for ObjectFs {
             }
         })
     }
-    fn commit_batch<'a>(
-        &'a self,
-        requests: &'a [Transaction],
-    ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
-        Box::pin(self.commit_batch(requests))
-    }
-}
-impl Authority for crate::service::MetadataService {
-    fn data(&self) -> &DataStore {
-        self.data()
-    }
-    fn filesystem(&self) -> NodeId {
-        self.filesystem()
-    }
-    fn root(&self) -> NodeId {
-        self.root()
-    }
-    fn observe_latest(&self) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(self.observe_latest())
-    }
-    fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(self.observe_revision(r))
-    }
-    fn retained_revisions_page(
-        &self,
-        after: Option<Revision>,
-        limit: u32,
-    ) -> BoxFuture<'_, Result<RevisionPage>> {
-        Box::pin(self.retained_revisions_page(after, limit))
-    }
-    fn commit_batch<'a>(
-        &'a self,
-        requests: &'a [Transaction],
-    ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
-        Box::pin(self.commit_batch(requests))
-    }
+});
+
+impl_authority_forwarding!(crate::service::MetadataService, {
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.remember(content))
     }
@@ -291,36 +273,9 @@ impl Authority for crate::service::MetadataService {
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(self.restore_transaction(bytes))
     }
-}
-impl Authority for crate::service::ServiceClient {
-    fn data(&self) -> &DataStore {
-        self.data()
-    }
-    fn filesystem(&self) -> NodeId {
-        self.filesystem()
-    }
-    fn root(&self) -> NodeId {
-        self.root()
-    }
-    fn observe_latest(&self) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(self.observe_latest())
-    }
-    fn observe_revision(&self, r: Revision) -> BoxFuture<'_, Result<Snapshot>> {
-        Box::pin(self.observe_revision(r))
-    }
-    fn retained_revisions_page(
-        &self,
-        after: Option<Revision>,
-        limit: u32,
-    ) -> BoxFuture<'_, Result<RevisionPage>> {
-        Box::pin(self.retained_revisions_page(after, limit))
-    }
-    fn commit_batch<'a>(
-        &'a self,
-        requests: &'a [Transaction],
-    ) -> BoxFuture<'a, Result<Vec<Outcome>>> {
-        Box::pin(self.commit_batch(requests))
-    }
+});
+
+impl_authority_forwarding!(crate::service::ServiceClient, {
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.register(content))
     }
@@ -349,4 +304,4 @@ impl Authority for crate::service::ServiceClient {
     fn restore_transaction<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<Transaction>> {
         Box::pin(self.restore_transaction(bytes))
     }
-}
+});

@@ -16,14 +16,14 @@
 // under the License.
 
 //! CLI adapter for volume admission and durable file-handle operations.
-use crate::{Command, revision};
+use crate::{CliError, CliResult, CliStage, Command, revision};
 use clap::Subcommand;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio::io::AsyncReadExt;
 use yinyang::direct::{DirectRuntime, DirectRuntimeInspectionState};
 use yinyang::runtime::{Runtime, RuntimeStatus};
-use yinyang::volume::{Access, Model, Volume, VolumeConfig};
+use yinyang::volume::{Access, Model, VolumeContext};
 
 #[derive(Subcommand)]
 pub enum FileCommand {
@@ -80,18 +80,6 @@ pub enum FileCommand {
         path: String,
     },
 }
-fn operator() -> Result<opendal::Operator, opendal::Error> {
-    let config = std::env::vars()
-        .filter_map(|(k, v)| {
-            k.strip_prefix("YINYANG_S3_")
-                .map(|k| (k.to_ascii_lowercase(), v))
-        })
-        .collect::<Vec<_>>();
-    let operator = opendal::Operator::via_iter("s3", config)?;
-    #[cfg(feature = "benchmark-telemetry")]
-    let operator = yinyang::benchmark::instrument(operator);
-    Ok(operator)
-}
 fn status(value: RuntimeStatus) {
     println!("local handles: {}", value.handles.len());
     for h in value.handles {
@@ -116,32 +104,22 @@ fn status(value: RuntimeStatus) {
         );
     }
 }
-async fn destination(
-    runtime: &Runtime,
-    path: &str,
-) -> Result<(yinyang::core::NodeId, String), Box<dyn std::error::Error>> {
+async fn destination(runtime: &Runtime, path: &str) -> CliResult<(yinyang::core::NodeId, String)> {
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
     let snapshot = runtime.authority().observe_latest().await?;
     let parent = snapshot
         .resolve(parent)
         .await?
-        .ok_or("destination parent missing")?;
+        .ok_or_else(|| CliError::invalid(CliStage::Operation, "destination parent missing"))?;
     Ok((parent.id(), name.to_owned()))
 }
-pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let mut config = VolumeConfig::from_json(&tokio::fs::read(path).await?)?;
-    if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
-        config.staging = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(&config.staging);
-    }
-    let token = std::env::var("YINYANG_SERVICE_TOKEN").ok();
+pub async fn run(context: VolumeContext, command: Command) -> CliResult<ExitCode> {
+    let config = &context.config;
     if let Command::Status { revision: Some(_) } = &command {
-        return Err(
-            "--revision is only supported by object-storage `yy status`, not `yy --volume CONFIG status`"
-                .into(),
-        );
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            "--revision is only supported by object-storage `yy status`, not `yy --volume CONFIG status`",
+        ));
     }
     if matches!(command, Command::Status { .. }) {
         println!(
@@ -155,7 +133,7 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
             } else if config.access == Access::Sync {
                 println!(
                     "direct sync state: inspect with `yy --volume {} sync status --json`",
-                    path.display()
+                    context.path.display()
                 );
             } else {
                 match DirectRuntime::inspect(&config.staging, None) {
@@ -189,25 +167,21 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
                     },
                     Err(error) => {
                         println!("direct local state: unavailable ({error})");
-                        local_error = Some(error.to_string());
+                        local_error = Some(error);
                     }
                 }
             }
-            match operator() {
-                Ok(operator) => match yinyang::volume::direct_namespace(&config, operator) {
-                    Ok(namespace) => match namespace.observe().await {
-                        Ok(snapshot) => {
-                            let root = snapshot.read_dir(snapshot.root()).unwrap_or_default();
-                            let directories =
-                                root.iter().filter(|node| node.is_directory()).count();
-                            println!(
-                                "direct namespace: {} ({} root entries, {directories} directories)",
-                                snapshot.revision().to_hex(),
-                                root.len()
-                            );
-                        }
-                        Err(error) => println!("direct namespace: unavailable ({error})"),
-                    },
+            match context.direct_namespace() {
+                Ok(namespace) => match namespace.observe().await {
+                    Ok(snapshot) => {
+                        let root = snapshot.read_dir(snapshot.root()).unwrap_or_default();
+                        let directories = root.iter().filter(|node| node.is_directory()).count();
+                        println!(
+                            "direct namespace: {} ({} root entries, {directories} directories)",
+                            snapshot.revision().to_hex(),
+                            root.len()
+                        );
+                    }
                     Err(error) => println!("direct namespace: unavailable ({error})"),
                 },
                 Err(error) => println!("direct namespace: unavailable ({error})"),
@@ -223,32 +197,26 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
             println!("local staging: not initialized");
         }
         // Always report persisted errors even when credentials or the authority are unavailable.
-        match operator() {
-            Ok(operator) => match Volume::connect(&config, operator, token).await {
-                Ok(authority) => match authority.observe_latest().await {
-                    Ok(snapshot) => println!("remote latest: {}", revision(snapshot.revision())),
-                    Err(error) => println!("remote: unavailable ({error})"),
-                },
+        match context.connect_authority().await {
+            Ok(authority) => match authority.observe_latest().await {
+                Ok(snapshot) => println!("remote latest: {}", revision(snapshot.revision())),
                 Err(error) => println!("remote: unavailable ({error})"),
             },
             Err(error) => println!("remote: unavailable ({error})"),
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let operator = operator()?;
-    if matches!(command, Command::Capabilities) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&config.capabilities(&operator))?
-        );
-        config.validate(&operator)?;
-        return Ok(ExitCode::SUCCESS);
-    }
     if let Command::Receipt { commit_id } = command {
         if config.model == Model::Direct {
-            return Err("Direct volumes have no Managed publication receipts".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "Direct volumes have no Managed publication receipts",
+            ));
         }
-        let authority = Volume::connect(&config, operator, token).await?;
+        let authority = context
+            .connect_authority()
+            .await
+            .map_err(|error| CliError::from_runtime(CliStage::Connect, error))?;
         let Some(receipt) = authority
             .observe_latest()
             .await?
@@ -269,7 +237,16 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
     if let Command::Mount { mountpoint } = command {
         #[cfg(target_os = "linux")]
         {
-            return match yinyang::fuse::run(config, operator, token, mountpoint).await? {
+            let operator = context.operator()?;
+            let service_token = context.service_token()?;
+            return match yinyang::fuse::run(
+                context.config.clone(),
+                operator,
+                service_token,
+                mountpoint,
+            )
+            .await?
+            {
                 yinyang::fuse::Outcome::Unmounted => Ok(ExitCode::SUCCESS),
                 yinyang::fuse::Outcome::TeardownExpired { grace } => {
                     eprintln!(
@@ -285,14 +262,21 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (operator, token, mountpoint);
-            return Err("the fuse frontend is implemented only on Linux".into());
+            let _ = mountpoint;
+            return Err(CliError::invalid(
+                CliStage::Admission,
+                "the fuse frontend is implemented only on Linux",
+            ));
         }
     }
     let Command::File { command } = command else {
-        return Err("with --volume use mount, file, sync, space, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve".into());
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            "with --volume use mount, file, sync, space, capabilities, receipt, or status; initialize object storage with yy create or service storage with yy serve",
+        ));
     };
-    let volume = Volume::open(config, operator, token).await?;
+    context.storage_capabilities()?;
+    let volume = context.open_file_volume().await?;
     let runtime = volume.runtime();
     match command {
         FileCommand::Open { path, write } => {
@@ -338,7 +322,7 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
                     file.write(position, &buffer[..count]).await?;
                     position = position
                         .checked_add(count as u64)
-                        .ok_or("offset overflow")?;
+                        .ok_or_else(|| CliError::invalid(CliStage::Argument, "offset overflow"))?;
                 }
             }
             let status = file.sync_local().await?;
@@ -388,7 +372,7 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
                 .await?
                 .resolve(&source)
                 .await?
-                .ok_or("source missing")?;
+                .ok_or_else(|| CliError::invalid(CliStage::Operation, "source missing"))?;
             let (parent, name) = destination(runtime, &target).await?;
             runtime.rename(node.id(), parent, &name).await?;
         }
@@ -399,7 +383,7 @@ pub async fn run(path: &Path, command: Command) -> Result<ExitCode, Box<dyn std:
                 .await?
                 .resolve(&path)
                 .await?
-                .ok_or("path missing")?;
+                .ok_or_else(|| CliError::invalid(CliStage::Operation, "path missing"))?;
             runtime.unlink(node.id()).await?;
         }
     }

@@ -41,7 +41,7 @@ names, so that namespace is outside the support boundary.
 
 ## Writable Mount
 
-- Explicit `read_only: false` requires staging. The effective capabilities
+- Explicit `read_only: false` requires staging. The admitted capabilities
   include whole-object write, append, truncate, remote fsync and recoverable
   staging, but omit Managed stable identity, atomic rename and retained unlink
   reads.

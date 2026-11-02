@@ -37,7 +37,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
 use yinyang::core::{
-    Authority, BackendProfile, CommitOutcome, Error, ErrorKind, Fs, NodeKind, Planner, Receipt,
+    Authority, CommitOutcome, Error, ErrorKind, Fs, NodeKind, Planner, Receipt,
     Result as CoreResult, Snapshot,
 };
 
@@ -645,7 +645,6 @@ impl Fixture {
             "storage_profile": "minio",
             "staging": state,
             "read_only": false,
-            "require": [],
         });
         if self.publication == Publication::Service {
             value["service_address"] = serde_json::Value::String(
@@ -1166,7 +1165,7 @@ impl Fixture {
         runtime().block_on(async {
             match self.publication {
                 Publication::Object => Arc::new(
-                    Fs::open(operator, BackendProfile::Minio)
+                    Fs::open(operator)
                         .await
                         .expect("open independent object authority"),
                 ) as Arc<dyn Authority>,

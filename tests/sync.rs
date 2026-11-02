@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Transaction};
+use yinyang::core::{Authority, CommitOutcome, Fs, NodeId, Revision, Transaction};
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::sync::{
     EditStatus, FileMetadata, NamespaceOperation, NamespaceState, RenameMode, Sync,
@@ -103,12 +103,7 @@ async fn exercise(authority: Arc<dyn Authority>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sync_is_independent_and_conditional_in_both_modes() {
     let backend = TestBackend::default();
-    exercise(Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    ))
-    .await;
+    exercise(Arc::new(Fs::create(backend.operator()).await.unwrap())).await;
     let backend = TestBackend::default();
     let temp = tempfile::tempdir().unwrap();
     let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
@@ -127,11 +122,7 @@ async fn sync_is_independent_and_conditional_in_both_modes() {
 #[tokio::test]
 async fn original_upload_survives_unknown_and_restart() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
         .await
@@ -671,12 +662,7 @@ async fn exercise_namespace(authority: Arc<dyn Authority>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn namespace_intents_are_durable_and_conflict_safe_in_both_modes() {
     let backend = TestBackend::default();
-    exercise_namespace(Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    ))
-    .await;
+    exercise_namespace(Arc::new(Fs::create(backend.operator()).await.unwrap())).await;
 
     let backend = TestBackend::default();
     let temp = tempfile::tempdir().unwrap();
@@ -697,11 +683,7 @@ async fn namespace_intents_are_durable_and_conflict_safe_in_both_modes() {
 #[tokio::test]
 async fn namespace_unknown_retries_the_original_request_after_restart() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let sync = Sync::open(authority.clone(), temp.path().join("sync"))
         .await
@@ -758,11 +740,7 @@ async fn namespace_unknown_retries_the_original_request_after_restart() {
 #[tokio::test]
 async fn namespace_unknown_survives_unavailable_recovery_and_resolves_once() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let sync = Sync::open(authority.clone(), temp.path().join("sync"))
         .await
@@ -810,11 +788,7 @@ async fn namespace_unknown_survives_unavailable_recovery_and_resolves_once() {
 #[tokio::test]
 async fn namespace_restore_failure_keeps_a_prepared_intent_retryable() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let sync = Sync::open(authority.clone(), temp.path().join("sync"))
         .await
@@ -841,11 +815,7 @@ async fn namespace_restore_failure_keeps_a_prepared_intent_retryable() {
 #[tokio::test]
 async fn namespace_post_dispatch_error_stays_unknown_and_resolves() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let fault = Arc::new(FaultAuthority::new(authority.clone()));
     let temp = tempfile::tempdir().unwrap();
     let sync = Sync::open(fault.clone(), temp.path().join("sync"))
@@ -874,11 +844,7 @@ async fn namespace_post_dispatch_error_stays_unknown_and_resolves() {
 #[tokio::test]
 async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let editor = Runtime::open(authority.clone(), temp.path().join("editor"))
         .await
@@ -928,11 +894,7 @@ async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
 #[tokio::test]
 async fn unsupported_and_partial_sync_schemas_are_not_repaired() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("sync");
     drop(Sync::open(authority.clone(), &state).await.unwrap());

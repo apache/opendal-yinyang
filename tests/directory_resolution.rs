@@ -29,7 +29,7 @@ use std::os::linux::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{Authority, BackendProfile, Fs};
+use yinyang::core::{Authority, Fs};
 use yinyang::replica::{Conflict, DirectorySync, Resolution, RunOutcome};
 use yinyang::sync::{FileMetadata, Sync};
 
@@ -201,11 +201,7 @@ async fn assert_noop_in_sync(sync: &mut DirectorySync) {
 async fn local_deletion_vs_remote_edit_resolves_both_ways() {
     for keep in [true, false] {
         let backend = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
         let temp = tempfile::tempdir().unwrap();
         let root = temp
             .path()
@@ -280,11 +276,7 @@ async fn local_deletion_vs_remote_edit_resolves_both_ways() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_directory_tree_kept_over_remote_deletion() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("payload");
     let state = temp.path().join("state");
@@ -345,11 +337,7 @@ async fn local_directory_tree_kept_over_remote_deletion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_directory_deletion_keeps_remote_children() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("payload");
     let state = temp.path().join("state");
@@ -415,11 +403,7 @@ async fn renamed_and_rename_rename_conflicts_keep_local() {
     // Rename elsewhere while the local file is edited: keep-local republishes
     // the local bytes under the recorded name.
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     remote_create_file(&authority, "source.txt", b"base").await;
 
@@ -465,11 +449,7 @@ async fn renamed_and_rename_rename_conflicts_keep_local() {
     // Rename against rename: keep-local must confirm the recorded local name
     // or republish it without ever failing against a stale predicate.
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     remote_create_file(&authority, "source.txt", b"base").await;
 

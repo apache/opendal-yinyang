@@ -26,12 +26,13 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::{CliError, CliResult, CliStage};
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use yinyang::core::Authority;
 use yinyang::replica as domain;
 use yinyang::replica::{DirectorySync, Replica};
-use yinyang::volume::{Access, Model, Volume, VolumeConfig};
+use yinyang::volume::{Access, Model, VolumeContext};
 
 /// Managed Sync subcommands. Every subcommand requires `--volume CONFIG`.
 #[derive(Subcommand)]
@@ -369,106 +370,60 @@ pub enum ArtifactPhase {
     Failed,
 }
 
-pub async fn run(
-    config_path: &Path,
-    command: SyncCommand,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let mut config = load_volume(config_path).await?;
-    if config.staging.is_relative() {
-        config.staging = config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(&config.staging);
+pub async fn run(context: VolumeContext, command: SyncCommand) -> CliResult<ExitCode> {
+    if context.config.model != Model::Managed || context.config.access != Access::Sync {
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            format!(
+                "managed sync requires a Managed volume with access=sync, found model={:?} access={:?}",
+                context.config.model, context.config.access
+            ),
+        ));
     }
-    let operator = admit(&config)?;
     match command {
-        SyncCommand::Status { json } => status(&config, operator, json).await,
-        SyncCommand::Init { directory } => init(&config, operator, &directory).await,
-        SyncCommand::Backup { output } => backup(&config, operator, &output).await,
-        SyncCommand::Restore { backup, directory } => {
-            restore(&config, operator, &backup, &directory).await
-        }
-        SyncCommand::Run => reconcile(&config, operator).await,
+        SyncCommand::Status { json } => status(&context, json).await,
+        SyncCommand::Init { directory } => init(&context, &directory).await,
+        SyncCommand::Backup { output } => backup(&context, &output).await,
+        SyncCommand::Restore { backup, directory } => restore(&context, &backup, &directory).await,
+        SyncCommand::Run => reconcile(&context).await,
         SyncCommand::Export {
             artifact,
             conflict,
             side,
             output,
-        } => export(&config, operator, artifact, conflict, side, &output).await,
+        } => export(&context, artifact, conflict, side, &output).await,
         SyncCommand::Resolve {
             conflict,
             keep,
             content,
-        } => resolve(&config, operator, &conflict, keep, content.as_deref()).await,
+        } => resolve(&context, &conflict, keep, content.as_deref()).await,
     }
-}
-
-async fn load_volume(path: &Path) -> Result<VolumeConfig, Box<dyn std::error::Error>> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| format!("read volume configuration {}: {error}", path.display()))?;
-    Ok(VolumeConfig::from_json(&bytes)?)
-}
-
-/// Builds the OpenDAL operator from `YINYANG_S3_*` without contacting storage.
-fn operator() -> Result<opendal::Operator, opendal::Error> {
-    let config = std::env::vars()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("YINYANG_S3_")
-                .map(|key| (key.to_ascii_lowercase(), value))
-        })
-        .collect::<Vec<_>>();
-    let operator = opendal::Operator::via_iter("s3", config)?;
-    #[cfg(feature = "benchmark-telemetry")]
-    let operator = yinyang::benchmark::instrument(operator);
-    Ok(operator)
-}
-
-/// Applies the same four-layer admission as every other volume command, then
-/// pins the exact Managed + Sync combination this frontend implements.
-fn admit(config: &VolumeConfig) -> Result<opendal::Operator, Box<dyn std::error::Error>> {
-    if config.model != Model::Managed || config.access != Access::Sync {
-        return Err(format!(
-            "managed sync requires a Managed volume with access=sync, found model={:?} access={:?}",
-            config.model, config.access
-        )
-        .into());
-    }
-    let operator = operator().map_err(|error| format!("storage configuration: {error}"))?;
-    config.validate(&operator)?;
-    Ok(operator)
-}
-
-fn token() -> Option<String> {
-    std::env::var("YINYANG_SERVICE_TOKEN").ok()
 }
 
 /// Connects the configured publication authority, if it is reachable.
-async fn connect(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-) -> Result<std::sync::Arc<dyn Authority>, Box<dyn std::error::Error>> {
-    Ok(Volume::connect(config, operator, token()).await?)
+async fn connect(context: &VolumeContext) -> CliResult<std::sync::Arc<dyn Authority>> {
+    context.storage_capabilities()?;
+    context
+        .connect_authority()
+        .await
+        .map_err(|error| CliError::from_runtime(CliStage::Connect, error))
 }
 
-async fn status(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-    json: bool,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+async fn status(context: &VolumeContext, json: bool) -> CliResult<ExitCode> {
+    let config = &context.config;
     // Classify the local binding without touching the authority, so an unbound
     // or invalid binding stays offline and never blocks on remote I/O.
     let local = DirectorySync::inspect_local(&config.staging, None)
         .await
-        .map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
     let inspection = match local.binding.state {
-        domain::BindingState::Bound => match connect(config, operator).await {
+        domain::BindingState::Bound => match connect(context).await {
             Ok(authority) => DirectorySync::inspect(authority, &config.staging)
                 .await
-                .map_err(fatal)?,
+                .map_err(|error| CliError::from_boxed(CliStage::Observe, error))?,
             Err(error) => DirectorySync::inspect_local(&config.staging, Some(error.to_string()))
                 .await
-                .map_err(fatal)?,
+                .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?,
         },
         _ => local,
     };
@@ -481,84 +436,84 @@ async fn status(
     Ok(ExitCode::from(code))
 }
 
-async fn init(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-    directory: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let authority = connect(config, operator).await?;
-    DirectorySync::init(authority, &config.staging, directory)
+async fn init(context: &VolumeContext, directory: &Path) -> CliResult<ExitCode> {
+    let authority = connect(context).await?;
+    DirectorySync::init(authority, &context.config.staging, directory)
         .await
-        .map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::LocalState, error))?;
     println!(
         "sync bound {} to state {}",
         directory.display(),
-        config.staging.display()
+        context.config.staging.display()
     );
     Ok(ExitCode::SUCCESS)
 }
 
-async fn backup(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-    output: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let authority = connect(config, operator).await?;
-    let directory = DirectorySync::open(authority, &config.staging)
+async fn backup(context: &VolumeContext, output: &Path) -> CliResult<ExitCode> {
+    let authority = connect(context).await?;
+    let directory = DirectorySync::open(authority, &context.config.staging)
         .await
-        .map_err(fatal)?;
-    directory.backup(output).await.map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
+    directory
+        .backup(output)
+        .await
+        .map_err(|error| CliError::from_boxed(CliStage::LocalState, error))?;
     println!("sync backup written to {}", output.display());
     Ok(ExitCode::SUCCESS)
 }
 
-async fn restore(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-    backup: &Path,
-    directory: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let authority = connect(config, operator).await?;
-    DirectorySync::restore(authority, backup, &config.staging, directory)
+async fn restore(context: &VolumeContext, backup: &Path, directory: &Path) -> CliResult<ExitCode> {
+    let authority = connect(context).await?;
+    DirectorySync::restore(authority, backup, &context.config.staging, directory)
         .await
-        .map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::LocalState, error))?;
     println!(
         "sync restored {} with state {}",
         directory.display(),
-        config.staging.display()
+        context.config.staging.display()
     );
     Ok(ExitCode::SUCCESS)
 }
 
-async fn reconcile(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let authority = connect(config, operator).await?;
-    let mut directory = DirectorySync::open(authority, &config.staging)
+async fn reconcile(context: &VolumeContext) -> CliResult<ExitCode> {
+    let authority = connect(context).await?;
+    let mut directory = DirectorySync::open(authority, &context.config.staging)
         .await
-        .map_err(fatal)?;
-    let outcome = directory.run().await.map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
+    let outcome = directory
+        .run()
+        .await
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
     report(&outcome)?;
     Ok(ExitCode::SUCCESS)
 }
 
 async fn export(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
+    context: &VolumeContext,
     artifact: Option<String>,
     conflict: Option<String>,
     side: Option<SyncSide>,
     output: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> CliResult<ExitCode> {
     let side = match (&artifact, &conflict) {
         (Some(_), None) => None,
-        (None, Some(_)) => Some(side.ok_or("--conflict requires --side local|remote")?),
+        (None, Some(_)) => Some(side.ok_or_else(|| {
+            CliError::invalid(
+                CliStage::Argument,
+                "--conflict requires --side local|remote",
+            )
+        })?),
         (Some(_), Some(_)) => {
-            return Err("--artifact and --conflict are mutually exclusive".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "--artifact and --conflict are mutually exclusive",
+            ));
         }
         (None, None) => {
-            return Err("export requires exactly one of --artifact or --conflict".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "export requires exactly one of --artifact or --conflict",
+            ));
         }
     };
     // `create_new` refuses to clobber an existing path, so a failed export can
@@ -568,20 +523,24 @@ async fn export(
         .create_new(true)
         .open(output)
         .map_err(|error| {
-            format!(
-                "create export {} (refusing to overwrite an existing path): {error}",
-                output.display()
+            CliError::new(
+                CliStage::Output,
+                crate::runtime_kind_from_io(error.kind()),
+                format!(
+                    "create export {} (refusing to overwrite an existing path): {error}",
+                    output.display()
+                ),
             )
         })?;
-    let outcome: Result<(), Box<dyn std::error::Error>> = if let Some(id) = &artifact {
+    let outcome: CliResult<()> = if let Some(id) = &artifact {
         // Retained bytes are local; export must not require remote connectivity.
-        export_artifact_local(config, id, &mut file).await
+        export_artifact_local(context, id, &mut file).await
     } else {
         let id = conflict.as_deref().expect("conflict selector present");
         match side.expect("conflict side present") {
             // The local side is durable local bytes; no authority is needed.
-            SyncSide::Local => export_conflict_local(config, id, &mut file),
-            SyncSide::Remote => export_conflict_remote(config, operator, id, &mut file).await,
+            SyncSide::Local => export_conflict_local(context, id, &mut file),
+            SyncSide::Remote => export_conflict_remote(context, id, &mut file).await,
         }
     };
     drop(file);
@@ -596,78 +555,104 @@ async fn export(
 /// Exports a retained artifact through the local replica, without connecting to
 /// the publication authority.
 async fn export_artifact_local(
-    config: &VolumeConfig,
+    context: &VolumeContext,
     id: &str,
     output: &mut dyn std::io::Write,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let inspection = DirectorySync::inspect_local(&config.staging, None)
+) -> CliResult<()> {
+    let inspection = DirectorySync::inspect_local(&context.config.staging, None)
         .await
-        .map_err(fatal)?;
-    let volume = inspection
-        .binding
-        .volume
-        .ok_or("sync state is not bound; run sync init")?;
-    let replica = Replica::open(&config.staging, volume)?;
-    replica.export_artifact(id, output)?;
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
+    let volume = inspection.binding.volume.ok_or_else(|| {
+        CliError::invalid(
+            CliStage::SyncState,
+            "sync state is not bound; run sync init",
+        )
+    })?;
+    let replica = Replica::open(&context.config.staging, volume).map_err(|error| {
+        CliError::new(
+            CliStage::LocalState,
+            runtime_kind_from_replica(error.kind()),
+            error.to_string(),
+        )
+    })?;
+    replica.export_artifact(id, output).map_err(|error| {
+        CliError::new(
+            CliStage::LocalState,
+            runtime_kind_from_replica(error.kind()),
+            error.to_string(),
+        )
+    })?;
     Ok(())
 }
 
 /// Exports a conflict's local side through the authority-free local reader.
 fn export_conflict_local(
-    config: &VolumeConfig,
+    context: &VolumeContext,
     id: &str,
     output: &mut dyn std::io::Write,
-) -> Result<(), Box<dyn std::error::Error>> {
-    yinyang::replica::export_conflict_local(&config.staging, id, output).map_err(fatal)?;
+) -> CliResult<()> {
+    yinyang::replica::export_conflict_local(&context.config.staging, id, output)
+        .map_err(|error| CliError::from_boxed(CliStage::LocalState, error))?;
     Ok(())
 }
 
 /// Exports a conflict's remote side. It reads a retained revision, so this path
 /// needs the publication authority.
 async fn export_conflict_remote(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
+    context: &VolumeContext,
     id: &str,
     output: &mut dyn std::io::Write,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let authority = connect(config, operator).await?;
-    let directory = DirectorySync::open(authority, &config.staging)
+) -> CliResult<()> {
+    let authority = connect(context).await?;
+    let directory = DirectorySync::open(authority, &context.config.staging)
         .await
-        .map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
     directory
         .export_conflict_side(id, "remote", output)
         .await
-        .map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::Observe, error))?;
     Ok(())
 }
 
 async fn resolve(
-    config: &VolumeConfig,
-    operator: opendal::Operator,
+    context: &VolumeContext,
     conflict: &str,
     keep: Option<SyncSide>,
     content: Option<&Path>,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> CliResult<ExitCode> {
     let decision = match (keep, content) {
         (Some(side), None) => side.domain_keep(),
         (None, Some(path)) => {
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|error| format!("read resolution content {}: {error}", path.display()))?;
+            let bytes = tokio::fs::read(path).await.map_err(|error| {
+                CliError::new(
+                    CliStage::LocalState,
+                    crate::runtime_kind_from_io(error.kind()),
+                    format!("read resolution content {}: {error}", path.display()),
+                )
+            })?;
             domain::Resolution::Content(bytes)
         }
         (Some(_), Some(_)) => {
-            return Err("--keep and --content are mutually exclusive".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "--keep and --content are mutually exclusive",
+            ));
         }
         (None, None) => {
-            return Err("resolve requires exactly one of --keep or --content".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "resolve requires exactly one of --keep or --content",
+            ));
         }
     };
-    let authority = connect(config, operator).await?;
-    let mut directory = DirectorySync::open(authority, &config.staging)
+    let authority = connect(context).await?;
+    let mut directory = DirectorySync::open(authority, &context.config.staging)
         .await
-        .map_err(fatal)?;
-    let outcome = directory.resolve(conflict, decision).await.map_err(fatal)?;
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
+    let outcome = directory
+        .resolve(conflict, decision)
+        .await
+        .map_err(|error| CliError::from_boxed(CliStage::SyncState, error))?;
     report(&outcome)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -676,13 +661,16 @@ async fn resolve(
 /// example, an observed v1 completion with a newer local v2). Only an
 /// unresolved `Unknown` outcome — a possibly published request with no receipt
 /// — must fail so the operator retries instead of treating it as lost.
-fn report(outcome: &domain::RunOutcome) -> Result<(), Box<dyn std::error::Error>> {
+fn report(outcome: &domain::RunOutcome) -> CliResult<()> {
     if outcome.unknown > 0 {
-        return Err(format!(
-            "{} sync outcome(s) are unknown; a request may still publish — inspect `sync status` and retry",
-            outcome.unknown
-        )
-        .into());
+        return Err(CliError::new(
+            CliStage::SyncState,
+            yinyang::runtime::ErrorKind::Unknown,
+            format!(
+                "{} sync outcome(s) are unknown; a request may still publish — inspect `sync status` and retry",
+                outcome.unknown
+            ),
+        ));
     }
     println!(
         "sync: published {} materialized {} pending {} conflicts {} in-sync {}",
@@ -699,13 +687,20 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Adapts the replica layer's boxed error to this adapter's error type while
-/// keeping the diagnostic text, which names the offending path.
-fn fatal(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {
-    error.to_string().into()
+fn runtime_kind_from_replica(kind: domain::ErrorKind) -> yinyang::runtime::ErrorKind {
+    use domain::ErrorKind as Kind;
+    use yinyang::runtime::ErrorKind as RuntimeKind;
+    match kind {
+        Kind::Invalid => RuntimeKind::Invalid,
+        Kind::Unsupported => RuntimeKind::Unsupported,
+        Kind::Conflict => RuntimeKind::Conflict,
+        Kind::Corrupt => RuntimeKind::Corrupt,
+        Kind::Busy => RuntimeKind::Busy,
+        Kind::Io => RuntimeKind::Io,
+    }
 }
 
-fn project(inspection: &domain::Inspection) -> Result<SyncStatus, String> {
+fn project(inspection: &domain::Inspection) -> CliResult<SyncStatus> {
     let entries = inspection
         .entries
         .iter()
@@ -954,7 +949,7 @@ fn project_artifact(artifact: &domain::Artifact) -> Result<ArtifactRecord, Strin
 
 /// Writes the status projection, propagating serialization or stdout failure
 /// instead of reporting success without a document.
-fn emit(document: &SyncStatus, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn emit(document: &SyncStatus, json: bool) -> CliResult<()> {
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
     if json {

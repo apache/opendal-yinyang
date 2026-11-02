@@ -18,7 +18,7 @@
 //! Real S3/FUSE acceptance for read-only Direct volumes.
 
 use crate::harness::{
-    Fixture, RequestCounter, assert_errno, effective_capabilities, local_paths, path_text, payload,
+    Fixture, RequestCounter, admitted_capabilities, assert_errno, local_paths, path_text, payload,
     read_fully_at, run_timeout,
 };
 use serde_json::Value;
@@ -121,7 +121,7 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
     let local_before = local_paths(fixture.temp.path());
 
     let capabilities = fixture.yy_ok(&["--volume", path_text(&config), "capabilities"]);
-    assert_direct_read_only_capabilities(&effective_capabilities(&capabilities.stdout));
+    assert_direct_read_only_capabilities(&admitted_capabilities(&capabilities.stdout));
 
     let doctor = fixture.yy_ok(&["--volume", path_text(&config), "doctor", "--json"]);
     let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
@@ -211,7 +211,7 @@ fn direct_read_only_default_admission_doctor_capabilities_and_fuse() {
 
     let explicit_true = fixture.config("direct-true", "fuse", Some(true), None);
     let capabilities = fixture.yy_ok(&["--volume", path_text(&explicit_true), "capabilities"]);
-    assert_direct_read_only_capabilities(&effective_capabilities(&capabilities.stdout));
+    assert_direct_read_only_capabilities(&admitted_capabilities(&capabilities.stdout));
 
     let explicit_false = fixture.config("direct-false", "fuse", Some(false), None);
     let requests = RequestCounter::start();

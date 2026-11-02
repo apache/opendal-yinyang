@@ -17,17 +17,17 @@
 
 //! CLI adapter for durable one-shot directory publication recovery.
 
+use crate::{CliError, CliResult, CliStage, exit_code_for_kind};
 use clap::Subcommand;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use uuid::Uuid;
 use yinyang::core::{CommitId, Fs, Receipt};
 use yinyang::runtime::{Error, ErrorKind};
 use yinyang::{DirectoryInspection, DirectoryJournal, DirectoryState, DirectoryStatus};
 
-const EXIT_UNCERTAIN: u8 = 3;
-const EXIT_NOT_PUBLISHED: u8 = 4;
 const SCHEMA: &str = "yinyang.publication.inspect.v1";
 
 #[derive(Subcommand)]
@@ -96,11 +96,7 @@ struct FailureDocument {
     commit_id: Option<String>,
 }
 
-pub async fn inspect(
-    commit_id: Option<Uuid>,
-    state: &Path,
-    json: bool,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub async fn inspect(commit_id: Option<Uuid>, state: &Path, json: bool) -> CliResult<ExitCode> {
     let inspection = DirectoryJournal::inspect(state).await?;
     let document = project_inspection(&inspection, commit_id)?;
     if json {
@@ -111,10 +107,7 @@ pub async fn inspect(
     Ok(ExitCode::SUCCESS)
 }
 
-pub async fn run(
-    fs: &Fs,
-    command: PublicationCommand,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub async fn run(fs: &Fs, command: PublicationCommand) -> CliResult<ExitCode> {
     match command {
         PublicationCommand::Inspect { .. } => {
             unreachable!("inspection is handled without a backend")
@@ -128,10 +121,7 @@ pub async fn run(
     }
 }
 
-pub async fn publish(
-    journal: &DirectoryJournal,
-    commit_id: CommitId,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub async fn publish(journal: &DirectoryJournal, commit_id: CommitId) -> CliResult<ExitCode> {
     match journal.publish(commit_id).await {
         Ok(receipt) => {
             print_receipt(&receipt);
@@ -144,7 +134,7 @@ pub async fn publish(
 pub fn classify_outcome(
     outcome: yinyang::core::CommitOutcome,
     commit_id: Uuid,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> CliResult<ExitCode> {
     match outcome {
         yinyang::core::CommitOutcome::Committed(receipt) => {
             println!(
@@ -157,52 +147,48 @@ pub fn classify_outcome(
             eprintln!(
                 "yy: original namespace predicates changed; publication conflicts are not retryable"
             );
-            Ok(ExitCode::from(EXIT_NOT_PUBLISHED))
+            Ok(ExitCode::from(exit_code_for_kind(ErrorKind::Conflict)))
         }
         yinyang::core::CommitOutcome::Retryable => {
             eprintln!(
                 "yy: publication did not commit; retry the frozen request with a durable publication journal"
             );
-            Ok(ExitCode::from(EXIT_NOT_PUBLISHED))
+            Ok(ExitCode::from(exit_code_for_kind(ErrorKind::Retryable)))
         }
         yinyang::core::CommitOutcome::Unknown(_) => {
             eprintln!(
                 "yy: publication outcome is unknown; query `yy receipt {commit_id}`; an absent receipt does not prove failure"
             );
-            Ok(ExitCode::from(EXIT_UNCERTAIN))
+            Ok(ExitCode::from(exit_code_for_kind(ErrorKind::Unknown)))
         }
     }
 }
 
-async fn retry(
-    fs: &Fs,
-    state: &Path,
-    commit_id: Uuid,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let journal = DirectoryJournal::open(fs, state).await?;
+async fn retry(fs: &Fs, state: &Path, commit_id: Uuid) -> CliResult<ExitCode> {
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
     publish(&journal, CommitId::from_bytes(*commit_id.as_bytes())).await
 }
 
-async fn export(
-    fs: &Fs,
-    state: &Path,
-    commit_id: Uuid,
-    destination: &Path,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let journal = DirectoryJournal::open(fs, state).await?;
+async fn export(fs: &Fs, state: &Path, commit_id: Uuid, destination: &Path) -> CliResult<ExitCode> {
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
     let id = CommitId::from_bytes(*commit_id.as_bytes());
     let status = journal.status(id).await?.ok_or_else(|| {
-        format!(
-            "publication intent {commit_id} is not present in {}",
-            state.display()
+        CliError::invalid(
+            CliStage::Publication,
+            format!(
+                "publication intent {commit_id} is not present in {}",
+                state.display()
+            ),
         )
     })?;
     if !status.can_export() {
-        return Err(format!(
-            "publication intent {commit_id} cannot be exported from state {}",
-            state.display()
-        )
-        .into());
+        return Err(CliError::invalid(
+            CliStage::Publication,
+            format!(
+                "publication intent {commit_id} cannot be exported from state {}",
+                state.display()
+            ),
+        ));
     }
     journal.export(id, destination).await?;
     println!(
@@ -216,7 +202,7 @@ async fn classify_journal_error(
     journal: &DirectoryJournal,
     commit_id: CommitId,
     error: Error,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+) -> CliResult<ExitCode> {
     let status = journal.status(commit_id).await.ok().flatten();
     if let Some(status) = status {
         match &status.state {
@@ -229,11 +215,11 @@ async fn classify_journal_error(
                     "yy: {error}; publication outcome is unknown, query `yy receipt {}`; an absent receipt does not prove failure",
                     commit_uuid(commit_id)
                 );
-                return Ok(ExitCode::from(EXIT_UNCERTAIN));
+                return Ok(ExitCode::from(exit_code_for_kind(ErrorKind::Unknown)));
             }
             DirectoryState::Conflict | DirectoryState::Retryable => {
                 eprintln!("yy: {error}");
-                return Ok(ExitCode::from(EXIT_NOT_PUBLISHED));
+                return Ok(ExitCode::from(exit_code_for_kind(ErrorKind::Conflict)));
             }
             DirectoryState::Prepared | DirectoryState::Failed => {}
         }
@@ -244,11 +230,11 @@ async fn classify_journal_error(
                 "yy: {error}; query `yy receipt {}`; an absent receipt does not prove failure",
                 commit_uuid(commit_id)
             );
-            Ok(ExitCode::from(EXIT_UNCERTAIN))
+            Ok(ExitCode::from(exit_code_for_kind(ErrorKind::Unknown)))
         }
         ErrorKind::Conflict | ErrorKind::Retryable => {
             eprintln!("yy: {error}");
-            Ok(ExitCode::from(EXIT_NOT_PUBLISHED))
+            Ok(ExitCode::from(exit_code_for_kind(error.kind())))
         }
         _ => Err(error.into()),
     }
@@ -257,7 +243,7 @@ async fn classify_journal_error(
 fn project_inspection(
     inspection: &DirectoryInspection,
     selected: Option<Uuid>,
-) -> Result<InspectionDocument, String> {
+) -> CliResult<InspectionDocument> {
     let mut intents = inspection
         .intents
         .iter()
@@ -270,9 +256,12 @@ fn project_inspection(
     if intents.is_empty()
         && let Some(selected) = selected
     {
-        return Err(format!(
-            "publication intent {} is not present in the journal",
-            selected
+        return Err(CliError::invalid(
+            CliStage::Publication,
+            format!(
+                "publication intent {} is not present in the journal",
+                selected
+            ),
         ));
     }
     intents.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));

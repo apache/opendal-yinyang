@@ -32,7 +32,8 @@ use futures_util::future::BoxFuture;
 use opendal::Operator;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -40,7 +41,132 @@ use tokio::io::AsyncRead;
 mod transport;
 pub use transport::{ServiceClient, serve};
 
+#[cfg(test)]
+mod connection_tracking {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static OPENS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> = OnceLock::new();
+
+    pub(super) fn record(path: &Path) {
+        let mut opens = OPENS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("connection counter lock");
+        *opens.entry(path.to_owned()).or_default() += 1;
+    }
+
+    pub(super) fn count(path: &Path) -> u64 {
+        OPENS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("connection counter lock")
+            .get(path)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 type Db = Arc<Mutex<Connection>>;
+const ROLLBACK_FAILURE_PREFIX: &str = "yy metadata service: ROLLBACK failed";
+
+struct SqliteTransaction {
+    writer: Db,
+    gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    poisoned: Arc<AtomicBool>,
+    active: bool,
+}
+
+impl SqliteTransaction {
+    fn new(writer: Db, gate: tokio::sync::OwnedMutexGuard<()>, poisoned: Arc<AtomicBool>) -> Self {
+        Self {
+            writer,
+            gate: Some(gate),
+            poisoned,
+            active: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+
+    async fn rollback(mut self) {
+        let result = db_call(&self.writer, |connection| {
+            rollback_connection(connection).map_err(|message| {
+                Error::new(ErrorKind::Storage, "rollback metadata transaction", message)
+            })
+        })
+        .await;
+        if let Err(error) = result {
+            report_rollback_failure(&self.poisoned, error);
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for SqliteTransaction {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(gate) = self.gate.take() else {
+            return;
+        };
+        // Dropping the cancelled future removes every handle that could enqueue
+        // another db_call. At most one already-running blocking call can still
+        // hold the writer mutex; this cleanup waits for it, then rolls back, and
+        // keeps the gate until cleanup finishes.
+        let writer = self.writer.clone();
+        let poisoned = self.poisoned.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn_blocking(move || {
+                if let Err(error) = rollback_sync(&writer) {
+                    report_rollback_failure(&poisoned, error);
+                }
+                drop(gate);
+            }));
+        } else {
+            if let Err(error) = rollback_sync(&writer) {
+                report_rollback_failure(&poisoned, error);
+            }
+            drop(gate);
+        }
+    }
+}
+
+fn rollback_sync(writer: &Db) -> std::result::Result<(), String> {
+    let connection = writer
+        .lock()
+        .map_err(|_| "writer connection lock is poisoned".to_owned())?;
+    rollback_connection(&connection)
+}
+
+fn rollback_connection(connection: &Connection) -> std::result::Result<(), String> {
+    match connection.execute_batch("ROLLBACK") {
+        Ok(()) => Ok(()),
+        Err(_) if connection.is_autocommit() => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn report_rollback_failure(poisoned: &AtomicBool, error: impl std::fmt::Display) {
+    poisoned.store(true, Ordering::Release);
+    eprintln!("{ROLLBACK_FAILURE_PREFIX}: {error}; reopen the metadata service");
+}
+
+fn ensure_writer_healthy(poisoned: &AtomicBool) -> Result<()> {
+    if poisoned.load(Ordering::Acquire) {
+        return Err(Error::new(
+            ErrorKind::Storage,
+            "metadata database",
+            "writer connection is unusable after a failed ROLLBACK; reopen the metadata service",
+        ));
+    }
+    Ok(())
+}
+
 const REQUIRED_TABLES: [&str; 4] = ["authority", "prepared", "records", "revisions"];
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const AUTHORITY_COLUMNS: [(&str, &str); 5] = [
@@ -60,11 +186,14 @@ const RECORDS_COLUMNS: [(&str, &str); 5] = [
 ];
 const REVISIONS_COLUMNS: [(&str, &str); 2] = [("token", "BLOB"), ("sequence", "INTEGER")];
 
-/// One durable filesystem authority. Clones and independent processes coordinate
-/// through SQLite; no process-local cache determines the latest revision.
+/// One durable filesystem authority. Clones share one writer and one reader
+/// connection; independent processes still coordinate through SQLite.
 #[derive(Clone, Debug)]
 pub struct MetadataService {
-    path: PathBuf,
+    writer: Db,
+    reader: Db,
+    write_gate: Arc<tokio::sync::Mutex<()>>,
+    writer_poisoned: Arc<AtomicBool>,
     data: DataStore,
     filesystem: NodeId,
     root: NodeId,
@@ -203,6 +332,8 @@ async fn db_call<T: Send + 'static>(
     })?
 }
 async fn connect(path: &Path, create: bool) -> Result<Db> {
+    #[cfg(test)]
+    connection_tracking::record(path);
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
@@ -230,12 +361,13 @@ async fn connect(path: &Path, create: bool) -> Result<Db> {
 }
 
 async fn connect_read_only(path: &Path) -> Result<Db> {
+    #[cfg(test)]
+    connection_tracking::record(path);
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(sql)?;
         conn.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
-        conn.execute_batch("PRAGMA query_only=ON;").map_err(sql)?;
         if !inspect_schema(&conn)? {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -243,6 +375,10 @@ async fn connect_read_only(path: &Path) -> Result<Db> {
                 "database is missing or uninitialized",
             ));
         }
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA query_only=ON;",
+        )
+        .map_err(sql)?;
         Ok(Arc::new(Mutex::new(conn)))
     })
     .await
@@ -299,8 +435,8 @@ impl MetadataService {
     /// Initialize a new local database or reopen its exact existing authority.
     pub async fn create(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let db = connect(&path, true).await?;
-        let (filesystem, root, _) = db_call(&db, |conn| {
+        let writer = connect(&path, true).await?;
+        let (filesystem, root, _) = db_call(&writer, |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
             tx.execute_batch("CREATE TABLE IF NOT EXISTS authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL, root BLOB NOT NULL, latest BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS revisions(token BLOB PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL);
@@ -320,8 +456,12 @@ impl MetadataService {
             tx.commit().map_err(sql)?;
             Ok(result)
         }).await?;
+        let reader = connect_read_only(&path).await?;
         let fs = Self {
-            path,
+            writer,
+            reader,
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            writer_poisoned: Arc::new(AtomicBool::new(false)),
             data: DataStore::new(operator.clone(), filesystem)?,
             filesystem,
             root,
@@ -342,10 +482,14 @@ impl MetadataService {
     }
     pub async fn open(path: impl AsRef<Path>, operator: Operator) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let db = connect(&path, false).await?;
-        let (filesystem, root, _) = db_call(&db, |c| manifest(c)).await?;
+        let writer = connect(&path, false).await?;
+        let (filesystem, root, _) = db_call(&writer, |c| manifest(c)).await?;
+        let reader = connect_read_only(&path).await?;
         let fs = Self {
-            path,
+            writer,
+            reader,
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            writer_poisoned: Arc::new(AtomicBool::new(false)),
             data: DataStore::new(operator.clone(), filesystem)?,
             filesystem,
             root,
@@ -396,12 +540,11 @@ impl MetadataService {
         }
     }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
-        let db = connect(&self.path, false).await?;
-        let (fs, root, revision) = db_call(&db, |c| manifest(c)).await?;
+        let (fs, root, revision) = db_call(&self.reader, |c| manifest(c)).await?;
         if fs != self.filesystem || root != self.root {
             return Err(Error::invalid("observe service", "authority changed"));
         }
-        Ok(self.snapshot(db, revision))
+        Ok(self.snapshot(self.reader.clone(), revision))
     }
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         if revision.sequence > i64::MAX as u64 {
@@ -411,8 +554,7 @@ impl MetadataService {
                 "revision not retained",
             ));
         }
-        let db = connect(&self.path, false).await?;
-        db_call(&db, move |c| {
+        db_call(&self.reader, move |c| {
             let exists: bool = c
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
@@ -430,7 +572,7 @@ impl MetadataService {
             Ok(())
         })
         .await?;
-        Ok(self.snapshot(db, revision))
+        Ok(self.snapshot(self.reader.clone(), revision))
     }
     /// Read a bounded page from the durable retained revision index without
     /// changing journal mode, taking the writer transaction, or recovering.
@@ -445,9 +587,8 @@ impl MetadataService {
                 format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
             ));
         }
-        let db = connect_read_only(&self.path).await?;
         let after = after.map(Revision::to_bytes);
-        let mut revisions = db_call(&db, move |conn| {
+        let mut revisions = db_call(&self.reader, move |conn| {
             let limit = i64::from(limit) + 1;
             let mut rows = Vec::new();
             if let Some(after) = after.as_ref() {
@@ -602,8 +743,9 @@ impl MetadataService {
     }
     pub(crate) async fn remember(&self, content: &PreparedContent) -> Result<()> {
         let descriptor = self.data.accept(content)?.to_bytes();
-        let db = connect(&self.path, false).await?;
-        db_call(&db, move |c| {
+        let _guard = self.write_gate.lock().await;
+        ensure_writer_healthy(&self.writer_poisoned)?;
+        db_call(&self.writer, move |c| {
             c.execute(
                 "INSERT OR IGNORE INTO prepared(descriptor) VALUES(?1)",
                 params![descriptor],
@@ -622,11 +764,10 @@ impl MetadataService {
     pub async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
         let (revision, files) = Transaction::inspect(bytes)?;
         let snapshot = self.observe_revision(revision).await?;
-        let db = connect(&self.path, false).await?;
         let mut prepared = Vec::new();
         for file in files {
             let descriptor = file.to_bytes();
-            let present = db_call(&db, move |c| {
+            let present = db_call(&self.reader, move |c| {
                 c.query_row(
                     "SELECT EXISTS(SELECT 1 FROM prepared WHERE descriptor=?1)",
                     params![descriptor],
@@ -661,13 +802,15 @@ impl MetadataService {
         if requests.is_empty() {
             return Ok(vec![]);
         }
+        let gate = Arc::clone(&self.write_gate).lock_owned().await;
+        ensure_writer_healthy(&self.writer_poisoned)?;
         // Even an in-process caller must have registered durable readiness.
         let mut restored = Vec::new();
         for request in requests {
             request.validate(self.filesystem)?;
             restored.push(self.restore_transaction(&request.to_bytes()?).await?);
         }
-        let result = self.publish(&restored).await;
+        let result = self.publish(&restored, gate).await;
         match result {
             Err(e) if e.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
@@ -675,14 +818,35 @@ impl MetadataService {
             other => other,
         }
     }
-    async fn publish(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
-        let db = connect(&self.path, false).await?;
-        db_call(&db, |c| {
+    async fn publish(
+        &self,
+        requests: &[Transaction],
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Vec<Outcome>> {
+        let transaction =
+            SqliteTransaction::new(self.writer.clone(), gate, Arc::clone(&self.writer_poisoned));
+        let result = self.publish_inner(requests).await;
+        if result.as_ref().is_err()
+            || result.as_ref().is_ok_and(|outcomes| {
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, Outcome::Unknown(_)))
+            })
+        {
+            transaction.rollback().await;
+        } else {
+            transaction.disarm();
+        }
+        result
+    }
+    // The caller holds the writer gate for the complete SQLite transaction.
+    async fn publish_inner(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        db_call(&self.writer, |c| {
             c.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
             Ok(())
         })
         .await?;
-        let (_, _, old) = db_call(&db, |c| manifest(c)).await?;
+        let (_, _, old) = db_call(&self.writer, |c| manifest(c)).await?;
         let sequence = old
             .sequence
             .checked_add(1)
@@ -690,7 +854,7 @@ impl MetadataService {
             .ok_or_else(|| Error::unsupported("service commit", "revision exhausted"))?;
         let revision = Revision::new(sequence);
         // This view observes preceding accepted members inside this SQL transaction.
-        let candidate = self.snapshot(db.clone(), revision);
+        let candidate = self.snapshot(self.writer.clone(), revision);
         let mut outcomes = Vec::new();
         let mut ordinal = 0;
         for request in requests {
@@ -721,7 +885,7 @@ impl MetadataService {
             .encode()?;
             let id = *request.id().as_bytes();
             let key = receipt.cursor.key();
-            db_call(&db, move |c| {
+            db_call(&self.writer, move |c| {
                 for (family, rows) in [
                     (0, delta.nodes),
                     (1, delta.entries),
@@ -757,14 +921,14 @@ impl MetadataService {
             ordinal += 1;
         }
         if ordinal == 0 {
-            db_call(&db, |c| {
+            db_call(&self.writer, |c| {
                 c.execute_batch("ROLLBACK").map_err(sql)?;
                 Ok(())
             })
             .await?;
             return Ok(outcomes);
         }
-        db_call(&db, move |c| {
+        db_call(&self.writer, move |c| {
             c.execute(
                 "INSERT INTO revisions(token,sequence) VALUES(?1,?2)",
                 params![revision.to_bytes().as_slice(), sequence as i64],
@@ -779,7 +943,7 @@ impl MetadataService {
         })
         .await?;
         // A failed durability acknowledgement is not proof of rollback.
-        if db_call(&db, |c| {
+        if db_call(&self.writer, |c| {
             c.execute_batch("COMMIT").map_err(sql)?;
             Ok(())
         })
@@ -968,5 +1132,110 @@ mod admission_tests {
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .unwrap();
         assert_eq!(synchronous, 2);
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use crate::{CommitId, Planner};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_service_reuses_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metadata.db");
+        let backend = TestBackend::default();
+        let service = MetadataService::create(&path, backend.operator())
+            .await
+            .unwrap();
+        assert_eq!(connection_tracking::count(&path), 2);
+
+        let observed = service.observe_latest().await.unwrap();
+        let content = service.prepare(&mut b"reused".as_slice()).await.unwrap();
+        let mut planner = Planner::new(&observed, CommitId::generate());
+        planner
+            .create_file(service.root(), "file", content, false)
+            .await
+            .unwrap();
+        let request = planner.finish().unwrap();
+        service.commit(&request).await.unwrap();
+        service.observe_revision(observed.revision()).await.unwrap();
+        service.retained_revisions_page(None, 2).await.unwrap();
+        service
+            .restore_transaction(&request.to_bytes().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(connection_tracking::count(&path), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_publication_transaction_releases_the_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        let gate = Arc::clone(&service.write_gate).lock_owned().await;
+        db_call(&service.writer, |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        drop(SqliteTransaction::new(
+            service.writer.clone(),
+            gate,
+            Arc::clone(&service.writer_poisoned),
+        ));
+
+        let _gate = Arc::clone(&service.write_gate).lock_owned().await;
+        db_call(&service.writer, |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+            connection.execute_batch("ROLLBACK").map_err(sql)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn rollback_accepts_an_already_finished_transaction() {
+        let connection = Connection::open_in_memory().unwrap();
+        assert!(rollback_connection(&connection).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_writer_requires_service_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+            .await
+            .unwrap();
+        service.writer_poisoned.store(true, Ordering::Release);
+
+        let content = service
+            .data()
+            .prepare(&mut b"poisoned".as_slice())
+            .await
+            .unwrap();
+        let error = service.remember(&content).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("reopen the metadata service"));
+
+        let observed = service.observe_latest().await.unwrap();
+        let mut planner = Planner::new(&observed, CommitId::generate());
+        planner
+            .create_file(service.root(), "file", content, false)
+            .await
+            .unwrap();
+        let error = service
+            .commit(&planner.finish().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("reopen the metadata service"));
     }
 }

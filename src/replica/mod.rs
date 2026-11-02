@@ -24,6 +24,7 @@
 mod backup;
 pub mod directory;
 mod error;
+mod layout;
 pub(super) mod linux;
 pub(super) mod state;
 
@@ -35,6 +36,7 @@ pub use directory::{
     RemoteEvidence, RemoteStatus, Resolution, RunOutcome, StatusSummary, export_conflict_local,
 };
 pub use error::{Error, ErrorKind, Result};
+pub use layout::check_root_state;
 pub use linux::{
     ARTIFACT_BUDGET_BYTES, ARTIFACT_BUDGET_COUNT, Artifact, ArtifactKind, CapturedContent,
     Conflict, ContentHash, Identity, InstallOutcome, LocalKind, LocalNode, LocalSnapshot,

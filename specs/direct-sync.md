@@ -31,8 +31,9 @@ Direct Sync requires a Linux host and this configuration combination:
 ```
 
 The existing `staging` field is the Direct Sync state directory. It is not
-object payload staging for a Managed runtime. It must be non-empty, outside the
-local root, on the same filesystem as the local root, and writable only as
+object payload staging for a Managed runtime. It must be non-empty, distinct
+from the local root, and neither path may contain the other. Both paths must be
+on the same filesystem, and the state directory must be writable only as
 required by the installing account. The state directory must not grant group or
 other permissions. It is dedicated to one Direct Sync binding and must not be
 shared with a writable Direct Mount runtime or another Sync root.
@@ -270,9 +271,10 @@ may create an empty WAL or update derived shared-memory state, but existing
 logical rows and accepted bytes remain unchanged. A conflict's local and remote
 bytes are retained locally, so both sides can be exported offline.
 
-Exit code `0` means a valid status or completed finite command, `3` means the
-state is unbound, `4` means the binding is invalid, and `1` means an argument,
-admission or unexpected command failure.
+Exit code `0` means a valid status or completed finite command. Exit code `3`
+means the state is unbound or the operation ended `Unknown`; `4` means the
+binding is invalid or the operation ended `Conflict` or `Retryable`. `1` means
+an argument, admission or other command failure.
 
 ## Limits
 

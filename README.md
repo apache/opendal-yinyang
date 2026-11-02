@@ -158,7 +158,7 @@ SQLite authority with authenticated loopback RPC. Start it with
 
 The [file runtime](specs/file-runtime.md) supports pinned handles, durable local
 write/append/truncate, conditional remote fsync, and restart recovery over either
-publication authority. Configure the [volume and required capabilities](specs/volume-capabilities.md),
+publication authority. Configure [volume admission](specs/volume-capabilities.md),
 then use `yy --volume volume.json file ...` and `yy --volume volume.json status`.
 Local write acknowledgment and remote publication are reported separately.
 The file runtime's library frontend installs no mount; directory reconciliation

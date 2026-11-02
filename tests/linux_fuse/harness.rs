@@ -31,7 +31,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, BackendProfile, CommitId, CommitOutcome, Fs, Planner};
+use yinyang::core::{Authority, CommitId, CommitOutcome, Fs, Planner};
 use yinyang::runtime::Runtime as YinYangRuntime;
 
 #[path = "../support/yy.rs"]
@@ -452,7 +452,7 @@ impl Fixture {
     ) -> PathBuf {
         let staging = self.temp.path().join(name);
         let mut json = format!(
-            "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {},\n  \"require\": []",
+            "{{\n  \"name\": {},\n  \"model\": \"managed\",\n  \"access\": \"mount\",\n  \"frontend\": \"{}\",\n  \"publication\": \"{}\",\n  \"storage_profile\": \"minio\",\n  \"staging\": {},\n  \"read_only\": {}",
             json_string(name),
             frontend.as_str(),
             self.publication().as_str(),
@@ -486,7 +486,7 @@ impl Fixture {
         runtime.block_on(async move {
             let authority: Arc<dyn Authority> = match publication {
                 Publication::Object => Arc::new(
-                    Fs::open(operator, BackendProfile::Minio)
+                    Fs::open(operator)
                         .await
                         .expect("open object authority for batch seed"),
                 ),
@@ -941,7 +941,7 @@ impl Fixture {
         runtime.block_on(async move {
             let authority: Arc<dyn Authority> = match publication {
                 Publication::Object => Arc::new(
-                    Fs::open(operator, BackendProfile::Minio)
+                    Fs::open(operator)
                         .await
                         .expect("open in-process object authority"),
                 ),

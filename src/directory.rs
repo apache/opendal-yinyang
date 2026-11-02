@@ -21,8 +21,8 @@ use std::path::Path;
 use std::time::SystemTime;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use yinyang_core::{
-    CommitId, CommitOutcome, ContentDescriptor, ContentId, Error, ErrorKind, Fs, Node, NodeKind,
-    Planner, Result, Revision, Snapshot, Transaction,
+    Authority, CommitId, CommitOutcome, ContentDescriptor, ContentId, Error, ErrorKind, Node,
+    NodeKind, Planner, Result, Revision, Snapshot, Transaction,
 };
 
 mod journal;
@@ -58,26 +58,26 @@ enum ManifestKind {
 /// node and directory. Keep the returned transaction to retry identical intent
 /// without scanning local files or uploading prepared content again.
 pub async fn prepare_directory(
-    fs: &Fs,
+    authority: &dyn Authority,
     observed: &Snapshot,
     source: &Path,
     id: CommitId,
 ) -> Result<Transaction> {
-    Ok(prepare_directory_request(fs, observed, source, id)
+    Ok(prepare_directory_request(authority, observed, source, id)
         .await?
         .transaction)
 }
 
 async fn prepare_directory_request(
-    fs: &Fs,
+    authority: &dyn Authority,
     observed: &Snapshot,
     source: &Path,
     id: CommitId,
 ) -> Result<PreparedDirectory> {
-    check_filesystem(fs, observed)?;
+    check_filesystem(authority, observed)?;
     let manifest = scan(source).await?;
     // Recover readiness under this process's authority, including after reopen.
-    let observed = fs.observe_revision(observed.revision()).await?;
+    let observed = authority.observe_revision(observed.revision()).await?;
     let mut planner = Planner::new(&observed, id);
     let mut remote = BTreeMap::<String, Node>::new();
     let mut pending = vec![(String::new(), observed.root())];
@@ -101,12 +101,13 @@ async fn prepare_directory_request(
             planner.remove(node.id()).await?;
         }
     }
-    let empty = fs.data().prepare(&mut b"".as_slice()).await?;
-    let mut identities = BTreeMap::from([(String::new(), fs.root())]);
+    let mut empty_source = b"".as_slice();
+    let empty = authority.prepare(&mut empty_source).await?;
+    let mut identities = BTreeMap::from([(String::new(), authority.root())]);
     let mut contents = BTreeMap::<String, ContentDescriptor>::new();
     for (path, entry) in &manifest {
         let id = if path.is_empty() {
-            fs.root()
+            authority.root()
         } else if let Some(node) = remote
             .get(path)
             .filter(|n| n.is_directory() == entry.directory)
@@ -146,7 +147,7 @@ async fn prepare_directory_request(
             .is_none_or(|file| file.content_id() != identity)
         {
             input.rewind().await.map_err(|e| io_error(&local, e))?;
-            let prepared = fs.data().prepare(&mut input).await?;
+            let prepared = authority.prepare(&mut input).await?;
             if prepared.content_id() != identity {
                 return Err(source_changed());
             }
@@ -200,15 +201,16 @@ async fn prepare_directory_request(
 }
 
 /// One-shot convenience. For an uncertain retry, retain prepare_directory's
-/// Transaction and call Fs::commit again; do not replan under the same identity.
+/// Transaction and call Authority::commit again; do not replan under the same
+/// identity.
 pub async fn publish_directory(
-    fs: &Fs,
+    authority: &dyn Authority,
     observed: &Snapshot,
     source: &Path,
     id: CommitId,
 ) -> Result<CommitOutcome> {
-    let request = prepare_directory(fs, observed, source, id).await?;
-    fs.commit(&request).await
+    let request = prepare_directory(authority, observed, source, id).await?;
+    authority.commit(&request).await
 }
 
 /// Materialize names only for a whole-directory operation, not core publication.
@@ -240,8 +242,12 @@ pub async fn directory_nodes(observed: &Snapshot) -> Result<BTreeMap<String, Nod
 
 /// Restore a pinned snapshot into a new destination, installing each verified
 /// file without replacement. Whole-directory installation is not atomic.
-pub async fn restore_directory(fs: &Fs, observed: &Snapshot, destination: &Path) -> Result<()> {
-    check_filesystem(fs, observed)?;
+pub async fn restore_directory(
+    authority: &dyn Authority,
+    observed: &Snapshot,
+    destination: &Path,
+) -> Result<()> {
+    check_filesystem(authority, observed)?;
     let nodes = directory_nodes(observed).await?;
     let entries = nodes
         .into_iter()
@@ -258,17 +264,17 @@ pub async fn restore_directory(fs: &Fs, observed: &Snapshot, destination: &Path)
             }
         })
         .collect();
-    install_directory(fs, destination, entries).await
+    install_directory(authority, destination, entries).await
 }
 
 /// Restore a retained historical revision into a new destination.
 pub async fn restore_directory_revision(
-    fs: &Fs,
+    authority: &dyn Authority,
     revision: Revision,
     destination: &Path,
 ) -> Result<()> {
-    let observed = fs.observe_revision(revision).await?;
-    restore_directory(fs, &observed, destination).await
+    let observed = authority.observe_revision(revision).await?;
+    restore_directory(authority, &observed, destination).await
 }
 
 struct InstallEntry {
@@ -279,11 +285,11 @@ struct InstallEntry {
 }
 
 async fn install_directory(
-    fs: &Fs,
+    authority: &dyn Authority,
     destination: &Path,
     mut entries: Vec<InstallEntry>,
 ) -> Result<()> {
-    validate_install_entries(fs, &entries)?;
+    validate_install_entries(authority, &entries)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     tokio::fs::create_dir(destination)
         .await
@@ -311,7 +317,7 @@ async fn install_directory(
                 .map_err(|e| io_error(&target, e))?;
         let (output, temporary) = staged.into_parts();
         let mut output = tokio::fs::File::from_std(output);
-        let copied = fs
+        let copied = authority
             .data()
             .read_range(&file, 0..file.content_id().length(), &mut output)
             .await;
@@ -341,7 +347,7 @@ async fn install_directory(
     Ok(())
 }
 
-fn validate_install_entries(fs: &Fs, entries: &[InstallEntry]) -> Result<()> {
+fn validate_install_entries(authority: &dyn Authority, entries: &[InstallEntry]) -> Result<()> {
     let mut paths = BTreeMap::<&str, &InstallEntry>::new();
     for entry in entries {
         if paths.insert(&entry.path, entry).is_some() {
@@ -356,7 +362,8 @@ fn validate_install_entries(fs: &Fs, entries: &[InstallEntry]) -> Result<()> {
         }
         match (entry.kind, &entry.content) {
             (ManifestKind::Directory, None) => {}
-            (ManifestKind::File, Some(content)) if content.filesystem() == fs.filesystem() => {}
+            (ManifestKind::File, Some(content))
+                if content.filesystem() == authority.filesystem() => {}
             (ManifestKind::File, Some(_)) => {
                 return Err(invalid(
                     "directory manifest content belongs to another filesystem",
@@ -433,8 +440,8 @@ impl DirectoryManifest {
     }
 }
 
-fn check_filesystem(fs: &Fs, observed: &Snapshot) -> Result<()> {
-    if fs.filesystem() != observed.filesystem() || fs.root() != observed.root() {
+fn check_filesystem(authority: &dyn Authority, observed: &Snapshot) -> Result<()> {
+    if authority.filesystem() != observed.filesystem() || authority.root() != observed.root() {
         return Err(invalid("observation belongs to another filesystem"));
     }
     Ok(())
@@ -565,14 +572,12 @@ fn io_error(path: &Path, error: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use crate::support::TestBackend;
-    use yinyang_core::BackendProfile;
+    use yinyang_core::Fs;
 
     #[tokio::test]
     async fn install_rejects_noncanonical_paths_before_creating_the_destination() {
         let backend = TestBackend::default();
-        let fs = Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
+        let fs = Fs::create(backend.operator()).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         for (index, path) in [
             "/outside",
