@@ -83,16 +83,18 @@ No writer performs partial migration, column addition, shape detection, or
 profile dispatch.
 
 The 64 KiB content verification unit enters logical identity and remains fixed
-unless a new content profile is introduced. The merged
-[Linux read-only range results](../docs/linux-range-cost-results.md) observed
-9-11 storage requests and 7.4-9.2 ms p50 for repeated warm range reads over one
-immutable version; those numbers describe content-range reads, not metadata
+unless a new content profile is introduced. One loopback-Silo qualification
+observed at most 0.077 MiB of response payload for a cold 4 KiB read and
+0.140 MiB for a two-unit boundary crossing on 8 MiB and 32 MiB files; repeated
+warm reads over one immutable version issued 9-11 storage requests at
+7.4-9.2 ms p50. The qualified bound is recorded in the pull request that
+introduced it (#101). Those numbers describe content-range reads, not metadata
 LOOKUP. Managed FUSE metadata now reuses an accepted snapshot for one second,
 and the object authority shares a byte-bounded content-addressed page cache
-across snapshots. The range study did not compare other unit sizes and does not
-make 64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry
-counts, and other requested-range policy are tunable without changing logical
-identity when the authenticated bytes and identities remain unchanged.
+across snapshots. The study did not compare other unit sizes and does not make
+64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry counts,
+and other requested-range policy are tunable without changing logical identity
+when the authenticated bytes and identities remain unchanged.
 
 ## Local state
 

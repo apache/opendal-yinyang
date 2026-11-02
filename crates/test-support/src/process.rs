@@ -49,6 +49,12 @@ impl Captured {
     }
 }
 
+pub fn run_external(program: &str, args: &[&str], timeout: Duration) -> Captured {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_timeout(command, timeout)
+}
+
 pub fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
     let command_description = describe_command(&command);
     command
@@ -103,7 +109,7 @@ fn describe_command(command: &Command) -> String {
         .join(" ")
 }
 
-fn read_all(mut reader: impl Read) -> Vec<u8> {
+pub fn read_all(mut reader: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     let _ = reader.read_to_end(&mut bytes);
     bytes

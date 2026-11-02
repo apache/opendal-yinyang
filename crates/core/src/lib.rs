@@ -41,5 +41,4 @@ pub use snapshot::{DirectoryPage, FileVersion, ScanToken};
 pub use transaction::{Planner, Transaction};
 
 #[cfg(test)]
-#[path = "../tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;

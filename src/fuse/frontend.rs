@@ -60,7 +60,7 @@ impl ManagedBackend {
         config: VolumeConfig,
         operator: opendal::Operator,
         token: Option<String>,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    ) -> super::Result<Self> {
         let read_only = config.read_only;
         let name = config.name.clone();
         let authority = Volume::connect(&config, operator, token).await?;
@@ -72,10 +72,9 @@ impl ManagedBackend {
         let snapshot = mount.authority().observe_latest().await?;
         let root_node = snapshot.node(root).await?;
         if !root_node.is_some_and(|node| node.is_directory()) {
-            return Err(std::io::Error::other(
-                "remote filesystem root is unavailable or not a directory",
-            )
-            .into());
+            return Err(BackendError::Session(
+                "remote filesystem root is unavailable or not a directory".to_owned(),
+            ));
         }
         Ok(Self {
             mount,

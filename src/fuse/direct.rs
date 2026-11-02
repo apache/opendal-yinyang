@@ -107,7 +107,7 @@ impl DirectBackend {
     pub(super) async fn open(
         config: VolumeConfig,
         operator: opendal::Operator,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    ) -> super::Result<Self> {
         let namespace = DirectNamespace::new(operator.clone())?;
         let (direct, pending) = if config.read_only {
             (None, Vec::new())
@@ -125,7 +125,9 @@ impl DirectBackend {
         };
         let snapshot = namespace.observe().await?;
         if !snapshot.root_node().is_directory() {
-            return Err(std::io::Error::other("Direct namespace root is not a directory").into());
+            return Err(BackendError::Session(
+                "Direct namespace root is not a directory".to_owned(),
+            ));
         }
         let root = snapshot.root();
         let backend = Self {

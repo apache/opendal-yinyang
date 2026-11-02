@@ -59,6 +59,10 @@ use fuser::{Config, MountOption, Session, SessionACL};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub use backend::BackendError as Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
 /// How long a signal-initiated teardown waits after a lazy unmount before it
 /// reports that the caller must terminate the process.
 const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -83,9 +87,11 @@ pub async fn run(
     operator: opendal::Operator,
     token: Option<String>,
     mountpoint: PathBuf,
-) -> Result<Outcome, Box<dyn std::error::Error>> {
+) -> Result<Outcome> {
     if config.frontend != Frontend::Fuse {
-        return Err("the mount command requires frontend=fuse".into());
+        return Err(
+            crate::runtime::Error::Invalid("the mount command requires frontend=fuse").into(),
+        );
     }
     config.validate(&operator)?;
     if config.model == Model::Direct {
@@ -96,10 +102,7 @@ pub async fn run(
     run_backend(backend, mountpoint).await
 }
 
-async fn run_backend<B: Backend>(
-    backend: Arc<B>,
-    mountpoint: PathBuf,
-) -> Result<Outcome, Box<dyn std::error::Error>> {
+async fn run_backend<B: Backend>(backend: Arc<B>, mountpoint: PathBuf) -> Result<Outcome> {
     let read_only = backend.read_only();
     let name = backend.name().to_owned();
     let adapter = Adapter::new(backend, tokio::runtime::Handle::current());
@@ -122,7 +125,8 @@ async fn run_backend<B: Backend>(
             None
         }
     };
-    let session = Session::new(adapter.clone(), &mountpoint, &options)?;
+    let session = Session::new(adapter.clone(), &mountpoint, &options)
+        .map_err(|error| session_error("create FUSE session", error))?;
     adapter.install_notifier(session.notifier());
     println!(
         "yy: mounted {} {} at {} (fuse.yinyang)",
@@ -136,7 +140,9 @@ async fn run_backend<B: Backend>(
     // public thread guard for a natural end (for example `fusermount3 -u`),
     // and receives the local teardown request. Exactly one `join` or
     // `umount_and_join` runs under the shared grace period.
-    let background = session.spawn()?;
+    let background = session
+        .spawn()
+        .map_err(|error| session_error("spawn FUSE session", error))?;
     let (stop_refresh, stop_refresh_rx) = tokio::sync::oneshot::channel::<()>();
     let refresh_task = hangup.map(|signal| {
         let refresh = adapter.clone();
@@ -177,13 +183,12 @@ async fn run_backend<B: Backend>(
         let session = match joined {
             Some(result) => result,
             None => join.await,
-        };
-        let refresh = match refresh_task {
-            Some(task) => task.await,
-            None => Ok(()),
-        };
-        session.map_err(blocking_error)??;
-        refresh.map_err(blocking_error)?;
+        }
+        .map_err(blocking_error)?;
+        if let Some(task) = refresh_task {
+            task.await.map_err(blocking_error)?;
+        }
+        session.map_err(|error| session_error("join FUSE session", error))?;
         Ok(())
     })
     .await
@@ -203,29 +208,30 @@ async fn run_backend<B: Backend>(
     }
 }
 
-fn blocking_error(error: tokio::task::JoinError) -> std::io::Error {
-    std::io::Error::other(format!("filesystem session task failed: {error}"))
+fn blocking_error(error: tokio::task::JoinError) -> Error {
+    Error::Session(format!("filesystem session task failed: {error}"))
+}
+
+fn session_error(context: &str, error: std::io::Error) -> Error {
+    Error::Session(format!("{context}: {error}"))
 }
 
 /// A read-only snapshot must never expose staged bytes that were not
 /// published. The staging lease is already held, so the check cannot race
 /// another client, and refusing startup changes no remote state.
-pub(super) async fn reject_unpublished_staging(
-    mount: &Mount,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn reject_unpublished_staging(mount: &Mount) -> Result<()> {
     let status = mount.status().await?;
     if let Some(handle) = status
         .handles
         .iter()
         .find(|handle| handle.pending || handle.frozen || handle.conflict || handle.error.is_some())
     {
-        return Err(std::io::Error::other(format!(
+        return Err(Error::Session(format!(
             "staging contains handle {} with unpublished, frozen, conflicted or failed state; \
              a read-only FUSE mount will not expose it; publish or acknowledge it with the \
              library frontend before mounting",
             handle.id
-        ))
-        .into());
+        )));
     }
     Ok(())
 }

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod support;
 use std::sync::Arc;
 use support::TestBackend;
 use yinyang_core::object::ObjectFs;
@@ -23,6 +22,7 @@ use yinyang_core::service::{MetadataService, ServiceClient, serve};
 use yinyang_core::{
     Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, Planner,
 };
+use yinyang_test_support as support;
 
 fn committed(outcome: Outcome) -> yinyang_core::Receipt {
     match outcome {

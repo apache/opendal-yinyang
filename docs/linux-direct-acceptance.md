@@ -186,6 +186,7 @@ suspended versioning, Requester Pays, Object Lock, access points, directory
 buckets, other AWS partitions, S3-compatible services and endpoint overrides
 remain outside this qualification.
 
-The bounded source, binary, fixture, raw LIST and conditional-request evidence
-is recorded in
-[`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md).
+On one us-east-2 Amazon S3 host, the bounded qualification covered a
+1,005-object recursive namespace across 28 LIST pages and conditional
+create, replace, and delete against one versioned and one never-versioned
+bucket; it is recorded in the pull request that introduced it (#110).

@@ -41,6 +41,13 @@ use tokio::io::AsyncRead;
 mod transport;
 pub use transport::{ServiceClient, serve};
 
+pub const SERVICE_TOKEN_MIN_BYTES: usize = 32;
+pub const SERVICE_TOKEN_MAX_BYTES: usize = 1024;
+
+pub fn valid_service_token(token: &str) -> bool {
+    (SERVICE_TOKEN_MIN_BYTES..=SERVICE_TOKEN_MAX_BYTES).contains(&token.len())
+}
+
 #[cfg(test)]
 mod connection_tracking {
     use std::collections::BTreeMap;

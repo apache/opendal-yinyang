@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use yinyang_core::service::ServiceClient;
+use yinyang_core::service::{ServiceClient, valid_service_token};
 use yinyang_core::{Authority, ErrorKind as CoreErrorKind, Fs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -712,6 +712,20 @@ pub struct StorageConnection {
 }
 
 impl StorageConnection {
+    /// Build an operator from explicit OpenDAL S3 configuration.
+    pub fn from_config(
+        config: impl IntoIterator<Item = (String, String)>,
+        service_token: Option<String>,
+    ) -> Result<Self> {
+        let operator = Operator::via_iter("s3", config).map_err(operator_error)?;
+        #[cfg(feature = "benchmark-telemetry")]
+        let operator = crate::benchmark::instrument(operator);
+        Ok(Self {
+            operator,
+            service_token,
+        })
+    }
+
     pub fn operator(&self) -> &Operator {
         &self.operator
     }
@@ -733,13 +747,7 @@ pub fn storage_connection() -> Result<StorageConnection> {
                 .map(|key| (key.to_ascii_lowercase(), value))
         })
         .collect::<Vec<_>>();
-    let operator = Operator::via_iter("s3", config).map_err(operator_error)?;
-    #[cfg(feature = "benchmark-telemetry")]
-    let operator = crate::benchmark::instrument(operator);
-    Ok(StorageConnection {
-        operator,
-        service_token: std::env::var("YINYANG_SERVICE_TOKEN").ok(),
-    })
+    StorageConnection::from_config(config, std::env::var("YINYANG_SERVICE_TOKEN").ok())
 }
 
 pub fn storage_profile_from_env() -> Result<StorageProfile> {
@@ -840,7 +848,7 @@ impl Volume {
                         "YINYANG_SERVICE_TOKEN is required",
                     ))
                 })?;
-                if !(32..=1024).contains(&token.len()) {
+                if !valid_service_token(&token) {
                     return Err(Error::Core(yinyang_core::Error::new(
                         CoreErrorKind::PermissionDenied,
                         "connect service",

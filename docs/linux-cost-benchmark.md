@@ -145,8 +145,9 @@ materialization even if a later release reclaims a clean staged file.
 Warm here means repeated reads through the same `FileVersion`; it does not imply
 local staging or a persistent content cache. The measured requests and bytes
 must determine whether those reads still fetch remote units or proofs.
-The bounded 2026-10-27 matched result is recorded in
-[`linux-range-cost-results.md`](linux-range-cost-results.md).
+The 2026-10-27 matched run kept cold 4 KiB reads on 8 MiB and 32 MiB files
+below 0.075 MiB of response payload and 0.090 MiB of mount staging on one
+loopback-Silo host; recorded in the pull request that introduced it (#101).
 
 The `repeated-random` workload measures one Managed object authority through a
 read-only FUSE mount against a direct Amazon S3 HTTPS endpoint. It adds
@@ -154,9 +155,11 @@ same-offset repetition, an 8 MiB hot working set, over-capacity random access,
 restart, forced eviction, and replacement with an old descriptor. The optional
 `benchmark-telemetry` feature installs the released OpenDAL MetricsLayer in the
 measured `yy` process, so request counts and HTTP body bytes are collected
-without a proxy or TLS termination. Its exact source/binary identities,
-per-batch accounting, memory tradeoff, negative cases, and raw evidence are in
-[`linux-verified-range-reuse.md`](linux-verified-range-reuse.md).
+without a proxy or TLS termination. On one us-east-2 Amazon S3 host, the
+verified 16 MiB cache bound reduced repeated 4 KiB reads from 217.853-291.127 ms
+to 0.053-0.054 ms with zero HTTP requests; a 32 MiB over-capacity batch retained
+a p95 improvement but regressed its maximum. These bounds are recorded in the
+pull request that introduced them (#111).
 
 The `incremental` workload uses one 32 MiB writable FUSE file and both object
 and service publication. It measures writable open separately from three
@@ -168,8 +171,10 @@ tradeoffs in the raw samples. Length-changing append or truncate behavior is
 covered by functional FUSE acceptance and is not included in the same-length
 fallback assertion.
 
-The accepted matched result and raw 16-row evidence are in
-[`linux-incremental-write-results.md`](linux-incremental-write-results.md).
+On one loopback-Silo host, three same-length 4 KiB overwrites and fsync kept
+optimized S3 GET bodies at or below 272,988 bytes and PUT bodies at or below
+135,855 bytes per scenario across both authorities; these bounds are recorded
+in the pull request that introduced them (#122).
 
 The `length-changing` workload records schema `yinyang.linux-cost.v6`, which
 adds `useful_bytes` to every row; it is the same collector shape for the
@@ -177,9 +182,11 @@ matched baseline and optimized runs. The complete-source fallback in the
 baseline is expected to read and publish most of the file for each length
 change, while `required` mode rejects that behavior.
 
-The accepted matched result, binary identities, per-operation traffic, staging
-tradeoff, and negative observations are in
-[`linux-length-changing-write-results.md`](linux-length-changing-write-results.md).
+On one loopback-Silo host, append, truncate, zero-extension, and
+shrink-then-extend operations kept optimized S3 GET bodies at or below
+201,163 bytes and PUT bodies at or below 169,042 bytes per sample across both
+authorities; these bounds are recorded in the pull request that introduced them
+(#128).
 
 The first FUSE open materializes the complete file, so a cold 4 KiB read is
 expected to transfer much more than 4 KiB. A sparse update starts from the
@@ -242,6 +249,7 @@ The benchmark does not claim production capacity, cross-host performance, or a
 performance regression threshold. Default matrices measure one isolated
 loopback Silo on the recorded host; the repeated/random report records its
 separate real Amazon S3 region, host and sampling limits. These measurements do
-not replace the functional Linux acceptance suites. Do not commit generated
-datasets or large build artifacts; retain only bounded evidence and reusable
-tooling in the repository.
+not replace the functional Linux acceptance suites. Keep generated datasets,
+JSON and JSONL outputs, and result reports outside the repository; the default
+`target/linux-cost/` output is ephemeral. `docs/` documents how to run and
+interpret the benchmark, not collected results.

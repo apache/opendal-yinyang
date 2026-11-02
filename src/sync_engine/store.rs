@@ -17,11 +17,13 @@
 
 //! The single durable state schema for Managed and Direct Sync.
 
+#[cfg(test)]
+use super::ErrorKind;
 use super::adapter::{
     EntryKind, RemoteCursor, RemoteEntry, RemoteFailure, RemoteReceipt, SyncModel,
 };
 use super::types::{ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, LocalStat};
-use super::{Error, ErrorKind, Result};
+use super::{Error, Result};
 use crate::intent;
 use crate::local::store;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
@@ -1543,19 +1545,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
 }
 
 fn store_error(error: store::Error) -> Error {
-    let kind = match error.kind() {
-        store::ErrorKind::Invalid => ErrorKind::Invalid,
-        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
-        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
-        store::ErrorKind::Busy => ErrorKind::Busy,
-        store::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
-        store::ErrorKind::NotFound => ErrorKind::NotFound,
-        store::ErrorKind::ReadOnly => ErrorKind::ReadOnly,
-        store::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-        store::ErrorKind::NoSpace => ErrorKind::NoSpace,
-        store::ErrorKind::Io => ErrorKind::Io,
-    };
-    Error::new(kind, error.to_string())
+    Error::new(error.kind().into(), error.to_string())
 }
 
 fn now_ns() -> Result<i64> {

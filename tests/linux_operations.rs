@@ -30,9 +30,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::Value;
-
-#[path = "support/yy.rs"]
-mod yy;
+use yinyang_test_support::yy;
 
 const SERVICE_TOKEN: &str = "yinyang-operations-test-token-0000000000000000";
 
@@ -724,7 +722,7 @@ fn require_fuse() {
 }
 
 fn clean_yy(args: &[&str]) -> Command {
-    let mut command = Command::new(yy::binary());
+    let mut command = Command::new(yy::binary(env!("CARGO_BIN_EXE_yy")));
     command.args(args);
     remove_yinyang_environment(&mut command);
     command
@@ -812,7 +810,7 @@ impl Install {
         let bin = prefix.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let yy = bin.join("yy");
-        fs::copy(yy::binary(), &yy).unwrap();
+        fs::copy(yy::binary(env!("CARGO_BIN_EXE_yy")), &yy).unwrap();
         let mut permissions = fs::metadata(&yy).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&yy, permissions).unwrap();
