@@ -304,6 +304,7 @@ enum BenchWorkload {
     ReadOnlyRange,
     Incremental,
     LengthChanging,
+    WriteLatency,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -328,7 +329,7 @@ struct CommandBenchLinuxCost {
         long,
         value_enum,
         default_value = "full",
-        help = "Select the complete product matrix, the matched read-only range workload, the same-length writable workload, or the length-changing writable workload."
+        help = "Select the complete product matrix, the matched read-only range workload, the same-length writable workload, the length-changing writable workload, or the continuous open-write-fsync workload."
     )]
     workload: BenchWorkload,
     #[arg(
@@ -370,7 +371,8 @@ impl CommandBenchLinuxCost {
         let profile = match self.workload {
             BenchWorkload::ReadOnlyRange
             | BenchWorkload::Incremental
-            | BenchWorkload::LengthChanging => "full",
+            | BenchWorkload::LengthChanging
+            | BenchWorkload::WriteLatency => "full",
             BenchWorkload::Full => match self.profile {
                 BenchProfile::Early => "early",
                 BenchProfile::Full => "full",
@@ -386,6 +388,7 @@ impl CommandBenchLinuxCost {
             BenchWorkload::ReadOnlyRange => "read-only-range",
             BenchWorkload::Incremental => "incremental",
             BenchWorkload::LengthChanging => "length-changing",
+            BenchWorkload::WriteLatency => "write-latency",
         };
         let incremental_expect = match self.incremental_expect {
             BenchIncrementalExpectation::Baseline => "baseline",

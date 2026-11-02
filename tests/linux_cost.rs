@@ -68,6 +68,7 @@ enum Workload {
     RepeatedRandom,
     Incremental,
     LengthChanging,
+    WriteLatency,
 }
 
 impl Workload {
@@ -78,6 +79,7 @@ impl Workload {
             Self::RepeatedRandom => "repeated-random",
             Self::Incremental => "incremental",
             Self::LengthChanging => "length-changing",
+            Self::WriteLatency => "write-latency",
         }
     }
 }
@@ -341,8 +343,9 @@ fn linux_cost_benchmark() {
         Ok("repeated-random") => Workload::RepeatedRandom,
         Ok("incremental") => Workload::Incremental,
         Ok("length-changing") => Workload::LengthChanging,
+        Ok("write-latency") => Workload::WriteLatency,
         value => panic!(
-            "YINYANG_COST_WORKLOAD must be full, read-only-range, repeated-random, incremental, or length-changing, got {value:?}"
+            "YINYANG_COST_WORKLOAD must be full, read-only-range, repeated-random, incremental, length-changing, or write-latency, got {value:?}"
         ),
     };
     let incremental_expectation = match std::env::var("YINYANG_COST_INCREMENTAL_EXPECT").as_deref()
@@ -365,6 +368,7 @@ fn linux_cost_benchmark() {
             | Workload::RepeatedRandom
             | Workload::Incremental
             | Workload::LengthChanging
+            | Workload::WriteLatency
     ) && profile != Profile::Full
     {
         panic!("range and incremental workloads require YINYANG_COST_PROFILE=full");
@@ -416,8 +420,7 @@ fn linux_cost_benchmark() {
     let metadata_transport = if workload == Workload::RepeatedRandom {
         "object authority directly over HTTPS; no metadata service".to_owned()
     } else {
-        "authenticated loopback TCP through a byte-counting proxy; transport opens one connection per RPC"
-            .to_owned()
+        "authenticated loopback TCP through a byte-counting proxy; connection-window summaries are not application RPC counts".to_owned()
     };
     let range_cache_policy = std::env::var("YINYANG_COST_RANGE_POLICY")
         .unwrap_or_else(|_| "unspecified; select the exact measured binary policy".to_owned());
@@ -491,6 +494,13 @@ fn linux_cost_benchmark() {
         (Profile::Full, PublicationFilter::Object) => &[Publication::Object],
         (Profile::Full, PublicationFilter::Service) => &[Publication::Service],
     };
+    if matches!(workload, Workload::WriteLatency) {
+        for &publication in publications {
+            run_write_latency_matrix(&context, &proxy, publication, &mut recorder);
+        }
+        recorder.finish();
+        return;
+    }
     if matches!(workload, Workload::Incremental) {
         for &publication in publications {
             run_incremental_matrix(
@@ -525,9 +535,13 @@ fn linux_cost_benchmark() {
             &[Scale::Small, Scale::Medium]
         }
         (Workload::Full, Profile::Early) => &[Scale::Small],
-        (Workload::RepeatedRandom | Workload::Incremental | Workload::LengthChanging, _) => {
-            unreachable!("specialized workloads return above")
-        }
+        (
+            Workload::RepeatedRandom
+            | Workload::Incremental
+            | Workload::LengthChanging
+            | Workload::WriteLatency,
+            _,
+        ) => unreachable!("specialized workloads return above"),
     };
     if matches!(workload, Workload::ReadOnlyRange) {
         for &publication in publications {
@@ -1379,7 +1393,7 @@ fn run_write_latency_case(
     );
     assert_eq!(
         network.service_activity.in_flight_at_end, 0,
-        "service RPCs remained in flight after the write-latency batch"
+        "service proxy connections remained active after the write-latency batch"
     );
     for (index, bytes) in expected.iter().enumerate() {
         let batch = index / WRITE_LATENCY_BATCH_FILES;
@@ -1436,7 +1450,7 @@ fn run_write_latency_case(
                 s3_max_concurrency
             ),
             format!(
-                "observed_service_rpc_max_concurrency={}",
+                "observed_service_proxy_connection_max_concurrency={}",
                 service_max_concurrency
             ),
             "network totals cover the complete lifecycle batch; phase arrays are latency diagnostics, not network attribution"

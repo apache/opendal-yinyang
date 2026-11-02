@@ -23,7 +23,7 @@ usage() {
   cat <<'EOF'
 Usage: tests/linux_incremental_cost_capture.sh \
   --expected-source SHA \
-  [--workload incremental|length-changing] \
+  [--workload incremental|length-changing|write-latency] \
   --expect baseline|required \
   --label LABEL \
   --output-dir DIR
@@ -106,8 +106,8 @@ done
 [[ $expected_source =~ ^[0-9a-f]{40}$ ]] ||
   fail "expected source must be a full lowercase SHA"
 [[ $label =~ ^[a-z0-9-]+$ ]] || fail "label must be lowercase letters, digits and hyphens"
-[[ $workload == incremental || $workload == length-changing ]] ||
-  fail "workload must be incremental or length-changing"
+[[ $workload == incremental || $workload == length-changing || $workload == write-latency ]] ||
+  fail "workload must be incremental, length-changing, or write-latency"
 [[ $expectation == baseline || $expectation == required ]] ||
   fail "expectation must be baseline or required"
 
@@ -177,7 +177,7 @@ with open(path, encoding="utf-8") as source:
                     f"{record.get('scenario')} did not retain multiple samples"
                 )
         if (
-            expected_workload == "incremental"
+            expected_workload in {"incremental", "write-latency"}
             and record.get("scenario", "").startswith("fuse_write_latency_")
             and not record.get("scenario", "").endswith("_mount_ready")
         ):
@@ -238,7 +238,7 @@ if expected_workload == "length-changing":
     missing = sorted(required - seen)
     if missing:
         raise SystemExit(f"length-changing workload is missing records: {missing}")
-if expected_workload == "incremental":
+if expected_workload in {"incremental", "write-latency"}:
     required = {
         f"fuse_write_latency_{writers}" for writers in (1, 4)
     }
