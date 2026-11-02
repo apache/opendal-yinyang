@@ -36,7 +36,7 @@ in the backup; do not delete the state or manufacture a missing receipt.
 | Object authority | Every object below the configured operator root, including `.yinyang/head` and all immutable content/index objects. |
 | Metadata service | A consistent SQLite backup of the service database. Its WAL contains committed state. |
 | Mount/file runtime | A consistent SQLite backup of `staging.db`. Chunks, frozen plans, local generations, and the error ledger are inside it. |
-| Managed Sync | `replica.db`, `sync.db`, `content/staging.db`, retained `quarantine/` bytes, and the bound local root. |
+| Managed or Direct Sync | The bound local root, `sync-engine.db`, required adapter support databases under `state/`, and retained artifact content. Prefer the `sync backup` package shown below. |
 | One-shot publication | `directory.db` and the immutable object content referenced by its frozen requests. The original source is not needed for retry or export. |
 
 Do not copy only a live SQLite main file. Either freeze the owning process and
@@ -103,22 +103,24 @@ filesystem identities. Use the dedicated package command:
 yy --volume CONFIG sync backup --output /backup/notes-sync
 ```
 
-The command takes the existing writer leases, validates the live Sync and
-staging profiles, and creates a new directory containing:
+The command takes the existing writer leases, validates the shared
+`yinyang-sync-engine-2` profile, and
+creates a new directory containing:
 
 ```text
 manifest.bin
 root/
-state/replica.db
-state/sync.db
-state/content/staging.db
-state/quarantine/
+state/sync-engine.db
+state/artifacts/
 ```
 
-The SQLite files are created with `VACUUM INTO`, not by copying a live main
-database. `manifest.bin` records the filesystem identity, the complete
-quiesced local snapshot with content hashes, each retained artifact's current
-tree and hash, the SQLite file hashes, and the original filesystem identities.
+`sync-engine.db` is created with `VACUUM INTO`, not by copying a live main
+database. Other local state files that are present are checksummed and copied
+at their existing relative path; the engine itself requires only its database
+and retained artifacts.
+`manifest.bin` records the filesystem identity, the complete quiesced local
+snapshot with content hashes, each retained artifact's current tree and hash,
+every database file hash, and the original filesystem identities.
 It is an experimental package format, not a public migration or online
 replication format.
 
@@ -145,10 +147,11 @@ the restore destination.
 After copying, restore remaps the original root and quarantine inode identities
 to the new filesystem identities. It preserves accepted content fingerprints,
 commit IDs, Unknown requests, and historical artifact digests verbatim. This
-mapping is what preserves an unscanned local rename through `detect_moves` and
-what prevents a changed retained artifact from being mistaken for a different
-file. The mapping is written in one SQLite transaction; invalid or ambiguous
-old-to-new identity collisions fail before `replica.db` is rebound.
+mapping is what preserves an unscanned local rename through baseline identity
+and what prevents a changed retained artifact from being mistaken for a
+different file. The mapping is written in one SQLite transaction; invalid or
+ambiguous old-to-new identity collisions fail before `sync-engine.db` is
+rebound.
 
 A copied root can contain local edits that were not yet reconciled. They remain
 local edits and are reported by `sync status`; restore does not invent an

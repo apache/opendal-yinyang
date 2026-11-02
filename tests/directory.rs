@@ -676,7 +676,7 @@ async fn journal_local_confirmation_failure_remains_typed_unknown() {
     database
         .execute_batch(
             "CREATE TRIGGER fail_local_confirmation
-             BEFORE UPDATE OF state ON publications
+             BEFORE UPDATE OF state ON intents
              WHEN NEW.state=2
              BEGIN
                  SELECT RAISE(ABORT, 'confirmation unavailable');
@@ -774,17 +774,17 @@ async fn journal_rejects_an_old_profile_before_changing_its_schema() {
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
     assert_eq!(mode, "delete");
-    let publications: bool = database
+    let intents: bool = database
         .query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master WHERE type='table' AND name='publications'
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents'
              )",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
-        !publications,
+        !intents,
         "rejecting an old profile must not initialize the current schema"
     );
 }
@@ -804,17 +804,17 @@ async fn journal_rejects_a_partial_known_schema_without_repairing_it() {
                      filesystem BLOB NOT NULL,
                      root BLOB NOT NULL
                  );
-                 INSERT INTO binding VALUES(1,'yinyang-directory-2',zeroblob(16),zeroblob(16));
-                 CREATE TABLE publications(
-                     commit_id BLOB PRIMARY KEY,
-                     baseline BLOB NOT NULL,
+                 INSERT INTO binding VALUES(1,'yinyang-directory-3',zeroblob(16),zeroblob(16));
+                 CREATE TABLE intents(
+                     id BLOB PRIMARY KEY,
+                     request_id BLOB NOT NULL,
                      request_digest BLOB NOT NULL,
-                     source TEXT NOT NULL,
                      request BLOB NOT NULL,
-                     manifest BLOB NOT NULL,
+                     commit_id BLOB,
                      state INTEGER NOT NULL,
                      receipt_revision BLOB,
-                     receipt_ordinal INTEGER
+                     receipt_ordinal INTEGER,
+                     failure BLOB
                  );",
             )
             .unwrap();
@@ -833,14 +833,14 @@ async fn journal_rejects_a_partial_known_schema_without_repairing_it() {
     );
     let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
     let columns: Vec<String> = {
-        let mut statement = database.prepare("PRAGMA table_info(publications)").unwrap();
+        let mut statement = database.prepare("PRAGMA table_info(intents)").unwrap();
         statement
             .query_map([], |row| row.get(1))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap()
     };
-    assert!(!columns.iter().any(|column| column == "failure"));
+    assert!(!columns.iter().any(|column| column == "metadata"));
 }
 
 #[tokio::test]
@@ -859,7 +859,7 @@ async fn journal_inspection_rejects_a_malformed_frozen_identity() {
     rusqlite::Connection::open(state.join("directory.db"))
         .unwrap()
         .execute(
-            "UPDATE publications SET request=?2 WHERE commit_id=?1",
+            "UPDATE intents SET request=?2 WHERE request_id=?1",
             rusqlite::params![id.as_bytes().as_slice(), b"malformed"],
         )
         .unwrap();

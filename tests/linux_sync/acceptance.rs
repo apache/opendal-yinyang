@@ -62,6 +62,9 @@ fn assert_tree(root: &Path, expected: &Tree, context: &str) {
     let actual = local_tree(root).unwrap_or_else(|error| {
         panic!("scan local tree {} for {context}: {error}", root.display())
     });
+    if &actual != expected {
+        eprintln!("{context} actual:\n{actual:#?}\n{context} expected:\n{expected:#?}");
+    }
     assert_eq!(&actual, expected, "{context}: local tree mismatch");
 }
 
@@ -178,7 +181,7 @@ fn managed_sync_containment_is_symmetric_for_init_and_restore() {
             "state must not be inside the synchronized root"
         };
         assert!(stderr.contains(expected), "{stderr}");
-        assert!(!state.join("replica.db").exists());
+        assert!(!state.join("sync-engine.db").exists());
     }
 
     let source = fixture.sync_paths("containment-source");
@@ -219,7 +222,7 @@ fn managed_sync_containment_is_symmetric_for_init_and_restore() {
             root.to_str().unwrap(),
         ]);
         assert_failure(&output, "Managed Sync restore containment");
-        assert!(!state.join("replica.db").exists());
+        assert!(!state.join("sync-engine.db").exists());
     }
 }
 
@@ -238,7 +241,7 @@ fn managed_sync_initial_pull_and_push_both_authorities() {
         let before = pull.sync_status(&client);
         assert_eq!(before.binding.state, BindingState::Bound);
         assert_eq!(before.local.scan, LocalScanState::Clean);
-        assert!(!before.summary.in_sync);
+        assert!(!before.summary.in_sync, "{before:#?}");
         pull.sync_run_ok(&client);
         assert_tree(&client.directory, &expected, "initial remote pull");
         let status = assert_in_sync(&pull, &client);
@@ -386,12 +389,8 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
         let repeated_entry = repeated.entry("shared.txt");
         assert_eq!(repeated_entry.state, EntryState::Conflict);
         assert_eq!(
-            repeated_entry
-                .conflict
-                .as_ref()
-                .expect("conflict entry retains nested evidence")
-                .id,
-            conflict.id
+            repeated_entry.conflict.as_deref(),
+            Some(conflict.id.as_str())
         );
         assert_eq!(repeated_entry.original_path, conflict.original_path);
         assert_eq!(repeated_entry.desired_path, conflict.desired_path);
@@ -415,12 +414,24 @@ fn managed_sync_content_conflicts_export_and_explicit_resolution_both_authoritie
         let remote_export = fixture.path("content-remote");
         fixture.sync_export_conflict(&right, &conflict.id, "local", &local_export);
         fixture.sync_export_conflict(&right, &conflict.id, "remote", &remote_export);
-        assert_eq!(fs::read(&local_export).unwrap(), b"right");
-        assert_eq!(fs::read(&remote_export).unwrap(), b"left");
+        assert_eq!(
+            fs::read(&local_export).unwrap(),
+            b"right",
+            "local conflict export retained the wrong bytes"
+        );
+        assert_eq!(
+            fs::read(&remote_export).unwrap(),
+            b"left",
+            "remote conflict export retained the wrong bytes"
+        );
 
         fixture.sync_resolve_keep(&right, &conflict.id, "local");
         fixture.sync_run_ok(&right);
-        assert_eq!(remote_file_bytes(&fixture, "shared.txt"), b"right");
+        assert_eq!(
+            remote_file_bytes(&fixture, "shared.txt"),
+            b"right",
+            "keep-local resolution did not publish the selected bytes"
+        );
         assert_in_sync(&fixture, &right);
         fixture.sync_run_ok(&left);
         assert_eq!(
@@ -528,7 +539,8 @@ fn resolve_content_preserves_concurrent_local(drop_after_release: bool, write_v4
             assert!(!status.summary.in_sync, "{status:#?}");
             assert_eq!(
                 status.entry("resolve-race.txt").state,
-                EntryState::LocalPending
+                EntryState::LocalPending,
+                "drop_after_release={drop_after_release} write_v4={write_v4}: {status:#?}"
             );
         }
     } else {

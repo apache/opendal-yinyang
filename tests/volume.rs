@@ -363,7 +363,7 @@ async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
 #[cfg(target_os = "linux")]
 #[test]
 fn root_state_containment_rejects_both_directions() {
-    use yinyang::replica::{ErrorKind, check_root_state};
+    use yinyang::sync_engine::{ErrorKind, check_root_state};
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
@@ -382,32 +382,40 @@ fn root_state_containment_rejects_both_directions() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn managed_replica_init_rejects_both_containment_directions() {
-    use yinyang::core::NodeId;
-    use yinyang::replica::{ErrorKind, Replica};
+#[tokio::test]
+async fn managed_sync_init_rejects_both_containment_directions() {
+    use std::sync::Arc;
+    use yinyang::sync_engine::{ErrorKind, ManagedAdapter, SyncEngine};
 
     let temp = tempfile::tempdir().unwrap();
-    let volume = NodeId::from_bytes([1; 16]);
+    let backend = TestBackend::default();
+    let authority: Arc<dyn yinyang::core::Authority> =
+        Arc::new(Fs::create(backend.operator()).await.unwrap());
 
     let root = temp.path().join("root-a");
     let state = root.join("state");
-    let error = Replica::init(&state, &root, volume).unwrap_err();
+    let error = SyncEngine::init(ManagedAdapter::new(authority.clone()), &state, &root)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(error.kind(), ErrorKind::Invalid);
-    assert!(!state.join("replica.db").exists());
+    assert!(!state.join("sync-engine.db").exists());
 
     let state = temp.path().join("state-b");
     let root = state.join("root");
-    let error = Replica::init(&state, &root, volume).unwrap_err();
+    let error = SyncEngine::init(ManagedAdapter::new(authority), &state, &root)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(error.kind(), ErrorKind::Invalid);
-    assert!(!state.join("replica.db").exists());
+    assert!(!state.join("sync-engine.db").exists());
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn managed_restore_rejects_both_containment_directions_before_creation() {
+async fn managed_sync_restore_rejects_both_containment_directions_before_creation() {
     use std::sync::Arc;
-    use yinyang::replica::{DirectorySync, ErrorKind};
+    use yinyang::sync_engine::{ErrorKind, ManagedAdapter, SyncEngine};
 
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
@@ -416,7 +424,8 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
     let source_root = temp.path().join("source-root");
     let source_state = temp.path().join("source-state");
     std::fs::create_dir(&source_root).unwrap();
-    let sync = DirectorySync::init(authority.clone(), &source_state, &source_root)
+    let adapter = ManagedAdapter::new(authority.clone());
+    let mut sync = SyncEngine::init(adapter.clone(), &source_state, &source_root)
         .await
         .unwrap();
     let backup = temp.path().join("backup");
@@ -436,16 +445,17 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
         } else {
             std::fs::create_dir_all(&root).unwrap();
         }
-        let error = DirectorySync::restore(authority.clone(), &backup, &state, &root)
-            .await
-            .err()
-            .expect("containment must reject restore");
-        let error = error
-            .downcast_ref::<yinyang::replica::Error>()
-            .expect("restore preserves the replica error kind");
+        let error = SyncEngine::restore(
+            ManagedAdapter::new(authority.clone()),
+            &backup,
+            &root,
+            &state,
+        )
+        .await
+        .err()
+        .expect("containment must reject restore");
         assert_eq!(error.kind(), ErrorKind::Invalid, "{error}");
-        assert!(!state.join("replica.db").exists());
-        assert!(!state.join("sync.db").exists());
+        assert!(!state.join("sync-engine.db").exists());
     }
 }
 

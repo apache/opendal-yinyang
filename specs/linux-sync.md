@@ -1,14 +1,13 @@
-# Linux ordinary-directory Managed Sync
+# Linux ordinary-directory Sync
 
 **Status: experimental.**
 
-The `yy --volume CONFIG sync` frontend reconciles one ordinary Linux directory
-with a Managed volume's remote root. It is the failure and progress surface for
-the reconciliation contract: it fixes admission, exit codes and a versioned
-status document so a script or a test can decide what happened without parsing
-logs. The reconciliation itself lives in `yinyang::replica::DirectorySync`; the
-frontend only binds a volume configuration to that responsibility and projects
-its evidence.
+`yy --volume CONFIG sync` reconciles one ordinary Linux directory with one
+Managed or Direct remote namespace. Both models use
+`yinyang::sync_engine::SyncEngine`; the model is selected by the adapter built
+from the admitted volume. The engine owns local scanning, the common baseline,
+reconciliation, retained artifacts, conflicts, local installs, status and
+backup. The adapter owns remote observation and conditional publication.
 
 ## Commands
 
@@ -20,232 +19,233 @@ yy --volume CONFIG sync run
 yy --volume CONFIG sync status  [--json]
 yy --volume CONFIG sync export  --artifact ARTIFACT_ID --output PATH
 yy --volume CONFIG sync export  --conflict CONFLICT_ID --side local|remote --output PATH
-yy --volume CONFIG sync resolve CONFLICT --keep local|remote
-yy --volume CONFIG sync resolve CONFLICT --content PATH
+yy --volume CONFIG sync resolve ID --keep local|remote
+yy --volume CONFIG sync resolve ID --content PATH
 ```
 
-- `init` binds `ROOT` to the volume's remote root. It creates the local root and
-  the state directory when missing, rejects equal paths or either containment
-  direction, and requires root and state on the same filesystem.
-- `backup` writes one experimental quiesced package containing the bound root,
-  `replica.db`, `sync.db`, content staging, retained artifacts, and a manifest
-  binding their filesystem identities and current content hashes. It requires
-  exclusive Sync/runtime leases and refuses incomplete local installs.
-- `restore` validates a backup package and the configured authority before
-  creating absent destination root/state paths. It applies the same equality,
-  containment and same-filesystem check as `init`, then copies the package
-  and rebinds root/quarantine inode identities in one SQLite transaction. It
-  preserves accepted fingerprints, commit identities, Unknown work, and
-  historical artifact digests.
-- `run` performs one finite reconciliation pass: it retries any associated
-  durable work, observes the local and remote trees once, pulls remote changes,
-  and publishes independent local file creations with one authority batch per
-  directory depth (up to the authority's 4096-member limit).
-- `status` reports the current binding, remote and local observations, and the
-  derived per-path state. It never changes authoritative database/WAL bytes,
-  logical state, or acquires the publication lease, so it stays usable while
-  `run` holds the lease. SQLite may create an empty `-wal` and may create or
-  update derived `-shm`; existing WAL/journal bytes remain protected.
-- `export` writes retained bytes. `--artifact` selects a retained artifact from
-  `status`; `--conflict` with `--side` selects one side of a conflict. The output
-  path must not exist.
-- `resolve` applies one durable decision to an active conflict: `--keep` selects
-  the local or remote observation, `--content` adopts explicit bytes from a file.
-  A decision that publishes local bytes goes through the same work/receipt path
-  as an ordinary edit; keeping the remote observation applies the recorded remote
-  state locally without a new publish, and an already-matching choice can be a
-  no-op.
+`init` creates or validates the ordinary local root, validates the state
+directory and binds both to the configured model and namespace. The root and
+state must be distinct, have no containment relationship, and share one
+filesystem. Initial admission requires exactly one side to contain files or
+directories. Both non-empty sides fail rather than inventing a merge.
+
+`run` performs one finite pass. `status` is read-only and remains useful while a
+writer holds the state lease or the remote is unavailable. `export --artifact`
+and the local side of a conflict are available offline. The remote conflict side
+requires the configured remote.
+
+`backup` writes one quiesced package containing the bound root,
+`sync-engine.db`, adapter support state, retained artifacts and a
+checksum-protected manifest. It refuses incomplete installs. `restore` validates
+the complete package and adapter-specific support state before creating either
+absent destination. Restore rebinds root, state, baseline and artifact inode
+identities while preserving accepted content evidence, requests and receipts.
 
 ## Admission
 
-`sync` requires a Linux host and a volume that is exactly:
+The configured volume must use `access: "sync"`, `frontend: "library"`, and
+`read_only: false`. Managed uses its configured object or loopback service
+authority. Direct uses its storage-native namespace and requires the conditional
+create, replace and delete capabilities from [direct.md](direct.md).
 
-```json
+The `staging` field is the Sync state directory. It never contains credentials.
+Shared volume admission validates configuration and storage before any state or
+remote effect.
+
+## Capabilities
+
+An adapter reports a closed capability set. Each flag selects a real engine
+path:
+
+| Capability | Meaning |
+| --- | --- |
+| `directories` | The remote represents empty directories as namespace entries. |
+| `executable` | The remote stores the executable bit. |
+| `rename` | The remote supports identity-preserving namespace rename. |
+| `batch` | Multiple frozen requests may be submitted in one adapter call. |
+| `max_batch` | Maximum requests the adapter accepts in one call. |
+| `delta` | Observation accepts the accepted entry map and a stored cursor. |
+| `receipt_lookup` | A possibly dispatched request can be resolved by its original receipt. |
+
+Managed reports directories, executable metadata, rename, batches, change-feed
+deltas and receipt lookup. Direct reports none of those capabilities; it applies
+one exact ETag-or-absent request at a time and always performs a full
+observation.
+
+## State profile
+
+The shared profile is `yinyang-sync-engine-2`. Its exact tables are:
+
+```text
+binding
+baseline
+baseline_meta
+artifacts
+installs
+conflicts
+intents
+work
+```
+
+`binding` records the model, namespace identity and digest, canonical root and
+state paths, and root/state filesystem identities. `baseline` records the
+accepted remote entry and accepted local fingerprint per path.
+`baseline_meta.cursor` is the only persisted remote change cursor.
+
+`intents` is the durable request log and uses the shared state codec documented
+in [sync-runtime.md](sync-runtime.md). It stores the adapter request identity
+and digest, opaque frozen request bytes, typed state, optional commit identity,
+receipt, typed failure and engine work association metadata. A request is
+marked `Unknown` in a durable transaction before dispatch can occur. `work`
+stores only the path association and accepted inputs; it reads request state
+from `intents`.
+
+Managed namespace planning and content preparation are internal adapter work.
+The engine sends mixed create and content-edit requests through one
+`publish_batch`, so a Managed pass at one depth produces one authority head
+commit.
+
+SQLite uses WAL with `synchronous=FULL`. Older profiles and current profiles
+with missing, extra or malformed tables/columns are rejected. There is no
+migration.
+
+## Reconciliation
+
+The engine scans the local tree before planning and keeps that observation for
+the pass; it observes a path again only where a local effect requires current
+identity evidence. Persistent scan evidence is reused only while inode, size,
+mtime and ctime match and the stat is racy-clean. Evidence never replaces the
+accepted content fingerprint.
+
+Planning is a three-way comparison of baseline, live local and live remote.
+Parents are created before children and removals run children first. No remote
+overwrite or last-writer-wins path exists. A file/directory kind conflict blocks
+automatic changes below that path. A remote-deleted directory is quarantined as
+one subtree only when every local descendant still matches the baseline;
+otherwise its retained descendants become explicit conflicts.
+
+File moves use stable remote identity only when the adapter supports rename.
+Otherwise they converge as create followed by delete. A rename that races an
+edit or another rename is retained as a conflict with source and desired paths.
+
+Independent publishable files are frozen first and submitted through
+`publish_batch` according to `batch` and `max_batch`. Managed creates at one
+directory depth therefore contribute to one head commit. Direct applies the
+same frozen requests one at a time. Content edits use the same publication path
+as creates.
+
+With `delta`, Managed starts from the accepted entry map and
+`baseline_meta.cursor`. Changes are applied by stable NodeId, affected paths are
+recomputed, and a renamed directory re-walks only its new subtree. An
+unavailable or truncated cursor falls back to one full walk. Direct always
+walks the remote namespace.
+
+## Unknown, conflict and resolution
+
+An adapter returns exactly `Applied`, `Conflict`, `Unknown`, `Retryable` or
+`Unsupported` per frozen request. A batch member keeps its own outcome.
+
+`Unknown` means dispatch may have occurred. The original frozen request and
+retained input remain. Receipt-capable adapters look up the original receipt on
+the next retry pass; otherwise they replay the same request identity with the
+same source and precondition. A later observation never proves that an
+ambiguous request committed. A newer local edit is not replaced by the older
+accepted input.
+
+Conflicts retain both available sides until an explicit decision. `--keep
+local` publishes the current local decision against a newly observed remote
+precondition. `--keep remote` materializes the observed remote state without a
+publication. `--content PATH` prepares the selected bytes directly and records
+that selected input, not the live file observed when a response arrives.
+
+## Local install
+
+The engine creates a private fd-relative temporary file and an `installs` row
+before dispatch. The adapter writes remote bytes into the supplied borrowed fd
+and verifies them: Managed verifies the core content identity; Direct verifies
+its accepted version/ETag, size and read pin.
+
+Installation then verifies the temporary through an open descriptor and applies
+it by descriptor-relative rename or exchange. The expected local inode, parent
+identity and bytes are checked again at the effect boundary. A changed target is
+retained and becomes a conflict. Deletion first quarantines the exact observed
+inode. Recovery interprets only durable install rows and never guesses from a
+path name alone.
+
+## Retained artifacts
+
+The artifact kinds are `replaced-file`, `rollback-displaced`,
+`quarantined-file`, `quarantined-directory`, `upload-retained`,
+`conflict-local`, `conflict-remote` and `resolution`. Every row names its release
+event.
+
+Upload inputs are released after the accepted publication is durable. A
+superseded local version survives one reconciliation boundary so a late write
+through an already-open descriptor is observable. Conflict material remains
+until explicit resolution. Other unreferenced artifacts are bounded to 64
+entries and 256 MiB, oldest first.
+
+A retained file changed after displacement is reported as a conflict from its
+cheap stat evidence. Export reads the current retained bytes. Directory
+quarantine is exported as a retained path; byte-stream export of a directory is
+unsupported.
+
+## Status
+
+`status --json` always emits schema `yinyang.sync.status.v1`:
+
+```text
 {
-  "model": "managed",
-  "access": "sync",
-  "frontend": "library",
-  "read_only": false
+  "schema": "yinyang.sync.status.v1",
+  "model": "managed|direct",
+  "binding": { "state": "unbound|bound|error", "state_directory": "...",
+               "root": "...", "namespace": "...", "same_filesystem": true,
+               "error": null },
+  "remote": { "availability": "not_checked|available|unavailable",
+              "cursor": "...", "error": null },
+  "local": { "scan": "not_scanned|clean|changed|failed", "error": null },
+  "summary": { "in_sync": false, "pending": 0, "unknown": 0, "conflicts": 0,
+               "failed": 0, "retained_artifacts": 0, "retained_bytes": 0 },
+  "entries": [],
+  "conflicts": [],
+  "artifacts": []
 }
 ```
 
-It runs the shared single-table admission as every other volume command and
-additionally pins this Managed + Sync command applicability, so a valid Mount
-package or a Direct volume is rejected rather than silently reinterpreted. The
-frontend is the library frontend, not an OS mount. The frontend performs
-bidirectional reconciliation, so `read_only: true` is rejected for `access:
-sync` instead of being silently ignored while the volume still published writes.
-Storage credentials and the `--volume` configuration are supplied exactly as for
-the other volume commands; the JSON document never carries secrets.
+Each entry carries local, remote and baseline evidence, its current typed
+intent/outcome and an optional conflict identity. A rename conflict references
+the desired-path entry. `summary.conflicts` and
+`summary.retained_artifacts` equal their top-level array lengths.
+
+`summary.in_sync` is true only when the binding and remote are valid, the local
+scan is clean, no pending/Unknown/failed/conflict work remains, every entry is
+`in_sync`, and each baseline row pairs compatible local and remote content
+evidence. A mismatch is a typed corrupt-state error, never `in_sync`.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success, or a valid bound `status` document (including pending, conflict or unknown entries). |
-| 3 | `status` found no binding, or an operation ended `Unknown`. Status commands still print a valid document. |
-| 4 | `status` found an invalid binding, or an operation ended `Conflict` or `Retryable`. Status commands still print a valid document. |
-| 1 | Argument, configuration, admission or other unexpected failure. |
+| 0 | The finite command completed, or a valid bound status was emitted. |
+| 3 | Status is unbound, or an operation retained an `Unknown` request. |
+| 4 | Status is an invalid binding, or an operation ended `Conflict`/`Retryable`. |
+| 1 | Argument, admission, configuration or unexpected operation failure. |
 
-`run` and `resolve` succeed whenever a finite pass completed, even if work is
-still pending (for example, an observed remote completion with a newer local
-edit). They fail only on an unresolved `Unknown` outcome: a request that may
-still have published and whose receipt is missing. `status` must be consulted to
-decide whether to retry.
+`run` may succeed with pending or conflict evidence. It fails when an Unknown
+request remains unresolved.
 
-## Offline behavior
+## Cost acceptance
 
-`status` and `export --artifact` work without remote connectivity. `status`
-classifies the local binding first and reports remote availability truthfully,
-marking it unavailable with the real connection error when the authority cannot
-be reached; it never fabricates success. `export --artifact` and `export
---conflict --side local` read durable local bytes and never contact the
-authority. `export --conflict --side remote` reads a retained revision and
-needs the authority.
+For both adapters, one pull hashes at most twice the pulled tree size, a settled
+no-op hashes zero local bytes, and a settled state retains zero artifact bytes.
+Managed creates at one depth use one adapter batch and therefore one authority
+head commit. Direct uses one remote mutation per file, as required by its
+non-batch capability. No-op cost is independent of process lifetime and tree
+history.
 
-## Backup identity
+## Limits
 
-The root and state directory identities recorded in `replica.db` are not
-portable across an ordinary filesystem copy. The backup manifest therefore
-contains complete quiesced `LocalSnapshot` evidence for the root and each
-retained artifact, including original inode relationships and current content
-hashes, plus hashes of the consistent SQLite package files. Restore verifies
-the package, then maps original root/quarantine identities to the copied
-destinations. Baseline and work fingerprints and CommitIds are not rewritten.
-
-An unscanned local rename remains a rename because the old inode is mapped to
-the copied inode at its new path. Local edits not represented by baseline/work
-remain local differences. A retained artifact is validated against the bytes
-captured by the quiesced backup, not against the install's historical
-`expected_digest`; the existing conflict rules may therefore report the
-retained artifact as conflicted without discarding its bytes.
-
-Restore requires the supported manifest profile, documented local component
-profiles, a matching filesystem, absent destination paths, and terminal install
-records. It rejects malformed
-checksums, unsafe/duplicate paths or artifact names, wrong profiles, incomplete
-installs, and ambiguous old-to-new identity collisions before creating or
-rebinding destinations. The package format is experimental and is not an
-online snapshot contract or a local-profile migration mechanism. See
-[Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
-
-Before package copy, restore validates `replica.db`, `sync.db`, and
-`content/staging.db` read-only and binds the manifest to the replica binding.
-The package container remains `YYBK0001`. Restore accepts only the current
-replica, Sync and content-staging profiles. Older, newer, unknown or partial
-schemas fail without creating either destination; there is no upgrade path.
-
-## Status document
-
-`status --json` prints one `yinyang.sync.status.v1` document. Every field is
-always present; an unknown value is `null` rather than omitted. Enumerations are
-`snake_case`. Digests are 32-byte hex, node and commit identities are 16-byte
-hex, and revisions are 24-byte hex.
-
-```text
-{
-  "schema": "yinyang.sync.status.v1",
-  "binding": { "state": "bound|unbound|error", "state_directory": "...",
-               "root": "...", "filesystem": "...", "same_filesystem": true },
-  "remote":  { "availability": "not_checked|available|unavailable",
-               "revision": "...", "error": null },
-  "local":   { "scan": "not_scanned|clean|changed|failed", "error": null },
-  "summary": { "in_sync": false, "pending": 0, "unknown": 0, "conflicts": 0,
-               "failed": 0, "retained_artifacts": 0, "retained_bytes": 0 },
-  "entries": [ {
-    "path": "...", "original_path": null, "desired_path": null,
-    "state": "in_sync|local_pending|remote_pending|conflict|unknown|failed",
-    "local":  { "kind": "file|directory", "length": 0, "digest": "...",
-                "executable": false, "presence": "present|absent|unknown" },
-    "remote": { "kind": "file|directory", "length": 0, "digest": "...",
-                "executable": false, "presence": "present|absent|unknown",
-                "node": "...", "revision": "..." },
-    "baseline": { "node": "...", "revision": "..." },
-    "intent": { "id": "...", "operation": "content|create_file|create_directory|remove|rename|set_executable",
-                "state": "prepared|unknown|committed|conflict|retryable|failed",
-                "commit_id": "...", "receipt_revision": "..." },
-    "outcome": { "state": "pending|remote_completed|conflict|unknown|retryable|failed|none", "error": null },
-    "conflict": null
-  } ],
-  "conflicts": [ { "id": "...", "path": "...", "original_path": null, "desired_path": null,
-                   "local": "current_file|current_directory|retained_artifact|deleted|unknown",
-                   "remote": "current_file|current_directory|retained_artifact|deleted|unknown",
-                   "local_artifact": null, "remote_artifact": null,
-                   "remote_revision": "...", "error": "..." } ],
-  "artifacts": [ { "id": "...", "origin": "...",
-                   "kind": "replaced_file|rollback_displaced|quarantined_file|quarantined_directory|upload_retained",
-                   "phase": "preparing|prepared|moved|retained|conflict|failed",
-                   "path": "...", "exportable": true, "error": null } ]
-}
-```
-
-`entries` is sorted by `path`. `summary.conflicts` equals the number of
-top-level conflicts and `summary.retained_artifacts` equals the number of
-artifacts. `summary.retained_bytes` is the sum of their recorded payload
-lengths. An entry in conflict carries the same conflict identity in its nested
-`conflict` object. `summary.in_sync` is true only after a valid binding and
-baseline, an observed remote, no unresolved work, and an actual local/remote
-match.
-
-## Retained artifact lifecycle
-
-An artifact is verified when it is created. Status and run use its recorded
-device, inode, size, modification time and change time as cheap evidence; they
-hash retained bytes only when that evidence changed, when the artifact is
-exported, or when recovery uses it. A matching stat refreshes evidence after a
-metadata-only change without reading the payload.
-
-`upload-retained` captures from ordinary local publication are deleted after the
-edit's committed baseline is durable. A `replaced-file` or
-`rollback-displaced` artifact is verified against its recorded stat identity at
-the start of the next run, then deleted if unchanged. The pending-settle marker
-is stored in `artifacts.settle_pending`, so the boundary survives a new CLI
-process. Keeping it through one reconciliation boundary makes late writes
-through an already-open displaced inode observable; a changed inode becomes a
-conflict instead of being deleted.
-Explicit resolution inputs are deleted after their publication receipt, baseline
-update and conflict clearance are all durable. Unknown, Retryable, active
-conflict and incomplete-install artifacts remain.
-
-Every artifact not held by unknown work, retryable work or an active conflict is
-limited to 64 artifacts and 256 MiB per replica. The run releases oldest rows
-first until both limits hold. Directory quarantine artifacts survive the same
-one-reconciliation evidence window as displaced files, then are removed
-recursively only after the creation-time tree check succeeded and their stat
-identity still matches; a changed or ambiguous directory is retained and
-reported as a conflict. Status counts and byte summaries include every remaining
-artifact.
-
-## Example
-
-```shell
-export YINYANG_S3_BUCKET=my-bucket
-export YINYANG_S3_REGION=us-east-1
-export YINYANG_S3_ROOT=my-filesystem
-export YINYANG_STORAGE_PROFILE=minio
-export YINYANG_S3_ENDPOINT=http://127.0.0.1:9000
-
-cat > sync.json <<'JSON'
-{
-  "name": "notes",
-  "model": "managed",
-  "access": "sync",
-  "frontend": "library",
-  "publication": "object",
-  "storage_profile": "minio",
-  "staging": "/var/lib/yinyang/notes-state",
-  "read_only": false
-}
-JSON
-
-yy --volume sync.json sync init --directory "$HOME/notes"
-yy --volume sync.json sync run
-yy --volume sync.json sync status --json
-```
-
-## Limitations
-
-`sync` is implemented only on Linux and drives an ordinary directory; it does
-not provide macOS File Provider integration, an automatic watcher or a daemon.
-A retained artifact's bytes and a conflict's local side are exported offline; a
-conflict's remote side needs the authority.
+Sync is Linux-only and ordinary-directory-only. It has no watcher or daemon.
+Direct does not support empty directory markers, executable metadata, atomic
+rename or receipt lookup. Managed depends on the authority's retained change
+cursor; an unavailable cursor falls back to a full walk.

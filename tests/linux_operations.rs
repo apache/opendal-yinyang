@@ -282,7 +282,7 @@ fn isolated_user_service_lifecycle() {
 
     units.stop(&units.serve);
     assert!(state.join("metadata/metadata.db").exists());
-    assert!(state.join("service-sync/sync.db").exists());
+    assert!(state.join("service-sync/sync-engine.db").exists());
 
     let mount_config = write_config(&configs, "object", "mount", "fuse", "object", None);
     rewrite_staging(&mount_config, &state.join("object"));
@@ -352,13 +352,13 @@ fn isolated_user_service_lifecycle() {
     units.restart(&units.sync_instance("sync"));
     units.wait_active(&units.sync_instance("sync"));
     units.stop(&units.sync_instance("sync"));
-    assert!(state.join("sync/sync.db").exists());
+    assert!(state.join("sync/sync-engine.db").exists());
 
     drop(units);
     fs::remove_dir_all(&install.prefix).unwrap();
     assert!(state.join("metadata/metadata.db").exists());
     assert!(state.join("object/staging.db").exists());
-    assert!(state.join("sync/sync.db").exists());
+    assert!(state.join("sync/sync-engine.db").exists());
 }
 
 fn cli_smoke() {
@@ -500,7 +500,7 @@ fn cli_smoke_with(storage: Storage) {
         "sync run exit 0 alone is not convergence: {status:#}"
     );
     assert!(
-        state.join("sync/sync.db").exists(),
+        state.join("sync/sync-engine.db").exists(),
         "finite sync did not retain durable state"
     );
 
@@ -698,15 +698,15 @@ fn cli_smoke_with(storage: Storage) {
         "metadata service stop discarded its authority database"
     );
     assert!(state.join("service/staging.db").exists());
-    assert!(state.join("service-sync/sync.db").exists());
+    assert!(state.join("service-sync/sync-engine.db").exists());
 
     fs::remove_dir_all(&install.prefix).unwrap();
     assert!(local.join("hello.txt").exists());
     assert!(state.join("object/staging.db").exists());
-    assert!(state.join("sync/sync.db").exists());
+    assert!(state.join("sync/sync-engine.db").exists());
     assert!(service_database.exists());
     assert!(state.join("service/staging.db").exists());
-    assert!(state.join("service-sync/sync.db").exists());
+    assert!(state.join("service-sync/sync-engine.db").exists());
     assert!(object_config.exists());
     assert!(sync_config.exists());
     assert!(service_config.exists());

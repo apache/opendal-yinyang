@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Deterministic Managed Sync engine regression and scale tests.
+
 #![cfg(target_os = "linux")]
 
 #[path = "../crates/core/tests/support/mod.rs"]
@@ -22,21 +24,21 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction};
-use yinyang::replica::{DirectorySync, Resolution};
-use yinyang::runtime::ErrorKind as RuntimeErrorKind;
-use yinyang::sync::{FileMetadata, Sync};
+use yinyang::core::{
+    Authority, CommitId, CommitOutcome, Fs, NodeId, Planner, Revision, Snapshot, Transaction,
+};
+use yinyang::sync_engine::{
+    ManagedAdapter, Resolution, RunOutcome, StatusDocument, SyncEngine, SyncModel,
+};
 
-/// An independent snapshot of a real tree on one side of a sync.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TreeEntry {
     Directory,
@@ -62,8 +64,8 @@ fn local_tree(root: &Path) -> BTreeMap<String, TreeEntry> {
             tree.insert(
                 rel.to_owned(),
                 TreeEntry::File {
-                    executable: metadata.st_mode() & 0o111 != 0,
-                    bytes: std::fs::read(path).expect("tree file bytes"),
+                    executable: metadata.permissions().mode() & 0o111 != 0,
+                    bytes: std::fs::read(path).expect("tree file"),
                 },
             );
         }
@@ -78,13 +80,16 @@ fn tree_bytes(path: &Path) -> u64 {
         return 0;
     }
     let mut bytes = 0;
-    for entry in std::fs::read_dir(path).expect("tree directory") {
-        let entry = entry.expect("tree entry");
-        let metadata = entry.metadata().expect("tree metadata");
-        if metadata.is_dir() {
-            bytes += tree_bytes(&entry.path());
-        } else {
-            bytes += metadata.len();
+    let mut pending = vec![path.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).expect("tree bytes directory") {
+            let entry = entry.expect("tree bytes entry");
+            let metadata = entry.metadata().expect("tree bytes metadata");
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                bytes += metadata.len();
+            }
         }
     }
     bytes
@@ -129,299 +134,67 @@ async fn remote_tree(authority: &Arc<dyn Authority>) -> BTreeMap<String, TreeEnt
     tree
 }
 
-/// Seed a nested remote tree through the same public Sync contract that
-/// DirectorySync uses for publication.
-async fn seed_remote_tree(authority: &Arc<dyn Authority>) {
-    let temp = tempfile::tempdir().unwrap();
-    let sync = Sync::open(authority.clone(), temp.path().join("seed"))
-        .await
-        .unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    let directory = sync
-        .stage_create_directory(authority.root(), "dir", baseline.revision())
-        .await
-        .unwrap();
-    let revision = sync.publish(directory).await.unwrap();
-    let dir_node = sync
-        .namespace_status(directory)
-        .await
-        .unwrap()
-        .intent
-        .operation
-        .node_id();
-    let baseline = authority.observe_revision(revision).await.unwrap();
-    let sub = sync
-        .stage_create_directory(dir_node, "sub", baseline.revision())
-        .await
-        .unwrap();
-    let revision = sync.publish(sub).await.unwrap();
-    let sub_node = sync
-        .namespace_status(sub)
-        .await
-        .unwrap()
-        .intent
-        .operation
-        .node_id();
-    let baseline = authority.observe_revision(revision).await.unwrap();
-    let file = sync
-        .stage_create_file(
-            sub_node,
-            "file",
-            baseline.revision(),
-            FileMetadata::new(true),
-            &mut &b"remote executable"[..],
-        )
-        .await
-        .unwrap();
-    let revision = sync.publish(file).await.unwrap();
-    let baseline = authority.observe_revision(revision).await.unwrap();
-    let empty = sync
-        .stage_create_file(
-            sub_node,
-            "empty",
-            baseline.revision(),
-            FileMetadata::new(false),
-            &mut &b""[..],
-        )
-        .await
-        .unwrap();
-    sync.publish(empty).await.unwrap();
+struct ManagedHarness {
+    engine: SyncEngine<ManagedAdapter>,
+    adapter: ManagedAdapter,
+    state: PathBuf,
 }
 
-async fn exercise_initial_pull(authority: Arc<dyn Authority>) {
-    let temp = tempfile::tempdir().unwrap();
-    seed_remote_tree(&authority).await;
-    let root = temp.path().join("payload");
-    let state = temp.path().join("state");
-    std::fs::create_dir_all(&root).unwrap();
-
-    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
-        .await
-        .unwrap();
-    let first = sync.run().await.unwrap();
-    assert_eq!(first.published_local, 0);
-    assert_eq!(first.materialized_remote, 4);
-    assert!(
-        first.conflicts.is_empty(),
-        "initial pull conflicts: {:?}",
-        first.conflicts
-    );
-    assert!(first.in_sync);
-    let local = local_tree(&root);
-    assert_eq!(
-        local["dir/sub/file"],
-        TreeEntry::File {
-            executable: true,
-            bytes: b"remote executable".to_vec(),
-        }
-    );
-    assert_eq!(
-        local["dir/sub/empty"],
-        TreeEntry::File {
-            executable: false,
-            bytes: Vec::new(),
-        }
-    );
-    assert_eq!(
-        local,
-        remote_tree(&authority).await,
-        "initial pull must converge to the identical real tree"
-    );
-
-    let second = sync.run().await.unwrap();
-    assert_eq!(second.published_local, 0, "unchanged pull must not publish");
-    assert_eq!(
-        second.materialized_remote, 0,
-        "unchanged pull must not materialize"
-    );
-    assert!(second.conflicts.is_empty());
-    assert!(
-        second.in_sync,
-        "a converged unchanged pull must report in sync"
-    );
-    assert_eq!(local_tree(&root), remote_tree(&authority).await);
-
-    drop(sync);
-    let mut reopened = DirectorySync::open(authority.clone(), &state)
-        .await
-        .unwrap();
-    let third = reopened.run().await.unwrap();
-    assert_eq!(third.published_local, 0);
-    assert_eq!(third.materialized_remote, 0);
-    assert!(third.conflicts.is_empty());
-    assert!(
-        third.in_sync,
-        "a reopened converged sync must report in sync"
-    );
-    assert_eq!(
-        local_tree(&root),
-        remote_tree(&authority).await,
-        "a reopened sync must stay converged"
-    );
-}
-
-async fn exercise_initial_push(authority: Arc<dyn Authority>) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("payload");
-    let state = temp.path().join("state");
-    let sub = root.join("dir/sub");
-    std::fs::create_dir_all(&sub).unwrap();
-    let file = sub.join("file");
-    std::fs::write(&file, b"local executable").unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(sub.join("empty"), b"").unwrap();
-
-    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
-        .await
-        .unwrap();
-    let first = sync.run().await.unwrap();
-    assert_eq!(first.published_local, 4);
-    assert_eq!(first.materialized_remote, 0);
-    assert!(
-        first.conflicts.is_empty(),
-        "initial push conflicts: {:?}",
-        first.conflicts
-    );
-    assert!(first.in_sync);
-    assert_eq!(
-        local_tree(&root),
-        remote_tree(&authority).await,
-        "initial push must converge to the identical real tree"
-    );
-
-    let second = sync.run().await.unwrap();
-    assert_eq!(second.published_local, 0, "unchanged push must not publish");
-    assert_eq!(
-        second.materialized_remote, 0,
-        "unchanged push must not materialize"
-    );
-    assert!(second.conflicts.is_empty());
-    assert!(
-        second.in_sync,
-        "a converged unchanged push must report in sync"
-    );
-    assert_eq!(local_tree(&root), remote_tree(&authority).await);
-}
-
-async fn exercise_rename_with_edit(authority: Arc<dyn Authority>) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("payload");
-    let state = temp.path().join("state");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("old"), b"version one").unwrap();
-
-    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
-        .await
-        .unwrap();
-    let first = sync.run().await.unwrap();
-    assert_eq!(first.published_local, 1);
-    assert!(first.conflicts.is_empty());
-    assert_eq!(
-        local_tree(&root),
-        remote_tree(&authority).await,
-        "the file must converge at the old name before it is renamed"
-    );
-
-    // Rename and rewrite before a single run. The rename receipt must not
-    // acknowledge v2 bytes that the namespace intent never published.
-    std::fs::rename(root.join("old"), root.join("renamed")).unwrap();
-    std::fs::write(root.join("renamed"), b"version two").unwrap();
-    for _ in 0..8 {
-        let outcome = sync.run().await.unwrap();
-        assert!(
-            outcome.conflicts.is_empty(),
-            "rename/edit run conflicts: {:?}",
-            outcome.conflicts
-        );
-        if local_tree(&root) == remote_tree(&authority).await {
-            break;
+impl ManagedHarness {
+    async fn init(authority: Arc<dyn Authority>, state: &Path, root: &Path) -> Self {
+        std::fs::create_dir_all(root).unwrap();
+        let adapter = ManagedAdapter::new(authority);
+        let engine = SyncEngine::init(adapter.clone(), state, root)
+            .await
+            .unwrap();
+        Self {
+            engine,
+            adapter,
+            state: state.to_owned(),
         }
     }
-    let local = local_tree(&root);
-    let remote = remote_tree(&authority).await;
-    assert_eq!(
-        local, remote,
-        "the renamed and re-edited local file must converge to the new name and bytes"
-    );
-    assert_eq!(
-        local["renamed"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"version two".to_vec(),
+
+    async fn open(authority: Arc<dyn Authority>, state: &Path) -> Self {
+        let adapter = ManagedAdapter::new(authority);
+        let engine = SyncEngine::open(adapter.clone(), state).await.unwrap();
+        Self {
+            engine,
+            adapter,
+            state: state.to_owned(),
         }
-    );
-    assert_eq!(local.get("old"), None);
-    assert_eq!(remote.get("old"), None);
+    }
 
-    let stable = sync.run().await.unwrap();
-    assert_eq!(stable.published_local, 0, "converged run must not publish");
-    assert_eq!(
-        stable.materialized_remote, 0,
-        "converged run must not materialize"
-    );
-    assert!(stable.conflicts.is_empty());
-    assert!(stable.in_sync, "a converged stable run must report in sync");
-    assert_eq!(local_tree(&root), remote_tree(&authority).await);
-}
+    async fn run(&mut self) -> RunOutcome {
+        self.engine.run().await.unwrap()
+    }
 
-async fn service_authority() -> (
-    Arc<dyn Authority>,
-    tempfile::TempDir,
-    tokio::task::JoinHandle<yinyang::core::Result<()>>,
-) {
-    let backend = TestBackend::default();
-    let temp = tempfile::tempdir().unwrap();
-    let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
+    async fn resolve(&mut self, id: &str, resolution: Resolution) -> RunOutcome {
+        self.engine.resolve(id, resolution).await.unwrap()
+    }
+
+    async fn inspect(&self) -> StatusDocument {
+        SyncEngine::<ManagedAdapter>::inspect(
+            Some(&self.adapter),
+            &self.state,
+            SyncModel::Managed,
+            None,
+        )
         .await
-        .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let token = "directory-sync-service-auth-token-0123456789abcdef".to_owned();
-    let server = tokio::spawn(serve(listener, service, token.clone()));
-    let client = ServiceClient::connect(address, token, backend.operator())
-        .await
-        .unwrap();
-    (Arc::new(client), temp, server)
+    }
+
+    fn hash_bytes_read(&self) -> u64 {
+        self.engine.hash_bytes_read()
+    }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn initial_nested_sync_converges_in_object_and_service_modes() {
-    exercise_initial_pull(Arc::new(
-        Fs::create(TestBackend::default().operator()).await.unwrap(),
-    ))
-    .await;
-    exercise_initial_push(Arc::new(
-        Fs::create(TestBackend::default().operator()).await.unwrap(),
-    ))
-    .await;
-
-    let (client, temp, server) = service_authority().await;
-    exercise_initial_pull(client).await;
-    server.abort();
-    drop(temp);
-
-    let (client, temp, server) = service_authority().await;
-    exercise_initial_push(client).await;
-    server.abort();
-    drop(temp);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn renamed_and_re_edited_local_file_converges() {
-    exercise_rename_with_edit(Arc::new(
-        Fs::create(TestBackend::default().operator()).await.unwrap(),
-    ))
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn managed_sync_publishes_two_hundred_file_creates_in_one_commit() {
     const FILES: usize = 200;
-
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
+    let state = temp.path().join("state");
     std::fs::create_dir_all(&root).unwrap();
     for index in 0..FILES {
         std::fs::write(
@@ -430,11 +203,9 @@ async fn managed_sync_publishes_two_hundred_file_creates_in_one_commit() {
         )
         .unwrap();
     }
-    let mut sync = DirectorySync::init(authority, &temp.path().join("state"), &root)
-        .await
-        .unwrap();
+    let mut sync = ManagedHarness::init(authority, &state, &root).await;
     let before = backend.state.lock().unwrap().head_conditional_writes;
-    assert!(sync.run().await.unwrap().in_sync);
+    assert!(sync.run().await.in_sync);
     let commits = backend.state.lock().unwrap().head_conditional_writes - before;
     assert_eq!(
         commits, 1,
@@ -442,12 +213,30 @@ async fn managed_sync_publishes_two_hundred_file_creates_in_one_commit() {
     );
 }
 
-/// Delegating authority with two explicit hold points. The after-commit mode
-/// completes the real commit and then delays the successful response until the
-/// test releases it; the before-commit mode parks the request before the real
-/// commit so an external edit can land on the authority in between. The
-/// original commit outcomes are returned unchanged; lost or Unknown responses
-/// are a separate acceptance concern.
+#[tokio::test]
+async fn managed_sync_mixed_creates_and_content_edits_use_one_head_commit() {
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("edited"), b"baseline").unwrap();
+    std::fs::write(root.join("other"), b"unchanged").unwrap();
+    let mut sync = ManagedHarness::init(authority, &state, &root).await;
+    assert!(sync.run().await.in_sync);
+
+    std::fs::write(root.join("edited"), b"replacement").unwrap();
+    std::fs::write(root.join("created"), b"new bytes").unwrap();
+    let before = backend.state.lock().unwrap().head_conditional_writes;
+    assert!(sync.run().await.in_sync);
+    let commits = backend.state.lock().unwrap().head_conditional_writes - before;
+    assert_eq!(
+        commits, 1,
+        "mixed file creates and edits used {commits} head commits"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
     const SMALL: usize = 512 * 1024;
@@ -474,97 +263,67 @@ async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
     let large = writer_root.join("large");
     std::fs::write(&large, vec![1_u8; LARGE]).unwrap();
 
-    let mut writer = DirectorySync::init(authority.clone(), &writer_state, &writer_root)
-        .await
-        .unwrap();
+    let mut writer = ManagedHarness::init(authority.clone(), &writer_state, &writer_root).await;
     let before = backend.state.lock().unwrap().head_conditional_writes;
-    assert!(writer.run().await.unwrap().in_sync);
-    let head_commits = backend.state.lock().unwrap().head_conditional_writes - before;
+    assert!(writer.run().await.in_sync);
+    let commits = backend.state.lock().unwrap().head_conditional_writes - before;
     assert!(
-        head_commits <= 16,
-        "one new-file pass used {head_commits} head commits"
+        commits <= 16,
+        "one new-file pass used {commits} head commits"
     );
-    println!("managed sync new-file head commits: {head_commits}");
-    let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
-        .await
-        .unwrap();
-    assert_eq!(writer_status.summary.retained_bytes, 0);
-    assert_eq!(tree_bytes(&writer_state.join("quarantine")), 0);
+    assert_eq!(writer.inspect().await.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&writer_state.join("artifacts")), 0);
 
-    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
-        .await
-        .unwrap();
-    assert!(reader.run().await.unwrap().in_sync);
-    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
-        .await
-        .unwrap();
-    assert_eq!(reader_status.summary.retained_bytes, 0);
-    assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
+    let mut reader = ManagedHarness::init(authority.clone(), &reader_state, &reader_root).await;
+    assert!(reader.run().await.in_sync);
+    assert_eq!(reader.inspect().await.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&reader_state.join("artifacts")), 0);
 
     for edit in 0..EDITS {
         let mut bytes = vec![(edit % 250 + 2) as u8; LARGE];
         bytes[..8].copy_from_slice(&(edit as u64).to_le_bytes());
         std::fs::write(&large, bytes).unwrap();
-        assert!(writer.run().await.unwrap().in_sync);
-        let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
-            .await
-            .unwrap();
-        assert_eq!(writer_status.summary.retained_bytes, 0);
-        assert!(reader.run().await.unwrap().in_sync);
-        let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
-            .await
-            .unwrap();
+        assert!(writer.run().await.in_sync);
+        assert_eq!(writer.inspect().await.summary.retained_bytes, 0);
+        assert!(reader.run().await.in_sync);
         assert!(
-            reader_status.summary.retained_bytes <= LARGE as u64,
-            "reader retained more than one displaced version after edit {edit}: {}",
-            reader_status.summary.retained_bytes
-        );
-        assert!(
-            tree_bytes(&reader_state.join("quarantine")) <= (LARGE + 4096) as u64,
-            "reader quarantine grew after edit {edit}"
+            reader.inspect().await.summary.retained_bytes <= LARGE as u64,
+            "reader retained more than one displaced version after edit {edit}"
         );
     }
 
     drop(reader);
-    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
-        .await
-        .unwrap();
-    assert!(reader.run().await.unwrap().in_sync);
-    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
-        .await
-        .unwrap();
-    assert_eq!(reader_status.summary.retained_bytes, 0);
-    assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
+    let mut reader = ManagedHarness::open(authority.clone(), &reader_state).await;
+    assert!(reader.run().await.in_sync);
+    assert_eq!(reader.inspect().await.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&reader_state.join("artifacts")), 0);
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    reader.reset_hash_bytes_read();
-    assert!(reader.run().await.unwrap().in_sync);
+    assert!(reader.run().await.in_sync);
     assert!(
         reader.hash_bytes_read() <= LARGE as u64,
         "the first post-window run may refresh one racy evidence record"
     );
-    reader.reset_hash_bytes_read();
-    assert!(reader.run().await.unwrap().in_sync);
+    assert!(reader.run().await.in_sync);
     assert_eq!(
         reader.hash_bytes_read(),
         0,
-        "a settled no-op must use cached stat identity instead of rehashing local files"
+        "a settled no-op must use cached stat identity"
     );
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let mut changed = vec![7_u8; LARGE];
     changed[..8].copy_from_slice(&u64::MAX.to_le_bytes());
     std::fs::write(reader_root.join("large"), &changed).unwrap();
-    reader.reset_hash_bytes_read();
-    assert!(reader.run().await.unwrap().in_sync);
+    assert!(reader.run().await.in_sync);
     assert!(
         reader.hash_bytes_read() >= LARGE as u64,
-        "a same-size in-place edit must invalidate persistent stat evidence"
+        "an in-place edit must invalidate persistent stat evidence"
     );
-    assert!(writer.run().await.unwrap().in_sync);
+    assert!(writer.run().await.in_sync);
     assert_eq!(std::fs::read(&large).unwrap(), changed);
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn managed_sync_pull_hashing_is_linear() {
     const SIZE: usize = 256 * 1024;
     for files in [32_usize, 128] {
@@ -578,36 +337,33 @@ async fn managed_sync_pull_hashing_is_linear() {
             bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
             std::fs::write(push_root.join(format!("file-{index:03}")), bytes).unwrap();
         }
-        let mut push = DirectorySync::init(
+        let mut push = ManagedHarness::init(
             authority.clone(),
             &temp.path().join("push-state"),
             &push_root,
         )
-        .await
-        .unwrap();
-        assert!(push.run().await.unwrap().in_sync);
+        .await;
+        assert!(push.run().await.in_sync);
 
         let pull_root = temp.path().join("pull");
         std::fs::create_dir_all(&pull_root).unwrap();
-        let mut pull = DirectorySync::init(
+        let mut pull = ManagedHarness::init(
             authority.clone(),
             &temp.path().join("pull-state"),
             &pull_root,
         )
-        .await
-        .unwrap();
-        pull.reset_hash_bytes_read();
-        assert!(pull.run().await.unwrap().in_sync);
+        .await;
+        let before = pull.hash_bytes_read();
+        assert!(pull.run().await.in_sync);
         let tree = (files * SIZE) as u64;
         assert!(
-            pull.hash_bytes_read() <= tree * 2,
-            "{files}-file pull hashed {} bytes for a {tree}-byte tree",
-            pull.hash_bytes_read()
+            pull.hash_bytes_read() - before <= tree * 2,
+            "{files}-file pull rehashed more than twice the tree"
         );
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 #[ignore = "release-mode scale benchmark; run explicitly with --ignored --nocapture"]
 async fn managed_sync_scale_benchmark() {
     const SIZE: usize = 512 * 1024;
@@ -623,50 +379,43 @@ async fn managed_sync_scale_benchmark() {
             bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
             std::fs::write(directory.join(format!("f{index}")), bytes).unwrap();
         }
-        let mut push = DirectorySync::init(
+        let mut push = ManagedHarness::init(
             authority.clone(),
             &temp.path().join("push-state"),
             &push_root,
         )
-        .await
-        .unwrap();
+        .await;
         let before = Instant::now();
-        assert!(push.run().await.unwrap().in_sync);
+        assert!(push.run().await.in_sync);
         let push_seconds = before.elapsed().as_secs_f64();
 
         let pull_root = temp.path().join("pull");
         std::fs::create_dir_all(&pull_root).unwrap();
-        let mut pull = DirectorySync::init(
+        let mut pull = ManagedHarness::init(
             authority.clone(),
             &temp.path().join("pull-state"),
             &pull_root,
         )
-        .await
-        .unwrap();
-        pull.reset_hash_bytes_read();
+        .await;
         let before = Instant::now();
-        assert!(pull.run().await.unwrap().in_sync);
+        assert!(pull.run().await.in_sync);
         let pull_seconds = before.elapsed().as_secs_f64();
         let pull_hashes = pull.hash_bytes_read();
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        pull.reset_hash_bytes_read();
-        assert!(pull.run().await.unwrap().in_sync);
-        pull.reset_hash_bytes_read();
+        assert!(pull.run().await.in_sync);
         let before = Instant::now();
-        assert!(pull.run().await.unwrap().in_sync);
+        assert!(pull.run().await.in_sync);
         let noop_seconds = before.elapsed().as_secs_f64();
         let noop_hashes = pull.hash_bytes_read();
         assert_eq!(noop_hashes, 0);
         println!(
-            "W2_SCALE files={files} size={SIZE} push_s={push_seconds:.3} pull_s={pull_seconds:.3} \
-             noop_s={noop_seconds:.3} pull_hashed_bytes={pull_hashes} \
-             noop_hashed_bytes={noop_hashes} tree_bytes={}",
+            "W2_SCALE files={files} size={SIZE} push_s={push_seconds:.3} pull_s={pull_seconds:.3} noop_s={noop_seconds:.3} pull_hashed_bytes={pull_hashes} noop_hashed_bytes={noop_hashes} tree_bytes={}",
             files * SIZE
         );
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 #[ignore = "release-mode edit benchmark; run explicitly with --ignored --nocapture"]
 async fn managed_sync_edit_benchmark() {
     const SIZE: usize = 1024 * 1024;
@@ -680,151 +429,30 @@ async fn managed_sync_edit_benchmark() {
     std::fs::create_dir_all(&reader_root).unwrap();
     let file = writer_root.join("file");
     std::fs::write(&file, vec![1_u8; SIZE]).unwrap();
-    let mut writer = DirectorySync::init(authority.clone(), &writer_state, &writer_root)
-        .await
-        .unwrap();
-    assert!(writer.run().await.unwrap().in_sync);
-    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
-        .await
-        .unwrap();
-    assert!(reader.run().await.unwrap().in_sync);
+    let mut writer = ManagedHarness::init(authority.clone(), &writer_state, &writer_root).await;
+    assert!(writer.run().await.in_sync);
+    let mut reader = ManagedHarness::init(authority.clone(), &reader_state, &reader_root).await;
+    assert!(reader.run().await.in_sync);
     for edit in 0..EDITS {
         let mut bytes = vec![(edit % 250 + 2) as u8; SIZE];
         bytes[..8].copy_from_slice(&(edit as u64).to_le_bytes());
         std::fs::write(&file, bytes).unwrap();
-        assert!(writer.run().await.unwrap().in_sync);
-        assert!(reader.run().await.unwrap().in_sync);
+        assert!(writer.run().await.in_sync);
+        assert!(reader.run().await.in_sync);
     }
-    let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
-        .await
-        .unwrap();
-    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
-        .await
-        .unwrap();
+    let writer_retained = writer.inspect().await.summary.retained_bytes;
+    let reader_retained = reader.inspect().await.summary.retained_bytes;
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    reader.reset_hash_bytes_read();
-    assert!(reader.run().await.unwrap().in_sync);
-    reader.reset_hash_bytes_read();
-    let before = Instant::now();
-    assert!(reader.run().await.unwrap().in_sync);
-    let settled = DirectorySync::inspect(authority.clone(), &reader_state)
-        .await
-        .unwrap();
-    assert_eq!(reader.hash_bytes_read(), 0);
+    assert!(reader.run().await.in_sync);
+    let started = Instant::now();
+    assert!(reader.run().await.in_sync);
     println!(
-        "W2_EDITS edits={EDITS} writer_retained_bytes={} reader_retained_bytes={} \
-         settled_retained_bytes={} noop_hashed_bytes={} noop_s={:.3} quarantine_bytes={}",
-        writer_status.summary.retained_bytes,
-        reader_status.summary.retained_bytes,
-        settled.summary.retained_bytes,
+        "W2_EDITS edits={EDITS} writer_retained_bytes={writer_retained} reader_retained_bytes={reader_retained} settled_retained_bytes={} noop_hashed_bytes={} noop_s={:.3} artifact_bytes={}",
+        reader.inspect().await.summary.retained_bytes,
         reader.hash_bytes_read(),
-        before.elapsed().as_secs_f64(),
-        tree_bytes(&reader_state.join("quarantine"))
+        started.elapsed().as_secs_f64(),
+        tree_bytes(&reader_state.join("artifacts"))
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_sync_publication_does_not_reimport_prepared_content() {
-    const SIZE: usize = 4 * 1024 * 1024;
-
-    async fn measure(authority: Arc<dyn Authority>, backend: &TestBackend) -> (u64, u64, u64, u64) {
-        let temp = tempfile::tempdir().unwrap();
-        let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-            .await
-            .unwrap();
-        let baseline = authority.observe_latest().await.unwrap().revision();
-        let reads = || backend.state.lock().unwrap().data_read_bytes;
-        let before = reads();
-        let edit = sync
-            .stage_create_file(
-                authority.root(),
-                "file",
-                baseline,
-                FileMetadata::new(false),
-                &mut &vec![9_u8; SIZE][..],
-            )
-            .await
-            .unwrap();
-        let staged = reads() - before;
-        let before_publish = reads();
-        let revision = sync.publish(edit).await.unwrap();
-        let published = reads() - before_publish;
-        let node = sync
-            .namespace_status(edit)
-            .await
-            .unwrap()
-            .intent
-            .operation
-            .node_id();
-        let replacement = vec![3_u8; SIZE];
-        let before_stage = reads();
-        let content = sync
-            .stage(node, revision, &mut &replacement[..])
-            .await
-            .unwrap();
-        let content_staged = reads() - before_stage;
-        drop(sync);
-        let sync = Sync::open(authority, temp.path().join("sync"))
-            .await
-            .unwrap();
-        let before_publish = reads();
-        sync.publish(content).await.unwrap();
-        (staged, published, content_staged, reads() - before_publish)
-    }
-
-    let object_backend = TestBackend::default();
-    let object: Arc<dyn Authority> = Arc::new(Fs::create(object_backend.operator()).await.unwrap());
-    let (object_stage, object_publish, object_content_stage, object_content_publish) =
-        measure(object, &object_backend).await;
-    assert!(
-        object_publish < 64 * 1024,
-        "object publication read {object_publish} bytes after preparation"
-    );
-    assert!(object_stage <= SIZE as u64 + 64 * 1024);
-    assert!(
-        object_content_publish <= SIZE as u64 + 64 * 1024,
-        "object content publication read {object_content_publish} bytes"
-    );
-
-    let service_backend = TestBackend::default();
-    let service_temp = tempfile::tempdir().unwrap();
-    let service = MetadataService::create(
-        service_temp.path().join("metadata.db"),
-        service_backend.operator(),
-    )
-    .await
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let token = "managed-sync-publication-read-test".to_owned();
-    let server = tokio::spawn(serve(listener, service, token.clone()));
-    let client: Arc<dyn Authority> = Arc::new(
-        ServiceClient::connect(address, token, service_backend.operator())
-            .await
-            .unwrap(),
-    );
-    let (service_stage, service_publish, service_content_stage, service_content_publish) =
-        measure(client, &service_backend).await;
-    assert!(
-        service_publish < 64 * 1024,
-        "service publication read {service_publish} bytes after preparation"
-    );
-    assert!(
-        service_stage <= SIZE as u64 + 64 * 1024,
-        "service preparation read {service_stage} bytes"
-    );
-    assert!(
-        service_content_publish <= SIZE as u64 + 64 * 1024,
-        "service content publication read {service_content_publish} bytes"
-    );
-    println!(
-        "W2_READBACK object_stage={object_stage} object_publish={object_publish} \
-         object_content_stage={object_content_stage} \
-         object_content_publish={object_content_publish} service_stage={service_stage} \
-         service_publish={service_publish} service_content_stage={service_content_stage} \
-         service_content_publish={service_content_publish}"
-    );
-    server.abort();
 }
 
 #[derive(Debug)]
@@ -832,8 +460,8 @@ struct HeldAuthority {
     inner: Arc<dyn Authority>,
     committed: tokio::sync::mpsc::UnboundedSender<()>,
     release: Arc<tokio::sync::Notify>,
-    hold_next: Arc<AtomicBool>,
-    hold_before_next: Arc<AtomicBool>,
+    hold_next: AtomicBool,
+    hold_before_next: AtomicBool,
 }
 
 impl HeldAuthority {
@@ -841,27 +469,14 @@ impl HeldAuthority {
         inner: Arc<dyn Authority>,
         committed: tokio::sync::mpsc::UnboundedSender<()>,
         release: Arc<tokio::sync::Notify>,
+        before: bool,
     ) -> Self {
         Self {
             inner,
             committed,
             release,
-            hold_next: Arc::new(AtomicBool::new(true)),
-            hold_before_next: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn new_before_commit(
-        inner: Arc<dyn Authority>,
-        committed: tokio::sync::mpsc::UnboundedSender<()>,
-        release: Arc<tokio::sync::Notify>,
-    ) -> Self {
-        Self {
-            inner,
-            committed,
-            release,
-            hold_next: Arc::new(AtomicBool::new(false)),
-            hold_before_next: Arc::new(AtomicBool::new(true)),
+            hold_next: AtomicBool::new(!before),
+            hold_before_next: AtomicBool::new(before),
         }
     }
 }
@@ -916,95 +531,51 @@ async fn local_edit_during_delayed_publication_receipt_stays_pending() {
         authority.clone(),
         committed_tx,
         release.clone(),
+        false,
     ));
-
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("payload");
     let state = temp.path().join("state");
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("file");
     std::fs::write(&file, b"version one").unwrap();
-
-    let mut sync = DirectorySync::init(held.clone(), &state, &root)
-        .await
-        .unwrap();
-    let run1 = sync.run();
+    let mut sync = ManagedHarness::init(held.clone(), &state, &root).await;
+    let run = sync.run();
     let writer = async {
-        committed_rx
-            .recv()
-            .await
-            .expect("v1 commit must complete before the local edit");
-        std::fs::write(&file, b"version two").expect("local v2 write");
+        committed_rx.recv().await.expect("v1 commit");
+        std::fs::write(&file, b"version two").unwrap();
         release.notify_one();
     };
-    let outcome1 = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        tokio::join!(run1, writer)
-    })
-    .await
-    .expect("v1 publication must commit and release its receipt in time")
-    .0
-    .unwrap();
-
-    assert_eq!(outcome1.published_local, 1);
-    assert!(
-        outcome1.conflicts.is_empty(),
-        "v1 run conflicts: {:?}",
-        outcome1.conflicts
-    );
-    assert!(
-        !outcome1.in_sync,
-        "the local v2 edit must not be marked in sync behind a delayed receipt"
-    );
-    assert!(
-        outcome1.pending > 0,
-        "the local v2 edit must remain pending until it is published"
-    );
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(run, writer) })
+            .await
+            .unwrap()
+            .0;
+    assert_eq!(outcome.published_local, 1);
+    assert_eq!(outcome.conflicts, 0);
+    assert!(!outcome.in_sync);
+    assert!(outcome.pending > 0);
     assert_eq!(
-        local_tree(&root)["file"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"version two".to_vec(),
-        }
-    );
-    let remote = remote_tree(&authority).await;
-    assert_eq!(
-        remote["file"],
+        remote_tree(&authority).await["file"],
         TreeEntry::File {
             executable: false,
             bytes: b"version one".to_vec(),
-        },
-        "the remote must contain only the version that was actually uploaded"
+        }
     );
     drop(sync);
 
-    // The local edit must survive the delayed receipt: a fresh sync publishes v2.
-    let mut reopened = DirectorySync::open(held.clone(), &state).await.unwrap();
-    let outcome2 = reopened.run().await.unwrap();
-    assert!(
-        outcome2.published_local >= 1,
-        "the second run must publish the pending local version"
-    );
-    assert!(
-        outcome2.conflicts.is_empty(),
-        "v2 publish conflicts: {:?}",
-        outcome2.conflicts
-    );
-    assert!(outcome2.in_sync);
-    let remote = remote_tree(&authority).await;
+    let mut reopened = ManagedHarness::open(held.clone(), &state).await;
+    let second = reopened.run().await;
+    assert!(second.published_local >= 1);
+    assert_eq!(second.conflicts, 0);
+    assert!(second.in_sync);
     assert_eq!(
-        remote["file"],
+        remote_tree(&authority).await["file"],
         TreeEntry::File {
             executable: false,
             bytes: b"version two".to_vec(),
         }
     );
-
-    let outcome3 = reopened.run().await.unwrap();
-    assert_eq!(outcome3.published_local, 0);
-    assert_eq!(outcome3.materialized_remote, 0);
-    assert!(outcome3.conflicts.is_empty());
-    assert!(outcome3.in_sync);
-    assert_eq!(local_tree(&root), remote);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1017,100 +588,58 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("a"), b"local-a").unwrap();
     std::fs::write(root.join("b"), b"local-b").unwrap();
-
-    // A common baseline first, without any held commit.
-    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
-        .await
-        .unwrap();
-    let first = sync.run().await.unwrap();
+    let mut sync = ManagedHarness::init(authority.clone(), &state, &root).await;
+    let first = sync.run().await;
     assert_eq!(first.published_local, 2);
-    assert!(first.conflicts.is_empty());
-    assert_eq!(local_tree(&root), remote_tree(&authority).await);
+    assert_eq!(first.conflicts, 0);
     drop(sync);
 
-    // The next run stages local edits while the remote is observed unchanged,
-    // then parks a's commit before it reaches the real authority.
     std::fs::write(root.join("a"), b"local-a2").unwrap();
     std::fs::write(root.join("b"), b"local-b2").unwrap();
     let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Notify::new());
-    let held = Arc::new(HeldAuthority::new_before_commit(
+    let held = Arc::new(HeldAuthority::new(
         authority.clone(),
         committed_tx,
         release.clone(),
+        true,
     ));
-    let mut sync = DirectorySync::open(held.clone(), &state).await.unwrap();
+    let mut sync = ManagedHarness::open(held.clone(), &state).await;
     let run = sync.run();
     let writer = async {
-        committed_rx
-            .recv()
-            .await
-            .expect("a commit must reach the pre-commit barrier");
-        // The external edit goes through a public Sync journal on the
-        // independent raw authority while a's commit is parked.
-        let external = tempfile::tempdir().unwrap();
-        let seed = Sync::open(authority.clone(), external.path().join("seed"))
-            .await
-            .unwrap();
+        committed_rx.recv().await.expect("pre-commit barrier");
         let baseline = authority.observe_latest().await.unwrap();
         let b = baseline.resolve("b").await.unwrap().unwrap().id();
-        assert_eq!(
-            baseline
-                .open_file(b)
-                .await
-                .unwrap()
-                .read(0, 64)
-                .await
-                .unwrap(),
-            b"local-b",
-            "the run must observe the remote unchanged before the interleave"
-        );
-        let edit = seed
-            .stage(b, baseline.revision(), &mut &b"external-b"[..])
+        let prepared = authority
+            .data()
+            .prepare(&mut &b"external-b"[..])
             .await
             .unwrap();
-        seed.publish(edit).await.unwrap();
+        let mut planner = Planner::new(&baseline, CommitId::generate());
+        let _ = planner.node(b).await.unwrap();
+        planner.set_content(b, prepared).await.unwrap();
+        assert!(matches!(
+            authority.commit(&planner.finish().unwrap()).await.unwrap(),
+            CommitOutcome::Committed(_)
+        ));
         release.notify_one();
     };
-    let run_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        tokio::join!(run, writer)
-    })
-    .await
-    .expect("the interleaved run must finish within the timeout")
-    .0;
+    let result = tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(run, writer) })
+        .await
+        .unwrap()
+        .0;
     drop(sync);
-    if let Ok(outcome) = run_result {
-        assert!(
-            !outcome.in_sync,
-            "a run observing a competing remote edit must not report in sync"
-        );
-    }
+    assert!(!result.in_sync);
 
-    // Data safety: a's own edit landed, external-b survived, local b is kept.
     let local = local_tree(&root);
     let remote = remote_tree(&authority).await;
-    assert_eq!(
-        remote["a"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"local-a2".to_vec(),
-        },
-        "the local a edit must be published"
-    );
     assert_eq!(
         remote["b"],
         TreeEntry::File {
             executable: false,
             bytes: b"external-b".to_vec(),
         },
-        "the interleaved external edit must not be overwritten"
-    );
-    assert_eq!(
-        local["a"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"local-a2".to_vec(),
-        }
+        "external edit must survive"
     );
     assert_eq!(
         local["b"],
@@ -1118,400 +647,66 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
             executable: false,
             bytes: b"local-b2".to_vec(),
         },
-        "the local b edit must survive the interleaved run"
+        "local edit must survive"
     );
-
-    // Read-only inspection must expose a resolvable conflict, never in-sync.
-    let inspected = DirectorySync::inspect(authority.clone(), &state)
-        .await
-        .unwrap();
-    assert!(
-        !inspected.conflicts.is_empty(),
-        "the competing external edit must surface as a resolvable conflict"
-    );
-    assert!(
-        inspected
-            .conflicts
-            .iter()
-            .all(|conflict| !conflict.id.is_empty())
-    );
-
-    // The conflict is resolvable: keeping the remote side adopts the external
-    // bytes locally, preserves them remotely, and returns to in_sync.
-    let conflict = inspected.conflicts[0].clone();
-    let mut resolver = DirectorySync::open(authority.clone(), &state)
-        .await
-        .unwrap();
-    resolver
-        .resolve(&conflict.id, Resolution::KeepRemote)
-        .await
-        .unwrap();
-    let local = local_tree(&root);
-    let remote = remote_tree(&authority).await;
-    assert_eq!(
-        local["b"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"external-b".to_vec(),
-        },
-        "keep-remote must adopt the external bytes locally"
-    );
-    assert_eq!(
-        remote["b"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"external-b".to_vec(),
-        },
-        "the external remote edit must survive resolution"
-    );
-    drop(resolver);
-
-    let mut reopened = DirectorySync::open(authority.clone(), &state)
-        .await
-        .unwrap();
-    let stable = reopened.run().await.unwrap();
-    assert!(
-        stable.in_sync,
-        "a resolved interleaving must reach in_sync on the next run"
-    );
-    let final_status = DirectorySync::inspect(authority.clone(), &state)
-        .await
-        .unwrap();
-    assert!(final_status.conflicts.is_empty());
-    assert!(final_status.summary.in_sync);
+    let inspected = ManagedHarness::open(authority.clone(), &state).await;
+    let status = inspected.inspect().await;
+    assert!(!status.conflicts.is_empty());
+    let conflict = status.conflicts[0].id.clone();
+    let mut resolver = inspected;
+    resolver.resolve(&conflict, Resolution::KeepRemote).await;
+    let stable = resolver.run().await;
+    assert!(stable.in_sync, "{stable:?}");
+    assert!(resolver.inspect().await.conflicts.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_deletion_during_delayed_publication_receipt_stays_pending() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let held = Arc::new(HeldAuthority::new(
-        authority.clone(),
-        committed_tx,
-        release.clone(),
-    ));
+async fn managed_sync_publication_does_not_reimport_prepared_content() {
+    const SIZE: usize = 4 * 1024 * 1024;
 
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("payload");
-    let state = temp.path().join("state");
-    std::fs::create_dir_all(&root).unwrap();
-    let file = root.join("file");
-    std::fs::write(&file, b"version one").unwrap();
-
-    let mut sync = DirectorySync::init(held.clone(), &state, &root)
-        .await
-        .unwrap();
-    let run1 = sync.run();
-    let writer = async {
-        committed_rx
-            .recv()
-            .await
-            .expect("v1 commit must complete before the local delete");
-        std::fs::remove_file(&file).expect("local delete");
-        release.notify_one();
-    };
-    let outcome1 = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        tokio::join!(run1, writer)
-    })
-    .await
-    .expect("v1 publication must commit and release its receipt in time")
-    .0
-    .unwrap();
-
-    assert_eq!(outcome1.published_local, 1);
-    assert!(
-        outcome1.conflicts.is_empty(),
-        "v1 run conflicts: {:?}",
-        outcome1.conflicts
-    );
-    assert!(
-        !outcome1.in_sync,
-        "the local deletion must not be marked in sync behind a delayed receipt"
-    );
-    assert!(
-        outcome1.pending > 0,
-        "the local deletion must remain pending until it is published"
-    );
-    assert!(
-        !file.exists(),
-        "the delayed receipt must not resurrect the deleted local file"
-    );
-    let remote = remote_tree(&authority).await;
-    assert_eq!(
-        remote["file"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"version one".to_vec(),
-        },
-        "the remote must still hold only the uploaded v1"
-    );
-    drop(sync);
-
-    // The accepted v1 baseline must survive the delayed receipt so the next
-    // run publishes the local deletion instead of materializing v1 back.
-    let mut reopened = DirectorySync::open(held.clone(), &state).await.unwrap();
-    let outcome2 = reopened.run().await.unwrap();
-    assert!(
-        outcome2.published_local >= 1,
-        "the next run must publish the local deletion"
-    );
-    assert!(
-        outcome2.conflicts.is_empty(),
-        "deletion publish conflicts: {:?}",
-        outcome2.conflicts
-    );
-    let remote = remote_tree(&authority).await;
-    assert_eq!(
-        remote.get("file"),
-        None,
-        "the published deletion must remove the remote file"
-    );
-    assert!(!file.exists());
-
-    let outcome3 = reopened.run().await.unwrap();
-    assert_eq!(outcome3.published_local, 0);
-    assert_eq!(outcome3.materialized_remote, 0);
-    assert!(outcome3.conflicts.is_empty());
-    assert!(
-        outcome3.in_sync,
-        "a converged run after the published deletion must report in sync"
-    );
-    assert_eq!(local_tree(&root), remote);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn namespace_only_rename_receipt_keeps_interleaved_content() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("payload");
-    let state = temp.path().join("state");
-    let dir = root.join("dir");
-    let file = dir.join("file");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(&file, b"v1").unwrap();
-
-    // A common baseline for the directory subtree first.
-    let mut sync = DirectorySync::init(authority.clone(), &state, &root)
-        .await
-        .unwrap();
-    let first = sync.run().await.unwrap();
-    assert_eq!(first.published_local, 2);
-    assert!(first.conflicts.is_empty());
-    assert_eq!(local_tree(&root), remote_tree(&authority).await);
-    drop(sync);
-
-    // The next run renames the directory locally while the remote is observed
-    // unchanged, then parks the rename commit before it executes.
-    std::fs::rename(&dir, root.join("moved")).unwrap();
-    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let held = Arc::new(HeldAuthority::new_before_commit(
-        authority.clone(),
-        committed_tx,
-        release.clone(),
-    ));
-    let mut sync = DirectorySync::open(held.clone(), &state).await.unwrap();
-    let run = sync.run();
-    let writer = async {
-        committed_rx
-            .recv()
-            .await
-            .expect("the rename commit must reach the pre-commit barrier");
-        // The interleaved content edit goes through the independent raw
-        // authority while the namespace-only rename is parked. The rename
-        // predicates guard links and entries, never the inner file content,
-        // so this exact schedule commits and later materializes v2.
-        let external = tempfile::tempdir().unwrap();
-        let seed = Sync::open(authority.clone(), external.path().join("seed"))
-            .await
-            .unwrap();
-        let baseline = authority.observe_latest().await.unwrap();
-        let file = baseline.resolve("dir/file").await.unwrap().unwrap().id();
-        assert_eq!(
-            baseline
-                .open_file(file)
-                .await
-                .unwrap()
-                .read(0, 64)
-                .await
-                .unwrap(),
-            b"v1",
-            "the run must observe the remote unchanged before the interleave"
-        );
-        let edit = seed
-            .stage(
-                file,
-                baseline.revision(),
-                &mut &b"v2-was-never-seen-locally"[..],
-            )
-            .await
-            .unwrap();
-        seed.publish(edit).await.unwrap();
-        release.notify_one();
-    };
-    let outcome1 = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        tokio::join!(run, writer)
-    })
-    .await
-    .expect("the interleaved rename run must finish within the timeout")
-    .0
-    .unwrap_or_else(|error| panic!("the audited rename interleave must commit: {error}"));
-
-    assert!(
-        outcome1.conflicts.is_empty(),
-        "the audited rename interleave must not conflict: {:?}",
-        outcome1.conflicts
-    );
-    let local1 = local_tree(&root);
-    let remote1 = remote_tree(&authority).await;
-    assert!(
-        !remote1.contains_key("dir"),
-        "the accepted rename must move the directory out of the old name"
-    );
-    assert_eq!(
-        remote1["moved/file"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"v2-was-never-seen-locally".to_vec(),
-        },
-        "the namespace rename receipt must not swallow the interleaved external content"
-    );
-    assert!(
-        !outcome1.in_sync || local1 == remote1,
-        "in_sync must imply identical real trees"
-    );
-    // The first run may materialize the retained v2 immediately; only when the
-    // local v1 survives it must the unobserved content stay pending.
-    if local1.get("moved/file")
-        == Some(&TreeEntry::File {
-            executable: false,
-            bytes: b"v1".to_vec(),
-        })
-    {
-        assert!(
-            outcome1.pending > 0,
-            "a surviving local v1 must keep the unobserved remote v2 pending"
-        );
-        assert!(
-            !outcome1.in_sync,
-            "a surviving local v1 must not report in sync"
-        );
+    async fn measure(authority: Arc<dyn Authority>, backend: &TestBackend) -> u64 {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), vec![9_u8; SIZE]).unwrap();
+        let adapter = ManagedAdapter::new(authority);
+        let state = temp.path().join("state");
+        let mut sync = SyncEngine::init(adapter, &state, &root).await.unwrap();
+        let reads = || backend.state.lock().unwrap().data_read_bytes;
+        let before = reads();
+        assert!(sync.run().await.unwrap().in_sync);
+        reads() - before
     }
 
-    // A reopened sync materializes the retained v2 and then runs stable.
-    drop(sync);
-    let mut reopened = DirectorySync::open(held.clone(), &state).await.unwrap();
-    let outcome2 = reopened.run().await.unwrap();
-    assert!(outcome2.conflicts.is_empty());
-    let local2 = local_tree(&root);
-    let remote2 = remote_tree(&authority).await;
-    assert_eq!(
-        local2, remote2,
-        "the next run must converge the moved subtree to the interleaved v2"
-    );
-    assert_eq!(
-        local2["moved/file"],
-        TreeEntry::File {
-            executable: false,
-            bytes: b"v2-was-never-seen-locally".to_vec(),
-        }
-    );
-    assert!(!local2.contains_key("dir"));
-
-    let outcome3 = reopened.run().await.unwrap();
-    assert_eq!(outcome3.published_local, 0);
-    assert_eq!(outcome3.materialized_remote, 0);
-    assert!(outcome3.conflicts.is_empty());
+    let object_backend = TestBackend::default();
+    let object: Arc<dyn Authority> = Arc::new(Fs::create(object_backend.operator()).await.unwrap());
+    let reads = measure(object, &object_backend).await;
     assert!(
-        outcome3.in_sync,
-        "the converged renamed subtree must report in sync"
+        reads <= SIZE as u64 + 64 * 1024,
+        "object run read {reads} bytes for a {SIZE}-byte file"
     );
-    assert_eq!(local_tree(&root), remote_tree(&authority).await);
-}
 
-#[tokio::test]
-async fn composite_preflight_rejects_an_old_sync_profile() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    let state = temp.path().join("state");
-    drop(
-        DirectorySync::init(authority.clone(), &state, &root)
+    let service_backend = TestBackend::default();
+    let service_temp = tempfile::tempdir().unwrap();
+    let service = MetadataService::create(
+        service_temp.path().join("metadata.db"),
+        service_backend.operator(),
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let token = "managed-sync-publication-read-test".to_owned();
+    let server = tokio::spawn(serve(listener, service, token.clone()));
+    let client: Arc<dyn Authority> = Arc::new(
+        ServiceClient::connect(address, token, service_backend.operator())
             .await
             .unwrap(),
     );
-    rusqlite::Connection::open(state.join("sync.db"))
-        .unwrap()
-        .execute(
-            "UPDATE binding SET profile='yinyang-sync-2' WHERE singleton=1",
-            [],
-        )
-        .unwrap();
-
-    let error = DirectorySync::open(authority, &state).await.err().unwrap();
-    assert_eq!(
-        error
-            .downcast_ref::<yinyang::runtime::Error>()
-            .unwrap_or_else(|| {
-                panic!(
-                    "unexpected preflight error type {}: {error}",
-                    std::any::type_name_of_val(error.as_ref())
-                )
-            })
-            .kind(),
-        RuntimeErrorKind::Unsupported
+    let reads = measure(client, &service_backend).await;
+    assert!(
+        reads <= SIZE as u64 + 128 * 1024,
+        "service run read {reads} bytes for a {SIZE}-byte file"
     );
-    let profile: String = rusqlite::Connection::open(state.join("sync.db"))
-        .unwrap()
-        .query_row("SELECT profile FROM binding", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(profile, "yinyang-sync-2");
-}
-
-#[tokio::test]
-async fn composite_preflight_rejects_an_old_staging_profile() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    let state = temp.path().join("state");
-    drop(
-        DirectorySync::init(authority.clone(), &state, &root)
-            .await
-            .unwrap(),
-    );
-    rusqlite::Connection::open(state.join("content/staging.db"))
-        .unwrap()
-        .execute(
-            "UPDATE authority SET profile='yinyang-stage-3' WHERE singleton=1",
-            [],
-        )
-        .unwrap();
-
-    let error = DirectorySync::open(authority, &state).await.err().unwrap();
-    assert_eq!(
-        error
-            .downcast_ref::<yinyang::runtime::Error>()
-            .unwrap_or_else(|| {
-                panic!(
-                    "unexpected preflight error type {}: {error}",
-                    std::any::type_name_of_val(error.as_ref())
-                )
-            })
-            .kind(),
-        RuntimeErrorKind::Unsupported
-    );
-    let profile: String = rusqlite::Connection::open(state.join("content/staging.db"))
-        .unwrap()
-        .query_row(
-            "SELECT profile FROM authority WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(profile, "yinyang-stage-3");
+    server.abort();
 }

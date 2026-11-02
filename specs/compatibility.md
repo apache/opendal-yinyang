@@ -96,17 +96,16 @@ identity when the authenticated bytes and identities remain unchanged.
 
 ## Local state
 
-Local staging, Sync, directory-journal, replica, Direct runtime and Direct Sync
-state each have one current identifier:
+Local staging, Sync, directory-journal, Direct runtime and Sync engine state
+each have one current identifier:
 
 | Local state | Current identifier |
 | --- | --- |
 | File staging | `yinyang-stage-4` |
-| Sync journal | `yinyang-sync-3` |
-| Directory publication | `yinyang-directory-2` |
-| Directory replica | `yinyang-directory-replica-3` |
+| Sync engine | `yinyang-sync-engine-2` |
+| Sync content journal | `yinyang-sync-4` |
+| Directory publication | `yinyang-directory-3` |
 | Direct mutation runtime | `yinyang-direct-runtime-2` |
-| Direct Sync | `yinyang-direct-sync-2` |
 | Backup manifest | `YYBK0001` version 1 |
 
 Every local database contains exactly one profile row with `singleton=1`.

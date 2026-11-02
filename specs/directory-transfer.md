@@ -65,16 +65,17 @@ generations. Receipt lookup alone is not publication of a newly scanned source.
 The caller supplies a dedicated local state directory. It contains
 `directory.db`, an experimental SQLite WAL database using
 `synchronous=FULL`, bound to exactly one filesystem and root. Keep the
-database and WAL together. Profile `yinyang-directory-2` stores the exact
-serialized `Transaction`, its
-CommitId, baseline revision, request digest, diagnostic source path, and a
-directory manifest derived during that same successful preparation. Unknown or
+database and WAL together. Profile `yinyang-directory-3` uses the shared
+`intents` state codec from [sync-runtime.md](sync-runtime.md). Its `metadata`
+column stores the diagnostic source path and directory manifest derived during
+the same successful preparation. The request, CommitId, request digest,
+baseline, receipt and typed failure use the shared columns. Unknown or
 mismatched profiles and filesystem bindings are rejected. This local format has
 no migration path.
 
-The supported schema signature is the exact table set `binding` and
-`publications` with their exact column-name sets. Maintained inserts name their
-columns explicitly, so column order is not part of the signature. A writer
+The supported schema signature is the exact table set `binding` and `intents`
+with their exact column-name sets. Maintained inserts name their columns
+explicitly, so column order is not part of the signature. A writer
 validates an existing database before journal-mode configuration or DDL. A
 missing or zero-table database may be initialized after the journal's SQLite
 write transaction starts; an older or unknown profile returns `Unsupported`,

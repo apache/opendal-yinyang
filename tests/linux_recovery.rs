@@ -845,12 +845,12 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
     let remote_before = remote_identities(&fixture.operator());
     let live = retention_plan(&fixture, &source.config, 1, &[], None);
     assert_plan_boundaries(&live);
-    let live_baseline = live["protection"]["staging"]["replica"]["baseline"]["revision"]
+    let live_baseline = live["protection"]["staging"]["engine"]["baseline"]["revisions"][0]
         .as_str()
-        .expect("live replica baseline revision")
+        .expect("live engine baseline revision")
         .to_owned();
     assert_eq!(live_baseline.len(), 48);
-    assert_decision_reason(&live, &live_baseline, "replica_baseline");
+    assert_decision_reason(&live, &live_baseline, "sync_engine_baseline");
     assert_eq!(
         authoritative_tree(&source.state),
         source_state_before,
@@ -924,7 +924,7 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
     assert_eq!(valid["state"], "validated");
     assert_eq!(valid["staging"]["binding"]["state"], "verified");
     assert_eq!(
-        valid["staging"]["replica"]["baseline"]["revision"],
+        valid["staging"]["engine"]["baseline"]["revisions"][0],
         live_baseline
     );
     let corrupt_package = package_by_path(packages, &corrupt);
@@ -935,7 +935,7 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
             .as_str()
             .is_some_and(|error| !error.is_empty())
     );
-    assert_decision_reason(&protected, &live_baseline, "backup_replica_baseline");
+    assert_decision_reason(&protected, &live_baseline, "backup_sync_engine_baseline");
     assert!(
         protected["unresolved"]
             .as_array()
@@ -953,7 +953,7 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
     assert_eq!(
         authoritative_tree(&source.state),
         source_state_before_backup_plans,
-        "backup retention planning changed the unrelated live replica state"
+        "backup retention planning changed the unrelated live Sync engine state"
     );
     assert_eq!(authoritative_tree(&backup), backup_before);
     assert_eq!(authoritative_tree(&corrupt), corrupt_before);
@@ -1180,7 +1180,7 @@ fn retention_plan(
 }
 
 fn assert_plan_boundaries(plan: &serde_json::Value) {
-    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v3");
+    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v4");
     assert_eq!(plan["deletion_authorized"], false);
     assert!(plan["reclaimable_bytes"].is_null());
     assert_eq!(plan["policy"]["published_history"], "retained_by_default");
@@ -1221,7 +1221,7 @@ fn package_by_path<'a>(packages: &'a [serde_json::Value], path: &Path) -> &'a se
 }
 
 fn clear_ephemeral_locks(staging: &Path) {
-    for relative in ["replica.lock", "runtime.lock", "content/runtime.lock"] {
+    for relative in ["sync-engine.lock", "runtime.lock", "content/runtime.lock"] {
         match fs::remove_file(staging.join(relative)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1231,7 +1231,7 @@ fn clear_ephemeral_locks(staging: &Path) {
 }
 
 fn assert_no_ephemeral_locks(staging: &Path) {
-    for relative in ["replica.lock", "runtime.lock", "content/runtime.lock"] {
+    for relative in ["sync-engine.lock", "runtime.lock", "content/runtime.lock"] {
         assert!(
             !staging.join(relative).exists(),
             "read-only planning created writer lease {relative} under {}",

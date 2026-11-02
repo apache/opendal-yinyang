@@ -17,935 +17,229 @@
 
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
-use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{Authority, CommitOutcome, Fs, NodeId, Revision, Transaction};
-use yinyang::runtime::{ErrorKind, Runtime};
-use yinyang::sync::{
-    EditStatus, FileMetadata, NamespaceOperation, NamespaceState, RenameMode, Sync,
+use yinyang::core::{
+    Authority, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs, NodeId, Planner,
+    Revision, Snapshot, Transaction,
 };
+use yinyang::runtime::ErrorKind;
+use yinyang::sync::{IntentState, Sync};
 
-async fn exercise(authority: Arc<dyn Authority>) {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
-        .await
-        .unwrap();
-    runtime.create_file(authority.root(), "file").await.unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    let node = baseline.resolve("file").await.unwrap().unwrap().id();
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let edit = sync
-        .stage(node, baseline.revision(), &mut &b"local"[..])
-        .await
-        .unwrap();
-    assert!(sync.status(edit).await.unwrap().pending);
-    assert_eq!(
-        sync.stage(node, baseline.revision(), &mut &b"local"[..])
-            .await
-            .unwrap(),
-        edit
-    );
-    assert_eq!(sync.edits().await.unwrap(), vec![edit]);
-    let published = sync.publish(edit).await.unwrap();
-    assert_eq!(sync.publish(edit).await.unwrap(), published);
-    drop(sync);
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    assert_eq!(sync.publish(edit).await.unwrap(), published);
-    assert_eq!(
-        sync.stage(node, baseline.revision(), &mut &b"local"[..])
-            .await
-            .unwrap(),
-        edit
-    );
-    let pinned = baseline.open_file(node).await.unwrap();
-    assert!(pinned.read(0, 10).await.unwrap().is_empty());
-    assert_eq!(
-        authority
-            .observe_revision(published)
-            .await
-            .unwrap()
-            .open_file(node)
-            .await
-            .unwrap()
-            .read(0, 10)
-            .await
-            .unwrap(),
-        b"local"
-    );
-    let stale = sync
-        .stage(node, baseline.revision(), &mut &b"offline"[..])
-        .await
-        .unwrap();
-    assert_eq!(
-        sync.publish(stale).await.unwrap_err().kind(),
-        ErrorKind::Conflict
-    );
-    assert_eq!(sync.read(stale, 0, 10).await.unwrap(), b"offline");
-    // Empty-to-empty intent must still protect its original baseline.
-    let empty = sync
-        .stage(node, baseline.revision(), &mut &b""[..])
-        .await
-        .unwrap();
-    assert_eq!(
-        sync.publish(empty).await.unwrap_err().kind(),
-        ErrorKind::Conflict
-    );
-    assert!(sync.read(empty, 0, 10).await.unwrap().is_empty());
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sync_is_independent_and_conditional_in_both_modes() {
-    let backend = TestBackend::default();
-    exercise(Arc::new(Fs::create(backend.operator()).await.unwrap())).await;
-    let backend = TestBackend::default();
-    let temp = tempfile::tempdir().unwrap();
-    let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
-        .await
-        .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let token = "sync-test-only-service-token-at-least-32-bytes";
-    let server = tokio::spawn(serve(listener, service, token.into()));
-    let client = ServiceClient::connect(address, token.into(), backend.operator())
-        .await
-        .unwrap();
-    exercise(Arc::new(client)).await;
-    server.abort();
-}
-#[tokio::test]
-async fn original_upload_survives_unknown_and_restart() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
-        .await
-        .unwrap();
-    runtime.create_file(authority.root(), "file").await.unwrap();
-    let base = authority.observe_latest().await.unwrap();
-    let node = base.resolve("file").await.unwrap().unwrap().id();
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let edit = sync
-        .stage(node, base.revision(), &mut &b"recover"[..])
-        .await
-        .unwrap();
-    backend.state.lock().unwrap().delay_next_head = true;
-    let error = sync.publish(edit).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unknown);
-    let commit = error.commit_id().unwrap();
-    drop(sync);
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    assert_eq!(
-        sync.status(edit).await.unwrap().error.unwrap().commit_id(),
-        Some(commit)
-    );
-    let revision = sync.publish(edit).await.unwrap();
-    let receipt = authority
-        .observe_latest()
-        .await
-        .unwrap()
-        .receipt(commit)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(revision, receipt.cursor.revision);
-}
-
-async fn create_file(
-    authority: &Arc<dyn Authority>,
-    runtime: &Runtime,
-    parent: NodeId,
-    name: &str,
-) -> (Revision, NodeId) {
-    let (node, _) = runtime
-        .create_file_with_node(parent, name, false)
-        .await
-        .unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    (baseline.revision(), node)
-}
-
-async fn create_directory(
-    authority: &Arc<dyn Authority>,
-    runtime: &Runtime,
-    parent: NodeId,
-    name: &str,
-) -> (Revision, NodeId) {
-    let (node, _) = runtime
-        .create_directory_with_node(parent, name)
-        .await
-        .unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    (baseline.revision(), node)
-}
-
-fn assert_conflict(result: yinyang::runtime::Result<Revision>) {
-    assert_eq!(result.unwrap_err().kind(), ErrorKind::Conflict);
-}
-
-/// Delegating authority that substitutes a non-Unknown error after the inner
-/// authority already published, modeling a lost or malformed response.
 #[derive(Debug)]
-struct FaultAuthority {
+struct LostResponseAuthority {
     inner: Arc<dyn Authority>,
-    fail_next: Arc<AtomicBool>,
+    lose_next: AtomicBool,
 }
 
-impl FaultAuthority {
+impl LostResponseAuthority {
     fn new(inner: Arc<dyn Authority>) -> Self {
         Self {
             inner,
-            fail_next: Arc::new(AtomicBool::new(false)),
+            lose_next: AtomicBool::new(false),
         }
     }
 
-    fn fail_next_response(&self) {
-        self.fail_next.store(true, Ordering::SeqCst);
+    fn lose_next_response(&self) {
+        self.lose_next.store(true, Ordering::SeqCst);
     }
 }
 
-impl Authority for FaultAuthority {
-    fn data(&self) -> &yinyang::core::DataStore {
+impl Authority for LostResponseAuthority {
+    fn data(&self) -> &DataStore {
         self.inner.data()
     }
+
     fn filesystem(&self) -> NodeId {
         self.inner.filesystem()
     }
+
     fn root(&self) -> NodeId {
         self.inner.root()
     }
+
     fn observe_latest<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<yinyang::core::Snapshot>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + 'a>> {
         self.inner.observe_latest()
     }
+
     fn observe_revision<'a>(
         &'a self,
         revision: Revision,
-    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<yinyang::core::Snapshot>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Snapshot>> + Send + 'a>> {
         self.inner.observe_revision(revision)
     }
+
     fn commit_batch<'a>(
         &'a self,
         requests: &'a [Transaction],
     ) -> Pin<Box<dyn Future<Output = yinyang::core::Result<Vec<CommitOutcome>>> + Send + 'a>> {
         Box::pin(async move {
             let outcomes = self.inner.commit_batch(requests).await?;
-            if self.fail_next.swap(false, Ordering::SeqCst) {
-                return Err(
-                    yinyang::core::ContentDescriptor::from_bytes(b"malformed response")
-                        .unwrap_err(),
-                );
+            if self.lose_next.swap(false, Ordering::SeqCst) {
+                return Err(yinyang::core::Error::new(
+                    CoreErrorKind::Invalid,
+                    "test content publication",
+                    "lost response after publication",
+                ));
             }
             Ok(outcomes)
         })
     }
 }
 
-async fn exercise_namespace(authority: Arc<dyn Authority>) {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
-        .await
-        .unwrap();
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let root = authority.root();
-
-    // Create with bytes and executable metadata. The durable identity survives
-    // restart and the exact intent resolves to the same commit.
-    let baseline = authority.observe_latest().await.unwrap();
-    let created = sync
-        .stage_create_file(
-            root,
-            "created",
-            baseline.revision(),
-            FileMetadata::new(true),
-            &mut &b"created bytes"[..],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        sync.stage_create_file(
-            root,
-            "created",
-            baseline.revision(),
-            FileMetadata::new(true),
-            &mut &b"created bytes"[..],
-        )
-        .await
-        .unwrap(),
-        created
+async fn create_file(authority: &Arc<dyn Authority>, name: &str, bytes: &[u8]) -> NodeId {
+    let prepared = authority.data().prepare(&mut &bytes[..]).await.unwrap();
+    let mut planner = Planner::new(
+        &authority.observe_latest().await.unwrap(),
+        CommitId::generate(),
     );
-    let status = sync.namespace_status(created).await.unwrap();
-    assert_eq!(status.state, NamespaceState::Prepared);
-    assert_eq!(sync.read(created, 0, 64).await.unwrap(), b"created bytes");
-    let NamespaceOperation::CreateFile {
-        node: created_node,
-        metadata,
-        ..
-    } = status.intent.operation
-    else {
-        panic!("expected file creation intent");
+    planner
+        .create_file(authority.root(), name, prepared, false)
+        .await
+        .unwrap();
+    let outcome = authority.commit(&planner.finish().unwrap()).await.unwrap();
+    let CommitOutcome::Committed(receipt) = outcome else {
+        panic!("create was not committed");
     };
-    assert!(metadata.executable);
-    assert!(matches!(
-        sync.edit_status(created).await.unwrap(),
-        EditStatus::Namespace(_)
-    ));
-    assert!(
-        sync.namespace_intents()
-            .await
-            .unwrap()
-            .iter()
-            .any(|intent| intent.intent.id == created)
-    );
-    let inspect = Sync::inspect(temp.path().join("sync")).await.unwrap();
-    assert!(
-        inspect
-            .namespace
-            .iter()
-            .any(|intent| intent.intent.id == created)
-    );
-    let revision = sync.publish(created).await.unwrap();
-    let committed = authority.observe_revision(revision).await.unwrap();
-    let file = committed.open_file(created_node).await.unwrap();
-    assert!(file.node().executable());
-    assert_eq!(file.read(0, 64).await.unwrap(), b"created bytes");
-    let status = sync.namespace_status(created).await.unwrap();
-    assert!(matches!(status.state, NamespaceState::Committed(_)));
-    drop(sync);
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        sync.namespace_status(created).await.unwrap().state,
-        NamespaceState::Committed(_)
-    ));
-    assert_eq!(sync.publish(created).await.unwrap(), revision);
-
-    // Directory creation and a stable-identity rename.
-    let baseline = authority.observe_latest().await.unwrap();
-    let directory = sync
-        .stage_create_directory(root, "dir", baseline.revision())
-        .await
-        .unwrap();
-    let revision = sync.publish(directory).await.unwrap();
-    let directory_node = match sync
-        .namespace_status(directory)
+    authority
+        .observe_revision(receipt.cursor.revision)
         .await
         .unwrap()
-        .intent
-        .operation
-    {
-        NamespaceOperation::CreateDirectory { node, .. } => node,
-        operation => panic!("expected directory creation, got {operation:?}"),
-    };
-    assert!(
-        authority
-            .observe_revision(revision)
-            .await
-            .unwrap()
-            .node(directory_node)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_directory()
-    );
-    let baseline = authority.observe_latest().await.unwrap();
-    let rename = sync
-        .stage_rename(
-            created_node,
-            baseline.revision(),
-            directory_node,
-            "moved",
-            RenameMode::NoReplace,
-        )
-        .await
-        .unwrap();
-    let revision = sync.publish(rename).await.unwrap();
-    let observed = authority.observe_revision(revision).await.unwrap();
-    assert_eq!(
-        observed.resolve("dir/moved").await.unwrap().unwrap().id(),
-        created_node
-    );
-    assert!(observed.resolve("created").await.unwrap().is_none());
-
-    // Removing a live file cannot make its pinned baseline disappear.
-    let baseline = authority.observe_latest().await.unwrap();
-    let remove = sync
-        .stage_remove(created_node, baseline.revision())
-        .await
-        .unwrap();
-    assert_eq!(
-        sync.read(remove, 0, 1).await.unwrap_err().kind(),
-        ErrorKind::Unsupported
-    );
-    let revision = sync.publish(remove).await.unwrap();
-    assert!(
-        authority
-            .observe_revision(revision)
-            .await
-            .unwrap()
-            .resolve("dir/moved")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        baseline
-            .open_file(created_node)
-            .await
-            .unwrap()
-            .read(0, 64)
-            .await
-            .unwrap(),
-        b"created bytes"
-    );
-
-    // No-replace rejects an occupied destination while replace removes exactly
-    // the observed destination and keeps its old version readable.
-    let (_, source) = create_file(&authority, &runtime, root, "source").await;
-    let (baseline, target) = create_file(&authority, &runtime, root, "target").await;
-    let baseline = authority.observe_revision(baseline).await.unwrap();
-    assert_eq!(
-        sync.stage_rename(
-            source,
-            baseline.revision(),
-            root,
-            "target",
-            RenameMode::NoReplace,
-        )
-        .await
-        .unwrap_err()
-        .kind(),
-        ErrorKind::AlreadyExists
-    );
-    let replace = sync
-        .stage_rename(
-            source,
-            baseline.revision(),
-            root,
-            "target",
-            RenameMode::Replace,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        sync.namespace_status(replace).await.unwrap().intent.operation,
-        NamespaceOperation::Rename {
-            replaced: Some(id),
-            ..
-        } if id == target
-    ));
-    let revision = sync.publish(replace).await.unwrap();
-    let observed = authority.observe_revision(revision).await.unwrap();
-    assert_eq!(
-        observed.resolve("target").await.unwrap().unwrap().id(),
-        source
-    );
-    baseline.open_file(target).await.unwrap();
-
-    // Executable changes use a baseline-bound metadata transaction.
-    let (baseline, executable) = create_file(&authority, &runtime, root, "executable").await;
-    let set_executable = sync
-        .stage_set_executable(executable, baseline, true)
-        .await
-        .unwrap();
-    let revision = sync.publish(set_executable).await.unwrap();
-    assert!(
-        authority
-            .observe_revision(revision)
-            .await
-            .unwrap()
-            .node(executable)
-            .await
-            .unwrap()
-            .unwrap()
-            .executable()
-    );
-
-    // Create/create: the second intent keeps its conflict.
-    let baseline = authority.observe_latest().await.unwrap();
-    let first = sync
-        .stage_create_file(
-            root,
-            "same",
-            baseline.revision(),
-            FileMetadata::new(false),
-            &mut &b"first"[..],
-        )
-        .await
-        .unwrap();
-    let second = sync
-        .stage_create_file(
-            root,
-            "same",
-            baseline.revision(),
-            FileMetadata::new(false),
-            &mut &b"second"[..],
-        )
-        .await
-        .unwrap();
-    sync.publish(first).await.unwrap();
-    assert_conflict(sync.publish(second).await);
-    assert_eq!(
-        sync.namespace_status(second).await.unwrap().state,
-        NamespaceState::Conflict
-    );
-    assert_conflict(sync.publish(second).await);
-
-    // Content/edit -> rename conflict. The rename guards the source's complete
-    // logical state rather than only its old parent/name topology.
-    let (baseline, renamed) = create_file(&authority, &runtime, root, "renamed").await;
-    let content = sync
-        .stage(renamed, baseline, &mut &b"new content"[..])
-        .await
-        .unwrap();
-    let rename = sync
-        .stage_rename(
-            renamed,
-            baseline,
-            root,
-            "renamed-new",
-            RenameMode::NoReplace,
-        )
-        .await
-        .unwrap();
-    sync.publish(content).await.unwrap();
-    assert_conflict(sync.publish(rename).await);
-    assert_eq!(
-        sync.namespace_status(rename).await.unwrap().state,
-        NamespaceState::Conflict
-    );
-
-    // Rename-first is safe: the same baseline content edit still commits under
-    // the moved identity because its content predicates were unchanged.
-    let (baseline, always_safe) =
-        create_file(&authority, &runtime, root, "moved-then-edited").await;
-    let content = sync
-        .stage(always_safe, baseline, &mut &b"moved edit"[..])
-        .await
-        .unwrap();
-    let rename = sync
-        .stage_rename(
-            always_safe,
-            baseline,
-            root,
-            "moved-then-edited-2",
-            RenameMode::NoReplace,
-        )
-        .await
-        .unwrap();
-    sync.publish(rename).await.unwrap();
-    let revision = sync.publish(content).await.unwrap();
-    let observed = authority.observe_revision(revision).await.unwrap();
-    assert_eq!(
-        observed
-            .resolve("moved-then-edited-2")
-            .await
-            .unwrap()
-            .unwrap()
-            .id(),
-        always_safe
-    );
-    assert_eq!(
-        observed
-            .open_file(always_safe)
-            .await
-            .unwrap()
-            .read(0, 64)
-            .await
-            .unwrap(),
-        b"moved edit"
-    );
-
-    // Delete/edit conflicts in both orders. Neither the local replacement nor
-    // the pinned pre-delete version can be silently discarded.
-    let (baseline, deleted) = create_file(&authority, &runtime, root, "deleted-first").await;
-    let content = sync
-        .stage(deleted, baseline, &mut &b"edit before remove"[..])
-        .await
-        .unwrap();
-    let remove = sync.stage_remove(deleted, baseline).await.unwrap();
-    sync.publish(content).await.unwrap();
-    assert_conflict(sync.publish(remove).await);
-
-    let (baseline, deleted) = create_file(&authority, &runtime, root, "removed-first").await;
-    let content = sync
-        .stage(deleted, baseline, &mut &b"edit after remove"[..])
-        .await
-        .unwrap();
-    let remove = sync.stage_remove(deleted, baseline).await.unwrap();
-    sync.publish(remove).await.unwrap();
-    assert_conflict(sync.publish(content).await);
-    assert_eq!(
-        sync.read(content, 0, 64).await.unwrap(),
-        b"edit after remove"
-    );
-
-    // Rename/rename: only one move of the common baseline may publish.
-    let (baseline, moved) = create_file(&authority, &runtime, root, "moved-twice").await;
-    let left = sync
-        .stage_rename(moved, baseline, root, "left", RenameMode::NoReplace)
-        .await
-        .unwrap();
-    let right = sync
-        .stage_rename(moved, baseline, root, "right", RenameMode::NoReplace)
-        .await
-        .unwrap();
-    sync.publish(left).await.unwrap();
-    assert_conflict(sync.publish(right).await);
-
-    // Parent removal versus child creation, in both publication orders.
-    let (baseline, parent) = create_directory(&authority, &runtime, root, "parent-a").await;
-    let remove = sync.stage_remove(parent, baseline).await.unwrap();
-    let child = sync
-        .stage_create_file(
-            parent,
-            "child",
-            baseline,
-            FileMetadata::new(false),
-            &mut &b""[..],
-        )
-        .await
-        .unwrap();
-    sync.publish(child).await.unwrap();
-    assert_conflict(sync.publish(remove).await);
-
-    let (baseline, parent) = create_directory(&authority, &runtime, root, "parent-b").await;
-    let remove = sync.stage_remove(parent, baseline).await.unwrap();
-    let child = sync
-        .stage_create_file(
-            parent,
-            "child",
-            baseline,
-            FileMetadata::new(false),
-            &mut &b""[..],
-        )
-        .await
-        .unwrap();
-    sync.publish(remove).await.unwrap();
-    assert_conflict(sync.publish(child).await);
-
-    // A content edit conflicts with an executable change against the same
-    // baseline; the executable intent remains inspectable.
-    let (baseline, metadata) = create_file(&authority, &runtime, root, "metadata-race").await;
-    let content = sync
-        .stage(metadata, baseline, &mut &b"edited"[..])
-        .await
-        .unwrap();
-    let mode = sync
-        .stage_set_executable(metadata, baseline, true)
-        .await
-        .unwrap();
-    sync.publish(content).await.unwrap();
-    assert_conflict(sync.publish(mode).await);
-    assert_eq!(
-        sync.namespace_status(mode).await.unwrap().state,
-        NamespaceState::Conflict
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn namespace_intents_are_durable_and_conflict_safe_in_both_modes() {
-    let backend = TestBackend::default();
-    exercise_namespace(Arc::new(Fs::create(backend.operator()).await.unwrap())).await;
-
-    let backend = TestBackend::default();
-    let temp = tempfile::tempdir().unwrap();
-    let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
-        .await
-        .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let token = "sync-test-only-service-token-at-least-32-bytes";
-    let server = tokio::spawn(serve(listener, service, token.into()));
-    let client = ServiceClient::connect(address, token.into(), backend.operator())
-        .await
-        .unwrap();
-    exercise_namespace(Arc::new(client)).await;
-    server.abort();
-}
-
-#[tokio::test]
-async fn namespace_unknown_retries_the_original_request_after_restart() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    let intent = sync
-        .stage_create_directory(authority.root(), "uncertain", baseline.revision())
-        .await
-        .unwrap();
-    let node = sync
-        .namespace_status(intent)
+        .resolve(name)
         .await
         .unwrap()
-        .intent
-        .operation
-        .node_id();
-    backend.state.lock().unwrap().delay_next_head = true;
-    let error = sync.publish(intent).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unknown);
-    let status = sync.namespace_status(intent).await.unwrap();
-    assert_eq!(status.state, NamespaceState::Unknown);
-    assert_eq!(status.failure.unwrap().commit_id(), error.commit_id());
-    drop(sync);
+        .unwrap()
+        .id()
+}
 
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    assert_eq!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Unknown
+async fn replace_file(authority: &Arc<dyn Authority>, node: NodeId, bytes: &[u8]) {
+    let prepared = authority.data().prepare(&mut &bytes[..]).await.unwrap();
+    let mut planner = Planner::new(
+        &authority.observe_latest().await.unwrap(),
+        CommitId::generate(),
     );
-    assert!(sync.resolve_namespace(intent).await.unwrap().is_none());
-    let revision = sync.publish(intent).await.unwrap();
-    let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
-    assert_eq!(receipt.cursor.revision, revision);
-    assert_eq!(
-        authority
-            .observe_revision(revision)
-            .await
-            .unwrap()
-            .node(node)
-            .await
-            .unwrap()
-            .unwrap()
-            .id(),
-        node
-    );
+    let _ = planner.node(node).await.unwrap();
+    planner.set_content(node, prepared).await.unwrap();
     assert!(matches!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Committed(_)
+        authority.commit(&planner.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
     ));
 }
 
+async fn remote_bytes(authority: &Arc<dyn Authority>, node: NodeId) -> Vec<u8> {
+    let snapshot = authority.observe_latest().await.unwrap();
+    let file = snapshot.open_file(node).await.unwrap();
+    let mut bytes = Vec::new();
+    file.read_range(0..file.descriptor().content_id().length(), &mut bytes)
+        .await
+        .unwrap();
+    bytes
+}
+
 #[tokio::test]
-async fn namespace_unknown_survives_unavailable_recovery_and_resolves_once() {
+async fn content_edits_are_conditional_and_conflicts_are_terminal() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let node = create_file(&authority, "edited", b"baseline").await;
     let temp = tempfile::tempdir().unwrap();
     let sync = Sync::open(authority.clone(), temp.path().join("sync"))
         .await
         .unwrap();
     let baseline = authority.observe_latest().await.unwrap();
-    let intent = sync
-        .stage_create_directory(authority.root(), "published-then-lost", baseline.revision())
-        .await
-        .unwrap();
-    backend.lose_next_head_response_and_go_offline();
-    let error = sync.publish(intent).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unknown);
-    assert_eq!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Unknown
-    );
-    drop(sync);
-
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let before = sync.namespace_status(intent).await.unwrap();
-    assert_eq!(before.state, NamespaceState::Unknown);
-    assert!(sync.publish(intent).await.is_err());
-    let after = sync.namespace_status(intent).await.unwrap();
-    assert_eq!(after.state, NamespaceState::Unknown);
-    assert_eq!(after.intent.commit_id, before.intent.commit_id);
-    assert_eq!(after.intent.request_digest, before.intent.request_digest);
-
-    backend.state.lock().unwrap().offline = false;
-    let revision = sync.publish(intent).await.unwrap();
-    let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
-    assert_eq!(revision, receipt.cursor.revision);
-    assert!(matches!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Committed(_)
-    ));
-    assert_eq!(
-        authority.observe_latest().await.unwrap().revision(),
-        receipt.cursor.revision
-    );
-    assert_eq!(sync.publish(intent).await.unwrap(), receipt.cursor.revision);
-}
-
-#[tokio::test]
-async fn namespace_restore_failure_keeps_a_prepared_intent_retryable() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let sync = Sync::open(authority.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    let intent = sync
-        .stage_create_directory(authority.root(), "retry-restore", baseline.revision())
-        .await
-        .unwrap();
-    backend.state.lock().unwrap().offline = true;
-    assert!(sync.publish(intent).await.is_err());
-    assert_eq!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Retryable
-    );
-    backend.state.lock().unwrap().offline = false;
-    sync.publish(intent).await.unwrap();
-    assert!(matches!(
-        sync.namespace_status(intent).await.unwrap().state,
-        NamespaceState::Committed(_)
-    ));
-}
-
-#[tokio::test]
-async fn namespace_post_dispatch_error_stays_unknown_and_resolves() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let fault = Arc::new(FaultAuthority::new(authority.clone()));
-    let temp = tempfile::tempdir().unwrap();
-    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let baseline = fault.observe_latest().await.unwrap();
-    let intent = sync
-        .stage_create_directory(fault.root(), "lost-malformed", baseline.revision())
-        .await
-        .unwrap();
-    fault.fail_next_response();
-    let error = sync.publish(intent).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unknown);
-    let status = sync.namespace_status(intent).await.unwrap();
-    assert_eq!(status.state, NamespaceState::Unknown);
-    let failure = status.failure.clone().unwrap();
-    assert_eq!(failure.kind(), ErrorKind::Unknown);
-    assert_eq!(failure.commit_id(), Some(status.intent.commit_id));
-    let receipt = sync.resolve_namespace(intent).await.unwrap().unwrap();
-    assert_eq!(
-        authority.observe_latest().await.unwrap().revision(),
-        receipt.cursor.revision
-    );
-}
-
-#[tokio::test]
-async fn content_post_dispatch_error_exposes_frozen_identity_without_lease() {
-    let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let editor = Runtime::open(authority.clone(), temp.path().join("editor"))
-        .await
-        .unwrap();
-    editor.create_file(authority.root(), "file").await.unwrap();
-    let baseline = authority.observe_latest().await.unwrap();
-    let node = baseline.resolve("file").await.unwrap().unwrap().id();
-
-    let fault = Arc::new(FaultAuthority::new(authority.clone()));
-    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
     let edit = sync
-        .stage(node, baseline.revision(), &mut &b"content"[..])
+        .stage(node, baseline.revision(), &mut &b"local replacement"[..])
         .await
         .unwrap();
-    fault.fail_next_response();
+
+    replace_file(&authority, node, b"remote replacement").await;
     let error = sync.publish(edit).await.unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Unknown);
-    let commit = error.commit_id().unwrap();
-    let status = sync.status(edit).await.unwrap();
-    assert!(status.frozen);
-    assert_eq!(status.frozen_commit_id, Some(commit));
-    assert_eq!(status.error.unwrap().commit_id(), Some(commit));
-
-    // Read-only inspection succeeds while the writer still owns the lease.
-    let inspect = Sync::inspect(temp.path().join("sync")).await.unwrap();
-    let inspected = inspect
-        .content
-        .iter()
-        .find(|inspected| inspected.id == edit)
-        .unwrap_or_else(|| panic!("missing inspected edit"));
-    assert_eq!(inspected.handle.frozen_commit_id, Some(commit));
-    drop(sync);
-
-    backend.state.lock().unwrap().offline = true;
-    let sync = Sync::open(fault.clone(), temp.path().join("sync"))
-        .await
-        .unwrap();
-    let status = sync.status(edit).await.unwrap();
-    assert_eq!(status.frozen_commit_id, Some(commit));
-    assert_eq!(status.error.unwrap().commit_id(), Some(commit));
-    backend.state.lock().unwrap().offline = false;
-    sync.publish(edit).await.unwrap();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    assert_eq!(
+        sync.status(edit).await.unwrap().state,
+        IntentState::Conflict
+    );
+    assert_eq!(remote_bytes(&authority, node).await, b"remote replacement");
+    let inspected = Sync::inspect(temp.path().join("sync")).await.unwrap();
+    assert_eq!(inspected.intents.len(), 1);
+    assert_eq!(inspected.intents[0].baseline, baseline.revision());
 }
 
 #[tokio::test]
-async fn unsupported_and_partial_sync_schemas_are_not_repaired() {
+async fn unknown_content_receipt_is_resolved_after_restart_without_recommit() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let inner: Arc<dyn Authority> = Arc::new(fs);
+    let node = create_file(&inner, "edited", b"baseline").await;
+    let fault = Arc::new(LostResponseAuthority::new(inner));
+    let authority: Arc<dyn Authority> = fault.clone();
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("sync");
-    drop(Sync::open(authority.clone(), &state).await.unwrap());
-    {
-        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
-        connection
-            .execute_batch(
-                "DROP TABLE namespaces;
-                 UPDATE binding SET profile='yinyang-sync-99';",
-            )
-            .unwrap();
-    }
+    let sync = Sync::open(authority.clone(), &state).await.unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let edit = sync
+        .stage(node, baseline.revision(), &mut &b"replacement"[..])
+        .await
+        .unwrap();
+    fault.lose_next_response();
+    let error = sync.publish(edit).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    let published_revision = authority.observe_latest().await.unwrap().revision();
+    let status = sync.status(edit).await.unwrap();
+    assert_eq!(status.state, IntentState::Unknown);
     assert_eq!(
-        Sync::open(authority.clone(), &state)
-            .await
-            .err()
-            .unwrap()
-            .kind(),
-        ErrorKind::Unsupported
+        status.error.as_ref().unwrap().commit_id(),
+        Some(status.commit_id)
     );
-    {
-        let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
-        let profile: String = connection
-            .query_row("SELECT profile FROM binding", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(profile, "yinyang-sync-99");
-        let namespaces: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sqlite_master
-                    WHERE type='table' AND name='namespaces'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!namespaces);
-        connection
-            .execute("UPDATE binding SET profile='yinyang-sync-3'", [])
-            .unwrap();
-    }
+    assert_eq!(remote_bytes(&authority, node).await, b"replacement");
+    drop(sync);
+
+    let reopened = Sync::open(authority.clone(), &state).await.unwrap();
+    let receipt = reopened.publish(edit).await.unwrap();
+    assert_eq!(receipt, published_revision);
     assert_eq!(
-        Sync::open(authority.clone(), &state)
-            .await
-            .err()
-            .unwrap()
-            .kind(),
-        ErrorKind::Corrupt
+        reopened.status(edit).await.unwrap().state,
+        IntentState::Committed
     );
     assert_eq!(
-        Sync::inspect(&state).await.unwrap_err().kind(),
-        ErrorKind::Corrupt
+        authority.observe_latest().await.unwrap().revision(),
+        published_revision
     );
+    assert_eq!(remote_bytes(&authority, node).await, b"replacement");
+}
+
+#[tokio::test]
+async fn unsupported_sync_schema_is_not_repaired() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    std::fs::create_dir_all(&state).unwrap();
+    let connection = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE binding(
+                singleton INTEGER PRIMARY KEY,
+                profile TEXT NOT NULL,
+                filesystem BLOB NOT NULL
+             );
+             INSERT INTO binding VALUES(1, 'yinyang-sync-999', x'00000000000000000000000000000000');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match Sync::open(authority, &state).await {
+        Ok(_) => panic!("unsupported Sync schema was opened"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let bytes = std::fs::read(state.join("sync.db")).unwrap();
+    assert!(!bytes.is_empty());
 }
