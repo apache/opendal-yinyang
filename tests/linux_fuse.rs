@@ -26,4 +26,4 @@ mod linux_fuse {
     pub mod retention;
 }
 
-pub(crate) use linux_fuse as harness;
+pub(crate) use support::linux_fuse as harness;
