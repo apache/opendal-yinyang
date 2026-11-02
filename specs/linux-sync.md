@@ -212,6 +212,11 @@ unsupported.
 }
 ```
 
+`remote.revision` is the observed Managed authority revision. It is `null`
+when unavailable and for Direct Sync, whose storage-native namespace has no
+common authority revision. `remote.cursor` remains the adapter checkpoint and
+is not required to have the same encoding as `revision`.
+
 Each entry carries local, remote and baseline evidence, its current typed
 intent/outcome and an optional conflict identity. A rename conflict references
 the desired-path entry. `summary.conflicts` and
