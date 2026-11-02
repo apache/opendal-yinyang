@@ -277,7 +277,7 @@ impl Runtime {
             HandleBase {
                 expected: Some(descriptor),
                 file: Some(file),
-                snapshot: Some(snapshot),
+                snapshot: writable.then_some(snapshot),
             },
         )
     }
@@ -559,7 +559,7 @@ impl FileHandle {
             ));
         }
         base.file = Some(file.clone());
-        base.snapshot = Some(snapshot);
+        base.snapshot = record.writable.then_some(snapshot);
         Ok(Some(file))
     }
     async fn base_snapshot(&self, revision: Revision) -> Result<Option<Snapshot>> {
