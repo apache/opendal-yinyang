@@ -665,12 +665,22 @@ fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -
     put_segment(c, id, start, &data)?;
     Ok(())
 }
+/// Read every table that cross-validation compares from one WAL snapshot.
+///
+/// A live writer can commit between two autocommit SELECTs. Without one read
+/// transaction, a reader could see a handle marked ready together with the
+/// base table from before that commit and report valid state as corrupt.
+fn read_snapshot(c: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
+    c.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(local)
+}
 impl Stage {
     pub async fn validate(path: PathBuf, fs: NodeId) -> Result<()> {
         tokio::task::spawn_blocking(move || {
-            let c = store::open_read_only(&path).map_err(store_error)?;
-            validate_store(&c, Some(fs))?;
-            validate_state(&c)?;
+            let mut c = store::open_read_only(&path).map_err(store_error)?;
+            let snapshot = read_snapshot(&mut c)?;
+            validate_store(&snapshot, Some(fs))?;
+            validate_state(&snapshot)?;
             Ok(())
         })
         .await
@@ -679,12 +689,13 @@ impl Stage {
 
     pub async fn inspect(path: PathBuf) -> Result<RuntimeStatus> {
         tokio::task::spawn_blocking(move || {
-            let c = store::open_read_only(&path).map_err(store_error)?;
-            validate_store(&c, None)?;
-            validate_state(&c)?;
+            let mut c = store::open_read_only(&path).map_err(store_error)?;
+            let snapshot = read_snapshot(&mut c)?;
+            validate_store(&snapshot, None)?;
+            validate_state(&snapshot)?;
             Ok(RuntimeStatus {
-                handles: records(&c)?.iter().map(Record::status).collect(),
-                errors: errors(&c)?,
+                handles: records(&snapshot)?.iter().map(Record::status).collect(),
+                errors: errors(&snapshot)?,
             })
         })
         .await
@@ -695,10 +706,11 @@ impl Stage {
             std::fs::create_dir_all(&path).map_err(local)?;
             let database = path.join("staging.db");
             if database.try_exists().map_err(local)? {
-                let c = store::open_read_only(&database).map_err(store_error)?;
-                if !store::is_empty(&c).map_err(store_error)? {
-                    validate_store(&c, Some(fs))?;
-                    validate_state(&c)?;
+                let mut c = store::open_read_only(&database).map_err(store_error)?;
+                let snapshot = read_snapshot(&mut c)?;
+                if !store::is_empty(&snapshot).map_err(store_error)? {
+                    validate_store(&snapshot, Some(fs))?;
+                    validate_state(&snapshot)?;
                 }
             }
             let lock = std::fs::OpenOptions::new()
@@ -1088,8 +1100,7 @@ fn mutable(r: &Record) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn raw_database(path: &std::path::Path, profile: &str) -> NodeId {
-        let fs = NodeId::generate();
+    fn raw_database_with_fs(path: &std::path::Path, profile: &str, fs: NodeId) {
         let c = Connection::open(path).unwrap();
         c.execute_batch(CREATE_SCHEMA).unwrap();
         c.execute(
@@ -1097,7 +1108,23 @@ mod tests {
             params![profile, fs.as_bytes().as_slice()],
         )
         .unwrap();
+    }
+
+    fn raw_database(path: &std::path::Path, profile: &str) -> NodeId {
+        let fs = NodeId::generate();
+        raw_database_with_fs(path, profile, fs);
         fs
+    }
+
+    fn wal_stage(path: &std::path::Path, fs: NodeId, record: &Record) -> Connection {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        raw_database_with_fs(path, PROFILE.name, fs);
+        let writer = Connection::open(path).unwrap();
+        save(&writer, record).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
     }
 
     fn names(path: &std::path::Path) -> Vec<String> {
@@ -1164,6 +1191,112 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM handles", [], |row| row.get(0))
             .unwrap();
         assert_eq!(handles, 1);
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_prevents_interleaved_handle_base_validation() {
+        let backend = crate::support::TestBackend::default();
+        let authority = yinyang_core::Fs::create(backend.operator()).await.unwrap();
+        let fs = authority.filesystem();
+        let mut source: &[u8] = b"";
+        let descriptor = authority
+            .prepare(&mut source)
+            .await
+            .unwrap()
+            .descriptor()
+            .to_bytes();
+        let id = [24_u8; 16];
+        let incomplete = Record {
+            id,
+            node: *NodeId::generate().as_bytes(),
+            base: [10; 24],
+            length: 0,
+            local: 0,
+            remote: 0,
+            writable: true,
+            ready: false,
+            plan: None,
+            conflict: false,
+            error: None,
+            failure: None,
+        };
+        let temp = tempfile::tempdir().unwrap();
+
+        let snapshot_path = temp.path().join("snapshot/staging.db");
+        let mut snapshot_writer = wal_stage(&snapshot_path, fs, &incomplete);
+        let mut reader = store::open_read_only(&snapshot_path).unwrap();
+        let snapshot = read_snapshot(&mut reader).unwrap();
+        let query_only: i64 = snapshot
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(query_only, 1);
+        let _: i64 = snapshot
+            .query_row("SELECT COUNT(*) FROM handles", [], |row| row.get(0))
+            .unwrap();
+
+        let tx = snapshot_writer.transaction().unwrap();
+        put_base(&tx, id, &descriptor, 0).unwrap();
+        let mut ready = record(&tx, id).unwrap();
+        ready.ready = true;
+        save(&tx, &ready).unwrap();
+        tx.commit().unwrap();
+
+        let snapshot_bases: i64 = snapshot
+            .query_row("SELECT COUNT(*) FROM bases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(snapshot_bases, 0);
+        validate_state(&snapshot).unwrap();
+        drop(snapshot);
+        drop(reader);
+        drop(snapshot_writer);
+
+        let race_path = temp.path().join("race/staging.db");
+        let mut race_writer = wal_stage(&race_path, fs, &incomplete);
+        let reader = store::open_read_only(&race_path).unwrap();
+        let (stale_record, failure) = reader
+            .query_row(
+                "SELECT record,failure FROM handles WHERE id=?1",
+                params![id.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .map_err(local)
+            .unwrap();
+        let stale = decoded_record(&stale_record, failure).unwrap();
+        assert!(!stale.ready);
+
+        let tx = race_writer.transaction().unwrap();
+        put_base(&tx, id, &descriptor, 0).unwrap();
+        let mut ready = record(&tx, id).unwrap();
+        ready.ready = true;
+        save(&tx, &ready).unwrap();
+        tx.commit().unwrap();
+
+        let (handle, fresh_descriptor, prefix): (Vec<u8>, Vec<u8>, i64) = reader
+            .query_row("SELECT handle,descriptor,prefix FROM bases", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(handle.as_slice(), id.as_slice());
+
+        let interleaved = Connection::open_in_memory().unwrap();
+        interleaved.execute_batch(CREATE_SCHEMA).unwrap();
+        interleaved
+            .execute(
+                "INSERT INTO authority(singleton,profile,filesystem) VALUES(1,?1,?2)",
+                params![PROFILE.name, fs.as_bytes().as_slice()],
+            )
+            .unwrap();
+        save(&interleaved, &stale).unwrap();
+        put_base(
+            &interleaved,
+            id,
+            &fresh_descriptor,
+            positioned(prefix).unwrap(),
+        )
+        .unwrap();
+        let error = validate_state(&interleaved).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
+        assert!(error.to_string().contains("incomplete handle"));
     }
 
     #[tokio::test]
