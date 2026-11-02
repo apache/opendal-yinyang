@@ -875,6 +875,7 @@ impl MetadataService {
             }
         }
         if !pending.is_empty() {
+            ensure_writer_healthy(&self.writer_poisoned)?;
             let mut restored = Vec::with_capacity(pending.len());
             for (_, bytes) in &pending {
                 restored.push(self.restore_transaction(bytes).await?);
