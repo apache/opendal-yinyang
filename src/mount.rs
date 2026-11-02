@@ -25,7 +25,7 @@ use tokio::sync::{Mutex, Semaphore};
 use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
 
 enum NodeState {
-    Writable(Mutex<FileHandle>),
+    Writable(Box<Mutex<FileHandle>>),
     ReadOnly(FileVersion),
 }
 struct Node {
@@ -35,7 +35,7 @@ struct Node {
 impl Node {
     fn writable_handle(&self) -> Result<&Mutex<FileHandle>> {
         match &self.state {
-            NodeState::Writable(handle) => Ok(handle),
+            NodeState::Writable(handle) => Ok(handle.as_ref()),
             NodeState::ReadOnly(_) => Err(Error::State(
                 ErrorKind::Unsupported,
                 "node is a read-only observation",
@@ -119,7 +119,9 @@ impl Mount {
             nodes.insert(
                 state.node,
                 Arc::new(Node {
-                    state: NodeState::Writable(Mutex::new(runtime.recover(state.id).await?)),
+                    state: NodeState::Writable(Box::new(Mutex::new(
+                        runtime.recover(state.id).await?,
+                    ))),
                     references: AtomicUsize::new(0),
                 }),
             );
@@ -214,7 +216,7 @@ impl Mount {
                 .open_node(id, !self.inner.read_only)
                 .await?;
             let node = Arc::new(Node {
-                state: NodeState::Writable(Mutex::new(handle)),
+                state: NodeState::Writable(Box::new(Mutex::new(handle))),
                 references: AtomicUsize::new(0),
             });
             {
