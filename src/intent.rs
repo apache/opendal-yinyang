@@ -17,7 +17,7 @@
 
 //! Shared durable intent table and state codec.
 
-use yinyang_core::{Authority, CommitId, Receipt, Revision};
+use yinyang_core::{CommitId, Receipt, Revision};
 
 pub(crate) const TABLE: &str = "intents";
 
@@ -105,29 +105,4 @@ pub(crate) fn receipt(
         }
         _ => Err("incomplete receipt fields".to_owned()),
     }
-}
-
-pub(crate) async fn receipt_for(
-    authority: &dyn Authority,
-    commit_id: CommitId,
-    request_digest: [u8; 32],
-) -> yinyang_core::Result<Option<Receipt>> {
-    let receipt = authority.observe_latest().await?.receipt(commit_id).await?;
-    if let Some(receipt) = &receipt {
-        if receipt.request_digest != request_digest {
-            return Err(yinyang_core::Error::new(
-                yinyang_core::ErrorKind::Corrupt,
-                "receipt lookup",
-                "commit identity returned a different request",
-            ));
-        }
-        if receipt.commit_id != commit_id {
-            return Err(yinyang_core::Error::new(
-                yinyang_core::ErrorKind::Corrupt,
-                "receipt lookup",
-                "receipt commit identity changed",
-            ));
-        }
-    }
-    Ok(receipt)
 }
