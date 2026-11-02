@@ -11,17 +11,19 @@ qualification.
 | --- | --- | --- |
 | `cargo x test` | host-independent test runners | Rust unit and integration tests; ignored native tests are compiled but not executed |
 | `cargo x test-linux-fuse` | Ubuntu, `/dev/fuse`, isolated Silo | Real `fuse.yinyang` mount, read-only range hydration, writable recovery, corruption, refresh, restart and lifecycle |
+| `cargo x test-linux-applications` | Ubuntu, `/dev/fuse`, isolated Silo, git, rsync, GNU tar | Tested rsync in-place updates and mode rejection, read-only GNU tar backup, symlink rejection, Git loose-object rejection, independent-authority bytes/executable bits and remount |
 | `cargo x test-linux-direct` | Ubuntu, `/dev/fuse`, Python 3, isolated Silo | Read-only and conditional-writable Direct Mount, Direct Sync, raw inventory/bytes, uncertainty and restart boundaries |
 | `cargo x test-managed-sync` | Ubuntu, isolated Silo | Real-process Managed Sync initial push/pull, conflicts, retained artifacts, restart and recovery |
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object and loopback-service Mount and finite Sync |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
 | `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Direct `yy` checksum/manifest/`--help`, actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor and recovery |
 
-GitHub Actions runs the FUSE and installed-CLI checks in the `linux-fuse` job
-after starting isolated Silo. It runs backup and recovery acceptance in the
-`s3` job after installing `sqlite3`. The broad `s3_` test filter explicitly
-skips the two operations tests that require `/dev/fuse`, so the non-FUSE job
-cannot report an accidental green or fail through a missing device.
+GitHub Actions runs the FUSE, application and installed-CLI checks in the
+`linux-fuse` job after starting isolated Silo. It runs backup and recovery
+acceptance in the `s3` job after installing `sqlite3`. The broad `s3_` test
+filter explicitly skips the two operations tests that require `/dev/fuse`, so
+the non-FUSE job cannot report an accidental green or fail through a missing
+device.
 
 The separate trial-distribution workflow verifies the standalone `yy`,
 `yy.sha256`, `LICENSE`, `NOTICE` and source manifest before uploading them as a
@@ -32,7 +34,10 @@ selector and falls back to the Cargo test binary only when unset. The
 installed-operations entrypoint also copies that selected binary
 into its clean prefix and exercises a real writable `fuse.yinyang` mount,
 remount and finite Sync for both publication authorities. The workflow records
-the source and selected binary SHA-256 before those runs.
+the source and selected binary SHA-256 before those runs. The application step
+also selects the archive binary and checks the tested rsync/GNU tar workflows,
+including object and service publication, before continuing to the
+installed-prefix checks.
 
 Run only the first-layer read-only FUSE scenarios when isolating frontend
 changes:
