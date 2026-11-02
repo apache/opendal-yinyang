@@ -526,8 +526,23 @@ impl Sync {
                 .await?;
             return Ok(receipt.cursor.revision);
         }
-        let request = match self.authority().restore_transaction(&row.request).await {
-            Ok(request) => request,
+        let commit_id = row.commit_id()?;
+        let digest = row.digest()?;
+        match yinyang_core::Transaction::verify_identity(
+            &row.request,
+            self.authority().filesystem(),
+        ) {
+            Ok((_, frozen_id, frozen_digest))
+                if frozen_id == commit_id && frozen_digest == digest => {}
+            Ok(_) => {
+                let failure = Failure::capture(&Error::State(
+                    ErrorKind::Corrupt,
+                    "frozen content request identity disagrees with local intent",
+                ));
+                self.save_state(edit, intent::State::Failed, None, Some(&failure))
+                    .await?;
+                return Err(Error::Retained(failure));
+            }
             Err(error) => {
                 let error = Error::from(error);
                 let failure = Failure::capture(&error);
@@ -540,11 +555,29 @@ impl Sync {
                     .await?;
                 return Err(Error::Retained(failure));
             }
-        };
+        }
         self.save_state(edit, intent::State::Unknown, None, None)
             .await?;
-        match self.authority().commit(&request).await {
+        let outcome = match self
+            .authority()
+            .commit_frozen_batch(std::slice::from_ref(&row.request))
+            .await
+        {
+            Ok(mut outcomes) if outcomes.len() == 1 => Ok(outcomes.remove(0)),
+            Ok(_) => Err(Error::State(
+                ErrorKind::Corrupt,
+                "content frozen batch returned an invalid outcome count",
+            )),
+            Err(error) => Err(Error::from(error)),
+        };
+        match outcome {
             Ok(yinyang_core::CommitOutcome::Committed(receipt)) => {
+                if receipt.commit_id != commit_id || receipt.request_digest != digest {
+                    return Err(Error::State(
+                        ErrorKind::Corrupt,
+                        "content commit returned a receipt for another request",
+                    ));
+                }
                 self.save_state(edit, intent::State::Committed, Some(&receipt), None)
                     .await?;
                 Ok(receipt.cursor.revision)
@@ -569,6 +602,12 @@ impl Sync {
                 Err(Error::Retryable)
             }
             Ok(yinyang_core::CommitOutcome::Unknown(commit)) => {
+                if commit != commit_id {
+                    return Err(Error::State(
+                        ErrorKind::Corrupt,
+                        "content commit returned an unknown outcome for another request",
+                    ));
+                }
                 let failure = Failure::unknown_with(commit, "content commit outcome is unknown");
                 self.save_state(edit, intent::State::Unknown, None, Some(&failure))
                     .await?;
@@ -576,7 +615,7 @@ impl Sync {
             }
             Err(error) => {
                 let failure = Failure::unknown_with(
-                    row.commit_id()?,
+                    commit_id,
                     format!("content commit failed after dispatch: {error}"),
                 );
                 self.save_state(edit, intent::State::Unknown, None, Some(&failure))

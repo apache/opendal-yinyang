@@ -365,18 +365,6 @@ pub(super) async fn freeze(
     frozen(transaction, operation, path, original_path, desired_path)
 }
 
-pub(super) fn restore(
-    transaction: Transaction,
-    request: &FrozenRemoteRequest,
-) -> Result<Transaction> {
-    if transaction.id().as_bytes() != &request.id || transaction.digest() != request.digest {
-        return Err(Error::corrupt(
-            "restored Managed transaction identity disagrees with the frozen request",
-        ));
-    }
-    Ok(transaction)
-}
-
 fn frozen(
     transaction: Transaction,
     operation: RemoteOperation,
@@ -407,15 +395,4 @@ fn identity(key: &RequestKey) -> Result<([u8; 16], CommitId)> {
 
 fn name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
-}
-
-pub(super) async fn prepare(
-    authority: &Arc<dyn Authority>,
-    request: &FrozenRemoteRequest,
-) -> Result<Transaction> {
-    let transaction = authority
-        .restore_transaction(&request.bytes)
-        .await
-        .map_err(Error::from)?;
-    restore(transaction, request)
 }
