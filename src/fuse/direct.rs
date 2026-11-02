@@ -302,7 +302,7 @@ impl DirectBackend {
                     eprintln!("yy: fuse flush: cannot retain Direct conflict state: {error}");
                 }
                 self.refresh_remote_only().await;
-                Err(BackendError::Stale)
+                Err(BackendError::ContentConflict)
             }
             DirectFlushOutcome::Unknown { .. } => {
                 if let Err(error) = self.refresh_pending().await {
@@ -628,7 +628,7 @@ impl Backend for DirectBackend {
                 DirectFlushOutcome::Conflict { .. } => {
                     let _ = self.refresh_pending().await;
                     self.refresh_remote_only().await;
-                    return Err(BackendError::Stale);
+                    return Err(BackendError::ContentConflict);
                 }
                 DirectFlushOutcome::Unknown { .. } => {
                     let _ = self.refresh_pending().await;

@@ -327,7 +327,9 @@ impl Backend for ManagedBackend {
         if has_open_flag(flags.0, nix::fcntl::OFlag::O_SYNC)
             || has_open_flag(flags.0, nix::fcntl::OFlag::O_DSYNC)
         {
-            file.flush().await?;
+            file.flush()
+                .await
+                .map_err(BackendError::runtime_content_publication)?;
             self.invalidate_snapshot();
         }
         Ok(())
@@ -337,7 +339,9 @@ impl Backend for ManagedBackend {
         let ManagedFile::Staged(file) = file else {
             return Ok(());
         };
-        file.flush().await?;
+        file.flush()
+            .await
+            .map_err(BackendError::runtime_content_publication)?;
         self.invalidate_snapshot();
         Ok(())
     }
@@ -346,7 +350,9 @@ impl Backend for ManagedBackend {
         let ManagedFile::Staged(file) = file else {
             return Ok(());
         };
-        file.fsync().await?;
+        file.fsync()
+            .await
+            .map_err(BackendError::runtime_content_publication)?;
         self.invalidate_snapshot();
         Ok(())
     }
@@ -390,9 +396,23 @@ impl Backend for ManagedBackend {
                     .ok_or(BackendError::MutationIo)?
             } else {
                 self.reclaim_clean_state(id).await?;
+                // Linux may replay a pathname truncate once after ESTALE. Keep
+                // that replay on the retained conflict instead of reporting
+                // the frozen handle as a different error.
+                if self
+                    .mount
+                    .node_status(id)
+                    .await?
+                    .and_then(|status| status.error)
+                    .is_some_and(|failure| failure.kind() == crate::runtime::ErrorKind::Conflict)
+                {
+                    return Err(BackendError::ContentConflict);
+                }
                 let file = self.mount.open_node(id, true).await?;
                 file.truncate(length).await?;
-                file.flush().await?;
+                file.flush()
+                    .await
+                    .map_err(BackendError::runtime_content_publication)?;
                 let attr = self
                     .shared_attr(id)
                     .await?
@@ -439,7 +459,7 @@ impl Backend for ManagedBackend {
                     }
                     result
                 };
-                result?;
+                result.map_err(BackendError::runtime_content_publication)?;
             }
             let snapshot = self.fetch_snapshot().await?;
             return self.snapshot_attr(&snapshot, id).await;
