@@ -726,6 +726,10 @@ impl FileHandle {
     /// preparation is returned to the caller and never retried as a different
     /// streaming request.
     async fn prepare_publication(&self, r: &Record) -> Result<PreparedContent> {
+        self.prepare_publication_uncached(r).await
+    }
+
+    async fn prepare_publication_uncached(&self, r: &Record) -> Result<PreparedContent> {
         let stage = &self.runtime.inner.stage;
         let base = self.base_file().await?;
         if let Some(base) = &base
@@ -821,6 +825,7 @@ impl FileHandle {
         produced?;
         Ok(prepared)
     }
+
     async fn publish(&mut self) -> Result<Option<Receipt>> {
         let stage = &self.runtime.inner.stage;
         stage.barrier().await?;
@@ -836,7 +841,12 @@ impl FileHandle {
             return Err(Error::Conflict);
         }
         let request = if let Some(bytes) = &r.plan {
-            self.runtime.authority().restore_transaction(bytes).await?
+            self.runtime
+                .inner
+                .authority
+                .restore_transaction(bytes)
+                .await
+                .map_err(Error::from)?
         } else {
             let prepared = self.prepare_publication(&r).await?;
             let snapshot = self

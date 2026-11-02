@@ -104,7 +104,7 @@ state each have one current identifier:
 | File staging | `yinyang-stage-4` |
 | Sync journal | `yinyang-sync-3` |
 | Directory publication | `yinyang-directory-2` |
-| Directory replica | `yinyang-directory-replica-2` |
+| Directory replica | `yinyang-directory-replica-3` |
 | Direct mutation runtime | `yinyang-direct-runtime-2` |
 | Direct Sync | `yinyang-direct-sync-2` |
 | Backup manifest | `YYBK0001` version 1 |

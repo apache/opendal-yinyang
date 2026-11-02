@@ -279,6 +279,12 @@ impl_authority_forwarding!(crate::service::ServiceClient, {
     fn register<'a>(&'a self, content: &'a PreparedContent) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.register(content))
     }
+    fn prepare<'a>(
+        &'a self,
+        source: &'a mut (dyn AsyncRead + Unpin + Send),
+    ) -> BoxFuture<'a, Result<PreparedContent>> {
+        Box::pin(crate::service::ServiceClient::prepare(self, source))
+    }
     fn prepare_overwrite<'a>(
         &'a self,
         base: &'a FileVersion,

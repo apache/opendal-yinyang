@@ -24,12 +24,18 @@ The baseline exists only after admission and is stored in the replica database.
 Status never reports `in_sync` for a binding without an accepted common
 baseline.
 
-Profile `yinyang-directory-replica-2` binds the state to one filesystem.
+Profile `yinyang-directory-replica-3` binds the state to one filesystem.
 Its exact table and column-name sets are current; column order is not part of
 the signature because maintained inserts name their columns. SQLite uses WAL
 with `synchronous=FULL`. Install and artifact journal writes that precede a
 local rename, exchange or quarantine are durable when committed before that
 effect.
+
+The current baseline requires persisted scan evidence in
+`local_stat_size`, `local_stat_mtime`, `local_stat_mtime_nsec`,
+`local_stat_ctime`, `local_stat_ctime_nsec` and `local_stat_recorded_ns`.
+Artifacts persist `digest`, `length`, stat identity and `settle_pending`; work
+persists `upload_artifact`.
 
 There is no schema upgrade or shape-synthesis path. An older or unknown profile
 returns `Unsupported`; a current identifier with a missing, extra or malformed
@@ -70,6 +76,26 @@ children for creation and children before parents for removal. Renames are
 detected by identity and applied as one per-root move with each descendant's
 accepted fingerprint relocated, so a namespace receipt never acknowledges a
 concurrent content edit.
+
+The run keeps that local observation and updates it for paths it installs,
+removes or patches; it does not rescan the whole tree inside a per-entry branch.
+Per-path rechecks use `Replica::observe_path`. The replica baseline stores the
+verified digest together with device, inode, size, mtime, ctime and the time
+that evidence was recorded. A later process reuses that digest while the stat
+identity still matches and both mtime and ctime are strictly older than the
+recorded time minus one second; racy or changed entries are hashed and their
+evidence replaced. All evidence refreshed by one scan commits in one SQLite
+transaction; per-path `observe_path` refreshes one row. This makes a settled
+no-op independent of the process lifetime without missing an in-place edit. The
+remote tree is walked once;
+successful publication results update the in-memory observation used for final
+pending counts when no second authority read is required.
+
+Independent local file creations at one directory depth are staged first and
+published with one `Sync::publish_batch`. A batch member owns its own receipt,
+Conflict, Retryable or Unknown state. Parent directories are published before a
+child depth, and each parent baseline is refreshed once per batch rather than
+once per child.
 
 A namespace operation stages against the path's own accepted revision.
 Only paths whose parent directory entry list this run already changed advance to
@@ -121,7 +147,13 @@ Retained artifacts export their current bytes, including writes that landed
 after the exchange. A conflict side exports its retained artifact or live local
 bytes (`local`) or the recorded remote node version (`remote`). Directory
 artifacts expose their retained path; byte-stream export of a directory is
-unsupported.
+unsupported. Upload and resolved-conflict artifacts are released at their
+durable release events. A displaced inode survives one reconciliation boundary
+so a late writer through the old inode is observable, then it is released if its
+stat identity still matches the accepted displacement. The pending-settle bit
+is durable, so a later `sync run` in another process performs that check.
+Active conflict material is never pruned; all other artifacts are bounded to 64 entries and 256 MiB,
+oldest first.
 
 ## Backup and isolated restore
 

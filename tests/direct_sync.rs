@@ -332,6 +332,9 @@ async fn upload_pull_and_conditional_deletes_use_storage_native_state() {
         Some(b"local".as_slice())
     );
     drop(sync);
+    let status =
+        DirectSync::<MemoryRemote>::inspect(Some(&fixture.remote), &fixture.state, None).await;
+    assert_eq!(status.summary.retained_artifacts, 0);
 
     fixture.handle.put("remote.txt", b"remote");
     let mut sync = fixture.open().await;

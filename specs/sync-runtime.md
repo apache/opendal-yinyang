@@ -27,6 +27,13 @@ exact request. Completed edits stay available for idempotent retry. The current
 experimental profile retains these records indefinitely; it has no automatic
 garbage collection or conflict-resolution policy.
 
+`publish_batch` prepares every namespace member independently, records each
+member's `Unknown` dispatch state before dispatch, and submits one
+`Authority::commit_batch`. Every member keeps its own frozen request, CommitId,
+receipt or Conflict/Retryable/Unknown result, so one rejected member cannot hide
+another member's accepted receipt. Requests are submitted in caller order and
+must be independent; Directory Sync uses one batch per directory depth.
+
 Local staging, remote completion and platform acknowledgment are separate.
 An adapter may mark a file in-sync only if the currently observed local version
 still matches the completed edit. Completion of v1 must not acknowledge a newer
@@ -127,6 +134,17 @@ durable;
 publication is forbidden before that mapping. Interrupted staging can leave
 unreferenced, never-dispatched content, collected on restart or before the next
 stage. Missing referenced content is an error, not permission to replan.
+
+Each core `DataStore`, and all of its clones, owns one bounded set of verified
+`ContentDescriptor` values. Preparation records a descriptor only after the
+pack is verified; service preparation records it after the service answers
+`Registered`. Publication restores a frozen request through the normal
+`Authority::restore_transaction` path, and `DataStore::import` returns the
+prepared evidence without another read on a hit. The set is process-local and
+bounded at 65,536 entries, so a restarted or evicted descriptor falls back to
+one full verified import. A service client sends a completed pack descriptor to
+the service; the service verifies it once and records durable preparation
+evidence before acknowledging registration.
 
 The namespace table stores the logical operation, exact `CommitId`, canonical
 request digest, baseline, transaction bytes, durable state, receipt, and typed

@@ -26,7 +26,9 @@ mod resolution;
 
 use super::backup::BackupManifest;
 use crate::replica::state::{BaselineNode, BaselineRecord, ConflictRecord, WorkRecord};
-use crate::replica::{Artifact, Conflict, Identity, LocalKind, LocalNode, LocalSnapshot, Replica};
+use crate::replica::{
+    Artifact, Conflict, ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, Replica,
+};
 use crate::sync::{EditId, FileMetadata, NamespaceState, RenameMode, Sync};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek as _, SeekFrom, Write};
@@ -165,6 +167,7 @@ pub struct StatusSummary {
     pub conflicts: usize,
     pub failed: u64,
     pub retained_artifacts: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -644,6 +647,7 @@ impl DirectorySync {
             conflicts: conflicts.len(),
             failed,
             retained_artifacts: status.artifacts.len() as u64,
+            retained_bytes: status.retained_bytes,
         };
         Ok(Inspection {
             binding,
@@ -662,6 +666,14 @@ impl DirectorySync {
 
     pub fn state(&self) -> &Path {
         self.replica.state()
+    }
+
+    pub fn hash_bytes_read(&self) -> u64 {
+        self.replica.hash_bytes_read()
+    }
+
+    pub fn reset_hash_bytes_read(&self) {
+        self.replica.reset_hash_bytes_read();
     }
 
     /// Retained-artifact export and conflict-side export share one path-based
@@ -738,11 +750,12 @@ impl DirectorySync {
 
     pub async fn run(&mut self) -> Result<RunOutcome> {
         let mut outcome = RunOutcome::default();
+        self.replica.settle_fresh_artifacts()?;
         self.retry_associated(&mut outcome).await?;
 
         let observed = self.sync.authority().observe_latest().await?;
         let mut remote = crate::directory_nodes(&observed).await?;
-        let current = self.replica.scan()?;
+        let mut current = self.replica.scan()?;
 
         if self.replica.store().load_baseline()?.is_none() {
             self.admit(&mut outcome, &current, &mut remote, &observed)
@@ -769,7 +782,7 @@ impl DirectorySync {
                 replica: &mut self.replica,
                 outcome: &mut outcome,
                 baseline,
-                current: &current,
+                current: &mut current,
                 remote: &mut remote,
                 revision: observed.revision(),
                 nodes: BTreeMap::new(),
@@ -780,7 +793,9 @@ impl DirectorySync {
             ctx.reconcile().await?;
         }
 
-        self.finalize(&mut outcome, observed.revision()).await?;
+        self.finalize(&mut outcome, observed.revision(), &current, &remote)
+            .await?;
+        self.replica.prune_artifacts()?;
         Ok(outcome)
     }
 
@@ -807,6 +822,12 @@ impl DirectorySync {
     /// Stop reporting a resolved conflict: drop the durable record, or
     /// acknowledge the retained inode if the conflict was synthesized from one.
     fn clear_resolved_conflict(&mut self, conflict_id: &str) -> Result<()> {
+        let durable = self
+            .replica
+            .store()
+            .conflicts()?
+            .into_iter()
+            .find(|conflict| conflict.id == conflict_id);
         let artifact = self
             .replica
             .store()
@@ -814,12 +835,18 @@ impl DirectorySync {
             .into_iter()
             .find(|artifact| artifact_conflict_identity(&artifact.id) == conflict_id);
         match artifact {
-            Some(artifact) => self.replica.acknowledge_retained_artifact(&artifact.id)?,
+            Some(artifact) => {
+                self.replica.acknowledge_retained_artifact(&artifact.id)?;
+                self.replica.release_artifact(&artifact.id)?;
+            }
             None => {
                 self.replica
                     .store_mut()
                     .supersede_conflict_work(conflict_id)?;
                 self.replica.store_mut().remove_conflict(conflict_id)?;
+                if let Some(artifact) = durable.and_then(|conflict| conflict.local_artifact) {
+                    self.replica.release_artifact(&artifact)?;
+                }
             }
         }
         Ok(())
@@ -913,7 +940,13 @@ impl DirectorySync {
         Ok(())
     }
 
-    async fn finalize(&mut self, outcome: &mut RunOutcome, revision: Revision) -> Result<()> {
+    async fn finalize(
+        &mut self,
+        outcome: &mut RunOutcome,
+        revision: Revision,
+        current: &LocalSnapshot,
+        remote: &BTreeMap<String, Node>,
+    ) -> Result<()> {
         outcome.revision = Some(revision);
         let status = self.replica.status()?;
         outcome.conflicts.extend(status.conflicts.clone());
@@ -924,9 +957,6 @@ impl DirectorySync {
 
         // Recompute honest pending/unknown from the persisted baseline.
         let baseline = self.replica.store().load_baseline()?;
-        let current = self.replica.scan()?;
-        let observed = self.sync.authority().observe_latest().await?;
-        let remote = crate::directory_nodes(&observed).await?;
         let mut pending = 0_u64;
         if let Some(baseline) = &baseline {
             let mut paths: BTreeSet<String> = BTreeSet::new();
@@ -994,6 +1024,14 @@ impl DirectorySync {
                             Some(revision),
                             None,
                         )?;
+                        if let Some(artifact) = record.upload_artifact.as_deref() {
+                            self.replica.release_artifact(artifact)?;
+                        }
+                        if record.conflict.is_some()
+                            && let Some(artifact) = record.source_artifact.as_deref()
+                        {
+                            self.replica.release_artifact(artifact)?;
+                        }
                     } else {
                         // The remote receipt committed but the live local
                         // version moved on. Keep the association unresolved so
@@ -1281,8 +1319,7 @@ fn accepted_local_before(
     let Some(previous) = previous else {
         return Ok(None);
     };
-    let fresh = replica.scan()?;
-    let Some(current) = fresh.get(to) else {
+    let Some(current) = replica.observe_path(to)? else {
         return Ok(None);
     };
     Ok(Some(LocalNode {
@@ -1291,6 +1328,7 @@ fn accepted_local_before(
         executable: previous.executable,
         identity: current.identity,
         parent: current.parent,
+        stat: current.stat,
     }))
 }
 
@@ -1324,6 +1362,7 @@ fn accepted_local(record: &WorkRecord) -> Result<Option<LocalNode>> {
         executable: record.local_executable.unwrap_or(false),
         identity,
         parent,
+        stat: None,
     }))
 }
 
@@ -1335,12 +1374,20 @@ enum Action {
     Delete,
 }
 
+struct PendingFileCreate {
+    edit: EditId,
+    path: String,
+    local: LocalNode,
+    parent: String,
+    upload_artifact: String,
+}
+
 struct Context<'a> {
     sync: &'a mut Sync,
     replica: &'a mut Replica,
     outcome: &'a mut RunOutcome,
     baseline: BaselineRecord,
-    current: &'a LocalSnapshot,
+    current: &'a mut LocalSnapshot,
     remote: &'a mut BTreeMap<String, Node>,
     revision: Revision,
     nodes: BTreeMap<String, NodeId>,
@@ -1414,6 +1461,8 @@ impl<'a> Context<'a> {
 
         let mut ascending: Vec<String> = paths.iter().cloned().collect();
         ascending.sort_by_key(|path| (depth(path), path.clone()));
+        let mut pending_files = Vec::new();
+        let mut pending_depth = None;
         for path in &ascending {
             if path.is_empty() || handled.contains(path) || self.blocked.contains(path) {
                 continue;
@@ -1421,8 +1470,32 @@ impl<'a> Context<'a> {
             if under_any(&retained, path) {
                 continue;
             }
+            let local = local_action(self.baseline.local.get(path), self.current.get(path));
+            let remote = remote_action(self.baseline.remote.get(path), self.remote.get(path));
+            let batchable = local == Action::Create
+                && remote == Action::None
+                && self
+                    .current
+                    .get(path)
+                    .is_some_and(|node| matches!(node.kind, LocalKind::File { .. }));
+            if batchable {
+                if pending_depth != Some(depth(path)) {
+                    self.flush_file_batch(&mut pending_files).await?;
+                    pending_depth = Some(depth(path));
+                }
+                let node = self
+                    .current
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| "pending local file disappeared".to_string())?;
+                pending_files.push(self.stage_file_create(path, &node).await?);
+                continue;
+            }
+            self.flush_file_batch(&mut pending_files).await?;
+            pending_depth = None;
             self.entry(path).await?;
         }
+        self.flush_file_batch(&mut pending_files).await?;
 
         let mut descending = ascending.clone();
         descending.sort_by_key(|path| (depth(path), path.clone()));
@@ -1701,8 +1774,7 @@ impl<'a> Context<'a> {
         let Some(previous) = previous else {
             return Ok(None);
         };
-        let fresh = self.replica.scan()?;
-        let Some(current) = fresh.get(to) else {
+        let Some(current) = self.replica.observe_path(to)? else {
             return Ok(None);
         };
         Ok(Some(LocalNode {
@@ -1711,6 +1783,7 @@ impl<'a> Context<'a> {
             executable: previous.executable,
             identity: current.identity,
             parent: current.parent,
+            stat: current.stat,
         }))
     }
 
@@ -1859,20 +1932,24 @@ impl<'a> Context<'a> {
             (Action::Delete, Action::None) => Ok(()),
             (Action::Create, Action::Create) => {
                 let remote_node = self.remote.get(path).cloned().unwrap();
-                if canonical_matches(self.replica, self.current.get(path).unwrap(), &remote_node)
-                    .await?
+                if let Some(local) =
+                    canonical_local(self.replica, self.current.get(path).unwrap(), &remote_node)
+                        .await?
                 {
-                    self.accept_remote(path, &remote_node).await
+                    self.accept_remote_node(path, &remote_node, Some(local))
+                        .await
                 } else {
                     self.conflict(path, None, Some(path)).await
                 }
             }
             (Action::Modify, Action::Modify) => {
                 let remote_node = self.remote.get(path).cloned().unwrap();
-                if canonical_matches(self.replica, self.current.get(path).unwrap(), &remote_node)
-                    .await?
+                if let Some(local) =
+                    canonical_local(self.replica, self.current.get(path).unwrap(), &remote_node)
+                        .await?
                 {
-                    self.accept_remote(path, &remote_node).await
+                    self.accept_remote_node(path, &remote_node, Some(local))
+                        .await
                 } else {
                     self.conflict(path, Some(path), Some(path)).await
                 }
@@ -1898,15 +1975,17 @@ impl<'a> Context<'a> {
             .sync
             .stage_create_directory(parent_node, name, parent_revision)
             .await?;
+        let local = self.current.get(path).cloned();
         self.associate(
             edit,
             path,
             None,
             Some(path),
             "create-directory",
-            self.current.get(path),
+            local.as_ref(),
             Some(parent_node),
             parent_revision,
+            None,
         )?;
         let Some(revision) = self.publish_edit(edit, path).await? else {
             return Ok(());
@@ -1916,15 +1995,123 @@ impl<'a> Context<'a> {
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
         self.mark_parent_dirty(path);
-        if let Some(local) = self.current.get(path) {
-            self.accept_local(path, local, node_id, revision).await?;
+        if let Some(local) = self.current.get(path).cloned() {
+            self.accept_local(path, &local, node_id, revision).await?;
         }
         self.refresh_parent_baseline(path, revision).await?;
-        self.replica
-            .store_mut()
-            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        self.refresh_local_path(path)?;
+        self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
+        Ok(())
+    }
+
+    async fn stage_file_create(
+        &mut self,
+        path: &str,
+        node: &LocalNode,
+    ) -> Result<PendingFileCreate> {
+        let (parent, name) = split(path);
+        let parent_node = self
+            .nodes
+            .get(parent)
+            .copied()
+            .ok_or_else(|| format!("file parent {parent:?} is missing"))?;
+        let parent_revision = self.entry_revision(parent);
+        let captured = self.replica.capture_file(path, node)?;
+        let upload_artifact = captured.artifact.id.clone();
+        let mut source = tokio::fs::File::from_std(self.replica.open_artifact(&upload_artifact)?);
+        let edit = self
+            .sync
+            .stage_create_file(
+                parent_node,
+                name,
+                parent_revision,
+                FileMetadata::new(node.executable),
+                &mut source,
+            )
+            .await?;
+        self.associate(
+            edit,
+            path,
+            None,
+            Some(path),
+            "create-file",
+            Some(node),
+            Some(parent_node),
+            parent_revision,
+            Some(&upload_artifact),
+        )?;
+        Ok(PendingFileCreate {
+            edit,
+            path: path.to_owned(),
+            local: node.clone(),
+            parent: parent.to_owned(),
+            upload_artifact,
+        })
+    }
+
+    async fn flush_file_batch(&mut self, pending: &mut Vec<PendingFileCreate>) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let edits = pending.iter().map(|member| member.edit).collect::<Vec<_>>();
+        let results = self.sync.publish_batch(&edits).await;
+        let mut parents = BTreeMap::<String, (String, Revision)>::new();
+        for (member, result) in pending.drain(..).zip(results) {
+            match result {
+                Ok(revision) => {
+                    self.revision = self.revision.max(revision);
+                    self.outcome.revision = Some(self.revision);
+                    let node_id = self.namespace_node(member.edit).await?;
+                    self.accept_local(&member.path, &member.local, node_id, revision)
+                        .await?;
+                    self.mark_parent_dirty(&member.path);
+                    self.refresh_local_path(&member.path)?;
+                    self.complete_work(member.edit, revision, Some(&member.upload_artifact))?;
+                    parents
+                        .entry(member.parent)
+                        .or_insert((member.path, revision));
+                    self.outcome.published_local += 1;
+                }
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Conflict => {
+                    self.replica.store_mut().update_work(
+                        member.edit.as_bytes(),
+                        "conflict",
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                    self.record_publish_conflict(&member.path).await?;
+                }
+                Err(error) if error.kind() == crate::runtime::ErrorKind::Retryable => {
+                    self.replica.store_mut().update_work(
+                        member.edit.as_bytes(),
+                        "retryable",
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                }
+                Err(error) => {
+                    if error.kind() == crate::runtime::ErrorKind::Unknown {
+                        self.outcome.unknown += 1;
+                    }
+                    if let Some(commit) = error.commit_id() {
+                        self.replica
+                            .store_mut()
+                            .set_work_commit_id(member.edit.as_bytes(), *commit.as_bytes())?;
+                    }
+                    self.replica.store_mut().update_work(
+                        member.edit.as_bytes(),
+                        work_state_for(&error),
+                        None,
+                        Some(&error.to_string()),
+                    )?;
+                }
+            }
+        }
+        for (_, (path, revision)) in parents {
+            self.refresh_parent_baseline(&path, revision).await?;
+        }
         Ok(())
     }
 
@@ -1937,6 +2124,7 @@ impl<'a> Context<'a> {
             .ok_or_else(|| format!("file parent {parent:?} is missing"))?;
         let parent_revision = self.entry_revision(parent);
         let captured = self.replica.capture_file(path, node)?;
+        let upload_artifact = captured.artifact.id.clone();
         let mut source =
             tokio::fs::File::from_std(self.replica.open_artifact(&captured.artifact.id)?);
         let edit = self
@@ -1958,6 +2146,7 @@ impl<'a> Context<'a> {
             Some(node),
             Some(parent_node),
             parent_revision,
+            Some(&captured.artifact.id),
         )?;
         let Some(revision) = self.publish_edit(edit, path).await? else {
             return Ok(());
@@ -1969,9 +2158,8 @@ impl<'a> Context<'a> {
         self.mark_parent_dirty(path);
         self.accept_local(path, node, node_id, revision).await?;
         self.refresh_parent_baseline(path, revision).await?;
-        self.replica
-            .store_mut()
-            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        self.refresh_local_path(path)?;
+        self.complete_work(edit, revision, Some(&upload_artifact))?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
         Ok(())
@@ -1985,6 +2173,7 @@ impl<'a> Context<'a> {
             .ok_or_else(|| format!("modify source {path:?} is missing"))?;
         let predicate = self.entry_revision(path);
         let captured = self.replica.capture_file(path, node)?;
+        let upload_artifact = captured.artifact.id.clone();
         let mut source =
             tokio::fs::File::from_std(self.replica.open_artifact(&captured.artifact.id)?);
         let edit = self.sync.stage(remote_node, predicate, &mut source).await?;
@@ -1997,6 +2186,7 @@ impl<'a> Context<'a> {
             Some(node),
             Some(remote_node),
             predicate,
+            Some(&captured.artifact.id),
         )?;
         let Some(revision) = self.publish_edit(edit, path).await? else {
             return Ok(());
@@ -2004,9 +2194,8 @@ impl<'a> Context<'a> {
         self.revision = revision;
         self.revisions.insert(path.to_owned(), revision);
         self.accept_local(path, node, remote_node, revision).await?;
-        self.replica
-            .store_mut()
-            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        self.refresh_local_path(path)?;
+        self.complete_work(edit, revision, Some(&upload_artifact))?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
         Ok(())
@@ -2029,6 +2218,7 @@ impl<'a> Context<'a> {
             None,
             Some(node),
             predicate,
+            None,
         )?;
         let Some(revision) = self.publish_edit(edit, path).await? else {
             return Ok(());
@@ -2036,12 +2226,12 @@ impl<'a> Context<'a> {
         self.revision = revision;
         self.nodes.remove(path);
         self.revisions.remove(path);
+        self.remote.remove(path);
         self.mark_parent_dirty(path);
         self.replica.store_mut().remove_baseline_path(path)?;
         self.refresh_parent_baseline(path, revision).await?;
-        self.replica
-            .store_mut()
-            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        self.refresh_local_path(path)?;
+        self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
         Ok(())
@@ -2073,6 +2263,7 @@ impl<'a> Context<'a> {
             None,
             Some(node),
             predicate,
+            None,
         )?;
         let Some(revision) = self.publish_edit(edit, from).await? else {
             return Ok(None);
@@ -2083,11 +2274,16 @@ impl<'a> Context<'a> {
         self.mark_parent_dirty(from);
         self.mark_parent_dirty(to);
         self.migrate_baseline_path(from, to, revision).await?;
+        let snapshot = self.sync.authority().observe_revision(revision).await?;
+        self.remote.remove(from);
+        if let Some(node) = snapshot.resolve(to).await? {
+            self.remote.insert(to.to_owned(), node);
+        }
         self.refresh_parent_baseline(from, revision).await?;
         self.refresh_parent_baseline(to, revision).await?;
-        self.replica
-            .store_mut()
-            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        self.refresh_local_path(from)?;
+        self.refresh_local_path(to)?;
+        self.complete_work(edit, revision, None)?;
         self.outcome.published_local += 1;
         self.outcome.revision = Some(revision);
         Ok(Some(revision))
@@ -2097,6 +2293,9 @@ impl<'a> Context<'a> {
         match node.kind() {
             NodeKind::Directory { .. } => match self.replica.create_directory_local(path) {
                 Ok(()) => {
+                    if let Some(local) = self.replica.observe_path(path)? {
+                        self.current.insert_node(local);
+                    }
                     self.nodes.insert(path.to_owned(), node.id());
                     self.revisions.insert(path.to_owned(), self.revision);
                     self.outcome.materialized_remote += 1;
@@ -2121,6 +2320,9 @@ impl<'a> Context<'a> {
                     .create_file_local(path, node.executable(), &mut staged)
                 {
                     Ok(()) => {
+                        if let Some(local) = self.replica.observe_path(path)? {
+                            self.current.insert_node(local);
+                        }
                         self.nodes.insert(path.to_owned(), node.id());
                         self.revisions.insert(path.to_owned(), self.revision);
                         self.outcome.materialized_remote += 1;
@@ -2165,6 +2367,9 @@ impl<'a> Context<'a> {
         }
         match install.finish() {
             Ok(_) => {
+                if let Some(local) = self.replica.observe_path(path)? {
+                    self.current.insert_node(local);
+                }
                 self.nodes.insert(path.to_owned(), node.id());
                 self.revisions.insert(path.to_owned(), self.revision);
                 self.outcome.materialized_remote += 1;
@@ -2186,9 +2391,11 @@ impl<'a> Context<'a> {
             "remote deletion",
             Some(self.revision.to_bytes()),
         ) {
-            Ok(_) => {
+            Ok(_artifact) => {
+                self.current.remove_subtree(path);
                 self.nodes.remove(path);
                 self.revisions.remove(path);
+                self.remote.remove(path);
                 self.replica.store_mut().remove_baseline_path(path)?;
                 self.outcome.materialized_remote += 1;
                 Ok(())
@@ -2200,6 +2407,11 @@ impl<'a> Context<'a> {
     async fn remote_rename(&mut self, from: &str, to: &str) -> Result<bool> {
         match self.replica.rename_local(from, to) {
             Ok(()) => {
+                let Some(observed) = self.replica.observe_path(to)? else {
+                    self.conflict(from, Some(from), Some(to)).await?;
+                    return Ok(false);
+                };
+                self.current.move_subtree(from, to, &observed);
                 self.migrate_baseline_path(from, to, self.revision).await?;
                 self.outcome.materialized_remote += 1;
                 Ok(true)
@@ -2349,6 +2561,7 @@ impl<'a> Context<'a> {
         self.replica
             .store_mut()
             .save_baseline_path(parent, &node, accepted.as_ref(), revision)?;
+        self.remote.insert(parent.to_owned(), node);
         self.revisions.insert(parent.to_owned(), revision);
         Ok(())
     }
@@ -2364,6 +2577,7 @@ impl<'a> Context<'a> {
         local: Option<&LocalNode>,
         baseline_node: Option<NodeId>,
         baseline_revision: Revision,
+        upload_artifact: Option<&str>,
     ) -> Result<()> {
         let (local_kind, local_digest, local_length, local_executable) = match local {
             Some(node) => (
@@ -2408,9 +2622,37 @@ impl<'a> Context<'a> {
             commit_id: None,
             conflict: None,
             source_artifact: None,
+            upload_artifact: upload_artifact.map(str::to_owned),
             state: "prepared".to_owned(),
             error: None,
         })?;
+        Ok(())
+    }
+
+    fn complete_work(
+        &mut self,
+        edit: EditId,
+        revision: Revision,
+        upload_artifact: Option<&str>,
+    ) -> Result<()> {
+        self.replica
+            .store_mut()
+            .update_work(edit.as_bytes(), "committed", Some(revision), None)?;
+        if let Some(artifact) = upload_artifact {
+            self.replica.release_artifact(artifact)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_local_path(&mut self, path: &str) -> Result<()> {
+        match self.replica.observe_path(path)? {
+            Some(node) => {
+                self.current.insert_node(node);
+            }
+            None => {
+                self.current.remove_subtree(path);
+            }
+        }
         Ok(())
     }
 
@@ -2513,24 +2755,31 @@ impl<'a> Context<'a> {
         self.replica
             .store_mut()
             .save_baseline_path(path, &node, Some(accepted), revision)?;
+        self.remote.insert(path.to_owned(), node);
         self.nodes.insert(path.to_owned(), node_id);
         self.revisions.insert(path.to_owned(), revision);
         Ok(())
     }
 
     async fn accept_remote(&mut self, path: &str, node: &Node) -> Result<()> {
-        let fresh = self.replica.scan()?;
-        let Some(current) = fresh.get(path).cloned() else {
+        let current = self.replica.observe_path(path)?;
+        self.accept_remote_node(path, node, current).await
+    }
+
+    async fn accept_remote_node(
+        &mut self,
+        path: &str,
+        node: &Node,
+        current: Option<LocalNode>,
+    ) -> Result<()> {
+        let Some(current) = current else {
             return Ok(());
         };
-        if canonical_matches(self.replica, &current, node).await? {
-            self.replica.store_mut().save_baseline_path(
-                path,
-                node,
-                Some(&current),
-                self.revision,
-            )?;
-        }
+        self.replica
+            .store_mut()
+            .save_baseline_path(path, node, Some(&current), self.revision)?;
+        self.current.insert_node(current);
+        self.remote.insert(path.to_owned(), node.clone());
         Ok(())
     }
 
@@ -2665,21 +2914,36 @@ fn local_equal(left: &LocalNode, right: &LocalNode) -> bool {
     left.kind == right.kind && left.executable == right.executable
 }
 
-async fn canonical_matches(
-    replica: &mut Replica,
+async fn canonical_local(
+    replica: &Replica,
     local: &LocalNode,
     remote: &Node,
-) -> Result<bool> {
+) -> Result<Option<LocalNode>> {
     match (local.kind, remote.kind()) {
-        (LocalKind::Directory, NodeKind::Directory { .. }) => Ok(true),
-        (LocalKind::File { .. }, NodeKind::File(file)) => {
-            let captured = replica.capture_file(&local.path, local)?;
-            let mut source =
-                tokio::fs::File::from_std(replica.open_artifact(&captured.artifact.id)?);
-            let content = yinyang_core::ContentId::calculate(&mut source).await?;
-            Ok(local.executable == remote.executable() && content == file.content_id())
+        (LocalKind::Directory, NodeKind::Directory { .. }) => {
+            Ok(replica.observe_path(&local.path)?)
         }
-        _ => Ok(false),
+        (LocalKind::File { .. }, NodeKind::File(file)) => {
+            let mut source =
+                tokio::fs::File::from_std(replica.open_observed_file(&local.path, local)?);
+            let (content, digest) =
+                yinyang_core::ContentId::calculate_with_raw_digest(&mut source).await?;
+            if local.executable != remote.executable() || content != file.content_id() {
+                return Ok(None);
+            }
+            Ok(Some(LocalNode {
+                path: local.path.clone(),
+                kind: LocalKind::File {
+                    length: content.length(),
+                    digest: ContentHash::from_bytes(digest),
+                },
+                executable: local.executable,
+                identity: local.identity,
+                parent: local.parent,
+                stat: local.stat,
+            }))
+        }
+        _ => Ok(None),
     }
 }
 

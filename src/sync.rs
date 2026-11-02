@@ -17,14 +17,14 @@
 
 //! Durable conditional uploads for OS-managed or ordinary local replicas.
 use crate::local::store;
-use crate::runtime::{Error, ErrorKind, HandleStatus, Result, Runtime};
+use crate::runtime::{Error, ErrorKind, Failure, HandleStatus, Result, Runtime};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
-use yinyang_core::{Authority, NodeId, Receipt, Revision};
+use yinyang_core::{Authority, NodeId, Receipt, Revision, Transaction};
 
 mod namespace;
 pub use namespace::{
@@ -502,6 +502,71 @@ impl Sync {
             .await?;
         handle.fsync().await?;
         Ok(handle.status().await?.remote_revision)
+    }
+
+    /// Publish namespace intents through one authority batch while retaining a
+    /// separate receipt, Conflict, Retryable or Unknown outcome per member.
+    /// Content edits fall back to the existing per-edit path.
+    pub async fn publish_batch(&self, edits: &[EditId]) -> Vec<Result<Revision>> {
+        let mut results = (0..edits.len()).map(|_| None).collect::<Vec<_>>();
+        let mut requests = Vec::<(usize, EditId, Transaction)>::new();
+        let mut content = Vec::new();
+        {
+            let _gate = self.inner.gate.lock().await;
+            for (index, edit) in edits.iter().copied().enumerate() {
+                match namespace::exists(self, edit).await {
+                    Ok(true) => match namespace::prepare_batch(self, edit).await {
+                        Ok(namespace::BatchPrepare::Done(result)) => {
+                            results[index] = Some(result);
+                        }
+                        Ok(namespace::BatchPrepare::Request(request)) => {
+                            requests.push((index, edit, request));
+                        }
+                        Err(error) => results[index] = Some(Err(error)),
+                    },
+                    Ok(false) => content.push((index, edit)),
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+        }
+        for (index, edit) in content {
+            results[index] = Some(self.publish(edit).await);
+        }
+        if !requests.is_empty() {
+            let batch = requests
+                .iter()
+                .map(|(_, _, request)| request.clone())
+                .collect::<Vec<_>>();
+            match self.authority().commit_batch(&batch).await {
+                Ok(outcomes) if outcomes.len() == requests.len() => {
+                    for ((index, edit, request), outcome) in requests.iter().zip(outcomes) {
+                        results[*index] =
+                            Some(namespace::complete_batch(self, *edit, request, outcome).await);
+                    }
+                }
+                Ok(_) => {
+                    let failure = Failure::capture(&Error::State(
+                        ErrorKind::Corrupt,
+                        "authority returned the wrong batch outcome count",
+                    ));
+                    for (index, edit, _) in &requests {
+                        let _ = namespace::mark_batch_unknown(self, *edit, failure.clone()).await;
+                        results[*index] = Some(Err(Error::Retained(failure.clone())));
+                    }
+                }
+                Err(error) => {
+                    let failure = Failure::capture(&Error::from(error));
+                    for (index, edit, _) in &requests {
+                        let _ = namespace::mark_batch_unknown(self, *edit, failure.clone()).await;
+                        results[*index] = Some(Err(Error::Retained(failure.clone())));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| result.unwrap_or(Err(Error::Invalid("missing batch result"))))
+            .collect()
     }
     /// Export retained bytes without claiming remote completion.
     ///

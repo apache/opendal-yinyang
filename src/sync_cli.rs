@@ -186,6 +186,7 @@ pub struct StatusSummary {
     pub conflicts: usize,
     pub failed: u64,
     pub retained_artifacts: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -727,6 +728,7 @@ fn project(inspection: &domain::Inspection) -> CliResult<SyncStatus> {
             conflicts: inspection.summary.conflicts,
             failed: inspection.summary.failed,
             retained_artifacts: inspection.summary.retained_artifacts,
+            retained_bytes: inspection.summary.retained_bytes,
         },
         entries,
         conflicts,
@@ -956,7 +958,7 @@ fn emit(document: &SyncStatus, json: bool) -> CliResult<()> {
     } else {
         writeln!(
             stdout,
-            "sync: {:?} remote: {:?} local: {:?} in-sync: {} pending: {} unknown: {} conflicts: {} failed: {} artifacts: {}",
+            "sync: {:?} remote: {:?} local: {:?} in-sync: {} pending: {} unknown: {} conflicts: {} failed: {} artifacts: {} retained-bytes: {}",
             document.binding.state,
             document.remote.availability,
             document.local.scan,
@@ -966,6 +968,7 @@ fn emit(document: &SyncStatus, json: bool) -> CliResult<()> {
             document.summary.conflicts,
             document.summary.failed,
             document.summary.retained_artifacts,
+            document.summary.retained_bytes,
         )?;
     }
     Ok(())

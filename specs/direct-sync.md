@@ -133,13 +133,12 @@ remote rename: a pass can end with both names present or with one side
 partially applied, and the retained work makes the next retry boundary
 explicit.
 
-No watcher, daemon or automatic garbage collection is implied. When removing a
-file also empties an ancestor directory that is required by the durable
-baseline, Direct Sync removes that now-empty parent with fd-relative
-`AT_REMOVEDIR` calls and stops at the first non-empty directory. This keeps a
-pulled `dir/file` delete convergent and a later run is a no-op. An unrelated
-empty directory that is not an ancestor of accepted or pending file state
-remains an explicit unsupported namespace entry.
+No watcher or daemon is implied. When removing a file also empties an ancestor
+directory that is required by the durable baseline, Direct Sync removes that
+now-empty parent with fd-relative `AT_REMOVEDIR` calls and stops at the first
+non-empty directory. This keeps a pulled `dir/file` delete convergent and a
+later run is a no-op. An unrelated empty directory that is not an ancestor of
+accepted or pending file state remains an explicit unsupported namespace entry.
 
 ## Remote publication
 
@@ -225,8 +224,11 @@ Conflict resolution is explicit:
 explicit-content merge contract. A user can edit the local directory, export
 both sides and then choose `--keep local`.
 
-Artifacts are retained indefinitely in the experimental profile. There is no
-automatic artifact or version-history garbage collection.
+An upload or resolution input is released after its work record is terminal and
+the accepted baseline is durable. A displaced local inode is released after the
+install baseline is durable. Active conflict artifacts stay until an explicit
+resolution clears that conflict; Unknown work keeps its exact input. Status
+reports the remaining artifact count.
 
 ## Status and CLI
 
@@ -289,5 +291,6 @@ an argument, admission or other command failure.
 - A multi-page object listing is not an atomic namespace snapshot.
 - ETag conditions inherit the selected storage service's collision and ABA
   boundaries.
-- Artifact retention grows with conflicts and retained upload inputs; automatic
-  garbage collection is out of scope.
+- Active conflict artifacts grow until explicitly resolved. Ordinary uploads,
+  resolution inputs and displaced inodes do not accumulate after their durable
+  release events.

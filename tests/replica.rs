@@ -103,6 +103,38 @@ fn scan_rejects_hard_links_with_the_existing_validation_path() {
 }
 
 #[test]
+fn artifact_budget_prunes_oldest_unreferenced_entries() {
+    let (_temp, _root, mut replica) = setup();
+    let mut ids = Vec::new();
+    for index in 0..yinyang::replica::ARTIFACT_BUDGET_COUNT + 6 {
+        ids.push(replica.retain_bytes("file", &[index as u8; 16]).unwrap());
+    }
+    let before = replica.status().unwrap();
+    assert_eq!(
+        before.artifacts.len(),
+        yinyang::replica::ARTIFACT_BUDGET_COUNT + 6
+    );
+    replica.prune_artifacts().unwrap();
+    let after = replica.status().unwrap();
+    assert_eq!(
+        after.artifacts.len(),
+        yinyang::replica::ARTIFACT_BUDGET_COUNT
+    );
+    assert_eq!(
+        after.retained_bytes,
+        yinyang::replica::ARTIFACT_BUDGET_COUNT as u64 * 16
+    );
+    for pruned in &ids[..6] {
+        assert!(
+            !after
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.id == *pruned)
+        );
+    }
+}
+
+#[test]
 fn exchange_retains_old_inode_for_open_writer() {
     let (temp, root, mut replica) = setup();
     fs::write(root.join("file"), b"old").unwrap();

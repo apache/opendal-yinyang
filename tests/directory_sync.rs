@@ -28,6 +28,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{Authority, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction};
@@ -70,6 +71,23 @@ fn local_tree(root: &Path) -> BTreeMap<String, TreeEntry> {
     let mut tree = BTreeMap::new();
     walk(root, "", &mut tree);
     tree
+}
+
+fn tree_bytes(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    let mut bytes = 0;
+    for entry in std::fs::read_dir(path).expect("tree directory") {
+        let entry = entry.expect("tree entry");
+        let metadata = entry.metadata().expect("tree metadata");
+        if metadata.is_dir() {
+            bytes += tree_bytes(&entry.path());
+        } else {
+            bytes += metadata.len();
+        }
+    }
+    bytes
 }
 
 async fn remote_tree(authority: &Arc<dyn Authority>) -> BTreeMap<String, TreeEntry> {
@@ -396,12 +414,419 @@ async fn renamed_and_re_edited_local_file_converges() {
     .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn managed_sync_publishes_two_hundred_file_creates_in_one_commit() {
+    const FILES: usize = 200;
+
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..FILES {
+        std::fs::write(
+            root.join(format!("file-{index:03}")),
+            [u8::try_from(index).unwrap()],
+        )
+        .unwrap();
+    }
+    let mut sync = DirectorySync::init(authority, &temp.path().join("state"), &root)
+        .await
+        .unwrap();
+    let before = backend.state.lock().unwrap().head_conditional_writes;
+    assert!(sync.run().await.unwrap().in_sync);
+    let commits = backend.state.lock().unwrap().head_conditional_writes - before;
+    assert_eq!(
+        commits, 1,
+        "{FILES} file creates used {commits} head commits"
+    );
+}
+
 /// Delegating authority with two explicit hold points. The after-commit mode
 /// completes the real commit and then delays the successful response until the
 /// test releases it; the before-commit mode parks the request before the real
 /// commit so an external edit can land on the authority in between. The
 /// original commit outcomes are returned unchanged; lost or Unknown responses
 /// are a separate acceptance concern.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_sync_releases_artifacts_and_has_a_constant_noop_cost() {
+    const SMALL: usize = 512 * 1024;
+    const LARGE: usize = 1024 * 1024;
+    const FILES: usize = 64;
+    const EDITS: usize = 40;
+
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let writer_root = temp.path().join("writer");
+    let reader_root = temp.path().join("reader");
+    let writer_state = temp.path().join("writer-state");
+    let reader_state = temp.path().join("reader-state");
+    std::fs::create_dir_all(&writer_root).unwrap();
+    std::fs::create_dir_all(&reader_root).unwrap();
+    for index in 0..FILES {
+        std::fs::write(
+            writer_root.join(format!("small-{index:03}")),
+            vec![index as u8; SMALL],
+        )
+        .unwrap();
+    }
+    let large = writer_root.join("large");
+    std::fs::write(&large, vec![1_u8; LARGE]).unwrap();
+
+    let mut writer = DirectorySync::init(authority.clone(), &writer_state, &writer_root)
+        .await
+        .unwrap();
+    let before = backend.state.lock().unwrap().head_conditional_writes;
+    assert!(writer.run().await.unwrap().in_sync);
+    let head_commits = backend.state.lock().unwrap().head_conditional_writes - before;
+    assert!(
+        head_commits <= 16,
+        "one new-file pass used {head_commits} head commits"
+    );
+    println!("managed sync new-file head commits: {head_commits}");
+    let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
+        .await
+        .unwrap();
+    assert_eq!(writer_status.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&writer_state.join("quarantine")), 0);
+
+    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
+        .await
+        .unwrap();
+    assert!(reader.run().await.unwrap().in_sync);
+    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
+    assert_eq!(reader_status.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
+
+    for edit in 0..EDITS {
+        let mut bytes = vec![(edit % 250 + 2) as u8; LARGE];
+        bytes[..8].copy_from_slice(&(edit as u64).to_le_bytes());
+        std::fs::write(&large, bytes).unwrap();
+        assert!(writer.run().await.unwrap().in_sync);
+        let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
+            .await
+            .unwrap();
+        assert_eq!(writer_status.summary.retained_bytes, 0);
+        assert!(reader.run().await.unwrap().in_sync);
+        let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
+            .await
+            .unwrap();
+        assert!(
+            reader_status.summary.retained_bytes <= LARGE as u64,
+            "reader retained more than one displaced version after edit {edit}: {}",
+            reader_status.summary.retained_bytes
+        );
+        assert!(
+            tree_bytes(&reader_state.join("quarantine")) <= (LARGE + 4096) as u64,
+            "reader quarantine grew after edit {edit}"
+        );
+    }
+
+    drop(reader);
+    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
+        .await
+        .unwrap();
+    assert!(reader.run().await.unwrap().in_sync);
+    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
+    assert_eq!(reader_status.summary.retained_bytes, 0);
+    assert_eq!(tree_bytes(&reader_state.join("quarantine")), 0);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reader.reset_hash_bytes_read();
+    assert!(reader.run().await.unwrap().in_sync);
+    assert!(
+        reader.hash_bytes_read() <= LARGE as u64,
+        "the first post-window run may refresh one racy evidence record"
+    );
+    reader.reset_hash_bytes_read();
+    assert!(reader.run().await.unwrap().in_sync);
+    assert_eq!(
+        reader.hash_bytes_read(),
+        0,
+        "a settled no-op must use cached stat identity instead of rehashing local files"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let mut changed = vec![7_u8; LARGE];
+    changed[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(reader_root.join("large"), &changed).unwrap();
+    reader.reset_hash_bytes_read();
+    assert!(reader.run().await.unwrap().in_sync);
+    assert!(
+        reader.hash_bytes_read() >= LARGE as u64,
+        "a same-size in-place edit must invalidate persistent stat evidence"
+    );
+    assert!(writer.run().await.unwrap().in_sync);
+    assert_eq!(std::fs::read(&large).unwrap(), changed);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn managed_sync_pull_hashing_is_linear() {
+    const SIZE: usize = 256 * 1024;
+    for files in [32_usize, 128] {
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let push_root = temp.path().join("push");
+        std::fs::create_dir_all(&push_root).unwrap();
+        for index in 0..files {
+            let mut bytes = vec![(index % 251) as u8; SIZE];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            std::fs::write(push_root.join(format!("file-{index:03}")), bytes).unwrap();
+        }
+        let mut push = DirectorySync::init(
+            authority.clone(),
+            &temp.path().join("push-state"),
+            &push_root,
+        )
+        .await
+        .unwrap();
+        assert!(push.run().await.unwrap().in_sync);
+
+        let pull_root = temp.path().join("pull");
+        std::fs::create_dir_all(&pull_root).unwrap();
+        let mut pull = DirectorySync::init(
+            authority.clone(),
+            &temp.path().join("pull-state"),
+            &pull_root,
+        )
+        .await
+        .unwrap();
+        pull.reset_hash_bytes_read();
+        assert!(pull.run().await.unwrap().in_sync);
+        let tree = (files * SIZE) as u64;
+        assert!(
+            pull.hash_bytes_read() <= tree * 2,
+            "{files}-file pull hashed {} bytes for a {tree}-byte tree",
+            pull.hash_bytes_read()
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "release-mode scale benchmark; run explicitly with --ignored --nocapture"]
+async fn managed_sync_scale_benchmark() {
+    const SIZE: usize = 512 * 1024;
+    for files in [32_usize, 64, 128, 256] {
+        let backend = TestBackend::default();
+        let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let push_root = temp.path().join("push");
+        for index in 0..files {
+            let directory = push_root.join(format!("d{}", index % 4));
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut bytes = vec![(index % 251) as u8; SIZE];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            std::fs::write(directory.join(format!("f{index}")), bytes).unwrap();
+        }
+        let mut push = DirectorySync::init(
+            authority.clone(),
+            &temp.path().join("push-state"),
+            &push_root,
+        )
+        .await
+        .unwrap();
+        let before = Instant::now();
+        assert!(push.run().await.unwrap().in_sync);
+        let push_seconds = before.elapsed().as_secs_f64();
+
+        let pull_root = temp.path().join("pull");
+        std::fs::create_dir_all(&pull_root).unwrap();
+        let mut pull = DirectorySync::init(
+            authority.clone(),
+            &temp.path().join("pull-state"),
+            &pull_root,
+        )
+        .await
+        .unwrap();
+        pull.reset_hash_bytes_read();
+        let before = Instant::now();
+        assert!(pull.run().await.unwrap().in_sync);
+        let pull_seconds = before.elapsed().as_secs_f64();
+        let pull_hashes = pull.hash_bytes_read();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        pull.reset_hash_bytes_read();
+        assert!(pull.run().await.unwrap().in_sync);
+        pull.reset_hash_bytes_read();
+        let before = Instant::now();
+        assert!(pull.run().await.unwrap().in_sync);
+        let noop_seconds = before.elapsed().as_secs_f64();
+        let noop_hashes = pull.hash_bytes_read();
+        assert_eq!(noop_hashes, 0);
+        println!(
+            "W2_SCALE files={files} size={SIZE} push_s={push_seconds:.3} pull_s={pull_seconds:.3} \
+             noop_s={noop_seconds:.3} pull_hashed_bytes={pull_hashes} \
+             noop_hashed_bytes={noop_hashes} tree_bytes={}",
+            files * SIZE
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "release-mode edit benchmark; run explicitly with --ignored --nocapture"]
+async fn managed_sync_edit_benchmark() {
+    const SIZE: usize = 1024 * 1024;
+    const EDITS: usize = 40;
+    let backend = TestBackend::default();
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let (writer_root, reader_root) = (temp.path().join("writer"), temp.path().join("reader"));
+    let (writer_state, reader_state) = (temp.path().join("ws"), temp.path().join("rs"));
+    std::fs::create_dir_all(&writer_root).unwrap();
+    std::fs::create_dir_all(&reader_root).unwrap();
+    let file = writer_root.join("file");
+    std::fs::write(&file, vec![1_u8; SIZE]).unwrap();
+    let mut writer = DirectorySync::init(authority.clone(), &writer_state, &writer_root)
+        .await
+        .unwrap();
+    assert!(writer.run().await.unwrap().in_sync);
+    let mut reader = DirectorySync::init(authority.clone(), &reader_state, &reader_root)
+        .await
+        .unwrap();
+    assert!(reader.run().await.unwrap().in_sync);
+    for edit in 0..EDITS {
+        let mut bytes = vec![(edit % 250 + 2) as u8; SIZE];
+        bytes[..8].copy_from_slice(&(edit as u64).to_le_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        assert!(writer.run().await.unwrap().in_sync);
+        assert!(reader.run().await.unwrap().in_sync);
+    }
+    let writer_status = DirectorySync::inspect(authority.clone(), &writer_state)
+        .await
+        .unwrap();
+    let reader_status = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    reader.reset_hash_bytes_read();
+    assert!(reader.run().await.unwrap().in_sync);
+    reader.reset_hash_bytes_read();
+    let before = Instant::now();
+    assert!(reader.run().await.unwrap().in_sync);
+    let settled = DirectorySync::inspect(authority.clone(), &reader_state)
+        .await
+        .unwrap();
+    assert_eq!(reader.hash_bytes_read(), 0);
+    println!(
+        "W2_EDITS edits={EDITS} writer_retained_bytes={} reader_retained_bytes={} \
+         settled_retained_bytes={} noop_hashed_bytes={} noop_s={:.3} quarantine_bytes={}",
+        writer_status.summary.retained_bytes,
+        reader_status.summary.retained_bytes,
+        settled.summary.retained_bytes,
+        reader.hash_bytes_read(),
+        before.elapsed().as_secs_f64(),
+        tree_bytes(&reader_state.join("quarantine"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_sync_publication_does_not_reimport_prepared_content() {
+    const SIZE: usize = 4 * 1024 * 1024;
+
+    async fn measure(authority: Arc<dyn Authority>, backend: &TestBackend) -> (u64, u64, u64, u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let sync = Sync::open(authority.clone(), temp.path().join("sync"))
+            .await
+            .unwrap();
+        let baseline = authority.observe_latest().await.unwrap().revision();
+        let reads = || backend.state.lock().unwrap().data_read_bytes;
+        let before = reads();
+        let edit = sync
+            .stage_create_file(
+                authority.root(),
+                "file",
+                baseline,
+                FileMetadata::new(false),
+                &mut &vec![9_u8; SIZE][..],
+            )
+            .await
+            .unwrap();
+        let staged = reads() - before;
+        let before_publish = reads();
+        let revision = sync.publish(edit).await.unwrap();
+        let published = reads() - before_publish;
+        let node = sync
+            .namespace_status(edit)
+            .await
+            .unwrap()
+            .intent
+            .operation
+            .node_id();
+        let replacement = vec![3_u8; SIZE];
+        let before_stage = reads();
+        let content = sync
+            .stage(node, revision, &mut &replacement[..])
+            .await
+            .unwrap();
+        let content_staged = reads() - before_stage;
+        drop(sync);
+        let sync = Sync::open(authority, temp.path().join("sync"))
+            .await
+            .unwrap();
+        let before_publish = reads();
+        sync.publish(content).await.unwrap();
+        (staged, published, content_staged, reads() - before_publish)
+    }
+
+    let object_backend = TestBackend::default();
+    let object: Arc<dyn Authority> = Arc::new(Fs::create(object_backend.operator()).await.unwrap());
+    let (object_stage, object_publish, object_content_stage, object_content_publish) =
+        measure(object, &object_backend).await;
+    assert!(
+        object_publish < 64 * 1024,
+        "object publication read {object_publish} bytes after preparation"
+    );
+    assert!(object_stage <= SIZE as u64 + 64 * 1024);
+    assert!(
+        object_content_publish <= SIZE as u64 + 64 * 1024,
+        "object content publication read {object_content_publish} bytes"
+    );
+
+    let service_backend = TestBackend::default();
+    let service_temp = tempfile::tempdir().unwrap();
+    let service = MetadataService::create(
+        service_temp.path().join("metadata.db"),
+        service_backend.operator(),
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let token = "managed-sync-publication-read-test".to_owned();
+    let server = tokio::spawn(serve(listener, service, token.clone()));
+    let client: Arc<dyn Authority> = Arc::new(
+        ServiceClient::connect(address, token, service_backend.operator())
+            .await
+            .unwrap(),
+    );
+    let (service_stage, service_publish, service_content_stage, service_content_publish) =
+        measure(client, &service_backend).await;
+    assert!(
+        service_publish < 64 * 1024,
+        "service publication read {service_publish} bytes after preparation"
+    );
+    assert!(
+        service_stage <= SIZE as u64 + 64 * 1024,
+        "service preparation read {service_stage} bytes"
+    );
+    assert!(
+        service_content_publish <= SIZE as u64 + 64 * 1024,
+        "service content publication read {service_content_publish} bytes"
+    );
+    println!(
+        "W2_READBACK object_stage={object_stage} object_publish={object_publish} \
+         object_content_stage={object_content_stage} \
+         object_content_publish={object_content_publish} service_stage={service_stage} \
+         service_publish={service_publish} service_content_stage={service_content_stage} \
+         service_content_publish={service_content_publish}"
+    );
+    server.abort();
+}
+
 #[derive(Debug)]
 struct HeldAuthority {
     inner: Arc<dyn Authority>,

@@ -120,12 +120,16 @@ least-recently-used eviction. Map and allocation overhead are additional.
 Clones and concurrent `FileVersion` readers of the same binding share this
 budget. The cache ends with the process and is never persisted. Eviction,
 restart, or a fresh logical version requires storage reads again.
-`DataStore::import`, content preparation, and fixed-offset updates intentionally
-remain uncached: cached read-serving evidence cannot promote untrusted
-descriptors to preparation authority or replace their independent storage
-verification. The backend immutable-write contract still applies; externally
-deleted or corrupted ranges may remain readable only when their previously
-verified bytes are still cached.
+`DataStore::import` uses a separate bounded verified-descriptor set of 65,536
+entries. Preparation, verified import, bounded overwrite, bounded update, and
+successful service registration record their descriptor only after the pack has
+been verified. A later import in the same process, including through a
+`DataStore` clone, returns preparation evidence without another storage read.
+The set is FIFO-bounded; eviction, restart, or a separately constructed
+`DataStore` requires one full verified import. Cached read-serving ranges do
+not populate this set. The backend immutable-write contract still applies;
+externally deleted or corrupted ranges may remain readable only when their
+previously verified bytes are still cached.
 
 ## Preparation authority
 
@@ -134,7 +138,8 @@ constructible or deserializable by callers: it binds the descriptor to a
 process-local `DataStore` authority shared by clones. A separately created data
 binding cannot produce handles accepted by that authority, even if given the
 same filesystem UUID. `import` verifies all units of an untrusted descriptor
-before issuing evidence. Metadata authorities must only recover published
+before issuing evidence unless that exact descriptor is already in the
+authority's verified set. Metadata authorities must only recover published
 evidence from authenticated records in their own publication lineage.
 
 The conservative OpenDAL binding streams and hashes each newly written pack,
