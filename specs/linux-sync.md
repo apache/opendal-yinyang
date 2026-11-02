@@ -40,6 +40,10 @@ checksum-protected manifest. It refuses incomplete installs. `restore` validates
 the complete package and adapter-specific support state before creating either
 absent destination. Restore rebinds root, state, baseline and artifact inode
 identities while preserving accepted content evidence, requests and receipts.
+Each restored artifact is verified once against its recorded length and digest;
+its new device, inode, mtime and ctime are persisted in the same rebind
+transaction. A mismatch keeps the artifact marked changed for explicit
+inspection instead of rehashing unchanged retained content on every status.
 
 ## Admission
 
