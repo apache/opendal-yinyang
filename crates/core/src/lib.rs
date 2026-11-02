@@ -22,6 +22,7 @@ mod compatibility;
 pub mod data;
 pub use authority::Authority;
 mod error;
+mod expiry;
 mod identity;
 mod index;
 pub mod namespace;
@@ -31,9 +32,12 @@ pub mod service;
 mod snapshot;
 pub mod transaction;
 
-pub use authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
+pub use authority::{
+    RETAINED_REVISIONS_PAGE_MAX, RevisionHistoryPage, RevisionRecord, RevisionStatus,
+};
 pub use data::{ContentDescriptor, ContentEdit, ContentId, DataStore, PreparedContent};
 pub use error::{Error, ErrorKind, Result};
+pub use expiry::{EXPIRY_CANDIDATES_MAX, ExpiryRequest};
 pub use identity::{CommitId, NodeId};
 pub use namespace::{DirectoryEntry, Link, Node, NodeKind};
 pub use object::{Cursor, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot};

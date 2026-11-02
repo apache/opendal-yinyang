@@ -2147,7 +2147,9 @@ fn physical_issue_state(kind: ErrorKind) -> &'static str {
         ErrorKind::Corrupt => "corrupt",
         ErrorKind::Invalid | ErrorKind::InvalidName => "invalid",
         ErrorKind::Unsupported => "unsupported",
-        ErrorKind::Storage | ErrorKind::Io | ErrorKind::PermissionDenied => "unavailable",
+        ErrorKind::Storage | ErrorKind::Io | ErrorKind::PermissionDenied | ErrorKind::Expired => {
+            "unavailable"
+        }
         ErrorKind::AlreadyExists
         | ErrorKind::NotDirectory
         | ErrorKind::IsDirectory
