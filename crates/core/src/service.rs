@@ -879,7 +879,7 @@ impl MetadataService {
             for (_, bytes) in &pending {
                 restored.push(self.restore_transaction(bytes).await?);
             }
-            let committed = self.commit_batch(&restored).await?;
+            let committed = self.publish_restored(&restored).await?;
             for ((index, _), outcome) in pending.into_iter().zip(committed) {
                 outcomes[index] = Some(outcome);
             }
@@ -980,7 +980,7 @@ impl MetadataService {
         let receipt_key = id.to_vec();
         let change_key = receipt.cursor.key();
         let candidates = request.candidates().to_vec();
-        let inserted = db_call(&self.writer, move |c| {
+        db_call(&self.writer, move |c| {
             for candidate in &candidates {
                 let updated = c
                     .execute(
@@ -1021,7 +1021,6 @@ impl MetadataService {
             Ok(())
         })
         .await?;
-        let _ = inserted;
         if db_call(&self.writer, |c| {
             c.execute_batch("COMMIT").map_err(sql)?;
             Ok(())
@@ -1040,6 +1039,13 @@ impl MetadataService {
             .remove(0))
     }
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        let plans = requests
+            .iter()
+            .map(Transaction::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_frozen_batch(&plans).await
+    }
+    async fn publish_restored(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
         if requests.len() > 4096 {
             return Err(Error::unsupported(
                 "service batch",
@@ -1051,13 +1057,10 @@ impl MetadataService {
         }
         let gate = Arc::clone(&self.write_gate).lock_owned().await;
         ensure_writer_healthy(&self.writer_poisoned)?;
-        // Even an in-process caller must have registered durable readiness.
-        let mut restored = Vec::new();
         for request in requests {
             request.validate(self.filesystem)?;
-            restored.push(self.restore_transaction(&request.to_bytes()?).await?);
         }
-        let result = self.publish(&restored, gate).await;
+        let result = self.publish(requests, gate).await;
         match result {
             Err(e) if e.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
