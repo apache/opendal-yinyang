@@ -667,9 +667,9 @@ fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -
 }
 /// Read every table that cross-validation compares from one WAL snapshot.
 ///
-/// A live writer can commit between two autocommit SELECTs. Without one read
-/// transaction, a reader could see a handle marked ready together with the
-/// base table from before that commit and report valid state as corrupt.
+/// A live writer can commit between two autocommit SELECT statements. Without
+/// one read transaction, a reader could see a handle marked ready together with
+/// the base table from before that commit and report valid state as corrupt.
 fn read_snapshot(c: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
     c.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
         .map_err(local)
