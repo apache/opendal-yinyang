@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
+use yinyang::core::service::valid_service_token;
 use yinyang::core::{CommitId, Fs, Revision};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 use yinyang::volume::{VolumeContext, VolumeLoadError, VolumeLoadStage};
@@ -72,11 +73,6 @@ impl CliError {
         Self::new(stage, error.kind(), error.to_string())
     }
 
-    pub(crate) fn from_boxed(stage: CliStage, error: Box<dyn StdError + Send + Sync>) -> Self {
-        let kind = classify_boxed_error(error.as_ref());
-        Self::new(stage, kind, error.to_string())
-    }
-
     pub(crate) const fn stage(&self) -> CliStage {
         self.stage
     }
@@ -110,49 +106,12 @@ pub(crate) fn exit_code_for_kind(kind: RuntimeErrorKind) -> u8 {
     }
 }
 
-fn classify_boxed_error(error: &(dyn StdError + 'static)) -> RuntimeErrorKind {
-    if let Some(error) = error.downcast_ref::<yinyang::runtime::Error>() {
-        return error.kind();
-    }
-    if let Some(error) = error.downcast_ref::<yinyang::core::Error>() {
-        return runtime_kind_from_core(error.kind());
-    }
-    if let Some(error) = error.downcast_ref::<yinyang::direct::Error>() {
-        return runtime_kind_from_direct(error.kind());
-    }
-    if let Some(error) = error.downcast_ref::<opendal::Error>() {
-        return runtime_kind_from_opendal(error.kind());
-    }
-    if let Some(error) = error.downcast_ref::<std::io::Error>() {
-        return runtime_kind_from_io(error.kind());
-    }
-    RuntimeErrorKind::Io
-}
-
 pub(crate) fn runtime_kind_from_io(kind: std::io::ErrorKind) -> RuntimeErrorKind {
     match kind {
         std::io::ErrorKind::NotFound => RuntimeErrorKind::NotFound,
         std::io::ErrorKind::AlreadyExists => RuntimeErrorKind::AlreadyExists,
         std::io::ErrorKind::PermissionDenied => RuntimeErrorKind::PermissionDenied,
         _ => RuntimeErrorKind::Io,
-    }
-}
-
-pub(crate) fn runtime_kind_from_core(kind: yinyang::core::ErrorKind) -> RuntimeErrorKind {
-    use yinyang::core::ErrorKind as Kind;
-    match kind {
-        Kind::Invalid => RuntimeErrorKind::Invalid,
-        Kind::Corrupt => RuntimeErrorKind::Corrupt,
-        Kind::NotFound => RuntimeErrorKind::NotFound,
-        Kind::AlreadyExists => RuntimeErrorKind::AlreadyExists,
-        Kind::Unsupported => RuntimeErrorKind::Unsupported,
-        Kind::Storage => RuntimeErrorKind::Storage,
-        Kind::Io => RuntimeErrorKind::Io,
-        Kind::InvalidName => RuntimeErrorKind::InvalidName,
-        Kind::NotDirectory => RuntimeErrorKind::NotDirectory,
-        Kind::IsDirectory => RuntimeErrorKind::IsDirectory,
-        Kind::NotEmpty => RuntimeErrorKind::NotEmpty,
-        Kind::PermissionDenied => RuntimeErrorKind::PermissionDenied,
     }
 }
 
@@ -220,6 +179,13 @@ impl From<yinyang::direct::Error> for CliError {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl From<yinyang::fuse::Error> for CliError {
+    fn from(error: yinyang::fuse::Error) -> Self {
+        Self::new(CliStage::Operation, error.kind(), error.to_string())
+    }
+}
+
 impl From<opendal::Error> for CliError {
     fn from(error: opendal::Error) -> Self {
         Self::new(
@@ -255,22 +221,6 @@ impl From<String> for CliError {
 impl From<&str> for CliError {
     fn from(message: &str) -> Self {
         Self::invalid(CliStage::Operation, message)
-    }
-}
-
-impl From<Box<dyn StdError + Send + Sync>> for CliError {
-    fn from(error: Box<dyn StdError + Send + Sync>) -> Self {
-        Self::from_boxed(CliStage::Operation, error)
-    }
-}
-
-impl From<Box<dyn StdError>> for CliError {
-    fn from(error: Box<dyn StdError>) -> Self {
-        Self::new(
-            CliStage::Operation,
-            classify_boxed_error(error.as_ref()),
-            error.to_string(),
-        )
     }
 }
 
@@ -472,7 +422,7 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
                 )
             })?
             .to_owned();
-        if !listen.ip().is_loopback() || !(32..=1024).contains(&token.len()) {
+        if !listen.ip().is_loopback() || !valid_service_token(&token) {
             return Err(CliError::invalid(
                 CliStage::Configuration,
                 "metadata service requires loopback and a 32..=1024 byte token",

@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../../core/tests/support/mod.rs"]
-mod support;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use support::TestBackend;
 use yinyang::core::{Authority, Fs};
 use yinyang_native::{Mode, Session};
+use yinyang_test_support as support;
 
 async fn call(session: &mut Session, request: Value) -> Value {
     session

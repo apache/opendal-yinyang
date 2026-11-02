@@ -54,5 +54,4 @@ pub use space::{
 pub use yinyang_core as core;
 
 #[cfg(test)]
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;

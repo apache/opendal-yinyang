@@ -44,6 +44,7 @@ opendal = { workspace = true, features = [
 ] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+yinyang-test-support = { path = "../test-support" }
 
 [lints]
 workspace = true

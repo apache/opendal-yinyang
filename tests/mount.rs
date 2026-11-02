@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -29,6 +27,7 @@ use yinyang::core::{
 };
 use yinyang::mount::Mount;
 use yinyang::runtime::{ErrorKind, Runtime};
+use yinyang_test_support as support;
 
 struct PausingObserveAuthority {
     inner: Arc<dyn Authority>,

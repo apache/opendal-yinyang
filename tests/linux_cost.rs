@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-#[path = "linux_sync/harness.rs"]
-mod fixture;
+mod support;
+use support::linux_sync as fixture;
 
 use fixture::{Fixture, Publication, SyncPaths};
 use nix::sys::signal::{Signal, kill};

@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;
 
 use std::future::Future;
 use std::pin::Pin;

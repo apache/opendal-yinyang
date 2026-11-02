@@ -21,11 +21,13 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, Fs, Node, NodeId, NodeKind, Revision, Snapshot};
+use yinyang::core::{Authority, Node, NodeId, NodeKind, Revision, Snapshot};
 use yinyang::mount::{Mount, MountFile};
 use yinyang::runtime::{Error, ErrorKind, Result};
 use yinyang::sync::{EditId, Sync};
+use yinyang::volume::{
+    Access, Frontend, Model, Publication, StorageConnection, StorageProfile, Volume, VolumeConfig,
+};
 
 mod ffi;
 
@@ -131,37 +133,12 @@ pub struct Session {
 }
 impl Session {
     pub async fn connect(config: Config, mode: Mode) -> Result<Self> {
-        match config.profile.as_str() {
-            "minio" | "amazon-s3" => {}
-            _ => return Err(Error::Invalid("unsupported native backend profile")),
-        }
-        if !config.staging.is_absolute() {
-            return Err(Error::Invalid("native staging must be absolute"));
-        }
         opendal::install_default();
-        let operator = opendal::Operator::via_iter("s3", config.storage)
-            .map_err(|_| Error::State(ErrorKind::Storage, "invalid S3 operator configuration"))?;
-        let authority: Arc<dyn Authority> = if let Some(address) = config.service_address {
-            if !address.ip().is_loopback() {
-                return Err(Error::Invalid("native service transport requires loopback"));
-            }
-            Arc::new(
-                ServiceClient::connect(
-                    address,
-                    config
-                        .service_token
-                        .ok_or(Error::Invalid("service token is required"))?,
-                    operator,
-                )
-                .await?,
-            )
-        } else {
-            if config.service_token.is_some() {
-                return Err(Error::Invalid("service token without service address"));
-            }
-            Arc::new(Fs::open(operator).await?)
-        };
-        Self::open(authority, &config.staging, config.read_only, mode).await
+        let volume = native_volume_config(&config, mode)?;
+        let connection = StorageConnection::from_config(config.storage, config.service_token)?;
+        let (operator, token) = connection.into_parts();
+        let authority = Volume::connect(&volume, operator, token).await?;
+        Self::open(authority, &volume.staging, volume.read_only, mode).await
     }
     pub async fn open(
         authority: Arc<dyn Authority>,
@@ -472,6 +449,39 @@ impl Session {
         }
     }
 }
+
+fn native_volume_config(config: &Config, mode: Mode) -> Result<VolumeConfig> {
+    if !config.staging.is_absolute() {
+        return Err(Error::Invalid("native staging must be absolute"));
+    }
+    if config.service_address.is_none() && config.service_token.is_some() {
+        return Err(Error::Invalid("service token without service address"));
+    }
+    let storage_profile = match config.profile.as_str() {
+        "minio" => StorageProfile::Minio,
+        "amazon-s3" => StorageProfile::AmazonS3,
+        _ => return Err(Error::Invalid("unsupported native backend profile")),
+    };
+    Ok(VolumeConfig {
+        name: "native".to_owned(),
+        model: Model::Managed,
+        access: match mode {
+            Mode::Mount => Access::Mount,
+            Mode::Sync => Access::Sync,
+        },
+        frontend: Frontend::Library,
+        publication: if config.service_address.is_some() {
+            Publication::Service
+        } else {
+            Publication::Object
+        },
+        storage_profile,
+        staging: config.staging.clone(),
+        read_only: config.read_only,
+        service_address: config.service_address,
+    })
+}
+
 fn metadata(snapshot: &Snapshot, node: &Node) -> Value {
     let size = match node.kind() {
         NodeKind::File(content) => content.content_id().length(),
@@ -508,4 +518,72 @@ fn decode<const N: usize>(text: &str) -> Result<[u8; N]> {
 }
 fn node_id(text: &str) -> Result<NodeId> {
     Ok(NodeId::from_bytes(decode(text)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            storage: BTreeMap::new(),
+            profile: "minio".to_owned(),
+            staging: if cfg!(windows) {
+                PathBuf::from("C:\\staging")
+            } else {
+                PathBuf::from("/staging")
+            },
+            read_only: false,
+            service_address: None,
+            service_token: None,
+        }
+    }
+
+    #[test]
+    fn native_config_maps_to_the_shared_volume_contract() {
+        let mount = native_volume_config(&config(), Mode::Mount).unwrap();
+        assert_eq!(mount.model, Model::Managed);
+        assert_eq!(mount.access, Access::Mount);
+        assert_eq!(mount.frontend, Frontend::Library);
+        assert_eq!(mount.publication, Publication::Object);
+        assert_eq!(mount.storage_profile, StorageProfile::Minio);
+
+        let sync = native_volume_config(
+            &Config {
+                profile: "amazon-s3".to_owned(),
+                service_address: Some("127.0.0.1:7447".parse().unwrap()),
+                service_token: Some("native-service-token-with-32-bytes".to_owned()),
+                ..config()
+            },
+            Mode::Sync,
+        )
+        .unwrap();
+        assert_eq!(sync.access, Access::Sync);
+        assert_eq!(sync.publication, Publication::Service);
+        assert_eq!(sync.storage_profile, StorageProfile::AmazonS3);
+    }
+
+    #[test]
+    fn native_config_rejects_unadmitted_parts_before_storage() {
+        assert!(
+            native_volume_config(
+                &Config {
+                    staging: PathBuf::from("relative"),
+                    ..config()
+                },
+                Mode::Mount
+            )
+            .is_err()
+        );
+        assert!(
+            native_volume_config(
+                &Config {
+                    service_token: Some("native-service-token-with-32-bytes".to_owned()),
+                    ..config()
+                },
+                Mode::Mount
+            )
+            .is_err()
+        );
+    }
 }

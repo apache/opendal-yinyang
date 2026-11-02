@@ -1,6 +1,7 @@
 # File-operation runtime
 
-**Status: experimental Managed runtime; no OS frontend or bidirectional Sync.**
+**Status: experimental Managed library runtime; Linux FUSE and the shared Sync
+engine are separate layers.**
 
 `yinyang::runtime::Runtime` operates on an `Arc<dyn Authority>` and a local
 staging directory. Object and service publication share exactly the same handle

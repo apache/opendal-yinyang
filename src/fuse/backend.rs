@@ -36,11 +36,12 @@ pub(super) fn file_type(directory: bool) -> FileType {
 
 /// Errors whose Linux mapping is shared by every frontend path.
 #[derive(Debug)]
-pub(super) enum BackendError {
+pub enum BackendError {
     Runtime(crate::runtime::Error),
     NamespaceConflict,
     Core(yinyang_core::Error),
     Direct(crate::direct::Error),
+    Session(String),
     NotFound,
     NotDirectory,
     IsDirectory,
@@ -66,12 +67,39 @@ impl BackendError {
             Self::NamespaceConflict => fuser::Errno::EAGAIN,
             Self::Core(error) => core_errno(error.kind()),
             Self::Direct(error) => direct_errno(error.kind()),
+            Self::Session(_) => fuser::Errno::EIO,
             Self::NotFound => fuser::Errno::ENOENT,
             Self::NotDirectory => fuser::Errno::ENOTDIR,
             Self::IsDirectory => fuser::Errno::EISDIR,
             Self::Stale => fuser::Errno::ESTALE,
             Self::MutationIo => fuser::Errno::EIO,
             Self::MutationUnsupported => fuser::Errno::EOPNOTSUPP,
+        }
+    }
+
+    pub fn kind(&self) -> crate::runtime::ErrorKind {
+        match self {
+            Self::Runtime(error) => error.kind(),
+            Self::NamespaceConflict => crate::runtime::ErrorKind::Conflict,
+            Self::Core(error) => error.kind().into(),
+            Self::Direct(error) => match error.kind() {
+                crate::direct::ErrorKind::Invalid => crate::runtime::ErrorKind::Invalid,
+                crate::direct::ErrorKind::InvalidName => crate::runtime::ErrorKind::InvalidName,
+                crate::direct::ErrorKind::NotFound => crate::runtime::ErrorKind::NotFound,
+                crate::direct::ErrorKind::NotDirectory => crate::runtime::ErrorKind::NotDirectory,
+                crate::direct::ErrorKind::IsDirectory => crate::runtime::ErrorKind::IsDirectory,
+                crate::direct::ErrorKind::Stale => crate::runtime::ErrorKind::Conflict,
+                crate::direct::ErrorKind::Unsupported => crate::runtime::ErrorKind::Unsupported,
+                crate::direct::ErrorKind::Corrupt => crate::runtime::ErrorKind::Corrupt,
+                crate::direct::ErrorKind::Storage => crate::runtime::ErrorKind::Storage,
+            },
+            Self::Session(_) => crate::runtime::ErrorKind::Io,
+            Self::NotFound => crate::runtime::ErrorKind::NotFound,
+            Self::NotDirectory => crate::runtime::ErrorKind::NotDirectory,
+            Self::IsDirectory => crate::runtime::ErrorKind::IsDirectory,
+            Self::Stale => crate::runtime::ErrorKind::Conflict,
+            Self::MutationIo => crate::runtime::ErrorKind::Io,
+            Self::MutationUnsupported => crate::runtime::ErrorKind::Unsupported,
         }
     }
 }
@@ -83,6 +111,7 @@ impl fmt::Display for BackendError {
             Self::NamespaceConflict => formatter.write_str("namespace precondition conflict"),
             Self::Core(error) => error.fmt(formatter),
             Self::Direct(error) => error.fmt(formatter),
+            Self::Session(message) => formatter.write_str(message),
             Self::NotFound => formatter.write_str("entry is absent"),
             Self::NotDirectory => formatter.write_str("entry is not a directory"),
             Self::IsDirectory => formatter.write_str("entry is a directory"),

@@ -33,9 +33,11 @@ use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
 use yinyang::core::{Authority, CommitId, CommitOutcome, Fs, Planner};
 use yinyang::runtime::Runtime as YinYangRuntime;
-
-#[path = "../support/yy.rs"]
-mod yy;
+pub use yinyang_test_support::fixture::Publication;
+use yinyang_test_support::fixture::{require_storage_environment, storage_environment};
+use yinyang_test_support::process::read_all;
+pub use yinyang_test_support::process::{Captured, run_external, run_timeout};
+use yinyang_test_support::yy;
 
 /// The kernel filesystem type advertised by the YinYang FUSE adapter.
 pub const MOUNT_TYPE: &str = "fuse.yinyang";
@@ -49,106 +51,6 @@ pub fn require_fuse() {
     for tool in ["fusermount3", "timeout", "python3"] {
         if Command::new(tool).arg("--version").output().is_err() {
             panic!("required tool {tool} is not available for Linux FUSE acceptance");
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Captured {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-impl Captured {
-    pub fn success_or(&self, context: &str) {
-        assert!(
-            self.status.success(),
-            "{context} failed with {}:\nstdout:\n{}\nstderr:\n{}",
-            self.status,
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        );
-    }
-}
-
-pub fn run_timeout(mut cmd: Command, timeout: Duration) -> Captured {
-    let command_description = describe_command(&cmd);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to spawn command ({command_description}): {error}"));
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_thread = thread::spawn(move || read_all(stdout));
-    let stderr_thread = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let status = child.wait().expect("wait after kill");
-                    let stdout = stdout_thread.join().unwrap_or_default();
-                    let stderr = stderr_thread.join().unwrap_or_default();
-                    panic!(
-                        "command timed out after {timeout:?} with {status} ({command_description}):\nstdout:\n{}\nstderr:\n{}",
-                        String::from_utf8_lossy(&stdout),
-                        String::from_utf8_lossy(&stderr)
-                    );
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("failed to wait for command ({command_description}): {error}");
-            }
-        }
-    };
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
-    Captured {
-        status,
-        stdout,
-        stderr,
-    }
-}
-
-fn describe_command(command: &Command) -> String {
-    std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|value| format!("{value:?}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn run_external(program: &str, args: &[&str], timeout: Duration) -> Captured {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    run_timeout(cmd, timeout)
-}
-
-fn read_all(mut reader: impl Read) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
-    bytes
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Publication {
-    Object,
-    Service,
-}
-
-impl Publication {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Object => "object",
-            Self::Service => "service",
         }
     }
 }
@@ -192,6 +94,7 @@ pub struct RemoteObjectIdentity {
 impl Fixture {
     pub fn new(publication: Publication) -> Self {
         require_fuse();
+        require_storage_environment("minio", false, "Linux FUSE acceptance");
         let temp = tempfile::tempdir().expect("create temporary test directory");
         let root = format!(
             "fuse-{}-{}",
@@ -227,28 +130,11 @@ impl Fixture {
     }
 
     fn storage_env(&self) -> Vec<(&'static str, String)> {
-        let required = [
-            "YINYANG_S3_BUCKET",
-            "YINYANG_S3_ENDPOINT",
-            "YINYANG_S3_REGION",
-            "YINYANG_S3_ACCESS_KEY_ID",
-            "YINYANG_S3_SECRET_ACCESS_KEY",
-        ];
-        let mut env = Vec::new();
-        for name in required {
-            let value = std::env::var(name).unwrap_or_else(|_| {
-                panic!("set {name} before running Linux FUSE acceptance; missing configuration is a hard failure")
-            });
-            env.push((name, value));
-        }
-        env.push(("YINYANG_STORAGE_PROFILE", "minio".to_owned()));
-        env.push(("YINYANG_S3_ROOT", self.root.clone()));
-        env.push(("YINYANG_SERVICE_TOKEN", self.token.clone()));
-        env
+        storage_environment("minio", &self.root, &self.token, None, false)
     }
 
     pub fn yy_command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(yy::binary());
+        let mut cmd = Command::new(yy::binary(env!("CARGO_BIN_EXE_yy")));
         cmd.args(args);
         for (name, value) in self.storage_env() {
             cmd.env(name, value);

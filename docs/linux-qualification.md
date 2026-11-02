@@ -12,7 +12,8 @@ qualification.
 | `cargo x test` | host-independent test runners | Rust unit and integration tests; ignored native tests are compiled but not executed |
 | `cargo x test-linux-fuse` | Ubuntu, `/dev/fuse`, isolated Silo | Real `fuse.yinyang` mount, read-only range hydration, writable recovery, corruption, refresh, restart and lifecycle |
 | `cargo x test-linux-direct` | Ubuntu, `/dev/fuse`, Python 3, isolated Silo | Read-only and conditional-writable Direct Mount, Direct Sync, raw inventory/bytes, uncertainty and restart boundaries |
-| `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object Mount and finite Sync, loopback service Mount |
+| `cargo x test-managed-sync` | Ubuntu, isolated Silo | Real-process Managed Sync initial push/pull, conflicts, retained artifacts, restart and recovery |
+| `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object and loopback-service Mount and finite Sync |
 | `cargo x test-linux-recovery` | Ubuntu, isolated Silo, `sqlite3`, passwordless sudo | Consistent authority backup/restore, retained pending and unknown work, changed artifacts, and bounded-tmpfs disk exhaustion |
 | `.github/workflows/linux-trial.yml` | fresh Ubuntu 24.04 x86_64 runner, isolated Silo | Direct `yy` checksum/manifest/`--help`, actual archive checksum/inventory/identity, immutable install, quiesced activation, installed bytes/doctor and recovery |
 
@@ -88,24 +89,26 @@ real Amazon S3 child starts. The target provenance is read back from the
 installed release's `BUILD-MANIFEST`; the evidence records archive source,
 release and `yy` SHA-256 separately from the script checkout source.
 
-The explicit real-Amazon-S3 Direct record is
-[`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md). It qualifies only the
-two listed buckets, default us-east-2 endpoint, temporary role and sampled
-pagination/version behavior; it does not turn the loopback Silo suite into
-Amazon S3 evidence.
+The explicit real-Amazon-S3 Direct qualification covered only two task-owned
+buckets, the default us-east-2 endpoint, a temporary role, a 1,005-object
+recursive namespace across 28 LIST pages, and sampled version and conditional
+mutation behavior; it is recorded in the pull request that introduced it
+(#110). It does not turn the loopback Silo suite into Amazon S3 evidence.
 
 The source-pinned real-Amazon-S3 Direct entrypoint run remains the
 `f629ed207cce81f196b55915bdd1154a3269a79a` record with debug `yy` SHA-256
 `3dfe4c573b2d3311e07d4bf7c3be225a21d8541eec6fc7dc02262638ce06b9a0`.
-Its public boundary is recorded in
-[`linux-direct-amazon-s3.md`](linux-direct-amazon-s3.md). The final integrated
-source `17361970d1722ea3d60c5381bbb5323d11818184` did not repeat those Direct,
-backend, or range workloads.
+Its public boundary is the same two-bucket, default-endpoint, temporary-role
+qualification recorded in the pull request that introduced it (#110). The final
+integrated source `17361970d1722ea3d60c5381bbb5323d11818184` did not repeat
+those Direct, backend, or range workloads.
 
 Final integrated source `17361970d1722ea3d60c5381bbb5323d11818184` passed the
 repository gates, Rust 1.91 locked check, default release archive and the
-2700-second Managed operating envelope. Details, sampling gaps, limitations and
-public raw JSON are recorded in
+2700-second Managed operating envelope. The qualified bound was two
+1,350-second phases over 24 files of 256 KiB with four writers and two readers;
+it is recorded in the pull request that introduced it (#116). Details and
+limitations remain in
 [`linux-operating-envelope.md`](linux-operating-envelope.md).
 
 ## Matrix
@@ -135,20 +138,18 @@ responses and request-count checks cover the local fault path, but they are not
 conditional-DELETE provider certification. The source-pinned Amazon S3
 entrypoint evidence covers writable remount and finite Direct Sync at
 `f629ed2`, while the Amazon S3 primitive record covers read-only Direct and raw
-conditional requests. The accepted Core115 proof at `b630ef2` covers Managed
-FUSE 27 tests, operations 1, Managed Sync 12, recovery 4, and Direct 30 passed
-plus 8 filtered tests. Subsequent final-source changes were
-the doctor remediation text, documentation/specification text, harness
-procedure and Python test-loader registration; they did not change native
-contracts. Those Direct/backend/range workloads were not repeated at
-`1736197`. Other
+conditional requests. The earlier native proof at `b630ef2` covered Managed
+FUSE, operations, Managed Sync, recovery and Direct. Those Direct, backend and
+range workloads were not repeated at `1736197`. Other
 S3-compatible services remain outside the matrix unless they satisfy exact
 recursive LIST, conditional ETag mutation and the tested version/range
 behavior.
 
 Installation, lifecycle, health, recovery, and backup contracts are detailed in
 [`linux-operations.md`](linux-operations.md). Native mount behavior is detailed
-in [`linux-fuse.md`](../specs/linux-fuse.md). Matched range cost evidence is in
-[`linux-range-cost-results.md`](linux-range-cost-results.md). Bounded sustained
-operation, sampled resource growth and current limitations are recorded in
+in [`linux-fuse.md`](../specs/linux-fuse.md). The matched read-only range bound
+kept response payload at or below 0.077 MiB per cold 4 KiB read and 0.140 MiB
+for a boundary-crossing read on 8 MiB and 32 MiB files on one loopback-Silo
+host; it is recorded in the pull request that introduced it (#101). Bounded
+sustained operation and current limitations are documented in
 [`linux-operating-envelope.md`](linux-operating-envelope.md).

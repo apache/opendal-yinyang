@@ -94,20 +94,7 @@ impl std::error::Error for Error {}
 
 impl From<yinyang_core::Error> for Error {
     fn from(error: yinyang_core::Error) -> Self {
-        let kind = match error.kind() {
-            yinyang_core::ErrorKind::Invalid => ErrorKind::Invalid,
-            yinyang_core::ErrorKind::InvalidName => ErrorKind::InvalidName,
-            yinyang_core::ErrorKind::NotFound => ErrorKind::NotFound,
-            yinyang_core::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
-            yinyang_core::ErrorKind::NotDirectory => ErrorKind::NotDirectory,
-            yinyang_core::ErrorKind::IsDirectory => ErrorKind::IsDirectory,
-            yinyang_core::ErrorKind::NotEmpty => ErrorKind::NotEmpty,
-            yinyang_core::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-            yinyang_core::ErrorKind::Corrupt => ErrorKind::Corrupt,
-            yinyang_core::ErrorKind::Unsupported => ErrorKind::Unsupported,
-            yinyang_core::ErrorKind::Storage => ErrorKind::Storage,
-            yinyang_core::ErrorKind::Io => ErrorKind::Io,
-        };
+        let kind = error.kind().into();
         Self::new(kind, error.to_string())
     }
 }

@@ -36,6 +36,7 @@ yinyang = { path = "../.." }
 
 [dev-dependencies]
 tempfile = "3"
+yinyang-test-support = { path = "../test-support" }
 
 [lints]
 workspace = true
