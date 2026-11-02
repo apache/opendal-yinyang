@@ -18,7 +18,7 @@
 //! Durable direct-from-local-file content coordination for native adapters.
 
 use crate::intent;
-use crate::local::store;
+use crate::local::{lease, store};
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
@@ -27,6 +27,7 @@ use tokio::io::AsyncRead;
 use tokio::sync::Mutex;
 use yinyang_core::{Authority, CommitId, NodeId, Planner, Receipt, Revision, Transaction};
 
+const LEASE_FILE: &str = "sync.lock";
 const SCHEMA: &[store::TableColumns<'static>] = &[
     ("binding", &["singleton", "profile", "filesystem"]),
     (intent::TABLE, intent::COLUMNS),
@@ -81,6 +82,28 @@ pub(crate) async fn preflight_open(
     })
     .await
     .map_err(Error::local)?
+}
+
+/// Exclusive lease for one content Sync state profile.
+///
+/// Acquisition may create the configured directory and `sync.lock`, but it
+/// never creates, initializes, or recovers `sync.db`.
+pub(crate) struct StateLease {
+    _lease: lease::StateLease,
+}
+
+impl StateLease {
+    pub(crate) async fn acquire(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref().to_owned();
+        tokio::task::spawn_blocking(move || Self::acquire_sync(&directory))
+            .await
+            .map_err(Error::local)?
+    }
+
+    fn acquire_sync(directory: &Path) -> Result<Self> {
+        let lease = lease::StateLease::acquire(directory, LEASE_FILE).map_err(store_error)?;
+        Ok(Self { _lease: lease })
+    }
 }
 
 /// Content-addressed local intent, distinct from the frozen remote commit ID.
@@ -246,6 +269,7 @@ struct Inner {
     authority: Arc<dyn Authority>,
     journal: Arc<Mutex<Connection>>,
     gate: Mutex<()>,
+    _lease: StateLease,
 }
 
 /// Durable content publication from an exact local file.
@@ -270,6 +294,8 @@ impl Sync {
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(Error::local)?;
+        preflight_open(&directory, filesystem, false).await?;
+        let lease = StateLease::acquire(&directory).await?;
         preflight_open(&directory, filesystem, false).await?;
         let path = directory.join("sync.db");
         let journal = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -304,6 +330,7 @@ impl Sync {
                 authority,
                 journal: Arc::new(Mutex::new(journal)),
                 gate: Mutex::new(()),
+                _lease: lease,
             }),
         })
     }

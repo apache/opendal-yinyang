@@ -141,6 +141,23 @@ async fn remote_bytes(authority: &Arc<dyn Authority>, node: NodeId) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn content_sync_state_has_one_process_writer() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+
+    let sync = Sync::open(authority.clone(), &state).await.unwrap();
+    assert!(state.join("sync.lock").is_file());
+    let error = Sync::open(authority.clone(), &state).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Busy);
+
+    drop(sync);
+    Sync::open(authority, &state).await.unwrap();
+}
+
+#[tokio::test]
 async fn content_edits_are_conditional_and_conflicts_are_terminal() {
     let backend = TestBackend::default();
     let fs = Fs::create(backend.operator()).await.unwrap();

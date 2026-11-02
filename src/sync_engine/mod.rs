@@ -45,6 +45,7 @@ pub use evidence::{
     BackupInspection, BindingState, ConflictSideStatus, EngineArtifact, EngineConflict,
     EngineInspection, LocalScanState, StatusDocument,
 };
+pub(crate) use local::StateLease;
 pub use local::check_root_state;
 pub use managed::ManagedAdapter;
 pub use types::{ContentHash, Identity, LocalKind, LocalNode, LocalSnapshot, LocalStat};

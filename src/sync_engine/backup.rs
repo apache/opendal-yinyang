@@ -35,6 +35,12 @@ const MAGIC: [u8; 8] = *b"YYSYNC01";
 const VERSION: u8 = 1;
 const MANIFEST: &str = "manifest.bin";
 const DATABASES: [&str; 3] = ["sync-engine.db", "sync.db", "content/staging.db"];
+const PROCESS_LEASES: [&str; 4] = [
+    "sync-engine.lock",
+    "sync.lock",
+    "runtime.lock",
+    "content/runtime.lock",
+];
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 struct BackupManifest {
@@ -787,6 +793,7 @@ fn discover_support(state: &Path) -> Result<Vec<String>> {
                 || relative_text.starts_with("install/")
                 || relative_text.starts_with("artifacts/")
                 || DATABASES.contains(&relative_text)
+                || PROCESS_LEASES.contains(&relative_text)
                 || relative_text.ends_with("-wal")
                 || relative_text.ends_with("-shm")
             {
@@ -1007,5 +1014,25 @@ mod tests {
         manifest.save(&temp.path().join(MANIFEST)).unwrap();
         let error = BackupManifest::load(temp.path()).unwrap_err();
         assert!(error.to_string().contains("invalid path"));
+    }
+
+    #[test]
+    fn process_leases_are_not_backup_support_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("content")).unwrap();
+        for path in [
+            "sync-engine.lock",
+            "sync.lock",
+            "runtime.lock",
+            "content/runtime.lock",
+            "adapter.json",
+        ] {
+            fs::write(temp.path().join(path), b"test").unwrap();
+        }
+
+        assert_eq!(
+            discover_support(temp.path()).unwrap(),
+            vec!["adapter.json".to_owned()]
+        );
     }
 }

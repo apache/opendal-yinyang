@@ -87,11 +87,19 @@ and manifest there.
 
 ## Local profile
 
-The dedicated directory contains only `sync.db` with profile
-`yinyang-sync-4`. Its exact table set is `binding` and `intents`; the binding
-contains one filesystem identity. SQLite uses WAL with
+The dedicated directory contains `sync.db` with profile `yinyang-sync-4` and
+the process lease `sync.lock`. Its exact table set is `binding` and `intents`;
+the binding contains one filesystem identity. SQLite uses WAL with
 `synchronous=FULL`. Older, newer or unknown profiles and missing, extra or
 malformed tables/columns are rejected without repair or migration.
+
+One `Sync` instance owns `sync.lock` for its lifetime. A second process or
+instance fails with `Busy`; acquisition does not create or initialize
+`sync.db`. The writer preflights a present database read-only before creating
+the lease, then revalidates it after acquisition so state cannot change between
+the check and the locked open. Read-only inspection and restore validation do
+not acquire the lease. The lock file is ephemeral coordination state, not a
+logical intent and not backup data.
 
 Validation reads the profile and exact schema before journal-mode changes,
 DDL, recovery or dispatch. Read-only inspection may create an empty `-wal` and
