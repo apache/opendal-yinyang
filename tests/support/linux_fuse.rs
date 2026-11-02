@@ -856,6 +856,19 @@ impl Fixture {
     }
 
     pub fn mount(&self, config: &Path, mountpoint: &Path) -> Mounted {
+        self.spawn_mount(config, mountpoint, None)
+    }
+
+    pub fn mount_with_s3_endpoint(
+        &self,
+        config: &Path,
+        mountpoint: &Path,
+        endpoint: &str,
+    ) -> Mounted {
+        self.spawn_mount(config, mountpoint, Some(endpoint))
+    }
+
+    fn spawn_mount(&self, config: &Path, mountpoint: &Path, s3_endpoint: Option<&str>) -> Mounted {
         let staging = self
             .temp
             .path()
@@ -863,6 +876,9 @@ impl Fixture {
         let mountpoint = mountpoint.to_str().expect("UTF-8 mountpoint");
         let config = config.to_str().expect("UTF-8 config path");
         let mut cmd = self.yy_command(&["--volume", config, "mount", mountpoint]);
+        if let Some(endpoint) = s3_endpoint {
+            cmd.env("YINYANG_S3_ENDPOINT", endpoint);
+        }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap_or_else(|error| {
             panic!("failed to spawn `yy --volume {config} mount {mountpoint}`: {error}")

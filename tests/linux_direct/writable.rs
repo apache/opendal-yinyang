@@ -405,11 +405,7 @@ fn direct_write_create_is_conditional_and_never_clobbers_external_appearance() {
     let error = raced
         .sync_all()
         .expect_err("external object appearance must reject Direct creation");
-    assert_errno(
-        &error,
-        &[libc::EIO, libc::ESTALE],
-        "conditional Direct creation",
-    );
+    assert_errno(&error, &[libc::ESTALE], "conditional Direct creation");
     assert_eq!(
         fixture.raw_get("raced.txt").as_deref(),
         Some(external.as_slice()),
@@ -875,7 +871,7 @@ fn direct_write_external_replacement_conflict_retains_local_bytes_after_restart(
         .expect_err("external replacement must make Direct publication conflict");
     assert_errno(
         &error,
-        &[libc::EIO, libc::ESTALE],
+        &[libc::ESTALE],
         "Direct external replacement conflict",
     );
     assert_eq!(

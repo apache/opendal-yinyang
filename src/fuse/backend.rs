@@ -38,6 +38,7 @@ pub(super) fn file_type(directory: bool) -> FileType {
 #[derive(Debug)]
 pub enum BackendError {
     Runtime(crate::runtime::Error),
+    ContentConflict,
     NamespaceConflict,
     Core(yinyang_core::Error),
     Direct(crate::direct::Error),
@@ -51,6 +52,14 @@ pub enum BackendError {
 }
 
 impl BackendError {
+    pub(super) fn runtime_content_publication(error: crate::runtime::Error) -> Self {
+        if error.kind() == crate::runtime::ErrorKind::Conflict {
+            Self::ContentConflict
+        } else {
+            Self::Runtime(error)
+        }
+    }
+
     pub(super) fn runtime_namespace_mutation(error: crate::runtime::Error) -> Self {
         if error.kind() == crate::runtime::ErrorKind::Conflict {
             Self::NamespaceConflict
@@ -64,6 +73,7 @@ impl BackendError {
     pub(super) fn errno(&self) -> fuser::Errno {
         match self {
             Self::Runtime(error) => runtime_errno(error.kind()),
+            Self::ContentConflict => fuser::Errno::ESTALE,
             Self::NamespaceConflict => fuser::Errno::EAGAIN,
             Self::Core(error) => core_errno(error.kind()),
             Self::Direct(error) => direct_errno(error.kind()),
@@ -80,6 +90,7 @@ impl BackendError {
     pub fn kind(&self) -> crate::runtime::ErrorKind {
         match self {
             Self::Runtime(error) => error.kind(),
+            Self::ContentConflict => crate::runtime::ErrorKind::Conflict,
             Self::NamespaceConflict => crate::runtime::ErrorKind::Conflict,
             Self::Core(error) => error.kind().into(),
             Self::Direct(error) => match error.kind() {
@@ -108,6 +119,7 @@ impl fmt::Display for BackendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runtime(error) => error.fmt(formatter),
+            Self::ContentConflict => formatter.write_str("content publication conflict"),
             Self::NamespaceConflict => formatter.write_str("namespace precondition conflict"),
             Self::Core(error) => error.fmt(formatter),
             Self::Direct(error) => error.fmt(formatter),
@@ -363,5 +375,16 @@ mod tests {
             i32::from(BackendError::MutationUnsupported.errno()),
             libc::EOPNOTSUPP
         );
+    }
+
+    #[test]
+    fn content_publication_conflicts_use_estale() {
+        let managed = BackendError::runtime_content_publication(crate::runtime::Error::Conflict);
+        let direct = BackendError::ContentConflict;
+
+        assert_eq!(i32::from(managed.errno()), libc::ESTALE);
+        assert_eq!(i32::from(direct.errno()), libc::ESTALE);
+        assert_eq!(managed.kind(), crate::runtime::ErrorKind::Conflict);
+        assert_eq!(direct.kind(), crate::runtime::ErrorKind::Conflict);
     }
 }
