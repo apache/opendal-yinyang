@@ -3396,6 +3396,7 @@ mod tests {
         let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
         let mut recovered = runtime.recover(handle).await.unwrap();
         recovered.close().await.unwrap();
+        drop(recovered);
         drop(runtime);
         let report = expire_managed_retention(
             authority.as_ref(),
