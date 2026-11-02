@@ -150,7 +150,10 @@ async fn content_sync_state_has_one_process_writer() {
 
     let sync = Sync::open(authority.clone(), &state).await.unwrap();
     assert!(state.join("sync.lock").is_file());
-    let error = Sync::open(authority.clone(), &state).await.unwrap_err();
+    let error = match Sync::open(authority.clone(), &state).await {
+        Ok(_) => panic!("a second Sync writer opened the same state"),
+        Err(error) => error,
+    };
     assert_eq!(error.kind(), ErrorKind::Busy);
 
     drop(sync);
