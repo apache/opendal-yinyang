@@ -19,4 +19,5 @@
 
 #![allow(dead_code)]
 
+pub mod linux_fuse;
 pub mod linux_sync;
