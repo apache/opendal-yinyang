@@ -896,22 +896,26 @@ impl MetadataService {
         ensure_writer_healthy(&self.writer_poisoned)?;
         let transaction =
             SqliteTransaction::new(self.writer.clone(), gate, Arc::clone(&self.writer_poisoned));
-        let result = self.expire_inner(request).await;
-        if result.as_ref().is_err()
-            || result
-                .as_ref()
-                .is_ok_and(|outcome| matches!(outcome, Outcome::Unknown(_)))
-        {
-            transaction.rollback().await;
-        } else {
-            transaction.disarm();
-        }
+        let result = match self.expire_inner(request).await {
+            Ok((outcome, published)) => {
+                if published && !matches!(&outcome, Outcome::Unknown(_)) {
+                    transaction.disarm();
+                } else {
+                    transaction.rollback().await;
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                transaction.rollback().await;
+                Err(error)
+            }
+        };
         match result {
             Err(error) if error.kind() == ErrorKind::Storage => Ok(Outcome::Retryable),
             result => result,
         }
     }
-    async fn expire_inner(&self, request: &ExpiryRequest) -> Result<Outcome> {
+    async fn expire_inner(&self, request: &ExpiryRequest) -> Result<(Outcome, bool)> {
         db_call(&self.writer, |c| {
             c.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
             Ok(())
@@ -926,10 +930,10 @@ impl MetadataService {
                     "identity reused for a different request",
                 ));
             }
-            return Ok(Outcome::Committed(receipt));
+            return Ok((Outcome::Committed(receipt), false));
         }
         if old != request.expected_latest() {
-            return Ok(Outcome::Conflict);
+            return Ok((Outcome::Conflict, false));
         }
         for revision in request.candidates() {
             let candidate = *revision;
@@ -1029,9 +1033,9 @@ impl MetadataService {
         .await
         .is_err()
         {
-            return Ok(Outcome::Unknown(request.id()));
+            return Ok((Outcome::Unknown(request.id()), false));
         }
-        Ok(Outcome::Committed(receipt))
+        Ok((Outcome::Committed(receipt), true))
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
