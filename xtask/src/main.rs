@@ -59,7 +59,6 @@ impl Command {
             SubCommand::Macos(cmd) => cmd.run(),
             SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
-            SubCommand::TestCompatibility(cmd) => cmd.run(),
             SubCommand::TestLinuxDirect(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
             SubCommand::TestLinuxOperations(cmd) => cmd.run(),
@@ -86,10 +85,6 @@ enum SubCommand {
         about = "Run real Linux Managed Sync acceptance through yy and ordinary directories (requires isolated S3 settings)."
     )]
     TestManagedSync(CommandTestManagedSync),
-    #[clap(
-        about = "Run fd1338c cross-version object, service, staging, Sync, and journal acceptance (requires YY_LEGACY_BIN and isolated S3)."
-    )]
-    TestCompatibility(CommandTestCompatibility),
     #[clap(
         about = "Run deterministic Direct Mount and Sync acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
@@ -466,29 +461,6 @@ impl CommandTestManagedSync {
             "--test-threads=1",
         ]);
         run_command(cmd);
-    }
-}
-
-#[derive(Parser)]
-#[clap(name = "test-compatibility")]
-struct CommandTestCompatibility {}
-
-impl CommandTestCompatibility {
-    fn run(self) {
-        require_linux("cross-version compatibility acceptance");
-        require_isolated_storage("cross-version compatibility acceptance");
-        let legacy = std::env::var_os("YY_LEGACY_BIN").unwrap_or_else(|| {
-            panic!(
-                "YY_LEGACY_BIN is unset; cross-version acceptance must use the fd1338c producer binary"
-            )
-        });
-        if !std::path::Path::new(&legacy).is_file() {
-            panic!(
-                "YY_LEGACY_BIN does not name a file: {}",
-                std::path::Path::new(&legacy).display()
-            );
-        }
-        run_ignored_test("compatibility", Some("compatibility_"));
     }
 }
 

@@ -20,10 +20,14 @@ is introduced by this bridge.
 
 The native configuration explicitly selects an existing Managed S3 authority,
 Amazon S3 or MinIO profile, absolute staging path, read-only policy and optional
-authenticated loopback metadata service. It never creates or reformats remote
-storage. Credentials are supplied by the containing app; configuration and
-secrets must not be committed or printed. This experimental configuration does
-not silently admit a previously rejected `yy --volume` frontend combination.
+authenticated loopback metadata service. It maps to the same strict
+`VolumeConfig`, storage-operator constructor and authority connection used by
+the CLI: native Mount is Managed/library/Mount, native Sync is
+Managed/library/Sync, and the presence of `service_address` selects service
+publication. The bridge never creates or reformats remote storage. Credentials
+are supplied by the containing app; configuration and secrets must not be
+committed or printed. This mapping does not silently admit a previously rejected
+`yy --volume` frontend combination.
 
 Mount sessions expose shared reads/writes, truncation, remote fsync, clean
 refresh, release, namespace operations and atomic replace rename. Sync sessions

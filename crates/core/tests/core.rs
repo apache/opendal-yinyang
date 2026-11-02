@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod support;
 use std::sync::Arc;
 use support::*;
 use yinyang_core::{Authority, CommitId, ContentEdit, ErrorKind, NodeId};
+use yinyang_test_support as support;
 
 use yinyang_core::namespace::NodeKind as IndexedKind;
-use yinyang_core::object::{BackendProfile, ObjectFs, Outcome};
+use yinyang_core::object::{ObjectFs, Outcome};
 use yinyang_core::transaction::Planner;
 
 #[tokio::test]
@@ -346,9 +346,7 @@ async fn exact_published_overwrite_rejects_cross_binding_and_affected_corruption
 
     let range = BLOCK_BYTES as u64 - 3..BLOCK_BYTES as u64 + 5;
     let edits = [ContentEdit::new(range.clone(), b"selected").unwrap()];
-    let reopened = ObjectFs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = ObjectFs::open(backend.operator()).await.unwrap();
     backend.state.lock().unwrap().data_reads = 0;
     assert_eq!(
         reopened
@@ -424,13 +422,10 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
         parent
     );
     assert_eq!(
-        ObjectFs::open(
-            opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
-            BackendProfile::Minio
-        )
-        .await
-        .unwrap_err()
-        .kind(),
+        ObjectFs::open(opendal::Operator::new(opendal::services::Memory::default()).unwrap())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::Unsupported
     );
     let legacy = TestBackend::default();
@@ -442,7 +437,7 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
         },
     );
     assert_eq!(
-        ObjectFs::create(legacy.operator(), BackendProfile::Minio)
+        ObjectFs::create(legacy.operator())
             .await
             .unwrap_err()
             .kind(),
@@ -463,9 +458,7 @@ async fn s3_indexed_publication_and_reopen() {
         })
         .collect::<Vec<_>>();
     let operator = opendal::Operator::via_iter("s3", config).unwrap();
-    let fs = ObjectFs::create(operator.clone(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let fs = ObjectFs::create(operator.clone()).await.unwrap();
     let old = fs.observe_latest().await.unwrap();
     let bytes = vec![37; 12 * 1024 * 1024 + 17];
     let prepared = fs.data().prepare(&mut bytes.as_slice()).await.unwrap();
@@ -482,9 +475,7 @@ async fn s3_indexed_publication_and_reopen() {
         .unwrap();
     let request = plan.finish().unwrap();
     let receipt = committed(fs.commit(&request).await.unwrap());
-    let reopened = ObjectFs::open(operator, BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = ObjectFs::open(operator).await.unwrap();
     assert_eq!(committed(reopened.commit(&request).await.unwrap()), receipt);
     let file = reopened
         .observe_latest()
@@ -513,9 +504,7 @@ async fn s3_indexed_publication_and_reopen() {
 }
 
 async fn object_fs(backend: &TestBackend) -> ObjectFs {
-    ObjectFs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap()
+    ObjectFs::create(backend.operator()).await.unwrap()
 }
 fn committed(outcome: Outcome) -> yinyang_core::object::Receipt {
     match outcome {
@@ -766,9 +755,7 @@ async fn indexed_prepared_commit_does_not_read_data_and_reopen_retains_history()
             .iter()
             .any(|k| data_keys.contains(k))
     );
-    let reopened = ObjectFs::open(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let reopened = ObjectFs::open(backend.operator()).await.unwrap();
     let saved_revision = yinyang_core::Revision::from_bytes(old.revision().to_bytes());
     assert_eq!(
         reopened
@@ -976,7 +963,8 @@ async fn canonical_content_range_reads_and_incremental_overwrites() {
 async fn content_corruption_is_rejected_before_releasing_its_unit() {
     use yinyang_core::data::{BLOCK_BYTES, DataStore};
     let backend = TestBackend::default();
-    let store = DataStore::new(backend.operator(), NodeId::generate()).unwrap();
+    let id = NodeId::generate();
+    let store = DataStore::new(backend.operator(), id).unwrap();
     let bytes = vec![7; BLOCK_BYTES * 3];
     let file = store.prepare(&mut bytes.as_slice()).await.unwrap();
     let key = backend
@@ -1015,8 +1003,14 @@ async fn content_corruption_is_rejected_before_releasing_its_unit() {
         .await
         .unwrap();
     assert_eq!(output, vec![7]);
+    store.import(file.descriptor()).await.unwrap();
+    let restarted = DataStore::new(backend.operator(), id).unwrap();
     assert_eq!(
-        store.import(file.descriptor()).await.unwrap_err().kind(),
+        restarted
+            .import(file.descriptor())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::Corrupt
     );
 }

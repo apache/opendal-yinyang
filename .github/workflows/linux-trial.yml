@@ -33,13 +33,10 @@ on:
       - "specs/linux-trial-distribution.md"
       - "tests/linux_fuse/harness.rs"
       - "tests/linux_operations.rs"
-      - "tests/linux_prefix_upgrade.rs"
-      - "tests/linux_stage3_upgrade.rs"
       - "tests/linux_sync/harness.rs"
       - "tests/linux_trial_archive.sh"
       - "tests/linux_trial_distribution.sh"
       - "tests/support/**"
-      - "tests/fixtures/compatibility/546f419/**"
       - "tools/linux/**"
   workflow_dispatch:
 
@@ -60,7 +57,7 @@ env:
 
 jobs:
   trial:
-    name: Trial archive, install and upgrade
+    name: Trial archive and install
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -238,62 +235,6 @@ jobs:
           export YY_UPGRADE_BIN="$TRIAL_YY"
           cargo x test-linux-recovery \
             2>&1 | tee "$TRIAL_ROOT/evidence/recovery.log"
-
-      - name: Build pinned fd1338c producer
-        run: |
-          set -euo pipefail
-          legacy="$RUNNER_TEMP/opendal-yinyang-fd1338c"
-          git worktree add --detach "$legacy" fd1338c2f924a90e9da752b9158e748d1d3acaf4
-          test "$(git -C "$legacy" rev-parse HEAD)" = \
-            "fd1338c2f924a90e9da752b9158e748d1d3acaf4"
-          (
-            cd "$legacy"
-            cargo build --release --locked --bin yy
-          )
-          legacy_bin="$legacy/target/release/yy"
-          test -x "$legacy_bin"
-          sha256sum "$legacy_bin" |
-            tee "$TRIAL_ROOT/evidence/legacy-binary.sha256"
-          {
-            printf 'YY_LEGACY_BIN=%s\n' "$legacy_bin"
-            printf 'YINYANG_UPGRADE_LEGACY_SOURCE=%s\n' \
-              fd1338c2f924a90e9da752b9158e748d1d3acaf4
-            printf 'YINYANG_UPGRADE_LEGACY_REBUILD=1\n'
-          } >>"$GITHUB_ENV"
-
-      - name: Run installed-prefix upgrade with the archive target
-        run: |
-          set -euo pipefail
-          export YY_UPGRADE_BIN="$TRIAL_YY"
-          export YY_UPGRADE_RELEASE="$TRIAL_RELEASE"
-          export YINYANG_UPGRADE_SOURCE="$GITHUB_SHA"
-          export YINYANG_UPGRADE_EVIDENCE="$TRIAL_ROOT/evidence/upgrade.json"
-          cargo test \
-            -p yinyang \
-            --test linux_prefix_upgrade \
-            installed_prefix_upgrade_preserves_retained_work_and_service_wal \
-            -- \
-            --ignored \
-            --nocapture \
-            --test-threads=1 \
-            2>&1 | tee "$TRIAL_ROOT/evidence/upgrade.log"
-
-      - name: Run genuine stage-3 fixture upgrade with the archive target
-        run: |
-          set -euo pipefail
-          export YY_UPGRADE_BIN="$TRIAL_YY"
-          export YY_UPGRADE_RELEASE="$TRIAL_RELEASE"
-          export YINYANG_UPGRADE_SOURCE="$GITHUB_SHA"
-          export YINYANG_STAGE3_EVIDENCE="$TRIAL_ROOT/evidence/stage3-upgrade.json"
-          cargo test \
-            -p yinyang \
-            --test linux_stage3_upgrade \
-            installed_stage3_upgrade_preserves_sparse_segments_and_service_wal \
-            -- \
-            --ignored \
-            --nocapture \
-            --test-threads=1 \
-            2>&1 | tee "$TRIAL_ROOT/evidence/stage3-upgrade.log"
 
       - name: Upload directly downloadable yy
         uses: actions/upload-artifact@v4

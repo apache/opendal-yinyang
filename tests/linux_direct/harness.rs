@@ -783,11 +783,11 @@ pub fn local_paths(root: &Path) -> Vec<String> {
     paths
 }
 
-pub fn effective_capabilities(document: &[u8]) -> std::collections::BTreeSet<String> {
+pub fn admitted_capabilities(document: &[u8]) -> std::collections::BTreeSet<String> {
     let value: Value = serde_json::from_slice(document).expect("capabilities JSON");
-    value["effective"]
+    value["admitted"]
         .as_array()
-        .expect("effective capability array")
+        .expect("admitted capability array")
         .iter()
         .map(|value| value.as_str().expect("capability name").to_owned())
         .collect()

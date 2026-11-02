@@ -21,4 +21,4 @@ OpenDAL = "OpenDAL"
 WRONLY = "WRONLY"
 
 [files]
-extend-exclude = ["Cargo.lock", "docs/benchmarks/*.jsonl"]
+extend-exclude = ["Cargo.lock"]

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{future::Future, pin::Pin};
@@ -24,10 +22,11 @@ use support::TestBackend;
 use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
-    Authority, BackendProfile, CommitId, CommitOutcome, ContentEdit, DataStore, FileVersion, Fs,
-    NodeId, Planner, PreparedContent, Revision, Snapshot, Transaction,
+    Authority, CommitId, CommitOutcome, ContentEdit, DataStore, FileVersion, Fs, NodeId, Planner,
+    PreparedContent, Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{Error, ErrorKind, Runtime};
+use yinyang_test_support as support;
 
 #[derive(Default)]
 struct PrepareCalls {
@@ -759,9 +758,7 @@ async fn identity_access(runtime: &Runtime) {
     assert_eq!(retained.read(0, 20).await.unwrap(), b"original");
     retained.close().await.unwrap();
     assert!(runtime.open_node(root, false).await.is_err());
-    let foreign = Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let foreign = Fs::create(TestBackend::default().operator()).await.unwrap();
     let revision = foreign.observe_latest().await.unwrap().revision();
     assert!(runtime.open_node_at(revision, node, false).await.is_err());
 }
@@ -769,9 +766,7 @@ async fn identity_access(runtime: &Runtime) {
 async fn file_operations_share_object_and_service_contract() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let object = Fs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let object = Fs::create(backend.operator()).await.unwrap();
     exercise(
         Arc::new(object),
         &temp.path().join("object"),
@@ -804,11 +799,7 @@ async fn file_operations_share_object_and_service_contract() {
 async fn publication_reuses_only_its_matching_authenticated_base_snapshot() {
     let backend = TestBackend::default();
     let calls = Arc::new(PrepareCalls::default());
-    let inner: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let inner: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let authority: Arc<dyn Authority> = Arc::new(RecordingAuthority::new(inner, calls.clone()));
     let temp = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
@@ -863,11 +854,7 @@ async fn recovered_sparse_reads_authenticate_the_base_lazily() {
     const BLOCK: usize = 64 * 1024;
 
     let backend = TestBackend::default();
-    let inner: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let inner: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let fault = Arc::new(FailingRevisionAuthority::new(inner));
     let authority: Arc<dyn Authority> = fault.clone();
     let temp = tempfile::tempdir().unwrap();
@@ -927,11 +914,7 @@ async fn recovered_sparse_reads_authenticate_the_base_lazily() {
 async fn durable_staging_reopens_and_preserves_concurrent_generation_conflict() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     assert!(Runtime::open(authority.clone(), temp.path()).await.is_err());
     runtime.create_file(authority.root(), "file").await.unwrap();
@@ -1025,7 +1008,6 @@ async fn sparse_runtime(
             .unwrap()
     };
     assert_eq!(counts("bases"), 1);
-    assert_eq!(counts("chunks"), 0);
     assert_eq!(counts("segments"), 0);
     assert!(file.read(BASE_BYTES as u64, 64).await.unwrap().is_empty());
     assert!(
@@ -1192,11 +1174,7 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
     const BASE_BYTES: usize = 4 * 1024 * 1024;
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let inner: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let inner: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let calls = Arc::new(PrepareCalls::default());
     let authority: Arc<dyn Authority> = Arc::new(RecordingAuthority::new(inner, calls.clone()));
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
@@ -1399,11 +1377,7 @@ async fn sparse_length_changes_use_bounded_update_and_replay_frozen_requests() {
 async fn upload_failure_and_unknown_publication_keep_frozen_identity() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     runtime.create_file(authority.root(), "file").await.unwrap();
     let mut file = runtime.open_file("file", true).await.unwrap();
@@ -1450,11 +1424,7 @@ async fn upload_failure_and_unknown_publication_keep_frozen_identity() {
 async fn retryable_publication_replays_the_same_frozen_request() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     runtime.create_file(authority.root(), "file").await.unwrap();
     let mut file = runtime.open_file("file", true).await.unwrap();
@@ -1500,11 +1470,7 @@ async fn retryable_publication_replays_the_same_frozen_request() {
 async fn clean_handle_reports_unacknowledged_errors_on_close() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     runtime.create_file(authority.root(), "file").await.unwrap();
     let mut file = runtime.open_file("file", false).await.unwrap();
@@ -1519,11 +1485,7 @@ async fn clean_handle_reports_unacknowledged_errors_on_close() {
 async fn create_results_keep_the_committed_node_identity() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     let root = authority.root();
 
@@ -1592,11 +1554,7 @@ async fn create_results_keep_the_committed_node_identity() {
 async fn path_namespace_operations_use_snapshot_identity_and_kind() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     let root = authority.root();
     let (file, _) = runtime
@@ -1686,11 +1644,7 @@ async fn path_namespace_operations_use_snapshot_identity_and_kind() {
 async fn path_namespace_mutations_conflict_after_concurrent_move_and_replace() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let inner: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let inner: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let setup = Runtime::open(inner.clone(), temp.path().join("setup"))
         .await
         .unwrap();

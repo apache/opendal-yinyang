@@ -38,17 +38,17 @@ domain tags, integer widths, tree split, or descriptor/index fields requires a
 different profile identifier; existing identities are never reinterpreted
 through new tuning.
 
-The 65,536-byte verification unit enters those logical identities. The merged
-read-only FUSE range study
-[retains this identity](../docs/linux-range-cost-results.md): 4 KiB reads on
-8 MiB and 32 MiB files transferred at most 0.077 MiB of response payload and
-crossing one unit boundary transferred 0.133-0.140 MiB, rather than
-materializing the file. Repeated warm reads through one immutable version still
-issued 9-11 storage requests and took 7.4-9.2 ms p50, while the former
-full-staging path issued no requests and took 0.07-0.50 ms. That study observed
-the existing 64 KiB unit; it did not sweep alternative unit sizes or establish
-an optimum. Cache bounds, packing, and batching remain policy and do not change
-the profile when persisted bytes and logical identities are unchanged.
+The 65,536-byte verification unit enters those logical identities. One
+loopback-Silo qualification transferred at most 0.077 MiB of response payload
+for a cold 4 KiB read and 0.140 MiB when crossing one unit boundary on 8 MiB
+and 32 MiB files, rather than materializing the file. Repeated warm reads
+through one immutable version issued 9-11 storage requests and took 7.4-9.2 ms
+p50, while the former full-staging path issued no requests and took
+0.07-0.50 ms. The qualified bound is recorded in the pull request that
+introduced it (#101). That study observed the existing 64 KiB unit; it did not
+sweep alternative unit sizes or establish an optimum. Cache bounds, packing,
+and batching remain policy and do not change the profile when persisted bytes
+and logical identities are unchanged.
 
 Conformance vectors (lowercase hexadecimal):
 
@@ -120,12 +120,16 @@ least-recently-used eviction. Map and allocation overhead are additional.
 Clones and concurrent `FileVersion` readers of the same binding share this
 budget. The cache ends with the process and is never persisted. Eviction,
 restart, or a fresh logical version requires storage reads again.
-`DataStore::import`, content preparation, and fixed-offset updates intentionally
-remain uncached: cached read-serving evidence cannot promote untrusted
-descriptors to preparation authority or replace their independent storage
-verification. The backend immutable-write contract still applies; externally
-deleted or corrupted ranges may remain readable only when their previously
-verified bytes are still cached.
+`DataStore::import` uses a separate bounded verified-descriptor set of 65,536
+entries. Preparation, verified import, bounded overwrite, bounded update, and
+successful service registration record their descriptor only after the pack has
+been verified. A later import in the same process, including through a
+`DataStore` clone, returns preparation evidence without another storage read.
+The set is FIFO-bounded; eviction, restart, or a separately constructed
+`DataStore` requires one full verified import. Cached read-serving ranges do
+not populate this set. The backend immutable-write contract still applies;
+externally deleted or corrupted ranges may remain readable only when their
+previously verified bytes are still cached.
 
 ## Preparation authority
 
@@ -134,7 +138,8 @@ constructible or deserializable by callers: it binds the descriptor to a
 process-local `DataStore` authority shared by clones. A separately created data
 binding cannot produce handles accepted by that authority, even if given the
 same filesystem UUID. `import` verifies all units of an untrusted descriptor
-before issuing evidence. Metadata authorities must only recover published
+before issuing evidence unless that exact descriptor is already in the
+authority's verified set. Metadata authorities must only recover published
 evidence from authenticated records in their own publication lineage.
 
 The conservative OpenDAL binding streams and hashes each newly written pack,
@@ -208,8 +213,8 @@ implemented by this profile.
 
 ## Conformance
 
-[`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) contains
-independently encoded descriptors, proof nodes, ranges, and malformed/unknown
-records consumed directly by the core tests. The fixed hash vectors above and
-these stored vectors must both continue to pass. The complete reader/writer
-matrix and transition limits are defined by [Compatibility](compatibility.md).
+[`format`](../crates/core/tests/fixtures/format) contains independently encoded
+current content descriptor and pack vectors consumed directly by the core
+tests. The fixed hash vectors above and these stored vectors must both continue
+to pass. The reader/writer matrix and transition limits are defined by
+[Compatibility](compatibility.md).

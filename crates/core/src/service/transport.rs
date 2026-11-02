@@ -99,6 +99,15 @@ fn tag_kind(tag: u8) -> Result<ErrorKind> {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    #[test]
+    fn service_token_length_has_one_boundary() {
+        assert!(!super::super::valid_service_token(&"x".repeat(31)));
+        assert!(super::super::valid_service_token(&"x".repeat(32)));
+        assert!(super::super::valid_service_token(&"x".repeat(1024)));
+        assert!(!super::super::valid_service_token(&"x".repeat(1025)));
+    }
+
     #[test]
     fn domain_error_tags_round_trip_without_changing_existing_tags() {
         let kinds = [
@@ -165,7 +174,7 @@ async fn write_frame(stream: &mut TcpStream, value: &impl BorshSerialize) -> Res
     stream.flush().await.map_err(io)
 }
 fn validate_endpoint(addr: SocketAddr, token: &str) -> Result<()> {
-    if !addr.ip().is_loopback() || token.len() < 32 || token.len() > 1024 {
+    if !addr.ip().is_loopback() || !super::valid_service_token(token) {
         return Err(Error::unsupported(
             "metadata RPC",
             "requires loopback and a 32..=1024 byte authentication token",
@@ -518,10 +527,25 @@ impl ServiceClient {
         }
         Ok(RevisionPage { revisions, next })
     }
-    pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
-        let content = self.data.prepare(source).await?;
-        self.register(&content).await?;
-        Ok(content)
+    pub async fn prepare(
+        &self,
+        source: &mut (impl AsyncRead + Unpin + ?Sized),
+    ) -> Result<PreparedContent> {
+        let content = self.data.prepare_for_remote_verification(source).await?;
+        let descriptor = self.data.accept(&content)?;
+        match rpc(
+            self.addr,
+            &self.token,
+            Command::Register(descriptor.to_bytes()),
+        )
+        .await?
+        {
+            Response::Registered => {
+                self.data.record_verified(&descriptor);
+                self.data.published(descriptor)
+            }
+            _ => Err(protocol()),
+        }
     }
     pub async fn prepare_overwrite(
         &self,
@@ -560,6 +584,7 @@ impl ServiceClient {
         {
             return Err(protocol());
         }
+        self.data.record_verified(&descriptor);
         self.data.published(descriptor)
     }
     pub async fn prepare_update(
@@ -603,6 +628,7 @@ impl ServiceClient {
         {
             return Err(protocol());
         }
+        self.data.record_verified(&descriptor);
         self.data.published(descriptor)
     }
     pub async fn register(&self, content: &PreparedContent) -> Result<()> {

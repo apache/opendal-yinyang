@@ -21,7 +21,18 @@ use yinyang_core::CommitId;
 
 /// Classify errors without parsing diagnostic text. This is not an errno or
 /// platform status: adapters still choose their operation-specific mapping.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    BorshSerialize,
+    BorshDeserialize,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     Invalid,
     InvalidName,
@@ -44,8 +55,6 @@ pub enum ErrorKind {
     Storage,
     Io,
     NoSpace,
-    /// An older staging record retained only diagnostic text.
-    Unclassified,
 }
 
 /// A durable failure, including the original uncertain publication identity.
@@ -64,13 +73,6 @@ impl Failure {
     }
     pub fn commit_id(&self) -> Option<CommitId> {
         self.commit.map(CommitId::from_bytes)
-    }
-    pub(super) fn legacy(message: String) -> Self {
-        Self {
-            kind: ErrorKind::Unclassified,
-            message,
-            commit: None,
-        }
     }
     pub(crate) fn capture(error: &Error) -> Self {
         match error {
@@ -112,20 +114,7 @@ pub enum Error {
 impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
-            Self::Core(e) => match e.kind() {
-                yinyang_core::ErrorKind::Invalid => ErrorKind::Invalid,
-                yinyang_core::ErrorKind::InvalidName => ErrorKind::InvalidName,
-                yinyang_core::ErrorKind::NotFound => ErrorKind::NotFound,
-                yinyang_core::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
-                yinyang_core::ErrorKind::NotDirectory => ErrorKind::NotDirectory,
-                yinyang_core::ErrorKind::IsDirectory => ErrorKind::IsDirectory,
-                yinyang_core::ErrorKind::NotEmpty => ErrorKind::NotEmpty,
-                yinyang_core::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-                yinyang_core::ErrorKind::Corrupt => ErrorKind::Corrupt,
-                yinyang_core::ErrorKind::Unsupported => ErrorKind::Unsupported,
-                yinyang_core::ErrorKind::Storage => ErrorKind::Storage,
-                yinyang_core::ErrorKind::Io => ErrorKind::Io,
-            },
+            Self::Core(e) => e.kind().into(),
             Self::Local(e) | Self::Retained(e) => e.kind(),
             Self::Invalid(_) => ErrorKind::Invalid,
             Self::State(kind, _) => *kind,
@@ -150,6 +139,42 @@ impl Error {
             message: message.to_string(),
             commit: None,
         })
+    }
+}
+impl From<yinyang_core::ErrorKind> for ErrorKind {
+    fn from(kind: yinyang_core::ErrorKind) -> Self {
+        use yinyang_core::ErrorKind as Kind;
+        match kind {
+            Kind::Invalid => Self::Invalid,
+            Kind::InvalidName => Self::InvalidName,
+            Kind::NotFound => Self::NotFound,
+            Kind::AlreadyExists => Self::AlreadyExists,
+            Kind::NotDirectory => Self::NotDirectory,
+            Kind::IsDirectory => Self::IsDirectory,
+            Kind::NotEmpty => Self::NotEmpty,
+            Kind::PermissionDenied => Self::PermissionDenied,
+            Kind::Corrupt => Self::Corrupt,
+            Kind::Unsupported => Self::Unsupported,
+            Kind::Storage => Self::Storage,
+            Kind::Io => Self::Io,
+        }
+    }
+}
+impl From<crate::local::store::ErrorKind> for ErrorKind {
+    fn from(kind: crate::local::store::ErrorKind) -> Self {
+        use crate::local::store::ErrorKind as Kind;
+        match kind {
+            Kind::Invalid => Self::Invalid,
+            Kind::Unsupported => Self::Unsupported,
+            Kind::Corrupt => Self::Corrupt,
+            Kind::Busy => Self::Busy,
+            Kind::AlreadyExists => Self::AlreadyExists,
+            Kind::NotFound => Self::NotFound,
+            Kind::ReadOnly => Self::ReadOnly,
+            Kind::PermissionDenied => Self::PermissionDenied,
+            Kind::NoSpace => Self::NoSpace,
+            Kind::Io => Self::Io,
+        }
     }
 }
 impl std::fmt::Display for Error {
@@ -185,3 +210,26 @@ impl From<yinyang_core::Error> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_and_store_kinds_have_one_runtime_mapping() {
+        let core = yinyang_core::Error::new(
+            yinyang_core::ErrorKind::PermissionDenied,
+            "test",
+            "permission denied",
+        );
+        assert_eq!(Error::from(core).kind(), ErrorKind::PermissionDenied);
+        assert_eq!(
+            ErrorKind::from(crate::local::store::ErrorKind::Busy),
+            ErrorKind::Busy
+        );
+        assert_eq!(
+            ErrorKind::from(crate::local::store::ErrorKind::NoSpace),
+            ErrorKind::NoSpace
+        );
+    }
+}

@@ -124,17 +124,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build fd1338c legacy binary
-        run: |
-          legacy="$RUNNER_TEMP/opendal-yinyang-fd1338c"
-          git worktree add --detach "$legacy" fd1338c2f924a90e9da752b9158e748d1d3acaf4
-          test "$(git -C "$legacy" rev-parse HEAD)" = "fd1338c2f924a90e9da752b9158e748d1d3acaf4"
-          cargo build --release --locked --bin yy \
-            --manifest-path "$legacy/Cargo.toml" \
-            --target-dir "$legacy/target"
-          sha256sum "$legacy/target/release/yy"
-          echo "YY_LEGACY_BIN=$legacy/target/release/yy" >> "$GITHUB_ENV"
-
       - name: Install recovery tools
         run: |
           sudo apt-get update
@@ -160,9 +149,6 @@ jobs:
             --skip isolated_s3_cli_smoke \
             --skip real_amazon_s3_cli_smoke \
             --skip direct_amazon_s3_
-
-      - name: Run fd1338c cross-version acceptance
-        run: cargo x test-compatibility
 
       - name: Run isolated recovery acceptance
         run: cargo x test-linux-recovery

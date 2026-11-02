@@ -63,7 +63,7 @@ fn sync_status_at(fixture: &Fixture, config: &Path, endpoint: Option<&str>) -> V
     let output = run_sync_command(fixture, config, endpoint, &["status", "--json"]);
     output.success_or("Direct Sync status");
     let status: Value = serde_json::from_slice(&output.stdout).expect("Direct Sync status JSON");
-    assert_eq!(status["schema"], "yinyang.direct-sync.status.v1");
+    assert_eq!(status["schema"], "yinyang.sync.status.v1");
     status
 }
 
@@ -107,6 +107,7 @@ fn assert_in_sync(status: &Value) {
     assert_eq!(status["summary"]["conflicts"], 0, "{status:#}");
     assert_eq!(status["summary"]["failed"], 0, "{status:#}");
     assert_eq!(status["remote"]["availability"], "available", "{status:#}");
+    assert!(status["remote"]["revision"].is_null(), "{status:#}");
 }
 
 #[test]
@@ -172,6 +173,70 @@ fn direct_sync_finite_reconciliation_tracks_both_authorities() {
             .all(|key| !key.starts_with(".yinyang/")),
         "Direct Sync created Managed metadata"
     );
+}
+
+#[test]
+#[ignore = "requires isolated S3; run with cargo x test-linux-direct"]
+fn direct_sync_backup_restore_round_trip() {
+    let fixture = Fixture::new();
+    let state = fixture.path("direct-sync-backup-source-state");
+    let config = sync_config(&fixture, "direct-sync-backup-source", &state);
+    let local = fixture.path("direct-sync-backup-source-local");
+    fs::create_dir(&local).expect("create Direct Sync backup source root");
+    fs::write(local.join("before.txt"), b"before").expect("write Direct Sync backup source");
+    fixture
+        .yy_ok(&[
+            "--volume",
+            path_text(&config),
+            "sync",
+            "init",
+            "--directory",
+            path_text(&local),
+        ])
+        .success_or("Direct Sync backup source init");
+    sync_run(&fixture, &config);
+    assert_in_sync(&sync_status(&fixture, &config));
+
+    let backup = fixture.path("direct-sync-backup-package");
+    fixture
+        .yy_ok(&[
+            "--volume",
+            path_text(&config),
+            "sync",
+            "backup",
+            "--output",
+            path_text(&backup),
+        ])
+        .success_or("Direct Sync backup");
+
+    fixture.write_raw("after.txt", b"after");
+    let restored_state = fixture.path("direct-sync-backup-restored-state");
+    let restored_config = sync_config(&fixture, "direct-sync-backup-restored", &restored_state);
+    let restored = fixture.path("direct-sync-backup-restored-local");
+    fixture
+        .yy_ok(&[
+            "--volume",
+            path_text(&restored_config),
+            "sync",
+            "restore",
+            "--backup",
+            path_text(&backup),
+            "--directory",
+            path_text(&restored),
+        ])
+        .success_or("Direct Sync restore");
+    assert_eq!(
+        fs::read(restored.join("before.txt")).expect("read restored Direct Sync file"),
+        b"before"
+    );
+    assert!(!restored.join("after.txt").exists());
+
+    sync_run(&fixture, &restored_config);
+    assert_eq!(
+        fs::read(restored.join("after.txt")).expect("read reconciled restored Direct Sync file"),
+        b"after"
+    );
+    assert_in_sync(&sync_status(&fixture, &restored_config));
 }
 
 #[test]
@@ -388,7 +453,7 @@ fn direct_sync_doctor_rejects_unrepresentable_state_without_effects() {
             .is_some_and(|detail| detail.contains("group or other")),
         "{private_value:#}"
     );
-    assert!(!private_state.join("direct-sync.db").exists());
+    assert!(!private_state.join("sync-engine.db").exists());
 
     let marker_fixture = Fixture::new();
     let marker_state = marker_fixture.path("direct-sync-doctor-marker-state");
@@ -412,7 +477,7 @@ fn direct_sync_doctor_rejects_unrepresentable_state_without_effects() {
             .is_some_and(|detail| detail.contains("empty directory markers")),
         "{marker_value:#}"
     );
-    assert!(!marker_state.join("direct-sync.db").exists());
+    assert!(!marker_state.join("sync-engine.db").exists());
     assert_eq!(
         marker_fixture.raw_get("empty/").as_deref(),
         Some(b"".as_slice())
@@ -474,7 +539,7 @@ fn direct_sync_empty_directories_and_kind_changes_are_never_silently_ignored() {
             "Direct Sync empty-directory rejection was not explicit:\n{}",
             init.text()
         );
-        assert!(!state.join("direct-sync.db").exists());
+        assert!(!state.join("sync-engine.db").exists());
         assert_eq!(fixture.raw_get("local-empty/"), None);
         assert!(local.join("local-empty").is_dir());
     } else {
@@ -515,7 +580,7 @@ fn direct_sync_empty_directories_and_kind_changes_are_never_silently_ignored() {
             "Direct Sync remote-marker rejection was not explicit:\n{}",
             marker_init.text()
         );
-        assert!(!marker_state.join("direct-sync.db").exists());
+        assert!(!marker_state.join("sync-engine.db").exists());
         assert!(!marker_local.join("remote-empty").exists());
     } else {
         sync_run(&marker_fixture, &marker_config);
@@ -693,7 +758,7 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
     assert_eq!(status["summary"]["unknown"], 1, "{status:#}");
     let unknown = entry(&status, "uncertain.txt");
     assert_eq!(unknown["state"], "unknown", "{status:#}");
-    let work = unknown["work"]["id"]
+    let work = unknown["intent"]["id"]
         .as_str()
         .expect("Direct Sync Unknown work id");
     assert_eq!(
@@ -715,7 +780,9 @@ fn exercise_uncertain_sync(action: CommitAction, delivered: bool) {
         .as_array()
         .expect("Direct Sync artifacts")
         .iter()
-        .filter(|artifact| artifact["kind"] == "upload" && artifact["origin"] == "uncertain.txt")
+        .filter(|artifact| {
+            artifact["kind"] == "upload-retained" && artifact["origin"] == "uncertain.txt"
+        })
         .collect::<Vec<_>>();
     assert!(
         !artifacts.is_empty(),

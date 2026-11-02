@@ -383,7 +383,6 @@ class Trial:
             "storage_profile": "amazon-s3",
             "staging": str(self.state),
             "read_only": False,
-            "require": [],
         }
         descriptor = os.open(
             self.config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
@@ -505,7 +504,7 @@ class Trial:
             ["--volume", str(self.config), "space", "report", "--json"]
         )
         document = json.loads(completed.stdout)
-        if document.get("schema") != "yinyang.managed-space.report.v3":
+        if document.get("schema") != "yinyang.managed-space.report.v4":
             raise EnvelopeError(
                 f"unexpected managed-space report schema: {document.get('schema')}"
             )

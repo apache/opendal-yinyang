@@ -1,140 +1,103 @@
-# Linux ordinary-directory Managed Sync
+# Managed directory reconciliation
 
-**Status: experimental finite reconciliation on top of the durable Sync intents.**
+**Status: experimental.**
 
-`yinyang::replica::DirectorySync` reconciles one local ordinary directory with
-one Managed remote root. It owns the common baseline, local installation and
-conflict records; durable conditional publication belongs to
-[`yinyang::sync::Sync`](sync-runtime.md). It is Linux-only and performs explicit
-finite reconciliation runs; no watcher or daemon is implied.
+Managed ordinary-directory synchronization is one `SyncEngine` profile from
+[linux-sync.md](linux-sync.md). The engine supplies the local scan, common
+baseline, reconciliation, artifact lifecycle, local installation journal,
+conflicts, status and backup. This specification defines only the Managed
+adapter contract.
 
-## Common baseline
+## Remote identity
 
-The baseline records the last agreed state, one entry per synchronized path
-(excluding the root, which is the binding anchor):
+Managed remote entries have a stable 16-byte `NodeId`. The accepted baseline
+records that node, its kind, executable bit, content identity and the exact
+revision that accepted it. A later observation at the same path does not
+replace the accepted revision.
 
-- the accepted remote `NodeId`, kind, executable bit and content digest;
-- the accepted remote revision for that entry, used as the staging predicate
-  and as status evidence, never a freshly observed latest revision;
-- the accepted local fingerprint (kind, length, content digest, executable bit)
-  together with its inode and parent identity, captured when the entry was
-  accepted.
+The engine's local side of a baseline is the content accepted by a receipt. It
+is never copied from the live local file after a response arrives. If a local
+edit is newer than the accepted publication, it remains pending. If a retained
+or live local side no longer equals the baseline local digest, the path is not
+`in_sync`.
 
-The baseline exists only after admission and is stored in the replica database.
-Status never reports `in_sync` for a binding without an accepted common
-baseline.
+Managed content identity is verified by the core content descriptor. A download
+writes into the engine-owned fd and verifies the expected content before the
+engine installs it. Publication reuses the exact prepared request rather than
+materializing fresh bytes at publish time.
 
-Profile `yinyang-directory-replica-1` binds the state to one filesystem. Its
-required tables and positionally inserted columns have exact signatures. The
-historically additive columns remain supported upgrade inputs:
+## Observation
 
-- `baseline.remote_revision`;
-- `work.seq`, `work.conflict`, `work.source_artifact`, `work.local_dev`,
-  `work.local_ino`, `work.local_parent_dev`, `work.local_parent_ino`, and
-  `work.commit_id`;
-- the historical absence of the `work` table before managed reconciliation was
-  introduced.
+The adapter supports the `delta` capability. A successful observation returns
+`ChangeRecord` values:
 
-`baseline` and `work` queries name their columns, so those two tables accept
-their historical column order. Every missing required base column or unknown
-column is corruption. A writer validates the complete known shape, then adds all
-known missing columns in one SQLite transaction using the historical upgrade
-order; an unbound table set may be initialized with the profile inserted by
-`sync init`. Read-only inspection accepts the known old shapes and synthesizes
-neutral values for absent historical columns without changing the authoritative
-database or existing WAL/journal bytes. SQLite may create an empty `-wal` and
-may create or update derived `-shm`; existing WAL/journal bytes remain
-protected.
+```text
+ChangeRecord {
+    receipt,
+    changes: [
+        Change {
+            before: Option<Node>,
+            after: Option<Node>,
+        },
+    ],
+}
+```
 
-## Admission
+Changes are keyed by NodeId, not path. The engine applies them to the accepted
+entry map and recomputes affected paths from stable node identity. A rename
+whose new path has descendants re-walks only the new subtree from the returned
+snapshot. A cursor that is no longer retained, a truncated page, or an adapter
+that cannot supply a delta triggers exactly one full walk.
 
-An unbound state directory admits exactly one empty side. Recreation validates
-this before writing any baseline, then persists a root-only common baseline and
-hands the run to the same per-entry reconciler used by every later run. Two
-non-empty sides are an explicit conflict, not an implicit merge.
+The cursor is persisted only in `baseline_meta.cursor`. No baseline, work or
+binding row duplicates it.
 
-## Durable work association
+## Publication
 
-Before a staged edit is dispatched, the directory layer persists an association
-keyed by the edit identity: the current path, original and desired path, the
-operation, the accepted local fingerprint and identity, the baseline node and
-revision, any known original commit identity, the linked conflict, and the
-retained input artifact. Retry publishes only associated work and never
-resurrects orphaned staging.
+Managed reports `directories`, `executable`, `rename`, `batch`, `delta` and
+`receipt_lookup`. `max_batch` is 4096 independent requests. The engine submits
+one batch per directory depth for independent creates. Every batch member keeps
+its own frozen request, CommitId, receipt and typed outcome.
 
-Receipt application is ordered so an interrupted run is recoverable: the common
-baseline (and any linked-conflict clearance) is applied from the returned
-revision before the association is marked complete. Publication is idempotent,
-so re-running the exact request after a crash resolves to the same commit.
+The Managed adapter plans every namespace request internally against its
+supplied baseline. It persists the resulting `Transaction` as the frozen
+adapter request and cannot replace the common engine baseline or acknowledge
+bytes different from the accepted input. Content edits prepare the local file
+once and carry the resulting descriptor in the same per-pass batch.
 
-## Reconciliation
+Managed reports `Applied`, `Conflict`, `Unknown`, `Retryable` or `Unsupported`
+for each request. A receipt identifies the exact request identity and accepted
+revision and is not inferred from a later head observation.
 
-Each run scans the local tree, observes the remote, and performs a three-way
-comparison of baseline, local and remote per entry, ordering parents before
-children for creation and children before parents for removal. Renames are
-detected by identity and applied as one per-root move with each descendant's
-accepted fingerprint relocated, so a namespace receipt never acknowledges a
-concurrent content edit.
+## Change and outcome handling
 
-A namespace operation stages against the path's own accepted revision.
-Only paths whose parent directory entry list this run already changed advance to
-the running revision, so a child removal permits its parent's later removal
-without rebasing unrelated paths onto a newer global revision and hiding an
-external edit.
+Before dispatch, the engine commits the request as `Unknown`. Managed reports
+`receipt_lookup`, so a retry first asks for the original receipt. Receipt lookup
+by an exact request identity may accept that request without a second
+publication. The accepted local side is the request input. A newer live local
+file remains pending and is never folded into the completed baseline.
 
-A remote deletion of a directory is quarantined as one unit; when any local
-descendant diverges from the common baseline the directory is retained and the
-unchanged retained entries are recorded as explicit conflicts instead of being
-removed.
+A local install is one engine-owned operation. Managed provides a callback that
+writes the verified remote content into the supplied borrowed fd. The engine
+owns the temporary file, race rechecks, durable `installs` row, rename or
+exchange, baseline transition and artifact release.
 
-## Conflicts and resolution
+## Conflict resolution
 
-A conflict has a stable 32-hex identity derived from stable evidence (paths,
-observable sides, baseline and remote node). Detecting the same unresolved
-evidence again refreshes that record rather than inserting a duplicate, and
-reuses the first retained backup. A side is classified by presence
-(`current_file`, `current_directory`, `deleted`, `retained_artifact`,
-`unknown`). `retained_artifact` is reserved for a version that exists only in
-retained state, such as a displaced inode written after an atomic exchange; an
-ordinary content divergence is `current_file` on both sides even when a backup
-copy is preserved separately.
+Managed conflict material follows [linux-sync.md](linux-sync.md). `--keep
+remote` materializes the recorded node/revision without issuing a publication.
+`--keep local` and `--content PATH` create a new request against a newly
+observed baseline. The selected local bytes are frozen before dispatch and
+remain the accepted local side after success.
 
-Resolution is durable and choice-specific. `KeepLocal` and explicit `Content`
-retain the chosen input as an artifact and stage a durable conditional request
-against the recorded predicate; the conflict clears only after the receipt
-commits, and a stale predicate produces a new conflict rather than overwriting
-the remote. When the chosen state already matches, that request may be a no-op
-and the conflict clears without a remote mutation. `KeepRemote` issues no new
-remote request: it materializes or quarantines the local path from the recorded
-remote evidence (the recorded node version or deletion), applies the resulting
-baseline, and clears the conflict once the local result is durable.
+## State and backup
 
-## Read-only inspection
+Managed uses `yinyang-sync-engine-2` and the shared tables documented in
+[linux-sync.md](linux-sync.md). The engine `intents` table is the only durable
+Managed namespace/content intent log; the content-only `yinyang::sync::Sync`
+profile is used only by the in-process native content bridge.
 
-`DirectorySync::inspect` (and `inspect_local` when no authority can be
-constructed) reports the binding, a full local scan classified against the
-baseline, live remote availability, per-entry local/remote/baseline evidence,
-per-entry intent state (including a preserved original commit identity) and
-outcome, active conflicts and retained artifacts. It acquires no writer lease,
-runs no recovery and performs no writes, so it remains usable while a writer
-runs and while the remote is unreachable. The adapter owns the versioned JSON
-projection; the library exposes only domain evidence.
-
-## Export
-
-Retained artifacts export their current bytes, including writes that landed
-after the exchange. A conflict side exports its retained artifact or live local
-bytes (`local`) or the recorded remote node version (`remote`). Directory
-artifacts expose their retained path; byte-stream export of a directory is
-unsupported.
-
-## Backup and isolated restore
-
-`DirectorySync::backup` captures a quiesced package containing the local root,
-`replica.db`, `sync.db`, content staging, retained artifacts, and a
-checksum-protected manifest. `DirectorySync::restore` validates the package
-before creating destination trees, copies it to absent root/state paths, and
-maps the original root/quarantine identities to their copied identities. Work
-records, accepted fingerprints, CommitIds, and historical artifact digests
-remain unchanged. Incomplete installs are rejected rather than reinterpreted.
-See [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
+Object-mode Managed backup contains `sync-engine.db`, the bound root, retained
+artifacts and the package manifest. Restore validates the package, rebinds local
+identities and preserves engine intents, baselines and artifact content
+evidence.

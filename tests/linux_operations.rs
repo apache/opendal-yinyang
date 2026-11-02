@@ -30,9 +30,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::Value;
-
-#[path = "support/yy.rs"]
-mod yy;
+use yinyang_test_support::yy;
 
 const SERVICE_TOKEN: &str = "yinyang-operations-test-token-0000000000000000";
 
@@ -282,7 +280,7 @@ fn isolated_user_service_lifecycle() {
 
     units.stop(&units.serve);
     assert!(state.join("metadata/metadata.db").exists());
-    assert!(state.join("service-sync/sync.db").exists());
+    assert!(state.join("service-sync/sync-engine.db").exists());
 
     let mount_config = write_config(&configs, "object", "mount", "fuse", "object", None);
     rewrite_staging(&mount_config, &state.join("object"));
@@ -352,13 +350,13 @@ fn isolated_user_service_lifecycle() {
     units.restart(&units.sync_instance("sync"));
     units.wait_active(&units.sync_instance("sync"));
     units.stop(&units.sync_instance("sync"));
-    assert!(state.join("sync/sync.db").exists());
+    assert!(state.join("sync/sync-engine.db").exists());
 
     drop(units);
     fs::remove_dir_all(&install.prefix).unwrap();
     assert!(state.join("metadata/metadata.db").exists());
     assert!(state.join("object/staging.db").exists());
-    assert!(state.join("sync/sync.db").exists());
+    assert!(state.join("sync/sync-engine.db").exists());
 }
 
 fn cli_smoke() {
@@ -500,7 +498,7 @@ fn cli_smoke_with(storage: Storage) {
         "sync run exit 0 alone is not convergence: {status:#}"
     );
     assert!(
-        state.join("sync/sync.db").exists(),
+        state.join("sync/sync-engine.db").exists(),
         "finite sync did not retain durable state"
     );
 
@@ -698,15 +696,15 @@ fn cli_smoke_with(storage: Storage) {
         "metadata service stop discarded its authority database"
     );
     assert!(state.join("service/staging.db").exists());
-    assert!(state.join("service-sync/sync.db").exists());
+    assert!(state.join("service-sync/sync-engine.db").exists());
 
     fs::remove_dir_all(&install.prefix).unwrap();
     assert!(local.join("hello.txt").exists());
     assert!(state.join("object/staging.db").exists());
-    assert!(state.join("sync/sync.db").exists());
+    assert!(state.join("sync/sync-engine.db").exists());
     assert!(service_database.exists());
     assert!(state.join("service/staging.db").exists());
-    assert!(state.join("service-sync/sync.db").exists());
+    assert!(state.join("service-sync/sync-engine.db").exists());
     assert!(object_config.exists());
     assert!(sync_config.exists());
     assert!(service_config.exists());
@@ -724,7 +722,7 @@ fn require_fuse() {
 }
 
 fn clean_yy(args: &[&str]) -> Command {
-    let mut command = Command::new(yy::binary());
+    let mut command = Command::new(yy::binary(env!("CARGO_BIN_EXE_yy")));
     command.args(args);
     remove_yinyang_environment(&mut command);
     command
@@ -787,7 +785,6 @@ fn write_config_with_profile(
         "storage_profile": profile,
         "staging": directory.join(format!("{name}-state")),
         "read_only": false,
-        "require": [],
     });
     if let Some(address) = service_address {
         value["service_address"] = address.into();
@@ -813,7 +810,7 @@ impl Install {
         let bin = prefix.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let yy = bin.join("yy");
-        fs::copy(yy::binary(), &yy).unwrap();
+        fs::copy(yy::binary(env!("CARGO_BIN_EXE_yy")), &yy).unwrap();
         let mut permissions = fs::metadata(&yy).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&yy, permissions).unwrap();

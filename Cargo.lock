@@ -2670,7 +2670,6 @@ dependencies = [
  "clap",
  "fuser",
  "futures-util",
- "hmac",
  "libc",
  "metrics",
  "nix",
@@ -2684,6 +2683,7 @@ dependencies = [
  "tokio",
  "uuid",
  "yinyang-core",
+ "yinyang-test-support",
 ]
 
 [[package]]
@@ -2700,6 +2700,7 @@ dependencies = [
  "unicode-casefold",
  "unicode-normalization",
  "uuid",
+ "yinyang-test-support",
 ]
 
 [[package]]
@@ -2713,6 +2714,18 @@ dependencies = [
  "tokio",
  "uuid",
  "yinyang",
+ "yinyang-test-support",
+]
+
+[[package]]
+name = "yinyang-test-support"
+version = "0.0.24"
+dependencies = [
+ "blake3",
+ "hmac",
+ "opendal",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

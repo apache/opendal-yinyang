@@ -24,39 +24,44 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
 use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
 
+enum NodeState {
+    Writable(Mutex<FileHandle>),
+    ReadOnly(FileVersion),
+}
 struct Node {
-    handle: Mutex<FileHandle>,
+    state: NodeState,
     references: AtomicUsize,
 }
-#[derive(Debug)]
-struct ReadOnlyNode {
-    version: FileVersion,
-    references: AtomicUsize,
+impl Node {
+    fn writable_handle(&self) -> Result<&Mutex<FileHandle>> {
+        match &self.state {
+            NodeState::Writable(handle) => Ok(handle),
+            NodeState::ReadOnly(_) => Err(Error::State(
+                ErrorKind::Unsupported,
+                "node is a read-only observation",
+            )),
+        }
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OpenKind {
+    Writable,
+    ReadOnly,
+}
+
 struct OpenGate {
     inner: Arc<Inner>,
     id: NodeId,
+    kind: OpenKind,
     ready: Arc<Semaphore>,
 }
 impl Drop for OpenGate {
     fn drop(&mut self) {
         if let Ok(mut opening) = self.inner.opening.lock() {
-            opening.remove(&self.id);
+            opening.remove(&(self.id, self.kind));
         }
         // Close wakes every waiter; a single permit would strand later waiters.
-        self.ready.close();
-    }
-}
-struct ReadOnlyOpenGate {
-    inner: Arc<Inner>,
-    id: NodeId,
-    ready: Arc<Semaphore>,
-}
-impl Drop for ReadOnlyOpenGate {
-    fn drop(&mut self) {
-        if let Ok(mut opening) = self.inner.read_only_opening.lock() {
-            opening.remove(&self.id);
-        }
         self.ready.close();
     }
 }
@@ -78,9 +83,7 @@ struct Inner {
     runtime: Runtime,
     read_only: bool,
     nodes: StdMutex<BTreeMap<NodeId, Arc<Node>>>,
-    opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
-    read_only_nodes: StdMutex<BTreeMap<NodeId, Arc<ReadOnlyNode>>>,
-    read_only_opening: StdMutex<BTreeMap<NodeId, Arc<Semaphore>>>,
+    opening: StdMutex<BTreeMap<(NodeId, OpenKind), Arc<Semaphore>>>,
 }
 /// A mount instance owns one shared staged version per writable node and one
 /// pinned authenticated file observation per active read-only node. It does not
@@ -116,7 +119,7 @@ impl Mount {
             nodes.insert(
                 state.node,
                 Arc::new(Node {
-                    handle: Mutex::new(runtime.recover(state.id).await?),
+                    state: NodeState::Writable(Mutex::new(runtime.recover(state.id).await?)),
                     references: AtomicUsize::new(0),
                 }),
             );
@@ -127,8 +130,6 @@ impl Mount {
                 read_only,
                 nodes: StdMutex::new(nodes),
                 opening: StdMutex::new(BTreeMap::new()),
-                read_only_nodes: StdMutex::new(BTreeMap::new()),
-                read_only_opening: StdMutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -148,7 +149,10 @@ impl Mount {
         let Some(guard) = guard else {
             return Ok(None);
         };
-        guard.node.handle.lock().await.status().await.map(Some)
+        let NodeState::Writable(handle) = &guard.node.state else {
+            return Ok(None);
+        };
+        handle.lock().await.status().await.map(Some)
     }
     /// Namespace operations use the same conditional runtime contract. Do not
     /// open private FileHandles through this runtime alongside Mount references.
@@ -159,21 +163,28 @@ impl Mount {
         if writable && self.inner.read_only {
             return Err(Error::State(ErrorKind::ReadOnly, "mount is read-only"));
         }
+        let kind = OpenKind::Writable;
         loop {
             // Cache lookup and gate registration must be one critical section.
             // Always take nodes then opening, and never hold either across await.
             let (existing, gate) = {
                 let nodes = self.inner.nodes.lock().map_err(Error::local)?;
                 if let Some(node) = nodes.get(&id) {
+                    if !matches!(node.state, NodeState::Writable(_)) {
+                        return Err(Error::State(
+                            ErrorKind::Unsupported,
+                            "node already has a read-only observation",
+                        ));
+                    }
                     node.references.fetch_add(1, Ordering::Relaxed);
                     (Some(node.clone()), None)
                 } else {
                     let mut opening = self.inner.opening.lock().map_err(Error::local)?;
-                    match opening.get(&id) {
+                    match opening.get(&(id, kind)) {
                         Some(ready) => (None, Some((ready.clone(), true))),
                         None => {
                             let ready = Arc::new(Semaphore::new(0));
-                            opening.insert(id, ready.clone());
+                            opening.insert((id, kind), ready.clone());
                             (None, Some((ready, false)))
                         }
                     }
@@ -194,6 +205,7 @@ impl Mount {
             let gate = OpenGate {
                 inner: self.inner.clone(),
                 id,
+                kind,
                 ready,
             };
             let handle = self
@@ -202,7 +214,7 @@ impl Mount {
                 .open_node(id, !self.inner.read_only)
                 .await?;
             let node = Arc::new(Node {
-                handle: Mutex::new(handle),
+                state: NodeState::Writable(Mutex::new(handle)),
                 references: AtomicUsize::new(0),
             });
             {
@@ -229,26 +241,39 @@ impl Mount {
             Err(error) if error.kind() == ErrorKind::Busy => {}
             Err(error) => return Err(error),
         }
+        let kind = OpenKind::ReadOnly;
         loop {
             let (existing, gate) = {
-                let nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+                let nodes = self.inner.nodes.lock().map_err(Error::local)?;
                 if let Some(node) = nodes.get(&id) {
+                    if !matches!(node.state, NodeState::ReadOnly(_)) {
+                        return Err(Error::State(
+                            ErrorKind::Unsupported,
+                            "node already has a writable mount reference",
+                        ));
+                    }
                     node.references.fetch_add(1, Ordering::Relaxed);
                     (Some(node.clone()), None)
                 } else {
-                    let mut opening = self.inner.read_only_opening.lock().map_err(Error::local)?;
-                    match opening.get(&id) {
+                    let mut opening = self.inner.opening.lock().map_err(Error::local)?;
+                    match opening.get(&(id, kind)) {
                         Some(ready) => (None, Some((ready.clone(), true))),
                         None => {
                             let ready = Arc::new(Semaphore::new(0));
-                            opening.insert(id, ready.clone());
+                            opening.insert((id, kind), ready.clone());
                             (None, Some((ready, false)))
                         }
                     }
                 }
             };
             if let Some(node) = existing {
-                return Ok(MountReadOnlyFile { node });
+                let version = match &node.state {
+                    NodeState::ReadOnly(version) => version.clone(),
+                    NodeState::Writable(_) => {
+                        unreachable!("the existing node variant was checked above")
+                    }
+                };
+                return Ok(MountReadOnlyFile { node, version });
             }
             let (ready, waiting) = gate.expect("a waiter or owner always carries the node gate");
             if waiting {
@@ -256,9 +281,10 @@ impl Mount {
                 continue;
             }
 
-            let gate = ReadOnlyOpenGate {
+            let gate = OpenGate {
                 inner: self.inner.clone(),
                 id,
+                kind,
                 ready,
             };
             let version = self
@@ -269,41 +295,53 @@ impl Mount {
                 .await?
                 .open_file(id)
                 .await?;
-            let node = Arc::new(ReadOnlyNode {
-                version,
+            let node = Arc::new(Node {
+                state: NodeState::ReadOnly(version),
                 references: AtomicUsize::new(0),
             });
             {
-                let mut nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+                let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
                 nodes.insert(id, node.clone());
                 node.references.fetch_add(1, Ordering::Relaxed);
             }
             drop(gate);
-            return Ok(MountReadOnlyFile { node });
+            let version = match &node.state {
+                NodeState::ReadOnly(version) => version.clone(),
+                NodeState::Writable(_) => {
+                    unreachable!("the created node is a read-only observation")
+                }
+            };
+            return Ok(MountReadOnlyFile { node, version });
         }
     }
     /// Return the currently pinned read-only observation for path metadata.
     /// A zero-reference entry is retired here because the operation that held
     /// the final reference may finish after FUSE release already returned Busy.
     pub fn read_only_version(&self, id: NodeId) -> Result<Option<FileVersion>> {
-        let mut nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+        let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
         let Some(node) = nodes.get(&id) else {
+            return Ok(None);
+        };
+        let NodeState::ReadOnly(version) = &node.state else {
             return Ok(None);
         };
         if node.references.load(Ordering::Relaxed) == 0 {
             nodes.remove(&id);
             return Ok(None);
         }
-        Ok(Some(node.version.clone()))
+        Ok(Some(version.clone()))
     }
     /// Forget an unreferenced read-only observation. An interrupted operation
     /// may still hold the observation after FUSE release; a later open retries
     /// this reclaim so it still observes the current remote revision.
     pub fn reclaim_read_only(&self, id: NodeId) -> Result<()> {
-        let mut nodes = self.inner.read_only_nodes.lock().map_err(Error::local)?;
+        let mut nodes = self.inner.nodes.lock().map_err(Error::local)?;
         let Some(node) = nodes.get(&id) else {
             return Ok(());
         };
+        if !matches!(node.state, NodeState::ReadOnly(_)) {
+            return Ok(());
+        }
         if node.references.load(Ordering::Relaxed) != 0 {
             return Err(Error::State(
                 ErrorKind::Busy,
@@ -313,6 +351,17 @@ impl Mount {
         nodes.remove(&id);
         Ok(())
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn reference_count(&self, id: NodeId) -> Option<usize> {
+        self.inner
+            .nodes
+            .lock()
+            .ok()?
+            .get(&id)
+            .map(|node| node.references.load(Ordering::Relaxed))
+    }
+
     /// Replace a clean local version with a fresh remote observation. Pending,
     /// frozen or failed versions are never rebased. Adapters must coordinate any
     /// OS cache invalidation outside this call; no OS callbacks run under locks.
@@ -324,7 +373,7 @@ impl Mount {
         let Some(guard) = guard else {
             return Ok(());
         };
-        let mut handle = guard.node.handle.lock().await;
+        let mut handle = guard.node.writable_handle()?.lock().await;
         let state = handle.status().await?;
         if state.pending || state.frozen || state.error.is_some() {
             return Err(Error::State(
@@ -351,7 +400,10 @@ impl Mount {
         };
         let mut failure = None;
         for node in &nodes {
-            if let Err(error) = node.node.handle.lock().await.fsync().await {
+            let Ok(handle) = node.node.writable_handle() else {
+                continue;
+            };
+            if let Err(error) = handle.lock().await.fsync().await {
                 failure.get_or_insert(error);
             }
         }
@@ -374,7 +426,7 @@ impl Mount {
             node.clone()
         };
         {
-            let handle = node.handle.lock().await;
+            let handle = node.writable_handle()?.lock().await;
             let state = handle.status().await?;
             if state.pending || state.frozen || state.error.is_some() {
                 return Err(Error::State(
@@ -397,7 +449,7 @@ impl Mount {
             }
             let _ = nodes.remove(&id);
         }
-        node.handle.lock().await.close().await
+        node.writable_handle()?.lock().await.close().await
     }
 }
 /// An access-checked reference to a shared node. Dropping it performs no I/O,
@@ -410,9 +462,17 @@ pub struct MountFile {
 /// A read-only reference to one authenticated pinned file version. Dropping it
 /// performs no I/O; the caller reclaims the observation when the last kernel
 /// handle is released.
-#[derive(Debug)]
 pub struct MountReadOnlyFile {
-    node: Arc<ReadOnlyNode>,
+    node: Arc<Node>,
+    version: FileVersion,
+}
+impl std::fmt::Debug for MountReadOnlyFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountReadOnlyFile")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 impl Drop for MountReadOnlyFile {
     fn drop(&mut self) {
@@ -421,10 +481,10 @@ impl Drop for MountReadOnlyFile {
 }
 impl MountReadOnlyFile {
     pub fn version(&self) -> &FileVersion {
-        &self.node.version
+        &self.version
     }
     pub async fn read(&self, offset: u64, length: usize) -> yinyang_core::Result<Vec<u8>> {
-        self.node.version.read(offset, length).await
+        self.version.read(offset, length).await
     }
 }
 impl Drop for MountFile {
@@ -441,40 +501,64 @@ impl MountFile {
         }
     }
     pub async fn status(&self) -> Result<HandleStatus> {
-        self.node.handle.lock().await.status().await
+        self.node.writable_handle()?.lock().await.status().await
     }
     pub async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
-        self.node.handle.lock().await.read(offset, length).await
+        self.node
+            .writable_handle()?
+            .lock()
+            .await
+            .read(offset, length)
+            .await
     }
     pub async fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         self.require_write()?;
-        self.node.handle.lock().await.write(offset, bytes).await
+        self.node
+            .writable_handle()?
+            .lock()
+            .await
+            .write(offset, bytes)
+            .await
     }
     pub async fn append(&self, bytes: &[u8]) -> Result<u64> {
         self.require_write()?;
-        self.node.handle.lock().await.append(bytes).await
+        self.node
+            .writable_handle()?
+            .lock()
+            .await
+            .append(bytes)
+            .await
     }
     pub async fn truncate(&self, length: u64) -> Result<()> {
         self.require_write()?;
-        self.node.handle.lock().await.truncate(length).await
+        self.node
+            .writable_handle()?
+            .lock()
+            .await
+            .truncate(length)
+            .await
     }
     pub async fn fsync(&self) -> Result<Option<Receipt>> {
-        self.node.handle.lock().await.fsync().await
+        self.publish().await
     }
     /// Publish staged bytes for a FUSE flush or close that can report errors.
     /// Dropping or releasing the reference never performs this operation.
     pub async fn flush(&self) -> Result<Option<Receipt>> {
-        self.fsync().await
+        self.publish().await
     }
     /// Publish this node's dirty content first, then update the executable
     /// flag and advance the shared clean handle to the metadata revision.
     pub async fn set_executable(&self, executable: bool) -> Result<Receipt> {
         self.require_write()?;
         self.node
-            .handle
+            .writable_handle()?
             .lock()
             .await
             .set_executable(executable)
             .await
+    }
+
+    async fn publish(&self) -> Result<Option<Receipt>> {
+        self.node.writable_handle()?.lock().await.fsync().await
     }
 }

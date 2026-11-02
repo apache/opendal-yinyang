@@ -147,7 +147,6 @@ install -m 0644 \
   docs/linux-qualification.md \
   docs/linux-operating-envelope.md \
   docs/linux-backup-recovery.md \
-  docs/linux-compatibility-acceptance.md \
   docs/linux-trial-distribution.md \
   "$tree/share/doc/yinyang/"
 

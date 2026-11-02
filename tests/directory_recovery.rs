@@ -23,9 +23,6 @@
 //! forwards normal S3 traffic and interferes only with the final conditional
 //! head publication, so no production-only fault hook is required.
 
-#[path = "linux_sync/harness.rs"]
-mod support;
-
 use futures_util::TryStreamExt as _;
 use serde_json::Value;
 use std::io::Read;
@@ -33,12 +30,12 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use support::{Fixture, Publication, Tree, local_tree, runtime};
+mod support;
+
+use support::linux_sync::{Fixture, Publication, Tree, local_tree, runtime};
+use yinyang_test_support::s3_gate;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(180);
-
-#[path = "support/s3_gate.rs"]
-mod s3_gate;
 
 use s3_gate::{CommitAction, S3Gate};
 

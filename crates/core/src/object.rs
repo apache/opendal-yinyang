@@ -25,16 +25,6 @@ use crate::{Error, ErrorKind, NodeId, Result};
 use futures_util::TryStreamExt as _;
 use opendal::Operator;
 
-/// Deployment semantics, not inferred from OpenDAL capability flags.
-/// The endpoint must implement the named provider's documented strong reads,
-/// durable immutable writes and atomic conditional writes. External mutations
-/// under the owned prefix invalidate these guarantees.
-#[derive(Clone, Copy, Debug)]
-pub enum BackendProfile {
-    AmazonS3,
-    Minio,
-}
-
 // Kept available here for existing object-profile callers.
 pub use crate::snapshot::{
     Change, ChangeRecord, Cursor, DirectoryPage, Outcome, Receipt, Revision, ScanToken, Snapshot,
@@ -66,6 +56,10 @@ pub(crate) struct ObjectState {
 }
 impl ObjectState {
     fn view(&self) -> Snapshot {
+        self.view_cached(IndexCache::default())
+    }
+
+    fn view_cached(&self, cache: IndexCache) -> Snapshot {
         Snapshot {
             data: self.data.clone(),
             filesystem: self.filesystem,
@@ -73,7 +67,7 @@ impl ObjectState {
             revision: self.revision,
             reader: Arc::new(ObjectRecords {
                 data: self.data.clone(),
-                cache: IndexCache::default(),
+                cache,
                 indexes: [
                     self.nodes.clone(),
                     self.entries.clone(),
@@ -197,6 +191,7 @@ impl RecordReader for ObjectRecords {
 pub struct ObjectFs {
     operator: Operator,
     data: DataStore,
+    cache: IndexCache,
     filesystem: NodeId,
     root: NodeId,
     // Clones share a fair local publication gate; separate authorities retain
@@ -212,8 +207,8 @@ struct Head {
     etag: String,
 }
 impl ObjectFs {
-    pub async fn create(operator: Operator, profile: BackendProfile) -> Result<Self> {
-        validate_backend(&operator, profile)?;
+    pub async fn create(operator: Operator) -> Result<Self> {
+        validate_backend(&operator)?;
         if let Some(head) = read_head(&operator).await? {
             return Self::from_head(operator, head).await;
         }
@@ -258,15 +253,15 @@ impl ObjectFs {
             .if_not_exists(true)
             .await
         {
-            Ok(_) => Self::open(operator, profile).await,
-            Err(error) => match Self::open(operator, profile).await {
+            Ok(_) => Self::open(operator).await,
+            Err(error) => match Self::open(operator).await {
                 Ok(fs) => Ok(fs),
                 Err(_) => Err(Error::from_storage("create filesystem head", error)),
             },
         }
     }
-    pub async fn open(operator: Operator, profile: BackendProfile) -> Result<Self> {
-        validate_backend(&operator, profile)?;
+    pub async fn open(operator: Operator) -> Result<Self> {
+        validate_backend(&operator)?;
         let head = read_head(&operator)
             .await?
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "open filesystem", "head is missing"))?;
@@ -276,6 +271,7 @@ impl ObjectFs {
         let fs = Self {
             data: DataStore::new(operator.clone(), head.filesystem)?,
             operator,
+            cache: IndexCache::default(),
             filesystem: head.filesystem,
             root: head.root,
             commit_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -296,7 +292,7 @@ impl ObjectFs {
         self.filesystem
     }
     pub async fn observe_latest(&self) -> Result<Snapshot> {
-        Ok(self.observe_state().await?.view())
+        Ok(self.observe_state().await?.view_cached(self.cache.clone()))
     }
     pub(crate) async fn observe_state(&self) -> Result<ObjectState> {
         let head = read_head(&self.operator)
@@ -334,7 +330,7 @@ impl ObjectFs {
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
         let latest = self.observe_state().await?;
         if latest.revision == revision {
-            return Ok(latest.view());
+            return Ok(latest.view_cached(self.cache.clone()));
         }
         let bytes = latest
             .history
@@ -350,7 +346,7 @@ impl ObjectFs {
         Ok(self
             .load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
             .await?
-            .view())
+            .view_cached(self.cache.clone()))
     }
     pub(crate) async fn retained_revisions_page(
         &self,
@@ -587,7 +583,7 @@ async fn read_snapshot_roots(
         roots.next().unwrap()?,
     ])
 }
-fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()> {
+fn validate_backend(operator: &Operator) -> Result<()> {
     let info = operator.info();
     let cap = info.capability();
     if info.scheme() != "s3"
@@ -599,7 +595,7 @@ fn validate_backend(operator: &Operator, _profile: BackendProfile) -> Result<()>
     {
         return Err(Error::unsupported(
             "open object authority",
-            "the selected S3 semantic profile and conditional streaming capabilities are required",
+            "the S3 transport and conditional streaming capabilities are required",
         ));
     }
     Ok(())
@@ -691,4 +687,43 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
         reference: PackedRef::from_wire(reference)?,
         etag,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::TestBackend;
+    use crate::{Authority, CommitId, Planner};
+
+    #[tokio::test]
+    async fn snapshots_share_the_content_addressed_index_cache() {
+        let backend = TestBackend::default();
+        let fs = ObjectFs::create(backend.operator()).await.unwrap();
+        let mut empty_source: &[u8] = b"";
+        let empty = fs.prepare(&mut empty_source).await.unwrap();
+        let base = fs.observe_latest().await.unwrap();
+        let mut plan = Planner::new(&base, CommitId::generate());
+        let bulk = plan.create_directory(fs.root(), "bulk").await.unwrap();
+        for index in 0..1000 {
+            plan.create_file(bulk, &format!("entry-{index:04}"), empty.clone(), false)
+                .await
+                .unwrap();
+        }
+        let request = plan.finish().unwrap();
+        fs.commit(&request).await.unwrap();
+
+        let first = fs.observe_latest().await.unwrap();
+        let first_entry = first.lookup(bulk, "entry-0500").await.unwrap().unwrap();
+        first.node(first_entry.node_id).await.unwrap().unwrap();
+
+        let second = fs.observe_latest().await.unwrap();
+        backend.state.lock().unwrap().data_reads = 0;
+        let second_entry = second.lookup(bulk, "entry-0500").await.unwrap().unwrap();
+        second.node(second_entry.node_id).await.unwrap().unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            0,
+            "a warm page cache was not shared across snapshots"
+        );
+    }
 }

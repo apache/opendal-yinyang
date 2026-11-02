@@ -17,19 +17,13 @@
 
 #![cfg(target_os = "linux")]
 
-#[path = "linux_direct/acceptance.rs"]
-mod acceptance;
-#[path = "linux_direct/harness.rs"]
-mod harness;
-#[path = "support/process.rs"]
-mod process;
-#[path = "support/raw_s3.rs"]
-mod raw_s3;
-#[path = "linux_direct/real_s3.rs"]
-mod real_s3;
-#[path = "support/s3_gate.rs"]
-mod s3_gate;
-#[path = "linux_direct/sync.rs"]
-mod sync;
-#[path = "linux_direct/writable.rs"]
-mod writable;
+mod linux_direct {
+    pub mod acceptance;
+    pub mod harness;
+    pub mod real_s3;
+    pub mod sync;
+    pub mod writable;
+}
+
+pub(crate) use linux_direct::{harness, real_s3};
+use yinyang_test_support::{process, raw_s3, s3_gate};

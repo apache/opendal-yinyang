@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,8 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::transaction::Planner;
 use yinyang::core::{
-    Authority, BackendProfile, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs,
-    NodeId, Revision, Snapshot, Transaction,
+    Authority, CommitId, CommitOutcome, DataStore, ErrorKind as CoreErrorKind, Fs, NodeId,
+    Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
@@ -99,20 +98,39 @@ impl Authority for LostResponseAuthority {
 }
 
 #[tokio::test]
-async fn namespace_only_unknown_protects_baseline_without_content_handle() {
+async fn content_unknown_protects_baseline_without_a_staged_handle() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let inner: Arc<dyn Authority> = Arc::new(fs);
     let fault = Arc::new(LostResponseAuthority::new(inner));
     let authority: Arc<dyn Authority> = fault.clone();
+    let content = authority
+        .data()
+        .prepare(&mut b"baseline content".as_slice())
+        .await
+        .unwrap();
+    let mut plan = Planner::new(
+        &authority.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    plan.create_file(authority.root(), "edited", content, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        authority.commit(&plan.finish().unwrap()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("sync");
     let sync = Sync::open(authority.clone(), &state).await.unwrap();
     let baseline = authority.observe_latest().await.unwrap();
+    let node = baseline.resolve("edited").await.unwrap().unwrap();
     let intent = sync
-        .stage_create_directory(authority.root(), "namespace-only", baseline.revision())
+        .stage(
+            node.id(),
+            baseline.revision(),
+            &mut b"replacement content".as_slice(),
+        )
         .await
         .unwrap();
 
@@ -122,17 +140,15 @@ async fn namespace_only_unknown_protects_baseline_without_content_handle() {
     drop(sync);
 
     let sync_database = state.join("sync.db");
-    let content_database = state.join("content").join("staging.db");
     let sync_before = std::fs::read(&sync_database).unwrap();
-    let content_before = std::fs::read(&content_database).unwrap();
     let inspection = inspect_bound_local_staging(&state, authority.filesystem()).await;
 
     assert_eq!(inspection.state, StagingState::Available);
     assert_eq!(inspection.binding.state, StagingBindingState::Verified);
     assert!(inspection.errors.is_empty());
     assert_eq!(inspection.sync.state, StagingState::Available);
-    assert_eq!(inspection.sync.namespace_intents, 1);
-    assert_eq!(inspection.sync.namespace_unknown, 1);
+    assert_eq!(inspection.sync.intents, 1);
+    assert_eq!(inspection.sync.unknown, 1);
     assert_eq!(inspection.handles.total, 0);
     let baseline_hex = baseline
         .revision()
@@ -144,32 +160,23 @@ async fn namespace_only_unknown_protects_baseline_without_content_handle() {
         .protected_revisions
         .iter()
         .find(|revision| revision.revision == baseline_hex)
-        .expect("namespace baseline must be protected");
-    assert!(protected.reasons.contains(&"sync_namespace_unknown"));
+        .expect("intent baseline must be protected");
+    assert!(protected.reasons.contains(&"sync_intent_unknown"));
     assert_eq!(std::fs::read(&sync_database).unwrap(), sync_before);
-    assert_eq!(std::fs::read(&content_database).unwrap(), content_before);
 }
 
 #[tokio::test]
 async fn foreign_staging_is_unavailable_and_not_attributed() {
     let source_backend = TestBackend::default();
-    let source = Fs::create(source_backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let source = Fs::create(source_backend.operator()).await.unwrap();
     let source: Arc<dyn Authority> = Arc::new(source);
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("sync");
     let sync = Sync::open(source.clone(), &state).await.unwrap();
-    let baseline = source.observe_latest().await.unwrap();
-    sync.stage_create_directory(source.root(), "foreign", baseline.revision())
-        .await
-        .unwrap();
     drop(sync);
 
     let target_backend = TestBackend::default();
-    let target = Fs::create(target_backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let target = Fs::create(target_backend.operator()).await.unwrap();
     assert_ne!(source.filesystem(), target.filesystem());
     let sync_database = state.join("sync.db");
     let before = std::fs::read(&sync_database).unwrap();
@@ -179,7 +186,7 @@ async fn foreign_staging_is_unavailable_and_not_attributed() {
     assert_eq!(inspection.binding.state, StagingBindingState::Unavailable);
     assert!(inspection.binding.error.is_some());
     assert_eq!(inspection.handles.total, 0);
-    assert_eq!(inspection.sync.namespace_intents, 0);
+    assert_eq!(inspection.sync.intents, 0);
     assert!(inspection.protected_revisions.is_empty());
     assert_eq!(std::fs::read(&sync_database).unwrap(), before);
 }
@@ -187,9 +194,7 @@ async fn foreign_staging_is_unavailable_and_not_attributed() {
 #[tokio::test]
 async fn keep_last_and_requested_pin_select_only_declared_revisions() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let authority: Arc<dyn Authority> = Arc::new(fs);
     let temp = tempfile::tempdir().unwrap();
     let runtime = Runtime::open(authority.clone(), temp.path().join("editor"))
@@ -246,9 +251,7 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
 #[tokio::test]
 async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let authority: Arc<dyn Authority> = Arc::new(fs);
     let content = authority
         .data()
@@ -272,7 +275,7 @@ async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let report = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
         .await
         .unwrap();
-    assert_eq!(report.schema, "yinyang.managed-space.report.v3");
+    assert_eq!(report.schema, "yinyang.managed-space.report.v4");
     assert!(!report.deletion_authorized);
     assert_eq!(report.reclaimable_bytes, None);
     assert_eq!(report.physical.state, MeasurementState::Partial);
