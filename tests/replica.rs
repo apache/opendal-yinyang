@@ -83,6 +83,7 @@ impl RemoteAdapter for NoopAdapter {
     ) -> yinyang::sync_engine::Result<RemoteObservation> {
         Ok(RemoteObservation {
             cursor: RemoteCursor { bytes: vec![0; 27] },
+            revision: None,
             entries: BTreeMap::from([(String::new(), Self::root_entry())]),
         })
     }

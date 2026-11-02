@@ -1387,6 +1387,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 RemoteStatus {
                     availability: RemoteAvailability::Available,
                     cursor: Some(hex(&observation.cursor.bytes)),
+                    revision: observation.revision.map(|revision| hex(&revision)),
                     error: None,
                 },
             ),
@@ -1395,6 +1396,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 RemoteStatus {
                     availability: RemoteAvailability::Unavailable,
                     cursor: None,
+                    revision: None,
                     error: Some(error.to_string()),
                 },
             ),
@@ -1407,6 +1409,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                         RemoteAvailability::NotChecked
                     },
                     cursor: None,
+                    revision: None,
                     error: remote_error,
                 },
             ),

@@ -169,6 +169,8 @@ pub struct RemoteBaseline {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteObservation {
     pub cursor: RemoteCursor,
+    /// Observed authority revision when the adapter exposes one.
+    pub revision: Option<[u8; 24]>,
     pub entries: BTreeMap<String, RemoteEntry>,
 }
 

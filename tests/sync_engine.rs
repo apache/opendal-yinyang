@@ -179,6 +179,7 @@ impl RemoteAdapter for FakeAdapter {
         cursor[..8].copy_from_slice(&state.sequence.to_be_bytes());
         Ok(RemoteObservation {
             cursor: RemoteCursor { bytes: cursor },
+            revision: None,
             entries: state.entries.clone(),
         })
     }

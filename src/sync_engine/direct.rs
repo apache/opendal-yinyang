@@ -131,7 +131,11 @@ impl RemoteAdapter for DirectAdapter {
             .lock()
             .map_err(|_| Error::corrupt("Direct Sync snapshot cache was poisoned"))? =
             Some(snapshot);
-        Ok(RemoteObservation { cursor, entries })
+        Ok(RemoteObservation {
+            cursor,
+            revision: None,
+            entries,
+        })
     }
 
     async fn read_file(&self, entry: &RemoteEntry, output: BorrowedFd<'_>) -> Result<()> {

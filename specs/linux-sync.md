@@ -202,7 +202,7 @@ unsupported.
                "root": "...", "namespace": "...", "same_filesystem": true,
                "error": null },
   "remote": { "availability": "not_checked|available|unavailable",
-              "cursor": "...", "error": null },
+              "cursor": "...", "revision": "...", "error": null },
   "local": { "scan": "not_scanned|clean|changed|failed", "error": null },
   "summary": { "in_sync": false, "pending": 0, "unknown": 0, "conflicts": 0,
                "failed": 0, "retained_artifacts": 0, "retained_bytes": 0 },

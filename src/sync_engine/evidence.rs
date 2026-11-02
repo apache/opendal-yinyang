@@ -47,6 +47,7 @@ impl StatusDocument {
             remote: RemoteStatus {
                 availability: RemoteAvailability::NotChecked,
                 cursor: None,
+                revision: None,
                 error: None,
             },
             local: LocalStatus {
@@ -126,6 +127,7 @@ pub enum BindingState {
 pub struct RemoteStatus {
     pub availability: RemoteAvailability,
     pub cursor: Option<String>,
+    pub revision: Option<String>,
     pub error: Option<String>,
 }
 
