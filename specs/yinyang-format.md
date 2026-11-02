@@ -36,11 +36,20 @@ Content readiness follows [the content profile](content-profile.md).
 It loads only the snapshot descriptor, not the namespace. `Snapshot` provides
 identity lookup, path resolution, directory pagination, prepared published
 content, indexed receipt lookup, and ordered changes. `observe_revision` uses
-the retained-snapshot index. There is no listing-based discovery, implicit
-latest-cache substitution, expiry, garbage collection, or history replay.
+the typed retained-snapshot history. A known revision whose history entry is
+expired returns `Expired`; a revision absent from this lineage returns
+`NotFound`. There is no listing-based discovery, implicit latest-cache
+substitution, automatic expiry, garbage collection, or history replay.
 Revision tokens round-trip through 24-byte representations for persistence
 across process restarts. Decoding a token does not establish its validity:
 historical lookup checks membership in this filesystem's retained lineage.
+
+Expiry changes fresh revision lookup only. A `Snapshot` or `FileVersion` already
+held by a caller remains usable, and an exact frozen request can still restore
+its original predicates and content descriptors from a known expired base.
+Expiry never deletes metadata, receipts, change records, content packs, or
+physical objects. The current revision and a request's expected-latest guard
+are checked before publication.
 
 `Planner` captures conditions while constructing a deterministic transaction.
 `lookup` and `resolve` capture name bindings; `node` captures the complete
@@ -126,11 +135,11 @@ Physical references never enter logical content identities or request digests.
   nonce and advances the sequence; a revision is not a count of transactions.
   Comparison is lexicographic over sequence and nonce. Index keys use
   big-endian sequence followed by nonce.
-- Head: `(YYHEAD02:[u8;8], mode:u8=0, filesystem:[u8;16], root:[u8;16],
+- Head: `(YYHEAD03:[u8;8], mode:u8=0, filesystem:[u8;16], root:[u8;16],
   revision:Revision, descriptor:Ref)`, followed by ordinary BLAKE3 of that tuple.
   Maximum head size is 4 KiB. Unknown profiles/modes and legacy `YYHEAD01` are
   rejected; creation never overwrites an existing unsupported head.
-- Descriptor: `(YYSNAP02:[u8;8], filesystem:[u8;16], root:[u8;16],
+- Descriptor: `(YYSNAP03:[u8;8], filesystem:[u8;16], root:[u8;16],
   revision:Revision, roots:[Option<Ref>;5])`, at most 4 KiB. Root order is nodes,
   directory entries, receipts, changes, retained snapshots.
 - Node: `(id:[u8;16], generation:u64, executable:bool,
@@ -146,8 +155,12 @@ Physical references never enter logical content identities or request digests.
   after:Option<Vec<u8>>)>)`. Node encodings supply relationship and generation
   details. Keys concatenate revision index bytes and big-endian ordinal.
   Reads are bounded by their pinned snapshot's change root.
-- Retained-snapshot value: a Ref keyed by prior revision index bytes. A
-  successor records its predecessor descriptor; descriptors never hash themselves.
+- History record: the existing retained-snapshot root stores one value per
+  known revision. Its key is a one-byte status (`0` readable, `1` expired)
+  followed by the 24-byte revision. Its value is the original snapshot `Ref`.
+  A successor records its predecessor as readable; expiry moves selected
+  readable keys to the expired range without rewriting the referenced
+  descriptor. Descriptors never hash themselves.
 
 Every index is an immutable copy-on-write B+ tree with inclusive maximum-key
 separators. A page is `(YYINDEX2:[u8;8],level:u8,
@@ -199,25 +212,50 @@ For filesystem ID consisting of sixteen bytes of value 1, no conditions and
 no mutations, the request digest is
 `811032fb290ade714ee0ca3d8716fabd1f7154e478ae5da1a8b822411513eb4d`.
 
+### Explicit expiry request
+
+The explicit expiry request profile is `YYEXP001` with BLAKE3 derive-key context
+`Apache OpenDAL YinYang expiry request profile 1`. Its encoded tuple is
+`(YYEXP001:[u8;8], filesystem:[u8;16], request_id:[u8;16],
+expected_latest:Revision, digest:[u8;32], candidates:Vec<Revision>)`. The digest
+binds the authority, expected latest revision, and canonical candidate set; the
+request ID is the receipt lookup key and is not part of that digest.
+
+The candidate vector contains 1 through 256 revisions in strictly increasing,
+unique order. `ExpiryRequest::new` canonicalizes its input by sorting and
+deduplicating, while decoding byte input rejects a noncanonical vector. The
+current revision cannot be a candidate. An authority validates the request
+binding and digest before consulting history.
+
+An accepted expiry publishes a fresh revision and writes the existing receipt
+shape plus an empty change record in the same atomic publication as the history
+status changes. Same-request replay checks that receipt before expected-latest
+or candidate state. A changed expected latest returns `Conflict`; an unknown
+candidate is `NotFound`; an already expired candidate is `Expired`; ambiguous
+post-dispatch publication is `Unknown(original request_id)`.
+
 ## Compatibility and admission
 
-The supported object profile is `YYHEAD02` mode 0 with root descriptor
-`YYSNAP02`, index pages `YYINDEX2`, content descriptors `YYFILE02`, and canonical
-requests `YYREQ002`. Frozen requests use `YYPLAN01`; node identities use the
-derive-key context `Apache OpenDAL YinYang node identity profile 2`.
+The supported object profile is `YYHEAD03` mode 0 with root descriptor
+`YYSNAP03`, index pages `YYINDEX2`, content descriptors `YYFILE02`, canonical
+requests `YYREQ002`, and expiry requests `YYEXP001`. Frozen requests use
+`YYPLAN01`; node identities use the derive-key context
+`Apache OpenDAL YinYang node identity profile 2`.
 
-Readers reject `YYHEAD01`, `YYSERV01`, unknown head modes, and unknown snapshot,
-index, content, or plan identifiers with `Unsupported`. Head creation and
-replacement do not begin when an existing head is an unsupported profile.
+Readers reject `YYHEAD01`, `YYHEAD02`, `YYSNAP02`, `YYSERV01`, unknown head
+modes, and unknown snapshot, index, content, plan, or expiry identifiers with
+`Unsupported`. Head creation and replacement do not begin when an existing head
+is an unsupported profile.
 Malformed encodings carrying a supported identifier are `Corrupt` or `Invalid`.
 The object binding never opens a service authority, and the service binding never
 falls back to object publication.
 
-There is no in-place upgrade from `YYHEAD01`, automatic downgrade from this
-profile, or mixed old/new writer. A retained snapshot or receipt remains
-readable only while its head, descriptor, index, and content profiles are all in
-the supported matrix. See [Compatibility](compatibility.md) for the complete
-matrix and transition limits.
+There is no in-place upgrade from an older object profile, automatic downgrade
+from this profile, or mixed old/new writer. A retained snapshot or receipt
+remains interpretable only while its head, descriptor, index, and content
+profiles are all in the supported matrix. See
+[Compatibility](compatibility.md) for the complete matrix and transition
+limits.
 
 ## Verification and remaining limits
 
@@ -230,9 +268,9 @@ multipart preparation, range updates, publication, retries and reopen.
 
 There is no remote preparation-evidence protocol or general release support.
 The metadata-service engine described in its own specification is implemented
-by the same core but remains a separate authority mode. There is no mount
-policy, garbage collection, compression, or encryption implied by the object
-profile.
+by the same core but remains a separate authority mode. Explicit logical expiry
+is implemented by the shared authority API. There is no mount policy, physical
+garbage collection, compression, or encryption implied by the object profile.
 
 ## Conformance
 

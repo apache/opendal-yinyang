@@ -241,6 +241,12 @@ mod tests {
             "permission denied",
         );
         assert_eq!(Error::from(core).kind(), ErrorKind::PermissionDenied);
+        let expired = yinyang_core::Error::new(
+            yinyang_core::ErrorKind::Expired,
+            "test",
+            "revision is expired",
+        );
+        assert_eq!(Error::from(expired).kind(), ErrorKind::Expired);
         assert_eq!(
             ErrorKind::from(crate::local::store::ErrorKind::Busy),
             ErrorKind::Busy

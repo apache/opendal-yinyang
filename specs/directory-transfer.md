@@ -139,9 +139,11 @@ mutation or process restart, but it is not an offline export.
 `restore_directory(authority, snapshot, destination)` restores exactly that
 pinned revision, including after reopening the same filesystem.
 `restore_directory_revision(authority, revision, destination)` resolves one
-retained historical revision before applying the same rules. The destination
-must not exist and its parent must exist. An existing destination or symlink is
-rejected. After destination creation, prevent concurrent local mutation.
+known historical revision before applying the same rules. A fresh lookup returns
+`Expired` for a known revision that was explicitly expired and `NotFound` for a
+revision outside the lineage. The destination must not exist and its parent must
+exist. An existing destination or symlink is rejected. After destination
+creation, prevent concurrent local mutation.
 
 Each file streams through authenticated verification units into a temporary
 file in its destination directory. After the full read, output is flushed and
@@ -165,7 +167,17 @@ and local metadata that its broad replacement semantics require; core
 transactions, lookup and pagination do not materialize the filesystem.
 There is no stored 4096-byte full-path limit or materialized-version size limit.
 The object profile's per-value resource limit still bounds one encoded change
-record. No garbage collection or retention expiry is implemented.
+record. Explicit logical revision expiry is available through
+`Authority::expire`; physical garbage collection, deletion, and reclamation are
+not implemented.
+
+`Authority::commit_frozen_batch` accepts the original encoded frozen requests.
+It validates each authority binding and canonical semantic digest, resolves
+existing receipts before restoring content, and preserves input/outcome order
+for mixed committed and pending requests. Pending requests restore from their
+exact original base, including a known expired revision, and are never
+replanned or retargeted. Callers that only need one in-memory request may still
+use `commit`; normal first publication does not perform an encoded-plan restore.
 
 ## CLI
 

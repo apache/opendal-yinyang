@@ -857,7 +857,7 @@ impl FileHandle {
             let outcome = self
                 .runtime
                 .authority()
-                .commit_frozen_batch(&[bytes.clone()])
+                .commit_frozen_batch(std::slice::from_ref(bytes))
                 .await
                 .map(|mut outcomes| outcomes.remove(0));
             (request_id, outcome)

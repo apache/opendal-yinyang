@@ -21,12 +21,14 @@ blocking database helper, and writer operations use a process-local gate so a
 publication transaction cannot interleave with another write on the same
 connection. Independent service processes still coordinate through SQLite.
 
-The schema profile is `yinyang-sqlite-2`. The authority row retains filesystem
+The schema profile is `yinyang-sqlite-3`. The authority row retains filesystem
 and root identities plus the latest revision. Indexed valid-time records retain
 nodes, entries, receipts, and ordered changes. Each record has an inclusive
-start and exclusive end sequence. Revision tokens are retained separately and
-validated before reads. History is application data, not an expiring database
-MVCC window. There is no history deletion or garbage collection.
+start and exclusive end sequence. Revision tokens are retained separately with
+an explicit readable/expired flag and validated before reads. History is
+application data, not an expiring database MVCC window. Expiry changes only the
+flag consulted by fresh lookup; there is no history deletion, physical
+reclamation, or garbage collection.
 
 Before changing the SQLite journal mode or creating tables, opening checks the
 schema profile, the single authority profile row, the retained manifest, the
@@ -61,12 +63,22 @@ An unknown marker profile is `Unsupported`; malformed `YYSERV01` bytes are
 frozen-request restoration. `Snapshot`, `Planner`, `Transaction`, receipts,
 changes, and revision/scan tokens are shared with object mode.
 
-`Authority::retained_revisions_page` enumerates the durable revision table in
-strict token order. A page is limited to 256 revisions and uses the last
-returned revision as its exclusive continuation. Embedded inspection opens the
+`Authority::revision_history_page` is the single typed history owner. It
+enumerates the durable revision table in strict token order and attaches
+`Readable` or `Expired` to each record. A page is limited to 256 revisions and
+uses the last returned revision as its exclusive continuation.
+`Authority::retained_revisions` filters this history to readable records for
+callers that need the retained readable set. Embedded inspection opens the
 existing SQLite database read-only with `query_only` enabled; it does not
-migrate, recover, take the writer transaction, or infer retained revisions from
-content packs. `ServiceClient` exposes the same bounded page contract.
+migrate, recover, take the writer transaction, or infer revisions from content
+packs. `ServiceClient` exposes the same bounded typed page contract.
+
+An explicit expiry request is validated against its authority binding,
+canonical digest, expected latest revision, and every candidate before any
+mutation. `BEGIN IMMEDIATE` wraps the candidate flag changes, new revision row,
+receipt, empty change record, and latest-revision update. `COMMIT` is the sole
+publication point. The current revision cannot expire. Same-request replay
+checks the receipt before expected-latest or candidate state.
 
 In-process preparation carries trusted `DataStore` evidence and records
 readiness with a durable `synchronous=FULL` commit. A client uploads through OpenDAL,
@@ -86,10 +98,12 @@ new pack, and records durable readiness. The authenticated client does not
 register or import the whole result. Instead, its preparation request names the
 selected revision, NodeId, operation parameters, and edits; the server reopens
 that exact published base from SQLite metadata and applies the update itself.
-An unknown or unretained revision, missing or non-file NodeId, or different
-service binding fails before content payload reads. A retained older revision
-is a valid base; its original file predicates determine whether publication
-succeeds.
+An unknown revision, missing or non-file NodeId, or different service binding
+fails before content payload reads. A known readable or expired revision is a
+valid base when the caller already holds its exact snapshot, file version, or
+frozen request. A fresh `observe_revision` of an expired revision returns
+`Expired`; an unknown token returns `NotFound`. Original file predicates still
+determine whether publication succeeds.
 
 The request is capped at 4096 edits and the existing 16 MiB RPC frame.
 `prepare_update` additionally rejects a final length whose generated zero and
@@ -105,10 +119,18 @@ and mutations. The experimental Borsh envelope is
 Conditions are key/optional-value pairs. Mutation encodings reuse the logical
 canonical transaction tags and record encodings. Physical prepared descriptors
 are carried for file content; they do not enter the canonical logical digest.
-Restoration validates the original retained snapshot, derived node identities,
+Restoration validates the original known snapshot, derived node identities,
 all mandatory predicates, and digest. A caller cannot remove a condition to
 bypass concurrency checks. An untrusted serialized request is not preparation
 evidence. Object-mode restoration verifies referenced content through import.
+
+Encoded frozen-request replay first checks the authority binding and recomputes
+the canonical semantic digest from the untrusted plan. It does not trust the
+digest reported by `Transaction::inspect_identity`, observe latest as the new
+base, or import content before receipt resolution. A committed identity returns
+its original receipt immediately. A pending identity is restored from its exact
+known base, including an expired base, and retains its original CommitId,
+digest, predicates, and content descriptors.
 
 `YYPLAN01` is the supported frozen-request profile. Analysis of an unknown plan
 identifier returns `Unsupported` before observing the authority, importing
@@ -132,7 +154,8 @@ length followed by Borsh, bounded to 16 MiB. Request fields are protocol version
 1, token string, and a tagged command. Commands observe latest/specific
 revision, read/scan records at a revision, register content, prepare same-length
 or length-changing trusted updates from an exact published revision and NodeId,
-enumerate retained revisions, or commit frozen requests. Responses carry
+expire explicit known revisions, observe a held known revision for lazy reads,
+enumerate typed revision history, or commit frozen requests. Responses carry
 observations, records, readiness, prepared descriptors, typed outcomes,
 bounded revision pages, or typed errors. Maximum commit batch size, overwrite
 edit count, update edit count, and update generated-unit count are 4096; scans
@@ -147,19 +170,19 @@ version before dispatching or decoding a command against storage. Clients and
 servers that implement different versions fail explicitly rather than
 negotiating down or sharing an authority.
 
-New command and response variants are appended to the version 1 tagged enums so
-existing variant tags do not change. The retained-history command and response
-follow the overwrite and update variants. Older servers do not understand the
-appended overwrite, update, or history commands and therefore require a
-matching server binary for these paths. Existing
-register/observe/read/scan/commit traffic retains its prior encoding.
+Commands for overwrite and update retain tags 5 and 6. The current experimental
+profile then uses Expire=7, ObserveHeld=8, and RevisionHistory=9. The typed
+revision-history response is tag 7; the earlier untagged experimental history
+shape is not read. Older servers do not understand these appended commands and
+therefore require a matching server binary. Existing
+register/observe/read/scan/commit traffic retains tags 0 through 6.
 
 Error responses retain the existing tag order: Invalid=0, Corrupt=1,
 NotFound=2, AlreadyExists=3, Unsupported=4, Storage=5 and Io=6. Additional
 domain tags are InvalidName=7, NotDirectory=8, IsDirectory=9, NotEmpty=10 and
-PermissionDenied=11. Diagnostics remain strings. Clients reject unknown tags;
-deploy matching client/server versions for these new categories. This extends
-error reporting, not the persisted metadata or transaction encoding.
+PermissionDenied=11. `Expired=12` distinguishes a known expired revision from
+`NotFound=2`. Diagnostics remain strings. Clients reject unknown tags; deploy
+matching client/server versions for these categories.
 
 ## Failure and recovery
 
@@ -186,6 +209,12 @@ readiness, changes, and historical revisions. No automatic failover or
 background durability writer exists. Listener shutdown stops accepting new work; already
 accepted requests may finish.
 
+Expiry uncertainty follows the shared outcome rules. A failure before the
+SQLite publication transaction definitely did not publish and may be
+`Retryable`. A failed `COMMIT` acknowledgement returns
+`Unknown(original_request_id)`. Retrying the exact expiry bytes checks its
+receipt first and returns the original receipt when publication succeeded.
+
 For a supported quiesced backup, freeze service clients and create a consistent
 SQLite backup with the SQLite backup API (for example
 `sqlite3 DB ".backup DEST"`), then copy the complete content prefix. The
@@ -208,11 +237,13 @@ migration support.
 
 ## Compatibility
 
-The supported service profiles are `yinyang-sqlite-2`, `YYSERV01`, `YYPLAN01`,
-the shared `YYFILE02`/`YYHASH02` content profile, and loopback RPC version 1.
-There is no automatic schema upgrade or downgrade, no object-authority fallback,
-and no cross-profile read of local preparation evidence. A same-profile process
-restart retains published history, receipts, frozen requests, and readiness.
+The supported service profiles are `yinyang-sqlite-3`, `YYSERV01`, `YYPLAN01`,
+`YYEXP001`, the shared `YYFILE02`/`YYHASH02` content profile, and loopback RPC
+version 1. `yinyang-sqlite-2` and the earlier history wire shape are rejected
+without migration. There is no automatic schema upgrade or downgrade, no
+object-authority fallback, and no cross-profile read of local preparation
+evidence. A same-profile process restart retains published history, expiry
+state, receipts, frozen requests, and readiness.
 
 Current-profile content and transaction vectors under
 [`format`](../crates/core/tests/fixtures/format) are consumed directly by the
