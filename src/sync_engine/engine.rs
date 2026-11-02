@@ -3103,8 +3103,10 @@ fn artifact_changed(state: &Path, artifact: &super::store::ArtifactRecord) -> bo
     let Some(recorded) = artifact.stat else {
         return false;
     };
-    if !metadata.file_type().is_file()
-        || metadata.dev() != recorded.dev
+    if !metadata.file_type().is_file() {
+        return true;
+    }
+    if metadata.dev() != recorded.dev
         || metadata.ino() != recorded.ino
         || metadata.mtime() != recorded.mtime
         || metadata.mtime_nsec() != recorded.mtime_nsec
