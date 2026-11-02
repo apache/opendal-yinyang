@@ -386,7 +386,9 @@ only stops the request channel at process exit.
 The session runs in the foreground. Teardown waits on both the session end and
 SIGINT/SIGTERM: an external `fusermount3 -u` ends the session loop and the
 process exits on its own, while a signal detaches the mount and waits up to a
-five-second grace period. `Session::spawn` moves the mount object into
+five-second grace period. SIGINT and SIGTERM handlers, like the SIGHUP handler,
+are registered before the mount becomes visible, so a signal that arrives right
+after the mount appears detaches it instead of killing the process. `Session::spawn` moves the mount object into
 `BackgroundSession`, so a `SessionUnmounter` obtained before spawning would
 find an empty slot; one blocking owner holds the background session, polls its
 public thread guard for a natural end, and receives the local teardown
