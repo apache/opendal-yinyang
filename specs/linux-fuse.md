@@ -238,10 +238,14 @@ content revision, and advances only that clean handle to the receipt revision.
 An external content change therefore produces Conflict rather than rebasing
 old staged bytes onto new content. Managed chmod routes that Conflict, from
 either content publication or the metadata commit based on the recorded base,
-through the shared content-conflict result (`ESTALE`). FLUSH, FSYNC, an
-`O_SYNC`/`O_DSYNC` write publication, or truncate-with-publication also
-reports this errno and leaves the local bytes retained for an explicit refresh
-or resolution. Ownership, timestamps and other mode bits are not persisted.
+through the shared content-conflict result (`ESTALE`). Linux replays a
+pathname `chmod(2)` or `truncate(2)` once after an `ESTALE` returned by
+SETATTR. The retained handle keeps the original base, so a pathname truncate
+conflict continues to report `ESTALE` rather than changing to `EBUSY` on that
+replay. FLUSH, FSYNC, an `O_SYNC`/`O_DSYNC` write publication, and fd-based
+`fchmod(2)` or `ftruncate(2)` do not enter the pathname replay. Content
+publication conflicts leave local bytes retained for an explicit refresh or
+resolution. Ownership, timestamps and other mode bits are not persisted.
 
 ### Direct writable callbacks
 

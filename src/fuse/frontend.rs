@@ -396,6 +396,18 @@ impl Backend for ManagedBackend {
                     .ok_or(BackendError::MutationIo)?
             } else {
                 self.reclaim_clean_state(id).await?;
+                // Linux may replay a pathname truncate once after ESTALE. Keep
+                // that replay on the retained conflict instead of reporting
+                // the frozen handle as a different error.
+                if self
+                    .mount
+                    .node_status(id)
+                    .await?
+                    .and_then(|status| status.error)
+                    .is_some_and(|failure| failure.kind() == crate::runtime::ErrorKind::Conflict)
+                {
+                    return Err(BackendError::ContentConflict);
+                }
                 let file = self.mount.open_node(id, true).await?;
                 file.truncate(length).await?;
                 file.flush()
