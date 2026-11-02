@@ -84,7 +84,7 @@ jobs:
             printf 'os=%s %s\n' "$ID" "$VERSION_ID"
             rustc --version
             cargo --version
-            sha256sum --version | head -n 1
+            sha256sum --version | sed -n '1p'
           } | tee "$TRIAL_ROOT/evidence/host.txt"
 
       - name: Build trial archive
