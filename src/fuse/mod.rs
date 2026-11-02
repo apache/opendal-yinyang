@@ -112,9 +112,10 @@ async fn run_backend<B: Backend>(
         options.mount_options.insert(0, MountOption::RO);
     }
     options.acl = SessionACL::Owner;
-    // Register SIGHUP before the mount becomes externally visible so a
-    // refresh signal cannot fall through to the default handler while the loop
-    // task waits for its first poll.
+    // Register SIGHUP, SIGINT and SIGTERM before the mount becomes externally
+    // visible. A handler registered on first poll leaves a window in which a
+    // signal sent right after the mount appears takes the default action and
+    // kills the process instead of detaching the mount.
     let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(signal) => Some(signal),
         Err(error) => {
@@ -122,6 +123,7 @@ async fn run_backend<B: Backend>(
             None
         }
     };
+    let mut shutdown = ShutdownSignals::register()?;
     let session = Session::new(adapter.clone(), &mountpoint, &options)?;
     adapter.install_notifier(session.notifier());
     println!(
@@ -163,7 +165,7 @@ async fn run_backend<B: Backend>(
     // session end here and only await it in finalize when the signal path ran.
     let joined = tokio::select! {
         result = &mut join => Some(result),
-        _ = shutdown_signal() => {
+        _ = shutdown.recv() => {
             let _ = teardown.send(());
             None
         }
@@ -230,20 +232,28 @@ pub(super) async fn reject_unpublished_staging(
     Ok(())
 }
 
-/// Wait for SIGINT or SIGTERM, the two signals a foreground mount operator uses
-/// to tear the session down cleanly.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(signal) => signal,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
+/// SIGINT and SIGTERM, the two signals a foreground mount operator uses to tear
+/// the session down cleanly. Registration happens when this value is created,
+/// not when it is first polled.
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
         }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
     }
 }
 
