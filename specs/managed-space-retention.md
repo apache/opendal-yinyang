@@ -21,10 +21,11 @@ yy --volume CONFIG space retention expire \
 
 `--volume` is required. Managed `report` and `plan` use the selected authority.
 Direct `report` and `plan` keep their existing local-state observation path and
-make no Managed authority or namespace-object claim. Direct and read-only
-volumes reject `expire` before authority or local-state side effects. `expire`
-requires a writable Managed volume. `report` and `plan` remain observation-only
-even when the volume configuration is writable.
+make no Managed authority or namespace-object claim. `expire` is rejected for
+Direct or read-only volumes and on non-Linux hosts before authority or
+local-state side effects. `expire` requires a writable Managed volume on Linux.
+`report` and `plan` remain observation-only even when the volume configuration
+is writable.
 
 `space report --json` emits `yinyang.managed-space.report.v5`. `space retention
 plan --json` emits `yinyang.managed-retention.plan.v5`. `space retention expire
@@ -147,8 +148,19 @@ observed by `space retention plan --backup`.
 Local staging uses only existing paths:
 
 - `<staging>/staging.db` denotes managed mount or file-runtime staging;
-- `<staging>/sync-engine.db` denotes the shared Managed or Direct Sync engine;
-- `<staging>/sync.db` denotes the content-only library Sync intent journal.
+- `<staging>/content/staging.db` denotes content staging used by Sync;
+- `<staging>/sync.db` denotes the content-only library Sync intent journal;
+  and
+- `<staging>/sync-engine.db` and the engine-owned artifacts exposed by its
+  read-only inspection denote the shared Managed or Direct Sync engine.
+
+No other file, database, or directory is promoted to staging evidence. In
+particular, a one-shot directory-publication `--state` journal
+(`directory.db` and its WAL) is not discovered or registered even when that
+state directory is inside the configured staging path. Those frozen requests
+remain recoverable through Core receipt lookup or their known base under the
+[Directory transfer](directory-transfer.md) contract. Maintenance expiry does
+not accept a directory-journal path and creates no registry for one.
 
 An absent staging database remains absent. A present database is inspected
 through the existing read-only runtime inspection API. The report exposes
@@ -327,15 +339,18 @@ cleanup decision a separate future contract.
 Expiry requires every affected writer, reader, mount, Sync process, and backup
 activity for the volume to be stopped. The command's checkable scope is the
 configured `staging` path and every explicitly supplied `--backup` package.
-Other staging directories, external readers, untracked pins, and undisclosed
-backups remain unknown. The command reports `quiescence: "not_observed"` and
-does not claim global isolation.
+Within the configured staging path, only the component evidence listed under
+Space report is checkable; a one-shot directory-publication journal under that
+path is not discovered or registered. Other staging directories, external
+readers, untracked pins, and undisclosed backups remain unknown. The command
+reports `quiescence: "not_observed"` and does not claim global isolation.
 
-Admission order is fixed. Direct or read-only volumes are rejected before
-operator construction, credentials, authority connection, or local lease
-acquisition. The static operation check lives in the volume admission owner;
-the CLI only invokes it. A writable Linux Managed command then acquires the
-existing configured writer leases in this order:
+Admission order is fixed. Direct or read-only volumes, and commands on
+non-Linux hosts, are rejected before operator construction, credentials,
+authority connection, or local lease acquisition. The static operation check
+lives in the volume admission owner and enforces these refusals; the CLI only
+invokes it. On Linux, a writable Managed command then acquires the existing
+configured writer leases in this order:
 
 1. `sync-engine.lock`;
 2. `sync.lock`;
@@ -344,8 +359,12 @@ existing configured writer leases in this order:
 
 Lease acquisition may create the configured directories and lock files. It
 never creates, initializes, migrates, or recovers `sync-engine.db`, `sync.db`,
-`content/staging.db`, or `staging.db`. The leases remain held until the
-authority outcome is known. A held lease or lease error refuses mutation.
+`content/staging.db`, or `staging.db`. The leases cover evidence inspection and
+the dispatch attempt, and are released when the command returns, including
+when the authority outcome is `Unknown`. The command does not retain a lease
+while an Unknown outcome remains unresolved. After release, keeping every
+declared activity stopped is the caller's obligation. A held lease or lease
+error refuses mutation.
 
 After acquiring the leases, the command observes and freezes one exact
 `expected_latest` revision. It then validates the configured local state and
@@ -417,15 +436,16 @@ document. Command, admission, lease, unreadable-history, or internal failures
 that prevent a trustworthy document return a non-zero ordinary error without
 inventing a refusal document.
 
-After `retryable`, `unknown`, or a process crash, every declared local and
-backup activity remains stopped. Rerun the same explicit candidates and
-backups under the leases and verify the monotonic desired candidate state.
-Absence of a marker on one read is not proof that an earlier delayed request
-failed, and the CLI does not claim to replay or find the original expiry
-receipt. Resume only after the desired revisions are confirmed expired, or a
-new operation has committed. Core retains exact `ExpiryRequest` byte replay
-for lower-level callers that store that request; that is separate from the
-CLI's same-candidate recovery.
+After `retryable`, `unknown`, or a process crash, the command no longer holds
+its leases, and keeping every declared local and backup activity stopped is the
+caller's obligation. Rerun the same explicit candidates and backups under the
+leases and verify the monotonic desired candidate state. Absence of a marker
+on one read is not proof that an earlier delayed request failed, and the CLI
+does not claim to replay or find the original expiry receipt. Resume only
+after the desired revisions are confirmed expired, or a new operation has
+committed. Core retains exact `ExpiryRequest` byte replay for lower-level
+callers that store that request; that is separate from the CLI's
+same-candidate recovery.
 
 Fresh observation of a known expired revision returns `Expired`; a revision
 that never existed returns `NotFound`. Already-held immutable snapshots and
