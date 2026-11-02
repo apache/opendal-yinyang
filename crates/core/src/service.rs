@@ -875,11 +875,12 @@ impl MetadataService {
             }
         }
         if !pending.is_empty() {
+            ensure_writer_healthy(&self.writer_poisoned)?;
             let mut restored = Vec::with_capacity(pending.len());
             for (_, bytes) in &pending {
                 restored.push(self.restore_transaction(bytes).await?);
             }
-            let committed = self.commit_batch(&restored).await?;
+            let committed = self.publish_restored(&restored).await?;
             for ((index, _), outcome) in pending.into_iter().zip(committed) {
                 outcomes[index] = Some(outcome);
             }
@@ -895,22 +896,26 @@ impl MetadataService {
         ensure_writer_healthy(&self.writer_poisoned)?;
         let transaction =
             SqliteTransaction::new(self.writer.clone(), gate, Arc::clone(&self.writer_poisoned));
-        let result = self.expire_inner(request).await;
-        if result.as_ref().is_err()
-            || result
-                .as_ref()
-                .is_ok_and(|outcome| matches!(outcome, Outcome::Unknown(_)))
-        {
-            transaction.rollback().await;
-        } else {
-            transaction.disarm();
-        }
+        let result = match self.expire_inner(request).await {
+            Ok((outcome, published)) => {
+                if published && !matches!(&outcome, Outcome::Unknown(_)) {
+                    transaction.disarm();
+                } else {
+                    transaction.rollback().await;
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                transaction.rollback().await;
+                Err(error)
+            }
+        };
         match result {
             Err(error) if error.kind() == ErrorKind::Storage => Ok(Outcome::Retryable),
             result => result,
         }
     }
-    async fn expire_inner(&self, request: &ExpiryRequest) -> Result<Outcome> {
+    async fn expire_inner(&self, request: &ExpiryRequest) -> Result<(Outcome, bool)> {
         db_call(&self.writer, |c| {
             c.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
             Ok(())
@@ -925,10 +930,10 @@ impl MetadataService {
                     "identity reused for a different request",
                 ));
             }
-            return Ok(Outcome::Committed(receipt));
+            return Ok((Outcome::Committed(receipt), false));
         }
         if old != request.expected_latest() {
-            return Ok(Outcome::Conflict);
+            return Ok((Outcome::Conflict, false));
         }
         for revision in request.candidates() {
             let candidate = *revision;
@@ -980,7 +985,7 @@ impl MetadataService {
         let receipt_key = id.to_vec();
         let change_key = receipt.cursor.key();
         let candidates = request.candidates().to_vec();
-        let inserted = db_call(&self.writer, move |c| {
+        db_call(&self.writer, move |c| {
             for candidate in &candidates {
                 let updated = c
                     .execute(
@@ -1021,7 +1026,6 @@ impl MetadataService {
             Ok(())
         })
         .await?;
-        let _ = inserted;
         if db_call(&self.writer, |c| {
             c.execute_batch("COMMIT").map_err(sql)?;
             Ok(())
@@ -1029,9 +1033,9 @@ impl MetadataService {
         .await
         .is_err()
         {
-            return Ok(Outcome::Unknown(request.id()));
+            return Ok((Outcome::Unknown(request.id()), false));
         }
-        Ok(Outcome::Committed(receipt))
+        Ok((Outcome::Committed(receipt), true))
     }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
@@ -1040,6 +1044,13 @@ impl MetadataService {
             .remove(0))
     }
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        let plans = requests
+            .iter()
+            .map(Transaction::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_frozen_batch(&plans).await
+    }
+    async fn publish_restored(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
         if requests.len() > 4096 {
             return Err(Error::unsupported(
                 "service batch",
@@ -1051,13 +1062,10 @@ impl MetadataService {
         }
         let gate = Arc::clone(&self.write_gate).lock_owned().await;
         ensure_writer_healthy(&self.writer_poisoned)?;
-        // Even an in-process caller must have registered durable readiness.
-        let mut restored = Vec::new();
         for request in requests {
             request.validate(self.filesystem)?;
-            restored.push(self.restore_transaction(&request.to_bytes()?).await?);
         }
-        let result = self.publish(&restored, gate).await;
+        let result = self.publish(requests, gate).await;
         match result {
             Err(e) if e.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
@@ -1321,7 +1329,7 @@ mod admission_tests {
         Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE authority SET profile='yinyang-sqlite-1' WHERE singleton=1",
+                "UPDATE authority SET profile='yinyang-sqlite-2' WHERE singleton=1",
                 [],
             )
             .unwrap();
@@ -1338,7 +1346,7 @@ mod admission_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-sqlite-1");
+        assert_eq!(profile, "yinyang-sqlite-2");
     }
 
     #[tokio::test]

@@ -365,6 +365,14 @@ mod tests {
         );
         assert_eq!(i32::from(BackendError::MutationIo.errno()), libc::EIO);
         assert_eq!(
+            i32::from(runtime_errno(crate::runtime::ErrorKind::Expired)),
+            libc::EIO
+        );
+        assert_eq!(
+            i32::from(core_errno(yinyang_core::ErrorKind::Expired)),
+            libc::EIO
+        );
+        assert_eq!(
             i32::from(BackendError::MutationUnsupported.errno()),
             libc::EOPNOTSUPP
         );

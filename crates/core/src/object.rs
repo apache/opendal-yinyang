@@ -648,6 +648,40 @@ impl ObjectFs {
     pub(crate) async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
         let (revision, _, _) = Transaction::verify_identity(bytes, self.filesystem)?;
         let snapshot = self.observe_known_revision(revision).await?;
+        self.restore_transaction_from_snapshot(bytes, snapshot)
+            .await
+    }
+    async fn restore_transaction_from_latest(
+        &self,
+        bytes: &[u8],
+        latest: &ObjectState,
+    ) -> Result<Transaction> {
+        let (revision, _, _) = Transaction::verify_identity(bytes, self.filesystem)?;
+        let snapshot = if revision == latest.revision {
+            latest.view_cached(self.cache.clone())
+        } else {
+            let (_, reference) = self
+                .revision_reference(latest, revision)
+                .await?
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotFound,
+                        "observe known revision",
+                        "revision is not known in this lineage",
+                    )
+                })?;
+            self.load(PackedRef::from_wire(decode(&reference)?)?, revision, None)
+                .await?
+                .view_cached(self.cache.clone())
+        };
+        self.restore_transaction_from_snapshot(bytes, snapshot)
+            .await
+    }
+    async fn restore_transaction_from_snapshot(
+        &self,
+        bytes: &[u8],
+        snapshot: Snapshot,
+    ) -> Result<Transaction> {
         let (_, files) = Transaction::inspect(bytes)?;
         let mut prepared = Vec::new();
         for file in files {
@@ -665,12 +699,13 @@ impl ObjectFs {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let latest = self.observe_latest().await?;
+        let latest = self.observe_state().await?;
+        let latest_view = latest.view_cached(self.cache.clone());
         let mut outcomes = vec![None; requests.len()];
         let mut pending = Vec::new();
         for (index, bytes) in requests.iter().enumerate() {
             let (_, id, digest) = Transaction::verify_identity(bytes, self.filesystem)?;
-            if let Some(receipt) = latest.receipt(id).await? {
+            if let Some(receipt) = latest_view.receipt(id).await? {
                 if receipt.request_digest != digest {
                     return Err(Error::invalid(
                         "commit frozen batch",
@@ -685,7 +720,7 @@ impl ObjectFs {
         if !pending.is_empty() {
             let mut restored = Vec::with_capacity(pending.len());
             for (_, bytes) in &pending {
-                restored.push(self.restore_transaction(bytes).await?);
+                restored.push(self.restore_transaction_from_latest(bytes, &latest).await?);
             }
             let committed = self.commit_batch(&restored).await?;
             for ((index, _), outcome) in pending.into_iter().zip(committed) {
@@ -800,7 +835,7 @@ impl ObjectFs {
                 .history
                 .set(
                     &self.data,
-                    base.revision.to_bytes().to_vec(),
+                    history_key(RevisionStatus::Readable, base.revision),
                     Some(encode(&base.reference.wire())?),
                 )
                 .await?;
@@ -957,7 +992,7 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             "unknown service binding profile",
         ));
     }
-    if bytes.starts_with(b"YYHEAD01") {
+    if bytes.starts_with(b"YYHEAD01") || bytes.starts_with(b"YYHEAD02") {
         return Err(Error::unsupported(
             "open filesystem",
             "legacy format is not supported by the object authority",

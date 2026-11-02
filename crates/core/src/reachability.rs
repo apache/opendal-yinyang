@@ -592,9 +592,18 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                     Ok(())
                 })
             }
-            ObjectTable::History => match <[u8; 24]>::try_from(key) {
-                Ok(revision) => {
-                    let revision = Revision::from_bytes(revision);
+            ObjectTable::History => {
+                if key.len() != 25 || key[0] > 1 {
+                    Err(Error::corrupt(
+                        "inspect physical roots",
+                        "invalid typed history key",
+                    ))
+                } else {
+                    let revision = Revision::from_bytes(
+                        key[1..]
+                            .try_into()
+                            .expect("the typed history key was length checked"),
+                    );
                     if revision > self.revision {
                         Err(Error::corrupt(
                             "inspect physical roots",
@@ -608,11 +617,7 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                             })
                     }
                 }
-                Err(_) => Err(Error::corrupt(
-                    "inspect physical roots",
-                    "invalid retained revision key",
-                )),
-            },
+            }
         };
         if let Err(error) = result {
             self.inspection

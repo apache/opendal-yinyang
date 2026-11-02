@@ -482,7 +482,9 @@ async fn service_rejects_unregistered_content_and_missing_guards() {
         .await
         .unwrap_err();
     assert!(
-        error.message().contains("missing mandatory predicate"),
+        error
+            .message()
+            .contains("canonical request digest mismatch"),
         "{error}"
     );
     committed(service.commit(&plan).await.unwrap());
@@ -762,4 +764,68 @@ async fn service_client_expiry_preserves_remote_snapshot_reads() {
     }));
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_expiry_early_exits_release_the_writer_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    let initial = service.observe_latest().await.unwrap();
+    let mut current = Planner::new(&initial, CommitId::generate());
+    current
+        .create_directory(service.root(), "current")
+        .await
+        .unwrap();
+    let current = committed(service.commit(&current.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        service.filesystem(),
+        CommitId::generate(),
+        current.cursor.revision,
+        vec![initial.revision()],
+    )
+    .unwrap();
+    let first = committed(service.expire(&request).await.unwrap());
+    assert_eq!(committed(service.expire(&request).await.unwrap()), first);
+
+    let mut after_replay = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    after_replay
+        .create_directory(service.root(), "after-replay")
+        .await
+        .unwrap();
+    committed(
+        service
+            .commit(&after_replay.finish().unwrap())
+            .await
+            .unwrap(),
+    );
+
+    let conflict = ExpiryRequest::new(
+        service.filesystem(),
+        CommitId::generate(),
+        first.cursor.revision,
+        vec![current.cursor.revision],
+    )
+    .unwrap();
+    assert_eq!(service.expire(&conflict).await.unwrap(), Outcome::Conflict);
+
+    let mut after_conflict = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    after_conflict
+        .create_directory(service.root(), "after-conflict")
+        .await
+        .unwrap();
+    committed(
+        service
+            .commit(&after_conflict.finish().unwrap())
+            .await
+            .unwrap(),
+    );
 }
