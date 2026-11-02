@@ -1255,10 +1255,14 @@ fn object_publication_journal_restore_preserves_history_and_unknown() {
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage"]
-fn explicit_expiry_preserves_clean_ready_work_and_read_semantics() {
-    for publication in [Publication::Object, Publication::Service] {
-        explicit_expiry_clean_ready_work(publication);
-    }
+fn explicit_expiry_preserves_clean_ready_work_object() {
+    explicit_expiry_clean_ready_work(Publication::Object);
+}
+
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage"]
+fn explicit_expiry_preserves_clean_ready_work_service() {
+    explicit_expiry_clean_ready_work(Publication::Service);
 }
 
 fn explicit_expiry_clean_ready_work(publication: Publication) {
