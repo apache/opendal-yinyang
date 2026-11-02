@@ -3281,4 +3281,127 @@ mod tests {
         assert!(!staging.join("runtime.lock").exists());
         assert_eq!(std::fs::read(&database).unwrap(), before);
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expiry_admits_empty_declared_state_and_reports_already_expired() {
+        use crate::support::TestBackend;
+        use std::sync::Arc;
+        use yinyang_core::{Fs, Planner};
+
+        let backend = TestBackend::default();
+        let fs = Fs::create(backend.operator()).await.unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(fs);
+        for name in ["one", "two"] {
+            let snapshot = authority.observe_latest().await.unwrap();
+            let mut planner = Planner::new(&snapshot, CommitId::generate());
+            planner
+                .create_directory(authority.root(), name)
+                .await
+                .unwrap();
+            assert!(matches!(
+                authority.commit(&planner.finish().unwrap()).await.unwrap(),
+                CommitOutcome::Committed(_)
+            ));
+        }
+        let candidate = authority.retained_revisions().await.unwrap()[0];
+
+        let temp = tempdir().unwrap();
+        let staging = temp.path().join("state");
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[candidate],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::Committed);
+        assert!(!staging.join("staging.db").exists());
+        assert!(matches!(
+            authority
+                .observe_revision(candidate)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Expired
+        ));
+
+        let latest = authority.observe_latest().await.unwrap().revision();
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[candidate],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::AlreadyExpired);
+        assert_eq!(authority.observe_latest().await.unwrap().revision(), latest);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expiry_refuses_a_clean_recoverable_handle_base() {
+        use crate::support::TestBackend;
+        use std::sync::Arc;
+        use yinyang_core::Fs;
+
+        let backend = TestBackend::default();
+        let fs = Fs::create(backend.operator()).await.unwrap();
+        let authority: Arc<dyn Authority> = Arc::new(fs);
+        let temp = tempdir().unwrap();
+        let staging = temp.path().join("state");
+        let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+        let (node, receipt) = runtime
+            .create_file_with_node(authority.root(), "file", false)
+            .await
+            .unwrap();
+        let handle = runtime
+            .open_node(node, true)
+            .await
+            .unwrap()
+            .release()
+            .unwrap();
+        runtime
+            .create_directory(authority.root(), "later")
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let protected = receipt.cursor.revision;
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[protected],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::Refused);
+        assert!(report.revisions.iter().any(|decision| {
+            decision.revision == revision_hex(protected)
+                && decision.state == ExpiryDecisionState::Protected
+                && decision.reasons.contains(&"staging_base")
+        }));
+        assert!(authority.observe_revision(protected).await.is_ok());
+
+        let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+        let mut recovered = runtime.recover(handle).await.unwrap();
+        recovered.close().await.unwrap();
+        drop(runtime);
+        let report = expire_managed_retention(
+            authority.as_ref(),
+            &staging,
+            &[protected],
+            &[],
+            CommitId::generate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.state, ExpiryReportState::Committed);
+    }
 }

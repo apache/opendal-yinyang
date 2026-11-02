@@ -157,7 +157,9 @@ retained input remain. Receipt-capable adapters look up the original receipt on
 the next retry pass; otherwise they replay the same request identity with the
 same source and precondition. A later observation never proves that an
 ambiguous request committed. A newer local edit is not replaced by the older
-accepted input.
+accepted input. Managed sends exact frozen request bytes through the
+receipt-first frozen batch and can restore a pending request's exact known base
+when that revision is logically expired.
 
 Conflicts retain both available sides until an explicit decision. `--keep
 local` publishes the current local decision against a newly observed remote
