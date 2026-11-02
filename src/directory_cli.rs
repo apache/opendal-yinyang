@@ -22,6 +22,7 @@ use clap::Subcommand;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use uuid::Uuid;
 use yinyang::core::{CommitId, Fs, Receipt};
 use yinyang::runtime::{Error, ErrorKind};
@@ -164,12 +165,12 @@ pub fn classify_outcome(
 }
 
 async fn retry(fs: &Fs, state: &Path, commit_id: Uuid) -> CliResult<ExitCode> {
-    let journal = DirectoryJournal::open(fs, state).await?;
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
     publish(&journal, CommitId::from_bytes(*commit_id.as_bytes())).await
 }
 
 async fn export(fs: &Fs, state: &Path, commit_id: Uuid, destination: &Path) -> CliResult<ExitCode> {
-    let journal = DirectoryJournal::open(fs, state).await?;
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
     let id = CommitId::from_bytes(*commit_id.as_bytes());
     let status = journal.status(id).await?.ok_or_else(|| {
         CliError::invalid(

@@ -947,11 +947,7 @@ mod tests {
     #[tokio::test]
     async fn write_is_committed_but_only_sync_local_barriers_it() {
         let backend = crate::support::TestBackend::default();
-        let authority = Arc::new(
-            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority = Arc::new(yinyang_core::Fs::create(backend.operator()).await.unwrap());
         let temp = tempfile::tempdir().unwrap();
         let staging = temp.path().join("staging");
         let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
@@ -1073,11 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn frozen_plan_is_durable_before_commit_dispatch() {
         let backend = crate::support::TestBackend::default();
-        let inner = Arc::new(
-            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let inner = Arc::new(yinyang_core::Fs::create(backend.operator()).await.unwrap());
         let temp = tempfile::tempdir().unwrap();
         let staging = temp.path().join("staging");
         {

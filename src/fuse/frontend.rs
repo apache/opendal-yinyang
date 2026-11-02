@@ -673,7 +673,7 @@ fn revision_hex(revision: yinyang_core::Revision) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BackendProfile, Fs};
+    use crate::core::Fs;
     use crate::runtime::Runtime;
     use crate::support::TestBackend;
     use std::sync::Arc;
@@ -685,7 +685,7 @@ mod tests {
     ) -> (ManagedBackend, Arc<dyn Authority>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let authority: Arc<dyn Authority> = Arc::new(
-            Fs::open(backend.operator(), BackendProfile::Minio)
+            Fs::open(backend.operator())
                 .await
                 .unwrap_or_else(|_| unreachable!("test creates the authority first")),
         );
@@ -713,9 +713,7 @@ mod tests {
     #[tokio::test]
     async fn dirty_shared_node_reports_staged_size_in_path_attrs() {
         let backend_state = TestBackend::default();
-        Fs::create(backend_state.operator(), BackendProfile::Minio)
-            .await
-            .unwrap();
+        Fs::create(backend_state.operator()).await.unwrap();
         let (backend, authority, _temp) = backend(&backend_state, false).await;
         let (id, _) = backend
             .mount
@@ -732,11 +730,8 @@ mod tests {
     #[tokio::test]
     async fn repeated_metadata_callbacks_reuse_the_accepted_snapshot() {
         let backend_state = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend_state.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> =
+            Arc::new(Fs::create(backend_state.operator()).await.unwrap());
         let writer_temp = tempfile::tempdir().unwrap();
         let writer = Runtime::open(authority.clone(), writer_temp.path())
             .await

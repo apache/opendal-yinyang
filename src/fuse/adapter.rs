@@ -1125,7 +1125,7 @@ fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BackendProfile, Fs};
+    use crate::core::Fs;
     use crate::fuse::frontend::{ManagedBackend, ManagedFile};
     use crate::mount::Mount;
     use crate::runtime::Runtime;
@@ -1135,11 +1135,8 @@ mod tests {
     #[tokio::test]
     async fn release_drops_the_last_mount_reference_on_the_dispatch_thread() {
         let backend_state = TestBackend::default();
-        let authority: Arc<dyn Authority> = Arc::new(
-            Fs::create(backend_state.operator(), BackendProfile::Minio)
-                .await
-                .unwrap(),
-        );
+        let authority: Arc<dyn Authority> =
+            Arc::new(Fs::create(backend_state.operator()).await.unwrap());
         let writer_temp = tempfile::tempdir().unwrap();
         let writer = Runtime::open(authority.clone(), writer_temp.path())
             .await

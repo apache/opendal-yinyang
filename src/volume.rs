@@ -19,13 +19,13 @@
 use crate::direct::{self, DirectNamespace, DirectStorageBinding};
 use crate::runtime::{Error, ErrorKind, Result, Runtime};
 use opendal::Operator;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use yinyang_core::service::ServiceClient;
-use yinyang_core::{Authority, BackendProfile, ErrorKind as CoreErrorKind, Fs};
+use yinyang_core::{Authority, ErrorKind as CoreErrorKind, Fs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -139,39 +139,20 @@ pub enum Publication {
     Object,
     Service,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum RawStorageProfile {
+pub enum StorageProfile {
     AmazonS3,
     Minio,
 }
-
-impl From<RawStorageProfile> for BackendProfile {
-    fn from(profile: RawStorageProfile) -> Self {
-        match profile {
-            RawStorageProfile::AmazonS3 => BackendProfile::AmazonS3,
-            RawStorageProfile::Minio => BackendProfile::Minio,
+impl StorageProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AmazonS3 => "amazon-s3",
+            Self::Minio => "minio",
         }
     }
 }
-
-fn serialize_storage_profile<S>(
-    profile: &BackendProfile,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(backend_profile_name(*profile))
-}
-
-fn backend_profile_name(profile: BackendProfile) -> &'static str {
-    match profile {
-        BackendProfile::AmazonS3 => "amazon-s3",
-        BackendProfile::Minio => "minio",
-    }
-}
-
 /// Strict configuration: unknown fields are errors, not ignored security policy.
 /// Storage credentials and RPC token are supplied separately, never serialized.
 #[derive(Clone, Debug, Serialize)]
@@ -181,8 +162,7 @@ pub struct VolumeConfig {
     pub access: Access,
     pub frontend: Frontend,
     pub publication: Publication,
-    #[serde(serialize_with = "serialize_storage_profile")]
-    pub storage_profile: BackendProfile,
+    pub storage_profile: StorageProfile,
     #[serde(skip_serializing_if = "path_is_empty")]
     pub staging: PathBuf,
     #[serde(default)]
@@ -198,7 +178,7 @@ struct RawVolumeConfig {
     access: Access,
     frontend: Frontend,
     publication: Publication,
-    storage_profile: RawStorageProfile,
+    storage_profile: StorageProfile,
     #[serde(default)]
     staging: PathBuf,
     #[serde(default)]
@@ -219,7 +199,7 @@ impl<'de> Deserialize<'de> for VolumeConfig {
             access: raw.access,
             frontend: raw.frontend,
             publication: raw.publication,
-            storage_profile: raw.storage_profile.into(),
+            storage_profile: raw.storage_profile,
             staging: raw.staging,
             read_only: raw.read_only.unwrap_or(raw.model == Model::Direct),
             service_address: raw.service_address,
@@ -762,11 +742,11 @@ pub fn storage_connection() -> Result<StorageConnection> {
     })
 }
 
-pub fn storage_profile_from_env() -> Result<BackendProfile> {
+pub fn storage_profile_from_env() -> Result<StorageProfile> {
     match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
-        Ok("amazon-s3") => Ok(BackendProfile::AmazonS3),
-        Ok("minio") => Ok(BackendProfile::Minio),
-        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => Ok(BackendProfile::AmazonS3),
+        Ok("amazon-s3") => Ok(StorageProfile::AmazonS3),
+        Ok("minio") => Ok(StorageProfile::Minio),
+        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => Ok(StorageProfile::AmazonS3),
         _ => Err(Error::Core(yinyang_core::Error::new(
             CoreErrorKind::Invalid,
             "storage profile",
@@ -851,7 +831,7 @@ impl Volume {
             ));
         }
         let authority: Arc<dyn Authority> = match config.publication {
-            Publication::Object => Arc::new(Fs::open(operator, config.storage_profile).await?),
+            Publication::Object => Arc::new(Fs::open(operator).await?),
             Publication::Service => {
                 let token = token.ok_or_else(|| {
                     Error::Core(yinyang_core::Error::new(
@@ -907,7 +887,7 @@ pub fn direct_storage_binding(
             .map_err(|_| Error::Invalid("YINYANG_S3_ENDPOINT is not valid UTF-8"))?,
         None => "provider-default".to_owned(),
     };
-    let profile = backend_profile_name(config.storage_profile);
+    let profile = config.storage_profile.as_str();
     DirectStorageBinding::new(
         operator.info().scheme(),
         profile,

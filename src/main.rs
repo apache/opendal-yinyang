@@ -20,6 +20,7 @@ use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
 use yinyang::core::{CommitId, Fs, Revision};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 #[cfg(target_os = "linux")]
@@ -493,7 +494,7 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
     }
     let connection = yinyang::volume::storage_connection()
         .map_err(|error| CliError::from_runtime(CliStage::Operator, error))?;
-    let profile = yinyang::volume::storage_profile_from_env()
+    yinyang::volume::storage_profile_from_env()
         .map_err(|error| CliError::from_runtime(CliStage::Operator, error))?;
     if let Command::Serve { database, listen } = &cli.command {
         let token = connection
@@ -521,14 +522,14 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
     }
     let (operator, _) = connection.into_parts();
     if matches!(cli.command, Command::Create) {
-        let fs = Fs::create(operator, profile).await?;
+        let fs = Fs::create(operator).await?;
         println!(
             "filesystem ready at revision {}",
             revision(fs.observe_latest().await?.revision())
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let fs = Fs::open(operator, profile).await?;
+    let fs = Fs::open(operator).await?;
     match cli.command {
         Command::Create
         | Command::Serve { .. }
@@ -548,7 +549,7 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             let uuid = commit_id.unwrap_or_else(uuid::Uuid::new_v4);
             let id = CommitId::from_bytes(*uuid.as_bytes());
             let journal = if let Some(state) = &state {
-                let journal = yinyang::DirectoryJournal::open(&fs, state).await?;
+                let journal = yinyang::DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
                 if journal.status(id).await?.is_some() {
                     return Err(format!(
                         "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",

@@ -36,9 +36,7 @@ pub use data::{ContentDescriptor, ContentEdit, ContentId, DataStore, PreparedCon
 pub use error::{Error, ErrorKind, Result};
 pub use identity::{CommitId, NodeId};
 pub use namespace::{DirectoryEntry, Link, Node, NodeKind};
-pub use object::{
-    BackendProfile, Cursor, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot,
-};
+pub use object::{Cursor, ObjectFs as Fs, Outcome as CommitOutcome, Receipt, Revision, Snapshot};
 pub use snapshot::{DirectoryPage, FileVersion, ScanToken};
 pub use transaction::{Planner, Transaction};
 

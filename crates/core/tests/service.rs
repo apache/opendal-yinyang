@@ -18,7 +18,7 @@
 mod support;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang_core::object::{BackendProfile, ObjectFs};
+use yinyang_core::object::ObjectFs;
 use yinyang_core::service::{MetadataService, ServiceClient, serve};
 use yinyang_core::{
     Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, Planner,
@@ -187,9 +187,7 @@ async fn suite(fs: &dyn Authority) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_contract_object_and_metadata_service() {
     let object_backend = TestBackend::default();
-    let object = ObjectFs::create(object_backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    let object = ObjectFs::create(object_backend.operator()).await.unwrap();
     suite(&object).await;
     let dir = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
@@ -208,10 +206,7 @@ async fn authenticated_service_protocol_and_restart() {
         .await
         .unwrap();
     assert_eq!(
-        ObjectFs::open(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap_err()
-            .kind(),
+        ObjectFs::open(backend.operator()).await.unwrap_err().kind(),
         ErrorKind::Unsupported
     );
     let token = "test-only-service-token-32-bytes-long";

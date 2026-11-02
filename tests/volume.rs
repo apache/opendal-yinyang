@@ -18,7 +18,7 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 use support::TestBackend;
-use yinyang::core::{BackendProfile, Fs};
+use yinyang::core::Fs;
 use yinyang::volume::*;
 
 #[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
@@ -53,7 +53,7 @@ fn direct_config(staging: std::path::PathBuf) -> VolumeConfig {
         access: Access::Mount,
         frontend: Frontend::Fuse,
         publication: Publication::Object,
-        storage_profile: BackendProfile::Minio,
+        storage_profile: StorageProfile::Minio,
         staging,
         read_only: false,
         service_address: None,
@@ -67,7 +67,7 @@ fn config(path: std::path::PathBuf) -> VolumeConfig {
         access: Access::Mount,
         frontend: Frontend::Library,
         publication: Publication::Object,
-        storage_profile: BackendProfile::Minio,
+        storage_profile: StorageProfile::Minio,
         staging: path,
         read_only: false,
         service_address: None,
@@ -315,9 +315,7 @@ fn direct_sync_requires_conditional_delete_and_library_admission() {
 async fn read_only_volume_enforces_policy_on_new_and_recovered_handles() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    Fs::create(backend.operator(), BackendProfile::Minio)
-        .await
-        .unwrap();
+    Fs::create(backend.operator()).await.unwrap();
     let cfg = config(temp.path().join("state"));
     let volume = Volume::open(cfg.clone(), backend.operator(), None)
         .await
@@ -413,11 +411,8 @@ async fn managed_restore_rejects_both_containment_directions_before_creation() {
 
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
-    let authority: Arc<dyn yinyang::core::Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn yinyang::core::Authority> =
+        Arc::new(Fs::create(backend.operator()).await.unwrap());
     let source_root = temp.path().join("source-root");
     let source_state = temp.path().join("source-state");
     std::fs::create_dir(&source_root).unwrap();

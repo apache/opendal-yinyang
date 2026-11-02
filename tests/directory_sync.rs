@@ -30,9 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use support::TestBackend;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
-use yinyang::core::{
-    Authority, BackendProfile, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction,
-};
+use yinyang::core::{Authority, CommitOutcome, Fs, NodeId, Revision, Snapshot, Transaction};
 use yinyang::replica::{DirectorySync, Resolution};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 use yinyang::sync::{FileMetadata, Sync};
@@ -371,15 +369,11 @@ async fn service_authority() -> (
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn initial_nested_sync_converges_in_object_and_service_modes() {
     exercise_initial_pull(Arc::new(
-        Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
+        Fs::create(TestBackend::default().operator()).await.unwrap(),
     ))
     .await;
     exercise_initial_push(Arc::new(
-        Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
+        Fs::create(TestBackend::default().operator()).await.unwrap(),
     ))
     .await;
 
@@ -397,9 +391,7 @@ async fn initial_nested_sync_converges_in_object_and_service_modes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renamed_and_re_edited_local_file_converges() {
     exercise_rename_with_edit(Arc::new(
-        Fs::create(TestBackend::default().operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
+        Fs::create(TestBackend::default().operator()).await.unwrap(),
     ))
     .await;
 }
@@ -492,11 +484,7 @@ impl Authority for HeldAuthority {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_edit_during_delayed_publication_receipt_stays_pending() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Notify::new());
     let held = Arc::new(HeldAuthority::new(
@@ -597,11 +585,7 @@ async fn local_edit_during_delayed_publication_receipt_stays_pending() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("payload");
     let state = temp.path().join("state");
@@ -775,11 +759,7 @@ async fn interleaved_remote_edit_is_not_overwritten_by_local_run() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_deletion_during_delayed_publication_receipt_stays_pending() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Notify::new());
     let held = Arc::new(HeldAuthority::new(
@@ -879,11 +859,7 @@ async fn local_deletion_during_delayed_publication_receipt_stays_pending() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn namespace_only_rename_receipt_keeps_interleaved_content() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("payload");
     let state = temp.path().join("state");
@@ -1034,11 +1010,7 @@ async fn namespace_only_rename_receipt_keeps_interleaved_content() {
 #[tokio::test]
 async fn composite_preflight_rejects_an_old_sync_profile() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let state = temp.path().join("state");
@@ -1078,11 +1050,7 @@ async fn composite_preflight_rejects_an_old_sync_profile() {
 #[tokio::test]
 async fn composite_preflight_rejects_an_old_staging_profile() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let state = temp.path().join("state");

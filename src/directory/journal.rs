@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome, Fs, NodeId, Receipt, Revision, Snapshot, Transaction,
+    Authority, CommitId, CommitOutcome, NodeId, Receipt, Revision, Snapshot, Transaction,
 };
 
 const SCHEMA: &[store::TableColumns<'static>] = &[
@@ -151,7 +151,7 @@ impl DirectoryInspection {
 }
 
 struct Inner {
-    fs: Fs,
+    authority: Arc<dyn Authority>,
     journal_directory: PathBuf,
     database: Arc<Mutex<Connection>>,
     gate: Mutex<()>,
@@ -174,17 +174,17 @@ impl std::fmt::Debug for DirectoryJournal {
 }
 
 impl DirectoryJournal {
-    /// Open or create a journal bound to one object publication authority.
+    /// Open or create a journal bound to one shared publication authority.
     ///
     /// Keep this directory outside every source tree published through it.
     /// [`Self::prepare`] rejects a source that contains the journal directory.
-    pub async fn open(fs: &Fs, directory: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open(authority: Arc<dyn Authority>, directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref().to_owned();
         tokio::fs::create_dir_all(&directory).await.map_err(local)?;
         let directory = tokio::fs::canonicalize(&directory).await.map_err(local)?;
         let path = directory.join("directory.db");
-        let filesystem = *fs.filesystem().as_bytes();
-        let root = *fs.root().as_bytes();
+        let filesystem = *authority.filesystem().as_bytes();
+        let root = *authority.root().as_bytes();
         let database = tokio::task::spawn_blocking(move || -> Result<_> {
             let exists = path.try_exists().map_err(local)?;
             let mut connection = store::open_read_write(&path, !exists).map_err(store_error)?;
@@ -230,7 +230,7 @@ impl DirectoryJournal {
         .map_err(local)??;
         Ok(Self {
             inner: Arc::new(Inner {
-                fs: fs.clone(),
+                authority,
                 journal_directory: directory,
                 database: Arc::new(Mutex::new(database)),
                 gate: Mutex::new(()),
@@ -239,11 +239,11 @@ impl DirectoryJournal {
     }
 
     pub fn filesystem(&self) -> NodeId {
-        self.inner.fs.filesystem()
+        self.inner.authority.filesystem()
     }
 
     pub fn root(&self) -> NodeId {
-        self.inner.fs.root()
+        self.inner.authority.root()
     }
 
     /// Build and durably accept one new publication request.
@@ -275,7 +275,8 @@ impl DirectoryJournal {
             ));
         }
         let prepared =
-            prepare_directory_request(&self.inner.fs, observed, source, commit_id).await?;
+            prepare_directory_request(self.inner.authority.as_ref(), observed, source, commit_id)
+                .await?;
         let request = prepared.transaction.to_bytes()?;
         let (baseline, stored_id, digest) = Transaction::inspect_identity(&request)?;
         if stored_id != commit_id || digest != prepared.transaction.digest() {
@@ -285,7 +286,7 @@ impl DirectoryJournal {
             ));
         }
         let entries = prepared.manifest.install_entries()?;
-        validate_install_entries(&self.inner.fs, &entries)?;
+        validate_install_entries(self.inner.authority.as_ref(), &entries)?;
         let manifest = borsh::to_vec(&prepared.manifest).map_err(local)?;
         let source = source.to_string_lossy().into_owned();
         self.call(move |connection| {
@@ -337,7 +338,7 @@ impl DirectoryJournal {
             DirectoryState::Prepared | DirectoryState::Unknown | DirectoryState::Retryable => {}
         }
         if matches!(&status.state, DirectoryState::Unknown) {
-            match receipt_for(&self.inner.fs, &status.intent).await {
+            match receipt_for(self.inner.authority.as_ref(), &status.intent).await {
                 Ok(Some(receipt)) => {
                     if let Err(error) = save_state_async(
                         self,
@@ -366,7 +367,7 @@ impl DirectoryJournal {
                 }
             }
         }
-        let request = match self.inner.fs.restore_transaction(&row.request).await {
+        let request = match self.inner.authority.restore_transaction(&row.request).await {
             Ok(request) => request,
             Err(error) => {
                 let error = Error::from(error);
@@ -426,7 +427,7 @@ impl DirectoryJournal {
                 return Err(error);
             }
         }
-        match self.inner.fs.commit(&request).await {
+        match self.inner.authority.commit(&request).await {
             Ok(CommitOutcome::Committed(receipt)) => {
                 if receipt.commit_id != commit_id || receipt.request_digest != row.digest() {
                     return Err(unknown_after_dispatch(
@@ -593,7 +594,7 @@ impl DirectoryJournal {
         }
         let manifest: DirectoryManifest = borsh::from_slice(&row.manifest).map_err(local)?;
         let entries = manifest.install_entries()?;
-        install_directory(&self.inner.fs, destination, entries)
+        install_directory(self.inner.authority.as_ref(), destination, entries)
             .await
             .map_err(Error::from)
     }
@@ -881,8 +882,15 @@ async fn claim_dispatch(journal: &DirectoryJournal, id: CommitId) -> Result<Disp
     ))
 }
 
-async fn receipt_for(fs: &Fs, intent: &DirectoryIntent) -> Result<Option<Receipt>> {
-    let receipt = fs.observe_latest().await?.receipt(intent.commit_id).await?;
+async fn receipt_for(
+    authority: &dyn Authority,
+    intent: &DirectoryIntent,
+) -> Result<Option<Receipt>> {
+    let receipt = authority
+        .observe_latest()
+        .await?
+        .receipt(intent.commit_id)
+        .await?;
     if let Some(receipt) = &receipt
         && receipt.request_digest != intent.request_digest
     {

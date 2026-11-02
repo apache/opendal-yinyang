@@ -20,7 +20,7 @@ mod support;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{Authority, BackendProfile, Fs};
+use yinyang::core::{Authority, Fs};
 use yinyang_native::{Mode, Session};
 
 async fn call(session: &mut Session, request: Value) -> Value {
@@ -32,11 +32,7 @@ async fn call(session: &mut Session, request: Value) -> Value {
 #[tokio::test]
 async fn mount_and_sync_bridge_share_real_core_contracts() {
     let backend = TestBackend::default();
-    let authority: Arc<dyn Authority> = Arc::new(
-        Fs::create(backend.operator(), BackendProfile::Minio)
-            .await
-            .unwrap(),
-    );
+    let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let temp = tempfile::tempdir().unwrap();
     let mut mount = Session::open(
         authority.clone(),

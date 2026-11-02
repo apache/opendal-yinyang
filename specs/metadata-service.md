@@ -15,6 +15,12 @@ synchronization; network-mounted database files are unsupported. Keep the
 database and its WAL together; copying only the live main database is not a
 backup procedure.
 
+The service owns one long-lived writer connection and one long-lived read-only
+connection. Clones share both connections. Reads and writes run through the
+blocking database helper, and writer operations use a process-local gate so a
+publication transaction cannot interleave with another write on the same
+connection. Independent service processes still coordinate through SQLite.
+
 The schema profile is `yinyang-sqlite-2`. The authority row retains filesystem
 and root identities plus the latest revision. Indexed valid-time records retain
 nodes, entries, receipts, and ordered changes. Each record has an inclusive
@@ -31,8 +37,9 @@ inserts name columns explicitly, so column order is not part of the schema
 signature. This admission is a format check, not a scan of all historical
 records.
 
-Writers serialize at the database boundary, but revalidate original logical
-predicates through the same transaction evaluator as object publication.
+Writers serialize through the process-local gate and at the database boundary,
+but revalidate original logical predicates through the same transaction
+evaluator as object publication.
 Disjoint name slots and file states can both succeed from one observation;
 membership scans, file state, emptiness, and ancestor predicates detect real
 conflicts. Every accepted batch member's namespace delta, receipt, and changes
@@ -164,6 +171,14 @@ A timeout does not cancel or prove rollback of an
 in-flight durable transaction. Resolve via a retained receipt or retry the
 exact frozen request. Absent receipt is not proof that a delayed request cannot
 still commit.
+
+Cancelling a publication drops every future handle that could enqueue another
+database call. Transaction cleanup waits for at most the blocking call that was
+already in flight, rolls back, and only then releases the writer gate. If
+`ROLLBACK` fails and SQLite has not returned to autocommit mode, the service
+logs a stable `yy metadata service: ROLLBACK failed` diagnostic and marks the
+writer connection poisoned. Later writes return `Storage` and require the caller
+to reopen the service; reads on the separate read connection remain available.
 
 Duplicate identity/digest returns the original receipt. Identity reused with a
 different digest is invalid. Reopening the same database retains receipts,

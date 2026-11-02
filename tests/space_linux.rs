@@ -23,7 +23,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{Authority, BackendProfile, Fs, NodeId, Revision};
+use yinyang::core::{Authority, Fs, NodeId, Revision};
 use yinyang::replica::{DirectorySync, Replica};
 use yinyang::space::{BackupPackageState, StagingBindingState, plan_managed_retention};
 use yinyang::sync::{FileMetadata, Sync};
@@ -47,9 +47,7 @@ fn revision_hex(revision: Revision) -> String {
 #[tokio::test]
 async fn explicit_backup_protects_readable_package_dependencies_without_original_root() {
     let backend = TestBackend::default();
-    let fs = Fs::create(backend.operator(), BackendProfile::AmazonS3)
-        .await
-        .unwrap();
+    let fs = Fs::create(backend.operator()).await.unwrap();
     let authority: Arc<dyn Authority> = Arc::new(fs);
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
