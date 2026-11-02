@@ -81,15 +81,16 @@ installs recoverable handles instead of reconciling a directory.
 
 ## Loading and admission
 
-`VolumeContext::load` is the only volume loader used by `yy --volume`. It reads
-the strict JSON document, resolves a non-empty relative `staging` against the
-configuration file's directory, applies `read_only` defaults, and runs the pure
-admission table. It does not require storage environment variables. The S3
-operator and `YINYANG_SERVICE_TOKEN` are built and read once, lazily, by the
-first storage-dependent operation. Building the operator does not contact
-storage. Authority connection remains on demand, so argument validation, local
-status and local export paths continue without storage configuration or
-connectivity.
+`VolumeContext::load` is the only file-based volume loader used by `yy
+--volume`. It reads the strict JSON document, resolves a non-empty relative
+`staging` against the configuration file's directory, applies `read_only`
+defaults, and runs the pure admission table. It does not require storage
+environment variables. The CLI and native bridge both obtain storage operators
+from `volume::StorageConnection`; the CLI reads `YINYANG_S3_*` and
+`YINYANG_SERVICE_TOKEN` once, while native configuration supplies the equivalent
+map and token explicitly. Building the operator does not contact storage.
+Authority connection remains on demand, so argument validation, local status
+and local export paths continue without storage configuration or connectivity.
 
 Admission is one table over `model`, `access`, `frontend`, `publication`,
 `read_only`, staging presence and `service_address`. It returns the admitted
@@ -134,10 +135,10 @@ and conditional ETag reads. Writable Direct adds write, whole-file multi-write,
 empty writes, conditional create and conditional ETag replace. Direct Sync also
 requires conditional ETag delete.
 
-`yy capabilities` reports `admitted` and the raw storage capability flags. The
-raw storage object remains useful for qualification and diagnosis. Missing
-storage primitives or unimplemented combinations fail before the authority is
-connected or staging state is created.
+`yy --volume volume.json capabilities` reports `admitted` and the raw storage
+capability flags. The raw storage object remains useful for qualification and
+diagnosis. Missing storage primitives or unimplemented combinations fail before
+the authority is connected or staging state is created.
 
 The mount entry point requires `frontend=fuse` before starting the kernel
 session. A valid library configuration therefore cannot be mounted by mistake.

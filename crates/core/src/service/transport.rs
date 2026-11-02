@@ -99,6 +99,15 @@ fn tag_kind(tag: u8) -> Result<ErrorKind> {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    #[test]
+    fn service_token_length_has_one_boundary() {
+        assert!(!super::super::valid_service_token(&"x".repeat(31)));
+        assert!(super::super::valid_service_token(&"x".repeat(32)));
+        assert!(super::super::valid_service_token(&"x".repeat(1024)));
+        assert!(!super::super::valid_service_token(&"x".repeat(1025)));
+    }
+
     #[test]
     fn domain_error_tags_round_trip_without_changing_existing_tags() {
         let kinds = [
@@ -165,7 +174,7 @@ async fn write_frame(stream: &mut TcpStream, value: &impl BorshSerialize) -> Res
     stream.flush().await.map_err(io)
 }
 fn validate_endpoint(addr: SocketAddr, token: &str) -> Result<()> {
-    if !addr.ip().is_loopback() || token.len() < 32 || token.len() > 1024 {
+    if !addr.ip().is_loopback() || !super::valid_service_token(token) {
         return Err(Error::unsupported(
             "metadata RPC",
             "requires loopback and a 32..=1024 byte authentication token",

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod support;
 use std::sync::Arc;
 use support::*;
 use yinyang_core::{Authority, CommitId, ContentEdit, ErrorKind, NodeId};
+use yinyang_test_support as support;
 
 use yinyang_core::namespace::NodeKind as IndexedKind;
 use yinyang_core::object::{ObjectFs, Outcome};

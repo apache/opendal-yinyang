@@ -26,6 +26,8 @@ and CI. Run `cargo x --help` to list its commands.
 
 - `cargo x check` checks all workspace targets.
 - `cargo x test` runs all workspace tests.
+- `cargo x test-managed-sync` runs real-process Managed Sync acceptance against
+  isolated S3-compatible storage.
 - `cargo x test-linux-fuse` runs real Linux FUSE acceptance through `yy` and
   `/dev/fuse`.
 - `cargo x test-linux-direct` runs deterministic read-only and writable Direct
@@ -33,6 +35,8 @@ and CI. Run `cargo x --help` to list its commands.
   mount.
 - `cargo x test-linux-operations` runs installed Linux CLI and lifecycle checks.
 - `cargo x test-linux-recovery` runs isolated backup and recovery acceptance.
+- `cargo x bench-linux-cost` runs the reproducible Linux product-path benchmark
+  and writes its output to the requested `target/linux-cost/` path.
 - `cargo x lint` checks Rust formatting, Clippy, documentation, TOML formatting,
   and spelling.
 - `cargo x licenses` checks source headers and dependency licenses.
@@ -49,7 +53,7 @@ cargo x licenses
 ```
 
 Changes that affect the Linux FUSE frontend must also run
-`cargo x test-linux-fuse` on a Linux host with an isolated Amazon S3 or MinIO
+`cargo x test-linux-fuse` on a Linux host with an isolated MinIO-compatible S3
 environment. This acceptance fails when FUSE or its storage environment is
 missing; ordinary workspace tests do not mount a filesystem. See the
 [acceptance guide](docs/linux-fuse-acceptance.md) for setup and coverage.

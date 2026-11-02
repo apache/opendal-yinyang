@@ -1,14 +1,11 @@
 # Linux operating envelope
 
-**Status: passed for the two exact source/Amazon S3 combinations below.
-Sampling gaps, phase-relative measurements, and result boundaries remain
-explicit.**
+**Status: two exact source/Amazon S3 combinations passed the bounded workload
+described below. The result records are retained outside the repository.**
 
-This page records finite, bounded operating-envelope samples for exact `yy`
-builds. They are not capacity ratings, service-level objectives, long-running
-endurance guarantees or production sizing guides. Each measured combination is
-recorded by separate artifact and qualification-script source, binary hash,
-Ubuntu host identity, backend, dataset, concurrency and duration.
+This page documents how to run the finite, bounded operating-envelope workload.
+Its results are not capacity ratings, service-level objectives, long-running
+endurance guarantees or production sizing guides.
 
 ## Selected workload
 
@@ -204,179 +201,23 @@ latency benchmarks, native acceptance mounts and other S3 workloads can
 contaminate p50/p95 values and request timing even when final bytes remain
 correct.
 
-## Sparse sustained evidence (2026-11-01)
+## Qualified bounds
 
-Run `o-s3-e5c6ead-042dfb4-1800s-r1` completed with runner exit `0` and report
-status `pass`. The measured artifact source was
-`e5c6ead739254261351d6bae46a16777f65035b3`, read from its direct package
-`BUILD-MANIFEST`. The separate qualification-script source was
-`042dfb4c7d5a156cdbced5517801f6a0296eb94a`. The measured ELF SHA-256 was
-`bdfe412dc7351e478ed65bb74bf410c42614e468108f19fc0a27dc452ff9a923`.
+On one four-vCPU Ubuntu 24.04 host against a dedicated unversioned `us-east-2`
+Amazon S3 bucket, the v2 workload completed two 900-second phases with eight
+files of `8 MiB + 17 B`, four writers, and two readers. All 1,799
+mutation-and-fsync units succeeded, both independent restores matched, both
+unmounts were clean, SQLite integrity and doctor passed, and the observed
+current-key growth was not reclaimable-space accounting. This qualified bound
+is recorded in the pull request that introduced it (#133).
 
-The backend was a dedicated `us-east-2` Amazon S3 bucket in which versioning
-had never been enabled. The dataset started at eight files of `8 MiB + 17 B`,
-`67,109,000` logical bytes in total. Each phase computes its truncate limit
-relative to that phase's starting files, so logical data can shrink across
-phases; the observed phase-end totals were `58,851,464` and `50,593,928` bytes.
+The earlier same-length workload completed two 1,350-second phases with 24
+files of 256 KiB, four writers, two readers, and a dedicated versioned
+`us-east-2` bucket. Both phases had zero pwrite, fsync, retry, and uncertainty
+errors; the midpoint and final restores matched. This qualified bound is
+recorded in the pull request that introduced it (#116).
 
-| phase | scheduled | phase span | mutations | reader attempts | validated | transition skips | restore bytes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| steady-state-one | 900.000s | 912.431s | 981 | 3,562 | 1,681 | 1,881 | 58,851,464 |
-| steady-state-two | 900.000s | 920.022s | 818 | 3,571 | 1,670 | 1,901 | 50,593,928 |
-
-`actual_seconds=900.000` in each phase is the workload scheduling interval.
-The phase spans above include workload join, in-flight retry drain, and
-background inventory join; they are not claims that every operation completed
-at the 900-second boundary. The complete run wall time was `2,223.885439s`,
-including setup, both phase spans, midpoint restore, final restore, inventory,
-and health checks.
-
-All `1,799` mutation-and-fsync units succeeded. Every file recorded successful
-overwrite, append, truncate and zero-extension operations in both phases.
-`pwrite_errors`, mutation errors, fsync errors, fsync retry attempts, retry
-successes, uncertain files, active mutations and reader errors were all zero.
-The zero retry count covers application fsync retries; it is not a
-transport-level retry count.
-
-Writer latency starts before opening the file and ends after mutation and
-fsync. It excludes close and post-operation pacing. Across a phase, writer P50
-was `3,470.125ms` then `4,409.759ms`; P95 was `4,512.298ms` then
-`4,633.465ms`. These observations do not establish a stable latency trend, and
-the second phase is not attributed to a particular cause.
-
-Validated reader P50 was `327.988ms` then `323.019ms`; validated P95 was
-`438.296ms` then `451.770ms`. Validated-read maxima were `674.583ms` and
-`651.924ms`, while all reader-attempt maxima were `4,367.399ms` and
-`4,947.448ms`. Attempt maxima must not be replaced by the smaller
-validated-read maxima.
-
-Actual overlap was observed rather than inferred from configured concurrency.
-Both phases reached four concurrent writers, two concurrent readers and six
-combined operations. `observed_overlap` includes reader attempts that skipped
-before or during a mutation. `validated_read_overlap` includes only stable-epoch
-reads that compared actual bytes with expected bytes:
-
-| phase | attempt reader overlap | validated reader overlap |
-| --- | ---: | ---: |
-| steady-state-one | 515.469s | 461.214s |
-| steady-state-two | 480.897s | 441.103s |
-
-The midpoint and final independent restores each contained eight files and
-matched the expected in-memory bytes exactly. Both clean unmounts returned
-zero, remount readiness was restored, `staging.db` passed SQLite integrity
-checks, and `doctor` passed. Status reported `pending=0`, `frozen=0`,
-`conflicts=0`, `failed=0` and `ledger-errors=0`; no acknowledgment command was
-needed or called.
-
-The independent resource sampler produced `445` rows over the run with a
-maximum observed gap of `5.003s`. Peak sampled RSS and high-water RSS were
-`78,852,096` bytes, peak sampled staging allocation was `13,340,672` bytes, and
-peak sampled open descriptors were `20`. These are sampled lower bounds rather
-than continuous peak telemetry.
-
-Current-key inventory moved from `67,487,943` bytes across `107` keys after
-dataset creation to `184,325,734` bytes across `20,165` keys at the final
-sample: `+116,837,791` bytes and `+20,058` keys. Ten inventory samples were
-retained; completion timestamps had a maximum gap of `430.496s` because the
-scans themselves ran in the background. This current-key growth is not upload
-byte accounting, application request count, complete retained-history
-accounting, or reclaimable bytes. Disabling S3 bucket versioning does not mean
-YinYang stores no prior history: retained YinYang snapshots and shared packs can
-remain among current keys. `retained_bytes` and `object_versions` are backend
-version-inventory fields and remain unavailable for this unversioned bucket.
-
-Exact HTTPS request count remains unavailable; no compatible process-scoped
-client counter was supplied, and current keys or verifier requests do not
-substitute for that count.
-
-Raw evidence:
-
-- [accepted sparse operating-envelope JSON](benchmarks/linux-envelope-sparse-amazon-s3-2026-11-01-e5c6ead.json),
-  321,090 bytes, SHA-256
-  `ff05d618060a4de030aeaa85e9e9a159f16e5558fb098f20f6bcfbf1b7ac80e1`.
-
-## Earlier same-length operating-envelope evidence
-
-### Earlier source and artifact
-
-The earlier integrated source is
-`17361970d1722ea3d60c5381bbb5323d11818184`. Its default Ubuntu 24.04
-x86_64 archive is
-`yinyang-0.0.24-ubuntu-24.04-x86_64-17361970d172.tar.gz` with SHA-256
-`ca339b309f0132b2a21bd685fd9cab75d5d5e982059344bba06e77f523dcffb4`.
-The archive's `bin/yy` SHA-256 is
-`a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c`.
-
-AWS repository gates passed at this source: `cargo x lint`, `cargo x check`,
-`cargo x test`, `cargo x licenses`, and Rust 1.91.0 locked all-target check.
-The accepted Core115 native proof at
-`b630ef2` covers Managed FUSE 27 tests, operations 1, Managed Sync 12,
-recovery 4, and Direct 30 passed plus 8 filtered tests.
-The subsequent A revision changed only the doctor remediation text in
-`operations_cli.rs`; later harness/procedure and Python test-loader changes did
-not alter native contracts. Those native workloads were not repeated at
-`1736197`.
-
-### Earlier operating envelope
-
-Run `o-pin-1736197-envelope-45m-r2` completed with runner exit `0` and report
-status `pass`. It used the 24-file/256 KiB dataset, four range writers, two
-range readers, the default intervals, and the dedicated
-`yinyang-direct-q-35b90fdf-versioned` bucket in `us-east-2`.
-
-| phase | planned | actual | writer ops | reader ops | pwrite/fsync/retry errors | uncertain |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| steady-state-one | 1350s | 1409.689s | 1345 | 3011 | 0 / 0 / 0 | none |
-| steady-state-two | 1350s | 1728.775s | 1484 | 3469 | 0 / 0 / 0 | none |
-
-The phase durations total `3138.464s`; the full report spans `3285.049s`.
-Synchronous history collection and the final checks explain why neither is a
-45-minute wall-clock claim. Resource sampling produced 243 rows rather than a
-nominal five-second count of 540. The first phase retained 172 rows with a
-maximum gap of `209.392s`; the second retained 71 rows with a maximum gap of
-`441.46s`. These are sampled observations and lower bounds, not continuous
-telemetry.
-
-Both phases had empty `fatal` and `uncertain_files` lists.
-`durability.status=known` with zero pwrite and fsync errors. The pre-doctor
-status showed `pending=0 frozen=0 conflicts=0 failed=0 ledger-errors=0`; no
-ledger acknowledgment command was needed or invoked. `doctor` passed, the
-retained `staging.db` integrity check returned `ok`, both unmounts were clean,
-and the 24-file/6,291,456-byte restores matched at the midpoint and final
-check. The final paginated history contained 36,124 versions, zero delete
-markers and 840,781,692 stored bytes across 37 pages. Peak sampled RSS/HWM was
-35,586,048 bytes, peak staging allocation was 10,665,984 bytes, and peak open
-descriptors was 22.
-
-Exact Amazon S3 request count remains unavailable because the TLS path is
-outside the plain-HTTP counting proxy and no compatible process-scoped counter
-was supplied. The report does not infer requests from connections or verifier
-calls.
-
-Public raw evidence:
-
-- [accepted operating-envelope JSON](benchmarks/linux-envelope-amazon-s3-2026-10-28-1736197.json),
-  SHA-256
-  `858a7dd40e3662b536bef7206ead861ee6261580ef18d2b2893fc01a4d089c0e`;
-- [release build manifest](benchmarks/linux-release-manifest-2026-10-28-1736197.txt),
-  SHA-256
-  `d34e92efe67ac3e9b52d5574f5889c49e6c2b29e4fabe1b44b3fcda95343d37c`.
-
-The archive is prepared for this qualification but is not published as a
-release artifact.
-
-### Earlier smoke and failure evidence
-
-Earlier 90-second smoke runs are historical, not final proof. One exposed an
-oracle defect where expected bytes advanced only after `fsync`; the harness now
-advances the oracle after every successful `pwrite` segment and records fsync
-uncertainty separately. Their raw files remain private development evidence and
-are not used to support the final claims above.
-
-The pre-fix 45-minute run at source `455842b` failed before midpoint when an
-fsync retry deadline expired. The bounded `de86d1c` diagnostic classified the
-observed terminal retry as CAS exhaustion rather than folded storage error, but
-its runner exited `1` because doctor reported `ledger-errors=1`. These pre-fix
-states motivated the accepted same-client serialization fix and guarded
-acknowledgment procedure; they are not part of the final source, and the
-diagnostic database was not acknowledged.
+Both runs observed finite source, binary, backend, host, duration, and
+concurrency combinations only. Sampled resource gaps, current-key growth,
+request-accounting limits, and the absence of long-running or production
+capacity claims remain part of those records.

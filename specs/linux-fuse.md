@@ -1,11 +1,12 @@
 # Linux FUSE frontend
 
-**Status: experimental Managed and Direct mounts; Direct remains read-only
-unless writable access is explicitly configured with local staging. Protocol
-transport is the `fuser` 0.17 binding, not a YinYang FUSE implementation.**
+**Status: experimental Managed and Direct mounts; Direct defaults read-only and
+is writable only with explicit local staging. Protocol transport is the `fuser`
+0.17 binding, not a YinYang FUSE implementation.**
 
-The Linux frontend mounts one Managed volume through the kernel FUSE ABI with
-`yy --volume CONFIG mount MOUNTPOINT` and keeps the process in the foreground.
+The Linux frontend mounts one Managed or Direct volume through the kernel FUSE
+ABI with `yy --volume CONFIG mount MOUNTPOINT` and keeps the process in the
+foreground.
 One `Filesystem` adapter owns the session lifecycle, inode table, directory
 cursors, attribute synthesis, flag handling and errno mapping. Managed and
 Direct implement one backend contract for the operations that genuinely differ.
@@ -24,6 +25,10 @@ staging path are explicitly configured.
 Both use the admission rules in [`volume-capabilities.md`](volume-capabilities.md);
 Direct's mapping, pin and error contract is in [`direct.md`](direct.md). The
 frontend is rejected entirely on non-Linux targets.
+
+Startup, teardown and backend-open failures return `fuse::Error` with one
+`crate::runtime::ErrorKind`. The CLI consumes that typed kind directly; it does
+not inspect or downcast a boxed error chain.
 
 Managed startup order:
 

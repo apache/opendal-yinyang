@@ -66,13 +66,13 @@ rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 futures-util.workspace = true
-hmac = "0.13.0"
 opendal = { workspace = true, features = ["http-transport-reqwest", "services-s3"] }
 sha2 = "0.11.0"
 tempfile = "3"
+yinyang-test-support = { path = "crates/test-support" }
 
 [workspace]
-members = [".", "crates/core", "crates/native", "xtask"]
+members = [".", "crates/core", "crates/native", "crates/test-support", "xtask"]
 resolver = "3"
 
 [workspace.package]

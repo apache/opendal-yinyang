@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,6 +26,7 @@ use yinyang::core::{
 };
 use yinyang::runtime::ErrorKind;
 use yinyang::sync::{IntentState, Sync};
+use yinyang_test_support as support;
 
 #[derive(Debug)]
 struct LostResponseAuthority {

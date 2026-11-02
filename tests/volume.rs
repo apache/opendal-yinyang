@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use support::TestBackend;
 use yinyang::core::Fs;
 use yinyang::volume::*;
+use yinyang_test_support as support;
 
 #[allow(dead_code)] // Admission tests are Linux-gated; all-target checks still compile this helper.
 fn direct_operator(backend: &TestBackend, conditional_delete: bool) -> opendal::Operator {
