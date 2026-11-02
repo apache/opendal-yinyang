@@ -17,8 +17,11 @@
 
 #![cfg(target_os = "linux")]
 
+mod support;
+
 mod acceptance;
-mod harness;
 mod incremental;
 mod read_only_range;
 mod retention;
+
+pub(crate) use support::linux_fuse as harness;

@@ -19,16 +19,14 @@
 
 #![cfg(target_os = "linux")]
 
-#[allow(dead_code)]
-#[path = "linux_fuse/harness.rs"]
-mod harness;
+mod support;
 
-use harness::{Fixture, Frontend, Publication, run_timeout};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
+use support::linux_fuse::{Fixture, Frontend, Publication, run_timeout};
 
 const APPLICATION_TIMEOUT: Duration = Duration::from_secs(120);
 
