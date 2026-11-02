@@ -1387,6 +1387,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 RemoteStatus {
                     availability: RemoteAvailability::Available,
                     cursor: Some(hex(&observation.cursor.bytes)),
+                    revision: observation.revision.map(|revision| hex(&revision)),
                     error: None,
                 },
             ),
@@ -1395,6 +1396,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 RemoteStatus {
                     availability: RemoteAvailability::Unavailable,
                     cursor: None,
+                    revision: None,
                     error: Some(error.to_string()),
                 },
             ),
@@ -1407,23 +1409,44 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                         RemoteAvailability::NotChecked
                     },
                     cursor: None,
+                    revision: None,
                     error: remote_error,
                 },
             ),
         };
         let state_path = Path::new(&state_directory);
+        let explicit_conflict_paths = conflicts
+            .iter()
+            .flat_map(|conflict| {
+                [
+                    Some(conflict.path.as_str()),
+                    conflict.original_path.as_deref(),
+                    conflict.desired_path.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
         let mut virtual_conflicts = Vec::new();
         let mut virtual_conflicts_by_path = BTreeMap::new();
         let mut mutated_artifacts = BTreeSet::new();
+        let mut artifact_bytes_hashed = 0;
         if let Some(remote_entries) = &remote_entries {
             for artifact in &artifacts {
-                if !artifact_changed(state_path, artifact) {
+                if !artifact_changed_counted(state_path, artifact, &mut artifact_bytes_hashed) {
+                    continue;
+                }
+                mutated_artifacts.insert(artifact.id.clone());
+                // Status permits one conflict per path. An explicit conflict or
+                // the first changed artifact owns the path; every changed
+                // artifact still reports its own error.
+                if explicit_conflict_paths.contains(artifact.origin.as_str())
+                    || virtual_conflicts_by_path.contains_key(&artifact.origin)
+                {
                     continue;
                 }
                 let id = artifact_conflict_id(&artifact.id);
                 let remote = remote_entries.get(&artifact.origin);
                 virtual_conflicts_by_path.insert(artifact.origin.clone(), id.clone());
-                mutated_artifacts.insert(artifact.id.clone());
                 virtual_conflicts.push(ConflictStatus {
                     id,
                     path: artifact.origin.clone(),
@@ -1696,6 +1719,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             entries,
             conflicts: conflict_status,
             artifacts: artifact_status,
+            artifact_bytes_hashed,
         })
     }
 
@@ -3070,24 +3094,69 @@ fn artifact_conflict_id(id: &str) -> String {
 }
 
 fn artifact_changed(state: &Path, artifact: &super::store::ArtifactRecord) -> bool {
+    let mut hashed = 0;
+    artifact_changed_counted(state, artifact, &mut hashed)
+}
+
+fn artifact_changed_counted(
+    state: &Path,
+    artifact: &super::store::ArtifactRecord,
+    hashed: &mut u64,
+) -> bool {
     if artifact.kind == super::store::ArtifactKind::QuarantinedDirectory {
         return false;
     }
     let path = state.join("artifacts").join(&artifact.name);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(_) => return artifact.stat.is_some(),
+        Err(_) => return artifact.stat.is_some() || artifact.digest.is_some(),
     };
     let Some(recorded) = artifact.stat else {
         return false;
     };
-    metadata.dev() != recorded.dev
+    if !metadata.file_type().is_file() {
+        return true;
+    }
+    if metadata.dev() != recorded.dev
         || metadata.ino() != recorded.ino
         || metadata.mtime() != recorded.mtime
         || metadata.mtime_nsec() != recorded.mtime_nsec
         || metadata.ctime() != recorded.ctime
         || metadata.ctime_nsec() != recorded.ctime_nsec
         || metadata.size() != artifact.length
+    {
+        return !artifact_content_matches(&path, artifact, hashed);
+    }
+    false
+}
+
+fn artifact_content_matches(
+    path: &Path,
+    artifact: &super::store::ArtifactRecord,
+    hashed: &mut u64,
+) -> bool {
+    let Some(expected) = artifact.digest else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Ok(count) => count,
+            Err(_) => return false,
+        };
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        length = length.saturating_add(count as u64);
+        *hashed = hashed.saturating_add(count as u64);
+    }
+    length == artifact.length && hasher.finalize().as_bytes() == &expected
 }
 
 fn conflict_status(conflict: &ConflictRecord) -> ConflictStatus {

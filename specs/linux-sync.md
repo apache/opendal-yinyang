@@ -40,6 +40,10 @@ checksum-protected manifest. It refuses incomplete installs. `restore` validates
 the complete package and adapter-specific support state before creating either
 absent destination. Restore rebinds root, state, baseline and artifact inode
 identities while preserving accepted content evidence, requests and receipts.
+Each restored artifact is verified once against its recorded length and digest;
+its new device, inode, mtime and ctime are persisted in the same rebind
+transaction. A mismatch keeps the artifact marked changed for explicit
+inspection instead of rehashing unchanged retained content on every status.
 
 ## Admission
 
@@ -202,7 +206,7 @@ unsupported.
                "root": "...", "namespace": "...", "same_filesystem": true,
                "error": null },
   "remote": { "availability": "not_checked|available|unavailable",
-              "cursor": "...", "error": null },
+              "cursor": "...", "revision": "...", "error": null },
   "local": { "scan": "not_scanned|clean|changed|failed", "error": null },
   "summary": { "in_sync": false, "pending": 0, "unknown": 0, "conflicts": 0,
                "failed": 0, "retained_artifacts": 0, "retained_bytes": 0 },
@@ -211,6 +215,11 @@ unsupported.
   "artifacts": []
 }
 ```
+
+`remote.revision` is the observed Managed authority revision. It is `null`
+when unavailable and for Direct Sync, whose storage-native namespace has no
+common authority revision. `remote.cursor` remains the adapter checkpoint and
+is not required to have the same encoding as `revision`.
 
 Each entry carries local, remote and baseline evidence, its current typed
 intent/outcome and an optional conflict identity. A rename conflict references

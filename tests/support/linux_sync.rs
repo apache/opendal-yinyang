@@ -187,8 +187,10 @@ impl SyncStatus {
             assert_eq!(
                 matches.len(),
                 1,
-                "conflict {} must reference exactly one entry",
-                conflict.id
+                "conflict {} must reference exactly one entry; conflicts={:#?} entries={:#?}",
+                conflict.id,
+                self.conflicts,
+                self.entries
             );
             let entry = matches[0];
             assert_eq!(

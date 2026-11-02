@@ -29,6 +29,8 @@ use crate::local::store;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const TABLES: &[store::TableColumns<'static>] = &[
@@ -1309,6 +1311,7 @@ impl Store {
         &mut self,
         binding: &Binding,
         identities: &BTreeMap<Identity, Identity>,
+        state: &Path,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -1437,37 +1440,49 @@ impl Store {
 
         let artifacts = {
             let mut statement = transaction
-                .prepare("SELECT id,stat_dev,stat_ino FROM artifacts WHERE stat_dev IS NOT NULL")
+                .prepare(
+                    "SELECT id,name,length,digest FROM artifacts
+                     WHERE stat_dev IS NOT NULL ORDER BY id",
+                )
                 .map_err(|error| Error::corrupt(format!("read artifact identities: {error}")))?;
             statement
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
                     ))
                 })
                 .map_err(|error| Error::corrupt(format!("read artifact identities: {error}")))?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|error| Error::corrupt(format!("read artifact identities: {error}")))?
         };
-        for (id, dev, ino) in artifacts {
-            let old = Identity {
-                dev: decode_u64(&dev, "artifact device")?,
-                ino: decode_u64(&ino, "artifact inode")?,
+        for (id, name, length, digest) in artifacts {
+            let Some(digest) = digest else {
+                continue;
             };
-            let new = identities.get(&old).copied().ok_or_else(|| {
-                Error::corrupt(format!(
-                    "restored artifact {id} has no identity mapping for {old:?}"
-                ))
-            })?;
+            let digest: [u8; 32] = decode_fixed(&digest, "artifact digest")?;
+            let length = u64::try_from(length)
+                .map_err(|_| Error::corrupt("restored artifact has a negative length"))?;
+            let path = state.join("artifacts").join(&name);
+            let Some(stat) = verified_artifact_stat(&path, length, &digest) else {
+                continue;
+            };
             transaction
                 .execute(
-                    "UPDATE artifacts SET stat_dev=?2,stat_ino=?3 WHERE id=?1",
+                    "UPDATE artifacts SET
+                       stat_dev=?2,stat_ino=?3,stat_mtime=?4,stat_mtime_nsec=?5,
+                       stat_ctime=?6,stat_ctime_nsec=?7
+                     WHERE id=?1",
                     params![
                         id,
-                        new.dev.to_be_bytes().as_slice(),
-                        new.ino.to_be_bytes().as_slice()
+                        stat.dev().to_be_bytes().as_slice(),
+                        stat.ino().to_be_bytes().as_slice(),
+                        stat.mtime(),
+                        stat.mtime_nsec(),
+                        stat.ctime(),
+                        stat.ctime_nsec()
                     ],
                 )
                 .map_err(|error| Error::corrupt(format!("rebind artifact identity: {error}")))?;
@@ -1478,6 +1493,31 @@ impl Store {
             .map_err(|error| Error::corrupt(format!("commit sync rebind: {error}")))?;
         Ok(())
     }
+}
+
+fn verified_artifact_stat(
+    path: &Path,
+    expected_length: u64,
+    expected_digest: &[u8; 32],
+) -> Option<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_length {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        length = length.checked_add(count as u64)?;
+    }
+    (length == expected_length && hasher.finalize().as_bytes() == expected_digest)
+        .then_some(metadata)
 }
 
 fn rebind_fingerprint(

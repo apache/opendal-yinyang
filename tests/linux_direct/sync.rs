@@ -107,6 +107,7 @@ fn assert_in_sync(status: &Value) {
     assert_eq!(status["summary"]["conflicts"], 0, "{status:#}");
     assert_eq!(status["summary"]["failed"], 0, "{status:#}");
     assert_eq!(status["remote"]["availability"], "available", "{status:#}");
+    assert!(status["remote"]["revision"].is_null(), "{status:#}");
 }
 
 #[test]

@@ -86,6 +86,7 @@ impl RemoteAdapter for ManagedAdapter {
             stamp_revision(&mut entries, snapshot.revision());
             return Ok(RemoteObservation {
                 cursor: current_cursor(snapshot.revision()),
+                revision: Some(snapshot.revision().to_bytes()),
                 entries,
             });
         }
@@ -93,6 +94,7 @@ impl RemoteAdapter for ManagedAdapter {
         stamp_revision(&mut entries, snapshot.revision());
         Ok(RemoteObservation {
             cursor: current_cursor(snapshot.revision()),
+            revision: Some(snapshot.revision().to_bytes()),
             entries,
         })
     }

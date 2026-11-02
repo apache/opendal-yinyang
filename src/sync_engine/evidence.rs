@@ -29,6 +29,10 @@ pub struct StatusDocument {
     pub entries: Vec<EntryStatus>,
     pub conflicts: Vec<ConflictStatus>,
     pub artifacts: Vec<ArtifactStatus>,
+    /// Artifact bytes read by this status projection. Not serialized.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub artifact_bytes_hashed: u64,
 }
 
 impl StatusDocument {
@@ -47,6 +51,7 @@ impl StatusDocument {
             remote: RemoteStatus {
                 availability: RemoteAvailability::NotChecked,
                 cursor: None,
+                revision: None,
                 error: None,
             },
             local: LocalStatus {
@@ -57,6 +62,7 @@ impl StatusDocument {
             entries: Vec::new(),
             conflicts: Vec::new(),
             artifacts: Vec::new(),
+            artifact_bytes_hashed: 0,
         }
     }
 }
@@ -126,6 +132,7 @@ pub enum BindingState {
 pub struct RemoteStatus {
     pub availability: RemoteAvailability,
     pub cursor: Option<String>,
+    pub revision: Option<String>,
     pub error: Option<String>,
 }
 
