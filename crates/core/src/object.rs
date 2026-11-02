@@ -800,7 +800,7 @@ impl ObjectFs {
                 .history
                 .set(
                     &self.data,
-                    base.revision.to_bytes().to_vec(),
+                    history_key(RevisionStatus::Readable, base.revision),
                     Some(encode(&base.reference.wire())?),
                 )
                 .await?;
