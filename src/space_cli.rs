@@ -84,20 +84,11 @@ pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<Exi
             command: RetentionCommand::Expire { .. }
         }
     );
-    if config.model == Model::Direct {
-        if expiry {
-            return Err(CliError::invalid(
-                CliStage::Admission,
-                "space retention expire supports Managed volumes only; Direct has no retained revision history",
-            ));
-        }
-        return run_sync_space(config, command).await;
+    if expiry {
+        context.admit_managed_expiry()?;
     }
-    if expiry && config.read_only {
-        return Err(CliError::invalid(
-            CliStage::Admission,
-            "space retention expire requires a writable Managed volume",
-        ));
+    if config.model == Model::Direct {
+        return run_sync_space(config, command).await;
     }
     if let SpaceCommand::Retention {
         command: RetentionCommand::Expire { revision, .. },

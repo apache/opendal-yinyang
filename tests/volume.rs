@@ -72,6 +72,17 @@ fn config(path: std::path::PathBuf) -> VolumeConfig {
         service_address: None,
     }
 }
+
+async fn load_context(
+    path: &std::path::Path,
+    config: &VolumeConfig,
+) -> std::result::Result<VolumeContext, VolumeLoadError> {
+    tokio::fs::write(path, serde_json::to_vec(config).unwrap())
+        .await
+        .unwrap();
+    VolumeContext::load(path).await
+}
+
 #[tokio::test]
 async fn admission_precedes_side_effects_and_rejects_unknown_fields() {
     let temp = tempfile::tempdir().unwrap();
@@ -125,6 +136,55 @@ async fn admission_precedes_side_effects_and_rejects_unknown_fields() {
     json["require"] = serde_json::json!(["read"]);
     assert!(VolumeConfig::from_json(&serde_json::to_vec(&json).unwrap()).is_err());
 }
+
+#[tokio::test]
+async fn managed_expiry_admission_is_static_and_rejects_unsupported_volumes() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let writable = config(staging.clone());
+    let path = temp.path().join("writable.json");
+    let context = load_context(&path, &writable).await.unwrap();
+    let admission = context.admit_managed_expiry();
+    if !cfg!(target_os = "linux") {
+        assert_eq!(
+            admission.unwrap_err().kind(),
+            yinyang::runtime::ErrorKind::Unsupported
+        );
+        return;
+    }
+    admission.unwrap();
+    assert!(!staging.exists());
+
+    let direct = VolumeConfig {
+        model: Model::Direct,
+        staging: std::path::PathBuf::new(),
+        read_only: true,
+        ..writable.clone()
+    };
+    let path = temp.path().join("direct.json");
+    let error = load_context(&path, &direct)
+        .await
+        .unwrap()
+        .admit_managed_expiry()
+        .unwrap_err();
+    assert_eq!(error.stage(), VolumeLoadStage::Admission);
+    assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+
+    let read_only = VolumeConfig {
+        read_only: true,
+        ..writable
+    };
+    let path = temp.path().join("read-only.json");
+    let error = load_context(&path, &read_only)
+        .await
+        .unwrap()
+        .admit_managed_expiry()
+        .unwrap_err();
+    assert_eq!(error.stage(), VolumeLoadStage::Admission);
+    assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+    assert!(!staging.exists());
+}
+
 #[tokio::test]
 async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     let temp = tempfile::tempdir().unwrap();

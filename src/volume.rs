@@ -283,6 +283,25 @@ impl Admission {
             storage: StorageCapabilities::inspect(operator),
         })
     }
+
+    fn admit_managed_expiry(&self, config: &VolumeConfig) -> Result<()> {
+        if !cfg!(target_os = "linux") {
+            return Err(unsupported_admission(
+                "logical revision expiry is implemented only on Linux",
+            ));
+        }
+        if config.model != Model::Managed {
+            return Err(invalid_admission(
+                "logical revision expiry requires a Managed volume",
+            ));
+        }
+        if config.read_only || !self.capabilities.contains(&Capability::Write) {
+            return Err(invalid_admission(
+                "logical revision expiry requires a writable Managed volume",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl VolumeConfig {
@@ -508,6 +527,14 @@ fn invalid_admission(message: &'static str) -> Error {
     ))
 }
 
+fn unsupported_admission(message: &'static str) -> Error {
+    Error::Core(yinyang_core::Error::new(
+        CoreErrorKind::Unsupported,
+        "volume admission",
+        message,
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeLoadStage {
     Configuration,
@@ -673,6 +700,15 @@ impl VolumeContext {
 
     pub fn service_token(&self) -> std::result::Result<Option<String>, VolumeLoadError> {
         Ok(self.storage()?.connection.service_token.clone())
+    }
+
+    /// Admit stopped-process Managed expiry without loading storage or credentials.
+    pub fn admit_managed_expiry(&self) -> std::result::Result<(), VolumeLoadError> {
+        self.admission
+            .admit_managed_expiry(&self.config)
+            .map_err(|error| {
+                VolumeLoadError::from_runtime(VolumeLoadStage::Admission, error, Some(&self.config))
+            })
     }
 
     pub async fn connect_authority(&self) -> Result<Arc<dyn Authority>> {
