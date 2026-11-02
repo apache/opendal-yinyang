@@ -1415,6 +1415,17 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             ),
         };
         let state_path = Path::new(&state_directory);
+        let explicit_conflict_paths = conflicts
+            .iter()
+            .flat_map(|conflict| {
+                [
+                    Some(conflict.path.as_str()),
+                    conflict.original_path.as_deref(),
+                    conflict.desired_path.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
         let mut virtual_conflicts = Vec::new();
         let mut virtual_conflicts_by_path = BTreeMap::new();
         let mut mutated_artifacts = BTreeSet::new();
@@ -1423,10 +1434,18 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 if !artifact_changed(state_path, artifact) {
                     continue;
                 }
+                mutated_artifacts.insert(artifact.id.clone());
+                // Status permits one conflict per path. An explicit conflict or
+                // the first changed artifact owns the path; every changed
+                // artifact still reports its own error.
+                if explicit_conflict_paths.contains(artifact.origin.as_str())
+                    || virtual_conflicts_by_path.contains_key(&artifact.origin)
+                {
+                    continue;
+                }
                 let id = artifact_conflict_id(&artifact.id);
                 let remote = remote_entries.get(&artifact.origin);
                 virtual_conflicts_by_path.insert(artifact.origin.clone(), id.clone());
-                mutated_artifacts.insert(artifact.id.clone());
                 virtual_conflicts.push(ConflictStatus {
                     id,
                     path: artifact.origin.clone(),
