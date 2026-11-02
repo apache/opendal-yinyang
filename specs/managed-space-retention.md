@@ -333,8 +333,9 @@ does not claim global isolation.
 
 Admission order is fixed. Direct or read-only volumes are rejected before
 operator construction, credentials, authority connection, or local lease
-acquisition. A writable Managed command then acquires the existing configured
-writer leases in this order:
+acquisition. The static operation check lives in the volume admission owner;
+the CLI only invokes it. A writable Linux Managed command then acquires the
+existing configured writer leases in this order:
 
 1. `sync-engine.lock`;
 2. `sync.lock`;

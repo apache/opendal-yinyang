@@ -159,7 +159,9 @@ same source and precondition. A later observation never proves that an
 ambiguous request committed. A newer local edit is not replaced by the older
 accepted input. Managed sends exact frozen request bytes through the
 receipt-first frozen batch and can restore a pending request's exact known base
-when that revision is logically expired.
+when that revision is logically expired. Before dispatch it verifies each
+encoded transaction's canonical authority/identity/digest against the engine
+wrapper, and committed or Unknown outcomes must identify that same wrapper.
 
 Conflicts retain both available sides until an explicit decision. `--keep
 local` publishes the current local decision against a newly observed remote
