@@ -22,7 +22,7 @@ use yinyang_test_support as support;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{Authority, CommitId, Fs, NodeId, Planner, Revision};
+use yinyang::core::{Authority, CommitId, CommitOutcome, Fs, NodeId, Planner, Revision};
 use yinyang::runtime::Runtime;
 use yinyang::space::{
     BackupPackageState, StagingBindingState, inspect_bound_local_staging, plan_managed_retention,
@@ -58,7 +58,7 @@ fn parse_revision(value: &str) -> Revision {
 }
 
 #[tokio::test]
-async fn managed_adapter_rejects_wrapped_frozen_identity_before_dispatch() {
+async fn managed_adapter_rejects_wrong_frozen_wrapper_before_receipt_and_dispatch() {
     let backend = TestBackend::default();
     let fs = Fs::create(backend.operator()).await.unwrap();
     let authority: Arc<dyn Authority> = Arc::new(fs);
@@ -108,6 +108,40 @@ async fn managed_adapter_rejects_wrapped_frozen_identity_before_dispatch() {
             .unwrap()
             .is_none()
     );
+
+    assert!(matches!(
+        authority.commit(&transaction).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+    let committed = authority.observe_latest().await.unwrap();
+    assert!(committed.resolve("guarded").await.unwrap().is_some());
+    let adapter = ManagedAdapter::new(authority.clone());
+    for (request_id, request_digest) in [(wrong_id, digest), (id, wrong_digest)] {
+        let frozen = FrozenRemoteRequest {
+            id: request_id,
+            digest: request_digest,
+            bytes: bytes.clone(),
+            operation: RemoteOperation::CreateDirectory,
+            path: "guarded".to_owned(),
+            original_path: None,
+            desired_path: None,
+        };
+        let error = adapter.receipt(&frozen).await.unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Corrupt);
+
+        let error = adapter
+            .publish_batch(&[PreparedRemoteRequest {
+                request: frozen,
+                source: None,
+            }])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Corrupt);
+        assert_eq!(
+            authority.observe_latest().await.unwrap().revision(),
+            committed.revision()
+        );
+    }
 }
 
 #[tokio::test]

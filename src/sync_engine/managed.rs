@@ -166,6 +166,7 @@ impl RemoteAdapter for ManagedAdapter {
     }
 
     async fn receipt(&self, request: &FrozenRemoteRequest) -> Result<Option<RemoteOutcome>> {
+        super::managed_intent::verify_frozen(self.authority.as_ref(), request)?;
         let snapshot = self.authority.observe_latest().await.map_err(Error::from)?;
         let Some(receipt) = snapshot
             .receipt(CommitId::from_bytes(request.id))

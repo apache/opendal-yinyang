@@ -657,6 +657,74 @@ async fn journal_unknown_survives_offline_retry_and_resolves_the_original_receip
 }
 
 #[tokio::test]
+async fn unknown_journal_wrapper_validation_precedes_status_and_stays_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input).await;
+    let backend = TestBackend::default();
+    let fs = filesystem(&backend).await;
+    let state = temp.path().join("journal");
+    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+        .await
+        .unwrap();
+    let id = CommitId::generate();
+    let observed = fs.observe_latest().await.unwrap();
+    journal.prepare(&observed, &input, id).await.unwrap();
+
+    backend.lose_next_head_response_and_go_offline();
+    let error = journal.publish(id).await.unwrap_err();
+    assert_eq!(error.kind(), RuntimeErrorKind::Unknown);
+    assert_eq!(
+        journal.status(id).await.unwrap().unwrap().state,
+        DirectoryState::Unknown
+    );
+    backend.state.lock().unwrap().offline = false;
+    drop(journal);
+    drop(fs);
+
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    let (request, request_digest, commit_id): (Vec<u8>, Vec<u8>, Vec<u8>) = database
+        .query_row(
+            "SELECT request,request_digest,commit_id FROM intents WHERE id=?1",
+            rusqlite::params![id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE intents SET request_id=?2 WHERE id=?1",
+            rusqlite::params![id.as_bytes().as_slice(), vec![0xbb_u8; 16]],
+        )
+        .unwrap();
+    drop(database);
+
+    let fs = Fs::open(backend.operator()).await.unwrap();
+    let journal = DirectoryJournal::open(Arc::new(fs), &state).await.unwrap();
+    let error = journal.publish(id).await.unwrap_err();
+    assert_eq!(error.kind(), RuntimeErrorKind::Unknown);
+    assert_eq!(error.commit_id(), Some(id));
+    drop(journal);
+
+    let database = rusqlite::Connection::open(state.join("directory.db")).unwrap();
+    let (stored_state, stored_request, stored_digest, stored_commit): (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) = database
+        .query_row(
+            "SELECT state,request,request_digest,commit_id FROM intents WHERE id=?1",
+            rusqlite::params![id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_state, 1);
+    assert_eq!(stored_request, request);
+    assert_eq!(stored_digest, request_digest);
+    assert_eq!(stored_commit, commit_id);
+}
+
+#[tokio::test]
 async fn journal_local_confirmation_failure_remains_typed_unknown() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");

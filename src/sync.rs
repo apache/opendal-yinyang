@@ -518,44 +518,51 @@ impl Sync {
             }
             intent::State::Prepared | intent::State::Unknown | intent::State::Retryable => {}
         }
-        if state == intent::State::Unknown
-            && let Some(receipt) =
-                intent::receipt_for(self.authority(), row.commit_id()?, row.digest()?).await?
-        {
-            self.save_state(edit, intent::State::Committed, Some(&receipt), None)
-                .await?;
-            return Ok(receipt.cursor.revision);
-        }
-        let commit_id = row.commit_id()?;
-        let digest = row.digest()?;
-        match yinyang_core::Transaction::verify_identity(
-            &row.request,
-            self.authority().filesystem(),
-        ) {
-            Ok((_, frozen_id, frozen_digest))
-                if frozen_id == commit_id && frozen_digest == digest => {}
-            Ok(_) => {
-                let failure = Failure::capture(&Error::State(
-                    ErrorKind::Corrupt,
-                    "frozen content request identity disagrees with local intent",
-                ));
-                self.save_state(edit, intent::State::Failed, None, Some(&failure))
-                    .await?;
-                return Err(Error::Retained(failure));
-            }
+        let verification =
+            yinyang_core::Transaction::verify_identity(&row.request, self.authority().filesystem())
+                .map_err(Error::from)
+                .and_then(|(_, frozen_id, frozen_digest)| {
+                    let commit_id = row.commit_id()?;
+                    let digest = row.digest()?;
+                    if frozen_id == commit_id && frozen_digest == digest {
+                        Ok((frozen_id, frozen_digest))
+                    } else {
+                        Err(Error::State(
+                            ErrorKind::Corrupt,
+                            "frozen content request identity disagrees with local intent",
+                        ))
+                    }
+                });
+        let failure_commit = match &verification {
+            Ok((commit_id, _)) => *commit_id,
+            Err(_) => derived_commit(edit),
+        };
+        let (commit_id, digest) = match verification {
+            Ok(identity) => identity,
             Err(error) => {
-                let error = Error::from(error);
-                let failure = Failure::capture(&error);
-                let retry_state = if state == intent::State::Unknown {
+                let failure = if state == intent::State::Unknown {
+                    Failure::unknown_with(
+                        failure_commit,
+                        format!("content request verification failed: {error}"),
+                    )
+                } else {
+                    Failure::capture(&error)
+                };
+                let next_state = if state == intent::State::Unknown {
                     intent::State::Unknown
                 } else {
-                    intent::State::Retryable
+                    match error.kind() {
+                        ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
+                            intent::State::Failed
+                        }
+                        _ => intent::State::Retryable,
+                    }
                 };
-                self.save_state(edit, retry_state, None, Some(&failure))
+                self.save_state(edit, next_state, None, Some(&failure))
                     .await?;
                 return Err(Error::Retained(failure));
             }
-        }
+        };
         self.save_state(edit, intent::State::Unknown, None, None)
             .await?;
         let outcome = match self

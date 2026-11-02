@@ -317,7 +317,17 @@ impl DirectoryJournal {
         let row = load_async(self, commit_id)
             .await?
             .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown directory intent"))?;
-        let status = row.status(commit_id)?;
+        let stored_state = decode_state(row.state)?;
+        if stored_state == intent::State::Committed {
+            return receipt(&row, commit_id, row.digest()?);
+        }
+        let status = match row.status(commit_id) {
+            Ok(status) => status,
+            Err(error) if stored_state == intent::State::Unknown => {
+                return Err(unknown_after_dispatch(self, commit_id, error).await);
+            }
+            Err(error) => return Err(error),
+        };
         match &status.state {
             DirectoryState::Committed(receipt) => return Ok(receipt.clone()),
             DirectoryState::Conflict | DirectoryState::Failed => {
@@ -326,36 +336,6 @@ impl DirectoryJournal {
                 })?));
             }
             DirectoryState::Prepared | DirectoryState::Unknown | DirectoryState::Retryable => {}
-        }
-        if matches!(&status.state, DirectoryState::Unknown) {
-            match receipt_for(self.inner.authority.as_ref(), &status.intent).await {
-                Ok(Some(receipt)) => {
-                    if let Err(error) = save_state_async(
-                        self,
-                        commit_id,
-                        intent::State::Committed.code(),
-                        Some(receipt.clone()),
-                        None,
-                        StateFilter::Any,
-                    )
-                    .await
-                    {
-                        return Err(unknown_after_dispatch(
-                            self,
-                            commit_id,
-                            format!(
-                                "original receipt was found but local confirmation failed: {error}"
-                            ),
-                        )
-                        .await);
-                    }
-                    return Ok(receipt);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(unknown_after_dispatch(self, commit_id, error).await);
-                }
-            }
         }
         let (_, frozen_id, frozen_digest) =
             match Transaction::verify_identity(&row.request, self.inner.authority.filesystem()) {
@@ -384,7 +364,7 @@ impl DirectoryJournal {
                     return Err(Error::Retained(failure));
                 }
             };
-        if frozen_id != commit_id || frozen_digest != row.digest() {
+        if frozen_id != commit_id || frozen_digest != row.digest()? {
             let error = Error::local_kind(
                 ErrorKind::Corrupt,
                 "frozen directory transaction identity disagrees",
@@ -435,7 +415,7 @@ impl DirectoryJournal {
         };
         match outcome {
             Ok(CommitOutcome::Committed(receipt)) => {
-                if receipt.commit_id != commit_id || receipt.request_digest != row.digest() {
+                if receipt.commit_id != commit_id || receipt.request_digest != row.digest()? {
                     return Err(unknown_after_dispatch(
                         self,
                         commit_id,
@@ -592,7 +572,10 @@ impl DirectoryJournal {
             })?));
         }
         let (baseline, request_id, digest) = Transaction::inspect_identity(&row.request)?;
-        if baseline != status.intent.baseline || request_id != commit_id || digest != row.digest() {
+        if baseline != status.intent.baseline
+            || request_id != commit_id
+            || digest != row.digest()?
+        {
             return Err(Error::local_kind(
                 ErrorKind::Corrupt,
                 "retained directory transaction identity disagrees",
@@ -638,11 +621,11 @@ struct DirectoryMetadata {
 }
 
 impl StoredRow {
-    fn digest(&self) -> [u8; 32] {
+    fn digest(&self) -> Result<[u8; 32]> {
         self.digest
             .as_slice()
             .try_into()
-            .expect("stored request digest length")
+            .map_err(|_| Error::local_kind(ErrorKind::Corrupt, "invalid directory request digest"))
     }
 
     fn status(&self, id: CommitId) -> Result<DirectoryStatus> {
@@ -909,15 +892,6 @@ async fn claim_dispatch(journal: &DirectoryJournal, id: CommitId) -> Result<Disp
         ErrorKind::Busy,
         "directory intent remained busy while claiming dispatch",
     ))
-}
-
-async fn receipt_for(
-    authority: &dyn Authority,
-    intent: &DirectoryIntent,
-) -> Result<Option<Receipt>> {
-    intent::receipt_for(authority, intent.commit_id, intent.request_digest)
-        .await
-        .map_err(Error::from)
 }
 
 fn receipt(row: &StoredRow, id: CommitId, digest: [u8; 32]) -> Result<Receipt> {
