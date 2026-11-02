@@ -38,7 +38,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use yinyang::core::service::ServiceClient;
-use yinyang::core::{Authority, CommitId, NodeId};
+use yinyang::core::{Authority, CommitId, ErrorKind, NodeId, Revision, RevisionStatus};
 use yinyang::runtime::{Runtime, RuntimeStatus};
 
 const SERVICE_TOKEN: &str = "linux-recovery-service-token-0123456789";
@@ -49,6 +49,7 @@ const MAX_HTTP_BODY: usize = 16 * 1024 * 1024;
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
 fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
     let mut fixture = Fixture::new(Publication::Service);
+    let expire = fixture.remote_create_file("expire.txt", b"expire-base", false);
     let base = fixture.remote_create_file("pending.txt", b"base", false);
     fixture.remote_create_file("uncertain.txt", b"base", false);
     let source_staging = fixture.path("mount-source");
@@ -194,6 +195,38 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
         Some(b"pending-accepted".len() as u64)
     );
 
+    let destination_operator = operator_for_root(&destination_root);
+    let immutable_before = immutable_identities(&destination_operator);
+    let expired = run_expiry(
+        &fixture,
+        &restored_config,
+        &[expire.cursor.revision],
+        &[],
+        &[
+            ("YINYANG_S3_ROOT", &destination_root),
+            ("YINYANG_SERVICE_TOKEN", SERVICE_TOKEN),
+        ],
+    );
+    assert_expiry_success(&expired, Publication::Service, "committed");
+    assert_immutable_objects_retained(
+        &immutable_before,
+        &immutable_identities(&destination_operator),
+    );
+
+    let authorization = service_authority(
+        fixture.service_address(),
+        SERVICE_TOKEN,
+        destination_operator,
+    );
+    let expired_error = runtime()
+        .block_on(authorization.observe_revision(expire.cursor.revision))
+        .expect_err("restored authority retained expired revision as readable");
+    assert_eq!(expired_error.kind(), ErrorKind::Expired);
+    let unknown_error = runtime()
+        .block_on(authorization.observe_revision(Revision::from_bytes([0xff; 24])))
+        .expect_err("unknown restored revision became readable");
+    assert_eq!(unknown_error.kind(), ErrorKind::NotFound);
+
     let credential_failure = fixture.yy_with_env(
         &[
             "--volume",
@@ -256,12 +289,6 @@ fn service_and_mount_staging_restore_preserve_pending_and_unknown_work() {
         String::from_utf8_lossy(&uncertain_fsync.stdout)
     );
 
-    let destination_operator = operator_for_root(&destination_root);
-    let authorization = service_authority(
-        fixture.service_address(),
-        SERVICE_TOKEN,
-        destination_operator.clone(),
-    );
     let receipt = runtime()
         .block_on(async {
             authorization
@@ -834,7 +861,7 @@ fn sync_backup_restore_preserves_rename_unknown_and_changed_artifacts() {
 
 #[test]
 #[ignore = "requires isolated YINYANG_S3_* storage and sqlite3"]
-fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
+fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
     let fixture = Fixture::new(Publication::Object);
     let source = fixture.sync_client("history-source");
     fs::write(source.directory.join("first.txt"), b"first baseline").unwrap();
@@ -898,6 +925,83 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
     let moved_root = fixture.path("history-source-root-moved");
     fs::rename(&source.directory, &moved_root).unwrap();
 
+    let authority = fixture_authority(&fixture);
+    let latest_before_expiry = runtime()
+        .block_on(authority.observe_latest())
+        .expect("observe latest before backup-protected expiry")
+        .revision();
+    let live_revision = revision_from_hex(&live_baseline);
+    let backup_refused = run_expiry(
+        &fixture,
+        &observer.config,
+        &[live_revision],
+        &[&backup],
+        &[],
+    );
+    assert_expiry_refused(
+        &backup_refused,
+        Publication::Object,
+        "protected",
+        Some("backup_"),
+    );
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest_before_expiry,
+        live_revision,
+        "first.txt",
+        b"first baseline",
+    );
+    assert!(!source.directory.exists());
+    assert!(moved_root.exists());
+
+    let restored_state = fixture.path("history-backup-restored-state");
+    let restored_root = fixture.path("history-backup-restored-root");
+    let restored_config = fixture.path("history-backup-restored.json");
+    write_sync_config(
+        &restored_config,
+        "history-backup-restored",
+        &restored_state,
+        true,
+        None,
+    );
+    fixture
+        .yy_ok(&[
+            "--volume",
+            text(&restored_config),
+            "sync",
+            "restore",
+            "--backup",
+            text(&backup),
+            "--directory",
+            text(&restored_root),
+        ])
+        .success_or("restore supplied backup with the original root unavailable");
+    let restored_paths = fixture::SyncPaths {
+        config: restored_config,
+        directory: restored_root.clone(),
+        state: restored_state,
+    };
+    let restored = fixture.sync_status(&restored_paths);
+    assert_eq!(restored.summary.conflicts, 0);
+    assert_eq!(restored.entry("first.txt").state, EntryState::InSync);
+    assert_eq!(
+        restored.entry("second.txt").state,
+        EntryState::RemotePending
+    );
+    assert_eq!(
+        fs::read(restored_root.join("first.txt")).unwrap(),
+        b"first baseline"
+    );
+    fixture.sync_run_ok(&restored_paths);
+    let restored = fixture.sync_status(&restored_paths);
+    assert_eq!(restored.entry("first.txt").state, EntryState::InSync);
+    assert_eq!(restored.entry("second.txt").state, EntryState::InSync);
+    assert_eq!(
+        fs::read(restored_root.join("second.txt")).unwrap(),
+        b"second baseline"
+    );
+
     let corrupt = fixture.path("history-backup-corrupt");
     copy_directory(&backup, &corrupt);
     let manifest = corrupt.join("manifest.bin");
@@ -906,6 +1010,41 @@ fn retention_plan_protects_live_and_packaged_sync_baselines_read_only() {
     bytes[0] ^= 0xff;
     fs::write(&manifest, bytes).unwrap();
     let corrupt_before = authoritative_tree(&corrupt);
+
+    let corrupt_refused = run_expiry(
+        &fixture,
+        &observer.config,
+        &[live_revision],
+        &[&corrupt],
+        &[],
+    );
+    assert_expiry_evidence_refusal(&corrupt_refused, Publication::Object, "backup-package");
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest_before_expiry,
+        live_revision,
+        "first.txt",
+        b"first baseline",
+    );
+
+    let missing_backup = fixture.path("history-backup-missing");
+    let missing_refused = run_expiry(
+        &fixture,
+        &observer.config,
+        &[live_revision],
+        &[&missing_backup],
+        &[],
+    );
+    assert_expiry_evidence_refusal(&missing_refused, Publication::Object, "backup-package");
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest_before_expiry,
+        live_revision,
+        "first.txt",
+        b"first baseline",
+    );
 
     let protected = retention_plan(&fixture, &observer.config, 1, &[&backup, &corrupt], None);
     assert_plan_boundaries(&protected);
@@ -1117,6 +1256,271 @@ fn object_publication_journal_restore_preserves_history_and_unknown() {
     assert_eq!(local_tree(&restored_history).unwrap(), first_tree);
 }
 
+#[test]
+#[ignore = "requires isolated YINYANG_S3_* storage"]
+fn explicit_expiry_preserves_clean_ready_work_and_read_semantics() {
+    for publication in [Publication::Object, Publication::Service] {
+        explicit_expiry_clean_ready_work(publication);
+    }
+}
+
+fn explicit_expiry_clean_ready_work(publication: Publication) {
+    let mut fixture = Fixture::new(publication);
+    let expire = fixture.remote_create_file("expire.txt", b"expire-base", false);
+    let clean = fixture.remote_create_file("clean.txt", b"clean-base", false);
+
+    let clean_state = fixture.path("clean-state");
+    let clean_config = fixture.path("clean.json");
+    write_volume_config(
+        &clean_config,
+        "clean",
+        &clean_state,
+        publication == Publication::Object,
+        (publication == Publication::Service).then(|| fixture.service_address()),
+    );
+    let clean_handle = parse_handle(&fixture.yy_ok(&[
+        "--volume",
+        text(&clean_config),
+        "file",
+        "open",
+        "clean.txt",
+        "--write",
+    ]));
+    let clean_status = inspect(&clean_state);
+    let ready = clean_status
+        .handles
+        .iter()
+        .find(|handle| handle.id == clean_handle)
+        .expect("clean ready handle disappeared");
+    assert_eq!(ready.remote_revision, clean.cursor.revision);
+    assert!(!ready.pending && !ready.frozen);
+
+    let current = fixture.remote_create_file("current.txt", b"current", false);
+
+    let foreign = Fixture::new(Publication::Object);
+    foreign.remote_create_file("foreign.txt", b"foreign-base", false);
+    let foreign_state = foreign.path("foreign-state");
+    let foreign_open_config = foreign.path("foreign-open.json");
+    write_volume_config(
+        &foreign_open_config,
+        "foreign-open",
+        &foreign_state,
+        true,
+        None,
+    );
+    foreign.yy_ok(&[
+        "--volume",
+        text(&foreign_open_config),
+        "file",
+        "open",
+        "foreign.txt",
+        "--write",
+    ]);
+    let foreign_config = fixture.path("foreign.json");
+    write_volume_config(
+        &foreign_config,
+        "foreign",
+        &foreign_state,
+        publication == Publication::Object,
+        (publication == Publication::Service).then(|| fixture.service_address()),
+    );
+
+    let corrupt_state = fixture.path("corrupt-state");
+    fs::create_dir(&corrupt_state).unwrap();
+    fs::write(
+        corrupt_state.join("staging.db"),
+        b"not a managed staging database",
+    )
+    .unwrap();
+    let corrupt_config = fixture.path("corrupt.json");
+    write_volume_config(
+        &corrupt_config,
+        "corrupt",
+        &corrupt_state,
+        publication == Publication::Object,
+        (publication == Publication::Service).then(|| fixture.service_address()),
+    );
+
+    let empty_state = fixture.path("empty-state");
+    fs::create_dir(&empty_state).unwrap();
+    let empty_config = fixture.path("empty.json");
+    write_volume_config(
+        &empty_config,
+        "empty",
+        &empty_state,
+        publication == Publication::Object,
+        (publication == Publication::Service).then(|| fixture.service_address()),
+    );
+
+    let authority = fixture_authority(&fixture);
+    let latest = current.cursor.revision;
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_latest())
+            .expect("observe current revision")
+            .revision(),
+        latest
+    );
+    let tree_before = fixture.remote_tree().expect("observe logical tree");
+
+    let current_refused = run_expiry(&fixture, &clean_config, &[latest], &[], &[]);
+    assert_expiry_refused(&current_refused, publication, "current", None);
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest,
+        clean.cursor.revision,
+        "clean.txt",
+        b"clean-base",
+    );
+
+    let ready_refused = run_expiry(&fixture, &clean_config, &[clean.cursor.revision], &[], &[]);
+    assert_expiry_refused(&ready_refused, publication, "protected", Some("staging_"));
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest,
+        expire.cursor.revision,
+        "expire.txt",
+        b"expire-base",
+    );
+
+    let corrupt_refused = run_expiry(
+        &fixture,
+        &corrupt_config,
+        &[expire.cursor.revision],
+        &[],
+        &[],
+    );
+    assert_expiry_evidence_refusal(&corrupt_refused, publication, "local-staging");
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest,
+        expire.cursor.revision,
+        "expire.txt",
+        b"expire-base",
+    );
+
+    let foreign_refused = run_expiry(
+        &fixture,
+        &foreign_config,
+        &[expire.cursor.revision],
+        &[],
+        &[],
+    );
+    assert_expiry_evidence_refusal(&foreign_refused, publication, "local-staging");
+    assert_latest_and_candidate(
+        &fixture,
+        &authority,
+        latest,
+        expire.cursor.revision,
+        "expire.txt",
+        b"expire-base",
+    );
+
+    let immutable_before = immutable_identities(&fixture.operator());
+    let committed = run_expiry(&fixture, &empty_config, &[expire.cursor.revision], &[], &[]);
+    assert_expiry_success(&committed, publication, "committed");
+    let expiry_revision = runtime()
+        .block_on(authority.observe_latest())
+        .expect("observe expiry audit revision")
+        .revision();
+    assert_ne!(expiry_revision, latest);
+    assert_immutable_objects_retained(
+        &immutable_before,
+        &immutable_identities(&fixture.operator()),
+    );
+    assert_eq!(
+        fixture.remote_tree().expect("observe post-expiry tree"),
+        tree_before,
+        "logical expiry must not change the current namespace"
+    );
+
+    let repeated = run_expiry(&fixture, &empty_config, &[expire.cursor.revision], &[], &[]);
+    assert_expiry_success(&repeated, publication, "already_expired");
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_latest())
+            .expect("observe repeated expiry revision")
+            .revision(),
+        expiry_revision,
+        "an already-expired observation must not publish another audit revision"
+    );
+
+    let expired = runtime()
+        .block_on(authority.observe_revision(expire.cursor.revision))
+        .expect_err("known expired revision must not be fresh-readable");
+    assert_eq!(
+        expired.kind(),
+        ErrorKind::Expired,
+        "{publication:?}: {expired}"
+    );
+    let unknown_revision = Revision::from_bytes([0xff; 24]);
+    let unknown = runtime()
+        .block_on(authority.observe_revision(unknown_revision))
+        .expect_err("unknown revision must not be fresh-readable");
+    assert_eq!(
+        unknown.kind(),
+        ErrorKind::NotFound,
+        "{publication:?}: {unknown}"
+    );
+    let history = runtime()
+        .block_on(authority.revision_history())
+        .expect("read typed revision history");
+    assert!(history.iter().any(|record| {
+        record.revision == expire.cursor.revision && record.status == RevisionStatus::Expired
+    }));
+    assert!(history.iter().any(|record| {
+        record.revision == clean.cursor.revision && record.status == RevisionStatus::Readable
+    }));
+    assert!(
+        history.iter().any(|record| {
+            record.revision == latest && record.status == RevisionStatus::Readable
+        })
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|record| record.revision == unknown_revision)
+    );
+    assert_eq!(
+        revision_bytes(&authority, clean.cursor.revision, "clean.txt"),
+        b"clean-base"
+    );
+    assert_eq!(
+        revision_bytes(&authority, latest, "current.txt"),
+        b"current"
+    );
+
+    let clean_bytes = fixture.path("clean-new");
+    fs::write(&clean_bytes, b"clean-after-expiry").unwrap();
+    fixture.yy_ok(&[
+        "--volume",
+        text(&clean_config),
+        "file",
+        "write",
+        &clean_handle.to_string(),
+        text(&clean_bytes),
+    ]);
+    let clean_publish = fixture.yy_ok(&[
+        "--volume",
+        text(&clean_config),
+        "file",
+        "fsync",
+        &clean_handle.to_string(),
+    ]);
+    assert!(
+        String::from_utf8_lossy(&clean_publish.stdout).contains("revision:"),
+        "{publication:?}: clean ready handle did not recover: {}",
+        String::from_utf8_lossy(&clean_publish.stdout)
+    );
+    assert_eq!(
+        remote_entry_bytes(&fixture, "clean.txt").as_deref(),
+        Some(b"clean-after-expiry".as_slice())
+    );
+}
+
 fn inspect(staging: &Path) -> RuntimeStatus {
     runtime()
         .block_on(Runtime::inspect(staging))
@@ -1180,7 +1584,7 @@ fn retention_plan(
 }
 
 fn assert_plan_boundaries(plan: &serde_json::Value) {
-    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v4");
+    assert_eq!(plan["schema"], "yinyang.managed-retention.plan.v5");
     assert_eq!(plan["deletion_authorized"], false);
     assert!(plan["reclaimable_bytes"].is_null());
     assert_eq!(plan["policy"]["published_history"], "retained_by_default");
@@ -1303,6 +1707,242 @@ fn remote_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
     });
     identities.sort();
     identities
+}
+
+fn immutable_identities(operator: &opendal::Operator) -> Vec<RemoteIdentity> {
+    remote_identities(operator)
+        .into_iter()
+        .filter(|identity| identity.path != ".yinyang/head")
+        .collect()
+}
+
+fn assert_immutable_objects_retained(before: &[RemoteIdentity], after: &[RemoteIdentity]) {
+    let after = after
+        .iter()
+        .map(|identity| (identity.path.clone(), identity))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for identity in before {
+        let current = after
+            .get(&identity.path)
+            .unwrap_or_else(|| panic!("immutable object {} was removed", identity.path));
+        assert_eq!(
+            current.length, identity.length,
+            "immutable object {} changed length",
+            identity.path
+        );
+        assert_eq!(
+            current.etag, identity.etag,
+            "immutable object {} changed content identity",
+            identity.path
+        );
+    }
+}
+
+fn revision_text(revision: yinyang::core::Revision) -> String {
+    revision
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn revision_from_hex(value: &str) -> Revision {
+    let bytes = value.as_bytes();
+    assert_eq!(bytes.len(), 48, "revision must be 24-byte hexadecimal");
+    let mut decoded = [0_u8; 24];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        let high = parse_hex_nibble(bytes[index * 2]);
+        let low = parse_hex_nibble(bytes[index * 2 + 1]);
+        *byte = (high << 4) | low;
+    }
+    Revision::from_bytes(decoded)
+}
+
+fn parse_hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => panic!("revision contains a non-hexadecimal byte: {value}"),
+    }
+}
+
+fn fixture_authority(fixture: &Fixture) -> std::sync::Arc<dyn Authority> {
+    fixture.authority()
+}
+
+fn run_expiry(
+    fixture: &Fixture,
+    config: &Path,
+    revisions: &[Revision],
+    backups: &[&Path],
+    env: &[(&str, &str)],
+) -> Captured {
+    let mut args = vec![
+        "--volume".to_owned(),
+        text(config).to_owned(),
+        "space".to_owned(),
+        "retention".to_owned(),
+        "expire".to_owned(),
+    ];
+    for revision in revisions {
+        args.push("--revision".to_owned());
+        args.push(revision_text(*revision));
+    }
+    for backup in backups {
+        args.push("--backup".to_owned());
+        args.push(text(backup).to_owned());
+    }
+    args.push("--json".to_owned());
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    fixture.yy_with_env(&args, env)
+}
+
+fn expiry_document(output: &Captured) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse expiry JSON: {error}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn assert_expiry_success(output: &Captured, publication: Publication, expected_state: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{publication:?} expiry did not succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = expiry_document(output);
+    assert_eq!(
+        document["schema"], "yinyang.managed-retention.expiry.v1",
+        "{publication:?}: {document}"
+    );
+    assert_eq!(
+        document["state"], expected_state,
+        "{publication:?}: {document}"
+    );
+}
+
+fn assert_expiry_refused(
+    output: &Captured,
+    publication: Publication,
+    expected_decision: &str,
+    expected_reason_prefix: Option<&str>,
+) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{publication:?} expiry did not reach the intended refusal\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = expiry_document(output);
+    assert_eq!(
+        document["schema"], "yinyang.managed-retention.expiry.v1",
+        "{publication:?}: {document}"
+    );
+    assert_eq!(document["state"], "refused", "{publication:?}: {document}");
+    let decisions = document["revisions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{publication:?} expiry report has no decisions: {document}"));
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["state"] == expected_decision
+                && expected_reason_prefix.is_none_or(|prefix| {
+                    decision["reasons"].as_array().is_some_and(|reasons| {
+                        reasons.iter().any(|reason| {
+                            reason
+                                .as_str()
+                                .is_some_and(|reason| reason.starts_with(prefix))
+                        })
+                    })
+                })
+        }),
+        "{publication:?} refusal has no {expected_decision:?} decision with reason {expected_reason_prefix:?}: {document}"
+    );
+}
+
+fn assert_expiry_evidence_refusal(
+    output: &Captured,
+    publication: Publication,
+    expected_subject: &str,
+) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{publication:?} expiry did not produce an evidence refusal\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = expiry_document(output);
+    assert_eq!(
+        document["schema"], "yinyang.managed-retention.expiry.v1",
+        "{publication:?}: {document}"
+    );
+    assert_eq!(document["state"], "refused", "{publication:?}: {document}");
+    assert!(
+        document["unresolved"].as_array().is_some_and(|unresolved| {
+            unresolved
+                .iter()
+                .any(|entry| entry["subject"] == expected_subject)
+        }),
+        "{publication:?} refusal does not report unresolved {expected_subject:?}: {document}"
+    );
+}
+
+fn assert_latest_and_candidate(
+    fixture: &Fixture,
+    authority: &std::sync::Arc<dyn Authority>,
+    expected_latest: Revision,
+    candidate: Revision,
+    path: &str,
+    bytes: &[u8],
+) {
+    assert_eq!(
+        runtime()
+            .block_on(authority.observe_latest())
+            .expect("observe latest after refusal")
+            .revision(),
+        expected_latest,
+        "refusal changed the latest revision"
+    );
+    assert_eq!(
+        revision_bytes(authority, candidate, path),
+        bytes,
+        "refusal made the candidate unreadable"
+    );
+}
+
+fn revision_bytes(
+    authority: &std::sync::Arc<dyn Authority>,
+    revision: Revision,
+    path: &str,
+) -> Vec<u8> {
+    runtime()
+        .block_on(async {
+            let snapshot = authority.observe_revision(revision).await?;
+            let node = snapshot
+                .resolve(path)
+                .await?
+                .ok_or_else(|| format!("revision {} has no {path}", revision_text(revision)))?;
+            let file = snapshot.open_file(node.id()).await?;
+            let mut bytes = Vec::new();
+            file.read_range(0..file.descriptor().content_id().length(), &mut bytes)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes)
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "read {} at revision {}: {error}",
+                path,
+                revision_text(revision)
+            )
+        })
 }
 
 fn remove_prefix(operator: &opendal::Operator) {
