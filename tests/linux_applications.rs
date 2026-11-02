@@ -24,38 +24,24 @@ mod support;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::time::Duration;
 use support::linux_fuse::{Fixture, Frontend, Publication, run_timeout};
+use yinyang_test_support::process::Captured;
 
 const APPLICATION_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug)]
-struct AppOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+fn run_application(command: Command) -> Captured {
+    run_timeout(command, APPLICATION_TIMEOUT)
 }
 
-impl AppOutput {
-    fn success_or(&self, context: &str) {
-        assert!(
-            self.status.success(),
-            "{context} failed with {}:\nstdout:\n{}\nstderr:\n{}",
-            self.status,
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        );
-    }
-}
-
-fn run_application(command: Command) -> AppOutput {
-    let output = run_timeout(command, APPLICATION_TIMEOUT);
-    AppOutput {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    }
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C");
+    command
 }
 
 fn payload(seed: u8, length: usize) -> Vec<u8> {
@@ -95,7 +81,7 @@ fn write_source_tree(source: &Path) -> Vec<u8> {
     fs::create_dir_all(source.join("notes")).expect("create source notes");
     fs::create_dir_all(source.join("empty")).expect("create empty source directory");
 
-    let bytes = payload(17, 96 * 1024 + 37);
+    let bytes = payload(17, 384 * 1024 + 37);
     fs::write(source.join("assets/payload.bin"), &bytes).expect("write source payload");
     fs::write(
         source.join("notes/readme.txt"),
@@ -117,8 +103,9 @@ fn write_source_tree(source: &Path) -> Vec<u8> {
     bytes
 }
 
-fn rsync(source: &Path, destination: &Path, delete: bool, inplace: bool) -> AppOutput {
+fn rsync(source: &Path, destination: &Path, delete: bool, inplace: bool) -> Captured {
     let mut command = Command::new("rsync");
+    command.env("LC_ALL", "C");
     command.args([
         "-r",
         "--checksum",
@@ -242,7 +229,7 @@ fn application_rsync_existing_tree_update_survives_remount_both_publications() {
             "the independent authority must observe rsync payload bytes"
         );
 
-        let updated_payload = payload(93, 112 * 1024 + 11);
+        let updated_payload = payload(93, 448 * 1024 + 11);
         fs::write(source.join("assets/payload.bin"), &updated_payload)
             .expect("update source payload");
         fs::remove_file(source.join("notes/remove.txt")).expect("remove source note");
@@ -296,7 +283,7 @@ fn application_rsync_existing_tree_update_survives_remount_both_publications() {
     }
 }
 
-fn tar_create(archive: &Path, source: &Path) -> AppOutput {
+fn tar_create(archive: &Path, source: &Path) -> Captured {
     let mut command = Command::new("tar");
     command
         .env("LC_ALL", "C")
@@ -308,7 +295,7 @@ fn tar_create(archive: &Path, source: &Path) -> AppOutput {
     run_application(command)
 }
 
-fn tar_extract(archive: &Path, destination: &Path) -> AppOutput {
+fn tar_extract(archive: &Path, destination: &Path) -> Captured {
     let mut command = Command::new("tar");
     command
         .env("LC_ALL", "C")
@@ -490,10 +477,8 @@ fn application_git_loose_object_mode_is_rejected() {
     let blob = fixture.temp.path().join("git-blob.txt");
     fs::create_dir(&mountpoint).expect("create Git mountpoint");
 
-    let mut init = Command::new("git");
-    init.args(["init", "--bare"])
-        .arg(&local_bare)
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let mut init = git_command();
+    init.args(["init", "--bare"]).arg(&local_bare);
     run_application(init).success_or("initialize local bare Git fixture");
     fs::write(&blob, b"Git loose object mode probe\n").expect("write Git blob source");
 
@@ -501,7 +486,7 @@ fn application_git_loose_object_mode_is_rejected() {
     let mounted_bare = mounted.mountpoint().join("repository.git");
     copy_representable_tree(&local_bare, &mounted_bare);
 
-    let mut hash = Command::new("git");
+    let mut hash = git_command();
     hash.args(["hash-object"]).arg(&blob);
     let hash = run_application(hash);
     hash.success_or("hash Git probe blob");
@@ -511,14 +496,12 @@ fn application_git_loose_object_mode_is_rejected() {
         .to_owned();
     assert_eq!(object_id.len(), 40, "Git object ID length");
 
-    let mut write = Command::new("git");
+    let mut write = git_command();
     write
         .arg("--git-dir")
         .arg(&mounted_bare)
         .args(["hash-object", "-w"])
-        .arg(&blob)
-        .env("HOME", fixture.temp.path().join("git-home"))
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .arg(&blob);
     let rejected = run_application(write);
     assert_eq!(
         rejected.status.code(),

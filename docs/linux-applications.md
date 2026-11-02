@@ -89,14 +89,15 @@ cargo x test-linux-applications
 ```
 
 The entry point requires Linux, `/dev/fuse`, `fusermount3`, Git, rsync, GNU tar
-and the isolated `YINYANG_S3_*`/`YINYANG_STORAGE_PROFILE=minio` fixture. Missing
-tools or configuration are hard failures. The test runs both object and
-authenticated loopback service publication and uses `YY_UPGRADE_BIN` when set.
-The trial-distribution workflow sets that selector to the packaged archive's
+and the isolated `YINYANG_S3_*` fixture configured as MinIO. Missing tools or
+configuration are hard failures. The test runs both object and authenticated
+loopback service publication and uses `YY_UPGRADE_BIN` when set. The
+trial-distribution workflow sets that selector to the packaged archive's
 `bin/yy`.
 
-The maintainer suite also records the Git negative boundary.
-`git init --template=` and `git hash-object -w` against a representable
-bare-repository skeleton both fail with `EOPNOTSUPP` while creating private
-temporary or loose-object files. Git workflows are excluded rather than
-silently using a different mode model.
+The fresh-main probe and committed regression record the Git negative boundary.
+`git init --template=` failed during the probe, and the suite repeats the
+equivalent `git hash-object -w` boundary against a representable bare-repository
+skeleton. Both fail with `EOPNOTSUPP` while creating private temporary or
+loose-object files. Git workflows are excluded rather than silently using a
+different mode model.
