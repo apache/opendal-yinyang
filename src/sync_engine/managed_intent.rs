@@ -383,6 +383,19 @@ fn frozen(
     })
 }
 
+pub(super) fn verify_frozen(
+    authority: &dyn Authority,
+    request: &FrozenRemoteRequest,
+) -> Result<()> {
+    let (_, id, digest) = Transaction::verify_identity(&request.bytes, authority.filesystem())?;
+    if id.as_bytes() != &request.id || digest != request.digest {
+        return Err(Error::corrupt(
+            "frozen Managed transaction identity disagrees with its engine request",
+        ));
+    }
+    Ok(())
+}
+
 fn identity(key: &RequestKey) -> Result<([u8; 16], CommitId)> {
     let key = borsh::to_vec(key).map_err(|error| Error::corrupt(error.to_string()))?;
     let request = blake3::derive_key("yinyang-sync-engine-managed-request-1", &key);

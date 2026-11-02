@@ -3292,6 +3292,7 @@ mod tests {
         let backend = TestBackend::default();
         let fs = Fs::create(backend.operator()).await.unwrap();
         let authority: Arc<dyn Authority> = Arc::new(fs);
+        let candidate = authority.observe_latest().await.unwrap().revision();
         for name in ["one", "two"] {
             let snapshot = authority.observe_latest().await.unwrap();
             let mut planner = Planner::new(&snapshot, CommitId::generate());
@@ -3304,7 +3305,6 @@ mod tests {
                 CommitOutcome::Committed(_)
             ));
         }
-        let candidate = authority.retained_revisions().await.unwrap()[0];
 
         let temp = tempdir().unwrap();
         let staging = temp.path().join("state");
@@ -3382,16 +3382,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(report.state, ExpiryReportState::Refused);
-        assert!(report.revisions.iter().any(|decision| {
-            decision.revision == revision_hex(protected)
-                && decision.state == ExpiryDecisionState::Protected
-                && decision.reasons.contains(&"staging_base")
-        }));
+        assert!(
+            report.revisions.iter().any(|decision| {
+                decision.revision == revision_hex(protected)
+                    && decision.state == ExpiryDecisionState::Protected
+                    && decision.reasons.contains(&"staging_base")
+            }),
+            "{:#?}",
+            report.revisions
+        );
         assert!(authority.observe_revision(protected).await.is_ok());
 
         let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
         let mut recovered = runtime.recover(handle).await.unwrap();
         recovered.close().await.unwrap();
+        drop(recovered);
         drop(runtime);
         let report = expire_managed_retention(
             authority.as_ref(),

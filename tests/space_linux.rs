@@ -22,13 +22,16 @@ use yinyang_test_support as support;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{Authority, Fs, NodeId, Revision};
+use yinyang::core::{Authority, CommitId, Fs, NodeId, Planner, Revision};
 use yinyang::runtime::Runtime;
 use yinyang::space::{
     BackupPackageState, StagingBindingState, inspect_bound_local_staging, plan_managed_retention,
 };
 use yinyang::sync::Sync;
-use yinyang::sync_engine::{ManagedAdapter, SyncEngine, inspect_backup_package, inspect_state};
+use yinyang::sync_engine::{
+    ErrorKind as EngineErrorKind, FrozenRemoteRequest, ManagedAdapter, PreparedRemoteRequest,
+    RemoteAdapter, RemoteOperation, SyncEngine, inspect_backup_package, inspect_state,
+};
 
 fn identity_hex(identity: NodeId) -> String {
     identity
@@ -52,6 +55,59 @@ fn parse_revision(value: &str) -> Revision {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
     }
     Revision::from_bytes(bytes)
+}
+
+#[tokio::test]
+async fn managed_adapter_rejects_wrapped_frozen_identity_before_dispatch() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut planner = Planner::new(&snapshot, CommitId::generate());
+    planner
+        .create_directory(authority.root(), "guarded")
+        .await
+        .unwrap();
+    let transaction = planner.finish().unwrap();
+    let id = *transaction.id().as_bytes();
+    let digest = transaction.digest();
+    let bytes = transaction.to_bytes().unwrap();
+    let before = snapshot.revision();
+
+    let mut wrong_id = id;
+    wrong_id[0] ^= 1;
+    let mut wrong_digest = digest;
+    wrong_digest[0] ^= 1;
+    for (request_id, request_digest) in [(wrong_id, digest), (id, wrong_digest)] {
+        let request = PreparedRemoteRequest {
+            request: FrozenRemoteRequest {
+                id: request_id,
+                digest: request_digest,
+                bytes: bytes.clone(),
+                operation: RemoteOperation::CreateDirectory,
+                path: "guarded".to_owned(),
+                original_path: None,
+                desired_path: None,
+            },
+            source: None,
+        };
+        let error = ManagedAdapter::new(authority.clone())
+            .publish_batch(&[request])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Corrupt);
+        assert_eq!(authority.observe_latest().await.unwrap().revision(), before);
+    }
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("guarded")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
