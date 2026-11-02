@@ -59,6 +59,7 @@ impl Command {
             SubCommand::Macos(cmd) => cmd.run(),
             SubCommand::BenchLinuxCost(cmd) => cmd.run(),
             SubCommand::TestManagedSync(cmd) => cmd.run(),
+            SubCommand::TestLinuxApplications(cmd) => cmd.run(),
             SubCommand::TestLinuxDirect(cmd) => cmd.run(),
             SubCommand::TestLinuxFuse(cmd) => cmd.run(),
             SubCommand::TestLinuxOperations(cmd) => cmd.run(),
@@ -85,6 +86,10 @@ enum SubCommand {
         about = "Run real Linux Managed Sync acceptance through yy and ordinary directories (requires isolated S3 settings)."
     )]
     TestManagedSync(CommandTestManagedSync),
+    #[clap(
+        about = "Run real rsync and GNU tar workflows through yy and /dev/fuse (requires isolated S3)."
+    )]
+    TestLinuxApplications(CommandTestLinuxApplications),
     #[clap(
         about = "Run deterministic Direct Mount and Sync acceptance through yy and /dev/fuse (requires isolated S3 settings)."
     )]
@@ -461,6 +466,34 @@ impl CommandTestManagedSync {
             "--test-threads=1",
         ]);
         run_command(cmd);
+    }
+}
+
+#[derive(Parser)]
+#[clap(name = "test-linux-applications")]
+struct CommandTestLinuxApplications {}
+
+impl CommandTestLinuxApplications {
+    fn run(self) {
+        require_linux("Linux application acceptance");
+        require_fuse("Linux application acceptance");
+        require_isolated_storage("Linux application acceptance");
+        for tool in ["git", "rsync", "tar"] {
+            if which::which(tool).is_err() {
+                panic!(
+                    "{tool} is unavailable; Linux application acceptance requires the tested application binaries"
+                );
+            }
+        }
+        let tar = find_command("tar")
+            .arg("--version")
+            .output()
+            .expect("run tar --version");
+        assert!(
+            tar.status.success() && String::from_utf8_lossy(&tar.stdout).contains("GNU tar"),
+            "Linux application acceptance requires GNU tar"
+        );
+        run_ignored_test("linux_applications", Some("application_"));
     }
 }
 
