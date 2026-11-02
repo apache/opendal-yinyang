@@ -19,8 +19,8 @@
 
 //! Real-process Linux backup and isolated-restore acceptance.
 
-#[path = "linux_sync/harness.rs"]
-mod fixture;
+mod support;
+use support::linux_sync as fixture;
 
 use fixture::{
     ArtifactKind, Captured, EntryState, Fixture, Publication, RemoteEntry, SyncStatus, local_tree,

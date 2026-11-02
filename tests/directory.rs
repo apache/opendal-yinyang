@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -25,6 +23,7 @@ use yinyang::core::service::MetadataService;
 use yinyang::core::{Authority, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
 use yinyang::{DirectoryJournal, DirectoryState};
+use yinyang_test_support as support;
 
 async fn filesystem(backend: &TestBackend) -> Fs {
     Fs::create(backend.operator()).await.unwrap()

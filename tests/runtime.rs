@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{future::Future, pin::Pin};
@@ -28,6 +26,7 @@ use yinyang::core::{
     PreparedContent, Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{Error, ErrorKind, Runtime};
+use yinyang_test_support as support;
 
 #[derive(Default)]
 struct PrepareCalls {

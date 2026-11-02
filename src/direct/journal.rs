@@ -542,17 +542,11 @@ fn local(context: &str, error: std::io::Error) -> Error {
 }
 
 fn store_error(error: store::Error) -> Error {
-    let kind = match error.kind() {
-        store::ErrorKind::Invalid => ErrorKind::Invalid,
-        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
-        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
-        store::ErrorKind::Busy
-        | store::ErrorKind::AlreadyExists
-        | store::ErrorKind::NotFound
-        | store::ErrorKind::ReadOnly
-        | store::ErrorKind::PermissionDenied
-        | store::ErrorKind::NoSpace
-        | store::ErrorKind::Io => ErrorKind::Storage,
+    let kind = match crate::runtime::ErrorKind::from(error.kind()) {
+        crate::runtime::ErrorKind::Invalid => ErrorKind::Invalid,
+        crate::runtime::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        crate::runtime::ErrorKind::Corrupt => ErrorKind::Corrupt,
+        _ => ErrorKind::Storage,
     };
     Error::new(kind, error.to_string())
 }

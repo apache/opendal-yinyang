@@ -53,8 +53,9 @@ The archive inventory is fixed by schema v1:
 - `bin/yy`;
 - the three systemd user-unit templates;
 - the environment example;
-- the operational, qualification, recovery, profile-admission, operating-envelope
-  and trial-distribution documents;
+- `linux-operations.md`, `linux-qualification.md`,
+  `linux-operating-envelope.md`, `linux-backup-recovery.md` and
+  `linux-trial-distribution.md`;
 - `install-release.sh` and `verify-release.sh`.
 
 Every entry must be a regular file or directory. Absolute paths, `..`

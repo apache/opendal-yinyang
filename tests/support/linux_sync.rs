@@ -29,7 +29,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -40,33 +40,13 @@ use yinyang::core::{
     Authority, CommitOutcome, Error, ErrorKind, Fs, NodeKind, Planner, Receipt,
     Result as CoreResult, Snapshot,
 };
+pub use yinyang_test_support::fixture::Publication;
+use yinyang_test_support::fixture::{require_storage_environment, storage_environment};
+pub use yinyang_test_support::process::Captured;
+use yinyang_test_support::process::{read_all, run_timeout};
+use yinyang_test_support::yy;
 
-#[path = "../support/yy.rs"]
-mod yy;
-
-const STORAGE_VARIABLES: [&str; 5] = [
-    "YINYANG_S3_BUCKET",
-    "YINYANG_S3_ENDPOINT",
-    "YINYANG_S3_REGION",
-    "YINYANG_S3_ACCESS_KEY_ID",
-    "YINYANG_S3_SECRET_ACCESS_KEY",
-];
 const MAX_FRAME: usize = 16 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Publication {
-    Object,
-    Service,
-}
-
-impl Publication {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Object => "object",
-            Self::Service => "service",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteEntry {
@@ -75,25 +55,6 @@ pub enum RemoteEntry {
 }
 
 pub type Tree = BTreeMap<String, RemoteEntry>;
-
-#[derive(Debug)]
-pub struct Captured {
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-impl Captured {
-    pub fn success_or(&self, context: &str) {
-        assert!(
-            self.status.success(),
-            "{context} failed with {}:\nstdout:\n{}\nstderr:\n{}",
-            self.status,
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        );
-    }
-}
 
 pub struct RunningSync {
     child: Child,
@@ -144,15 +105,8 @@ impl Drop for RunningSync {
 }
 
 pub fn require_acceptance() {
-    let amazon_s3 = std::env::var("YINYANG_STORAGE_PROFILE").as_deref() == Ok("amazon-s3");
-    for name in STORAGE_VARIABLES {
-        if amazon_s3 && name == "YINYANG_S3_ENDPOINT" {
-            continue;
-        }
-        if std::env::var_os(name).is_none() {
-            panic!("{name} is unset; Managed Sync acceptance fails instead of skipping");
-        }
-    }
+    let profile = std::env::var("YINYANG_STORAGE_PROFILE").unwrap_or_else(|_| "minio".to_owned());
+    require_storage_environment(&profile, true, "Managed Sync acceptance");
 }
 
 pub struct Fixture {
@@ -574,40 +528,19 @@ impl Fixture {
     }
 
     fn storage_env(&self) -> Vec<(&'static str, String)> {
-        let mut env = Vec::with_capacity(STORAGE_VARIABLES.len() + 4);
         let profile =
             std::env::var("YINYANG_STORAGE_PROFILE").unwrap_or_else(|_| "minio".to_owned());
-        for name in STORAGE_VARIABLES {
-            if profile == "amazon-s3"
-                && name == "YINYANG_S3_ENDPOINT"
-                && self.storage_endpoint.is_none()
-                && std::env::var_os(name).is_none()
-            {
-                continue;
-            }
-            let value = if name == "YINYANG_S3_ENDPOINT" {
-                self.storage_endpoint
-                    .clone()
-                    .or_else(|| std::env::var(name).ok())
-            } else {
-                std::env::var(name).ok()
-            }
-            .unwrap_or_else(|| {
-                panic!("{name} disappeared after acceptance preflight; refusing to skip")
-            });
-            env.push((name, value));
-        }
-        env.push(("YINYANG_STORAGE_PROFILE", profile));
-        env.push(("YINYANG_S3_ROOT", self.root.clone()));
-        env.push(("YINYANG_SERVICE_TOKEN", self.token.clone()));
-        if let Ok(token) = std::env::var("YINYANG_S3_SESSION_TOKEN") {
-            env.push(("YINYANG_S3_SESSION_TOKEN", token));
-        }
-        env
+        storage_environment(
+            &profile,
+            &self.root,
+            &self.token,
+            self.storage_endpoint.as_deref(),
+            true,
+        )
     }
 
     pub fn yy_command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(yy::binary());
+        let mut command = Command::new(yy::binary(env!("CARGO_BIN_EXE_yy")));
         command.args(args);
         for (name, value) in self.storage_env() {
             command.env(name, value);
@@ -1622,63 +1555,4 @@ fn join(parent: &str, name: &str) -> String {
 fn text(path: &Path) -> &str {
     path.to_str()
         .unwrap_or_else(|| panic!("acceptance path is not UTF-8: {}", path.display()))
-}
-
-fn run_timeout(mut command: Command, timeout: Duration) -> Captured {
-    let command_description = describe_command(&command);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|error| panic!("spawn process ({command_description}): {error}"));
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_thread = thread::spawn(move || read_all(stdout));
-    let stderr_thread = thread::spawn(move || read_all(stderr));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            Ok(None) => {
-                let _ = child.kill();
-                let status = child.wait().expect("wait after timeout kill");
-                let stdout = stdout_thread.join().unwrap_or_default();
-                let stderr = stderr_thread.join().unwrap_or_default();
-                panic!(
-                    "command timed out after {timeout:?} with {status} ({command_description}):\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                );
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("wait for process ({command_description}): {error}");
-            }
-        }
-    };
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
-    Captured {
-        status,
-        stdout,
-        stderr,
-    }
-}
-
-fn describe_command(command: &Command) -> String {
-    std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|value| format!("{value:?}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn read_all(mut reader: impl Read) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let _ = reader.read_to_end(&mut bytes);
-    bytes
 }

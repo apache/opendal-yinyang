@@ -938,19 +938,7 @@ fn existing_identity(id: CommitId) -> Error {
 }
 
 fn store_error(error: store::Error) -> Error {
-    let kind = match error.kind() {
-        store::ErrorKind::Invalid => ErrorKind::Invalid,
-        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
-        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
-        store::ErrorKind::Busy => ErrorKind::Busy,
-        store::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
-        store::ErrorKind::NotFound => ErrorKind::NotFound,
-        store::ErrorKind::ReadOnly => ErrorKind::ReadOnly,
-        store::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-        store::ErrorKind::NoSpace => ErrorKind::NoSpace,
-        store::ErrorKind::Io => ErrorKind::Io,
-    };
-    Error::local_kind(kind, error)
+    Error::local_kind(error.kind().into(), error)
 }
 
 fn local(error: impl std::error::Error + 'static) -> Error {

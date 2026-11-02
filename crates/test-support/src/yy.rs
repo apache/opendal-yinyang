@@ -22,16 +22,15 @@ use std::sync::OnceLock;
 
 /// Select the actual archive binary when YY_UPGRADE_BIN is present.
 ///
-/// The same selector is used by installed operations and retained-state
-/// recovery, so a trial workflow can exercise one immutable archive binary
-/// without introducing a second override.
-pub fn binary() -> &'static Path {
+/// Linux acceptance suites share one immutable binary selector so a trial
+/// workflow can exercise the same artifact across product paths.
+pub fn binary(default: &'static str) -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY
         .get_or_init(|| {
             let selected = std::env::var_os("YY_UPGRADE_BIN")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_yy")));
+                .unwrap_or_else(|| PathBuf::from(default));
             assert!(
                 selected.is_file(),
                 "YY_UPGRADE_BIN must name a release yy binary: {}",

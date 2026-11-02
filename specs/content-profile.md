@@ -38,17 +38,17 @@ domain tags, integer widths, tree split, or descriptor/index fields requires a
 different profile identifier; existing identities are never reinterpreted
 through new tuning.
 
-The 65,536-byte verification unit enters those logical identities. The merged
-read-only FUSE range study
-[retains this identity](../docs/linux-range-cost-results.md): 4 KiB reads on
-8 MiB and 32 MiB files transferred at most 0.077 MiB of response payload and
-crossing one unit boundary transferred 0.133-0.140 MiB, rather than
-materializing the file. Repeated warm reads through one immutable version still
-issued 9-11 storage requests and took 7.4-9.2 ms p50, while the former
-full-staging path issued no requests and took 0.07-0.50 ms. That study observed
-the existing 64 KiB unit; it did not sweep alternative unit sizes or establish
-an optimum. Cache bounds, packing, and batching remain policy and do not change
-the profile when persisted bytes and logical identities are unchanged.
+The 65,536-byte verification unit enters those logical identities. One
+loopback-Silo qualification transferred at most 0.077 MiB of response payload
+for a cold 4 KiB read and 0.140 MiB when crossing one unit boundary on 8 MiB
+and 32 MiB files, rather than materializing the file. Repeated warm reads
+through one immutable version issued 9-11 storage requests and took 7.4-9.2 ms
+p50, while the former full-staging path issued no requests and took
+0.07-0.50 ms. The qualified bound is recorded in the pull request that
+introduced it (#101). That study observed the existing 64 KiB unit; it did not
+sweep alternative unit sizes or establish an optimum. Cache bounds, packing,
+and batching remain policy and do not change the profile when persisted bytes
+and logical identities are unchanged.
 
 Conformance vectors (lowercase hexadecimal):
 

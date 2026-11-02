@@ -24,7 +24,7 @@ Apache OpenDAL™ YinYang is a cross-platform filesystem foundation.
 > retained snapshots, and authenticated range-verifiable content. A durable
 > metadata service and recoverable Managed file handles share the transaction
 > contract. The `yy` CLI publishes and restores directories, operates configured
-> Managed volumes, and provides a Linux FUSE Managed Mount.
+> Managed and Direct volumes, and provides Linux FUSE Managed and Direct Mount.
 
 ## Current support
 

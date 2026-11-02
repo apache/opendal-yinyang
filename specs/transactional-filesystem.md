@@ -13,7 +13,6 @@ content model through two publication modes: OpenDAL and object storage alone,
 or a transactional metadata service with an OpenDAL data plane. A filesystem
 selects exactly one authoritative publication mode at creation. Both modes must
 preserve the semantics below; their physical metadata representations may differ.
-Object-storage publication is the first implementation target.
 
 The target replaces complete path-keyed version objects, embedded cumulative
 commit lists, and whole-head optimistic concurrency with persistent indexed

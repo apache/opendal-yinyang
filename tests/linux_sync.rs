@@ -21,5 +21,6 @@
 
 mod linux_sync {
     pub mod acceptance;
-    pub mod harness;
+    pub use crate::support::linux_sync as harness;
 }
+mod support;

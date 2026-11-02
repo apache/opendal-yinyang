@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde::Serialize;
+use yinyang::core::service::valid_service_token;
 use yinyang::direct::{DirectRuntime, DirectRuntimeInspectionState};
 use yinyang::runtime::ErrorKind;
 use yinyang::runtime::Runtime;
@@ -246,11 +247,26 @@ pub async fn run(path: &Path, json: bool) -> ExitCode {
                         ),
                         None::<String>,
                     );
-                    match context
-                        .service_token()
-                        .map_err(CliError::from)
-                        .and_then(|token| validate_service_token(&context.config, token))
-                    {
+                    match context.service_token().map_err(CliError::from).and_then(|token| {
+                        if context.config.publication != Publication::Service {
+                            return Ok(());
+                        }
+                        let token = token.ok_or_else(|| {
+                            CliError::new(
+                                CliStage::Operator,
+                                ErrorKind::PermissionDenied,
+                                "YINYANG_SERVICE_TOKEN is required for service publication",
+                            )
+                        })?;
+                        if !valid_service_token(&token) {
+                            return Err(CliError::new(
+                                CliStage::Operator,
+                                ErrorKind::PermissionDenied,
+                                "YINYANG_SERVICE_TOKEN must contain 32..=1024 bytes for service publication",
+                            ));
+                        }
+                        Ok(())
+                    }) {
                         Ok(()) => {
                             storage_ready = true;
                             (Health::Pass, detail, None)
@@ -518,27 +534,6 @@ fn storage_environment(config: &VolumeConfig) -> Result<String, CliError> {
         "bucket is present for volume storage_profile={:?} with {endpoint}; storage authentication uses {credentials}",
         config.storage_profile
     ))
-}
-
-fn validate_service_token(config: &VolumeConfig, token: Option<String>) -> Result<(), CliError> {
-    if config.publication != Publication::Service {
-        return Ok(());
-    }
-    let token = token.ok_or_else(|| {
-        CliError::new(
-            CliStage::Operator,
-            ErrorKind::PermissionDenied,
-            "YINYANG_SERVICE_TOKEN is required for service publication",
-        )
-    })?;
-    if !(32..=1024).contains(&token.len()) {
-        return Err(CliError::new(
-            CliStage::Operator,
-            ErrorKind::PermissionDenied,
-            "YINYANG_SERVICE_TOKEN must contain 32..=1024 bytes for service publication",
-        ));
-    }
-    Ok(())
 }
 
 fn check_fuse(config: &VolumeConfig, report: &mut DoctorReport) {
@@ -995,7 +990,7 @@ async fn check_authority(context: &VolumeContext, report: &mut DoctorReport) {
                 Some(authority_remediation(
                     config,
                     CliStage::Observe,
-                    crate::runtime_kind_from_core(error.kind()),
+                    ErrorKind::from(error.kind()),
                 )),
             ),
         },

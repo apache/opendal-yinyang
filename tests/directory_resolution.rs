@@ -19,8 +19,7 @@
 
 #![cfg(target_os = "linux")]
 
-#[path = "../crates/core/tests/support/mod.rs"]
-mod support;
+use yinyang_test_support as support;
 
 use std::path::Path;
 use std::sync::Arc;
