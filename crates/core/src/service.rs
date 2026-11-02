@@ -629,7 +629,7 @@ impl MetadataService {
             ));
         }
         let after = after.map(Revision::to_bytes);
-        let records = db_call(&self.reader, move |conn| {
+        let mut records = db_call(&self.reader, move |conn| {
             let rows = if let Some(after) = after.as_ref() {
                 let mut statement = conn
                     .prepare(
@@ -931,13 +931,14 @@ impl MetadataService {
             return Ok(Outcome::Conflict);
         }
         for revision in request.candidates() {
+            let candidate = *revision;
             if *revision == old {
                 return Err(Error::invalid(
                     "expire service revisions",
                     "the current revision cannot expire",
                 ));
             }
-            match db_call(&self.writer, move |c| revision_status(c, *revision)).await? {
+            match db_call(&self.writer, move |c| revision_status(c, candidate)).await? {
                 Some(RevisionStatus::Readable) => {}
                 Some(RevisionStatus::Expired) => {
                     return Err(Error::new(
