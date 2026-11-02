@@ -111,17 +111,7 @@ impl From<crate::runtime::Error> for Error {
 
 impl From<crate::direct::Error> for Error {
     fn from(error: crate::direct::Error) -> Self {
-        let kind = match error.kind() {
-            crate::direct::ErrorKind::Invalid => ErrorKind::Invalid,
-            crate::direct::ErrorKind::InvalidName => ErrorKind::InvalidName,
-            crate::direct::ErrorKind::NotFound => ErrorKind::NotFound,
-            crate::direct::ErrorKind::NotDirectory => ErrorKind::NotDirectory,
-            crate::direct::ErrorKind::IsDirectory => ErrorKind::IsDirectory,
-            crate::direct::ErrorKind::Stale => ErrorKind::Conflict,
-            crate::direct::ErrorKind::Unsupported => ErrorKind::Unsupported,
-            crate::direct::ErrorKind::Corrupt => ErrorKind::Corrupt,
-            crate::direct::ErrorKind::Storage => ErrorKind::Storage,
-        };
+        let kind = error.kind().into();
         Self::new(kind, error.to_string())
     }
 }

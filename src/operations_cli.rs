@@ -921,10 +921,7 @@ async fn check_direct_namespace(context: &VolumeContext, report: &mut DoctorRepo
             "namespace",
             Health::ActionRequired,
             error.to_string(),
-            Some(direct_remediation(
-                CliStage::Observe,
-                crate::runtime_kind_from_direct(error.kind()),
-            )),
+            Some(direct_remediation(CliStage::Observe, error.kind().into())),
         ),
     }
 }

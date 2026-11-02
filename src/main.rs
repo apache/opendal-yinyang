@@ -131,21 +131,6 @@ fn runtime_kind_from_opendal(kind: opendal::ErrorKind) -> RuntimeErrorKind {
     }
 }
 
-pub(crate) fn runtime_kind_from_direct(kind: yinyang::direct::ErrorKind) -> RuntimeErrorKind {
-    use yinyang::direct::ErrorKind as Kind;
-    match kind {
-        Kind::Invalid => RuntimeErrorKind::Invalid,
-        Kind::InvalidName => RuntimeErrorKind::InvalidName,
-        Kind::NotFound => RuntimeErrorKind::NotFound,
-        Kind::NotDirectory => RuntimeErrorKind::NotDirectory,
-        Kind::IsDirectory => RuntimeErrorKind::IsDirectory,
-        Kind::Stale => RuntimeErrorKind::Conflict,
-        Kind::Unsupported => RuntimeErrorKind::Unsupported,
-        Kind::Corrupt => RuntimeErrorKind::Corrupt,
-        Kind::Storage => RuntimeErrorKind::Storage,
-    }
-}
-
 impl From<VolumeLoadError> for CliError {
     fn from(error: VolumeLoadError) -> Self {
         let stage = match error.stage() {
@@ -171,11 +156,7 @@ impl From<yinyang::core::Error> for CliError {
 
 impl From<yinyang::direct::Error> for CliError {
     fn from(error: yinyang::direct::Error) -> Self {
-        Self::new(
-            CliStage::Operation,
-            runtime_kind_from_direct(error.kind()),
-            error.to_string(),
-        )
+        Self::new(CliStage::Operation, error.kind().into(), error.to_string())
     }
 }
 
@@ -586,7 +567,7 @@ fn hex_nibble(value: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_revision, runtime_kind_from_direct};
+    use super::parse_revision;
     use yinyang::runtime::ErrorKind;
 
     #[test]
@@ -606,7 +587,7 @@ mod tests {
     #[test]
     fn stale_direct_pin_is_a_conflict() {
         assert_eq!(
-            runtime_kind_from_direct(yinyang::direct::ErrorKind::Stale),
+            ErrorKind::from(yinyang::direct::ErrorKind::Stale),
             ErrorKind::Conflict
         );
     }
