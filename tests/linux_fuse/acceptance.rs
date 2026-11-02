@@ -673,7 +673,7 @@ fn exercise_path_truncate_conflict(publication: Publication) -> i32 {
 
     let (sender, receiver) = mpsc::channel();
     let caller = thread::spawn(move || {
-        let _ = sender.send(truncate(&path, LOCAL.len() as u64));
+        let _ = sender.send(truncate(&path, LOCAL.len() as i64));
     });
     gate.wait_blocked();
     fixture.remote_write(&library, "truncate-conflict.txt", EXTERNAL);
