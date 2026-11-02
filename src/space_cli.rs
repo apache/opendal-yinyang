@@ -18,14 +18,15 @@
 //! Read-only Managed space and retention CLI.
 
 use crate::RevisionArg;
+use crate::{CliError, CliResult, CliStage};
 use clap::Subcommand;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use yinyang::core::Revision;
 use yinyang::space::{
     ListingConsistency, ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, StagingState,
 };
-use yinyang::volume::{Model, Volume, VolumeConfig};
+use yinyang::volume::{Model, VolumeContext};
 
 #[derive(Subcommand)]
 pub enum SpaceCommand {
@@ -61,28 +62,19 @@ pub enum RetentionCommand {
     },
 }
 
-pub async fn run(
-    path: &Path,
-    command: SpaceCommand,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let bytes = tokio::fs::read(path).await?;
-    let mut config = VolumeConfig::from_json(&bytes)?;
-    if config.staging.is_relative() && !config.staging.as_os_str().is_empty() {
-        config.staging = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(&config.staging);
-    }
+pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<ExitCode> {
+    let config = &context.config;
     if config.model != Model::Managed {
-        return Err(
-            "space inspection supports Managed volumes only; Direct namespace objects are excluded"
-                .into(),
-        );
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            "space inspection supports Managed volumes only; Direct namespace objects are excluded",
+        ));
     }
-    let operator = operator()?;
-    config.validate(&operator)?;
-    let token = std::env::var("YINYANG_SERVICE_TOKEN").ok();
-    let authority = Volume::connect(&config, operator.clone(), token).await?;
+    let operator = context.operator()?;
+    let authority = context
+        .connect_authority()
+        .await
+        .map_err(|error| CliError::from_runtime(CliStage::Connect, error))?;
     match command {
         SpaceCommand::Report { json } => {
             let report = yinyang::space::inspect_managed_space(
@@ -126,19 +118,6 @@ pub async fn run(
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn operator() -> Result<opendal::Operator, opendal::Error> {
-    let config = std::env::vars()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("YINYANG_S3_")
-                .map(|key| (key.to_ascii_lowercase(), value))
-        })
-        .collect::<Vec<_>>();
-    let operator = opendal::Operator::via_iter("s3", config)?;
-    #[cfg(feature = "benchmark-telemetry")]
-    let operator = yinyang::benchmark::instrument(operator);
-    Ok(operator)
 }
 
 fn print_report(report: &ManagedSpaceReport) {

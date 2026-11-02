@@ -383,7 +383,6 @@ class Trial:
             "storage_profile": "amazon-s3",
             "staging": str(self.state),
             "read_only": False,
-            "require": [],
         }
         descriptor = os.open(
             self.config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600

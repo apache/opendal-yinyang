@@ -85,10 +85,12 @@ profile dispatch.
 The 64 KiB content verification unit enters logical identity and remains fixed
 unless a new content profile is introduced. The merged
 [Linux read-only range results](../docs/linux-range-cost-results.md) observed
-bounded payloads for 4 KiB reads and a two-unit boundary crossing, together
-with 9-11 storage requests and 7.4-9.2 ms p50 for repeated warm reads over one
-immutable version. The study did not compare other unit sizes and does not make
-64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry
+9-11 storage requests and 7.4-9.2 ms p50 for repeated warm range reads over one
+immutable version; those numbers describe content-range reads, not metadata
+LOOKUP. Managed FUSE metadata now reuses an accepted snapshot for one second,
+and the object authority shares a byte-bounded content-addressed page cache
+across snapshots. The range study did not compare other unit sizes and does not
+make 64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry
 counts, and other requested-range policy are tunable without changing logical
 identity when the authenticated bytes and identities remain unchanged.
 

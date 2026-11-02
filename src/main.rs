@@ -16,10 +16,15 @@
 // under the License.
 
 use clap::{Parser, Subcommand};
+use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use yinyang::core::{BackendProfile, CommitId, Fs, Revision};
+use yinyang::core::{CommitId, Fs, Revision};
+use yinyang::runtime::ErrorKind as RuntimeErrorKind;
+#[cfg(target_os = "linux")]
+use yinyang::volume::Model;
+use yinyang::volume::{VolumeContext, VolumeLoadError, VolumeLoadStage};
 #[cfg(target_os = "linux")]
 mod direct_sync_cli;
 mod directory_cli;
@@ -28,6 +33,279 @@ mod operations_cli;
 mod space_cli;
 #[cfg(target_os = "linux")]
 mod sync_cli;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CliStage {
+    Argument,
+    Configuration,
+    Operator,
+    Admission,
+    Connect,
+    Observe,
+    #[cfg(target_os = "linux")]
+    LocalState,
+    #[cfg(target_os = "linux")]
+    SyncState,
+    Publication,
+    Output,
+    Operation,
+}
+
+#[derive(Debug)]
+pub(crate) struct CliError {
+    stage: CliStage,
+    kind: RuntimeErrorKind,
+    message: String,
+}
+
+impl CliError {
+    pub(crate) fn new(stage: CliStage, kind: RuntimeErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            stage,
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn invalid(stage: CliStage, message: impl Into<String>) -> Self {
+        Self::new(stage, RuntimeErrorKind::Invalid, message)
+    }
+
+    pub(crate) fn from_runtime(stage: CliStage, error: yinyang::runtime::Error) -> Self {
+        Self::new(stage, error.kind(), error.to_string())
+    }
+
+    pub(crate) fn from_boxed(stage: CliStage, error: Box<dyn StdError + Send + Sync>) -> Self {
+        let kind = classify_boxed_error(error.as_ref());
+        Self::new(stage, kind, error.to_string())
+    }
+
+    pub(crate) const fn stage(&self) -> CliStage {
+        self.stage
+    }
+
+    pub(crate) const fn kind(&self) -> RuntimeErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn exit_code(&self) -> u8 {
+        exit_code_for_kind(self.kind)
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StdError for CliError {}
+
+pub(crate) fn exit_code_for_kind(kind: RuntimeErrorKind) -> u8 {
+    match kind {
+        RuntimeErrorKind::Unknown => 3,
+        RuntimeErrorKind::Conflict | RuntimeErrorKind::Retryable => 4,
+        _ => 1,
+    }
+}
+
+fn classify_boxed_error(error: &(dyn StdError + 'static)) -> RuntimeErrorKind {
+    if let Some(error) = error.downcast_ref::<yinyang::runtime::Error>() {
+        return error.kind();
+    }
+    if let Some(error) = error.downcast_ref::<yinyang::core::Error>() {
+        return runtime_kind_from_core(error.kind());
+    }
+    if let Some(error) = error.downcast_ref::<yinyang::direct::Error>() {
+        return runtime_kind_from_direct(error.kind());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(error) = error.downcast_ref::<yinyang::replica::Error>() {
+        return runtime_kind_from_replica(error.kind());
+    }
+    if let Some(error) = error.downcast_ref::<opendal::Error>() {
+        return runtime_kind_from_opendal(error.kind());
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return runtime_kind_from_io(error.kind());
+    }
+    RuntimeErrorKind::Io
+}
+
+pub(crate) fn runtime_kind_from_io(kind: std::io::ErrorKind) -> RuntimeErrorKind {
+    match kind {
+        std::io::ErrorKind::NotFound => RuntimeErrorKind::NotFound,
+        std::io::ErrorKind::AlreadyExists => RuntimeErrorKind::AlreadyExists,
+        std::io::ErrorKind::PermissionDenied => RuntimeErrorKind::PermissionDenied,
+        _ => RuntimeErrorKind::Io,
+    }
+}
+
+pub(crate) fn runtime_kind_from_core(kind: yinyang::core::ErrorKind) -> RuntimeErrorKind {
+    use yinyang::core::ErrorKind as Kind;
+    match kind {
+        Kind::Invalid => RuntimeErrorKind::Invalid,
+        Kind::Corrupt => RuntimeErrorKind::Corrupt,
+        Kind::NotFound => RuntimeErrorKind::NotFound,
+        Kind::AlreadyExists => RuntimeErrorKind::AlreadyExists,
+        Kind::Unsupported => RuntimeErrorKind::Unsupported,
+        Kind::Storage => RuntimeErrorKind::Storage,
+        Kind::Io => RuntimeErrorKind::Io,
+        Kind::InvalidName => RuntimeErrorKind::InvalidName,
+        Kind::NotDirectory => RuntimeErrorKind::NotDirectory,
+        Kind::IsDirectory => RuntimeErrorKind::IsDirectory,
+        Kind::NotEmpty => RuntimeErrorKind::NotEmpty,
+        Kind::PermissionDenied => RuntimeErrorKind::PermissionDenied,
+    }
+}
+
+fn runtime_kind_from_opendal(kind: opendal::ErrorKind) -> RuntimeErrorKind {
+    match kind {
+        opendal::ErrorKind::Unsupported => RuntimeErrorKind::Unsupported,
+        opendal::ErrorKind::ConfigInvalid => RuntimeErrorKind::Invalid,
+        opendal::ErrorKind::NotFound => RuntimeErrorKind::NotFound,
+        opendal::ErrorKind::PermissionDenied => RuntimeErrorKind::PermissionDenied,
+        opendal::ErrorKind::IsADirectory => RuntimeErrorKind::IsDirectory,
+        opendal::ErrorKind::NotADirectory => RuntimeErrorKind::NotDirectory,
+        opendal::ErrorKind::AlreadyExists => RuntimeErrorKind::AlreadyExists,
+        opendal::ErrorKind::Conflict | opendal::ErrorKind::ConditionNotMatch => {
+            RuntimeErrorKind::Conflict
+        }
+        _ => RuntimeErrorKind::Storage,
+    }
+}
+
+pub(crate) fn runtime_kind_from_direct(kind: yinyang::direct::ErrorKind) -> RuntimeErrorKind {
+    use yinyang::direct::ErrorKind as Kind;
+    match kind {
+        Kind::Invalid => RuntimeErrorKind::Invalid,
+        Kind::InvalidName => RuntimeErrorKind::InvalidName,
+        Kind::NotFound => RuntimeErrorKind::NotFound,
+        Kind::NotDirectory => RuntimeErrorKind::NotDirectory,
+        Kind::IsDirectory => RuntimeErrorKind::IsDirectory,
+        Kind::Stale => RuntimeErrorKind::Conflict,
+        Kind::Unsupported => RuntimeErrorKind::Unsupported,
+        Kind::Corrupt => RuntimeErrorKind::Corrupt,
+        Kind::Storage => RuntimeErrorKind::Storage,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_kind_from_replica(kind: yinyang::replica::ErrorKind) -> RuntimeErrorKind {
+    use yinyang::replica::ErrorKind as Kind;
+    match kind {
+        Kind::Invalid => RuntimeErrorKind::Invalid,
+        Kind::Unsupported => RuntimeErrorKind::Unsupported,
+        Kind::Conflict => RuntimeErrorKind::Conflict,
+        Kind::Corrupt => RuntimeErrorKind::Corrupt,
+        Kind::Busy => RuntimeErrorKind::Busy,
+        Kind::Io => RuntimeErrorKind::Io,
+    }
+}
+
+impl From<VolumeLoadError> for CliError {
+    fn from(error: VolumeLoadError) -> Self {
+        let stage = match error.stage() {
+            VolumeLoadStage::Configuration => CliStage::Configuration,
+            VolumeLoadStage::Operator => CliStage::Operator,
+            VolumeLoadStage::Admission => CliStage::Admission,
+        };
+        Self::new(stage, error.kind(), error.message())
+    }
+}
+
+impl From<yinyang::runtime::Error> for CliError {
+    fn from(error: yinyang::runtime::Error) -> Self {
+        Self::from_runtime(CliStage::Operation, error)
+    }
+}
+
+impl From<yinyang::core::Error> for CliError {
+    fn from(error: yinyang::core::Error) -> Self {
+        Self::from_runtime(CliStage::Operation, yinyang::runtime::Error::from(error))
+    }
+}
+
+impl From<yinyang::direct::Error> for CliError {
+    fn from(error: yinyang::direct::Error) -> Self {
+        Self::new(
+            CliStage::Operation,
+            runtime_kind_from_direct(error.kind()),
+            error.to_string(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<yinyang::replica::Error> for CliError {
+    fn from(error: yinyang::replica::Error) -> Self {
+        Self::new(
+            CliStage::Operation,
+            runtime_kind_from_replica(error.kind()),
+            error.to_string(),
+        )
+    }
+}
+
+impl From<opendal::Error> for CliError {
+    fn from(error: opendal::Error) -> Self {
+        Self::new(
+            CliStage::Operation,
+            runtime_kind_from_opendal(error.kind()),
+            error.to_string(),
+        )
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(error: std::io::Error) -> Self {
+        Self::new(
+            CliStage::Operation,
+            runtime_kind_from_io(error.kind()),
+            error.to_string(),
+        )
+    }
+}
+
+impl From<serde_json::Error> for CliError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::invalid(CliStage::Output, error.to_string())
+    }
+}
+
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self::invalid(CliStage::Operation, message)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(message: &str) -> Self {
+        Self::invalid(CliStage::Operation, message)
+    }
+}
+
+impl From<Box<dyn StdError + Send + Sync>> for CliError {
+    fn from(error: Box<dyn StdError + Send + Sync>) -> Self {
+        Self::from_boxed(CliStage::Operation, error)
+    }
+}
+
+impl From<Box<dyn StdError>> for CliError {
+    fn from(error: Box<dyn StdError>) -> Self {
+        Self::new(
+            CliStage::Operation,
+            classify_boxed_error(error.as_ref()),
+            error.to_string(),
+        )
+    }
+}
+
+pub(crate) type CliResult<T> = std::result::Result<T, CliError>;
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +321,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Inspect each capability layer and its effective intersection.
+    /// Inspect the admitted and storage-reported volume capabilities.
     Capabilities,
     /// Diagnose platform, configuration, storage, service and local-state readiness.
     Doctor {
@@ -131,14 +409,14 @@ async fn main() -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             eprintln!("yy: {error}");
-            ExitCode::FAILURE
+            ExitCode::from(error.exit_code())
         }
     };
     #[cfg(feature = "benchmark-telemetry")]
     drop(telemetry);
     result
 }
-async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> CliResult<ExitCode> {
     opendal::install_default();
     if let Command::Publication {
         command:
@@ -150,68 +428,98 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     } = &cli.command
     {
         if cli.volume.is_some() {
-            return Err("publication commands do not use --volume; configure object storage with YINYANG_S3_* instead".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "publication commands do not use --volume; configure object storage with YINYANG_S3_* instead",
+            ));
         }
         return directory_cli::inspect(*commit_id, state, *json).await;
     }
     if cli.volume.is_some() && matches!(cli.command, Command::Publication { .. }) {
-        return Err("publication commands do not use --volume; configure object storage with YINYANG_S3_* instead".into());
+        return Err(CliError::invalid(
+            CliStage::Argument,
+            "publication commands do not use --volume; configure object storage with YINYANG_S3_* instead",
+        ));
     }
     if let Some(path) = &cli.volume {
+        if let Command::Doctor { json } = &cli.command {
+            return Ok(operations_cli::run(path, *json).await);
+        }
+        let context = VolumeContext::load(path).await?;
         return match cli.command {
-            Command::Doctor { json } => {
-                return Ok(operations_cli::run(path, json).await);
+            Command::Capabilities => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&context.storage_capabilities()?)?
+                );
+                Ok(ExitCode::SUCCESS)
             }
             #[cfg(target_os = "linux")]
-            Command::Sync { command } => direct_sync_cli::run(path, command).await,
-            Command::Space { command } => space_cli::run(path, command).await,
-            command => file_cli::run(path, command).await,
+            Command::Sync { command } => match context.config.model {
+                Model::Managed => sync_cli::run(context, command).await,
+                Model::Direct => direct_sync_cli::run(context, command).await,
+            },
+            Command::Space { command } => space_cli::run(context, command).await,
+            command => file_cli::run(context, command).await,
         };
     }
     match cli.command {
         Command::Mount { .. } => {
-            return Err("mount requires --volume CONFIG.json with frontend=fuse".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "mount requires --volume CONFIG.json with frontend=fuse",
+            ));
         }
         Command::File { .. } | Command::Capabilities | Command::Doctor { .. } => {
-            return Err("this command requires --volume CONFIG.json".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "this command requires --volume CONFIG.json",
+            ));
         }
         #[cfg(target_os = "linux")]
         Command::Sync { .. } => {
-            return Err("this command requires --volume CONFIG.json".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "this command requires --volume CONFIG.json",
+            ));
         }
         Command::Space { .. } => {
-            return Err("space inspection requires --volume CONFIG.json".into());
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                "space inspection requires --volume CONFIG.json",
+            ));
         }
         _ => {}
     }
-    let profile = match std::env::var("YINYANG_STORAGE_PROFILE").as_deref() {
-        Ok("amazon-s3") => BackendProfile::AmazonS3,
-        Ok("minio") => BackendProfile::Minio,
-        Err(_) if std::env::var_os("YINYANG_S3_ENDPOINT").is_none() => BackendProfile::AmazonS3,
-        _ => return Err("set YINYANG_STORAGE_PROFILE to amazon-s3 or minio for the configured endpoint; other S3-compatible deployments are unsupported".into()),
-    };
-    let config = std::env::vars()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("YINYANG_S3_")
-                .map(|key| (key.to_ascii_lowercase(), value))
-        })
-        .collect::<Vec<_>>();
-    let operator = opendal::Operator::via_iter("s3", config)?;
-    #[cfg(feature = "benchmark-telemetry")]
-    let operator = yinyang::benchmark::instrument(operator);
+    let connection = yinyang::volume::storage_connection()
+        .map_err(|error| CliError::from_runtime(CliStage::Operator, error))?;
+    let profile = yinyang::volume::storage_profile_from_env()
+        .map_err(|error| CliError::from_runtime(CliStage::Operator, error))?;
     if let Command::Serve { database, listen } = &cli.command {
-        let token = std::env::var("YINYANG_SERVICE_TOKEN").map_err(
-            |_| "set YINYANG_SERVICE_TOKEN to a random authentication token of at least 32 bytes",
-        )?;
+        let token = connection
+            .service_token()
+            .ok_or_else(|| {
+                CliError::new(
+                    CliStage::Operator,
+                    RuntimeErrorKind::PermissionDenied,
+                    "set YINYANG_SERVICE_TOKEN to a random authentication token of at least 32 bytes",
+                )
+            })?
+            .to_owned();
         if !listen.ip().is_loopback() || !(32..=1024).contains(&token.len()) {
-            return Err("metadata service requires loopback and a 32..=1024 byte token".into());
+            return Err(CliError::invalid(
+                CliStage::Configuration,
+                "metadata service requires loopback and a 32..=1024 byte token",
+            ));
         }
+        let (operator, _) = connection.into_parts();
         let service = yinyang::core::service::MetadataService::create(database, operator).await?;
         let listener = tokio::net::TcpListener::bind(listen).await?;
         println!("metadata service listening on {}", listener.local_addr()?);
         yinyang::core::service::serve(listener, service, token).await?;
         return Ok(ExitCode::SUCCESS);
     }
+    let (operator, _) = connection.into_parts();
     if matches!(cli.command, Command::Create) {
         let fs = Fs::create(operator, profile).await?;
         println!(
@@ -362,7 +670,8 @@ fn hex_nibble(value: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_revision;
+    use super::{parse_revision, runtime_kind_from_direct};
+    use yinyang::runtime::ErrorKind;
 
     #[test]
     fn revision_requires_exactly_24_hex_bytes() {
@@ -375,6 +684,14 @@ mod tests {
                 .to_bytes()
                 .as_slice(),
             &[1; 24]
+        );
+    }
+
+    #[test]
+    fn stale_direct_pin_is_a_conflict() {
+        assert_eq!(
+            runtime_kind_from_direct(yinyang::direct::ErrorKind::Stale),
+            ErrorKind::Conflict
         );
     }
 }

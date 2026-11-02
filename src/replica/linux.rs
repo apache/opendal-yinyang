@@ -266,13 +266,7 @@ impl Replica {
         let root = std::fs::canonicalize(root).map_err(|e| Error::io("canonicalize", root, e))?;
         let state =
             std::fs::canonicalize(state).map_err(|e| Error::io("canonicalize", state, e))?;
-        if state.starts_with(&root) {
-            return Err(Error::invalid(format!(
-                "sync state {} must be outside the synchronized root {}",
-                state.display(),
-                root.display()
-            )));
-        }
+        super::check_root_state(&root, &state)?;
         let root_text = root
             .to_str()
             .ok_or_else(|| Error::unsupported("local root path is not UTF-8"))?
@@ -448,6 +442,7 @@ impl Replica {
             )));
         }
         let root = PathBuf::from(&binding.root);
+        super::check_root_state(&root, &state)?;
         let (root_fd, root_identity) = open_bound_directory(&root, "open bound local root")?;
         if binding.root_dev != root_identity.dev || binding.root_ino != root_identity.ino {
             return Err(Error::invalid(format!(

@@ -18,6 +18,7 @@
 #[path = "../crates/core/tests/support/mod.rs"]
 mod support;
 use std::path::Path;
+use std::process::Command;
 use support::TestBackend;
 use yinyang::core::{BackendProfile, CommitId, CommitOutcome, ErrorKind, Fs, Planner};
 use yinyang::runtime::ErrorKind as RuntimeErrorKind;
@@ -45,6 +46,19 @@ async fn source(root: &Path) {
     tokio::fs::write(root.join("large"), vec![91; 700_000])
         .await
         .unwrap();
+}
+
+fn yy_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yy"));
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("YINYANG_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 #[tokio::test]
@@ -896,13 +910,12 @@ fn volume_status_rejects_historical_revision_selection() {
             "storage_profile": "minio",
             "staging": temp.path().join("state"),
             "read_only": false,
-            "require": [],
         }))
         .unwrap(),
     )
     .unwrap();
     let revision = "01".repeat(24);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_yy"))
+    let output = yy_command()
         .args([
             "--volume",
             config.to_str().unwrap(),
@@ -918,6 +931,45 @@ fn volume_status_rejects_historical_revision_selection() {
         stderr.contains("--revision is only supported by object-storage `yy status`"),
         "{stderr}"
     );
+}
+
+#[test]
+fn volume_status_reports_local_state_without_storage_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("volume.json");
+    let staging = temp.path().join("state");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "name": "offline-status",
+            "model": "managed",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "staging": staging.clone(),
+            "read_only": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = yy_command()
+        .args(["--volume", config.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("local staging: not initialized"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("remote: unavailable"), "{stdout}");
+    assert!(!staging.exists());
 }
 
 #[test]
