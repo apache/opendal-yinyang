@@ -859,7 +859,17 @@ impl FileHandle {
                 .authority()
                 .commit_frozen_batch(std::slice::from_ref(bytes))
                 .await
-                .map(|mut outcomes| outcomes.remove(0));
+                .and_then(|mut outcomes| {
+                    if outcomes.len() == 1 {
+                        Ok(outcomes.remove(0))
+                    } else {
+                        Err(yinyang_core::Error::new(
+                            yinyang_core::ErrorKind::Corrupt,
+                            "frozen publication",
+                            "authority returned the wrong outcome count",
+                        ))
+                    }
+                });
             (request_id, outcome)
         } else {
             let prepared = self.prepare_publication(&r).await?;
