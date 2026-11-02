@@ -911,8 +911,11 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
     let source_state_before_backup_plans = authoritative_tree(&source.state);
     let remote_before_backup_plans = remote_identities(&fixture.operator());
     let observer = fixture.sync_paths("history-observer");
+    let expiry_observer = fixture.sync_paths("history-expiry-observer");
     assert!(!observer.directory.exists());
     assert!(!observer.state.exists());
+    assert!(!expiry_observer.directory.exists());
+    assert!(!expiry_observer.state.exists());
 
     let bounded = retention_plan(&fixture, &observer.config, 1, &[], None);
     assert_plan_boundaries(&bounded);
@@ -933,7 +936,7 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
     let live_revision = revision_from_hex(&live_baseline);
     let backup_refused = run_expiry(
         &fixture,
-        &observer.config,
+        &expiry_observer.config,
         &[live_revision],
         &[&backup],
         &[],
@@ -1012,7 +1015,7 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
 
     let corrupt_refused = run_expiry(
         &fixture,
-        &observer.config,
+        &expiry_observer.config,
         &[live_revision],
         &[&corrupt],
         &[],
@@ -1029,7 +1032,7 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
     let missing_backup = fixture.path("history-backup-missing");
     let missing_refused = run_expiry(
         &fixture,
-        &observer.config,
+        &expiry_observer.config,
         &[live_revision],
         &[&missing_backup],
         &[],
@@ -1042,6 +1045,9 @@ fn retention_and_expiry_protect_live_and_packaged_sync_baselines() {
         "first.txt",
         b"first baseline",
     );
+    assert!(!expiry_observer.state.join("staging.db").exists());
+    assert!(!expiry_observer.state.join("sync-engine.db").exists());
+    assert!(!expiry_observer.state.join("sync.db").exists());
 
     let protected = retention_plan(&fixture, &observer.config, 1, &[&backup, &corrupt], None);
     assert_plan_boundaries(&protected);
