@@ -348,7 +348,7 @@ async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let report = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
         .await
         .unwrap();
-    assert_eq!(report.schema, "yinyang.managed-space.report.v4");
+    assert_eq!(report.schema, "yinyang.managed-space.report.v5");
     assert!(!report.deletion_authorized);
     assert_eq!(report.reclaimable_bytes, None);
     assert_eq!(report.physical.state, MeasurementState::Partial);

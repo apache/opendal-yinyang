@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Managed space and retention CLI.
+//! Managed space reporting, retention planning, and explicit logical expiry CLI.
 
 use crate::RevisionArg;
 use crate::{CliError, CliResult, CliStage};
 use clap::Subcommand;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use yinyang::core::Revision;
+use yinyang::core::{CommitId, EXPIRY_CANDIDATES_MAX, Revision};
 use yinyang::space::{
-    ListingConsistency, ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, StagingState,
+    ExpiryDecisionState, ExpiryReportState, ListingConsistency, ManagedExpiryReport,
+    ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, RetentionRevisionState,
+    StagingState,
 };
 use yinyang::volume::{Model, VolumeConfig, VolumeContext};
 
@@ -32,11 +34,11 @@ use yinyang::volume::{Model, VolumeConfig, VolumeContext};
 pub enum SpaceCommand {
     /// Report logical, physical-object, and local-staging measurements.
     Report {
-        /// Emit the versioned `yinyang.managed-space.report.v4` document.
+        /// Emit the versioned `yinyang.managed-space.report.v5` document.
         #[arg(long)]
         json: bool,
     },
-    /// Build an explicit declarative retention selection without deleting data.
+    /// Plan retention or explicitly expire historical revisions without physical deletion.
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
@@ -56,7 +58,19 @@ pub enum RetentionCommand {
         /// Protect revisions referenced by an explicit validated backup package.
         #[arg(long = "backup")]
         backup: Vec<PathBuf>,
-        /// Emit the versioned `yinyang.managed-retention.plan.v4` document.
+        /// Emit the versioned `yinyang.managed-retention.plan.v5` document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly expire selected historical revisions after protection checks.
+    Expire {
+        /// Historical revision to expire; repeat for an atomic batch.
+        #[arg(long = "revision", required = true)]
+        revision: Vec<RevisionArg>,
+        /// Protect revisions referenced by an explicit validated backup package.
+        #[arg(long = "backup")]
+        backup: Vec<PathBuf>,
+        /// Emit the versioned `yinyang.managed-retention.expiry.v1` document.
         #[arg(long)]
         json: bool,
     },
@@ -64,8 +78,44 @@ pub enum RetentionCommand {
 
 pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<ExitCode> {
     let config = &context.config;
+    let expiry = matches!(
+        &command,
+        SpaceCommand::Retention {
+            command: RetentionCommand::Expire { .. }
+        }
+    );
     if config.model == Model::Direct {
+        if expiry {
+            return Err(CliError::invalid(
+                CliStage::Admission,
+                "space retention expire supports Managed volumes only; Direct has no retained revision history",
+            ));
+        }
         return run_sync_space(config, command).await;
+    }
+    if expiry && config.read_only {
+        return Err(CliError::invalid(
+            CliStage::Admission,
+            "space retention expire requires a writable Managed volume",
+        ));
+    }
+    if let SpaceCommand::Retention {
+        command: RetentionCommand::Expire { revision, .. },
+    } = &command
+    {
+        let count = revision
+            .iter()
+            .map(|revision| revision.0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if count > EXPIRY_CANDIDATES_MAX {
+            return Err(CliError::invalid(
+                CliStage::Argument,
+                format!(
+                    "space retention expire accepts at most {EXPIRY_CANDIDATES_MAX} unique revisions"
+                ),
+            ));
+        }
     }
     let operator = context.operator()?;
     let authority = context
@@ -113,6 +163,39 @@ pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<Exi
                 print_plan(&plan);
             }
         }
+        SpaceCommand::Retention {
+            command:
+                RetentionCommand::Expire {
+                    revision,
+                    backup,
+                    json,
+                },
+        } => {
+            let revisions = revision
+                .into_iter()
+                .map(|revision| revision.0)
+                .collect::<Vec<Revision>>();
+            let operation_id = CommitId::generate();
+            let report = yinyang::space::expire_managed_retention(
+                authority.as_ref(),
+                &config.staging,
+                &revisions,
+                &backup,
+                operation_id,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_expiry(&report);
+            }
+            let code = match report.state {
+                ExpiryReportState::Committed | ExpiryReportState::AlreadyExpired => 0,
+                ExpiryReportState::Refused | ExpiryReportState::Conflict => 2,
+                ExpiryReportState::Retryable | ExpiryReportState::Unknown => 3,
+            };
+            return Ok(ExitCode::from(code));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -136,6 +219,14 @@ async fn run_sync_space(config: &VolumeConfig, command: SpaceCommand) -> CliResu
             } else {
                 print_sync_retention(&plan);
             }
+        }
+        SpaceCommand::Retention {
+            command: RetentionCommand::Expire { .. },
+        } => {
+            return Err(CliError::invalid(
+                CliStage::Admission,
+                "space retention expire supports Managed volumes only",
+            ));
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -191,7 +282,19 @@ fn print_report(report: &ManagedSpaceReport) {
     );
     match report.logical.retained.state {
         MeasurementState::Available | MeasurementState::Partial => println!(
-            "logical retained: {} revisions observed, {} bytes across snapshots, {} unique-content bytes",
+            "logical retained: {} history identities ({} expired), {} readable revisions observed, {} bytes across readable snapshots, {} unique-content bytes",
+            report
+                .logical
+                .retained
+                .revision_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            report
+                .logical
+                .retained
+                .expired_revision_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
             report.logical.retained.observed_revisions.len(),
             report.logical.retained.observed_file_bytes,
             report.logical.retained.observed_unique_content_bytes
@@ -350,9 +453,15 @@ fn print_plan(plan: &ManagedRetentionPlan) {
         .filter(|revision| revision.selected)
         .count();
     println!(
-        "selection: {selected} selected of {} observed revisions ({:?})",
+        "selection: {selected} selected of {} history identities ({:?}); {} readable, {} expired",
         plan.revisions.len(),
-        plan.state
+        plan.state,
+        plan.readable_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        plan.expired_revision_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
     );
     if plan.retained_revision_count.is_none() {
         println!(
@@ -363,10 +472,10 @@ fn print_plan(plan: &ManagedRetentionPlan) {
         println!(
             "revision {}: {} [{}]",
             revision.revision,
-            if revision.selected {
-                "selected"
-            } else {
-                "outside-policy"
+            match revision.state {
+                RetentionRevisionState::Readable if revision.selected => "selected",
+                RetentionRevisionState::Readable => "outside-policy",
+                RetentionRevisionState::Expired => "expired",
             },
             revision.reasons.join(",")
         );
@@ -469,9 +578,94 @@ fn print_plan(plan: &ManagedRetentionPlan) {
     println!("deletion authorized: no");
     println!("reclaimable bytes: unknown; selection is not a cleanup estimate");
     println!(
-        "outside-policy revisions remain readable; --keep is not a persistent pin; no expiry command exists"
+        "outside-policy revisions remain readable; --keep is not a persistent pin; only an explicit expire command changes readability"
     );
     if plan.protection.staging.state == StagingState::Unavailable {
         println!("local staging evidence is unavailable; do not infer that no pending work exists");
+    }
+}
+
+fn print_expiry(report: &ManagedExpiryReport) {
+    println!(
+        "retention expiry: filesystem {} revision {} operation {}",
+        report.filesystem, report.observed_revision, report.operation_id
+    );
+    println!(
+        "state: {}{}",
+        expiry_state_name(report.state),
+        report
+            .after_revision
+            .as_deref()
+            .map(|revision| format!("; after revision {revision}"))
+            .unwrap_or_default()
+    );
+    for revision in &report.revisions {
+        println!(
+            "revision {}: {} [{}]",
+            revision.revision,
+            expiry_decision_name(revision.state),
+            revision.reasons.join(",")
+        );
+    }
+    println!(
+        "protected staging: binding {:?} pending {} frozen {} conflict {} unknown {} failed {} ledger-errors {}",
+        report.staging.binding.state,
+        report.staging.pending,
+        report.staging.frozen,
+        report.staging.conflict,
+        report.staging.unknown,
+        report.staging.failed,
+        report.staging.ledger_errors
+    );
+    println!(
+        "backup packages: {} supplied, {} validated",
+        report.backups.supplied, report.backups.validated
+    );
+    for unresolved in &report.unresolved {
+        println!(
+            "unresolved {} ({}): {}",
+            unresolved.subject, unresolved.state, unresolved.detail
+        );
+    }
+    println!(
+        "external readers: {}; untracked pins: {}; quiescence: {}",
+        report.external_readers, report.untracked_pins, report.quiescence
+    );
+    println!("physical cleanup: {}", report.physical_cleanup);
+    println!("deletion authorized: no");
+    println!("reclaimable bytes: unknown");
+    match report.state {
+        ExpiryReportState::AlreadyExpired => {
+            println!("all requested revisions were already expired; no new mutation was issued")
+        }
+        ExpiryReportState::Retryable | ExpiryReportState::Unknown => println!(
+            "keep every declared local and backup activity stopped; rerun the same candidate set and confirm the desired revision state before resuming"
+        ),
+        _ => {}
+    }
+}
+
+fn expiry_state_name(state: ExpiryReportState) -> &'static str {
+    match state {
+        ExpiryReportState::Committed => "committed",
+        ExpiryReportState::AlreadyExpired => "already_expired",
+        ExpiryReportState::Refused => "refused",
+        ExpiryReportState::Conflict => "conflict",
+        ExpiryReportState::Retryable => "retryable",
+        ExpiryReportState::Unknown => "unknown",
+    }
+}
+
+fn expiry_decision_name(state: ExpiryDecisionState) -> &'static str {
+    match state {
+        ExpiryDecisionState::Eligible => "eligible",
+        ExpiryDecisionState::Expired => "expired",
+        ExpiryDecisionState::AlreadyExpired => "already_expired",
+        ExpiryDecisionState::Current => "current",
+        ExpiryDecisionState::Missing => "missing",
+        ExpiryDecisionState::Unavailable => "unavailable",
+        ExpiryDecisionState::Protected => "protected",
+        ExpiryDecisionState::ProtectedMissing => "protected_missing",
+        ExpiryDecisionState::ProtectedExpired => "protected_expired",
     }
 }

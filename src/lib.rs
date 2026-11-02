@@ -47,7 +47,8 @@ pub use directory::{
     restore_directory_revision,
 };
 pub use space::{
-    ManagedRetentionPlan, ManagedSpaceReport, MeasurementState, Unresolved,
+    ExpiryDecisionState, ExpiryReportState, ManagedExpiryReport, ManagedRetentionPlan,
+    ManagedSpaceReport, MeasurementState, Unresolved, expire_managed_retention,
     inspect_bound_local_staging, inspect_local_staging, inspect_managed_space,
     plan_managed_retention,
 };
