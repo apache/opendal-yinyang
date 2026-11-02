@@ -176,11 +176,11 @@ optimized S3 GET bodies at or below 272,988 bytes and PUT bodies at or below
 135,855 bytes per scenario across both authorities; these bounds are recorded
 in the pull request that introduced them (#122).
 
-The current writable workloads record schema `yinyang.linux-cost.v7`, which
-adds application and remote activity summaries to the v6 `useful_bytes`
-collector shape. The complete-source fallback in a pre-optimization baseline is
-expected to read and publish most of the file for each length change, while
-`required` mode rejects that behavior.
+The `length-changing` workload records schema `yinyang.linux-cost.v6`, which
+adds `useful_bytes` to every row; it is the same collector shape for the
+matched baseline and optimized runs. The complete-source fallback in the
+baseline is expected to read and publish most of the file for each length
+change, while `required` mode rejects that behavior.
 
 On one loopback-Silo host, append, truncate, zero-extension, and
 shrink-then-extend operations kept optimized S3 GET bodies at or below
@@ -188,11 +188,10 @@ shrink-then-extend operations kept optimized S3 GET bodies at or below
 authorities; these bounds are recorded in the pull request that introduced them
 (#128).
 
-A Managed file open pins authenticated metadata without reading payload bytes.
-The first read of a missing verification unit authenticates and fetches that
-range from the pinned version. Writable staging records exact changed segments
-over that pinned base; publication advances the complete logical content
-descriptor without downloading unaffected bytes.
+The first FUSE open materializes the complete file, so a cold 4 KiB read is
+expected to transfer much more than 4 KiB. A sparse update starts from the
+materialized staging file and publishes a new complete content version. These
+are current behavior boundaries, not benchmark assumptions.
 
 `fuse_mount_ready` measures from before spawning `yy mount` until
 `/proc/mounts` reports `fuse.yinyang`, including daemon process I/O and proxy
@@ -218,10 +217,6 @@ Each JSONL record includes:
 - service TCP connections and raw framed bytes in both directions;
 - batch totals and per-sample network values, where per-sample divides only a
   sequential batch and explicitly notes that concurrent samples overlap;
-- application `sum - batch span` plus S3 request and metadata-service
-  connection window summaries, including active and union duration, weighted
-  concurrency excess, maximum observed concurrency, and in-flight work at the
-  end of each phase;
 - allocated local payload, Sync state, mount staging, SQLite database plus
   `-wal`/`-shm`, and persistent S3 object bytes and counts;
 - assertions that completed successfully and the failure count (zero for a
@@ -232,11 +227,6 @@ is the actual latency sample count. The summary shows both `total/sample` values
 so a five-run no-op batch is not presented as one run. A concurrent writer batch
 shares one network interval, so its per-sample network values are descriptive
 shares, not independent operation costs.
-
-The public JSONL retains the request-window summaries, not the per-request
-start/end interval arrays or a complete request timeline. Peak concurrency and
-overlap summaries are derived at runtime from proxy intervals before each
-record is written.
 
 `/proc/<pid>/io` is polled while the process is alive, so terminal increments can
 be missed and every value is a lower bound. Character counts also include socket
