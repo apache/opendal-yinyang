@@ -177,6 +177,22 @@ impl From<crate::local::store::ErrorKind> for ErrorKind {
         }
     }
 }
+impl From<crate::direct::ErrorKind> for ErrorKind {
+    fn from(kind: crate::direct::ErrorKind) -> Self {
+        use crate::direct::ErrorKind as Kind;
+        match kind {
+            Kind::Invalid => Self::Invalid,
+            Kind::InvalidName => Self::InvalidName,
+            Kind::NotFound => Self::NotFound,
+            Kind::NotDirectory => Self::NotDirectory,
+            Kind::IsDirectory => Self::IsDirectory,
+            Kind::Stale => Self::Conflict,
+            Kind::Unsupported => Self::Unsupported,
+            Kind::Corrupt => Self::Corrupt,
+            Kind::Storage => Self::Storage,
+        }
+    }
+}
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -231,5 +247,26 @@ mod tests {
             ErrorKind::from(crate::local::store::ErrorKind::NoSpace),
             ErrorKind::NoSpace
         );
+    }
+
+    #[test]
+    fn direct_kinds_have_one_runtime_mapping() {
+        use crate::direct::ErrorKind as DirectKind;
+
+        let cases = [
+            (DirectKind::Invalid, ErrorKind::Invalid),
+            (DirectKind::InvalidName, ErrorKind::InvalidName),
+            (DirectKind::NotFound, ErrorKind::NotFound),
+            (DirectKind::NotDirectory, ErrorKind::NotDirectory),
+            (DirectKind::IsDirectory, ErrorKind::IsDirectory),
+            (DirectKind::Stale, ErrorKind::Conflict),
+            (DirectKind::Unsupported, ErrorKind::Unsupported),
+            (DirectKind::Corrupt, ErrorKind::Corrupt),
+            (DirectKind::Storage, ErrorKind::Storage),
+        ];
+
+        for (direct, runtime) in cases {
+            assert_eq!(ErrorKind::from(direct), runtime);
+        }
     }
 }
