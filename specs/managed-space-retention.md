@@ -154,13 +154,14 @@ Local staging uses only existing paths:
 - `<staging>/sync-engine.db` and the engine-owned artifacts exposed by its
   read-only inspection denote the shared Managed or Direct Sync engine.
 
-No other file, database, or directory is promoted to staging evidence. In
-particular, a one-shot directory-publication `--state` journal
-(`directory.db` and its WAL) is not discovered or registered even when that
-state directory is inside the configured staging path. Those frozen requests
-remain recoverable through Core receipt lookup or their known base under the
-[Directory transfer](directory-transfer.md) contract. Maintenance expiry does
-not accept a directory-journal path and creates no registry for one.
+No other path is identified as a maintenance component or registered in
+`staging.databases`. In particular, a one-shot directory-publication `--state`
+journal (`directory.db` and its WAL) is not discovered or registered even when
+that state directory is inside the configured staging path. Those frozen
+requests remain recoverable through Core receipt lookup or their known base
+under the [Directory transfer](directory-transfer.md) contract. Maintenance
+expiry does not accept a directory-journal path and creates no registry for
+one.
 
 An absent staging database remains absent. A present database is inspected
 through the existing read-only runtime inspection API. The report exposes
