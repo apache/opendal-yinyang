@@ -105,6 +105,10 @@ impl TestBackend {
         self.state.lock().unwrap().stat_calls
     }
 
+    pub fn head_stat_calls(&self) -> u64 {
+        self.state.lock().unwrap().head_stat_calls
+    }
+
     pub fn corrupt_head(&self) {
         let mut state = self.state.lock().unwrap();
         let object = state
