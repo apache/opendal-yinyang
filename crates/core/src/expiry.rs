@@ -201,3 +201,84 @@ impl ExpiryRequest {
         Ok(request)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn revision(value: u8) -> Revision {
+        Revision::from_bytes([value; 24])
+    }
+
+    #[test]
+    fn expiry_request_bytes_are_canonical_and_authenticated() {
+        let authority = NodeId::from_bytes([1; 16]);
+        let id = CommitId::from_bytes([2; 16]);
+        let request = ExpiryRequest::new(
+            authority,
+            id,
+            revision(3),
+            vec![revision(2), revision(1), revision(1)],
+        )
+        .unwrap();
+        assert_eq!(request.candidates(), &[revision(1), revision(2)]);
+        let bytes = request.to_bytes().unwrap();
+        let decoded = ExpiryRequest::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.id(), id);
+        assert_eq!(decoded.digest(), request.digest());
+
+        let mut tampered = bytes.clone();
+        tampered[64] ^= 1;
+        assert_eq!(
+            ExpiryRequest::from_bytes(&tampered).unwrap_err().kind(),
+            ErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn encoded_candidates_must_remain_strictly_ordered() {
+        let request = ExpiryRequest::new(
+            NodeId::from_bytes([1; 16]),
+            CommitId::from_bytes([2; 16]),
+            revision(3),
+            vec![revision(1), revision(2)],
+        )
+        .unwrap();
+        let bytes = encode(&(
+            EXPIRY_REQUEST_MAGIC,
+            *request.filesystem.as_bytes(),
+            *request.id.as_bytes(),
+            request.expected_latest.to_bytes(),
+            request.digest,
+            vec![revision(2).to_bytes(), revision(1).to_bytes()],
+        ))
+        .unwrap();
+        assert_eq!(
+            ExpiryRequest::from_bytes(&bytes).unwrap_err().kind(),
+            ErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn expiry_candidates_are_bounded() {
+        let candidates = (0..=EXPIRY_CANDIDATES_MAX)
+            .map(|value| {
+                let mut bytes = [0; 24];
+                bytes[..8].copy_from_slice(&(value as u64).to_be_bytes());
+                bytes[8..].fill((value & 0xff) as u8);
+                Revision::from_bytes(bytes)
+            })
+            .collect();
+        assert_eq!(
+            ExpiryRequest::new(
+                NodeId::from_bytes([1; 16]),
+                CommitId::from_bytes([2; 16]),
+                revision(255),
+                candidates,
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Unsupported
+        );
+    }
+}

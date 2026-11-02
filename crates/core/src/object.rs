@@ -621,7 +621,24 @@ impl ObjectFs {
                 Ok(_) => return Ok(Outcome::Committed(receipt)),
                 Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => continue,
                 Err(_) => match self.observe_state().await {
-                    Ok(current) if current.etag.as_ref() != Some(etag) => continue,
+                    Ok(current) if current.etag.as_ref() != Some(etag) => {
+                        match current.view().receipt(request.id()).await {
+                            Ok(Some(current)) => {
+                                if current.request_digest != request.digest() {
+                                    return Err(Error::invalid(
+                                        "expire revisions",
+                                        "identity reused for a different request",
+                                    ));
+                                }
+                                return Ok(Outcome::Committed(current));
+                            }
+                            // The fresh observation fences the failed
+                            // conditional write. The fixed expected-latest guard
+                            // is now known to have lost, so do not retry candidates.
+                            Ok(None) => return Ok(Outcome::Conflict),
+                            Err(_) => return Ok(Outcome::Unknown(request.id())),
+                        }
+                    }
                     _ => return Ok(Outcome::Unknown(request.id())),
                 },
             }
