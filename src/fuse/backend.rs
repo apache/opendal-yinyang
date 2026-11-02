@@ -136,8 +136,7 @@ fn runtime_errno(kind: crate::runtime::ErrorKind) -> fuser::Errno {
         | ErrorKind::Unknown
         | ErrorKind::Corrupt
         | ErrorKind::Storage
-        | ErrorKind::Io
-        | ErrorKind::Unclassified => fuser::Errno::EIO,
+        | ErrorKind::Io => fuser::Errno::EIO,
     }
 }
 
@@ -165,7 +164,7 @@ fn direct_errno(kind: crate::direct::ErrorKind) -> fuser::Errno {
         ErrorKind::IsDirectory => fuser::Errno::EISDIR,
         ErrorKind::Stale => fuser::Errno::ESTALE,
         ErrorKind::Unsupported => fuser::Errno::EOPNOTSUPP,
-        ErrorKind::Storage => fuser::Errno::EIO,
+        ErrorKind::Corrupt | ErrorKind::Storage => fuser::Errno::EIO,
     }
 }
 

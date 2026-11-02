@@ -15,41 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Durable local write staging. SQLite keeps each acknowledged write and its
-//! generation atomic; exact dirty ranges overlay an authenticated base.
+//! Local write staging. SQLite commits each accepted write and its generation
+//! atomically; explicit barriers make the WAL durable.
 use super::*;
+use crate::local::store;
 use borsh::{BorshDeserialize, BorshSerialize};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::fs::File;
 use std::ops::Range;
 use tokio::sync::Mutex;
 
 pub(super) const CHUNK: u64 = 64 * 1024;
-const PROFILE_V1: &str = "yinyang-stage-1";
-const PROFILE_V2: &str = "yinyang-stage-2";
-const PROFILE_V3: &str = "yinyang-stage-3";
-const SCHEMA_V1: &[schema::TableColumns<'static>] = &[
-    ("authority", &["singleton", "profile", "filesystem"]),
-    ("handles", &["id", "record"]),
-    ("chunks", &["handle", "position", "data"]),
-    ("errors", &["sequence", "handle", "message"]),
-];
-const SCHEMA_V2: &[schema::TableColumns<'static>] = &[
-    ("authority", &["singleton", "profile", "filesystem"]),
-    ("handles", &["id", "record", "failure"]),
-    ("chunks", &["handle", "position", "data"]),
-    ("errors", &["sequence", "handle", "message", "failure"]),
-];
-const SCHEMA_V3: &[schema::TableColumns<'static>] = &[
+const SCHEMA: &[store::TableColumns<'static>] = &[
     ("authority", &["singleton", "profile", "filesystem"]),
     ("bases", &["handle", "descriptor", "prefix"]),
     ("handles", &["id", "record", "failure"]),
-    ("chunks", &["handle", "position", "data"]),
     ("errors", &["sequence", "handle", "message", "failure"]),
     ("segments", &["handle", "position", "data"]),
 ];
+const PROFILE: store::Profile = store::Profile {
+    name: "yinyang-stage-4",
+    table: "authority",
+    schema: SCHEMA,
+};
 
-const CREATE_SCHEMA_V3: &str = "
+const CREATE_SCHEMA: &str = "
     CREATE TABLE authority(
       singleton INTEGER PRIMARY KEY CHECK(singleton=1),
       profile TEXT NOT NULL,
@@ -61,29 +51,11 @@ const CREATE_SCHEMA_V3: &str = "
       prefix INTEGER NOT NULL
     );
     CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB NOT NULL, failure BLOB);
-    CREATE TABLE chunks(
-      handle BLOB NOT NULL,
-      position INTEGER NOT NULL,
-      data BLOB NOT NULL,
-      PRIMARY KEY(handle,position)
-    );
     CREATE TABLE errors(
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
       handle BLOB NOT NULL,
       message TEXT NOT NULL,
-      failure BLOB
-    );
-    CREATE TABLE segments(
-      handle BLOB NOT NULL,
-      position INTEGER NOT NULL,
-      data BLOB NOT NULL,
-      PRIMARY KEY(handle,position)
-    );";
-const CREATE_SPARSE_TABLES: &str = "
-    CREATE TABLE bases(
-      handle BLOB PRIMARY KEY,
-      descriptor BLOB NOT NULL,
-      prefix INTEGER NOT NULL
+      failure BLOB NOT NULL
     );
     CREATE TABLE segments(
       handle BLOB NOT NULL,
@@ -121,10 +93,7 @@ impl Record {
             pending: self.local != self.remote,
             frozen: self.plan.is_some(),
             conflict: self.conflict,
-            error: self
-                .failure
-                .clone()
-                .or_else(|| self.error.clone().map(Failure::legacy)),
+            error: self.failure.clone(),
             frozen_commit_id: self
                 .plan
                 .as_deref()
@@ -146,6 +115,25 @@ pub(super) struct StagedRead {
 pub(super) struct Stage {
     db: Arc<Mutex<Connection>>,
     _lock: Arc<File>,
+    #[cfg(test)]
+    barrier_calls: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    full_sync_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+fn store_error(error: store::Error) -> Error {
+    let kind = match error.kind() {
+        store::ErrorKind::Invalid => ErrorKind::Invalid,
+        store::ErrorKind::Unsupported => ErrorKind::Unsupported,
+        store::ErrorKind::Corrupt => ErrorKind::Corrupt,
+        store::ErrorKind::Busy => ErrorKind::Busy,
+        store::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
+        store::ErrorKind::NotFound => ErrorKind::NotFound,
+        store::ErrorKind::ReadOnly => ErrorKind::ReadOnly,
+        store::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+        store::ErrorKind::NoSpace => ErrorKind::NoSpace,
+        store::ErrorKind::Io => ErrorKind::Io,
+    };
+    Error::local_kind(kind, error)
 }
 fn local(e: impl std::error::Error + 'static) -> Error {
     let cause: &dyn std::error::Error = &e;
@@ -197,53 +185,19 @@ fn save(c: &Connection, r: &Record) -> Result<()> {
     .map_err(local)?;
     Ok(())
 }
-fn has_failure(c: &Connection, table: &str) -> Result<bool> {
-    c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='failure')",
-        [table],
-        |r| r.get(0),
+fn validate_store(c: &Connection, filesystem: Option<NodeId>) -> Result<()> {
+    let bindings = filesystem.map(|filesystem| {
+        [store::Binding::blob(
+            "filesystem",
+            filesystem.as_bytes().to_vec(),
+        )]
+    });
+    store::validate(
+        c,
+        &PROFILE,
+        bindings.as_ref().map(|bindings| bindings.as_slice()),
     )
-    .map_err(local)
-}
-
-fn validate_schema(c: &Connection, profile: &str) -> Result<()> {
-    let expected = match profile {
-        PROFILE_V1 => SCHEMA_V1,
-        PROFILE_V2 => SCHEMA_V2,
-        PROFILE_V3 => SCHEMA_V3,
-        _ => {
-            return Err(Error::State(
-                ErrorKind::Unsupported,
-                "unknown staging profile",
-            ));
-        }
-    };
-    if !schema::matches(c, expected).map_err(local)? {
-        return Err(Error::local_kind(
-            ErrorKind::Corrupt,
-            format!("staging profile {profile} has an unsupported schema"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_profile(c: &Connection, filesystem: Option<NodeId>) -> Result<String> {
-    let (profile, bound): (String, Vec<u8>) = c
-        .query_row(
-            "SELECT profile,filesystem FROM authority WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| {
-            Error::local_kind(ErrorKind::Corrupt, format!("read staging profile: {error}"))
-        })?;
-    validate_schema(c, &profile)?;
-    if let Some(filesystem) = filesystem
-        && bound != filesystem.as_bytes()
-    {
-        return Err(Error::Invalid("staging belongs to a different filesystem"));
-    }
-    Ok(profile)
+    .map_err(store_error)
 }
 fn decoded_record(bytes: &[u8], failure: Option<Vec<u8>>) -> Result<Record> {
     let mut r = decode(bytes)?;
@@ -262,24 +216,6 @@ fn record(c: &Connection, id: [u8; 16]) -> Result<Record> {
         .map_err(local)?;
     decoded_record(&bytes, failure)
 }
-fn chunk(c: &Connection, id: [u8; 16], index: u64) -> Result<Vec<u8>> {
-    Ok(c.query_row(
-        "SELECT data FROM chunks WHERE handle=?1 AND position=?2",
-        params![id.as_slice(), index as i64],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(local)?
-    .unwrap_or_default())
-}
-fn put_chunk(c: &Connection, id: [u8; 16], index: u64, bytes: &[u8]) -> Result<()> {
-    c.execute(
-        "INSERT OR REPLACE INTO chunks VALUES(?1,?2,?3)",
-        params![id.as_slice(), index as i64, bytes],
-    )
-    .map_err(local)?;
-    Ok(())
-}
 fn base(c: &Connection, id: [u8; 16]) -> Result<Option<Base>> {
     let (descriptor, prefix): (Vec<u8>, i64) = match c
         .query_row(
@@ -296,6 +232,12 @@ fn base(c: &Connection, id: [u8; 16]) -> Result<Option<Base>> {
     let prefix = u64::try_from(prefix).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e))?;
     ContentDescriptor::from_bytes(&descriptor)?;
     Ok(Some(Base { descriptor, prefix }))
+}
+fn required_base(c: &Connection, id: [u8; 16]) -> Result<Base> {
+    base(c, id)?.ok_or(Error::State(
+        ErrorKind::Corrupt,
+        "ready staging handle has no base",
+    ))
 }
 fn put_base(c: &Connection, id: [u8; 16], descriptor: &[u8], prefix: u64) -> Result<()> {
     let descriptor = ContentDescriptor::from_bytes(descriptor)?;
@@ -348,13 +290,9 @@ fn delete_segment(c: &Connection, id: [u8; 16], position: u64) -> Result<()> {
     Ok(())
 }
 fn records(c: &Connection) -> Result<Vec<Record>> {
-    // Inspect must also work before an older staging database is opened/upgraded.
-    let sql = if has_failure(c, "handles")? {
-        "SELECT record,failure FROM handles ORDER BY id"
-    } else {
-        "SELECT record,NULL FROM handles ORDER BY id"
-    };
-    let mut query = c.prepare(sql).map_err(local)?;
+    let mut query = c
+        .prepare("SELECT record,failure FROM handles ORDER BY id")
+        .map_err(local)?;
     let rows = query
         .query_map([], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
@@ -371,12 +309,9 @@ fn records(c: &Connection) -> Result<Vec<Record>> {
     Ok(result)
 }
 fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
-    let sql = if has_failure(c, "errors")? {
-        "SELECT sequence,handle,message,failure FROM errors ORDER BY sequence"
-    } else {
-        "SELECT sequence,handle,message,NULL FROM errors ORDER BY sequence"
-    };
-    let mut query = c.prepare(sql).map_err(local)?;
+    let mut query = c
+        .prepare("SELECT sequence,handle,message,failure FROM errors ORDER BY sequence")
+        .map_err(local)?;
     let rows = query
         .query_map([], |r| {
             Ok((
@@ -388,13 +323,13 @@ fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
         })
         .map_err(local)?;
     rows.map(|r| {
-        let (sequence, id, message, failure) = r.map_err(local)?;
-        let error = match failure {
-            Some(bytes) => {
-                borsh::from_slice(&bytes).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e))?
-            }
-            None => Failure::legacy(message),
-        };
+        let (sequence, id, _message, failure) = r.map_err(local)?;
+        let bytes = failure.ok_or(Error::State(
+            ErrorKind::Corrupt,
+            "staging error entry has no typed failure",
+        ))?;
+        let error =
+            borsh::from_slice(&bytes).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e))?;
         Ok(WritebackError {
             sequence: sequence as u64,
             handle: uuid::Uuid::from_slice(&id).map_err(local)?,
@@ -404,12 +339,9 @@ fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
     })
     .collect()
 }
-fn validate_state(c: &Connection, profile: &str) -> Result<()> {
+fn validate_state(c: &Connection) -> Result<()> {
     let _ = records(c)?;
     let _ = errors(c)?;
-    if profile != PROFILE_V3 {
-        return Ok(());
-    }
     let handles = {
         let mut query = c.prepare("SELECT id,record FROM handles").map_err(local)?;
         let rows = query
@@ -498,20 +430,15 @@ fn validate_state(c: &Connection, profile: &str) -> Result<()> {
                 "staging base prefix exceeds handle length",
             ));
         }
-        let materialized = c
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM chunks WHERE handle=?1)",
-                params![handle.as_slice()],
-                |r| r.get::<_, bool>(0),
-            )
-            .map_err(local)?;
-        if materialized {
+        sparse.insert(handle.to_vec(), (prefix, record.length));
+    }
+    for (id, record) in &handles {
+        if record.ready && !sparse.contains_key(id) {
             return Err(Error::State(
                 ErrorKind::Corrupt,
-                "sparse handle also has materialized chunks",
+                "ready staging handle has no base",
             ));
         }
-        sparse.insert(handle.to_vec(), (prefix, record.length));
     }
 
     let segments = {
@@ -741,15 +668,9 @@ fn coalesce_segment(c: &Connection, id: [u8; 16], position: u64, bytes: &[u8]) -
 impl Stage {
     pub async fn validate(path: PathBuf, fs: NodeId) -> Result<()> {
         tokio::task::spawn_blocking(move || {
-            let c = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(local)?;
-            c.busy_timeout(std::time::Duration::from_secs(1))
-                .map_err(local)?;
-            let profile = validate_profile(&c, Some(fs))?;
-            validate_state(&c, &profile)?;
+            let c = store::open_read_only(&path).map_err(store_error)?;
+            validate_store(&c, Some(fs))?;
+            validate_state(&c)?;
             Ok(())
         })
         .await
@@ -758,15 +679,9 @@ impl Stage {
 
     pub async fn inspect(path: PathBuf) -> Result<RuntimeStatus> {
         tokio::task::spawn_blocking(move || {
-            let c = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(local)?;
-            c.busy_timeout(std::time::Duration::from_secs(1))
-                .map_err(local)?;
-            let profile = validate_profile(&c, None)?;
-            validate_state(&c, &profile)?;
+            let c = store::open_read_only(&path).map_err(store_error)?;
+            validate_store(&c, None)?;
+            validate_state(&c)?;
             Ok(RuntimeStatus {
                 handles: records(&c)?.iter().map(Record::status).collect(),
                 errors: errors(&c)?,
@@ -780,18 +695,10 @@ impl Stage {
             std::fs::create_dir_all(&path).map_err(local)?;
             let database = path.join("staging.db");
             if database.try_exists().map_err(local)? {
-                let c = Connection::open_with_flags(
-                    &database,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )
-                .map_err(local)?;
-                c.busy_timeout(std::time::Duration::from_secs(1))
-                    .map_err(local)?;
-                if !schema::matches(&c, &[]).map_err(local)? {
-                    let profile = validate_profile(&c, Some(fs))?;
-                    if profile == PROFILE_V3 {
-                        validate_state(&c, &profile)?;
-                    }
+                let c = store::open_read_only(&database).map_err(store_error)?;
+                if !store::is_empty(&c).map_err(store_error)? {
+                    validate_store(&c, Some(fs))?;
+                    validate_state(&c)?;
                 }
             }
             let lock = std::fs::OpenOptions::new()
@@ -808,70 +715,21 @@ impl Stage {
                 std::fs::TryLockError::Error(e) => local(e),
             })?;
             let exists = database.try_exists().map_err(local)?;
-            let mut c = Connection::open_with_flags(
-                &database,
-                if exists {
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                } else {
-                    OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | OpenFlags::SQLITE_OPEN_CREATE
-                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                },
-            )
-            .map_err(local)?;
-            c.busy_timeout(std::time::Duration::from_secs(1))
-                .map_err(local)?;
-            // Revalidate after taking the process lease. A writer that finished
-            // between preflight and locking may have performed a supported
-            // upgrade; accept the resulting known profile.
-            let profile = if exists && !schema::matches(&c, &[]).map_err(local)? {
-                Some(validate_profile(&c, Some(fs))?)
-            } else {
-                None
-            };
+            let mut c = store::open_read_write(&database, !exists).map_err(store_error)?;
+            let empty = store::is_empty(&c).map_err(store_error)?;
             let tx = c.transaction().map_err(local)?;
-            match profile.as_deref() {
-                None => {
-                    tx.execute_batch(CREATE_SCHEMA_V3).map_err(local)?;
-                    tx.execute(
-                        "INSERT INTO authority VALUES(1,?1,?2)",
-                        params![PROFILE_V3, fs.as_bytes().as_slice()],
-                    )
-                    .map_err(local)?;
-                }
-                Some(PROFILE_V1) => {
-                    let _ = records(&tx)?;
-                    let _ = errors(&tx)?;
-                    tx.execute_batch(
-                        "ALTER TABLE handles ADD COLUMN failure BLOB;
-                         ALTER TABLE errors ADD COLUMN failure BLOB;",
-                    )
-                    .map_err(local)?;
-                    tx.execute_batch(CREATE_SPARSE_TABLES).map_err(local)?;
-                    tx.execute(
-                        "UPDATE authority SET profile=?1 WHERE singleton=1",
-                        [PROFILE_V3],
-                    )
-                    .map_err(local)?;
-                }
-                Some(PROFILE_V2) => {
-                    let _ = records(&tx)?;
-                    let _ = errors(&tx)?;
-                    tx.execute_batch(CREATE_SPARSE_TABLES).map_err(local)?;
-                    tx.execute(
-                        "UPDATE authority SET profile=?1 WHERE singleton=1",
-                        [PROFILE_V3],
-                    )
-                    .map_err(local)?;
-                }
-                Some(PROFILE_V3) => {
-                    let _ = records(&tx)?;
-                    let _ = errors(&tx)?;
-                }
-                Some(_) => unreachable!("profile validation rejected unsupported state"),
+            if empty {
+                store::initialize(
+                    &tx,
+                    &PROFILE,
+                    CREATE_SCHEMA,
+                    &[store::Binding::blob("filesystem", fs.as_bytes().to_vec())],
+                )
+                .map_err(store_error)?;
+            } else {
+                validate_store(&tx, Some(fs))?;
             }
-            let profile = validate_profile(&tx, Some(fs))?;
-            validate_state(&tx, &profile)?;
+            validate_state(&tx)?;
             // Incomplete opens have never been exposed or accepted application writes.
             let all = {
                 let mut q = tx.prepare("SELECT record FROM handles").map_err(local)?;
@@ -883,11 +741,6 @@ impl Stage {
             for bytes in all {
                 let r = decode(&bytes)?;
                 if !r.ready {
-                    tx.execute(
-                        "DELETE FROM chunks WHERE handle=?1",
-                        params![r.id.as_slice()],
-                    )
-                    .map_err(local)?;
                     tx.execute(
                         "DELETE FROM segments WHERE handle=?1",
                         params![r.id.as_slice()],
@@ -903,11 +756,14 @@ impl Stage {
                 }
             }
             tx.commit().map_err(local)?;
-            c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-                .map_err(local)?;
+            store::configure(&c, store::Durability::Barrier).map_err(store_error)?;
             Ok(Self {
                 db: Arc::new(Mutex::new(c)),
                 _lock: Arc::new(lock),
+                #[cfg(test)]
+                barrier_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                #[cfg(test)]
+                full_sync_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
         })
         .await
@@ -925,11 +781,61 @@ impl Stage {
             .await
             .map_err(local)?
     }
+    pub async fn barrier(&self) -> Result<()> {
+        #[cfg(test)]
+        let barrier_calls = self.barrier_calls.clone();
+        self.call(move |c| {
+            store::barrier(c).map_err(store_error)?;
+            #[cfg(test)]
+            barrier_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+    }
+    #[cfg(test)]
+    pub fn barrier_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.barrier_calls.clone()
+    }
+    #[cfg(test)]
+    pub fn full_sync_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.full_sync_calls.clone()
+    }
+    async fn call_durable<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        #[cfg(test)]
+        let full_sync_calls = self.full_sync_calls.clone();
+        let result = self
+            .call(move |connection| {
+                store::set_durability(connection, store::Durability::Journal)
+                    .map_err(store_error)?;
+                let result = f(connection);
+                let restored = store::set_durability(connection, store::Durability::Barrier)
+                    .map_err(store_error);
+                match (result, restored) {
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                    (Ok(value), Ok(())) => Ok(value),
+                }
+            })
+            .await;
+        #[cfg(test)]
+        if result.is_ok() {
+            full_sync_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
     pub async fn load(&self, id: [u8; 16]) -> Result<Record> {
         self.call(move |c| record(c, id)).await
     }
     pub async fn save(&self, r: Record) -> Result<()> {
         self.call(move |c| save(c, &r)).await
+    }
+    pub async fn save_durable(&self, r: Record) -> Result<()> {
+        // A FULL commit syncs the whole WAL, so it also makes every earlier
+        // NORMAL write durable. One WAL fsync is cheaper than a FULL checkpoint.
+        self.call_durable(move |c| save(c, &r)).await
     }
     pub async fn base(&self, id: [u8; 16]) -> Result<Option<Base>> {
         self.call(move |c| base(c, id)).await
@@ -992,14 +898,9 @@ impl Stage {
         .await
     }
     pub async fn complete_base(&self, r: Record, descriptor: Vec<u8>) -> Result<()> {
-        self.call(move |c| {
+        self.call_durable(move |c| {
             let tx = c.transaction().map_err(local)?;
             put_base(&tx, r.id, &descriptor, r.length)?;
-            tx.execute(
-                "DELETE FROM chunks WHERE handle=?1",
-                params![r.id.as_slice()],
-            )
-            .map_err(local)?;
             tx.execute(
                 "DELETE FROM segments WHERE handle=?1",
                 params![r.id.as_slice()],
@@ -1014,6 +915,7 @@ impl Stage {
     pub async fn read(&self, id: [u8; 16], offset: u64, length: usize) -> Result<StagedRead> {
         self.call(move |c| {
             let r = record(c, id)?;
+            let base = required_base(c, id)?;
             let end = offset.saturating_add(length as u64).min(r.length);
             if offset >= end {
                 return Ok(StagedRead {
@@ -1021,24 +923,7 @@ impl Stage {
                     base: Vec::new(),
                 });
             }
-            if let Some(base) = base(c, id)? {
-                return read_sparse(c, id, offset, end, base);
-            }
-            let mut result = Vec::new();
-            let mut position = offset;
-            while position < end {
-                let index = position / CHUNK;
-                let mut bytes = chunk(c, id, index)?;
-                bytes.resize(CHUNK as usize, 0);
-                let start = (position % CHUNK) as usize;
-                let size = ((end - position).min(CHUNK - start as u64)) as usize;
-                result.extend_from_slice(&bytes[start..start + size]);
-                position += size as u64;
-            }
-            Ok(StagedRead {
-                bytes: result,
-                base: Vec::new(),
-            })
+            read_sparse(c, id, offset, end, base)
         })
         .await
     }
@@ -1047,6 +932,7 @@ impl Stage {
             let tx = c.transaction().map_err(local)?;
             let mut r = record(&tx, id)?;
             mutable(&r)?;
+            required_base(&tx, id)?;
             let offset = offset.unwrap_or(r.length);
             let end = offset
                 .checked_add(bytes.len() as u64)
@@ -1055,22 +941,7 @@ impl Stage {
             if bytes.is_empty() {
                 return Ok(offset);
             }
-            if base(&tx, id)?.is_some() {
-                write_sparse(&tx, id, offset, &bytes)?;
-            } else {
-                let mut position = offset;
-                while position < end {
-                    let index = position / CHUNK;
-                    let mut block = chunk(&tx, id, index)?;
-                    block.resize(CHUNK as usize, 0);
-                    let start = (position % CHUNK) as usize;
-                    let size = (end - position).min(CHUNK - start as u64) as usize;
-                    let source = (position - offset) as usize;
-                    block[start..start + size].copy_from_slice(&bytes[source..source + size]);
-                    put_chunk(&tx, id, index, &block)?;
-                    position += size as u64;
-                }
-            }
+            write_sparse(&tx, id, offset, &bytes)?;
             r.length = r.length.max(end);
             r.local = r
                 .local
@@ -1096,49 +967,37 @@ impl Stage {
             let tx = c.transaction().map_err(local)?;
             let mut r = record(&tx, id)?;
             mutable(&r)?;
+            required_base(&tx, id)?;
             if length == r.length && !replacement {
                 return Ok(());
             }
-            if base(&tx, id)?.is_some() {
-                if length < r.length {
-                    tx.execute(
-                        "DELETE FROM segments WHERE handle=?1 AND position>=?2",
-                        params![id.as_slice(), i64::try_from(length).map_err(local)?],
-                    )
-                    .map_err(local)?;
-                    let crossing: Option<(i64, Vec<u8>)> = tx
-                        .query_row(
-                            "SELECT position,data FROM segments
-                             WHERE handle=?1 AND position<?2
-                             ORDER BY position DESC LIMIT 1",
-                            params![id.as_slice(), i64::try_from(length).map_err(local)?],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .optional()
-                        .map_err(local)?;
-                    if let Some((position, data)) = crossing {
-                        let position = positioned(position)?;
-                        if segment_end(position, &data)? > length {
-                            put_segment(&tx, id, position, &data[..(length - position) as usize])?;
-                        }
-                    }
-                    tx.execute(
-                        "UPDATE bases SET prefix=MIN(prefix,?2) WHERE handle=?1",
-                        params![id.as_slice(), i64::try_from(length).map_err(local)?],
-                    )
-                    .map_err(local)?;
-                }
-            } else if length < r.length {
+            if length < r.length {
                 tx.execute(
-                    "DELETE FROM chunks WHERE handle=?1 AND position>=?2",
-                    params![id.as_slice(), length.div_ceil(CHUNK) as i64],
+                    "DELETE FROM segments WHERE handle=?1 AND position>=?2",
+                    params![id.as_slice(), i64::try_from(length).map_err(local)?],
                 )
                 .map_err(local)?;
-                if !length.is_multiple_of(CHUNK) {
-                    let mut block = chunk(&tx, id, length / CHUNK)?;
-                    block.truncate((length % CHUNK) as usize);
-                    put_chunk(&tx, id, length / CHUNK, &block)?;
+                let crossing: Option<(i64, Vec<u8>)> = tx
+                    .query_row(
+                        "SELECT position,data FROM segments
+                         WHERE handle=?1 AND position<?2
+                         ORDER BY position DESC LIMIT 1",
+                        params![id.as_slice(), i64::try_from(length).map_err(local)?],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(local)?;
+                if let Some((position, data)) = crossing {
+                    let position = positioned(position)?;
+                    if segment_end(position, &data)? > length {
+                        put_segment(&tx, id, position, &data[..(length - position) as usize])?;
+                    }
                 }
+                tx.execute(
+                    "UPDATE bases SET prefix=MIN(prefix,?2) WHERE handle=?1",
+                    params![id.as_slice(), i64::try_from(length).map_err(local)?],
+                )
+                .map_err(local)?;
             }
             r.length = length;
             r.local = r
@@ -1175,8 +1034,6 @@ impl Stage {
     pub async fn remove(&self, id: [u8; 16]) -> Result<()> {
         self.call(move |c| {
             let tx = c.transaction().map_err(local)?;
-            tx.execute("DELETE FROM chunks WHERE handle=?1", params![id.as_slice()])
-                .map_err(local)?;
             tx.execute(
                 "DELETE FROM segments WHERE handle=?1",
                 params![id.as_slice()],
@@ -1231,21 +1088,12 @@ fn mutable(r: &Record) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn raw_database(path: &std::path::Path, profile: &str, typed_failures: bool) -> NodeId {
+    fn raw_database(path: &std::path::Path, profile: &str) -> NodeId {
         let fs = NodeId::generate();
-        let failure = if typed_failures { ",failure BLOB" } else { "" };
         let c = Connection::open(path).unwrap();
-        c.execute_batch(&format!(
-            "CREATE TABLE authority(singleton INTEGER PRIMARY KEY, profile TEXT, filesystem BLOB);
-             CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB{handle_failure});
-             CREATE TABLE chunks(handle BLOB, position INTEGER, data BLOB, PRIMARY KEY(handle,position));
-             CREATE TABLE errors(sequence INTEGER PRIMARY KEY AUTOINCREMENT, handle BLOB, message TEXT{error_failure});",
-            handle_failure = failure,
-            error_failure = failure,
-        ))
-        .unwrap();
+        c.execute_batch(CREATE_SCHEMA).unwrap();
         c.execute(
-            "INSERT INTO authority VALUES(1,?1,?2)",
+            "INSERT INTO authority(singleton,profile,filesystem) VALUES(1,?1,?2)",
             params![profile, fs.as_bytes().as_slice()],
         )
         .unwrap();
@@ -1262,10 +1110,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_handle_without_base_is_corrupt_before_incomplete_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging.db");
+        let fs = raw_database(&path, PROFILE.name);
+        let id = [23_u8; 16];
+        let c = Connection::open(&path).unwrap();
+        save(
+            &c,
+            &Record {
+                id,
+                node: *NodeId::generate().as_bytes(),
+                base: [9; 24],
+                length: 0,
+                local: 0,
+                remote: 0,
+                writable: true,
+                ready: true,
+                plan: None,
+                conflict: false,
+                error: None,
+                failure: None,
+            },
+        )
+        .unwrap();
+        let has_chunks: bool = c
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_chunks);
+        drop(c);
+
+        let error = Stage::inspect(path.clone()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Corrupt);
+        assert!(error.to_string().contains("no base"));
+        assert_eq!(
+            Stage::open(temp.path().to_owned(), fs)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::Corrupt
+        );
+        assert!(!temp.path().join("runtime.lock").exists());
+
+        let c = Connection::open(path).unwrap();
+        let handles: i64 = c
+            .query_row("SELECT COUNT(*) FROM handles", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(handles, 1);
+    }
+
+    #[tokio::test]
     async fn unsupported_profile_is_rejected_without_creating_a_lease_or_changing_sqlite() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let fs = raw_database(&path, "yinyang-stage-99", true);
+        let fs = raw_database(&path, "yinyang-stage-3");
         assert_eq!(
             Stage::inspect(path.clone()).await.unwrap_err().kind(),
             ErrorKind::Unsupported
@@ -1295,14 +1200,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-stage-99");
+        assert_eq!(profile, "yinyang-stage-3");
     }
 
     #[tokio::test]
     async fn unsupported_profile_read_only_rejection_preserves_authoritative_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let _ = raw_database(&path, "yinyang-stage-99", true);
+        let _ = raw_database(&path, "yinyang-stage-3");
         Connection::open(&path)
             .unwrap()
             .execute_batch("PRAGMA journal_mode=WAL")
@@ -1339,7 +1244,7 @@ mod tests {
     async fn unsupported_profile_only_in_existing_wal_is_read_without_changing_wal() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.db");
-        let _ = raw_database(&source, PROFILE_V2, true);
+        let _ = raw_database(&source, PROFILE.name);
         let writer = Connection::open(&source).unwrap();
         writer
             .execute_batch(
@@ -1381,7 +1286,11 @@ mod tests {
     async fn known_profile_with_partial_schema_is_not_repaired() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let fs = raw_database(&path, PROFILE_V2, false);
+        let fs = raw_database(&path, PROFILE.name);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE segments")
+            .unwrap();
         assert_eq!(
             Stage::inspect(path.clone()).await.unwrap_err().kind(),
             ErrorKind::Corrupt
@@ -1396,15 +1305,16 @@ mod tests {
         );
         assert!(!temp.path().join("runtime.lock").exists());
         let c = Connection::open(path).unwrap();
-        let handles: Vec<String> = {
-            let mut statement = c.prepare("PRAGMA table_info(handles)").unwrap();
-            statement
-                .query_map([], |row| row.get(1))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        assert_eq!(handles, ["id", "record"]);
+        let segments: bool = c
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type='table' AND name='segments'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!segments);
     }
 
     #[tokio::test]
@@ -1461,142 +1371,6 @@ mod tests {
             .unwrap();
         file.acknowledge_error().await.unwrap();
         file.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn stage_one_upgrade_preserves_pending_data_requests_and_legacy_errors() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("staging.db");
-        let fs = NodeId::generate();
-        let id = [7_u8; 16];
-        // Independently encode stage-1 fields, including an opaque frozen request.
-        let bytes = borsh::to_vec(&(
-            id,
-            [8_u8; 16],
-            [9_u8; 24],
-            3_u64,
-            2_u64,
-            1_u64,
-            true,
-            true,
-            Some(vec![1_u8, 2, 3]),
-            false,
-            Some(String::from("legacy failure")),
-        ))
-        .unwrap();
-        {
-            let c = Connection::open(&path).unwrap();
-            c.execute_batch("CREATE TABLE authority(singleton INTEGER PRIMARY KEY, profile TEXT, filesystem BLOB);
-                CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB);
-                CREATE TABLE chunks(handle BLOB, position INTEGER, data BLOB, PRIMARY KEY(handle,position));
-                CREATE TABLE errors(sequence INTEGER PRIMARY KEY AUTOINCREMENT, handle BLOB, message TEXT);").unwrap();
-            c.execute(
-                "INSERT INTO authority VALUES(1,'yinyang-stage-1',?1)",
-                [fs.as_bytes().as_slice()],
-            )
-            .unwrap();
-            c.execute(
-                "INSERT INTO handles VALUES(?1,?2)",
-                params![id.as_slice(), &bytes],
-            )
-            .unwrap();
-            c.execute(
-                "INSERT INTO chunks VALUES(?1,0,?2)",
-                params![id.as_slice(), b"abc".as_slice()],
-            )
-            .unwrap();
-            c.execute(
-                "INSERT INTO errors(handle,message) VALUES(?1,'legacy failure')",
-                [id.as_slice()],
-            )
-            .unwrap();
-        }
-        let before = Stage::inspect(path.clone()).await.unwrap();
-        assert_eq!(
-            before.handles[0].error.as_ref().unwrap().kind(),
-            ErrorKind::Unclassified
-        );
-        assert!(before.handles[0].pending && before.handles[0].frozen);
-        let stage = Stage::open(temp.path().to_owned(), fs).await.unwrap();
-        let r = stage.load(id).await.unwrap();
-        assert_eq!(borsh::to_vec(&r).unwrap(), bytes);
-        assert_eq!(stage.read(id, 0, 10).await.unwrap().bytes, b"abc");
-        let commit = CommitId::generate();
-        stage
-            .failure(id, Failure::capture(&Error::Unknown(commit)))
-            .await
-            .unwrap();
-        stage.acknowledge(u64::MAX).await.unwrap();
-        drop(stage);
-        let stage = Stage::open(temp.path().to_owned(), fs).await.unwrap();
-        let status = stage.status().await.unwrap();
-        assert!(status.errors.is_empty());
-        assert_eq!(
-            status.handles[0].error.as_ref().unwrap().commit_id(),
-            Some(commit)
-        );
-        assert_eq!(stage.load(id).await.unwrap().plan, Some(vec![1, 2, 3]));
-        assert_eq!(stage.read(id, 0, 3).await.unwrap().bytes, b"abc");
-        assert_eq!(
-            Stage::inspect(path).await.unwrap().handles[0]
-                .error
-                .as_ref()
-                .unwrap()
-                .kind(),
-            ErrorKind::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_two_chunks_remain_full_materialization_after_upgrade() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("staging.db");
-        let fs = raw_database(&path, PROFILE_V2, true);
-        let id = [17_u8; 16];
-        let record = Record {
-            id,
-            node: [18_u8; 16],
-            base: [19_u8; 24],
-            length: 16,
-            local: 1,
-            remote: 0,
-            writable: true,
-            ready: true,
-            plan: None,
-            conflict: false,
-            error: None,
-            failure: None,
-        };
-        {
-            let c = Connection::open(&path).unwrap();
-            c.execute(
-                "INSERT INTO handles(id,record,failure) VALUES(?1,?2,NULL)",
-                params![id.as_slice(), borsh::to_vec(&record).unwrap()],
-            )
-            .unwrap();
-            c.execute(
-                "INSERT INTO chunks VALUES(?1,0,?2)",
-                params![id.as_slice(), b"old-materialized".as_slice()],
-            )
-            .unwrap();
-        }
-
-        let stage = Stage::open(temp.path().to_owned(), fs).await.unwrap();
-        let read = stage.read(id, 0, 32).await.unwrap();
-        assert_eq!(read.bytes, b"old-materialized");
-        assert!(read.base.is_empty());
-        assert!(stage.base(id).await.unwrap().is_none());
-        let profile: String = stage
-            .db
-            .lock()
-            .await
-            .query_row(
-                "SELECT profile FROM authority WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(profile, PROFILE_V3);
     }
 
     #[tokio::test]
@@ -1754,9 +1528,11 @@ mod tests {
             waiting.await.unwrap();
             let writer = stage.clone();
             let mut submitted = Box::pin(writer.call(|c| {
+                let failure =
+                    borsh::to_vec(&Failure::capture(&Error::Invalid("accepted"))).unwrap();
                 c.execute(
-                    "INSERT INTO errors(handle,message) VALUES(?1,'accepted')",
-                    params![[0_u8; 16].as_slice()],
+                    "INSERT INTO errors(handle,message,failure) VALUES(?1,'accepted',?2)",
+                    params![[0_u8; 16].as_slice(), failure],
                 )
                 .map_err(local)?;
                 Ok(())

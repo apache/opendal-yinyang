@@ -9,11 +9,13 @@ provide high availability, multi-host consensus, or a remotely exposed transport
 
 `MetadataService::create/open` binds one local SQLite database to one content
 prefix. The database uses WAL, `synchronous=FULL`, and `BEGIN IMMEDIATE` for
-publication. Its filesystem must honor SQLite locking and synchronization;
-network-mounted database files are unsupported. Keep the database and its WAL
-together; copying only the live main database is not a backup procedure.
+publication. A successful preparation or commit is durable when its transaction
+commits. Its filesystem must honor SQLite locking and
+synchronization; network-mounted database files are unsupported. Keep the
+database and its WAL together; copying only the live main database is not a
+backup procedure.
 
-The schema profile is `yinyang-sqlite-1`. The authority row retains filesystem
+The schema profile is `yinyang-sqlite-2`. The authority row retains filesystem
 and root identities plus the latest revision. Indexed valid-time records retain
 nodes, entries, receipts, and ordered changes. Each record has an inclusive
 start and exclusive end sequence. Revision tokens are retained separately and
@@ -21,11 +23,13 @@ validated before reads. History is application data, not an expiring database
 MVCC window. There is no history deletion or garbage collection.
 
 Before changing the SQLite journal mode or creating tables, opening checks the
-schema profile, the retained `authority` manifest, the required tables, and the
-column order used by writes. An unknown profile returns `Unsupported`; a
-supported identifier with an incompatible schema or manifest returns `Corrupt`.
-Neither path modifies the database. This admission is a format check, not a scan
-of all historical records.
+schema profile, the single authority profile row, the retained manifest, the
+required tables, and each table's exact column-name set. An older or unknown
+profile returns `Unsupported`; a current identifier with an incompatible schema
+or manifest returns `Corrupt`. Neither path modifies the database. Maintained
+inserts name columns explicitly, so column order is not part of the schema
+signature. This admission is a format check, not a scan of all historical
+records.
 
 Writers serialize at the database boundary, but revalidate original logical
 predicates through the same transaction evaluator as object publication.
@@ -58,11 +62,12 @@ migrate, recover, take the writer transaction, or infer retained revisions from
 content packs. `ServiceClient` exposes the same bounded page contract.
 
 In-process preparation carries trusted `DataStore` evidence and records
-readiness durably. A client uploads through OpenDAL, then registers its content
-descriptor. The service fully verifies an untrusted descriptor before recording
-readiness. Publication and restart use that persisted evidence; they do not
-download the file again. Credentials and prefix isolation must prevent external
-writers from mutating immutable published content, as in object mode.
+readiness with a durable `synchronous=FULL` commit. A client uploads through OpenDAL,
+then registers its content descriptor. The service fully verifies an untrusted
+descriptor before recording readiness. Publication and restart use that
+persisted evidence; they do not download the file again. Credentials and prefix
+isolation must prevent external writers from mutating immutable published
+content, as in object mode.
 
 Trusted fixed-offset updates have a separate path. `Authority::prepare_overwrite`
 accepts an exact `FileVersion` and bounded `ContentEdit` ranges with unchanged
@@ -152,16 +157,18 @@ error reporting, not the persisted metadata or transaction encoding.
 ## Failure and recovery
 
 Database contention before commit returns `Retryable`; replay the original
-request, not a newly observed/replanned one. Failed commit acknowledgement and
-lost/timeout transport responses return `Unknown(commit_id)`. A timeout does
-not cancel or prove rollback of an in-flight durable transaction. Resolve via
-a retained receipt or retry the exact frozen request. Absent receipt is not
-proof that a delayed request cannot still commit.
+request, not a newly observed/replanned one. A successful `synchronous=FULL`
+SQLite `COMMIT` is durable before local success is reported. A failed commit
+acknowledgement and lost/timeout transport responses return `Unknown(commit_id)`.
+A timeout does not cancel or prove rollback of an
+in-flight durable transaction. Resolve via a retained receipt or retry the
+exact frozen request. Absent receipt is not proof that a delayed request cannot
+still commit.
 
 Duplicate identity/digest returns the original receipt. Identity reused with a
 different digest is invalid. Reopening the same database retains receipts,
 readiness, changes, and historical revisions. No automatic failover or
-checkpoint writer exists. Listener shutdown stops accepting new work; already
+background durability writer exists. Listener shutdown stops accepting new work; already
 accepted requests may finish.
 
 For a supported quiesced backup, freeze service clients and create a consistent
@@ -186,13 +193,13 @@ migration support.
 
 ## Compatibility
 
-The supported service profiles are `yinyang-sqlite-1`, `YYSERV01`, `YYPLAN01`,
+The supported service profiles are `yinyang-sqlite-2`, `YYSERV01`, `YYPLAN01`,
 the shared `YYFILE02`/`YYHASH02` content profile, and loopback RPC version 1.
 There is no automatic schema upgrade or downgrade, no object-authority fallback,
 and no cross-profile read of local preparation evidence. A same-profile process
 restart retains published history, receipts, frozen requests, and readiness.
 
-The independent SQLite and object vectors under
-[`compatibility-v2`](../crates/core/tests/fixtures/compatibility-v2) are consumed
-directly by the tests. See [Compatibility](compatibility.md) for the complete
-reader/writer matrix and unsupported-transition behavior.
+Current-profile content and transaction vectors under
+[`format`](../crates/core/tests/fixtures/format) are consumed directly by the
+tests. See [Compatibility](compatibility.md) for the reader/writer matrix and
+unsupported-transition behavior.

@@ -124,16 +124,14 @@ records. It rejects malformed
 checksums, unsafe/duplicate paths or artifact names, wrong profiles, incomplete
 installs, and ambiguous old-to-new identity collisions before creating or
 rebinding destinations. The package format is experimental and is not an
-online snapshot or migration contract. See
+online snapshot contract or a local-profile migration mechanism. See
 [Linux backup and isolated recovery](../docs/linux-backup-recovery.md).
 
 Before package copy, restore validates `replica.db`, `sync.db`, and
 `content/staging.db` read-only and binds the manifest to the replica binding.
-The package container remains `YYBK0001`. Supported `fd1338c2` local profiles
-may be restored and are upgraded only by the normal writer open after the
-isolated destinations exist; unknown profiles or partial known schemas fail
-without creating either destination. Other cross-version restore combinations
-remain unsupported.
+The package container remains `YYBK0001`. Restore accepts only the current
+replica, Sync and content-staging profiles. Older, newer, unknown or partial
+schemas fail without creating either destination; there is no upgrade path.
 
 ## Status document
 

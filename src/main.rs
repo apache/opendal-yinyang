@@ -133,7 +133,7 @@ fn classify_boxed_error(error: &(dyn StdError + 'static)) -> RuntimeErrorKind {
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
         return runtime_kind_from_io(error.kind());
     }
-    RuntimeErrorKind::Unclassified
+    RuntimeErrorKind::Io
 }
 
 pub(crate) fn runtime_kind_from_io(kind: std::io::ErrorKind) -> RuntimeErrorKind {
@@ -189,6 +189,7 @@ pub(crate) fn runtime_kind_from_direct(kind: yinyang::direct::ErrorKind) -> Runt
         Kind::IsDirectory => RuntimeErrorKind::IsDirectory,
         Kind::Stale => RuntimeErrorKind::Conflict,
         Kind::Unsupported => RuntimeErrorKind::Unsupported,
+        Kind::Corrupt => RuntimeErrorKind::Corrupt,
         Kind::Storage => RuntimeErrorKind::Storage,
     }
 }

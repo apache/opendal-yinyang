@@ -2,7 +2,7 @@
 
 Status: experimental Ubuntu 24.04 x86_64 trial artifact. The workflow produces a
 directly runnable `yy` binary for a first trial and a local qualification archive
-for maintainer installation and compatibility checks. Neither artifact is an
+for maintainer installation and profile-admission checks. Neither artifact is an
 official Apache Software Foundation release, tag or signature.
 
 ## Download and run yy
@@ -66,7 +66,7 @@ The artifact target is one named combination:
 - Managed Mount, finite Managed Sync, operational diagnostics and recovery as
   qualified in the existing Linux guides;
 - object publication and authenticated single-host loopback service publication;
-- isolated MinIO-compatible Silo for deterministic upgrade and recovery
+- isolated MinIO-compatible Silo for deterministic install and recovery
   fixtures.
 
 Amazon S3 evidence remains a separate backend record. A Silo run does not
@@ -170,41 +170,18 @@ Install the supplied unit templates and environment file as described in
 new `current` target, binary SHA-256, `yy doctor` result and retained volume
 state have been verified.
 
-### Upgrade and downgrade boundary
+### Local profile boundary
 
-The only trial upgrade route is a stopped, same-host replacement from one
-immutable release directory to the next. The verified target may reopen state
-only after its compatibility profiles admit every persistent profile reached by
-that state.
+The installer can replace one immutable release with another while all writers
+are stopped, but it does not migrate local state. A verified target may reopen
+state only when every persistent profile is the current one. Older identifiers
+are rejected with `Unsupported`; a current identifier with a different schema is
+rejected as `Corrupt`.
 
-`linux_prefix_upgrade` currently qualifies the exact `fd1338c` producer against
-the selected target archive binary. It exercises retained pending, frozen and
-Unknown requests, original receipts, finite Sync convergence and a non-empty
-service WAL.
-
-`linux_stage3_upgrade` separately qualifies the immutable `546f419` stage-3
-corpus against the same selected target archive. The corpus was produced by the
-accepted `546f419` trial archive binary and contains a genuine sparse pending
-handle, a request dropped before commit, a committed request whose response was
-lost, and a service metadata database copied with its non-empty WAL. The target
-must preserve sparse bytes, publish pending work, retry the original frozen and
-Unknown CommitIds/digests, resolve the lost receipt identity, reopen the service
-WAL and pass `doctor`. The producer binary and target binary hashes are recorded
-separately; the source tree being equal to a later main commit does not rename
-the producer.
-
-The actual installed-target stage-3 and bounded Amazon S3 record is
-[`linux-stage3-trial-results.md`](linux-stage3-trial-results.md). It records
-the exact archive, installed binary and later script-only qualification source
-separately.
-
-The installer intentionally has no rollback or downgrade command. Once a newer
-binary has opened or written configuration, staging, Sync or service state, do
-not relaunch an older binary against that state. An older release directory
-remaining on disk preserves audit and recovery inputs; it is not permission to
-run that binary. Existing compatibility preflight, a quiesced backup or an
-isolated restore define the supported recovery route. Arbitrary old/new
-downgrade remains unsupported.
+The installer intentionally has no rollback or downgrade command. Keeping an
+older release directory for audit does not permit it to open current state.
+Quiesced backup and isolated restore preserve evidence without converting local
+profiles.
 
 ## Local space and non-destructive retention
 
@@ -252,12 +229,9 @@ installs the actual archive into a versioned prefix, exercises checksum
 rejection, immutable installation, explicit quiesced activation and installed
 diagnostics, and runs recovery.
 
-The same workflow installs the pinned `fd1338c` producer and runs
-`linux_prefix_upgrade` with the archive's installed target binary. It then runs
-the immutable stage-3 fixture upgrade with that installed binary. It uploads
-the archive, checksum, manifest, exact binary hash, verifier output, upgrade
-JSON and separate stage-3 JSON as ordinary short-lived Actions evidence. The
-upload is not a release publication.
+The workflow uploads the archive, checksum, manifest, exact binary hash,
+verifier output, installed-operations and recovery evidence as ordinary
+short-lived Actions evidence. The upload is not a release publication.
 
 Hosted CI does not manufacture a systemd user session. It verifies the packaged
 unit inventory; the actual user-manager lifecycle remains an explicit

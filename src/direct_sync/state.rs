@@ -17,15 +17,14 @@
 
 //! Durable Direct Sync binding, baseline, work and conflict state.
 
+use crate::local::store;
 use crate::replica::{Error, Identity, LocalNode, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub(super) const PROFILE: &str = "yinyang-direct-sync-1";
-
-const TABLES: &[(&str, &[&str])] = &[
+const TABLES: &[store::TableColumns<'static>] = &[
     (
         "binding",
         &[
@@ -88,6 +87,11 @@ const TABLES: &[(&str, &[&str])] = &[
         ],
     ),
 ];
+pub(super) const PROFILE: store::Profile = store::Profile {
+    name: "yinyang-direct-sync-2",
+    table: "binding",
+    schema: TABLES,
+};
 
 const CREATE_SCHEMA: &str = "
     CREATE TABLE binding(
@@ -531,61 +535,53 @@ impl Store {
                 path.display()
             )));
         }
-        let connection = Connection::open(path)
-            .map_err(|error| Error::corrupt(format!("create Direct Sync database: {error}")))?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=FULL;
-                 PRAGMA foreign_keys=ON;",
-            )
-            .map_err(|error| Error::corrupt(format!("configure Direct Sync database: {error}")))?;
-        connection
-            .execute_batch(CREATE_SCHEMA)
-            .map_err(|error| Error::corrupt(format!("create Direct Sync schema: {error}")))?;
-        connection
-            .execute(
-                "INSERT INTO binding(
-                    singleton, profile, root, root_dev, root_ino, state_dev, state_ino, namespace
-                 ) VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    PROFILE,
+        let mut connection = store::open_read_write(path, true).map_err(store_error)?;
+        let transaction = connection.transaction().map_err(|error| {
+            Error::corrupt(format!("begin Direct Sync initialization: {error}"))
+        })?;
+        store::initialize(
+            &transaction,
+            &PROFILE,
+            CREATE_SCHEMA,
+            &[
+                store::Binding::text(
+                    "root",
                     binding
                         .root
                         .to_str()
                         .ok_or_else(|| Error::unsupported("Direct Sync root is not UTF-8"))?,
-                    binding.root_identity.dev.to_be_bytes().as_slice(),
-                    binding.root_identity.ino.to_be_bytes().as_slice(),
-                    binding.state_identity.dev.to_be_bytes().as_slice(),
-                    binding.state_identity.ino.to_be_bytes().as_slice(),
-                    binding.namespace,
-                ],
-            )
-            .map_err(|error| Error::corrupt(format!("bind Direct Sync state: {error}")))?;
+                ),
+                store::Binding::blob("root_dev", binding.root_identity.dev.to_be_bytes().to_vec()),
+                store::Binding::blob("root_ino", binding.root_identity.ino.to_be_bytes().to_vec()),
+                store::Binding::blob(
+                    "state_dev",
+                    binding.state_identity.dev.to_be_bytes().to_vec(),
+                ),
+                store::Binding::blob(
+                    "state_ino",
+                    binding.state_identity.ino.to_be_bytes().to_vec(),
+                ),
+                store::Binding::text("namespace", binding.namespace.clone()),
+            ],
+        )
+        .map_err(store_error)?;
+        transaction.commit().map_err(|error| {
+            Error::corrupt(format!("commit Direct Sync initialization: {error}"))
+        })?;
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         validate_schema(&connection)?;
         Ok(Self { connection })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path)
-            .map_err(|error| Error::corrupt(format!("open Direct Sync database: {error}")))?;
+        let connection = store::open_read_write(path, false).map_err(store_error)?;
         validate_schema(&connection)?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=FULL;
-                 PRAGMA foreign_keys=ON;",
-            )
-            .map_err(|error| Error::corrupt(format!("configure Direct Sync database: {error}")))?;
+        store::configure(&connection, store::Durability::Journal).map_err(store_error)?;
         Ok(Self { connection })
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|error| Error::corrupt(format!("inspect Direct Sync database: {error}")))?;
+        let connection = store::open_read_only(path).map_err(store_error)?;
         validate_schema(&connection)?;
         Ok(Self { connection })
     }
@@ -594,41 +590,34 @@ impl Store {
         let row = self
             .connection
             .query_row(
-                "SELECT profile, root, root_dev, root_ino, state_dev, state_ino, namespace
+                "SELECT root, root_dev, root_ino, state_dev, state_ino, namespace
                  FROM binding WHERE singleton=1",
                 [],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| Error::corrupt(format!("read Direct Sync binding: {error}")))?
             .ok_or_else(|| Error::invalid("Direct Sync state is not initialized"))?;
-        if row.0 != PROFILE {
-            return Err(Error::corrupt(format!(
-                "unsupported Direct Sync profile {:?}",
-                row.0
-            )));
-        }
         Ok(Binding {
-            root: PathBuf::from(row.1),
+            root: PathBuf::from(row.0),
             root_identity: Identity {
-                dev: decode_u64(&row.2, "root device")?,
-                ino: decode_u64(&row.3, "root inode")?,
+                dev: decode_u64(&row.1, "root device")?,
+                ino: decode_u64(&row.2, "root inode")?,
             },
             state_identity: Identity {
-                dev: decode_u64(&row.4, "state device")?,
-                ino: decode_u64(&row.5, "state inode")?,
+                dev: decode_u64(&row.3, "state device")?,
+                ino: decode_u64(&row.4, "state inode")?,
             },
-            namespace: row.6,
+            namespace: row.5,
         })
     }
 
@@ -1137,65 +1126,28 @@ impl Store {
 }
 
 fn validate_schema(connection: &Connection) -> Result<()> {
-    let mut statement = connection
-        .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )
-        .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?;
-    let actual_tables = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?;
-    let mut expected_tables = TABLES
-        .iter()
-        .map(|(table, _)| (*table).to_owned())
-        .collect::<Vec<_>>();
-    expected_tables.sort();
-    if actual_tables != expected_tables {
-        return Err(Error::corrupt(format!(
-            "Direct Sync tables are {actual_tables:?}, expected {expected_tables:?}"
-        )));
-    }
-    let profile = connection
-        .query_row("SELECT profile FROM binding WHERE singleton=1", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()
-        .map_err(|error| Error::corrupt(format!("inspect Direct Sync profile: {error}")))?
-        .ok_or_else(|| Error::corrupt("Direct Sync binding profile is missing"))?;
-    if profile != PROFILE {
-        return Err(Error::corrupt(format!(
-            "unsupported Direct Sync profile {profile:?}"
-        )));
-    }
-    for (table, expected) in TABLES {
-        let mut statement = connection
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| Error::corrupt(format!("inspect Direct Sync schema: {error}")))?;
-        if columns.len() != expected.len()
-            || columns
-                .iter()
-                .zip(expected.iter())
-                .any(|(actual, expected)| actual != expected)
-        {
-            return Err(Error::corrupt(format!(
-                "Direct Sync table {table:?} has columns {columns:?}, expected {expected:?}"
-            )));
-        }
-    }
-    Ok(())
+    store::validate(connection, &PROFILE, None).map_err(store_error)
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value)
         .map_err(|error| Error::corrupt(format!("encode Direct Sync state: {error}")))
+}
+
+fn store_error(error: store::Error) -> Error {
+    let kind = match error.kind() {
+        store::ErrorKind::Invalid => crate::replica::ErrorKind::Invalid,
+        store::ErrorKind::Unsupported => crate::replica::ErrorKind::Unsupported,
+        store::ErrorKind::Corrupt => crate::replica::ErrorKind::Corrupt,
+        store::ErrorKind::Busy => crate::replica::ErrorKind::Busy,
+        store::ErrorKind::AlreadyExists
+        | store::ErrorKind::NotFound
+        | store::ErrorKind::ReadOnly
+        | store::ErrorKind::PermissionDenied
+        | store::ErrorKind::NoSpace
+        | store::ErrorKind::Io => crate::replica::ErrorKind::Io,
+    };
+    Error::new(kind, error.to_string())
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], context: &str) -> Result<T> {
@@ -1231,4 +1183,52 @@ fn decode_id(bytes: &[u8], context: &str) -> Result<[u8; 16]> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding() -> Binding {
+        Binding {
+            root: PathBuf::from("/root"),
+            root_identity: Identity { dev: 1, ino: 2 },
+            state_identity: Identity { dev: 1, ino: 3 },
+            namespace: "namespace".to_owned(),
+        }
+    }
+
+    #[test]
+    fn old_profile_and_partial_current_schema_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("direct-sync.db");
+        drop(Store::create(&path, &binding()).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE binding SET profile='yinyang-direct-sync-1' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            Store::open_read_only(&path).err().unwrap().kind(),
+            crate::replica::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            Store::open(&path).err().unwrap().kind(),
+            crate::replica::ErrorKind::Unsupported
+        );
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE binding SET profile='yinyang-direct-sync-2' WHERE singleton=1;
+                 DROP TABLE installs;",
+            )
+            .unwrap();
+        assert_eq!(
+            Store::open_read_only(&path).err().unwrap().kind(),
+            crate::replica::ErrorKind::Corrupt
+        );
+    }
 }

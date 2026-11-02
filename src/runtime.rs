@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Managed file handles with durable local writes and conditional remote fsync.
+//! Managed file handles with explicit local barriers and conditional remote fsync.
 //! No OS mount, background synchronization, or full POSIX behavior is implied.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -29,7 +29,6 @@ use yinyang_core::{
 
 mod staging;
 use staging::{CHUNK, Record, Stage, StagedRead};
-pub(crate) mod schema;
 
 mod error;
 pub use error::{Error, ErrorKind, Failure, Result};
@@ -670,7 +669,7 @@ impl FileHandle {
             ));
         }
         record.base = revision.to_bytes();
-        stage.save(record).await
+        stage.save_durable(record).await
     }
     async fn report<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
@@ -689,9 +688,10 @@ impl FileHandle {
         }
         result
     }
-    /// Every successful write already commits a synchronous local SQLite
-    /// transaction. This reports its position without claiming remote durability.
+    /// Make every staged byte and local metadata change durable without
+    /// publishing to the authority.
     pub async fn sync_local(&self) -> Result<HandleStatus> {
+        self.runtime.inner.stage.barrier().await?;
         self.status().await
     }
     /// Explicitly acknowledge the handle's reported error, without changing its
@@ -823,6 +823,7 @@ impl FileHandle {
     }
     async fn publish(&mut self) -> Result<Option<Receipt>> {
         let stage = &self.runtime.inner.stage;
+        stage.barrier().await?;
         let mut r = stage.load(self.id).await?;
         if r.local == r.remote {
             if let Some(error) = self.status().await?.error {
@@ -849,7 +850,7 @@ impl FileHandle {
             let request = plan.finish()?;
             r.plan = Some(request.to_bytes()?);
             // Persist before dispatch: cancellation can never lose request identity.
-            stage.save(r.clone()).await?;
+            stage.save_durable(r.clone()).await?;
             request
         };
         match self.runtime.authority().commit(&request).await {
@@ -934,5 +935,174 @@ impl FileHandle {
         self.report(result).await?;
         self.closed = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn write_is_committed_but_only_sync_local_barriers_it() {
+        let backend = crate::support::TestBackend::default();
+        let authority = Arc::new(
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+        runtime.create_file(authority.root(), "file").await.unwrap();
+        let mut handle = runtime.open_file("file", true).await.unwrap();
+        handle.write(0, b"durable-at-barrier").await.unwrap();
+        assert_eq!(
+            runtime.inner.stage.barrier_counter().load(Ordering::SeqCst),
+            0
+        );
+
+        let connection = crate::local::store::open_read_only(&staging.join("staging.db")).unwrap();
+        let data: Vec<u8> = connection
+            .query_row(
+                "SELECT data FROM segments WHERE handle=?1 AND position=0",
+                rusqlite::params![handle.id().as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(data, b"durable-at-barrier");
+
+        handle.sync_local().await.unwrap();
+        assert_eq!(
+            runtime.inner.stage.barrier_counter().load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[derive(Debug)]
+    struct CommitProbe {
+        inner: Arc<dyn Authority>,
+        staging: PathBuf,
+        barrier: Mutex<Arc<AtomicUsize>>,
+        full_sync: Mutex<Arc<AtomicUsize>>,
+        observed_barrier: AtomicUsize,
+        observed_full_sync: AtomicUsize,
+        observed_plan: AtomicBool,
+    }
+
+    impl Authority for CommitProbe {
+        fn data(&self) -> &yinyang_core::DataStore {
+            self.inner.data()
+        }
+
+        fn filesystem(&self) -> NodeId {
+            self.inner.filesystem()
+        }
+
+        fn root(&self) -> NodeId {
+            self.inner.root()
+        }
+
+        fn observe_latest(&self) -> BoxFuture<'_, yinyang_core::Result<Snapshot>> {
+            self.inner.observe_latest()
+        }
+
+        fn observe_revision(
+            &self,
+            revision: Revision,
+        ) -> BoxFuture<'_, yinyang_core::Result<Snapshot>> {
+            self.inner.observe_revision(revision)
+        }
+
+        fn commit_batch<'a>(
+            &'a self,
+            requests: &'a [yinyang_core::Transaction],
+        ) -> BoxFuture<'a, yinyang_core::Result<Vec<yinyang_core::object::Outcome>>> {
+            self.inner.commit_batch(requests)
+        }
+
+        fn commit<'a>(
+            &'a self,
+            _request: &'a yinyang_core::Transaction,
+        ) -> BoxFuture<'a, yinyang_core::Result<CommitOutcome>> {
+            Box::pin(async move {
+                let barrier = self.barrier.lock().unwrap().clone();
+                self.observed_barrier
+                    .store(barrier.load(Ordering::SeqCst), Ordering::SeqCst);
+                let full_sync = self.full_sync.lock().unwrap().clone();
+                self.observed_full_sync
+                    .store(full_sync.load(Ordering::SeqCst), Ordering::SeqCst);
+                let connection = crate::local::store::open_read_only(
+                    &self.staging.join("staging.db"),
+                )
+                .map_err(|error| {
+                    yinyang_core::Error::new(
+                        yinyang_core::ErrorKind::Storage,
+                        "commit probe",
+                        error.to_string(),
+                    )
+                })?;
+                let record: Vec<u8> = connection
+                    .query_row("SELECT record FROM handles LIMIT 1", [], |row| row.get(0))
+                    .map_err(|error| {
+                        yinyang_core::Error::new(
+                            yinyang_core::ErrorKind::Storage,
+                            "commit probe",
+                            error.to_string(),
+                        )
+                    })?;
+                let record: Record = borsh::from_slice(&record).map_err(|error| {
+                    yinyang_core::Error::new(
+                        yinyang_core::ErrorKind::Corrupt,
+                        "commit probe",
+                        error.to_string(),
+                    )
+                })?;
+                self.observed_plan
+                    .store(record.plan.is_some(), Ordering::SeqCst);
+                Err(yinyang_core::Error::new(
+                    yinyang_core::ErrorKind::Unsupported,
+                    "commit probe",
+                    "stop before dispatch",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_plan_is_durable_before_commit_dispatch() {
+        let backend = crate::support::TestBackend::default();
+        let inner = Arc::new(
+            yinyang_core::Fs::create(backend.operator(), yinyang_core::BackendProfile::Minio)
+                .await
+                .unwrap(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        {
+            let bootstrap = Runtime::open(inner.clone(), &staging).await.unwrap();
+            bootstrap.create_file(inner.root(), "file").await.unwrap();
+        }
+
+        let probe = Arc::new(CommitProbe {
+            inner: inner.clone(),
+            staging: staging.clone(),
+            barrier: Mutex::new(Arc::new(AtomicUsize::new(0))),
+            full_sync: Mutex::new(Arc::new(AtomicUsize::new(0))),
+            observed_barrier: AtomicUsize::new(0),
+            observed_full_sync: AtomicUsize::new(0),
+            observed_plan: AtomicBool::new(false),
+        });
+        let runtime = Runtime::open(probe.clone(), &staging).await.unwrap();
+        *probe.barrier.lock().unwrap() = runtime.inner.stage.barrier_counter();
+        *probe.full_sync.lock().unwrap() = runtime.inner.stage.full_sync_counter();
+        let mut handle = runtime.open_file("file", true).await.unwrap();
+        handle.write(0, b"frozen").await.unwrap();
+        assert!(handle.fsync().await.is_err());
+        assert_eq!(probe.observed_barrier.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.observed_full_sync.load(Ordering::SeqCst), 1);
+        assert!(probe.observed_plan.load(Ordering::SeqCst));
+        assert!(handle.status().await.unwrap().frozen);
     }
 }

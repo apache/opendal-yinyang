@@ -376,6 +376,5 @@ fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Storage => "storage",
         ErrorKind::Io => "io",
         ErrorKind::NoSpace => "no_space",
-        ErrorKind::Unclassified => "unclassified",
     }
 }

@@ -24,27 +24,20 @@ The baseline exists only after admission and is stored in the replica database.
 Status never reports `in_sync` for a binding without an accepted common
 baseline.
 
-Profile `yinyang-directory-replica-1` binds the state to one filesystem. Its
-required tables and positionally inserted columns have exact signatures. The
-historically additive columns remain supported upgrade inputs:
+Profile `yinyang-directory-replica-2` binds the state to one filesystem.
+Its exact table and column-name sets are current; column order is not part of
+the signature because maintained inserts name their columns. SQLite uses WAL
+with `synchronous=FULL`. Install and artifact journal writes that precede a
+local rename, exchange or quarantine are durable when committed before that
+effect.
 
-- `baseline.remote_revision`;
-- `work.seq`, `work.conflict`, `work.source_artifact`, `work.local_dev`,
-  `work.local_ino`, `work.local_parent_dev`, `work.local_parent_ino`, and
-  `work.commit_id`;
-- the historical absence of the `work` table before managed reconciliation was
-  introduced.
-
-`baseline` and `work` queries name their columns, so those two tables accept
-their historical column order. Every missing required base column or unknown
-column is corruption. A writer validates the complete known shape, then adds all
-known missing columns in one SQLite transaction using the historical upgrade
-order; an unbound table set may be initialized with the profile inserted by
-`sync init`. Read-only inspection accepts the known old shapes and synthesizes
-neutral values for absent historical columns without changing the authoritative
-database or existing WAL/journal bytes. SQLite may create an empty `-wal` and
-may create or update derived `-shm`; existing WAL/journal bytes remain
-protected.
+There is no schema upgrade or shape-synthesis path. An older or unknown profile
+returns `Unsupported`; a current identifier with a missing, extra or malformed
+table or column set returns `Corrupt`. A writer validates the complete shape
+before recovery or DDL. Read-only inspection performs the same validation
+without changing the authoritative database. SQLite may create an empty
+`-wal` and may create or update derived `-shm`; existing WAL/journal bytes
+remain protected.
 
 ## Admission
 
@@ -60,7 +53,9 @@ keyed by the edit identity: the current path, original and desired path, the
 operation, the accepted local fingerprint and identity, the baseline node and
 revision, any known original commit identity, the linked conflict, and the
 retained input artifact. Retry publishes only associated work and never
-resurrects orphaned staging.
+resurrects orphaned staging. The association and the transition to a
+possibly-dispatched state are durable `synchronous=FULL` commits before the
+remote request.
 
 Receipt application is ordered so an interrupted run is recoverable: the common
 baseline (and any linked-conflict clearance) is applied from the returned

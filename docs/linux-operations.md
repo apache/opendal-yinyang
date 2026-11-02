@@ -52,15 +52,6 @@ and finite Sync convergence. The real Amazon S3 run used the installed binary
 prefix with no endpoint override. Evidence is limited to the named backend
 class and host; it is not a capacity, multi-host or HA claim.
 
-The installed-prefix upgrade harness passed at final integrated source
-`17361970d1722ea3d60c5381bbb5323d11818184` against the exact `fd1338c`
-producer. It retained frozen and pending handles, the original file and Sync
-receipts, and a 74,192-byte service WAL before target recovery. The target
-archive binary SHA-256 is
-`a6724f23fd5b5120f14b17dd9290db2cd337ebe8f934758accc953317f3c154c`.
-The earlier `79506c0` run remains preparatory history, not a substitute for
-this source-specific result.
-
 The tested `target/debug/yy` from source `7759518` had SHA-256
 `b9acff232c66f6dd898deeccb315e2a1f70af4e9e37959793bc7ba98425ed705`.
 
@@ -116,7 +107,7 @@ claim a source/build identity it did not test.
 The same output directory also contains the directly runnable `yy`,
 `yy.sha256`, `LICENSE`, `NOTICE` and `BUILD-MANIFEST`. The workflow uploads
 those files separately as the consumer trial artifact; the archive remains the
-input for immutable-prefix installation and compatibility qualification.
+input for immutable-prefix installation and profile-admission qualification.
 
 The script requires Ubuntu 24.04 x86_64, the tested host combination. This
 artifact is local qualification input, not an Apache Software Foundation
@@ -471,13 +462,12 @@ uncertain requests are part of the state. Backup and restore procedures are
 separate operational work; this guide only guarantees that unit stop and
 binary-prefix removal preserve state.
 
-## Installed upgrade
+## Installed binary replacement
 
-The only supported installed transition is a stopped, same-host replacement for
-an exact source pair recorded by acceptance. The producer is
-`fd1338c2f924a90e9da752b9158e748d1d3acaf4`; the target is the final accepted
-candidate that passes `tests/linux_prefix_upgrade.rs`. A build from another
-source does not inherit this result.
+An installed binary may be replaced while every writer is stopped. This is not
+a local-state upgrade: the replacement must use the same current persistent
+profiles. Older profile identifiers are rejected with `Unsupported`, and a
+current identifier with a different schema is rejected as `Corrupt`.
 
 Before switching:
 
@@ -489,7 +479,7 @@ Before switching:
    metadata database with its `-wal` and `-shm` files. Do not copy only SQLite
    main files.
 4. Keep the old release directory for audit, but do not point `current` back to
-   it after the new binary has opened or written state.
+   it after the new binary has opened or written state with another profile.
 
 Install the new binary into its own directory and atomically replace the
 symlink:
@@ -509,7 +499,7 @@ mv -Tf "$YY_ROOT/.current.new" "$YY_ROOT/current"
 systemctl --user daemon-reload
 ```
 
-Start the retained units and verify the transition before resuming clients:
+Start the retained units and verify admission before resuming clients:
 
 ```shell
 systemctl --user start yinyang-serve.service
@@ -520,19 +510,17 @@ yyvol object --volume "$HOME/.config/yinyang/volumes/object.json" status
 yyvol sync --volume "$HOME/.config/yinyang/volumes/sync.json" sync status --json
 ```
 
-Accept the upgrade only when retained pending/Unknown handles and original
+Accept the replacement only when retained pending/Unknown handles and original
 receipts are unchanged, locally acknowledged bytes are readable, the metadata
 service opens the same authority, `PRAGMA integrity_check` reports `ok`, and a
-finite Sync reaches `summary.in_sync=true`. The installed-prefix acceptance uses
-the exact repository unit templates and versioned `current` symlink, but runs
-the state transition as stopped processes so it is independent of a particular
-user session. The existing systemd lifecycle test separately covers start,
-restart and stop through `systemctl --user`.
+finite Sync reaches `summary.in_sync=true`. If any profile check returns
+`Unsupported` or `Corrupt`, stop and preserve the complete state. Do not delete
+WAL files or point an older binary at it.
 
-Arbitrary downgrade is not supported. If the target binary has opened or written
-newer local state, atomically switching `current` back is an unsupported
-operation even when the older directory remains. Use an isolated restore of a
-backup taken before the upgrade when recovery is required.
+Arbitrary downgrade is not supported. Switching `current` back is unsafe after
+state has been written by another profile, even when the older release
+directory remains. Restore an isolated backup taken before the replacement
+when recovery is required.
 
 ## Uninstall
 

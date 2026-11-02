@@ -165,34 +165,22 @@ receipts, WAL files, publication journals and local synchronized data. A
 successful stop is not a backup. Removing the versioned binary prefix and unit
 files does not imply deleting state or configuration.
 
-## Installed binary transitions
+## Installed binary replacement
 
-The supported experimental upgrade route is a stopped, same-host replacement
-of one immutable binary release:
+Installing a new immutable binary release is a stopped, same-host operation:
 
 1. Stop every Mount, finite Sync and metadata-service unit.
 2. Preserve the complete configuration, Mount staging, Sync state and metadata
    database including SQLite WAL files.
 3. Install the new binary into a new release directory, verify its identity,
    and atomically replace the `current` symlink while no `yy` writer runs.
-4. Reopen the retained state only with a binary that advertises every persistent
-   profile reached by that state.
-5. Require the source data, pending and frozen handles, original CommitIds,
-   receipts, retained local artifacts, SQLite integrity and finite Sync status
-   to survive before accepting the transition.
+4. Reopen retained state only with the same current persistent profiles.
 
-An exact producer and target source pair is a qualification result recorded in
-the operations guide. The general contract is not an arbitrary upgrade matrix.
-The first producer is `fd1338c2f924a90e9da752b9158e748d1d3acaf4`; a later
-accepted target is recorded only after the installed transition passes against
-the final target binary.
-
-Downgrade after the newer binary has opened or written local or authoritative
-state is unsupported. Keeping an older immutable release directory for audit or
-reinstallation does not grant downgrade permission. Hot replacement of a
-running binary, migration performed only because a release directory exists,
-and compatibility inferred from an equal package version are also unsupported.
-The package version and release directory identity are separate.
+A binary with a different local profile identifier rejects that state with
+`Unsupported`; it does not migrate, synthesize columns or reinterpret records.
+A current identifier with a different schema is rejected as `Corrupt`.
+Keeping an older release directory for audit does not grant downgrade or
+cross-version access.
 
 The concrete local archive, exact inventory, verifier, versioned-prefix
 installer and stopped activation are defined by the
@@ -217,12 +205,6 @@ reopen state that a newer binary has already touched.
 - removal of the installed binary prefix while state and configuration remain;
 - when run with isolated MinIO and a systemd user manager, actual start,
   restart and stop of the three user units through `systemctl --user`.
-
-`tests/linux_prefix_upgrade.rs` separately exercises a stopped installed-prefix
-transition from the exact `fd1338c` producer to the selected target binary,
-including retained pending, frozen and Unknown work, receipts and a non-empty
-service WAL. It uses the same versioned `current` prefix as the user units while
-keeping process lifetime independent of a particular systemd user session.
 
 `tests/linux_trial_distribution.sh` verifies the actual archive, checksum
 rejection, immutable installation and explicit quiesced activation boundary.

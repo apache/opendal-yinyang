@@ -44,8 +44,6 @@ pub enum ErrorKind {
     Storage,
     Io,
     NoSpace,
-    /// An older staging record retained only diagnostic text.
-    Unclassified,
 }
 
 /// A durable failure, including the original uncertain publication identity.
@@ -64,13 +62,6 @@ impl Failure {
     }
     pub fn commit_id(&self) -> Option<CommitId> {
         self.commit.map(CommitId::from_bytes)
-    }
-    pub(super) fn legacy(message: String) -> Self {
-        Self {
-            kind: ErrorKind::Unclassified,
-            message,
-            commit: None,
-        }
     }
     pub(crate) fn capture(error: &Error) -> Self {
         match error {

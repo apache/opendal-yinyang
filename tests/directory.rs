@@ -642,7 +642,7 @@ async fn separately_opened_journals_replay_one_exact_request_safely() {
 }
 
 #[tokio::test]
-async fn journal_rejects_a_future_profile_before_changing_its_schema() {
+async fn journal_rejects_an_old_profile_before_changing_its_schema() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("journal");
     tokio::fs::create_dir(&state).await.unwrap();
@@ -656,7 +656,7 @@ async fn journal_rejects_a_future_profile_before_changing_its_schema() {
                      filesystem BLOB NOT NULL,
                      root BLOB NOT NULL
                  );
-                 INSERT INTO binding VALUES(1,'yinyang-directory-99',zeroblob(16),zeroblob(16));",
+                 INSERT INTO binding VALUES(1,'yinyang-directory-1',zeroblob(16),zeroblob(16));",
             )
             .unwrap();
     }
@@ -688,7 +688,7 @@ async fn journal_rejects_a_future_profile_before_changing_its_schema() {
         .unwrap();
     assert!(
         !publications,
-        "rejecting a future profile must not initialize the v1 schema"
+        "rejecting an old profile must not initialize the current schema"
     );
 }
 
@@ -707,7 +707,7 @@ async fn journal_rejects_a_partial_known_schema_without_repairing_it() {
                      filesystem BLOB NOT NULL,
                      root BLOB NOT NULL
                  );
-                 INSERT INTO binding VALUES(1,'yinyang-directory-1',zeroblob(16),zeroblob(16));
+                 INSERT INTO binding VALUES(1,'yinyang-directory-2',zeroblob(16),zeroblob(16));
                  CREATE TABLE publications(
                      commit_id BLOB PRIMARY KEY,
                      baseline BLOB NOT NULL,

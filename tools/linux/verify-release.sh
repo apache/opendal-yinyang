@@ -187,7 +187,6 @@ $artifact_root/share/
 $artifact_root/share/doc/
 $artifact_root/share/doc/yinyang/
 $artifact_root/share/doc/yinyang/linux-backup-recovery.md
-$artifact_root/share/doc/yinyang/linux-compatibility-acceptance.md
 $artifact_root/share/doc/yinyang/linux-operating-envelope.md
 $artifact_root/share/doc/yinyang/linux-operations.md
 $artifact_root/share/doc/yinyang/linux-qualification.md
