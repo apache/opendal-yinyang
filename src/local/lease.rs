@@ -83,7 +83,10 @@ mod tests {
         assert!(state.join("state.lock").is_file());
         assert!(!state.join("state.db").exists());
 
-        let error = StateLease::acquire(&state, "state.lock").unwrap_err();
+        let error = match StateLease::acquire(&state, "state.lock") {
+            Ok(_) => panic!("a second local-state writer acquired the lease"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), ErrorKind::Busy);
 
         drop(lease);
