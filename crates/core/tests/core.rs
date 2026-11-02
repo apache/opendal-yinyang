@@ -253,6 +253,40 @@ async fn retained_revisions_are_sorted_deduplicated_and_metadata_authenticated()
 }
 
 #[tokio::test]
+async fn ordinary_object_commits_remain_readable_after_current_expiry_refusal() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut revisions = Vec::new();
+    for name in ["one", "two", "three"] {
+        let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        plan.create_directory(fs.root(), name).await.unwrap();
+        let receipt = committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+        revisions.push((receipt.cursor.revision, name));
+    }
+
+    let current = fs.observe_latest().await.unwrap();
+    assert_eq!(
+        ExpiryRequest::new(
+            fs.filesystem(),
+            CommitId::generate(),
+            current.revision(),
+            vec![current.revision()],
+        )
+        .unwrap_err()
+        .kind(),
+        ErrorKind::Invalid
+    );
+
+    for (revision, name) in revisions {
+        let snapshot = fs.observe_revision(revision).await.unwrap();
+        assert!(
+            snapshot.resolve(name).await.unwrap().is_some(),
+            "ordinary commit history for {name} was not readable"
+        );
+    }
+}
+
+#[tokio::test]
 async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions() {
     let backend = TestBackend::default();
     let fs = object_fs(&backend).await;
