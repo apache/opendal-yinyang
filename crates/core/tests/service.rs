@@ -482,7 +482,9 @@ async fn service_rejects_unregistered_content_and_missing_guards() {
         .await
         .unwrap_err();
     assert!(
-        error.message().contains("missing mandatory predicate"),
+        error
+            .message()
+            .contains("canonical request digest mismatch"),
         "{error}"
     );
     committed(service.commit(&plan).await.unwrap());
