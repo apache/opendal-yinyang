@@ -44,7 +44,7 @@ import uuid
 from pathlib import Path
 
 SIZE = 512 * 1024
-COUNTS = [32, 256]
+COUNTS = [int(value) for value in os.environ.get("COUNTS", "32,256").split(",")]
 READ = re.compile(
     r"^(?:\d+\s+)?(?:read|pread64|readv|preadv)\(\d+<([^>]*)>.* = (\d+)$"
 )
