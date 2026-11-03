@@ -98,6 +98,10 @@ async fn suite(fs: &dyn Authority) {
         "the original mode remains pinned"
     );
     assert_eq!(current.node(p).await.unwrap().unwrap().mode().bits(), 0o700);
+    assert!(
+        !current.node(p).await.unwrap().unwrap().executable(),
+        "directory execute bits are not the regular-file compatibility view"
+    );
 
     // Exact same observed file has at most one successful replacement.
     let newer = fs.prepare(&mut b"new bytes".as_slice()).await.unwrap();

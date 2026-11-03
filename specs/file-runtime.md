@@ -109,7 +109,10 @@ The compatibility executable mutation reads the complete current mode and
 changes executable meaning without discarding other read/write bits:
 `0600 -> 0700`, `0644 -> 0755`. It adds execute only to classes that already
 have a read or write bit and falls back to owner execute only when no class has
-either. Content replacement never changes the stored mode.
+either. Content replacement never changes the stored mode. The older
+`Node::executable()` view means "regular file with at least one execute bit";
+it remains false for directories, whose directory execute bits are read from
+`Node::mode()`.
 
 Path-addressed namespace helpers (`rename_path`, `rename_path_replace`,
 `unlink_path`, and `rmdir_path`) resolve the requested entry and construct its

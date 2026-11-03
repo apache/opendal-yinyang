@@ -122,8 +122,10 @@ impl Node {
     pub const fn mode(&self) -> NodeMode {
         self.mode
     }
+    /// Compatibility view for existing consumers: only regular files can be
+    /// executable. Directory execute bits remain available through `mode()`.
     pub const fn executable(&self) -> bool {
-        self.mode.executable()
+        matches!(&self.kind, NodeKind::File(_)) && self.mode.executable()
     }
     pub fn link(&self) -> Option<&Link> {
         self.link.as_ref()

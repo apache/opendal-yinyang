@@ -38,7 +38,6 @@ const ENOSYS: i32 = 38;
 const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
 const EROFS: i32 = 30;
-const EINVAL: i32 = 22;
 const ENOTCONN: i32 = 107;
 const EIO: i32 = 5;
 const ENOENT: i32 = 2;
