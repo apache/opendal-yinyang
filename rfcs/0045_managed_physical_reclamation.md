@@ -1,6 +1,6 @@
 - Proposal Name: `managed_physical_reclamation`
 - Start Date: 2026-11-03
-- RFC PR: unsubmitted
+- RFC PR: [apache/opendal-yinyang#153](https://github.com/apache/opendal-yinyang/pull/153)
 - Tracking Issue: [apache/opendal-yinyang#78](https://github.com/apache/opendal-yinyang/issues/78)
 
 # Summary
