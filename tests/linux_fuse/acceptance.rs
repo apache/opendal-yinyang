@@ -706,7 +706,7 @@ fn exercise_path_truncate_conflict(publication: Publication) -> i32 {
 
 #[test]
 #[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-fuse"]
-fn fuse_chmod_limits_to_executable_bit_both_publications() {
+fn fuse_ordinary_modes_and_permission_enforcement_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         let fixture = Fixture::new(publication);
         let suffix = fixture.publication().as_str();
@@ -719,40 +719,53 @@ fn fuse_chmod_limits_to_executable_bit_both_publications() {
         let mut mounted = fixture.mount(&config, &mountpoint);
         let path = mounted.mountpoint().join("chmod.txt");
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("baseline chmod 0644");
-        assert_eq!(mode(&path), 0o644);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .expect("chmod 0755 must be representable");
-        assert_eq!(mode(&path), 0o755);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod back to 0644");
-        assert_eq!(mode(&path), 0o644);
-
-        for unsupported_mode in [0o600, 0o000] {
-            let error = fs::set_permissions(&path, fs::Permissions::from_mode(unsupported_mode))
-                .expect_err("non-representable mode must fail explicitly");
-            assert_errno(
-                error,
-                &[ENOSYS, EOPNOTSUPP, EINVAL],
-                "chmod non-representable mode",
-            );
-            assert_eq!(
-                mode(&path),
-                0o644,
-                "failed chmod {unsupported_mode:o} must not change the previous attributes"
-            );
+        for expected in [0o600, 0o400, 0o700, 0o664, 0o755] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(expected))
+                .unwrap_or_else(|error| panic!("chmod {expected:o}: {error}"));
+            assert_eq!(mode(&path), expected);
         }
 
-        let directory = mounted.mountpoint().join("fixed-directory");
-        fs::create_dir(&directory).expect("create directory through the writable mount");
-        assert_eq!(mode(&directory), 0o755, "directories are fixed at 0755");
-        let error = fs::set_permissions(&directory, fs::Permissions::from_mode(0o644))
-            .expect_err("directory chmod 0644 must not report success");
-        assert_errno(error, &[ENOSYS, EOPNOTSUPP, EINVAL], "chmod directory 0644");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+            .expect("chmod read-only file");
+        let denied = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect_err("owner write through a 0400 file must fail");
+        assert_errno(denied, &[EACCES], "open write on 0400 file");
         assert_eq!(
-            mode(&directory),
-            0o755,
-            "a rejected directory chmod must leave 0755 unchanged"
+            fs::read(&path).expect("owner read through a 0400 file"),
+            b"mode"
         );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("chmod private writable file");
+        let mut writable = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("owner read/write through a 0600 file");
+        writable
+            .write_all(b"-0600")
+            .expect("write through a 0600 descriptor");
+        writable.sync_all().expect("publish 0600 write");
+        drop(writable);
+
+        let directory = mounted.mountpoint().join("ordinary-directory");
+        fs::create_dir(&directory).expect("create directory through the writable mount");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("chmod directory 0700");
+        assert_eq!(mode(&directory), 0o700);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o600))
+            .expect("chmod directory without execute permission");
+        let denied = fs::read_dir(&directory).expect_err("owner cannot traverse a 0600 directory");
+        assert_errno(
+            denied,
+            &[EACCES],
+            "read directory without execute permission",
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("restore directory traversal");
+        assert_eq!(mode(&directory), 0o755);
         mounted.unmount();
     }
 }

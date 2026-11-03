@@ -39,7 +39,7 @@ logs a failure and retains staged state; close is not an error-reporting durabil
 boundary. Recovery reopens the same staging directory and original frozen request.
 
 Ownership and modes are synthesized (current uid/gid, files 0644 or 0755 according
-to the core executable flag, directories 0755). Creation does not persist requested
+to the core's derived executable view, directories 0755). Creation does not persist requested
 permissions. Timestamps encode generation, not wall-clock times. Permission and
 timestamp changes, links and extended attributes are unsupported. There is no
 disk capacity claim. Unsupported metadata is not marked consumed.

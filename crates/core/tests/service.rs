@@ -20,8 +20,8 @@ use support::TestBackend;
 use yinyang_core::object::ObjectFs;
 use yinyang_core::service::{MetadataService, ServiceClient, serve};
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, ExpiryRequest, Planner,
-    RevisionStatus, Transaction,
+    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, ExpiryRequest, NodeMode,
+    Planner, RevisionStatus, Transaction,
 };
 use yinyang_test_support as support;
 
@@ -36,14 +36,27 @@ async fn suite(fs: &dyn Authority) {
     let file = fs.prepare(&mut b"original".as_slice()).await.unwrap();
     let mut create = Planner::new(&first, CommitId::generate());
     let a = create
-        .create_file(fs.root(), "a", file.clone(), false)
+        .create_file_with_mode(
+            fs.root(),
+            "a",
+            file.clone(),
+            NodeMode::from_bits(0o600).unwrap(),
+        )
         .await
         .unwrap();
     let b = create
-        .create_file(fs.root(), "b", file.clone(), false)
+        .create_file_with_mode(
+            fs.root(),
+            "b",
+            file.clone(),
+            NodeMode::from_bits(0o640).unwrap(),
+        )
         .await
         .unwrap();
-    let p = create.create_directory(fs.root(), "p").await.unwrap();
+    let p = create
+        .create_directory_with_mode(fs.root(), "p", NodeMode::from_bits(0o700).unwrap())
+        .await
+        .unwrap();
     let q = create.create_directory(fs.root(), "q").await.unwrap();
     let transaction = create.finish().unwrap();
     let receipt = committed(fs.commit(&transaction).await.unwrap());
@@ -77,6 +90,14 @@ async fn suite(fs: &dyn Authority) {
     assert!(current.node(a).await.unwrap().unwrap().executable());
     assert!(current.node(b).await.unwrap().unwrap().executable());
     assert!(!base.node(a).await.unwrap().unwrap().executable());
+    assert_eq!(current.node(a).await.unwrap().unwrap().mode().bits(), 0o700);
+    assert_eq!(current.node(b).await.unwrap().unwrap().mode().bits(), 0o750);
+    assert_eq!(
+        base.node(a).await.unwrap().unwrap().mode().bits(),
+        0o600,
+        "the original mode remains pinned"
+    );
+    assert_eq!(current.node(p).await.unwrap().unwrap().mode().bits(), 0o700);
 
     // Exact same observed file has at most one successful replacement.
     let newer = fs.prepare(&mut b"new bytes".as_slice()).await.unwrap();
@@ -88,6 +109,19 @@ async fn suite(fs: &dyn Authority) {
     assert_eq!(
         fs.commit(&r.finish().unwrap()).await.unwrap(),
         Outcome::Conflict
+    );
+    assert_eq!(
+        fs.observe_latest()
+            .await
+            .unwrap()
+            .node(a)
+            .await
+            .unwrap()
+            .unwrap()
+            .mode()
+            .bits(),
+        0o700,
+        "content replacement preserves the persisted mode"
     );
 
     // Empty removal is protected against insertions; scans include phantoms.

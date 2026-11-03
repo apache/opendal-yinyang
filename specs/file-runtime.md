@@ -96,8 +96,20 @@ publication. Callers needing frozen namespace replay use Authority/Planner.
 produced by the same Planner whose transaction returned the receipt. Adapters
 must use that identity instead of resolving the path again after publication,
 because a concurrent rename or replacement could otherwise bind the lookup to
-another node. File creation accepts the core executable flag; no other POSIX
-mode, ownership or timestamp state is persisted.
+another node. Lower-level creation accepts an exact `NodeMode` in
+`0o000..=0o777`; the compatibility bool helpers derive `0644` or `0755`.
+Defaults for direct Runtime callers remain `0644` for files and `0755` for
+directories. Ownership, timestamps, file-type bits and setuid/setgid/sticky
+state are not persisted.
+
+`Runtime::set_mode` conditionally updates one stable NodeId to an exact ordinary
+mode. A writable handle publishes its dirty content first and then commits the
+mode against the same recorded base before advancing to the receipt revision.
+The compatibility executable mutation reads the complete current mode and
+changes executable meaning without discarding other read/write bits:
+`0600 -> 0700`, `0644 -> 0755`. It adds execute only to classes that already
+have a read or write bit and falls back to owner execute only when no class has
+either. Content replacement never changes the stored mode.
 
 Path-addressed namespace helpers (`rename_path`, `rename_path_replace`,
 `unlink_path`, and `rmdir_path`) resolve the requested entry and construct its
@@ -186,7 +198,7 @@ base even when that revision is logically expired. Success updates the sparse
 base to the receipt's revision with another `synchronous=FULL` commit before
 returning. It never silently observes a newer conflicting file.
 
-A stale file generation, changed executable state, or unlink produces Conflict.
+A stale file generation, changed mode, or unlink produces Conflict.
 Staged bytes remain readable for explicit recovery/export or abort. Retryable
 and Unknown preserve the frozen request. Receipt absence cannot authorize
 aborting it. A crash between remote commit and local acknowledgment therefore

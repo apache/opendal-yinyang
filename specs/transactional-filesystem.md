@@ -45,8 +45,11 @@ NodeId -> Node
 (ParentId, NameKey) -> DirectoryEntry { name, node_id }
 ```
 
-A node contains a stable identity, kind, node generation, executable flag, and
-either directory membership state or file content state. Every non-root node has
+A node contains a stable identity, kind, node generation, ordinary Unix
+permission mode, and either directory membership state or file content state.
+The mode is restricted to `0o000..=0o777`; file-type and setuid/setgid/sticky
+bits, ownership, ACLs and xattrs are separate and are not persisted by this
+contract. Every non-root node has
 exactly one parent/name link, also accessible by its identity for ancestor
 traversal. This link and its directory entry must agree in every published
 snapshot. The root is a directory with a stable identity and no parent.
@@ -80,7 +83,7 @@ New nodes start at node generation 1; new directories start at membership
 generation 1. For each accepted transaction, compare its final logical state with
 the state immediately preceding that transaction:
 
-- A change to executable state or logical file bytes increments node generation
+- A change to mode or logical file bytes increments node generation
   exactly once. Unchanged logical state preserves it.
 - A change to a directory's `name -> NodeId` mapping increments that directory's
   membership generation exactly once. Descendant-only changes do not affect it.

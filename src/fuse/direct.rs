@@ -22,7 +22,7 @@ use super::backend::{
     Backend, BackendError, Created, DirectoryEntry, DirectoryOpen, DirectoryPage, Entry, Opened,
     Result, SetAttrRequest, file_type,
 };
-use super::flags::{has_open_flag, representable_mode, writable_create, writable_open};
+use super::flags::{has_open_flag, ordinary_mode, writable_create, writable_open};
 use super::inode::InodeIdentity;
 use crate::direct::{
     DirectFile, DirectFileHandle, DirectFlushOutcome, DirectId, DirectKind, DirectMutationState,
@@ -34,6 +34,7 @@ use fuser::OpenFlags;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
+use yinyang_core::NodeMode;
 
 impl InodeIdentity for DirectId {
     const DOMAIN: &'static [u8] = b"yinyang direct fuse inode v1";
@@ -613,7 +614,7 @@ impl Backend for DirectBackend {
         umask: u32,
         flags: i32,
     ) -> Result<Created<DirectId, DirectOpenFile>> {
-        if !representable_mode(mode, umask, false, false, false) {
+        if ordinary_mode(mode, umask, false) != Some(NodeMode::FILE) {
             return Err(BackendError::MutationUnsupported);
         }
         let snapshot = self.current()?;
