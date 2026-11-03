@@ -18,6 +18,7 @@
 //! Shared Linux open, create and rename flag interpretation.
 
 use fuser::{OpenAccMode, OpenFlags, RenameFlags};
+use yinyang_core::NodeMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RenameRejection {
@@ -46,13 +47,7 @@ pub(super) fn writable_create(flags: i32) -> bool {
     flags & libc::O_ACCMODE != libc::O_RDONLY
 }
 
-pub(super) fn representable_mode(
-    mode: u32,
-    umask: u32,
-    read_only: bool,
-    directory: bool,
-    executable: bool,
-) -> bool {
+pub(super) fn ordinary_mode(mode: u32, umask: u32, directory: bool) -> Option<NodeMode> {
     const S_IFMT: u32 = 0o170000;
     const S_IFREG: u32 = 0o100000;
     const S_IFDIR: u32 = 0o040000;
@@ -61,17 +56,10 @@ pub(super) fn representable_mode(
         || (directory && file_type == S_IFDIR)
         || (!directory && file_type == S_IFREG);
     if !type_ok || mode & !(S_IFMT | 0o777) != 0 {
-        return false;
+        return None;
     }
     let effective = mode & !umask & 0o777;
-    let expected = if directory || executable {
-        if read_only { 0o555 } else { 0o755 }
-    } else if read_only {
-        0o444
-    } else {
-        0o644
-    };
-    effective == expected
+    NodeMode::from_bits(u16::try_from(effective).expect("ordinary mode fits u16"))
 }
 
 pub(super) fn rename_replace(flags: RenameFlags) -> Result<bool, RenameRejection> {
@@ -92,21 +80,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn representable_modes_include_type_bits_but_not_special_bits() {
-        assert!(representable_mode(0o100644, 0, false, false, false));
-        assert!(representable_mode(0o100755, 0, false, false, true));
-        assert!(representable_mode(0o40755, 0, false, true, false));
-        assert!(representable_mode(0o100644, 0o022, false, false, false));
-        assert!(!representable_mode(0o100600, 0, false, false, false));
-        assert!(!representable_mode(
-            0o100644 | 0o4000,
-            0,
-            false,
-            false,
-            false
-        ));
-        assert!(!representable_mode(0o020000, 0, false, false, false));
-        assert!(!representable_mode(0o40755, 0, false, false, false));
+    fn ordinary_modes_include_type_bits_but_not_special_bits() {
+        assert_eq!(ordinary_mode(0o100644, 0, false), Some(NodeMode::FILE));
+        assert_eq!(
+            ordinary_mode(0o100755, 0, false),
+            Some(NodeMode::EXECUTABLE_FILE)
+        );
+        assert_eq!(ordinary_mode(0o40755, 0, true), Some(NodeMode::DIRECTORY));
+        assert_eq!(ordinary_mode(0o100644, 0o022, false), Some(NodeMode::FILE));
+        assert_eq!(
+            ordinary_mode(0o100600, 0, false),
+            NodeMode::from_bits(0o600)
+        );
+        assert_eq!(ordinary_mode(0o100644 | 0o4000, 0, false), None);
+        assert_eq!(ordinary_mode(0o020000, 0, false), None);
+        assert_eq!(ordinary_mode(0o40755, 0, false), None);
     }
 
     #[test]

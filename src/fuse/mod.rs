@@ -110,6 +110,7 @@ async fn run_backend<B: Backend>(backend: Arc<B>, mountpoint: PathBuf) -> Result
     options.mount_options = vec![
         MountOption::FSName(format!("yinyang-{name}")),
         MountOption::Subtype("yinyang".into()),
+        MountOption::DefaultPermissions,
     ];
     if read_only {
         options.mount_options.insert(0, MountOption::RO);

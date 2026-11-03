@@ -21,7 +21,7 @@ use crate::authority::{
 use crate::compatibility::{OBJECT_HEAD_MAGIC, OBJECT_SNAPSHOT_MAGIC, SERVICE_BINDING_MAGIC};
 use crate::data::{DataStore, PackedRef, RefWire};
 use crate::index::{Index, IndexCache};
-use crate::namespace::{Node, NodeKind, corrupt, decode, encode};
+use crate::namespace::{Node, NodeKind, NodeMode, corrupt, decode, encode};
 use crate::transaction::Transaction;
 use crate::{Error, ErrorKind, ExpiryRequest, NodeId, Result};
 use futures_util::TryStreamExt as _;
@@ -254,7 +254,7 @@ impl ObjectFs {
                     Node {
                         id: root,
                         generation: 1,
-                        executable: false,
+                        mode: NodeMode::DIRECTORY,
                         link: None,
                         kind: NodeKind::Directory { membership: 1 },
                     }
@@ -992,7 +992,10 @@ async fn read_head(operator: &Operator) -> Result<Option<Head>> {
             "unknown service binding profile",
         ));
     }
-    if bytes.starts_with(b"YYHEAD01") || bytes.starts_with(b"YYHEAD02") {
+    if bytes.starts_with(b"YYHEAD01")
+        || bytes.starts_with(b"YYHEAD02")
+        || bytes.starts_with(b"YYHEAD03")
+    {
         return Err(Error::unsupported(
             "open filesystem",
             "legacy format is not supported by the object authority",

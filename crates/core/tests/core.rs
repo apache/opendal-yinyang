@@ -792,7 +792,11 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
             .kind(),
         ErrorKind::Unsupported
     );
-    for legacy_bytes in [b"YYHEAD01legacy".as_slice(), b"YYHEAD02legacy"] {
+    for legacy_bytes in [
+        b"YYHEAD01legacy".as_slice(),
+        b"YYHEAD02legacy",
+        b"YYHEAD03legacy",
+    ] {
         let legacy = TestBackend::default();
         legacy.state.lock().unwrap().objects.insert(
             ".yinyang/head".into(),

@@ -18,7 +18,7 @@ below.
 | Application | Tested workflow | Recommendation |
 | --- | --- | --- |
 | GNU tar 1.35 | Explicit extraction, a quiesced read-only backup archive, and symlink rejection | Use the flags below and validate the extracted payload |
-| rsync 3.2.7 | `--inplace` update of an existing representable destination tree, including `--delete` | Use for in-place updates only |
+| rsync 3.2.7 | Creation of an absent destination tree and default safe-save replacement, including `--delete` | Use the command below and validate bytes and modes |
 
 Start a foreground mount with the configured volume:
 
@@ -29,25 +29,28 @@ yy --volume /absolute/path/to/volume.json mount /path/to/mountpoint
 Keep `yy` running while the application operates on the mountpoint. See
 [Linux operations](linux-operations.md) for volume setup and service choices.
 
-## rsync update
+## rsync creation and replacement
 
-The tested update command is:
+The tested command is:
 
 ```shell
 rsync -r --checksum --no-times --no-owner --no-group --omit-dir-times \
-  --inplace --delete SOURCE/ /path/to/mount/DESTINATION/
+  --delete SOURCE/ /path/to/mount/DESTINATION/
 ```
 
-The destination directories and files must already exist with representable
-modes before the first update, including an empty placeholder for each newly
-added source file. The acceptance verifies replacement bytes, a new source
-entry, removal of a source-deleted entry, executable mode and the same tree
-after remount.
+The destination may be absent. rsync creates it and its nested directories,
+creates files from the source modes (including `0600` and `0755`), and replaces
+existing files without `--inplace` or pre-created placeholders. The acceptance
+checks byte replacement, private and executable modes, a new source entry,
+removal of a source-deleted entry, and the same result after remount. Omit
+`--delete` when source-deleted destination entries should be retained; the
+acceptance also runs the same command without it.
 
-Default rsync safe-save and new-file creation use mode `0600`, which the mount
-rejects with `EOPNOTSUPP`; no destination entry is left behind. `--inplace`
-does not make new-file creation succeed. This guide does not claim general
-rsync mirroring, metadata preservation, hard links, symlinks, ACLs or xattrs.
+rsync's safe-save temporary files use `O_CREAT|O_EXCL` and mode `0600`; the
+mount persists that temporary mode, then rsync chmods the final mode before a
+plain rename replaces the destination. This guide does not claim general rsync
+mirroring, ownership or timestamp preservation, hard links, symlinks, ACLs or
+xattrs.
 
 ## GNU tar restore and backup
 
@@ -66,10 +69,10 @@ tar -cf /var/tmp/mounted-tree.tar -C /path/to/read-only/mount/RESTORE .
 ```
 
 The archive path must be outside the mount and GNU tar must exit 0. The
-read-only view reports `0444` files and `0555` executable files/directories,
-so the archive preserves payload bytes and the executable distinction but not
-the earlier writable bits. Extract the complete archive locally and compare
-every expected payload and executable bit.
+read-only view clears every write bit: `0644` becomes `0444`, `0755` files and
+directories become `0555`, `0600` becomes `0400`, and `0700` becomes `0500`.
+Extract the complete archive locally and compare every expected payload and
+ordinary mode. The archive does not preserve ownership or timestamps.
 
 `--no-overwrite-dir` intentionally keeps the pre-existing extraction root at
 its current mode. The acceptance treats that root as setup state and separately
@@ -95,9 +98,9 @@ loopback service publication and uses `YY_UPGRADE_BIN` when set. The
 trial-distribution workflow sets that selector to the packaged archive's
 `bin/yy`.
 
-The suite prepares a bare repository whose files and directories already use
-representable modes, then runs `git hash-object -w` against it. Git requests a
-non-representable mode for its loose-object temporary file, exits 128 with
-`Unable to create temporary file ... Operation not supported`, and leaves no
-object. Git workflows are excluded rather than silently using another mode
-model.
+The suite prepares a bare repository whose files and directories use ordinary
+modes, then runs `git hash-object -w` against it. The narrow probe verifies
+that Git's private loose-object temporary reaches the Managed mode boundary,
+the object is created, and its bytes can be read back through the mount. This
+does not qualify repository updates, pack/index/locking operations or other Git
+workflows.

@@ -22,7 +22,7 @@ use super::backend::{
     Backend, BackendError, Created, DirectoryOpen, DirectoryPage, Entry, Opened, Result,
     SetAttrRequest, file_type,
 };
-use super::flags::{has_open_flag, representable_mode, writable_create, writable_open};
+use super::flags::{has_open_flag, ordinary_mode, writable_create, writable_open};
 use super::reject_unpublished_staging;
 use crate::mount::{Mount, MountFile, MountReadOnlyFile};
 use crate::volume::{Volume, VolumeConfig};
@@ -152,7 +152,7 @@ impl ManagedBackend {
             yinyang_core::NodeKind::File(content) => content.content_id().length(),
             yinyang_core::NodeKind::Directory { .. } => 0,
         };
-        ObservedAttr::from_revision(node.is_directory(), node.executable(), size, revision)
+        ObservedAttr::from_revision(node.is_directory(), node.mode(), size, revision)
     }
 
     async fn snapshot_attr(&self, snapshot: &Snapshot, id: NodeId) -> Result<ObservedAttr> {
@@ -429,6 +429,13 @@ impl Backend for ManagedBackend {
             return Ok(attr);
         }
         if let Some(mode) = request.mode {
+            if self.read_only {
+                return Err(crate::runtime::Error::State(
+                    crate::runtime::ErrorKind::ReadOnly,
+                    "mount is read-only",
+                )
+                .into());
+            }
             let snapshot = self.fetch_snapshot().await?;
             let current = snapshot.node(id).await?.ok_or_else(|| {
                 yinyang_core::Error::new(
@@ -437,30 +444,28 @@ impl Backend for ManagedBackend {
                     "node is absent",
                 )
             })?;
-            let executable = mode & 0o111 != 0;
-            if !representable_mode(mode, 0, self.read_only, current.is_directory(), executable) {
-                return Err(BackendError::MutationUnsupported);
-            }
-            if !current.is_directory() {
-                let result = if let Some(file) = file {
-                    let ManagedFile::Staged(file) = file else {
-                        return Err(BackendError::MutationUnsupported);
-                    };
-                    file.set_executable(executable).await
-                } else {
-                    self.reclaim_clean_state(id).await?;
-                    let file = self.mount.open_node(id, true).await?;
-                    let result = file.set_executable(executable).await;
-                    drop(file);
-                    if let Err(error) = self.mount.reclaim(id).await
-                        && error.kind() != crate::runtime::ErrorKind::Busy
-                    {
-                        eprintln!("yy: fuse chmod cleanup: {error}");
-                    }
-                    result
+            let mode = ordinary_mode(mode, 0, current.is_directory())
+                .ok_or(BackendError::MutationUnsupported)?;
+            let result = if current.is_directory() {
+                self.mount.namespace().set_mode(id, mode).await
+            } else if let Some(file) = file {
+                let ManagedFile::Staged(file) = file else {
+                    return Err(BackendError::MutationUnsupported);
                 };
-                result.map_err(BackendError::runtime_content_publication)?;
-            }
+                file.set_mode(mode).await
+            } else {
+                self.reclaim_clean_state(id).await?;
+                let file = self.mount.open_node(id, true).await?;
+                let result = file.set_mode(mode).await;
+                drop(file);
+                if let Err(error) = self.mount.reclaim(id).await
+                    && error.kind() != crate::runtime::ErrorKind::Busy
+                {
+                    eprintln!("yy: fuse chmod cleanup: {error}");
+                }
+                result
+            };
+            result.map_err(BackendError::runtime_content_publication)?;
             let snapshot = self.fetch_snapshot().await?;
             return self.snapshot_attr(&snapshot, id).await;
         }
@@ -476,14 +481,12 @@ impl Backend for ManagedBackend {
         umask: u32,
         flags: i32,
     ) -> Result<Created<NodeId, ManagedFile>> {
-        if !representable_mode(mode, umask, self.read_only, false, mode & 0o111 != 0) {
-            return Err(BackendError::MutationUnsupported);
-        }
+        let mode = ordinary_mode(mode, umask, false).ok_or(BackendError::MutationUnsupported)?;
         let exclusive = has_open_flag(flags, nix::fcntl::OFlag::O_EXCL);
         let node = match self
             .mount
             .namespace()
-            .create_file_with_node(parent, name, mode & 0o111 != 0)
+            .create_file_with_node_mode(parent, name, mode)
             .await
         {
             Ok((node, _)) => node,
@@ -524,13 +527,11 @@ impl Backend for ManagedBackend {
         mode: u32,
         umask: u32,
     ) -> Result<Entry<NodeId>> {
-        if !representable_mode(mode, umask, self.read_only, true, false) {
-            return Err(BackendError::MutationUnsupported);
-        }
+        let mode = ordinary_mode(mode, umask, true).ok_or(BackendError::MutationUnsupported)?;
         let (node, _) = self
             .mount
             .namespace()
-            .create_directory_with_node(parent, name)
+            .create_directory_with_node_mode(parent, name, mode)
             .await?;
         let snapshot = self.fetch_snapshot().await?;
         let attr = self.snapshot_attr(&snapshot, node).await?;
@@ -806,6 +807,68 @@ mod tests {
             backend_state.state.lock().unwrap().data_reads,
             reads_after_warm,
             "warm metadata callbacks performed a new page read"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_mkdir_and_chmod_store_exact_ordinary_modes() {
+        let backend_state = TestBackend::default();
+        Fs::create(backend_state.operator()).await.unwrap();
+        let (backend, authority, _temp) = backend(&backend_state, false).await;
+        let root = authority.root();
+
+        let created = backend
+            .create(
+                root,
+                "private",
+                0o100600,
+                0,
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.attr.mode.bits(), 0o600);
+        drop(created.file);
+        backend.release(created.id, true).await.unwrap();
+
+        let directory = backend
+            .mkdir(root, "private-dir", 0o40700, 0)
+            .await
+            .unwrap();
+        assert_eq!(directory.attr.mode.bits(), 0o700);
+        let changed = backend
+            .setattr(
+                directory.id,
+                None,
+                SetAttrRequest {
+                    mode: Some(0o750),
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime: None,
+                    mtime: None,
+                    ctime: None,
+                    crtime: None,
+                    chgtime: None,
+                    bkuptime: None,
+                    flags: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.mode.bits(), 0o750);
+        assert_eq!(
+            authority
+                .observe_latest()
+                .await
+                .unwrap()
+                .node(directory.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode()
+                .bits(),
+            0o750
         );
     }
 }

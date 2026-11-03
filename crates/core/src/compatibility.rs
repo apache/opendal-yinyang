@@ -22,19 +22,19 @@ pub(crate) const CONTENT_DESCRIPTOR_MAGIC: [u8; 8] = *b"YYFILE02";
 pub(crate) const CONTENT_INDEX_MAGIC: [u8; 8] = *b"YYHASH02";
 pub(crate) const CONTENT_HASH_CONTEXT: &str = "Apache OpenDAL YinYang content profile 2";
 
-pub(crate) const OBJECT_HEAD_MAGIC: [u8; 8] = *b"YYHEAD03";
-pub(crate) const OBJECT_SNAPSHOT_MAGIC: [u8; 8] = *b"YYSNAP03";
+pub(crate) const OBJECT_HEAD_MAGIC: [u8; 8] = *b"YYHEAD04";
+pub(crate) const OBJECT_SNAPSHOT_MAGIC: [u8; 8] = *b"YYSNAP04";
 pub(crate) const OBJECT_INDEX_MAGIC: [u8; 8] = *b"YYINDEX2";
 
-pub(crate) const REQUEST_MAGIC: [u8; 8] = *b"YYREQ002";
-pub(crate) const REQUEST_HASH_CONTEXT: &str = "Apache OpenDAL YinYang request profile 2";
+pub(crate) const REQUEST_MAGIC: [u8; 8] = *b"YYREQ003";
+pub(crate) const REQUEST_HASH_CONTEXT: &str = "Apache OpenDAL YinYang request profile 3";
 pub(crate) const NODE_IDENTITY_CONTEXT: &str = "Apache OpenDAL YinYang node identity profile 2";
-pub(crate) const TRANSACTION_PLAN_MAGIC: [u8; 8] = *b"YYPLAN01";
+pub(crate) const TRANSACTION_PLAN_MAGIC: [u8; 8] = *b"YYPLAN02";
 
 pub(crate) const EXPIRY_REQUEST_MAGIC: [u8; 8] = *b"YYEXP001";
 pub(crate) const EXPIRY_REQUEST_HASH_CONTEXT: &str =
     "Apache OpenDAL YinYang expiry request profile 1";
 
 pub(crate) const SERVICE_BINDING_MAGIC: [u8; 8] = *b"YYSERV01";
-pub(crate) const SQLITE_SCHEMA_PROFILE: &str = "yinyang-sqlite-3";
-pub(crate) const RPC_PROTOCOL_VERSION: u8 = 1;
+pub(crate) const SQLITE_SCHEMA_PROFILE: &str = "yinyang-sqlite-4";
+pub(crate) const RPC_PROTOCOL_VERSION: u8 = 2;

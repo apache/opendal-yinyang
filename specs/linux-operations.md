@@ -150,11 +150,11 @@ do not install host-level services, enable lingering, start at boot by default
 or alter system-wide FUSE configuration.
 
 The Mount unit must not set `NoNewPrivileges=yes`: an unprivileged user mount
-may rely on the setuid `fusermount3` helper. It uses `UMask=0022` because the
-current FUSE frontend represents only `0644` and `0755` file modes; a stricter
-mask would make ordinary creates appear as unrepresentable `0600` files.
-Configuration, state and environment directories remain private (`0700`) and
-the common environment file remains `0600`.
+may rely on the setuid `fusermount3` helper. It uses `UMask=0022` for stable
+ordinary defaults. Managed persists ordinary modes such as `0600` and `0700`,
+so a stricter mask is a valid policy choice. Configuration, state and
+environment directories remain private (`0700`) and the common environment
+file remains `0600`.
 
 Mount and service units are restartable long-running processes. The Sync unit
 is oneshot: active/exited means the command completed successfully, never that
