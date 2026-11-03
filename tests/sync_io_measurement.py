@@ -45,9 +45,18 @@ from pathlib import Path
 
 SIZE = 512 * 1024
 COUNTS = [int(value) for value in os.environ.get("COUNTS", "32,256").split(",")]
-READ = re.compile(
-    r"^(?:\d+\s+)?(?:read|pread64|readv|preadv)\(\d+<([^>]*)>.* = (\d+)$"
+SYSCALLS = "read|pread64|readv|preadv"
+COMPLETE = re.compile(
+    rf"^(?:(\d+)\s+)?({SYSCALLS})\((\d+)<([^>]*)>(.*)\)\s+=\s+(-?\d+)(?:\s+.*)?$"
 )
+UNFINISHED = re.compile(
+    rf"^(?:(\d+)\s+)?({SYSCALLS})\((\d+)<([^>]*)>(.*)<unfinished \.\.\.>\s*$"
+)
+RESUMED = re.compile(
+    rf"^(?:(\d+)\s+)?<\.\.\. ({SYSCALLS}) resumed>(.*)\)\s+=\s+(-?\d+)(?:\s+.*)?$"
+)
+READ_MARKER = re.compile(rf"\b(?:{SYSCALLS})\(")
+RESUME_MARKER = re.compile(rf"<\.\.\. (?:{SYSCALLS}) resumed>")
 
 
 def run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
@@ -133,22 +142,129 @@ def parse_trace(trace: Path, work: Path, roots: tuple[Path, ...], state: Path) -
         "other_work": 0,
         "all_work": 0,
     }
+    pending: dict[str, tuple[str, str]] = {}
     for line in trace.read_text().splitlines():
-        match = READ.match(line)
-        if match is None:
+        complete = COMPLETE.match(line)
+        if complete is not None:
+            pid, _, _, path, _, returned = complete.groups()
+            if int(returned) > 0 and path.startswith(f"{work}/"):
+                add_read(totals, path, int(returned), work, roots, state)
             continue
-        path, returned = match.groups()
-        returned = int(returned)
-        if returned <= 0:
+
+        unfinished = UNFINISHED.match(line)
+        if unfinished is not None:
+            pid, syscall, _, path, _ = unfinished.groups()
+            pid = pid or "0"
+            if pid in pending:
+                raise RuntimeError(f"read syscall state collision for pid {pid}: {line}")
+            pending[pid] = (syscall, path)
             continue
-        if not path.startswith(f"{work}/"):
+
+        resumed = RESUMED.match(line)
+        if resumed is not None:
+            pid, syscall, _, returned = resumed.groups()
+            pid = pid or "0"
+            state_entry = pending.pop(pid, None)
+            if state_entry is None:
+                raise RuntimeError(f"read resumed without an unfinished read for pid {pid}: {line}")
+            pending_syscall, path = state_entry
+            if pending_syscall != syscall:
+                raise RuntimeError(
+                    f"read resumed as {syscall} but started as {pending_syscall}: {line}"
+                )
+            if int(returned) > 0 and path.startswith(f"{work}/"):
+                add_read(totals, path, int(returned), work, roots, state)
             continue
-        category = classify(path, work, roots, state)
-        if category == "other":
-            category = "other_work"
-        totals[category] += returned
-        totals["all_work"] += returned
+
+        if RESUME_MARKER.search(line) or (
+            READ_MARKER.search(line) and f"{work}/" in line
+        ):
+            raise RuntimeError(f"unparsed read syscall record: {line}")
+
+    if pending:
+        raise RuntimeError(f"unfinished read syscalls remain: {pending}")
     return totals
+
+
+def add_read(
+    totals: dict[str, int],
+    path: str,
+    returned: int,
+    work: Path,
+    roots: tuple[Path, ...],
+    state: Path,
+) -> None:
+    category = classify(path, work, roots, state)
+    if category == "other":
+        category = "other_work"
+    totals[category] += returned
+    totals["all_work"] += returned
+
+
+def check_parser_fixture() -> None:
+    with tempfile.TemporaryDirectory(prefix="yy-sync-io-parser-") as temporary:
+        work = Path(temporary)
+        root = work / "root"
+        state = work / "state"
+        trace = work / "interleaved.trace"
+        trace.write_text(
+            "\n".join(
+                [
+                    f'101 read(3<{root}/a>, ""..., 4096) = 4096',
+                    f'102 read(4<{root}/b>, ""..., 4096 <unfinished ...>',
+                    f'101 pread64(5<{state}/install/x>, ""..., 8192, 0) = 8192',
+                    f'103 read(6<{root}/c>, ""..., 4096 <unfinished ...>',
+                    '102 <... read resumed>""..., 4096) = 4096',
+                    '103 <... read resumed>""..., 4096) = -1 EAGAIN (Resource temporarily unavailable)',
+                    f'104 readv(7<{state}/app.db>, [{{iov_base="", iov_len=4096}}], 1) = 4096',
+                    "105 read(8</var/lib/not-target>, \"\"..., 4096) = 4096",
+                ]
+            )
+            + "\n"
+        )
+        actual = parse_trace(trace, work, (root,), state)
+        expected = {
+            "root": 8192,
+            "install": 8192,
+            "artifacts": 0,
+            "database": 4096,
+            "state": 0,
+            "other_work": 0,
+            "all_work": 20480,
+        }
+        if actual != expected:
+            raise RuntimeError(f"parser fixture totals differ: {actual} != {expected}")
+
+        malformed = work / "malformed.trace"
+        malformed.write_text(f'101 read(3<{root}/a>, ""..., 4096 = 4096\n')
+        try:
+            parse_trace(malformed, work, (root,), state)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("parser accepted an unclassified target read")
+
+        unfinished = work / "unfinished.trace"
+        unfinished.write_text(f'101 read(3<{root}/a>, ""..., 4096 <unfinished ...>\n')
+        try:
+            parse_trace(unfinished, work, (root,), state)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("parser accepted an unfinished target read")
+
+        print(
+            json.dumps(
+                {
+                    "schema": "yinyang.sync-io-parser-fixture.v1",
+                    "actual": actual,
+                    "expected": expected,
+                    "unclassified_target_rejected": True,
+                    "unfinished_target_rejected": True,
+                },
+                sort_keys=True,
+            )
+        )
 
 
 def loadavg() -> list[float]:
@@ -183,7 +299,7 @@ def measure(
     run(command, cwd=work, env=env)
     elapsed = time.perf_counter() - started
     return {
-        "elapsed_s": round(elapsed, 6),
+        "instrumented_elapsed_s": round(elapsed, 6),
         "local_read_bytes": parse_trace(trace_path, work, roots, state),
         "trace": str(trace_path),
     }
@@ -214,6 +330,7 @@ def measure_scale(
     work.mkdir(parents=True)
     traces = output / "traces" / f"{files}"
     traces.mkdir(parents=True)
+    completed = False
     try:
         run([str(yy), "create"], cwd=work, env=env)
         push_root = work / "push"
@@ -248,6 +365,9 @@ def measure_scale(
             "tree_bytes": files * SIZE,
             "host": os.uname().nodename,
             "loadavg_before": loadavg(),
+            "measurement_scope": "Managed object publication through loopback Silo",
+            "timing_scope": "strace-instrumented elapsed diagnostic; not a native latency claim",
+            "collector": "strace -f -yy -s 0 -e trace=read,pread64,readv,preadv",
         }
         result["push_initial"] = measure(
             yy,
@@ -316,16 +436,27 @@ def measure_scale(
         result["loadavg_after"] = loadavg()
         if not result["push_in_sync"] or not result["pull_in_sync"] or not result["trees_equal"]:
             raise RuntimeError(f"sync verification failed: {json.dumps(result, indent=2)}")
+        completed = True
         return result
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if completed:
+            shutil.rmtree(work, ignore_errors=True)
+        else:
+            print(f"retaining failed work directory and traces: {work}", file=sys.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--label", required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--label")
+    parser.add_argument("--check-parser-fixture", action="store_true")
     args = parser.parse_args()
+
+    if args.check_parser_fixture:
+        check_parser_fixture()
+        return
+    if args.output is None or args.label is None:
+        parser.error("--output and --label are required for a measurement")
 
     repo = Path(__file__).resolve().parents[1]
     if os.environ.get("SKIP_BUILD") != "1":
