@@ -123,12 +123,12 @@ commands and exclusions.
   namespace and pinned-fd assertions prove their effect.
 - Path truncate: real `truncate(2)` without an open descriptor commits its
   shrink/extend result to the independent authority at an explicit boundary.
-- Limited chmod: `0644 <-> 0755` is observable, while non-representable modes
-  such as `0600` and `0000` fail with an explicit error and leave attributes
-  unchanged. Directories remain fixed at `0755`; `chmod 0644` on a directory
-  must not report success. A path chmod to executable while one descriptor is
-  dirty must not self-conflict when that same descriptor continues writing and
-  later performs `fsync`.
+- Ordinary modes: the writable Managed mount reports the persisted mode
+  exactly; the owner-only session enforces `0400` write denial and `0600`
+  read/write access. Read-only mounts clear write bits. The executable
+  compatibility update preserves private read/write bits. A path chmod to
+  executable while one descriptor is dirty must not self-conflict when that
+  same descriptor continues writing and later performs `fsync`.
 - Safe-save rename replacement: `rename` replaces an observed destination
   atomically and the independent authority observes the result; plain rename
   preserves the moved node's inode identity.
