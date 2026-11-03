@@ -37,7 +37,7 @@ known profiles return `Corrupt` or `Invalid` as appropriate.
 | Expiry request | `YYEXP001`, expiry hash context 1 | Yes | Yes | No | Reject |
 | Service binding | `YYSERV01` | Yes | Yes | No | Reject |
 | SQLite authority | `yinyang-sqlite-4` | Yes | Yes | Reject `yinyang-sqlite-2`, `yinyang-sqlite-3` | Reject |
-| Loopback RPC | Protocol version 1, commands 0-9, error tags 0-12 | Yes | Yes | No | Reject |
+| Loopback RPC | Protocol version 2, commands 0-9, error tags 0-12 | Yes | Yes | Reject version 1 | Reject |
 
 The current writer emits only the identifiers in this table. The current reader
 does not perform an in-place profile upgrade, downgrade, authority-mode switch,
@@ -66,7 +66,7 @@ can mutate durable state:
 | Expiry request | `YYEXP001`, bounded canonical candidates, authority and digest | `Unsupported` | `Corrupt` or `Invalid` |
 | Service binding | Exact `YYSERV01` envelope before client acceptance | `Unsupported` | `Corrupt`; a different valid binding is `Invalid` |
 | SQLite authority | Schema profile, manifest, required tables, and exact column set before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
-| Loopback RPC | Frame decode and token authentication, then protocol version | `Unsupported` before command dispatch | `Invalid` |
+| Loopback RPC | Frame decode, token authentication, then protocol version 2 | `Unsupported` before command dispatch | `Invalid` |
 
 Authentication failures use the transport's existing `Invalid` response and do
 not reveal whether an unauthenticated version would otherwise be supported.

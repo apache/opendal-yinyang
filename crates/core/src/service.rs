@@ -1256,8 +1256,18 @@ mod admission_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    async fn raw_request(addr: std::net::SocketAddr, request: Vec<u8>) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_u32(request.len() as u32).await.unwrap();
+        stream.write_all(&request).await.unwrap();
+        let length = stream.read_u32().await.unwrap() as usize;
+        let mut response = vec![0; length];
+        stream.read_exact(&mut response).await.unwrap();
+        response
+    }
+
     #[tokio::test]
-    async fn unknown_rpc_version_is_rejected_before_command_dispatch() {
+    async fn old_rpc_version_is_unsupported_and_current_version_observes() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
         let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
@@ -1269,19 +1279,24 @@ mod admission_tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(serve(listener, service.clone(), token.into()));
 
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let request = borsh::to_vec(&(2_u8, token.to_owned(), 3_u8, vec![0_u8])).unwrap();
-        stream.write_u32(request.len() as u32).await.unwrap();
-        stream.write_all(&request).await.unwrap();
-        let length = stream.read_u32().await.unwrap() as usize;
-        let mut response = vec![0; length];
-        stream.read_exact(&mut response).await.unwrap();
+        let request = borsh::to_vec(&(1_u8, token.to_owned(), 3_u8, vec![0_u8])).unwrap();
+        let response = raw_request(addr, request).await;
         let (variant, kind, message): (u8, u8, String) = borsh::from_slice(&response).unwrap();
         assert_eq!(variant, 5, "expected an RPC error response");
         assert_eq!(kind, 4, "expected Unsupported");
         assert!(message.contains("unknown protocol version"), "{message}");
         assert_eq!(service.observe_latest().await.unwrap().revision(), before);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+        let request = borsh::to_vec(&(2_u8, token.to_owned(), 0_u8, 0_u8)).unwrap();
+        let response = raw_request(addr, request).await;
+        let (variant, filesystem, root, revision): (u8, [u8; 16], [u8; 16], [u8; 24]) =
+            borsh::from_slice(&response).unwrap();
+        assert_eq!(variant, 0, "expected a current-version observation");
+        assert_eq!(filesystem, *service.filesystem().as_bytes());
+        assert_eq!(root, *service.root().as_bytes());
+        assert_eq!(revision, before.to_bytes());
+        assert_eq!(service.observe_latest().await.unwrap().revision(), before);
         server.abort();
     }
 
