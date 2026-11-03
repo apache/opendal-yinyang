@@ -30,7 +30,7 @@ use fuser::OpenFlags;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
-use yinyang_core::{FileVersion, Node, NodeId, NodeMode, ScanToken, Snapshot};
+use yinyang_core::{FileVersion, Node, NodeId, ScanToken, Snapshot};
 
 const READDIR_PAGE: usize = 512;
 

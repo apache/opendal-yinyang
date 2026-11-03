@@ -167,7 +167,9 @@ mod tests {
 
     #[test]
     fn attributes_report_persisted_modes_and_mask_writes_when_read_only() {
-        let revision = Revision::new(7);
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&7_u64.to_be_bytes());
+        let revision = Revision::from_bytes(bytes);
         let writable = synthesize(
             fuser::INodeNo(44),
             ObservedAttr::from_revision(false, NodeMode::from_bits(0o600).unwrap(), 12, revision),
