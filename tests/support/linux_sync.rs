@@ -1342,8 +1342,11 @@ fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
 }
 
 fn is_commit(request: &[u8], token: &str) -> bool {
+    // Keep this wire-version check aligned with compatibility::RPC_PROTOCOL_VERSION;
+    // the private core constant is not part of the test-support API.
+    const CURRENT_RPC_VERSION: u8 = 2;
     const COMMIT: u8 = 4;
-    if request.first() != Some(&1) || request.len() < 5 {
+    if request.first() != Some(&CURRENT_RPC_VERSION) || request.len() < 5 {
         return false;
     }
     let length = u32::from_le_bytes(request[1..5].try_into().expect("four-byte token length"));
