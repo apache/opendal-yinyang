@@ -11,7 +11,7 @@ qualification.
 | --- | --- | --- |
 | `cargo x test` | host-independent test runners | Rust unit and integration tests; ignored native tests are compiled but not executed |
 | `cargo x test-linux-fuse` | Ubuntu, `/dev/fuse`, isolated Silo | Real `fuse.yinyang` mount, read-only range hydration, writable recovery, corruption, refresh, restart and lifecycle |
-| `cargo x test-linux-applications` | Ubuntu, `/dev/fuse`, isolated Silo, git, rsync, GNU tar | Tested rsync in-place updates and mode rejection, read-only GNU tar backup, symlink rejection, Git loose-object rejection, independent-authority bytes/executable bits and remount |
+| `cargo x test-linux-applications` | Ubuntu, `/dev/fuse`, isolated Silo, git, rsync, GNU tar | Tested rsync creation/replacement and private modes, controlled `0600` safe-save with pinned old fd, read-only GNU tar backup, symlink rejection, Git loose-object probe, independent-authority bytes and remount |
 | `cargo x test-linux-direct` | Ubuntu, `/dev/fuse`, Python 3, isolated Silo | Read-only and conditional-writable Direct Mount, Direct Sync, raw inventory/bytes, uncertainty and restart boundaries |
 | `cargo x test-managed-sync` | Ubuntu, isolated Silo | Real-process Managed Sync initial push/pull, conflicts, retained artifacts, restart and recovery |
 | `cargo x test-linux-operations` | Ubuntu, `/dev/fuse`, isolated Silo | Installed `yy` layout, doctor diagnostics, object and loopback-service Mount and finite Sync |
@@ -35,9 +35,9 @@ installed-operations entrypoint also copies that selected binary
 into its clean prefix and exercises a real writable `fuse.yinyang` mount,
 remount and finite Sync for both publication authorities. The workflow records
 the source and selected binary SHA-256 before those runs. The application step
-also selects the archive binary and checks the tested rsync/GNU tar workflows,
-including object and service publication, before continuing to the
-installed-prefix checks.
+also selects the archive binary and checks the tested rsync creation,
+replacement and safe-save workflows plus GNU tar across object and service
+publication before continuing to the installed-prefix checks.
 
 Run only the first-layer read-only FUSE scenarios when isolating frontend
 changes:

@@ -169,9 +169,10 @@ YINYANG_SERVICE_LISTEN=127.0.0.1:7447
 ```
 
 The environment file must stay mode `0600`. The config and state parent
-directories were created mode `0700` above; the mount unit uses `UMask=0022` so
-the FUSE frontend's supported `0644`/`0755` files are not weakened to
-unrepresentable `0600` modes. The service and Sync units use `UMask=0077`.
+directories were created mode `0700` above. The mount unit uses `UMask=0022`
+for stable ordinary defaults; Managed now persists ordinary modes such as
+`0600` and `0700`, so a stricter mask is a valid policy choice. The service and
+Sync units use `UMask=0077`.
 
 Record the archive SHA-256, `BUILD-MANIFEST`, `git rev-parse HEAD`, the
 `sha256sum` output and the host identity with the qualification evidence. The
