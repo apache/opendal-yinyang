@@ -129,6 +129,11 @@ commands and exclusions.
   compatibility update preserves private read/write bits. A path chmod to
   executable while one descriptor is dirty must not self-conflict when that
   same descriptor continues writing and later performs `fsync`.
+- Safe-save application acceptance: default rsync creates an absent nested
+  tree and replaces files without `--inplace`; a controlled `0600` temporary
+  is fsynced, chmodded, renamed over an open destination, and checked for old
+  descriptor bytes, fresh-open bytes, private/executable modes and remount for
+  both authorities. See [the application guide](linux-applications.md).
 - Safe-save rename replacement: `rename` replaces an observed destination
   atomically and the independent authority observes the result; plain rename
   preserves the moved node's inode identity.

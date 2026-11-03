@@ -48,9 +48,12 @@ acceptance also runs the same command without it.
 
 rsync's safe-save temporary files use `O_CREAT|O_EXCL` and mode `0600`; the
 mount persists that temporary mode, then rsync chmods the final mode before a
-plain rename replaces the destination. This guide does not claim general rsync
-mirroring, ownership or timestamp preservation, hard links, symlinks, ACLs or
-xattrs.
+plain rename replaces the destination. A separate controlled case verifies the
+same sequence with an already-open old descriptor: the old descriptor keeps
+the old bytes, a fresh open sees the replacement, and a remount retains the
+final mode and bytes for both Managed authorities. This guide does not claim
+general rsync mirroring, ownership or timestamp preservation, hard links,
+symlinks, ACLs or xattrs.
 
 ## GNU tar restore and backup
 

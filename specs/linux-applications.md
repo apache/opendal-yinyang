@@ -50,6 +50,15 @@ entry, and the same result after remount.
 The specification makes no claim about rsync hard-link, timestamp, ownership,
 ACL, xattr or link-preserving modes.
 
+A separate controlled safe-save case opens a destination before replacement,
+creates a temporary with mode `0600`, writes and fsyncs new bytes, changes the
+temporary to `0644`, and renames it over the destination. The old descriptor
+must retain the old bytes, a fresh open must see the new bytes, and a clean
+remount must retain the new bytes and mode. Both object and authenticated
+loopback service publication are covered. The case uses an in-process
+independent authority for the remote read; it does not spawn a CLI while a
+dirty descriptor is intentionally held.
+
 ## GNU tar extraction and archive
 
 The tested restore command is:
