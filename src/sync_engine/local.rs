@@ -375,7 +375,12 @@ impl LocalTree {
                 "downloaded file temporary does not match its accepted content",
             ));
         }
-        fingerprint_from_stat(&after, self.state_identity, digest, executable(&after))
+        fingerprint_from_stat(
+            &after,
+            self.state_identity,
+            *digest.as_bytes(),
+            executable(&after),
+        )
     }
 
     pub fn create_install_file(&self, prefix: &str) -> Result<(String, PathBuf, std::fs::File)> {
