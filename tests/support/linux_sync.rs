@@ -1120,6 +1120,10 @@ impl Fixture {
         })
     }
 
+    pub fn authority(&self) -> Arc<dyn Authority> {
+        self.remote_authority()
+    }
+
     pub fn operator(&self) -> opendal::Operator {
         opendal::install_default();
         let config = self
