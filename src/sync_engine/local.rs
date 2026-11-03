@@ -2042,24 +2042,16 @@ fn fingerprint_from_stat(
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(Error::corrupt("installed sync file is not a regular file"));
     }
-    Ok(LocalFingerprint {
-        length: stat.st_size as u64,
-        digest,
-        remote_digest: None,
+    LocalFingerprint::from_node(&LocalNode {
+        path: String::new(),
+        kind: LocalKind::File {
+            length: stat.st_size as u64,
+            digest: ContentHash::from_bytes(digest),
+        },
         executable,
-        dev: stat.st_dev,
-        ino: stat.st_ino,
-        parent_dev: parent.dev,
-        parent_ino: parent.ino,
-        stat: Some(super::store::ArtifactStat {
-            dev: stat.st_dev,
-            ino: stat.st_ino,
-            mtime: stat.st_mtime,
-            mtime_nsec: stat.st_mtime_nsec as i64,
-            ctime: stat.st_ctime,
-            ctime_nsec: stat.st_ctime_nsec as i64,
-        }),
-        recorded_ns: super::store::recorded_now()?,
+        identity: super::types::identity(stat),
+        parent: Some(parent),
+        stat: Some(super::types::LocalStat::from_stat(stat)),
     })
 }
 
