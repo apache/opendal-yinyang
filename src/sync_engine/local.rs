@@ -1644,7 +1644,7 @@ impl LocalTree {
         Ok(())
     }
 
-    fn install_conflict(&mut self, install: &mut InstallRecord, reason: &str) -> Result<()> {
+    fn install_conflict<T>(&mut self, install: &mut InstallRecord, reason: &str) -> Result<T> {
         install.state = InstallState::Conflict;
         install.error = Some(reason.to_owned());
         self.store.update_install(install)?;
@@ -2024,7 +2024,7 @@ fn stat_matches_fingerprint(stat: &Stat, fingerprint: &LocalFingerprint) -> bool
         && recorded.mtime_nsec == stat.st_mtime_nsec as i64
         && recorded.ctime == stat.st_ctime
         && recorded.ctime_nsec == stat.st_ctime_nsec as i64
-        && fingerprint.identity() == identity(stat)
+        && fingerprint.identity() == super::types::identity(stat)
         && fingerprint.executable == executable(stat)
 }
 
@@ -2037,7 +2037,7 @@ fn stat_matches_renamed_fingerprint(stat: &Stat, fingerprint: &LocalFingerprint)
         && fingerprint.length == stat.st_size as u64
         && recorded.mtime == stat.st_mtime
         && recorded.mtime_nsec == stat.st_mtime_nsec as i64
-        && fingerprint.identity() == identity(stat)
+        && fingerprint.identity() == super::types::identity(stat)
         && fingerprint.executable == executable(stat)
 }
 
