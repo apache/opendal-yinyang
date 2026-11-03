@@ -21,8 +21,9 @@
 
 mod support;
 
-use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -243,6 +244,97 @@ fn application_rsync_creates_and_replaces_without_seeded_destination_both_public
             ),
             updated_payload,
             "rsync bytes must remain authoritative after remount"
+        );
+        remounted.unmount();
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and isolated S3; run with cargo x test-linux-applications"]
+fn application_safe_save_0600_replacement_preserves_old_fd_and_remounts_both_publications() {
+    for publication in [Publication::Object, Publication::Service] {
+        let fixture = Fixture::new(publication);
+        let suffix = fixture.publication().as_str();
+        let config = fixture.volume_config(
+            &format!("application-safe-save-{suffix}"),
+            Frontend::Fuse,
+            false,
+        );
+        let mountpoint = fixture
+            .temp
+            .path()
+            .join(format!("mnt-application-safe-save-{suffix}"));
+        fs::create_dir(&mountpoint).expect("create safe-save mountpoint");
+        let mut mounted = fixture.mount(&config, &mountpoint);
+        let root = mounted.mountpoint();
+        let target = root.join("safe-save.bin");
+        let old_bytes = payload(31, 192 * 1024 + 7);
+        let new_bytes = payload(197, 256 * 1024 + 13);
+
+        fs::write(&target, &old_bytes).expect("write old safe-save target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("set old safe-save target mode");
+        let mut old_fd = File::open(&target).expect("open old safe-save descriptor");
+
+        let temporary = root.join(".safe-save.tmp");
+        let mut replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .expect("create private safe-save temporary");
+        assert_eq!(mode(&temporary), 0o600, "safe-save temporary mode");
+        replacement
+            .write_all(&new_bytes)
+            .expect("write safe-save temporary");
+        replacement.sync_all().expect("fsync safe-save temporary");
+        replacement
+            .set_permissions(fs::Permissions::from_mode(0o644))
+            .expect("change safe-save temporary mode");
+        assert_eq!(mode(&temporary), 0o644, "safe-save final mode");
+        drop(replacement);
+
+        fs::rename(&temporary, &target).expect("safe-save rename replacement");
+        assert_file(&target, &new_bytes, 0o644);
+
+        let mut fresh_fd = File::open(&target).expect("open fresh safe-save descriptor");
+        let mut fresh_bytes = Vec::new();
+        fresh_fd
+            .read_to_end(&mut fresh_bytes)
+            .expect("read fresh safe-save bytes");
+        assert_eq!(fresh_bytes, new_bytes, "fresh fd bytes after replacement");
+
+        old_fd
+            .seek(SeekFrom::Start(0))
+            .expect("rewind old safe-save descriptor");
+        let mut retained_old_bytes = Vec::new();
+        old_fd
+            .read_to_end(&mut retained_old_bytes)
+            .expect("read old safe-save bytes");
+        assert_eq!(
+            retained_old_bytes, old_bytes,
+            "old fd bytes must remain pinned across rename replacement"
+        );
+        assert_eq!(
+            fixture.remote_read(&config, "safe-save.bin", new_bytes.len()),
+            new_bytes,
+            "independent authority must observe replacement bytes"
+        );
+        drop(fresh_fd);
+        drop(old_fd);
+
+        mounted.unmount();
+        drop(mounted);
+        let mut remounted = fixture.mount(&config, &mountpoint);
+        assert_file(
+            &remounted.mountpoint().join("safe-save.bin"),
+            &new_bytes,
+            0o644,
+        );
+        assert_eq!(
+            fixture.remote_read(&config, "safe-save.bin", new_bytes.len()),
+            new_bytes,
+            "safe-save bytes must remain authoritative after remount"
         );
         remounted.unmount();
     }
