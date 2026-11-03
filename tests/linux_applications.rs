@@ -267,6 +267,24 @@ fn application_safe_save_0600_replacement_preserves_old_fd_and_remounts_both_pub
         fs::create_dir(&mountpoint).expect("create safe-save mountpoint");
         let mut mounted = fixture.mount(&config, &mountpoint);
         let root = mounted.mountpoint();
+        let umask_file = root.join("umask-file.txt");
+        let umask_directory = root.join("umask-directory");
+        let umask_created = Command::new("sh")
+            .env("LC_ALL", "C")
+            .args(["-c", "umask 022; : > \"$1\"; mkdir \"$2\"", "sh"])
+            .arg(&umask_file)
+            .arg(&umask_directory)
+            .output()
+            .expect("run umask create probe");
+        assert!(
+            umask_created.status.success(),
+            "umask create probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&umask_created.stdout),
+            String::from_utf8_lossy(&umask_created.stderr)
+        );
+        assert_file(&umask_file, b"", 0o644);
+        assert_eq!(mode(&umask_directory), 0o755, "directory umask mode");
+
         let target = root.join("safe-save.bin");
         let old_bytes = payload(31, 192 * 1024 + 7);
         let new_bytes = payload(197, 256 * 1024 + 13);
