@@ -329,11 +329,12 @@ impl LocalTree {
         )
     }
 
-    fn verify_private_install_temporary(
+    fn verify_install_temporary(
         &self,
         temporary: &str,
-        desired: &LocalFingerprint,
-    ) -> Result<()> {
+        expected: &LocalFingerprint,
+        allow_stat_reuse: bool,
+    ) -> Result<LocalFingerprint> {
         let path = self.install_path(temporary);
         let file = openat(
             &self.install_fd,
@@ -342,51 +343,39 @@ impl LocalTree {
             Mode::empty(),
         )
         .map_err(|error| Error::errno("open sync download", &path, error))?;
-        let stat =
+        let before =
             fstat(&file).map_err(|error| Error::errno("inspect sync download", &path, error))?;
-        if stat_matches_fingerprint(&stat, desired) {
-            return Ok(());
-        }
-        let (length, digest, _) = hash_at(&self.install_fd, temporary, &path)?;
-        if length != desired.length
-            || digest.as_bytes() != &desired.digest
-            || executable(&stat) != desired.executable
-        {
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
             return Err(Error::corrupt(
-                "downloaded file temporary does not match its accepted content",
+                "downloaded file temporary is not a regular file",
             ));
         }
-        Ok(())
-    }
-
-    fn verify_recovered_install_temporary(
-        &self,
-        temporary: &str,
-        desired: &LocalFingerprint,
-    ) -> Result<()> {
-        let path = self.install_path(temporary);
-        let file = openat(
-            &self.install_fd,
-            temporary,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| Error::errno("open recovered sync download", &path, error))?;
-        let stat = fstat(&file)
-            .map_err(|error| Error::errno("inspect recovered sync download", &path, error))?;
+        if allow_stat_reuse && stat_matches_fingerprint(&before, expected) {
+            return fingerprint_from_stat(
+                &before,
+                self.state_identity,
+                expected.digest,
+                expected.executable,
+            );
+        }
         let (length, digest, identity) = hash_at(&self.install_fd, temporary, &path)?;
-        if length != desired.length
-            || digest.as_bytes() != &desired.digest
-            || identity.dev != stat.st_dev
-            || identity.ino != stat.st_ino
-            || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-            || executable(&stat) != desired.executable
+        let after =
+            fstat(&file).map_err(|error| Error::errno("inspect sync download", &path, error))?;
+        if length != expected.length
+            || digest.as_bytes() != &expected.digest
+            || identity
+                != (Identity {
+                    dev: after.st_dev,
+                    ino: after.st_ino,
+                })
+            || !same_stable_stat(&before, &after)
+            || executable(&after) != expected.executable
         {
             return Err(Error::corrupt(
                 "downloaded file temporary does not match its accepted content",
             ));
         }
-        Ok(())
+        fingerprint_from_stat(&after, self.state_identity, digest, executable(&after))
     }
 
     pub fn create_install_file(&self, prefix: &str) -> Result<(String, PathBuf, std::fs::File)> {
@@ -1073,22 +1062,24 @@ impl LocalTree {
                         self.store.remove_install(&install.id)?;
                         continue;
                     }
+                    let mut verified = None;
                     if install.operation != InstallOperation::Delete {
                         let desired = install.desired_local.ok_or_else(|| {
                             Error::corrupt("prepared file install has no desired content")
                         })?;
-                        if let Err(error) =
-                            self.verify_recovered_install_temporary(&install.temporary, &desired)
-                        {
-                            install.state = InstallState::Failed;
-                            install.error = Some(format!(
-                                "prepared Direct Sync download is unavailable: {error}"
-                            ));
-                            self.store.update_install(&install)?;
-                            continue;
+                        match self.verify_install_temporary(&install.temporary, &desired, false) {
+                            Ok(fingerprint) => verified = Some(fingerprint),
+                            Err(error) => {
+                                install.state = InstallState::Failed;
+                                install.error = Some(format!(
+                                    "prepared Direct Sync download is unavailable: {error}"
+                                ));
+                                self.store.update_install(&install)?;
+                                continue;
+                            }
                         }
                     }
-                    if let Err(error) = self.apply_install(&mut install)
+                    if let Err(error) = self.apply_install(&mut install, verified.as_ref())
                         && error.kind() != ErrorKind::Conflict
                     {
                         return Err(error);
@@ -1184,10 +1175,14 @@ impl LocalTree {
         Ok(())
     }
 
-    pub fn apply_install(&mut self, install: &mut InstallRecord) -> Result<Option<LocalNode>> {
+    pub fn apply_install(
+        &mut self,
+        install: &mut InstallRecord,
+        temporary_evidence: Option<&LocalFingerprint>,
+    ) -> Result<Option<LocalNode>> {
         match install.operation {
             InstallOperation::Create | InstallOperation::Replace => {
-                self.install_file(install).map(Some)
+                self.install_file(install, temporary_evidence).map(Some)
             }
             InstallOperation::Delete => {
                 self.delete_file(install)?;
@@ -1307,11 +1302,19 @@ impl LocalTree {
         }
     }
 
-    fn install_file(&mut self, install: &mut InstallRecord) -> Result<LocalNode> {
+    fn install_file(
+        &mut self,
+        install: &mut InstallRecord,
+        temporary_evidence: Option<&LocalFingerprint>,
+    ) -> Result<LocalNode> {
         let desired = install
             .desired_local
             .ok_or_else(|| Error::corrupt("file install has no desired content"))?;
-        self.verify_private_install_temporary(&install.temporary, &desired)?;
+        self.verify_install_temporary(
+            &install.temporary,
+            temporary_evidence.unwrap_or(&desired),
+            true,
+        )?;
 
         let (parent, name) = split_path(&install.path)?;
         self.ensure_directory(parent)?;
@@ -2435,6 +2438,7 @@ impl Hasher {
 
 #[cfg(test)]
 mod tests {
+    use super::super::adapter::{EntryKind, RemotePin};
     use super::*;
 
     #[test]
@@ -2469,5 +2473,64 @@ mod tests {
                 .iter()
                 .all(|artifact| artifact.origin != "artifact-0")
         );
+    }
+
+    #[test]
+    fn recovery_reuses_verified_temporary_after_stat_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = temp.path().join("state");
+        let tree = LocalTree::create(&root, &state, SyncModel::Managed, "test").unwrap();
+        let bytes = b"recovered bytes";
+        let (temporary, path, file) = tree.create_install_file("download").unwrap();
+        let mut file = file;
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        let desired = tree
+            .install_desired_file(
+                &temporary,
+                DownloadedFile {
+                    length: bytes.len() as u64,
+                    digest: *blake3::hash(bytes).as_bytes(),
+                },
+            )
+            .unwrap();
+        let install = InstallRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: "file".to_owned(),
+            operation: InstallOperation::Create,
+            state: InstallState::Prepared,
+            expected_local: None,
+            desired_local: Some(desired),
+            desired_remote: Some(RemoteEntry {
+                path: "file".to_owned(),
+                kind: EntryKind::File,
+                length: bytes.len() as u64,
+                digest: Some([3; 32]),
+                executable: false,
+                pin: RemotePin::Managed {
+                    node: [1; 16],
+                    revision: [2; 24],
+                    digest: Some([3; 32]),
+                    executable: false,
+                    directory: false,
+                },
+            }),
+            temporary,
+            artifact: None,
+            error: None,
+        };
+        tree.store().insert_install(&install).unwrap();
+        drop(tree);
+
+        let mut touched = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        touched.write_all(bytes).unwrap();
+        touched.sync_all().unwrap();
+        drop(touched);
+
+        let mut reopened = LocalTree::open(&state, SyncModel::Managed, "test").unwrap();
+        reopened.recover_installs().unwrap();
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), bytes);
+        assert!(reopened.store().installs().unwrap().is_empty());
     }
 }

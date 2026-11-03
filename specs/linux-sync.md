@@ -183,9 +183,10 @@ rename or exchange and hashes the user-visible installed file once for baseline
 acceptance. The expected local inode, parent identity and bytes are still checked
 at the effect boundary; any changed evidence falls back to hashing and a changed
 target is retained as a conflict. Recovery treats a recorded temporary as
-untrusted across process restart and verifies its content once before continuing.
-Deletion first quarantines the exact observed inode. Recovery interprets only
-durable install rows and never guesses from a path name alone.
+untrusted across process restart, verifies its content once, and passes the
+resulting fingerprint into the install attempt. Deletion first quarantines the
+exact observed inode. Recovery interprets only durable install rows and never
+guesses from a path name alone.
 
 ## Retained artifacts
 

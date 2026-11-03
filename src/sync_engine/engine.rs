@@ -1142,9 +1142,11 @@ impl<R: RemoteAdapter> SyncEngine<R> {
         };
         install.desired_local = Some(desired);
         self.local.store().update_install(&install)?;
-        self.local.apply_install(&mut install)?.ok_or_else(|| {
-            Error::corrupt("file installation did not return its installed local node")
-        })
+        self.local
+            .apply_install(&mut install, None)?
+            .ok_or_else(|| {
+                Error::corrupt("file installation did not return its installed local node")
+            })
     }
 
     async fn delete_local_file(&mut self, path: &str, expected: LocalFingerprint) -> Result<()> {
@@ -1161,7 +1163,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             error: None,
         };
         self.local.store().insert_install(&install)?;
-        self.local.apply_install(&mut install).map(|_| ())
+        self.local.apply_install(&mut install, None).map(|_| ())
     }
 
     async fn record_conflict(
