@@ -511,7 +511,13 @@ impl<B: Backend> AdapterInner<B> {
             .await
         {
             Ok(created) => created,
-            Err(error) => return reply.error(error.errno()),
+            Err(error) => {
+                eprintln!(
+                    "yy probe: FUSE CREATE rejected name={name:?} errno={:?}",
+                    error.errno()
+                );
+                return reply.error(error.errno());
+            }
         };
         let attr = match self.attribute_for(created.id, created.attr) {
             Ok(attr) => attr,
