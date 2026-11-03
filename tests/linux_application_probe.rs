@@ -22,7 +22,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -80,6 +80,15 @@ fn probe_rsync_default_creation_fuse_mode() {
         String::from_utf8_lossy(&mounted_rsync.stdout),
         String::from_utf8_lossy(&mounted_rsync.stderr)
     );
+
+    let ordinary = mounted.mountpoint().join("ordinary-create.txt");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o666)
+        .open(&ordinary)
+        .expect("create an ordinary 0666 file through FUSE");
+
     eprintln!("yy output:\n{}", mounted.output_text());
     assert_eq!(
         mounted_rsync.status.code(),
