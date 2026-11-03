@@ -329,7 +329,7 @@ impl LocalTree {
         )
     }
 
-    pub fn verify_install_temporary(
+    fn verify_private_install_temporary(
         &self,
         temporary: &str,
         desired: &LocalFingerprint,
@@ -350,6 +350,36 @@ impl LocalTree {
         let (length, digest, _) = hash_at(&self.install_fd, temporary, &path)?;
         if length != desired.length
             || digest.as_bytes() != &desired.digest
+            || executable(&stat) != desired.executable
+        {
+            return Err(Error::corrupt(
+                "downloaded file temporary does not match its accepted content",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_recovered_install_temporary(
+        &self,
+        temporary: &str,
+        desired: &LocalFingerprint,
+    ) -> Result<()> {
+        let path = self.install_path(temporary);
+        let file = openat(
+            &self.install_fd,
+            temporary,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::errno("open recovered sync download", &path, error))?;
+        let stat = fstat(&file)
+            .map_err(|error| Error::errno("inspect recovered sync download", &path, error))?;
+        let (length, digest, identity) = hash_at(&self.install_fd, temporary, &path)?;
+        if length != desired.length
+            || digest.as_bytes() != &desired.digest
+            || identity.dev != stat.st_dev
+            || identity.ino != stat.st_ino
+            || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
             || executable(&stat) != desired.executable
         {
             return Err(Error::corrupt(
@@ -1048,7 +1078,7 @@ impl LocalTree {
                             Error::corrupt("prepared file install has no desired content")
                         })?;
                         if let Err(error) =
-                            self.verify_install_temporary(&install.temporary, &desired)
+                            self.verify_recovered_install_temporary(&install.temporary, &desired)
                         {
                             install.state = InstallState::Failed;
                             install.error = Some(format!(
@@ -1281,7 +1311,7 @@ impl LocalTree {
         let desired = install
             .desired_local
             .ok_or_else(|| Error::corrupt("file install has no desired content"))?;
-        self.verify_install_temporary(&install.temporary, &desired)?;
+        self.verify_private_install_temporary(&install.temporary, &desired)?;
 
         let (parent, name) = split_path(&install.path)?;
         self.ensure_directory(parent)?;
@@ -1504,46 +1534,13 @@ impl LocalTree {
 
         install.state = InstallState::Applied;
         self.store.update_install(install)?;
-        let installed = openat(
-            &parent_fd,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| {
-            Error::errno(
-                "open installed Direct Sync file",
-                &self.root.join(&install.path),
-                error,
-            )
-        })?;
-        let installed_stat = fstat(&installed).map_err(|error| {
-            Error::errno(
-                "inspect installed Direct Sync file",
-                &self.root.join(&install.path),
-                error,
-            )
-        })?;
-        let fingerprint = if FileType::from_raw_mode(installed_stat.st_mode)
-            == FileType::RegularFile
-            && stat_matches_renamed_fingerprint(&installed_stat, &desired)
-        {
-            fingerprint_from_stat(
-                &installed_stat,
-                parent_identity,
-                desired.digest,
-                desired.executable,
-            )?
-        } else {
-            let fingerprint = self.local_fingerprint(&install.path)?;
-            if !desired_matches(install.desired_local, Some(fingerprint)) {
-                return self.install_conflict(
-                    install,
-                    "installed local bytes changed before baseline acceptance",
-                );
-            }
-            fingerprint
-        };
+        let fingerprint = self.local_fingerprint(&install.path)?;
+        if !desired_matches(install.desired_local, Some(fingerprint)) {
+            return self.install_conflict(
+                install,
+                "installed local bytes changed before baseline acceptance",
+            );
+        }
         let baseline = build_baseline(install, fingerprint)?;
         let baseline_ref = baseline
             .as_ref()
@@ -2024,19 +2021,6 @@ fn stat_matches_fingerprint(stat: &Stat, fingerprint: &LocalFingerprint) -> bool
         && recorded.mtime_nsec == stat.st_mtime_nsec as i64
         && recorded.ctime == stat.st_ctime
         && recorded.ctime_nsec == stat.st_ctime_nsec as i64
-        && fingerprint.identity() == super::types::identity(stat)
-        && fingerprint.executable == executable(stat)
-}
-
-fn stat_matches_renamed_fingerprint(stat: &Stat, fingerprint: &LocalFingerprint) -> bool {
-    let Some(recorded) = fingerprint.stat else {
-        return false;
-    };
-    recorded.dev == stat.st_dev
-        && recorded.ino == stat.st_ino
-        && fingerprint.length == stat.st_size as u64
-        && recorded.mtime == stat.st_mtime
-        && recorded.mtime_nsec == stat.st_mtime_nsec as i64
         && fingerprint.identity() == super::types::identity(stat)
         && fingerprint.executable == executable(stat)
 }

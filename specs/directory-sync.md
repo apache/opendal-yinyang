@@ -27,8 +27,9 @@ verification unit before its bytes are written into the engine-owned fd. The
 same read accumulates the flat BLAKE3 digest used as the engine's local
 fingerprint, so the temporary file is not read back solely to authenticate it.
 Installation rechecks the private temporary's stat evidence and falls back to
-hashing if that evidence changed. Publication reuses the exact prepared request
-rather than materializing fresh bytes at publish time.
+hashing if that evidence changed. After installation, the engine hashes the
+user-visible file once for baseline acceptance. Publication reuses the exact
+prepared request rather than materializing fresh bytes at publish time.
 
 ## Observation
 
