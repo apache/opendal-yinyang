@@ -448,6 +448,9 @@ impl<B: Backend> AdapterInner<B> {
         fh: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
+        if let Some(mode) = mode {
+            eprintln!("yy probe: FUSE SETATTR mode={mode:04o}");
+        }
         let Some(id) = self.node(ino) else {
             return reply.error(fuser::Errno::ESTALE);
         };
@@ -492,6 +495,10 @@ impl<B: Backend> AdapterInner<B> {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        eprintln!(
+            "yy probe: FUSE CREATE name={name:?} mode={mode:04o} umask={umask:04o} effective={:04o} flags={flags:#x}",
+            mode & !umask & 0o777
+        );
         if self.backend.read_only() {
             return reply.error(fuser::Errno::EROFS);
         }
@@ -531,6 +538,10 @@ impl<B: Backend> AdapterInner<B> {
     }
 
     async fn mkdir(&self, parent: INodeNo, name: String, mode: u32, umask: u32, reply: ReplyEntry) {
+        eprintln!(
+            "yy probe: FUSE MKDIR name={name:?} mode={mode:04o} umask={umask:04o} effective={:04o}",
+            mode & !umask & 0o777
+        );
         if self.backend.read_only() {
             return reply.error(fuser::Errno::EROFS);
         }
@@ -585,6 +596,10 @@ impl<B: Backend> AdapterInner<B> {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        eprintln!(
+            "yy probe: FUSE RENAME parent={} name={name:?} new_parent={} new_name={new_name:?} flags={:?}",
+            parent.0, new_parent.0, flags
+        );
         if self.backend.read_only() {
             return reply.error(fuser::Errno::EROFS);
         }
