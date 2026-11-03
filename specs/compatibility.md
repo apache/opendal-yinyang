@@ -31,17 +31,20 @@ known profiles return `Corrupt` or `Invalid` as appropriate.
 | Family | Supported identifier | Reader | Writer | Older profiles | Newer profiles |
 | --- | --- | --- | --- | --- | --- |
 | Authenticated content | `YYFILE02` descriptor, `YYHASH02` index, 64 KiB logical units, content hash context 2 | Yes | Yes | No | Reject |
-| Object metadata | `YYHEAD02` mode 0, `YYSNAP02`, `YYINDEX2` | Yes | Yes | Reject `YYHEAD01` | Reject |
+| Object metadata | `YYHEAD03` mode 0, `YYSNAP03`, `YYINDEX2` | Yes | Yes | Reject `YYHEAD01`, `YYHEAD02`, `YYSNAP02` | Reject |
 | Canonical request | `YYREQ002`, request hash context 2, node identity context 2 | Yes | Yes | No | Reject |
 | Frozen transaction | `YYPLAN01` | Yes | Yes | No | Reject |
+| Expiry request | `YYEXP001`, expiry hash context 1 | Yes | Yes | No | Reject |
 | Service binding | `YYSERV01` | Yes | Yes | No | Reject |
-| SQLite authority | `yinyang-sqlite-2` | Yes | Yes | No | Reject |
-| Loopback RPC | Protocol version 1 | Yes | Yes | No | Reject |
+| SQLite authority | `yinyang-sqlite-3` | Yes | Yes | Reject `yinyang-sqlite-2` | Reject |
+| Loopback RPC | Protocol version 1, commands 0-9, error tags 0-12 | Yes | Yes | No | Reject |
 
 The current writer emits only the identifiers in this table. The current reader
 does not perform an in-place profile upgrade, downgrade, authority-mode switch,
-or mixed-profile write. A retained object, receipt, or frozen request remains
-readable only while every profile reached by that state is supported.
+or mixed-profile write. A known object, receipt, or frozen request remains
+interpretable only while every profile reached by that state is supported.
+Logical `Expired` status is not an unknown profile and does not erase the
+retained descriptor, receipt, or physical bytes.
 
 All rows are independently versioned. Implementing one row does not imply
 support for another. In particular, a valid service binding cannot be opened as
@@ -60,6 +63,7 @@ can mutate durable state:
 | Object head | Exact head bytes and profile/mode | `Unsupported` before head creation or replacement | `Corrupt` |
 | Object snapshot and index | Identifier before interpreting fields or child records | `Unsupported` before publication | `Corrupt` |
 | Frozen plan | Identifier before authority observation or content import | `Unsupported` | `Corrupt` or `Invalid` |
+| Expiry request | `YYEXP001`, bounded canonical candidates, authority and digest | `Unsupported` | `Corrupt` or `Invalid` |
 | Service binding | Exact `YYSERV01` envelope before client acceptance | `Unsupported` | `Corrupt`; a different valid binding is `Invalid` |
 | SQLite authority | Schema profile, manifest, required tables, and exact column set before WAL or DDL | `Unsupported` without changing the database | `Corrupt` without changing the database |
 | Loopback RPC | Frame decode and token authentication, then protocol version | `Unsupported` before command dispatch | `Invalid` |
@@ -95,6 +99,12 @@ across snapshots. The study did not compare other unit sizes and does not make
 64 KiB an optimum. Packing targets, page-cache sizes, batch limits, retry counts,
 and other requested-range policy are tunable without changing logical identity
 when the authenticated bytes and identities remain unchanged.
+
+Object history stores one status-prefixed record per known revision. Readable
+and expired records retain the same authenticated snapshot descriptor. Expiry
+does not introduce a second history root or a pin/reader registry. Fresh lookup
+distinguishes `Expired` from `NotFound`; held snapshots and exact frozen-plan
+restoration use the same known record without changing its status.
 
 ## Local state
 

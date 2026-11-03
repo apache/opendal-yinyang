@@ -847,13 +847,29 @@ impl FileHandle {
         if r.conflict {
             return Err(Error::Conflict);
         }
-        let request = if let Some(bytes) = &r.plan {
-            self.runtime
-                .inner
-                .authority
-                .restore_transaction(bytes)
+        let (request_id, outcome) = if let Some(bytes) = &r.plan {
+            let (_, request_id, _) = yinyang_core::Transaction::verify_identity(
+                bytes,
+                self.runtime.authority().filesystem(),
+            )
+            .map_err(Error::from)?;
+            let outcome = self
+                .runtime
+                .authority()
+                .commit_frozen_batch(std::slice::from_ref(bytes))
                 .await
-                .map_err(Error::from)?
+                .and_then(|mut outcomes| {
+                    if outcomes.len() == 1 {
+                        Ok(outcomes.remove(0))
+                    } else {
+                        Err(yinyang_core::Error::new(
+                            yinyang_core::ErrorKind::Corrupt,
+                            "frozen publication",
+                            "authority returned the wrong outcome count",
+                        ))
+                    }
+                });
+            (request_id, outcome)
         } else {
             let prepared = self.prepare_publication(&r).await?;
             let revision = Revision::from_bytes(r.base);
@@ -868,15 +884,19 @@ impl FileHandle {
             r.plan = Some(request.to_bytes()?);
             // Persist before dispatch: cancellation can never lose request identity.
             stage.save_durable(r.clone()).await?;
-            request
+            let request_id = request.id();
+            (request_id, self.runtime.authority().commit(&request).await)
         };
         self.base.lock().await.snapshot = None;
-        match self.runtime.authority().commit(&request).await {
+        match outcome {
             Err(error) => {
                 // The plan is already frozen and dispatch may still publish.
                 // A generic response or transport error cannot be a definitive
                 // failure; identity and digest stay available on the handle.
-                Err(Error::Retained(Failure::unknown_with(request.id(), error)))
+                Err(Error::Retained(Failure::unknown_with(
+                    request_id,
+                    Error::from(error),
+                )))
             }
             Ok(outcome) => match outcome {
                 CommitOutcome::Committed(receipt) => {

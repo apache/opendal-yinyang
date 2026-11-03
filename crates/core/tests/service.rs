@@ -20,7 +20,8 @@ use support::TestBackend;
 use yinyang_core::object::ObjectFs;
 use yinyang_core::service::{MetadataService, ServiceClient, serve};
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, Planner,
+    Authority, CommitId, CommitOutcome as Outcome, ContentEdit, ErrorKind, ExpiryRequest, Planner,
+    RevisionStatus, Transaction,
 };
 use yinyang_test_support as support;
 
@@ -289,8 +290,13 @@ async fn retained_revision_history_is_paginated_through_the_service_protocol() {
         plan.create_directory(service.root(), name).await.unwrap();
         committed(service.commit(&plan.finish().unwrap()).await.unwrap());
     }
-    let expected = service.retained_revisions().await.unwrap();
+    let expected = service.revision_history().await.unwrap();
     assert_eq!(expected.len(), 4);
+    assert!(
+        expected
+            .iter()
+            .all(|record| record.status == yinyang_core::RevisionStatus::Readable)
+    );
 
     let token = "test-only-service-token-32-bytes-long";
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -300,20 +306,17 @@ async fn retained_revision_history_is_paginated_through_the_service_protocol() {
         .await
         .unwrap();
 
-    let first = client.retained_revisions_page(None, 2).await.unwrap();
+    let first = client.revision_history_page(None, 2).await.unwrap();
     assert_eq!(first.revisions, expected[..2]);
     let cursor = first
         .next
         .expect("two of four revisions have a continuation");
-    let second = client
-        .retained_revisions_page(Some(cursor), 2)
-        .await
-        .unwrap();
+    let second = client.revision_history_page(Some(cursor), 2).await.unwrap();
     assert_eq!(second.revisions, expected[2..]);
     assert_eq!(second.next, None);
     assert_eq!(
         client
-            .retained_revisions_page(None, 0)
+            .revision_history_page(None, 0)
             .await
             .unwrap_err()
             .kind(),
@@ -479,7 +482,9 @@ async fn service_rejects_unregistered_content_and_missing_guards() {
         .await
         .unwrap_err();
     assert!(
-        error.message().contains("missing mandatory predicate"),
+        error
+            .message()
+            .contains("canonical request digest mismatch"),
         "{error}"
     );
     committed(service.commit(&plan).await.unwrap());
@@ -619,5 +624,208 @@ async fn independent_authorities_busy_retry_and_identity_misuse() {
             .unwrap_err()
             .kind(),
         ErrorKind::Invalid
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_expiry_preserves_held_views_and_replays_receipts_without_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let path = dir.path().join("metadata.db");
+    let service = MetadataService::create(&path, backend.operator())
+        .await
+        .unwrap();
+    let prepared = service.prepare(&mut b"held".as_slice()).await.unwrap();
+    let mut create = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    let file = create
+        .create_file(service.root(), "held", prepared, false)
+        .await
+        .unwrap();
+    let create = create.finish().unwrap();
+    let created = committed(service.commit(&create).await.unwrap());
+    let held = service
+        .observe_revision(created.cursor.revision)
+        .await
+        .unwrap();
+    let held_file = held.open_file(file).await.unwrap();
+    let mut advance = Planner::new(&held, CommitId::generate());
+    advance
+        .create_directory(service.root(), "advance")
+        .await
+        .unwrap();
+    let current = committed(service.commit(&advance.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        service.filesystem(),
+        CommitId::generate(),
+        current.cursor.revision,
+        vec![created.cursor.revision],
+    )
+    .unwrap();
+    let expiry = committed(service.expire(&request).await.unwrap());
+    assert_eq!(expiry.commit_id, request.id());
+
+    assert_eq!(
+        service
+            .observe_revision(created.cursor.revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Expired
+    );
+    assert!(held.resolve("held").await.unwrap().is_some());
+    assert_eq!(held_file.read(0, 4).await.unwrap(), b"held");
+    service
+        .prepare_overwrite(&held_file, &[ContentEdit::new(0..1, b"H").unwrap()])
+        .await
+        .unwrap();
+
+    let wire = create.to_bytes().unwrap();
+    let descriptor = Transaction::inspect(&wire).unwrap().1[0].to_bytes();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "DELETE FROM prepared WHERE descriptor=?1",
+            rusqlite::params![descriptor],
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .commit_frozen_batch(&[wire])
+            .await
+            .unwrap()
+            .remove(0),
+        Outcome::Committed(created)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_client_expiry_preserves_remote_snapshot_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    let prepared = service.prepare(&mut b"remote".as_slice()).await.unwrap();
+    let mut create = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    create
+        .create_file(service.root(), "remote", prepared, false)
+        .await
+        .unwrap();
+    let created = committed(service.commit(&create.finish().unwrap()).await.unwrap());
+    let mut advance = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    advance
+        .create_directory(service.root(), "advance")
+        .await
+        .unwrap();
+    let current = committed(service.commit(&advance.finish().unwrap()).await.unwrap());
+
+    let token = "test-expiry-held-snapshot-token-123456";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(listener, service.clone(), token.into()));
+    let client = ServiceClient::connect(addr, token.into(), backend.operator())
+        .await
+        .unwrap();
+    let held = client
+        .observe_revision(created.cursor.revision)
+        .await
+        .unwrap();
+    let request = ExpiryRequest::new(
+        client.filesystem(),
+        CommitId::generate(),
+        current.cursor.revision,
+        vec![created.cursor.revision],
+    )
+    .unwrap();
+    let receipt = committed(client.expire(&request).await.unwrap());
+
+    assert_eq!(receipt.request_digest, request.digest());
+    assert_eq!(
+        client
+            .observe_revision(created.cursor.revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Expired
+    );
+    assert!(held.resolve("remote").await.unwrap().is_some());
+    let history = client.revision_history_page(None, 8).await.unwrap();
+    assert!(history.revisions.iter().any(|record| {
+        record.revision == created.cursor.revision && record.status == RevisionStatus::Expired
+    }));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_expiry_early_exits_release_the_writer_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = TestBackend::default();
+    let service = MetadataService::create(dir.path().join("metadata.db"), backend.operator())
+        .await
+        .unwrap();
+    let initial = service.observe_latest().await.unwrap();
+    let mut current = Planner::new(&initial, CommitId::generate());
+    current
+        .create_directory(service.root(), "current")
+        .await
+        .unwrap();
+    let current = committed(service.commit(&current.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        service.filesystem(),
+        CommitId::generate(),
+        current.cursor.revision,
+        vec![initial.revision()],
+    )
+    .unwrap();
+    let first = committed(service.expire(&request).await.unwrap());
+    assert_eq!(committed(service.expire(&request).await.unwrap()), first);
+
+    let mut after_replay = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    after_replay
+        .create_directory(service.root(), "after-replay")
+        .await
+        .unwrap();
+    committed(
+        service
+            .commit(&after_replay.finish().unwrap())
+            .await
+            .unwrap(),
+    );
+
+    let conflict = ExpiryRequest::new(
+        service.filesystem(),
+        CommitId::generate(),
+        first.cursor.revision,
+        vec![current.cursor.revision],
+    )
+    .unwrap();
+    assert_eq!(service.expire(&conflict).await.unwrap(), Outcome::Conflict);
+
+    let mut after_conflict = Planner::new(
+        &service.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    after_conflict
+        .create_directory(service.root(), "after-conflict")
+        .await
+        .unwrap();
+    committed(
+        service
+            .commit(&after_conflict.finish().unwrap())
+            .await
+            .unwrap(),
     );
 }

@@ -17,7 +17,7 @@
 
 //! Read-only physical-reference reachability for published authority roots.
 
-use crate::authority::{Authority, RETAINED_REVISIONS_PAGE_MAX};
+use crate::authority::Authority;
 use crate::data::{ContentDescriptor, ContentReferenceKind, DataStore, PackedRef, RefWire};
 use crate::index::{Index, IndexCache, MetadataVisitor};
 use crate::namespace::{DirectoryEntry, Node, NodeKind, decode};
@@ -233,50 +233,11 @@ async fn collect_retained_revision_count<A: Authority + ?Sized>(
     authority: &A,
     latest: Revision,
 ) -> Result<u64> {
-    let mut after = None;
-    let mut revisions = BTreeSet::new();
-    loop {
-        let page = authority
-            .retained_revisions_page(after, RETAINED_REVISIONS_PAGE_MAX)
-            .await?;
-        if page.revisions.is_empty() {
-            if page.next.is_some() {
-                return Err(Error::new(
-                    ErrorKind::Corrupt,
-                    "list retained revisions",
-                    "authority returned an empty non-terminal page",
-                ));
-            }
-            break;
-        }
-        for revision in page.revisions {
-            if after.is_some_and(|cursor| revision <= cursor) || !revisions.insert(revision) {
-                return Err(Error::new(
-                    ErrorKind::Corrupt,
-                    "list retained revisions",
-                    "authority page is not strictly ordered",
-                ));
-            }
-        }
-        let last = revisions.iter().next_back().copied();
-        match page.next {
-            Some(next) if after.is_none_or(|cursor| next > cursor) && last == Some(next) => {
-                after = Some(next)
-            }
-            Some(_) => {
-                return Err(Error::new(
-                    ErrorKind::Corrupt,
-                    "list retained revisions",
-                    "authority continuation does not advance",
-                ));
-            }
-            None => break,
-        }
-    }
+    let revisions = authority.retained_revisions().await?;
     if !revisions.contains(&latest) {
         return Err(Error::corrupt(
             "list retained revisions",
-            "latest observation is absent from the retained revision index",
+            "latest observation is absent from the readable revision history",
         ));
     }
     revisions.len().try_into().map_err(|_| {
@@ -631,9 +592,18 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                     Ok(())
                 })
             }
-            ObjectTable::History => match <[u8; 24]>::try_from(key) {
-                Ok(revision) => {
-                    let revision = Revision::from_bytes(revision);
+            ObjectTable::History => {
+                if key.len() != 25 || key[0] > 1 {
+                    Err(Error::corrupt(
+                        "inspect physical roots",
+                        "invalid typed history key",
+                    ))
+                } else {
+                    let revision = Revision::from_bytes(
+                        key[1..]
+                            .try_into()
+                            .expect("the typed history key was length checked"),
+                    );
                     if revision > self.revision {
                         Err(Error::corrupt(
                             "inspect physical roots",
@@ -647,11 +617,7 @@ impl MetadataVisitor for ObjectMetadataVisitor<'_> {
                             })
                     }
                 }
-                Err(_) => Err(Error::corrupt(
-                    "inspect physical roots",
-                    "invalid retained revision key",
-                )),
-            },
+            }
         };
         if let Err(error) = result {
             self.inspection

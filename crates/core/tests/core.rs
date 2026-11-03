@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 use support::*;
-use yinyang_core::{Authority, CommitId, ContentEdit, ErrorKind, NodeId};
+use yinyang_core::{
+    Authority, CommitId, ContentEdit, ErrorKind, ExpiryRequest, NodeId, RevisionStatus,
+};
 use yinyang_test_support as support;
 
 use yinyang_core::namespace::NodeKind as IndexedKind;
@@ -251,6 +253,40 @@ async fn retained_revisions_are_sorted_deduplicated_and_metadata_authenticated()
 }
 
 #[tokio::test]
+async fn ordinary_object_commits_remain_readable_after_current_expiry_refusal() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let mut revisions = Vec::new();
+    for name in ["one", "two", "three"] {
+        let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        plan.create_directory(fs.root(), name).await.unwrap();
+        let receipt = committed(fs.commit(&plan.finish().unwrap()).await.unwrap());
+        revisions.push((receipt.cursor.revision, name));
+    }
+
+    let current = fs.observe_latest().await.unwrap();
+    assert_eq!(
+        ExpiryRequest::new(
+            fs.filesystem(),
+            CommitId::generate(),
+            current.revision(),
+            vec![current.revision()],
+        )
+        .unwrap_err()
+        .kind(),
+        ErrorKind::Invalid
+    );
+
+    for (revision, name) in revisions {
+        let snapshot = fs.observe_revision(revision).await.unwrap();
+        assert!(
+            snapshot.resolve(name).await.unwrap().is_some(),
+            "ordinary commit history for {name} was not readable"
+        );
+    }
+}
+
+#[tokio::test]
 async fn immutable_file_versions_reuse_verified_ranges_without_crossing_versions() {
     let backend = TestBackend::default();
     let fs = object_fs(&backend).await;
@@ -383,6 +419,334 @@ async fn exact_published_overwrite_rejects_cross_binding_and_affected_corruption
 }
 
 #[tokio::test]
+async fn explicit_expiry_preserves_held_versions_and_reports_typed_history() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let prepared = fs.data().prepare(&mut b"held".as_slice()).await.unwrap();
+    let mut create = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    let file = create
+        .create_file(fs.root(), "held", prepared, false)
+        .await
+        .unwrap();
+    let created = committed(fs.commit(&create.finish().unwrap()).await.unwrap());
+    let held = fs.observe_revision(created.cursor.revision).await.unwrap();
+    let held_file = held.open_file(file).await.unwrap();
+
+    let mut advance = Planner::new(&held, CommitId::generate());
+    advance.create_directory(fs.root(), "later").await.unwrap();
+    committed(fs.commit(&advance.finish().unwrap()).await.unwrap());
+    let latest = fs.observe_latest().await.unwrap();
+    let expiry_id = CommitId::generate();
+    let request = ExpiryRequest::new(
+        fs.filesystem(),
+        expiry_id,
+        latest.revision(),
+        vec![created.cursor.revision],
+    )
+    .unwrap();
+    let expiry = committed(fs.expire(&request).await.unwrap());
+    assert_eq!(expiry.commit_id, expiry_id);
+    assert_eq!(expiry.request_digest, request.digest());
+
+    assert_eq!(
+        fs.observe_revision(created.cursor.revision)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Expired
+    );
+    assert_eq!(
+        fs.observe_revision(yinyang_core::Revision::from_bytes([0xff; 24]))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert!(held.resolve("held").await.unwrap().is_some());
+    assert_eq!(held_file.read(0, 4).await.unwrap(), b"held");
+
+    let history = fs.revision_history().await.unwrap();
+    assert!(history.iter().any(|record| {
+        record.revision == created.cursor.revision && record.status == RevisionStatus::Expired
+    }));
+    assert!(history.iter().any(|record| {
+        record.revision == latest.revision() && record.status == RevisionStatus::Readable
+    }));
+    assert!(
+        !fs.retained_revisions()
+            .await
+            .unwrap()
+            .contains(&created.cursor.revision)
+    );
+    assert_eq!(
+        ExpiryRequest::new(
+            fs.filesystem(),
+            CommitId::generate(),
+            latest.revision(),
+            vec![latest.revision()],
+        )
+        .unwrap_err()
+        .kind(),
+        ErrorKind::Invalid
+    );
+}
+
+#[tokio::test]
+async fn expiry_expected_latest_and_candidate_refusal_are_all_or_none() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let initial = fs.observe_latest().await.unwrap().revision();
+    let mut first = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    first.create_directory(fs.root(), "first").await.unwrap();
+    let first = committed(fs.commit(&first.finish().unwrap()).await.unwrap());
+    let mut second = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    second.create_directory(fs.root(), "second").await.unwrap();
+    let second = committed(fs.commit(&second.finish().unwrap()).await.unwrap());
+
+    committed(
+        fs.expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                second.cursor.revision,
+                vec![initial],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let latest = fs.observe_latest().await.unwrap().revision();
+    let error = fs
+        .expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                latest,
+                vec![first.cursor.revision, initial],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Expired);
+    fs.observe_revision(first.cursor.revision).await.unwrap();
+    assert_eq!(fs.observe_latest().await.unwrap().revision(), latest);
+
+    assert_eq!(
+        fs.expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                second.cursor.revision,
+                vec![first.cursor.revision],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+        Outcome::Conflict
+    );
+    assert_eq!(
+        fs.expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                latest,
+                vec![yinyang_core::Revision::from_bytes([0xee; 24])],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err()
+        .kind(),
+        ErrorKind::NotFound
+    );
+    fs.observe_revision(first.cursor.revision).await.unwrap();
+}
+
+#[tokio::test]
+async fn expiry_resolves_lost_head_acknowledgement_from_the_fresh_head() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let initial = fs.observe_latest().await.unwrap().revision();
+    let mut advance = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    advance
+        .create_directory(fs.root(), "current")
+        .await
+        .unwrap();
+    let current = committed(fs.commit(&advance.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        fs.filesystem(),
+        CommitId::generate(),
+        current.cursor.revision,
+        vec![initial],
+    )
+    .unwrap();
+
+    {
+        let mut state = backend.state.lock().unwrap();
+        state.fail_after_head_write = true;
+        // The first read belongs to the initial observe. The second lets the
+        // post-error receipt resolution see the new head.
+        state.fail_head_read_after = Some(2);
+    }
+    let receipt = committed(fs.expire(&request).await.unwrap());
+    assert_eq!(receipt.request_digest, request.digest());
+}
+
+#[tokio::test]
+async fn expiry_lost_response_stays_unknown_and_retries_to_original_receipt() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let initial = fs.observe_latest().await.unwrap().revision();
+    let mut advance = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    advance
+        .create_directory(fs.root(), "current")
+        .await
+        .unwrap();
+    let current = committed(fs.commit(&advance.finish().unwrap()).await.unwrap());
+    let request = ExpiryRequest::new(
+        fs.filesystem(),
+        CommitId::generate(),
+        current.cursor.revision,
+        vec![initial],
+    )
+    .unwrap();
+
+    backend.lose_next_head_response_and_go_offline();
+    assert_eq!(
+        fs.expire(&request).await.unwrap(),
+        Outcome::Unknown(request.id())
+    );
+    backend.state.lock().unwrap().offline = false;
+    let receipt = committed(fs.expire(&request).await.unwrap());
+    assert_eq!(receipt.commit_id, request.id());
+    assert_eq!(
+        fs.observe_revision(initial).await.unwrap_err().kind(),
+        ErrorKind::Expired
+    );
+}
+
+#[tokio::test]
+async fn expired_base_still_restores_exact_frozen_plan_before_receipt_replay() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let initial = fs.observe_latest().await.unwrap();
+    let prepared = fs.data().prepare(&mut b"frozen".as_slice()).await.unwrap();
+    let mut plan = Planner::new(&initial, CommitId::generate());
+    let file = plan
+        .create_file(fs.root(), "frozen", prepared, false)
+        .await
+        .unwrap();
+    let frozen = plan.finish().unwrap();
+    let wire = frozen.to_bytes().unwrap();
+
+    let mut advance = Planner::new(&initial, CommitId::generate());
+    advance
+        .create_directory(fs.root(), "advance")
+        .await
+        .unwrap();
+    let current = committed(fs.commit(&advance.finish().unwrap()).await.unwrap());
+    committed(
+        fs.expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                current.cursor.revision,
+                vec![initial.revision()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let receipt = committed(
+        fs.commit_frozen_batch(std::slice::from_ref(&wire))
+            .await
+            .unwrap()
+            .remove(0),
+    );
+    assert_eq!(receipt.commit_id, frozen.id());
+    assert_eq!(
+        fs.observe_latest()
+            .await
+            .unwrap()
+            .open_file(file)
+            .await
+            .unwrap()
+            .read(0, 6)
+            .await
+            .unwrap(),
+        b"frozen"
+    );
+
+    assert_eq!(
+        fs.commit_frozen_batch(&[wire]).await.unwrap().remove(0),
+        Outcome::Committed(receipt)
+    );
+}
+
+#[tokio::test]
+async fn frozen_batch_preserves_input_order_for_mixed_receipt_states() {
+    let backend = TestBackend::default();
+    let fs = object_fs(&backend).await;
+    let prepared = fs.data().prepare(&mut b"first".as_slice()).await.unwrap();
+    let mut first = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+    first
+        .create_file(fs.root(), "first", prepared, false)
+        .await
+        .unwrap();
+    let first = first.finish().unwrap();
+    let first_receipt = committed(fs.commit(&first).await.unwrap());
+
+    let pending_base = fs.observe_latest().await.unwrap();
+    let prepared = fs.data().prepare(&mut b"pending".as_slice()).await.unwrap();
+    let mut pending = Planner::new(&pending_base, CommitId::generate());
+    pending
+        .create_file(fs.root(), "pending", prepared, false)
+        .await
+        .unwrap();
+    let pending = pending.finish().unwrap();
+
+    let mut advance = Planner::new(&pending_base, CommitId::generate());
+    advance
+        .create_directory(fs.root(), "advance")
+        .await
+        .unwrap();
+    let current = committed(fs.commit(&advance.finish().unwrap()).await.unwrap());
+    committed(
+        fs.expire(
+            &ExpiryRequest::new(
+                fs.filesystem(),
+                CommitId::generate(),
+                current.cursor.revision,
+                vec![pending_base.revision()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let outcomes = fs
+        .commit_frozen_batch(&[pending.to_bytes().unwrap(), first.to_bytes().unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    let Outcome::Committed(pending_receipt) = &outcomes[0] else {
+        panic!("pending request did not commit");
+    };
+    assert_eq!(pending_receipt.commit_id, pending.id());
+    assert_eq!(
+        outcomes[1],
+        Outcome::Committed(first_receipt),
+        "a mixed batch must retain input order instead of grouping receipts"
+    );
+}
+
+#[tokio::test]
 async fn indexed_deep_paths_names_and_invalid_profiles() {
     use yinyang_core::namespace::name_key;
     for name in [
@@ -428,22 +792,24 @@ async fn indexed_deep_paths_names_and_invalid_profiles() {
             .kind(),
         ErrorKind::Unsupported
     );
-    let legacy = TestBackend::default();
-    legacy.state.lock().unwrap().objects.insert(
-        ".yinyang/head".into(),
-        StoredObject {
-            bytes: b"YYHEAD01legacy".to_vec(),
-            etag: "legacy".into(),
-        },
-    );
-    assert_eq!(
-        ObjectFs::create(legacy.operator())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Unsupported
-    );
-    assert_eq!(legacy.state.lock().unwrap().objects.len(), 1);
+    for legacy_bytes in [b"YYHEAD01legacy".as_slice(), b"YYHEAD02legacy"] {
+        let legacy = TestBackend::default();
+        legacy.state.lock().unwrap().objects.insert(
+            ".yinyang/head".into(),
+            StoredObject {
+                bytes: legacy_bytes.to_vec(),
+                etag: "legacy".into(),
+            },
+        );
+        assert_eq!(
+            ObjectFs::create(legacy.operator())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(legacy.state.lock().unwrap().objects.len(), 1);
+    }
 }
 
 #[tokio::test]

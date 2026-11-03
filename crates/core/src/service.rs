@@ -18,15 +18,17 @@
 //! Durable single-authority metadata, independent of object-store head CAS.
 //! SQLite files must reside on a local filesystem that honors sync and locking.
 
-use crate::authority::{RETAINED_REVISIONS_PAGE_MAX, RevisionPage};
+use crate::authority::{
+    RETAINED_REVISIONS_PAGE_MAX, RevisionHistoryPage, RevisionRecord, RevisionStatus,
+};
 use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
 use crate::namespace::{Node, NodeKind, decode, encode};
 use crate::snapshot::{
     ChangeRecord, Cursor, FileVersion, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
 };
 use crate::{
-    ContentDescriptor, ContentEdit, DataStore, Error, ErrorKind, NodeId, PreparedContent, Result,
-    Revision, Transaction,
+    ContentDescriptor, ContentEdit, DataStore, Error, ErrorKind, ExpiryRequest, NodeId,
+    PreparedContent, Result, Revision, Transaction,
 };
 use futures_util::future::BoxFuture;
 use opendal::Operator;
@@ -191,7 +193,11 @@ const RECORDS_COLUMNS: [(&str, &str); 5] = [
     ("end", "INTEGER"),
     ("value", "BLOB"),
 ];
-const REVISIONS_COLUMNS: [(&str, &str); 2] = [("token", "BLOB"), ("sequence", "INTEGER")];
+const REVISIONS_COLUMNS: [(&str, &str); 3] = [
+    ("token", "BLOB"),
+    ("sequence", "INTEGER"),
+    ("expired", "INTEGER"),
+];
 
 /// One durable filesystem authority. Clones share one writer and one reader
 /// connection; independent processes still coordinate through SQLite.
@@ -301,15 +307,15 @@ fn inspect_schema(conn: &Connection) -> Result<bool> {
     check_columns(conn, "records", &RECORDS_COLUMNS)?;
     check_columns(conn, "revisions", &REVISIONS_COLUMNS)?;
     let (_, _, revision) = manifest(conn)?;
-    let sequence: Option<i64> = conn
+    let latest: Option<(i64, bool)> = conn
         .query_row(
-            "SELECT sequence FROM revisions WHERE token=?1",
+            "SELECT sequence,expired FROM revisions WHERE token=?1",
             params![revision.to_bytes().as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| corrupt_schema(format!("cannot validate retained revision: {error}")))?;
-    if sequence != Some(revision.sequence as i64) {
+    if latest != Some((revision.sequence as i64, false)) {
         return Err(corrupt_schema("latest manifest is not a retained revision"));
     }
     Ok(true)
@@ -424,6 +430,31 @@ fn fixed<const N: usize>(bytes: Vec<u8>) -> Result<[u8; N]> {
         )
     })
 }
+fn revision_status(conn: &Connection, revision: Revision) -> Result<Option<RevisionStatus>> {
+    if revision.sequence > i64::MAX as u64 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT sequence,expired FROM revisions WHERE token=?1",
+        params![revision.to_bytes().as_slice()],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+    )
+    .optional()
+    .map_err(sql)?
+    .map(|(sequence, expired)| {
+        if sequence != revision.sequence as i64 {
+            return Err(corrupt_schema(
+                "retained revision token disagrees with its sequence",
+            ));
+        }
+        Ok(if expired {
+            RevisionStatus::Expired
+        } else {
+            RevisionStatus::Readable
+        })
+    })
+    .transpose()
+}
 fn parse_service_binding(bytes: &[u8]) -> Result<(NodeId, NodeId)> {
     if bytes.len() < SERVICE_BINDING_MAGIC.len() {
         return Err(corrupt_schema("service binding is truncated"));
@@ -446,7 +477,7 @@ impl MetadataService {
         let (filesystem, root, _) = db_call(&writer, |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
             tx.execute_batch("CREATE TABLE IF NOT EXISTS authority(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL, filesystem BLOB NOT NULL, root BLOB NOT NULL, latest BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS revisions(token BLOB PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL);
+                CREATE TABLE IF NOT EXISTS revisions(token BLOB PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL, expired INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS records(family INTEGER NOT NULL, key BLOB NOT NULL, start INTEGER NOT NULL, end INTEGER, value BLOB NOT NULL, PRIMARY KEY(family,key,start));
                 CREATE INDEX IF NOT EXISTS records_current ON records(family,key) WHERE end IS NULL;
                 CREATE TABLE IF NOT EXISTS prepared(descriptor BLOB PRIMARY KEY);").map_err(sql)?;
@@ -455,7 +486,7 @@ impl MetadataService {
                 let root = NodeId::generate();
                 let revision = Revision::new(0);
                 tx.execute("INSERT INTO authority(singleton,profile,filesystem,root,latest) VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
-                tx.execute("INSERT INTO revisions(token,sequence) VALUES(?1,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
+                tx.execute("INSERT INTO revisions(token,sequence,expired) VALUES(?1,0,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
                 let node = Node {id:root, generation:1, executable:false, link:None, kind:NodeKind::Directory{membership:1}};
                 tx.execute("INSERT INTO records(family,key,start,end,value) VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
             }
@@ -554,100 +585,119 @@ impl MetadataService {
         Ok(self.snapshot(self.reader.clone(), revision))
     }
     pub async fn observe_revision(&self, revision: Revision) -> Result<Snapshot> {
-        if revision.sequence > i64::MAX as u64 {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                "observe service revision",
-                "revision not retained",
-            ));
-        }
-        db_call(&self.reader, move |c| {
-            let exists: bool = c
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM revisions WHERE token=?1 AND sequence=?2)",
-                    params![revision.to_bytes().as_slice(), revision.sequence as i64],
-                    |r| r.get(0),
-                )
-                .map_err(sql)?;
-            if !exists {
+        match db_call(&self.reader, move |c| revision_status(c, revision)).await? {
+            Some(RevisionStatus::Readable) => {}
+            Some(RevisionStatus::Expired) => {
+                return Err(Error::new(
+                    ErrorKind::Expired,
+                    "observe service revision",
+                    format!("revision {revision:?} is logically expired"),
+                ));
+            }
+            None => {
                 return Err(Error::new(
                     ErrorKind::NotFound,
                     "observe service revision",
                     "revision not retained",
                 ));
             }
-            Ok(())
-        })
-        .await?;
+        }
         Ok(self.snapshot(self.reader.clone(), revision))
     }
-    /// Read a bounded page from the durable retained revision index without
-    /// changing journal mode, taking the writer transaction, or recovering.
-    pub async fn retained_revisions_page(
+    /// Open a revision only for a caller that already holds an exact snapshot,
+    /// file version, or frozen plan. Public fresh lookup uses observe_revision.
+    pub(crate) async fn observe_known_revision(&self, revision: Revision) -> Result<Snapshot> {
+        let known = db_call(&self.reader, move |c| revision_status(c, revision)).await?;
+        if known.is_none() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "observe known service revision",
+                "revision not known",
+            ));
+        }
+        Ok(self.snapshot(self.reader.clone(), revision))
+    }
+    pub async fn revision_history_page(
         &self,
         after: Option<Revision>,
         limit: u32,
-    ) -> Result<RevisionPage> {
+    ) -> Result<RevisionHistoryPage> {
         if !(1..=RETAINED_REVISIONS_PAGE_MAX).contains(&limit) {
             return Err(Error::unsupported(
-                "list retained revisions",
+                "list revision history",
                 format!("page size must be 1..={RETAINED_REVISIONS_PAGE_MAX}"),
             ));
         }
         let after = after.map(Revision::to_bytes);
-        let mut revisions = db_call(&self.reader, move |conn| {
-            let limit = i64::from(limit) + 1;
-            let mut rows = Vec::new();
-            if let Some(after) = after.as_ref() {
+        let mut records = db_call(&self.reader, move |conn| {
+            let rows = if let Some(after) = after.as_ref() {
                 let mut statement = conn
                     .prepare(
-                        "SELECT token,sequence FROM revisions
+                        "SELECT token,sequence,expired FROM revisions
                          WHERE token>?1 ORDER BY token LIMIT ?2",
                     )
                     .map_err(sql)?;
-                let values = statement
-                    .query_map(params![after.as_slice(), limit], |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                statement
+                    .query_map(params![after.as_slice(), i64::from(limit) + 1], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
                     })
-                    .map_err(sql)?;
-                for value in values {
-                    rows.push(value.map_err(sql)?);
-                }
+                    .map_err(sql)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql)?
             } else {
                 let mut statement = conn
-                    .prepare("SELECT token,sequence FROM revisions ORDER BY token LIMIT ?1")
+                    .prepare(
+                        "SELECT token,sequence,expired FROM revisions
+                         ORDER BY token LIMIT ?1",
+                    )
                     .map_err(sql)?;
-                let values = statement
-                    .query_map(params![limit], |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                statement
+                    .query_map(params![i64::from(limit) + 1], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
                     })
-                    .map_err(sql)?;
-                for value in values {
-                    rows.push(value.map_err(sql)?);
-                }
-            }
+                    .map_err(sql)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql)?
+            };
             rows.into_iter()
-                .map(|(token, sequence)| {
+                .map(|(token, sequence, expired)| {
                     let revision = Revision::from_bytes(fixed(token)?);
                     if sequence < 0 || revision.sequence != sequence as u64 {
-                        return Err(corrupt_schema(
-                            "retained revision token disagrees with its sequence",
-                        ));
+                        return Err(corrupt_schema("revision token disagrees with its sequence"));
                     }
-                    Ok(revision)
+                    Ok(RevisionRecord {
+                        revision,
+                        status: if expired {
+                            RevisionStatus::Expired
+                        } else {
+                            RevisionStatus::Readable
+                        },
+                    })
                 })
                 .collect::<Result<Vec<_>>>()
         })
         .await?;
-        let more = revisions.len() > limit as usize;
-        revisions.truncate(limit as usize);
-        if revisions.windows(2).any(|window| window[0] >= window[1]) {
-            return Err(corrupt_schema(
-                "retained revisions are not strictly ordered",
-            ));
+        let more = records.len() > limit as usize;
+        records.truncate(limit as usize);
+        if records
+            .windows(2)
+            .any(|window| window[0].revision >= window[1].revision)
+        {
+            return Err(corrupt_schema("revision history is not strictly ordered"));
         }
-        let next = more.then(|| *revisions.last().expect("a nonempty page has a cursor"));
-        Ok(RevisionPage { revisions, next })
+        let next = more.then(|| records.last().expect("nonempty history page").revision);
+        Ok(RevisionHistoryPage {
+            revisions: records,
+            next,
+        })
     }
     /// In-process preparation already carries this service's trusted evidence.
     pub async fn prepare(&self, source: &mut (impl AsyncRead + Unpin)) -> Result<PreparedContent> {
@@ -663,7 +713,7 @@ impl MetadataService {
         base: &FileVersion,
         edits: &[ContentEdit<'_>],
     ) -> Result<PreparedContent> {
-        let snapshot = self.observe_revision(base.revision()).await?;
+        let snapshot = self.observe_known_revision(base.revision()).await?;
         let selected = snapshot.open_file(base.node().id()).await?;
         if selected.descriptor() != base.descriptor() {
             return Err(Error::invalid(
@@ -679,7 +729,7 @@ impl MetadataService {
         node: NodeId,
         edits: &[ContentEdit<'_>],
     ) -> Result<PreparedContent> {
-        let snapshot = self.observe_revision(revision).await?;
+        let snapshot = self.observe_known_revision(revision).await?;
         let base = snapshot.open_file(node).await?;
         self.prepare_overwrite_from_version(&base, edits).await
     }
@@ -705,7 +755,7 @@ impl MetadataService {
         final_length: u64,
         edits: &[ContentEdit<'_>],
     ) -> Result<PreparedContent> {
-        let snapshot = self.observe_revision(base.revision()).await?;
+        let snapshot = self.observe_known_revision(base.revision()).await?;
         let selected = snapshot.open_file(base.node().id()).await?;
         if selected.descriptor() != base.descriptor() {
             return Err(Error::invalid(
@@ -724,7 +774,7 @@ impl MetadataService {
         final_length: u64,
         edits: &[ContentEdit<'_>],
     ) -> Result<PreparedContent> {
-        let snapshot = self.observe_revision(revision).await?;
+        let snapshot = self.observe_known_revision(revision).await?;
         let base = snapshot.open_file(node).await?;
         self.prepare_update_from_version(&base, preserved_prefix, final_length, edits)
             .await
@@ -769,8 +819,9 @@ impl MetadataService {
         self.remember(&content).await
     }
     pub async fn restore_transaction(&self, bytes: &[u8]) -> Result<Transaction> {
-        let (revision, files) = Transaction::inspect(bytes)?;
-        let snapshot = self.observe_revision(revision).await?;
+        let (revision, _, _) = Transaction::verify_identity(bytes, self.filesystem)?;
+        let (_, files) = Transaction::inspect(bytes)?;
+        let snapshot = self.observe_known_revision(revision).await?;
         let mut prepared = Vec::new();
         for file in files {
             let descriptor = file.to_bytes();
@@ -793,6 +844,199 @@ impl MetadataService {
         }
         Transaction::restore(bytes, &snapshot, &prepared).await
     }
+    /// Resolve already-committed exact plans from receipts before any base
+    /// lookup or content-readiness check. Pending plans are then restored from
+    /// their exact known base, including a logically expired base.
+    pub async fn commit_frozen_batch(&self, requests: &[Vec<u8>]) -> Result<Vec<Outcome>> {
+        if requests.len() > 4096 {
+            return Err(Error::unsupported(
+                "commit frozen service batch",
+                "more than 4096 requests",
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let latest = self.observe_latest().await?;
+        let mut outcomes = vec![None; requests.len()];
+        let mut pending = Vec::new();
+        for (index, bytes) in requests.iter().enumerate() {
+            let (_, id, digest) = Transaction::verify_identity(bytes, self.filesystem)?;
+            if let Some(receipt) = latest.receipt(id).await? {
+                if receipt.request_digest != digest {
+                    return Err(Error::invalid(
+                        "commit frozen service batch",
+                        "identity reused for different request",
+                    ));
+                }
+                outcomes[index] = Some(Outcome::Committed(receipt));
+            } else {
+                pending.push((index, bytes));
+            }
+        }
+        if !pending.is_empty() {
+            ensure_writer_healthy(&self.writer_poisoned)?;
+            let mut restored = Vec::with_capacity(pending.len());
+            for (_, bytes) in &pending {
+                restored.push(self.restore_transaction(bytes).await?);
+            }
+            let committed = self.publish_restored(&restored).await?;
+            for ((index, _), outcome) in pending.into_iter().zip(committed) {
+                outcomes[index] = Some(outcome);
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every frozen request is resolved"))
+            .collect())
+    }
+    pub async fn expire(&self, request: &ExpiryRequest) -> Result<Outcome> {
+        request.validate(self.filesystem)?;
+        let gate = Arc::clone(&self.write_gate).lock_owned().await;
+        ensure_writer_healthy(&self.writer_poisoned)?;
+        let transaction =
+            SqliteTransaction::new(self.writer.clone(), gate, Arc::clone(&self.writer_poisoned));
+        let result = match self.expire_inner(request).await {
+            Ok((outcome, published)) => {
+                if published && !matches!(&outcome, Outcome::Unknown(_)) {
+                    transaction.disarm();
+                } else {
+                    transaction.rollback().await;
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                transaction.rollback().await;
+                Err(error)
+            }
+        };
+        match result {
+            Err(error) if error.kind() == ErrorKind::Storage => Ok(Outcome::Retryable),
+            result => result,
+        }
+    }
+    async fn expire_inner(&self, request: &ExpiryRequest) -> Result<(Outcome, bool)> {
+        db_call(&self.writer, |c| {
+            c.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+            Ok(())
+        })
+        .await?;
+        let (_, _, old) = db_call(&self.writer, |c| manifest(c)).await?;
+        let current = self.snapshot(self.writer.clone(), old);
+        if let Some(receipt) = current.receipt(request.id()).await? {
+            if receipt.request_digest != request.digest() {
+                return Err(Error::invalid(
+                    "expire service revisions",
+                    "identity reused for a different request",
+                ));
+            }
+            return Ok((Outcome::Committed(receipt), false));
+        }
+        if old != request.expected_latest() {
+            return Ok((Outcome::Conflict, false));
+        }
+        for revision in request.candidates() {
+            let candidate = *revision;
+            if *revision == old {
+                return Err(Error::invalid(
+                    "expire service revisions",
+                    "the current revision cannot expire",
+                ));
+            }
+            match db_call(&self.writer, move |c| revision_status(c, candidate)).await? {
+                Some(RevisionStatus::Readable) => {}
+                Some(RevisionStatus::Expired) => {
+                    return Err(Error::new(
+                        ErrorKind::Expired,
+                        "expire service revisions",
+                        format!("revision {revision:?} is already expired"),
+                    ));
+                }
+                None => {
+                    return Err(Error::new(
+                        ErrorKind::NotFound,
+                        "expire service revisions",
+                        format!("revision {revision:?} is unknown"),
+                    ));
+                }
+            }
+        }
+        let sequence = old
+            .sequence
+            .checked_add(1)
+            .filter(|sequence| *sequence <= i64::MAX as u64)
+            .ok_or_else(|| Error::unsupported("expire service revisions", "revision exhausted"))?;
+        let revision = Revision::new(sequence);
+        let receipt = Receipt {
+            commit_id: request.id(),
+            request_digest: request.digest(),
+            cursor: Cursor {
+                revision,
+                ordinal: 0,
+            },
+        };
+        let encoded_receipt = receipt.encode()?;
+        let encoded_change = ChangeRecord {
+            receipt: receipt.clone(),
+            changes: Vec::new(),
+        }
+        .encode()?;
+        let id = *request.id().as_bytes();
+        let receipt_key = id.to_vec();
+        let change_key = receipt.cursor.key();
+        let candidates = request.candidates().to_vec();
+        db_call(&self.writer, move |c| {
+            for candidate in &candidates {
+                let updated = c
+                    .execute(
+                        "UPDATE revisions SET expired=1 WHERE token=?1 AND sequence=?2 AND expired=0",
+                        params![candidate.to_bytes().as_slice(), candidate.sequence as i64],
+                    )
+                    .map_err(sql)?;
+                if updated != 1 {
+                    return Err(Error::new(
+                        ErrorKind::Corrupt,
+                        "expire service revisions",
+                        "candidate state changed within the publication transaction",
+                    ));
+                }
+            }
+            c.execute(
+                "INSERT INTO records(family,key,start,end,value)
+                 VALUES(2,?1,?2,NULL,?3)",
+                params![receipt_key, sequence as i64, encoded_receipt],
+            )
+            .map_err(sql)?;
+            c.execute(
+                "INSERT INTO records(family,key,start,end,value)
+                 VALUES(3,?1,?2,NULL,?3)",
+                params![change_key, sequence as i64, encoded_change],
+            )
+            .map_err(sql)?;
+            c.execute(
+                "INSERT INTO revisions(token,sequence,expired) VALUES(?1,?2,0)",
+                params![revision.to_bytes().as_slice(), sequence as i64],
+            )
+            .map_err(sql)?;
+            c.execute(
+                "UPDATE authority SET latest=?1 WHERE singleton=1",
+                params![revision.to_bytes().as_slice()],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await?;
+        if db_call(&self.writer, |c| {
+            c.execute_batch("COMMIT").map_err(sql)?;
+            Ok(())
+        })
+        .await
+        .is_err()
+        {
+            return Ok((Outcome::Unknown(request.id()), false));
+        }
+        Ok((Outcome::Committed(receipt), true))
+    }
     pub async fn commit(&self, request: &Transaction) -> Result<Outcome> {
         Ok(self
             .commit_batch(std::slice::from_ref(request))
@@ -800,6 +1044,13 @@ impl MetadataService {
             .remove(0))
     }
     pub async fn commit_batch(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
+        let plans = requests
+            .iter()
+            .map(Transaction::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_frozen_batch(&plans).await
+    }
+    async fn publish_restored(&self, requests: &[Transaction]) -> Result<Vec<Outcome>> {
         if requests.len() > 4096 {
             return Err(Error::unsupported(
                 "service batch",
@@ -811,13 +1062,10 @@ impl MetadataService {
         }
         let gate = Arc::clone(&self.write_gate).lock_owned().await;
         ensure_writer_healthy(&self.writer_poisoned)?;
-        // Even an in-process caller must have registered durable readiness.
-        let mut restored = Vec::new();
         for request in requests {
             request.validate(self.filesystem)?;
-            restored.push(self.restore_transaction(&request.to_bytes()?).await?);
         }
-        let result = self.publish(&restored, gate).await;
+        let result = self.publish(requests, gate).await;
         match result {
             Err(e) if e.kind() == ErrorKind::Storage => {
                 Ok(requests.iter().map(|_| Outcome::Retryable).collect())
@@ -937,7 +1185,7 @@ impl MetadataService {
         }
         db_call(&self.writer, move |c| {
             c.execute(
-                "INSERT INTO revisions(token,sequence) VALUES(?1,?2)",
+                "INSERT INTO revisions(token,sequence,expired) VALUES(?1,?2,0)",
                 params![revision.to_bytes().as_slice(), sequence as i64],
             )
             .map_err(sql)?;
@@ -1081,7 +1329,7 @@ mod admission_tests {
         Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE authority SET profile='yinyang-sqlite-1' WHERE singleton=1",
+                "UPDATE authority SET profile='yinyang-sqlite-2' WHERE singleton=1",
                 [],
             )
             .unwrap();
@@ -1098,7 +1346,7 @@ mod admission_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-sqlite-1");
+        assert_eq!(profile, "yinyang-sqlite-2");
     }
 
     #[tokio::test]
@@ -1168,7 +1416,7 @@ mod connection_tests {
         let request = planner.finish().unwrap();
         service.commit(&request).await.unwrap();
         service.observe_revision(observed.revision()).await.unwrap();
-        service.retained_revisions_page(None, 2).await.unwrap();
+        service.revision_history_page(None, 2).await.unwrap();
         service
             .restore_transaction(&request.to_bytes().unwrap())
             .await
