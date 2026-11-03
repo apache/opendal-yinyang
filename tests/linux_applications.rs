@@ -80,6 +80,7 @@ fn write_source_tree(source: &Path) -> Vec<u8> {
     fs::create_dir_all(source.join("bin")).expect("create source bin");
     fs::create_dir_all(source.join("notes")).expect("create source notes");
     fs::create_dir_all(source.join("empty")).expect("create empty source directory");
+    fs::create_dir_all(source.join("private-dir")).expect("create private source directory");
 
     let bytes = payload(17, 384 * 1024 + 37);
     fs::write(source.join("assets/payload.bin"), &bytes).expect("write source payload");
@@ -93,6 +94,18 @@ fn write_source_tree(source: &Path) -> Vec<u8> {
         b"this file is removed by the second sync\n",
     )
     .expect("write removable source note");
+    fs::write(source.join("notes/private.txt"), b"private rsync mode\n")
+        .expect("write private source note");
+    fs::set_permissions(
+        source.join("notes/private.txt"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("mark source note private");
+    fs::set_permissions(
+        source.join("private-dir"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("mark source directory private");
     fs::write(
         source.join("bin/run.sh"),
         b"#!/bin/sh\nprintf 'archive trial\\n'\n",
@@ -103,7 +116,7 @@ fn write_source_tree(source: &Path) -> Vec<u8> {
     bytes
 }
 
-fn rsync(source: &Path, destination: &Path, delete: bool, inplace: bool) -> Captured {
+fn rsync(source: &Path, destination: &Path, delete: bool) -> Captured {
     let mut command = Command::new("rsync");
     command.env("LC_ALL", "C");
     command.args([
@@ -114,9 +127,6 @@ fn rsync(source: &Path, destination: &Path, delete: bool, inplace: bool) -> Capt
         "--no-group",
         "--omit-dir-times",
     ]);
-    if inplace {
-        command.arg("--inplace");
-    }
     if delete {
         command.arg("--delete");
     }
@@ -124,58 +134,6 @@ fn rsync(source: &Path, destination: &Path, delete: bool, inplace: bool) -> Capt
         .arg(format!("{}/", source.display()))
         .arg(format!("{}/", destination.display()));
     run_application(command)
-}
-
-fn seed_rsync_destination(target: &Path) {
-    // rsync creates new files and default safe-save temporaries with mode 0600.
-    // This trial therefore exercises explicit in-place updates of entries whose
-    // modes the Managed mount can represent instead of claiming general rsync.
-    for directory in ["assets", "bin", "notes", "empty"] {
-        fs::create_dir_all(target.join(directory))
-            .unwrap_or_else(|error| panic!("create rsync target {directory}: {error}"));
-    }
-    for path in [
-        "assets/payload.bin",
-        "notes/readme.txt",
-        "notes/remove.txt",
-        "bin/run.sh",
-    ] {
-        fs::write(target.join(path), b"")
-            .unwrap_or_else(|error| panic!("seed rsync destination {path}: {error}"));
-    }
-    fs::set_permissions(target.join("bin/run.sh"), fs::Permissions::from_mode(0o755))
-        .expect("set seeded script mode");
-}
-
-fn assert_default_rsync_creation_rejected(source: &Path, target: &Path) {
-    fs::create_dir_all(source).expect("create rejected rsync source");
-    fs::create_dir(target).expect("create rejected rsync target");
-    fs::write(
-        source.join("created.txt"),
-        b"rsync cannot create this file\n",
-    )
-    .expect("write rejected rsync source");
-
-    let rejected = rsync(source, target, false, false);
-    assert_eq!(
-        rejected.status.code(),
-        Some(23),
-        "default rsync should report a partial transfer:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&rejected.stdout),
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
-    assert!(
-        stderr.contains("mkstemp") && stderr.contains("operation not supported"),
-        "default rsync failed before reaching its private temporary-file boundary:\n{stderr}"
-    );
-    assert!(
-        fs::read_dir(target)
-            .expect("list rejected rsync target")
-            .next()
-            .is_none(),
-        "a rejected rsync temporary must not leave another destination entry"
-    );
 }
 
 fn assert_rsync_tree(target: &Path, expected_payload: &[u8]) {
@@ -190,13 +148,19 @@ fn assert_rsync_tree(target: &Path, expected_payload: &[u8]) {
         b"#!/bin/sh\nprintf 'archive trial\\n'\n",
         0o755,
     );
+    assert_file(
+        &target.join("notes/private.txt"),
+        b"private rsync mode\n",
+        0o600,
+    );
     assert!(target.join("empty").is_dir());
     assert_eq!(mode(&target.join("empty")), 0o755);
+    assert_eq!(mode(&target.join("private-dir")), 0o700);
 }
 
 #[test]
 #[ignore = "requires /dev/fuse, rsync, and isolated S3; run with cargo x test-linux-applications"]
-fn application_rsync_existing_tree_update_survives_remount_both_publications() {
+fn application_rsync_creates_and_replaces_without_seeded_destination_both_publications() {
     for publication in [Publication::Object, Publication::Service] {
         let fixture = Fixture::new(publication);
         let suffix = fixture.publication().as_str();
@@ -216,8 +180,8 @@ fn application_rsync_existing_tree_update_survives_remount_both_publications() {
 
         let mut mounted = fixture.mount(&config, &mountpoint);
         let mount_root = mounted.mountpoint().to_path_buf();
-        seed_rsync_destination(&target);
-        rsync(&source, &target, false, true).success_or("initial rsync");
+        rsync(&source, &target, false).success_or("initial rsync");
+        rsync(&source, &target, false).success_or("repeated rsync");
         assert_rsync_tree(&target, &initial_payload);
         assert_eq!(
             fixture.remote_read(
@@ -234,8 +198,7 @@ fn application_rsync_existing_tree_update_survives_remount_both_publications() {
             .expect("update source payload");
         fs::remove_file(source.join("notes/remove.txt")).expect("remove source note");
         fs::write(source.join("notes/new.txt"), b"added by rsync\n").expect("add source note");
-        fs::write(target.join("notes/new.txt"), b"").expect("seed added rsync destination");
-        rsync(&source, &target, true, true).success_or("updating rsync with deletion");
+        rsync(&source, &target, true).success_or("updating rsync with deletion");
         assert_file(&target.join("assets/payload.bin"), &updated_payload, 0o644);
         assert!(
             !target.join("notes/remove.txt").exists(),
@@ -246,11 +209,6 @@ fn application_rsync_existing_tree_update_survives_remount_both_publications() {
             fixture.remote_read(&config, "rsync-target/notes/new.txt", 32),
             b"added by rsync\n"
         );
-        assert_default_rsync_creation_rejected(
-            &fixture.temp.path().join("rsync-rejected-source"),
-            &mountpoint.join("rsync-rejected-target"),
-        );
-
         mounted.unmount();
         drop(mounted);
         let mut remounted = fixture.mount(&config, &mountpoint);
@@ -269,6 +227,13 @@ fn application_rsync_existing_tree_update_survives_remount_both_publications() {
             &remounted.mountpoint().join("rsync-target/notes/new.txt"),
             b"added by rsync\n",
             0o644,
+        );
+        assert_file(
+            &remounted
+                .mountpoint()
+                .join("rsync-target/notes/private.txt"),
+            b"private rsync mode\n",
+            0o600,
         );
         assert_eq!(
             fixture.remote_read(
@@ -311,6 +276,8 @@ fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool, 
     let file_mode = if read_only { 0o444 } else { 0o644 };
     let executable_mode = if read_only { 0o555 } else { 0o755 };
     let directory_mode = if read_only { 0o555 } else { 0o755 };
+    let private_file_mode = if read_only { 0o400 } else { 0o600 };
+    let private_directory_mode = if read_only { 0o500 } else { 0o700 };
     assert_eq!(mode(root), root_mode, "extraction root mode");
     assert_file(
         &root.join("assets/payload.bin"),
@@ -328,6 +295,11 @@ fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool, 
         file_mode,
     );
     assert_file(
+        &root.join("notes/private.txt"),
+        b"private rsync mode\n",
+        private_file_mode,
+    );
+    assert_file(
         &root.join("bin/run.sh"),
         b"#!/bin/sh\nprintf 'archive trial\\n'\n",
         executable_mode,
@@ -343,6 +315,7 @@ fn assert_tar_round_trip(root: &Path, expected_payload: &[u8], read_only: bool, 
     }
     assert!(root.join("empty").is_dir());
     assert_eq!(mode(&root.join("empty")), directory_mode);
+    assert_eq!(mode(&root.join("private-dir")), private_directory_mode);
 }
 
 #[test]
@@ -469,7 +442,7 @@ fn copy_representable_tree(source: &Path, destination: &Path) {
 
 #[test]
 #[ignore = "requires /dev/fuse, git, and isolated S3; run with cargo x test-linux-applications"]
-fn application_git_loose_object_mode_is_rejected() {
+fn application_git_loose_object_private_mode_probe() {
     let fixture = Fixture::new(Publication::Object);
     let config = fixture.volume_config("application-git", Frontend::Fuse, false);
     let mountpoint = fixture.temp.path().join("mnt-application-git");
@@ -502,25 +475,23 @@ fn application_git_loose_object_mode_is_rejected() {
         .arg(&mounted_bare)
         .args(["hash-object", "-w"])
         .arg(&blob);
-    let rejected = run_application(write);
-    assert_eq!(
-        rejected.status.code(),
-        Some(128),
-        "Git loose-object creation should fail explicitly:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&rejected.stdout),
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
-    assert!(
-        stderr.contains("unable to create temporary file")
-            && stderr.contains("operation not supported"),
-        "Git failed before reaching its loose-object temporary file:\n{stderr}"
-    );
+    run_application(write).success_or("write Git loose object through the mode boundary");
     let object_path = mounted_bare
         .join("objects")
         .join(&object_id[..2])
         .join(&object_id[2..]);
-    assert_not_found(&object_path, "rejected Git object");
+    assert!(object_path.is_file(), "Git loose object was not created");
+
+    let mut read = git_command();
+    read.arg("--git-dir")
+        .arg(&mounted_bare)
+        .args(["cat-file", "-p", &object_id]);
+    let read = run_application(read);
+    read.success_or("read Git loose object through the mount");
+    assert_eq!(
+        read.stdout, b"Git loose object mode probe\n",
+        "loose-object bytes through the mount"
+    );
 
     mounted.unmount();
 }

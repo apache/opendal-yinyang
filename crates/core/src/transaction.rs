@@ -19,7 +19,9 @@ use crate::compatibility::{
     NODE_IDENTITY_CONTEXT, REQUEST_HASH_CONTEXT, REQUEST_MAGIC, TRANSACTION_PLAN_MAGIC,
 };
 use crate::data::PreparedContent;
-use crate::namespace::{DirectoryEntry, Link, Node, NodeKind, encode, entry_key};
+use crate::namespace::{
+    DirectoryEntry, Link, Node, NodeKind, NodeMode, corrupt, encode, entry_key,
+};
 use crate::snapshot::{Change, Snapshot};
 use crate::{CommitId, Error, NodeId, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,10 +33,10 @@ enum Mutation {
         parent: NodeId,
         name: String,
         file: Option<PreparedContent>,
-        executable: bool,
+        mode: NodeMode,
     },
     Content(NodeId, PreparedContent),
-    Executable(NodeId, bool),
+    Attributes(NodeId, NodeMode),
     Rename(NodeId, NodeId, String),
     Remove(NodeId),
 }
@@ -46,7 +48,7 @@ impl Mutation {
                 parent,
                 name,
                 file,
-                executable,
+                mode,
             } => encode(&(
                 0_u8,
                 *id.as_bytes(),
@@ -54,7 +56,7 @@ impl Mutation {
                 name,
                 file.as_ref()
                     .map(|f| (f.content_id().length(), *f.content_id().digest())),
-                *executable,
+                mode.bits(),
             ))?,
             Self::Content(id, file) => encode(&(
                 1_u8,
@@ -62,7 +64,7 @@ impl Mutation {
                 file.content_id().length(),
                 *file.content_id().digest(),
             ))?,
-            Self::Executable(id, value) => encode(&(2_u8, *id.as_bytes(), *value))?,
+            Self::Attributes(id, mode) => encode(&(2_u8, *id.as_bytes(), mode.bits()))?,
             Self::Rename(id, parent, name) => {
                 encode(&(3_u8, *id.as_bytes(), *parent.as_bytes(), name))?
             }
@@ -180,19 +182,19 @@ impl Transaction {
                         parent,
                         name,
                         file,
-                        executable,
+                        mode,
                     } => encode(&(
                         0_u8,
                         *id.as_bytes(),
                         *parent.as_bytes(),
                         name,
                         file.as_ref().map(|f| f.descriptor().to_bytes()),
-                        executable,
+                        mode.bits(),
                     ))?,
                     Mutation::Content(id, file) => {
                         encode(&(1_u8, *id.as_bytes(), file.descriptor().to_bytes()))?
                     }
-                    Mutation::Executable(id, value) => encode(&(2_u8, *id.as_bytes(), value))?,
+                    Mutation::Attributes(id, mode) => encode(&(2_u8, *id.as_bytes(), mode.bits()))?,
                     Mutation::Rename(id, parent, name) => {
                         encode(&(3_u8, *id.as_bytes(), *parent.as_bytes(), name))?
                     }
@@ -229,7 +231,7 @@ impl Transaction {
                         [u8; 16],
                         String,
                         Option<Vec<u8>>,
-                        bool,
+                        u16,
                     ) = crate::namespace::decode(&bytes)?;
                     if let Some(file) = file {
                         files.push(crate::ContentDescriptor::from_bytes(&file)?);
@@ -386,14 +388,16 @@ impl Transaction {
         for bytes in encoded {
             let mutation = match bytes.first() {
                 Some(0) => {
-                    let (_, node, parent, name, file, executable): (
+                    let (_, node, parent, name, file, mode): (
                         u8,
                         [u8; 16],
                         [u8; 16],
                         String,
                         Option<Vec<u8>>,
-                        bool,
+                        u16,
                     ) = crate::namespace::decode(&bytes)?;
+                    let mode = NodeMode::from_bits(mode)
+                        .ok_or_else(|| corrupt("invalid node mode in frozen request"))?;
                     let seed = encode(&(fs, id, mutations.len() as u64))?;
                     let derived = blake3::derive_key(NODE_IDENTITY_CONTEXT, &seed);
                     if node != derived[..16] {
@@ -407,7 +411,7 @@ impl Transaction {
                         parent: NodeId::from_bytes(parent),
                         name,
                         file: file.map(find).transpose()?,
-                        executable,
+                        mode,
                     }
                 }
                 Some(1) => {
@@ -416,8 +420,10 @@ impl Transaction {
                     Mutation::Content(NodeId::from_bytes(node), find(file)?)
                 }
                 Some(2) => {
-                    let (_, node, value): (u8, [u8; 16], bool) = crate::namespace::decode(&bytes)?;
-                    Mutation::Executable(NodeId::from_bytes(node), value)
+                    let (_, node, mode): (u8, [u8; 16], u16) = crate::namespace::decode(&bytes)?;
+                    let mode = NodeMode::from_bits(mode)
+                        .ok_or_else(|| corrupt("invalid node mode in frozen request"))?;
+                    Mutation::Attributes(NodeId::from_bytes(node), mode)
                 }
                 Some(3) => {
                     let (_, node, parent, name): (u8, [u8; 16], [u8; 16], String) =
@@ -467,19 +473,21 @@ impl Transaction {
 fn logical_mutation(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(match bytes.first() {
         Some(0) => {
-            let (_, id, parent, name, file, executable): (
+            let (_, id, parent, name, file, mode): (
                 u8,
                 [u8; 16],
                 [u8; 16],
                 String,
                 Option<Vec<u8>>,
-                bool,
+                u16,
             ) = crate::namespace::decode(bytes)?;
+            let mode = NodeMode::from_bits(mode)
+                .ok_or_else(|| corrupt("invalid node mode in frozen request"))?;
             let content_id = file
                 .map(|file| crate::ContentDescriptor::from_bytes(&file))
                 .transpose()?
                 .map(|file| (file.content_id().length(), *file.content_id().digest()));
-            encode(&(0_u8, id, parent, name, content_id, executable))?
+            encode(&(0_u8, id, parent, name, content_id, mode.bits()))?
         }
         Some(1) => {
             let (_, id, file): (u8, [u8; 16], Vec<u8>) = crate::namespace::decode(bytes)?;
@@ -492,8 +500,10 @@ fn logical_mutation(bytes: &[u8]) -> Result<Vec<u8>> {
             ))?
         }
         Some(2) => {
-            let (_, id, executable): (u8, [u8; 16], bool) = crate::namespace::decode(bytes)?;
-            encode(&(2_u8, id, executable))?
+            let (_, id, mode): (u8, [u8; 16], u16) = crate::namespace::decode(bytes)?;
+            let mode = NodeMode::from_bits(mode)
+                .ok_or_else(|| corrupt("invalid node mode in frozen request"))?;
+            encode(&(2_u8, id, mode.bits()))?
         }
         Some(3) => {
             let (_, id, parent, name): (u8, [u8; 16], [u8; 16], String) =
@@ -556,7 +566,16 @@ impl Planner {
         self.work.list(parent).await
     }
     pub async fn create_directory(&mut self, parent: NodeId, name: &str) -> Result<NodeId> {
-        self.create(parent, name, None, false).await
+        self.create_directory_with_mode(parent, name, NodeMode::DIRECTORY)
+            .await
+    }
+    pub async fn create_directory_with_mode(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        mode: NodeMode,
+    ) -> Result<NodeId> {
+        self.create(parent, name, None, mode).await
     }
     pub async fn create_file(
         &mut self,
@@ -565,14 +584,24 @@ impl Planner {
         file: PreparedContent,
         executable: bool,
     ) -> Result<NodeId> {
-        self.create(parent, name, Some(file), executable).await
+        self.create_file_with_mode(parent, name, file, NodeMode::from_executable(executable))
+            .await
+    }
+    pub async fn create_file_with_mode(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        file: PreparedContent,
+        mode: NodeMode,
+    ) -> Result<NodeId> {
+        self.create(parent, name, Some(file), mode).await
     }
     async fn create(
         &mut self,
         parent: NodeId,
         name: &str,
         file: Option<PreparedContent>,
-        executable: bool,
+        mode: NodeMode,
     ) -> Result<NodeId> {
         let seed = encode(&(
             *self.work.base.filesystem.as_bytes(),
@@ -586,7 +615,7 @@ impl Planner {
             parent,
             name: name.to_owned(),
             file,
-            executable,
+            mode,
         })
         .await?;
         Ok(id)
@@ -595,7 +624,17 @@ impl Planner {
         self.push(Mutation::Content(id, file)).await
     }
     pub async fn set_executable(&mut self, id: NodeId, value: bool) -> Result<()> {
-        self.push(Mutation::Executable(id, value)).await
+        let node = self.node(id).await?.ok_or_else(|| {
+            Error::new(
+                crate::ErrorKind::NotFound,
+                "set executable",
+                "node is absent",
+            )
+        })?;
+        self.set_mode(id, node.mode().with_executable(value)).await
+    }
+    pub async fn set_mode(&mut self, id: NodeId, mode: NodeMode) -> Result<()> {
+        self.push(Mutation::Attributes(id, mode)).await
     }
     /// Destination must be absent, or the same normalized slot of the moved node.
     pub async fn rename(&mut self, id: NodeId, parent: NodeId, name: &str) -> Result<()> {
@@ -800,7 +839,7 @@ impl Working {
                 parent,
                 name,
                 file,
-                executable,
+                mode,
             } => {
                 let key = entry_key(*parent, name)?;
                 self.directory(*parent).await?;
@@ -820,7 +859,7 @@ impl Working {
                 let node = Node {
                     id: *id,
                     generation: 1,
-                    executable: *executable,
+                    mode: *mode,
                     link: Some(Link {
                         parent: *parent,
                         name: name.clone(),
@@ -849,10 +888,10 @@ impl Working {
                 node.kind = NodeKind::File(self.base.data.accept(file)?);
                 self.nodes.insert(*id, Some(node));
             }
-            Mutation::Executable(id, value) => {
+            Mutation::Attributes(id, mode) => {
                 self.guard(*id, STATE).await?;
                 let mut node = self.required(*id).await?;
-                node.executable = *value;
+                node.mode = *mode;
                 self.nodes.insert(*id, Some(node));
             }
             Mutation::Rename(id, parent, name) => {
@@ -971,7 +1010,7 @@ impl Working {
                     NodeKind::File(f) => Some(f.content_id()),
                     _ => None,
                 };
-                if old.executable != node.executable || old_content != content {
+                if old.mode != node.mode || old_content != content {
                     node.generation = increment(old.generation)?;
                 }
             }
@@ -1003,7 +1042,7 @@ fn part(node: Option<&Node>, tag: u8) -> Result<Option<Vec<u8>>> {
         KIND => encode(&node.is_directory()),
         STATE => encode(&(
             node.generation,
-            node.executable,
+            node.mode.bits(),
             match &node.kind {
                 NodeKind::File(f) => Some((f.content_id().length(), *f.content_id().digest())),
                 _ => None,
@@ -1062,7 +1101,7 @@ mod tests {
             blake3::Hash::from(request.computed_digest().unwrap())
                 .to_hex()
                 .as_str(),
-            "811032fb290ade714ee0ca3d8716fabd1f7154e478ae5da1a8b822411513eb4d"
+            "079bd4e3c1cd9aa76631f7debadcbe6be704b6ac33ddbf028f9fa3acf7eb4eda"
         );
         assert_eq!(
             increment(u64::MAX).unwrap_err().kind(),
@@ -1106,7 +1145,7 @@ mod tests {
                 parent: NodeId::from_bytes([0x55; 16]),
                 name: "file".into(),
                 file: Some(prepared),
-                executable: true,
+                mode: NodeMode::EXECUTABLE_FILE,
             }],
         };
         request.digest = request.computed_digest().unwrap();

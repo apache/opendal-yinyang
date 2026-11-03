@@ -19,7 +19,7 @@
 
 use fuser::{FileAttr, FileType};
 use std::time::{Duration, SystemTime};
-use yinyang_core::Revision;
+use yinyang_core::{NodeMode, Revision};
 
 /// One documented metadata freshness window for both FUSE backends.
 pub const METADATA_STALENESS: Duration = Duration::from_secs(1);
@@ -46,16 +46,16 @@ pub enum AttributeTime {
 #[derive(Clone, Copy, Debug)]
 pub struct ObservedAttr {
     pub directory: bool,
-    pub executable: bool,
+    pub mode: NodeMode,
     pub size: u64,
     pub time: AttributeTime,
 }
 
 impl ObservedAttr {
-    pub fn from_revision(directory: bool, executable: bool, size: u64, revision: Revision) -> Self {
+    pub fn from_revision(directory: bool, mode: NodeMode, size: u64, revision: Revision) -> Self {
         Self {
             directory,
-            executable,
+            mode,
             size,
             time: AttributeTime::Revision(revision),
         }
@@ -64,7 +64,11 @@ impl ObservedAttr {
     pub fn from_storage(directory: bool, size: u64, modified: Option<SystemTime>) -> Self {
         Self {
             directory,
-            executable: false,
+            mode: if directory {
+                NodeMode::DIRECTORY
+            } else {
+                NodeMode::FILE
+            },
             size,
             time: AttributeTime::Storage(modified.unwrap_or_else(storage_fallback)),
         }
@@ -93,11 +97,12 @@ pub fn synthesize(ino: fuser::INodeNo, observed: ObservedAttr, read_only: bool) 
     } else {
         observed.size
     };
-    let perm = if observed.directory || observed.executable {
-        if read_only { 0o555 } else { 0o755 }
+    let mode = if read_only {
+        observed.mode.read_only()
     } else {
-        if read_only { 0o444 } else { 0o644 }
+        observed.mode
     };
+    let perm = mode.bits();
     FileAttr {
         ino,
         size,
@@ -158,5 +163,30 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(STAMP_EPOCH)
         );
         assert_eq!(directory.perm, 0o555);
+    }
+
+    #[test]
+    fn attributes_report_persisted_modes_and_mask_writes_when_read_only() {
+        let revision = Revision::new(7);
+        let writable = synthesize(
+            fuser::INodeNo(44),
+            ObservedAttr::from_revision(false, NodeMode::from_bits(0o600).unwrap(), 12, revision),
+            false,
+        );
+        assert_eq!(writable.perm, 0o600);
+
+        let read_only = synthesize(
+            fuser::INodeNo(45),
+            ObservedAttr::from_revision(false, NodeMode::from_bits(0o600).unwrap(), 12, revision),
+            true,
+        );
+        assert_eq!(read_only.perm, 0o400);
+
+        let directory = synthesize(
+            fuser::INodeNo(46),
+            ObservedAttr::from_revision(true, NodeMode::from_bits(0o700).unwrap(), 0, revision),
+            true,
+        );
+        assert_eq!(directory.perm, 0o500);
     }
 }

@@ -31,12 +31,12 @@ known profiles return `Corrupt` or `Invalid` as appropriate.
 | Family | Supported identifier | Reader | Writer | Older profiles | Newer profiles |
 | --- | --- | --- | --- | --- | --- |
 | Authenticated content | `YYFILE02` descriptor, `YYHASH02` index, 64 KiB logical units, content hash context 2 | Yes | Yes | No | Reject |
-| Object metadata | `YYHEAD03` mode 0, `YYSNAP03`, `YYINDEX2` | Yes | Yes | Reject `YYHEAD01`, `YYHEAD02`, `YYSNAP02` | Reject |
-| Canonical request | `YYREQ002`, request hash context 2, node identity context 2 | Yes | Yes | No | Reject |
-| Frozen transaction | `YYPLAN01` | Yes | Yes | No | Reject |
+| Object metadata | `YYHEAD04` mode 0, `YYSNAP04`, `YYINDEX2` | Yes | Yes | Reject `YYHEAD01`, `YYHEAD02`, `YYHEAD03`, `YYSNAP02`, `YYSNAP03` | Reject |
+| Canonical request | `YYREQ003`, request hash context 3, node identity context 2 | Yes | Yes | No | Reject |
+| Frozen transaction | `YYPLAN02` | Yes | Yes | No | Reject |
 | Expiry request | `YYEXP001`, expiry hash context 1 | Yes | Yes | No | Reject |
 | Service binding | `YYSERV01` | Yes | Yes | No | Reject |
-| SQLite authority | `yinyang-sqlite-3` | Yes | Yes | Reject `yinyang-sqlite-2` | Reject |
+| SQLite authority | `yinyang-sqlite-4` | Yes | Yes | Reject `yinyang-sqlite-2`, `yinyang-sqlite-3` | Reject |
 | Loopback RPC | Protocol version 1, commands 0-9, error tags 0-12 | Yes | Yes | No | Reject |
 
 The current writer emits only the identifiers in this table. The current reader

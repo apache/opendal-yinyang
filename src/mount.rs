@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Semaphore};
-use yinyang_core::{Authority, FileVersion, NodeId, Receipt};
+use yinyang_core::{Authority, FileVersion, NodeId, NodeMode, Receipt};
 
 // NodeState is always owned by Arc<Node>. Box the larger writable handle; keeping the
 // read-only FileVersion inline avoids a second allocation for every cached node.
@@ -560,6 +560,17 @@ impl MountFile {
             .lock()
             .await
             .set_executable(executable)
+            .await
+    }
+    /// Publish this node's dirty content first, then commit an exact ordinary
+    /// mode and advance the shared clean handle to the metadata revision.
+    pub async fn set_mode(&self, mode: NodeMode) -> Result<Receipt> {
+        self.require_write()?;
+        self.node
+            .writable_handle()?
+            .lock()
+            .await
+            .set_mode(mode)
             .await
     }
 

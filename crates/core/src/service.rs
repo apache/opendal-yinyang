@@ -22,7 +22,7 @@ use crate::authority::{
     RETAINED_REVISIONS_PAGE_MAX, RevisionHistoryPage, RevisionRecord, RevisionStatus,
 };
 use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
-use crate::namespace::{Node, NodeKind, decode, encode};
+use crate::namespace::{Node, NodeKind, NodeMode, decode, encode};
 use crate::snapshot::{
     ChangeRecord, Cursor, FileVersion, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
 };
@@ -487,7 +487,7 @@ impl MetadataService {
                 let revision = Revision::new(0);
                 tx.execute("INSERT INTO authority(singleton,profile,filesystem,root,latest) VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
                 tx.execute("INSERT INTO revisions(token,sequence,expired) VALUES(?1,0,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
-                let node = Node {id:root, generation:1, executable:false, link:None, kind:NodeKind::Directory{membership:1}};
+                let node = Node {id:root, generation:1, mode:NodeMode::DIRECTORY, link:None, kind:NodeKind::Directory{membership:1}};
                 tx.execute("INSERT INTO records(family,key,start,end,value) VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
             }
             let result = manifest(&tx)?;
@@ -1329,7 +1329,7 @@ mod admission_tests {
         Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE authority SET profile='yinyang-sqlite-2' WHERE singleton=1",
+                "UPDATE authority SET profile='yinyang-sqlite-3' WHERE singleton=1",
                 [],
             )
             .unwrap();
@@ -1346,7 +1346,7 @@ mod admission_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-sqlite-2");
+        assert_eq!(profile, "yinyang-sqlite-3");
     }
 
     #[tokio::test]
