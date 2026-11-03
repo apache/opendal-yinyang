@@ -35,14 +35,16 @@ The tested command is:
 
 ```shell
 rsync -r --checksum --no-times --no-owner --no-group --omit-dir-times \
-  [--delete] SOURCE/ /path/to/mount/DESTINATION/
+  --delete SOURCE/ /path/to/mount/DESTINATION/
 ```
 
 The destination may be absent. rsync creates it and its nested directories,
 creates files from the source modes (including `0600` and `0755`), and replaces
 existing files without `--inplace` or pre-created placeholders. The acceptance
 checks byte replacement, private and executable modes, a new source entry,
-removal of a source-deleted entry, and the same result after remount.
+removal of a source-deleted entry, and the same result after remount. Omit
+`--delete` when source-deleted destination entries should be retained; the
+acceptance also runs the same command without it.
 
 rsync's safe-save temporary files use `O_CREAT|O_EXCL` and mode `0600`; the
 mount persists that temporary mode, then rsync chmods the final mode before a
