@@ -37,4 +37,4 @@ pub(crate) const EXPIRY_REQUEST_HASH_CONTEXT: &str =
 
 pub(crate) const SERVICE_BINDING_MAGIC: [u8; 8] = *b"YYSERV01";
 pub(crate) const SQLITE_SCHEMA_PROFILE: &str = "yinyang-sqlite-4";
-pub(crate) const RPC_PROTOCOL_VERSION: u8 = 1;
+pub(crate) const RPC_PROTOCOL_VERSION: u8 = 2;
