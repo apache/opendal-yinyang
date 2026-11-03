@@ -38,7 +38,6 @@ const ENOSYS: i32 = 38;
 const EPERM: i32 = 1;
 const EOPNOTSUPP: i32 = 95;
 const EROFS: i32 = 30;
-const EINVAL: i32 = 22;
 const ENOTCONN: i32 = 107;
 const EIO: i32 = 5;
 const ENOENT: i32 = 2;
@@ -752,16 +751,20 @@ fn fuse_ordinary_modes_and_permission_enforcement_both_publications() {
 
         let directory = mounted.mountpoint().join("ordinary-directory");
         fs::create_dir(&directory).expect("create directory through the writable mount");
+        fs::write(directory.join("probe"), b"probe").expect("create directory child");
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .expect("chmod directory 0700");
         assert_eq!(mode(&directory), 0o700);
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o600))
             .expect("chmod directory without execute permission");
-        let denied = fs::read_dir(&directory).expect_err("owner cannot traverse a 0600 directory");
+        let denied = OpenOptions::new()
+            .read(true)
+            .open(directory.join("probe"))
+            .expect_err("owner cannot traverse a 0600 directory");
         assert_errno(
             denied,
             &[EACCES],
-            "read directory without execute permission",
+            "open a child without directory execute permission",
         );
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
             .expect("restore directory traversal");
