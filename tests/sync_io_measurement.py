@@ -296,22 +296,37 @@ def measure(
         *args,
     ]
     started = time.perf_counter()
-    run(command, cwd=work, env=env)
+    completed = run(command, cwd=work, env=env)
     elapsed = time.perf_counter() - started
     return {
         "instrumented_elapsed_s": round(elapsed, 6),
         "local_read_bytes": parse_trace(trace_path, work, roots, state),
+        "run_stdout": completed.stdout,
+        "run_stderr": completed.stderr,
         "trace": str(trace_path),
     }
 
 
-def status(yy: Path, config: Path, env: dict[str, str], cwd: Path) -> dict[str, object]:
+def status_check(
+    yy: Path,
+    config: Path,
+    env: dict[str, str],
+    cwd: Path,
+    stage: str,
+) -> dict[str, object]:
     result = run(
         [str(yy), "--volume", str(config), "sync", "status", "--json"],
         cwd=cwd,
         env=env,
     )
-    return json.loads(result.stdout)
+    document = json.loads(result.stdout)
+    summary = document["summary"]
+    if not summary["in_sync"]:
+        raise RuntimeError(f"{stage} did not reach in_sync: {json.dumps(summary)}")
+    return {
+        "stdout": result.stdout,
+        "summary": summary,
+    }
 
 
 def measure_scale(
@@ -369,7 +384,7 @@ def measure_scale(
             "timing_scope": "strace-instrumented elapsed diagnostic; not a native latency claim",
             "collector": "strace -f -yy -s 0 -e trace=read,pread64,readv,preadv",
         }
-        result["push_initial"] = measure(
+        push_initial = measure(
             yy,
             ["--volume", str(push_config), "sync", "run"],
             env=env,
@@ -378,7 +393,15 @@ def measure_scale(
             roots=(push_root,),
             state=push_state,
         )
-        result["pull_initial"] = measure(
+        push_initial["status"] = status_check(
+            yy,
+            push_config,
+            env,
+            work,
+            f"{files}-file initial push",
+        )
+        result["push_initial"] = push_initial
+        pull_initial = measure(
             yy,
             ["--volume", str(pull_config), "sync", "run"],
             env=env,
@@ -387,27 +410,41 @@ def measure_scale(
             roots=(pull_root,),
             state=pull_state,
         )
+        pull_initial["status"] = status_check(
+            yy,
+            pull_config,
+            env,
+            work,
+            f"{files}-file initial pull",
+        )
+        result["pull_initial"] = pull_initial
         time.sleep(1.2)
         noops = []
         for index in range(3):
-            noops.append(
-                measure(
-                    yy,
-                    ["--volume", str(pull_config), "sync", "run"],
-                    env=env,
-                    trace_path=traces / f"noop-{index + 1}.trace",
-                    work=work,
-                    roots=(pull_root,),
-                    state=pull_state,
-                )
+            noop = measure(
+                yy,
+                ["--volume", str(pull_config), "sync", "run"],
+                env=env,
+                trace_path=traces / f"noop-{index + 1}.trace",
+                work=work,
+                roots=(pull_root,),
+                state=pull_state,
             )
+            noop["status"] = status_check(
+                yy,
+                pull_config,
+                env,
+                work,
+                f"{files}-file no-op {index + 1}",
+            )
+            noops.append(noop)
         result["noop"] = noops
 
         edited = push_root / "d0" / "f0"
         update = bytearray([0xA5]) * SIZE
         update[:8] = (files + 1).to_bytes(8, "little")
         edited.write_bytes(update)
-        result["push_update"] = measure(
+        push_update = measure(
             yy,
             ["--volume", str(push_config), "sync", "run"],
             env=env,
@@ -416,7 +453,15 @@ def measure_scale(
             roots=(push_root,),
             state=push_state,
         )
-        result["pull_update"] = measure(
+        push_update["status"] = status_check(
+            yy,
+            push_config,
+            env,
+            work,
+            f"{files}-file push update",
+        )
+        result["push_update"] = push_update
+        pull_update = measure(
             yy,
             ["--volume", str(pull_config), "sync", "run"],
             env=env,
@@ -425,11 +470,17 @@ def measure_scale(
             roots=(pull_root,),
             state=pull_state,
         )
+        pull_update["status"] = status_check(
+            yy,
+            pull_config,
+            env,
+            work,
+            f"{files}-file pull update",
+        )
+        result["pull_update"] = pull_update
 
-        push_status = status(yy, push_config, env, work)
-        pull_status = status(yy, pull_config, env, work)
-        result["push_in_sync"] = push_status["summary"]["in_sync"]
-        result["pull_in_sync"] = pull_status["summary"]["in_sync"]
+        result["push_in_sync"] = result["push_update"]["status"]["summary"]["in_sync"]
+        result["pull_in_sync"] = result["pull_update"]["status"]["summary"]["in_sync"]
         result["push_tree"] = tree_digest(push_root)
         result["pull_tree"] = tree_digest(pull_root)
         result["trees_equal"] = result["push_tree"] == result["pull_tree"]
