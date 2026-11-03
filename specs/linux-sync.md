@@ -172,16 +172,21 @@ that selected input, not the live file observed when a response arrives.
 ## Local install
 
 The engine creates a private fd-relative temporary file and an `installs` row
-before dispatch. The adapter writes remote bytes into the supplied borrowed fd
-and verifies them: Managed verifies the core content identity; Direct verifies
-its accepted version/ETag, size and read pin.
+before dispatch. The adapter writes authenticated remote bytes into the supplied
+borrowed fd and returns the flat BLAKE3 digest from that same read: Managed
+authenticates each pinned verification unit, while Direct verifies its accepted
+version/ETag, size and read pin.
 
-Installation then verifies the temporary through an open descriptor and applies
-it by descriptor-relative rename or exchange. The expected local inode, parent
-identity and bytes are checked again at the effect boundary. A changed target is
-retained and becomes a conflict. Deletion first quarantines the exact observed
-inode. Recovery interprets only durable install rows and never guesses from a
-path name alone.
+Installation rechecks the private temporary's stat evidence and hashes it only
+when that evidence changed. It then applies the temporary by descriptor-relative
+rename or exchange and hashes the user-visible installed file once for baseline
+acceptance. The expected local inode, parent identity and bytes are still checked
+at the effect boundary; any changed evidence falls back to hashing and a changed
+target is retained as a conflict. Recovery treats a recorded temporary as
+untrusted across process restart, verifies its content once, and passes the
+resulting fingerprint into the install attempt. Deletion first quarantines the
+exact observed inode. Recovery interprets only durable install rows and never
+guesses from a path name alone.
 
 ## Retained artifacts
 
@@ -254,10 +259,12 @@ request remains unresolved.
 
 For both adapters, one pull hashes at most twice the pulled tree size, a settled
 no-op hashes zero local bytes, and a settled state retains zero artifact bytes.
-Managed creates at one depth use one adapter batch and therefore one authority
-head commit. Direct uses one remote mutation per file, as required by its
-non-batch capability. No-op cost is independent of process lifetime and tree
-history.
+The pull bound counts authenticated download work and the final local scan;
+the same pass also hashes the installed user-visible file once for baseline
+acceptance. The verified private temporary is not separately reread. Managed
+creates at one depth use one adapter batch and therefore one authority head
+commit. Direct uses one remote mutation per file, as required by its non-batch
+capability. No-op cost is independent of process lifetime and tree history.
 
 ## Limits
 

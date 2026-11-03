@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yinyang::sync_engine::{
-    EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter, RemoteBaseline,
-    RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure, RemoteObservation,
-    RemoteOperation, RemoteOutcome, RemotePin, RemoteRequest, SyncEngine, SyncModel,
+    DownloadedFile, EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter,
+    RemoteBaseline, RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure,
+    RemoteObservation, RemoteOperation, RemoteOutcome, RemotePin, RemoteRequest, SyncEngine,
+    SyncModel,
 };
 
 #[derive(Clone)]
@@ -188,7 +189,7 @@ impl RemoteAdapter for FakeAdapter {
         &self,
         entry: &RemoteEntry,
         output: BorrowedFd<'_>,
-    ) -> yinyang::sync_engine::Result<()> {
+    ) -> yinyang::sync_engine::Result<DownloadedFile> {
         let bytes = self
             .state
             .lock()
@@ -208,6 +209,10 @@ impl RemoteAdapter for FakeAdapter {
         })?;
         file.sync_all().map_err(|error| {
             yinyang::sync_engine::Error::io("sync fake download", Path::new("."), error)
+        })?;
+        Ok(DownloadedFile {
+            length: bytes.len() as u64,
+            digest: *blake3::hash(&bytes).as_bytes(),
         })
     }
 
@@ -643,8 +648,9 @@ async fn w2_costs_hold_for_managed_and_direct_capability_profiles() {
         assert!(engine.run().await.unwrap().in_sync);
         let pull_hashes = engine.hash_bytes_read();
         assert!(
-            pull_hashes <= tree * 2,
-            "{profile} pull hashed {pull_hashes} bytes for {tree} tree bytes"
+            pull_hashes <= tree,
+            "{profile} pull performed more than one local content scan: \
+             hashed {pull_hashes} bytes for {tree} tree bytes"
         );
         let status =
             SyncEngine::<FakeAdapter>::inspect(Some(&adapter), &state_path, adapter.model(), None)

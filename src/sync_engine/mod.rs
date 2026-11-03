@@ -33,10 +33,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub use adapter::{
-    EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter, RemoteBaseline,
-    RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure, RemoteObservation,
-    RemoteOperation, RemoteOutcome, RemotePin, RemoteReceipt, RemoteRequest, SYNC_SCHEMA,
-    SyncModel, hex,
+    DownloadedFile, EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter,
+    RemoteBaseline, RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure,
+    RemoteObservation, RemoteOperation, RemoteOutcome, RemotePin, RemoteReceipt, RemoteRequest,
+    SYNC_SCHEMA, SyncModel, hex,
 };
 pub use direct::{DirectAdapter, validate_namespace_entries};
 pub use engine::{Resolution, RunOutcome, SyncEngine};
