@@ -944,10 +944,10 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 }
             }
             Decision::MaterializeFile { entry, expected } => {
-                self.materialize_file(&entry, expected).await?;
+                let installed = self.materialize_file(&entry, expected).await?;
                 let path = entry.path.clone();
                 remote.insert(path.clone(), entry);
-                refresh_local_path(&self.local, &path, current)?;
+                current.insert_node(installed);
                 outcome.materialized_remote += 1;
             }
             Decision::MaterializeDirectory { entry } => {
@@ -1091,7 +1091,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
         &mut self,
         entry: &RemoteEntry,
         expected: Option<LocalFingerprint>,
-    ) -> Result<()> {
+    ) -> Result<LocalNode> {
         let (temporary, path, file) = self.local.create_install_file("download")?;
         let owned: OwnedFd = file.into();
         let mut install = InstallRecord {
@@ -1111,10 +1111,20 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             error: None,
         };
         self.local.store().insert_install(&install)?;
-        if let Err(error) = self.remote.read_file(entry, owned.as_fd()).await {
+        let downloaded = match self.remote.read_file(entry, owned.as_fd()).await {
+            Ok(downloaded) => downloaded,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                let _ = self.local.store().remove_install(&install.id);
+                return Err(error);
+            }
+        };
+        if downloaded.length != entry.length {
             let _ = std::fs::remove_file(&path);
             let _ = self.local.store().remove_install(&install.id);
-            return Err(error);
+            return Err(Error::corrupt(
+                "remote adapter returned a download with the wrong length",
+            ));
         }
         drop(owned);
         std::fs::set_permissions(
@@ -1122,7 +1132,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             std::fs::Permissions::from_mode(if entry.executable { 0o700 } else { 0o600 }),
         )
         .map_err(|error| Error::io("set downloaded sync file mode", &path, error))?;
-        let desired = match self.local.install_desired_file(&temporary) {
+        let desired = match self.local.install_desired_file(&temporary, downloaded) {
             Ok(desired) => desired,
             Err(error) => {
                 let _ = std::fs::remove_file(&path);
@@ -1132,7 +1142,9 @@ impl<R: RemoteAdapter> SyncEngine<R> {
         };
         install.desired_local = Some(desired);
         self.local.store().update_install(&install)?;
-        self.local.apply_install(&mut install)
+        self.local.apply_install(&mut install)?.ok_or_else(|| {
+            Error::corrupt("file installation did not return its installed local node")
+        })
     }
 
     async fn delete_local_file(&mut self, path: &str, expected: LocalFingerprint) -> Result<()> {
@@ -1149,7 +1161,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             error: None,
         };
         self.local.store().insert_install(&install)?;
-        self.local.apply_install(&mut install)
+        self.local.apply_install(&mut install).map(|_| ())
     }
 
     async fn record_conflict(
@@ -1862,7 +1874,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                             .map(LocalFingerprint::from_node)
                             .transpose()?;
                         if entry.kind == EntryKind::File {
-                            self.materialize_file(&entry, expected).await?;
+                            let _ = self.materialize_file(&entry, expected).await?;
                         } else {
                             self.materialize_remote_subtree(
                                 &path,
@@ -1932,7 +1944,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                     .filter(|node| !node.is_directory())
                     .map(LocalFingerprint::from_node)
                     .transpose()?;
-                self.materialize_file(&entry, expected).await?;
+                let _ = self.materialize_file(&entry, expected).await?;
                 remote.insert(path.to_owned(), entry);
                 outcome.materialized_remote += 1;
             }
@@ -1998,8 +2010,8 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                         .filter(|node| !node.is_directory())
                         .map(LocalFingerprint::from_node)
                         .transpose()?;
-                    self.materialize_file(&entry, expected).await?;
-                    refresh_local_path(&self.local, &entry_path, &mut current)?;
+                    let installed = self.materialize_file(&entry, expected).await?;
+                    current.insert_node(installed);
                     remote.insert(entry_path, entry);
                     outcome.materialized_remote += 1;
                 }
@@ -2243,7 +2255,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 .map(LocalFingerprint::from_node)
                 .transpose()?;
             if entry.kind == EntryKind::File {
-                self.materialize_file(&entry, expected).await?;
+                let _ = self.materialize_file(&entry, expected).await?;
             } else {
                 self.materialize_remote_subtree(&work.path, remote, &local, outcome)
                     .await?;

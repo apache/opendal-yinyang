@@ -422,8 +422,8 @@ async fn managed_sync_pull_hashing_is_linear() {
         assert!(pull.run().await.in_sync);
         let tree = (files * SIZE) as u64;
         assert!(
-            pull.hash_bytes_read() - before <= tree * 2,
-            "{files}-file pull rehashed more than twice the tree"
+            pull.hash_bytes_read() - before <= tree,
+            "{files}-file pull performed more than one local content scan"
         );
     }
 }

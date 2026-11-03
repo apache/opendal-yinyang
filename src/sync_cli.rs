@@ -23,9 +23,10 @@ use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use yinyang::sync_engine::{
-    BindingState, DirectAdapter, FrozenRemoteRequest, ManagedAdapter, PreparedRemoteRequest,
-    RemoteAdapter, RemoteBaseline, RemoteCapabilities, RemoteEntry, RemoteObservation,
-    RemoteOutcome, RemoteRequest, Resolution, RunOutcome, StatusDocument, SyncEngine, SyncModel,
+    BindingState, DirectAdapter, DownloadedFile, FrozenRemoteRequest, ManagedAdapter,
+    PreparedRemoteRequest, RemoteAdapter, RemoteBaseline, RemoteCapabilities, RemoteEntry,
+    RemoteObservation, RemoteOutcome, RemoteRequest, Resolution, RunOutcome, StatusDocument,
+    SyncEngine, SyncModel,
 };
 use yinyang::volume::{Access, Model, VolumeContext};
 
@@ -158,7 +159,7 @@ impl RemoteAdapter for CliRemote {
         &self,
         entry: &RemoteEntry,
         output: BorrowedFd<'_>,
-    ) -> yinyang::sync_engine::Result<()> {
+    ) -> yinyang::sync_engine::Result<DownloadedFile> {
         match self {
             Self::Managed(remote) => remote.read_file(entry, output).await,
             Self::Direct(remote) => remote.read_file(entry, output).await,

@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use yinyang::sync_engine::{
-    EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter, RemoteBaseline,
-    RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteObservation, RemoteOutcome, RemotePin,
-    RemoteRequest, SyncEngine, SyncModel, inspect_state,
+    DownloadedFile, EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter,
+    RemoteBaseline, RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteObservation,
+    RemoteOutcome, RemotePin, RemoteRequest, SyncEngine, SyncModel, inspect_state,
 };
 
 #[derive(Clone)]
@@ -92,7 +92,7 @@ impl RemoteAdapter for NoopAdapter {
         &self,
         _entry: &RemoteEntry,
         _output: BorrowedFd<'_>,
-    ) -> yinyang::sync_engine::Result<()> {
+    ) -> yinyang::sync_engine::Result<DownloadedFile> {
         unreachable!("no remote file exists")
     }
 

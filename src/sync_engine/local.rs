@@ -17,7 +17,7 @@
 
 //! fd-relative local storage shared by Managed and Direct Sync.
 
-use super::adapter::{RemoteEntry, SyncModel};
+use super::adapter::{DownloadedFile, RemoteEntry, SyncModel};
 use super::store::{
     ArtifactKind, ArtifactPhase, ArtifactRecord, ArtifactRelease, Binding, InstallOperation,
     InstallRecord, InstallState, LocalFingerprint, Store,
@@ -297,31 +297,66 @@ impl LocalTree {
         self.state.join("install").join(temporary)
     }
 
-    pub fn install_desired_file(&self, temporary: &str) -> Result<LocalFingerprint> {
+    pub fn install_desired_file(
+        &self,
+        temporary: &str,
+        downloaded: DownloadedFile,
+    ) -> Result<LocalFingerprint> {
         let path = self.install_path(temporary);
-        let stat = statat(&self.install_fd, temporary, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|error| Error::errno("inspect sync download", &path, error))?;
-        let (length, digest, identity) = hash_at(&self.install_fd, temporary, &path)?;
-        let file_stat = fstat(
-            &openat(
-                &self.install_fd,
-                temporary,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|error| Error::errno("open sync download", &path, error))?,
+        let file = openat(
+            &self.install_fd,
+            temporary,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
         )
-        .map_err(|error| Error::errno("inspect sync download", &path, error))?;
+        .map_err(|error| Error::errno("open sync download", &path, error))?;
+        let file_stat =
+            fstat(&file).map_err(|error| Error::errno("inspect sync download", &path, error))?;
+        if FileType::from_raw_mode(file_stat.st_mode) != FileType::RegularFile
+            || file_stat.st_size as u64 != downloaded.length
+        {
+            return Err(Error::corrupt(
+                "downloaded file does not match its verified length",
+            ));
+        }
         let executable =
             Mode::from_raw_mode(file_stat.st_mode).intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH);
-        LocalFingerprint::from_node(&LocalNode {
-            path: String::new(),
-            kind: LocalKind::File { length, digest },
+        fingerprint_from_stat(
+            &file_stat,
+            self.state_identity,
+            downloaded.digest,
             executable,
-            identity,
-            parent: Some(self.state_identity),
-            stat: Some(super::types::LocalStat::from_stat(&stat)),
-        })
+        )
+    }
+
+    pub fn verify_install_temporary(
+        &self,
+        temporary: &str,
+        desired: &LocalFingerprint,
+    ) -> Result<()> {
+        let path = self.install_path(temporary);
+        let file = openat(
+            &self.install_fd,
+            temporary,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::errno("open sync download", &path, error))?;
+        let stat =
+            fstat(&file).map_err(|error| Error::errno("inspect sync download", &path, error))?;
+        if stat_matches_fingerprint(&stat, desired) {
+            return Ok(());
+        }
+        let (length, digest, _) = hash_at(&self.install_fd, temporary, &path)?;
+        if length != desired.length
+            || digest.as_bytes() != &desired.digest
+            || executable(&stat) != desired.executable
+        {
+            return Err(Error::corrupt(
+                "downloaded file temporary does not match its accepted content",
+            ));
+        }
+        Ok(())
     }
 
     pub fn create_install_file(&self, prefix: &str) -> Result<(String, PathBuf, std::fs::File)> {
@@ -1012,23 +1047,13 @@ impl LocalTree {
                         let desired = install.desired_local.ok_or_else(|| {
                             Error::corrupt("prepared file install has no desired content")
                         })?;
-                        let current = match self.install_desired_file(&install.temporary) {
-                            Ok(current) => current,
-                            Err(error) => {
-                                install.state = InstallState::Failed;
-                                install.error = Some(format!(
-                                    "prepared Direct Sync download is unavailable: {error}"
-                                ));
-                                self.store.update_install(&install)?;
-                                continue;
-                            }
-                        };
-                        if current.length != desired.length || current.digest != desired.digest {
+                        if let Err(error) =
+                            self.verify_install_temporary(&install.temporary, &desired)
+                        {
                             install.state = InstallState::Failed;
-                            install.error = Some(
-                                "prepared Direct Sync download no longer matches its accepted bytes"
-                                    .to_owned(),
-                            );
+                            install.error = Some(format!(
+                                "prepared Direct Sync download is unavailable: {error}"
+                            ));
                             self.store.update_install(&install)?;
                             continue;
                         }
@@ -1129,10 +1154,15 @@ impl LocalTree {
         Ok(())
     }
 
-    pub fn apply_install(&mut self, install: &mut InstallRecord) -> Result<()> {
+    pub fn apply_install(&mut self, install: &mut InstallRecord) -> Result<Option<LocalNode>> {
         match install.operation {
-            InstallOperation::Create | InstallOperation::Replace => self.install_file(install),
-            InstallOperation::Delete => self.delete_file(install),
+            InstallOperation::Create | InstallOperation::Replace => {
+                self.install_file(install).map(Some)
+            }
+            InstallOperation::Delete => {
+                self.delete_file(install)?;
+                Ok(None)
+            }
         }
     }
 
@@ -1247,20 +1277,11 @@ impl LocalTree {
         }
     }
 
-    fn install_file(&mut self, install: &mut InstallRecord) -> Result<()> {
+    fn install_file(&mut self, install: &mut InstallRecord) -> Result<LocalNode> {
         let desired = install
             .desired_local
             .ok_or_else(|| Error::corrupt("file install has no desired content"))?;
-        let (temporary_length, temporary_digest, _) = hash_at(
-            &self.install_fd,
-            &install.temporary,
-            &self.install_path(&install.temporary),
-        )?;
-        if temporary_length != desired.length || temporary_digest.as_bytes() != &desired.digest {
-            return Err(Error::corrupt(
-                "downloaded file temporary does not match its accepted content",
-            ));
-        }
+        self.verify_install_temporary(&install.temporary, &desired)?;
 
         let (parent, name) = split_path(&install.path)?;
         self.ensure_directory(parent)?;
@@ -1277,8 +1298,14 @@ impl LocalTree {
         } else {
             Mode::RUSR | Mode::WUSR
         };
-        rustix::fs::fchmod(&temporary, mode)
-            .map_err(|error| Error::errno("set sync download mode", &temporary_path, error))?;
+        let temporary_stat = fstat(&temporary)
+            .map_err(|error| Error::errno("inspect sync download", &temporary_path, error))?;
+        if Mode::from_raw_mode(temporary_stat.st_mode) & (Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            != mode
+        {
+            rustix::fs::fchmod(&temporary, mode)
+                .map_err(|error| Error::errno("set sync download mode", &temporary_path, error))?;
+        }
         let parent_fd = self.open_relative_dir(parent)?;
         let parent_identity = identity(
             &parent_fd,
@@ -1477,13 +1504,46 @@ impl LocalTree {
 
         install.state = InstallState::Applied;
         self.store.update_install(install)?;
-        let fingerprint = self.local_fingerprint(&install.path)?;
-        if !desired_matches(install.desired_local, Some(fingerprint)) {
-            return self.install_conflict(
-                install,
-                "installed local bytes changed before baseline acceptance",
-            );
-        }
+        let installed = openat(
+            &parent_fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            Error::errno(
+                "open installed Direct Sync file",
+                &self.root.join(&install.path),
+                error,
+            )
+        })?;
+        let installed_stat = fstat(&installed).map_err(|error| {
+            Error::errno(
+                "inspect installed Direct Sync file",
+                &self.root.join(&install.path),
+                error,
+            )
+        })?;
+        let fingerprint = if FileType::from_raw_mode(installed_stat.st_mode)
+            == FileType::RegularFile
+            && stat_matches_renamed_fingerprint(&installed_stat, &desired)
+        {
+            fingerprint_from_stat(
+                &installed_stat,
+                parent_identity,
+                desired.digest,
+                desired.executable,
+            )?
+        } else {
+            let fingerprint = self.local_fingerprint(&install.path)?;
+            if !desired_matches(install.desired_local, Some(fingerprint)) {
+                return self.install_conflict(
+                    install,
+                    "installed local bytes changed before baseline acceptance",
+                );
+            }
+            fingerprint
+        };
         let baseline = build_baseline(install, fingerprint)?;
         let baseline_ref = baseline
             .as_ref()
@@ -1491,7 +1551,7 @@ impl LocalTree {
         self.store
             .complete_install(&install.id, baseline_ref, &install.path)?;
         self.mark_settled_artifact(install)?;
-        Ok(())
+        Ok(local_node_from_fingerprint(&install.path, fingerprint))
     }
 
     fn delete_file(&mut self, install: &mut InstallRecord) -> Result<()> {
@@ -1946,6 +2006,93 @@ fn desired_matches(
                 && desired.executable == fingerprint.executable
         }
         _ => false,
+    }
+}
+
+fn executable(stat: &Stat) -> bool {
+    Mode::from_raw_mode(stat.st_mode).intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH)
+}
+
+fn stat_matches_fingerprint(stat: &Stat, fingerprint: &LocalFingerprint) -> bool {
+    let Some(recorded) = fingerprint.stat else {
+        return false;
+    };
+    recorded.dev == stat.st_dev
+        && recorded.ino == stat.st_ino
+        && fingerprint.length == stat.st_size as u64
+        && recorded.mtime == stat.st_mtime
+        && recorded.mtime_nsec == stat.st_mtime_nsec as i64
+        && recorded.ctime == stat.st_ctime
+        && recorded.ctime_nsec == stat.st_ctime_nsec as i64
+        && fingerprint.identity() == identity(stat)
+        && fingerprint.executable == executable(stat)
+}
+
+fn stat_matches_renamed_fingerprint(stat: &Stat, fingerprint: &LocalFingerprint) -> bool {
+    let Some(recorded) = fingerprint.stat else {
+        return false;
+    };
+    recorded.dev == stat.st_dev
+        && recorded.ino == stat.st_ino
+        && fingerprint.length == stat.st_size as u64
+        && recorded.mtime == stat.st_mtime
+        && recorded.mtime_nsec == stat.st_mtime_nsec as i64
+        && fingerprint.identity() == identity(stat)
+        && fingerprint.executable == executable(stat)
+}
+
+fn fingerprint_from_stat(
+    stat: &Stat,
+    parent: Identity,
+    digest: [u8; 32],
+    executable: bool,
+) -> Result<LocalFingerprint> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(Error::corrupt("installed sync file is not a regular file"));
+    }
+    Ok(LocalFingerprint {
+        length: stat.st_size as u64,
+        digest,
+        remote_digest: None,
+        executable,
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        parent_dev: parent.dev,
+        parent_ino: parent.ino,
+        stat: Some(super::store::ArtifactStat {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            mtime: stat.st_mtime,
+            mtime_nsec: stat.st_mtime_nsec as i64,
+            ctime: stat.st_ctime,
+            ctime_nsec: stat.st_ctime_nsec as i64,
+        }),
+        recorded_ns: super::store::recorded_now()?,
+    })
+}
+
+fn local_node_from_fingerprint(path: &str, fingerprint: LocalFingerprint) -> LocalNode {
+    LocalNode {
+        path: path.to_owned(),
+        kind: LocalKind::File {
+            length: fingerprint.length,
+            digest: ContentHash::from_bytes(fingerprint.digest),
+        },
+        executable: fingerprint.executable,
+        identity: fingerprint.identity(),
+        parent: Some(Identity {
+            dev: fingerprint.parent_dev,
+            ino: fingerprint.parent_ino,
+        }),
+        stat: fingerprint.stat.map(|stat| super::types::LocalStat {
+            dev: stat.dev,
+            ino: stat.ino,
+            size: fingerprint.length,
+            mtime: stat.mtime,
+            mtime_nsec: stat.mtime_nsec,
+            ctime: stat.ctime,
+            ctime_nsec: stat.ctime_nsec,
+        }),
     }
 }
 

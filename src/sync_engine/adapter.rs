@@ -344,6 +344,17 @@ pub struct PreparedRemoteRequest {
     pub source: Option<PathBuf>,
 }
 
+/// Bytes written by a successful remote file read.
+///
+/// `digest` is the flat BLAKE3 digest of exactly `length` bytes written to the
+/// engine-owned descriptor. The adapter verifies the remote content before
+/// returning this evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadedFile {
+    pub length: u64,
+    pub digest: [u8; 32],
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RemoteFailure {
     pub kind: ErrorKind,
@@ -410,7 +421,11 @@ pub trait RemoteAdapter: Clone + Send + Sync {
 
     async fn observe(&self, baseline: Option<&RemoteBaseline>) -> Result<RemoteObservation>;
 
-    async fn read_file(&self, entry: &RemoteEntry, output: BorrowedFd<'_>) -> Result<()>;
+    async fn read_file(
+        &self,
+        entry: &RemoteEntry,
+        output: BorrowedFd<'_>,
+    ) -> Result<DownloadedFile>;
 
     async fn freeze(&self, request: RemoteRequest) -> Result<FrozenRemoteRequest>;
 
