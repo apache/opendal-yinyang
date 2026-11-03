@@ -699,7 +699,7 @@ impl FileHandle {
                 (None, Some(executable)) => snapshot
                     .node(node)
                     .await?
-                    .ok_or_else(|| Error::State(ErrorKind::NotFound, "node is absent"))?
+                    .ok_or(Error::State(ErrorKind::NotFound, "node is absent"))?
                     .mode()
                     .with_executable(executable),
                 _ => {
