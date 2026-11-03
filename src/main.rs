@@ -242,7 +242,7 @@ enum Command {
         #[command(subcommand)]
         command: sync_cli::SyncCommand,
     },
-    /// Inspect Managed space and plan declarative retention (requires --volume).
+    /// Inspect space, plan retention, or explicitly expire history (requires --volume).
     Space {
         #[command(subcommand)]
         command: space_cli::SpaceCommand,
@@ -383,7 +383,7 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
         Command::Space { .. } => {
             return Err(CliError::invalid(
                 CliStage::Argument,
-                "space inspection requires --volume CONFIG.json",
+                "space commands require --volume CONFIG.json",
             ));
         }
         _ => {}

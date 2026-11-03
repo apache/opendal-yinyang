@@ -359,6 +359,7 @@ fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Invalid => "invalid",
         ErrorKind::InvalidName => "invalid_name",
         ErrorKind::NotFound => "not_found",
+        ErrorKind::Expired => "expired",
         ErrorKind::AlreadyExists => "already_exists",
         ErrorKind::NotDirectory => "not_directory",
         ErrorKind::IsDirectory => "is_directory",
@@ -377,6 +378,5 @@ fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Storage => "storage",
         ErrorKind::Io => "io",
         ErrorKind::NoSpace => "no_space",
-        ErrorKind::Expired => "expired",
     }
 }

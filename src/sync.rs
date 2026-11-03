@@ -18,7 +18,7 @@
 //! Durable direct-from-local-file content coordination for native adapters.
 
 use crate::intent;
-use crate::local::store;
+use crate::local::{lease, store};
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
@@ -27,6 +27,7 @@ use tokio::io::AsyncRead;
 use tokio::sync::Mutex;
 use yinyang_core::{Authority, CommitId, NodeId, Planner, Receipt, Revision, Transaction};
 
+const LEASE_FILE: &str = "sync.lock";
 const SCHEMA: &[store::TableColumns<'static>] = &[
     ("binding", &["singleton", "profile", "filesystem"]),
     (intent::TABLE, intent::COLUMNS),
@@ -81,6 +82,28 @@ pub(crate) async fn preflight_open(
     })
     .await
     .map_err(Error::local)?
+}
+
+/// Exclusive lease for one content Sync state profile.
+///
+/// Acquisition may create the configured directory and `sync.lock`, but it
+/// never creates, initializes, or recovers `sync.db`.
+pub(crate) struct StateLease {
+    _lease: lease::StateLease,
+}
+
+impl StateLease {
+    pub(crate) async fn acquire(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref().to_owned();
+        tokio::task::spawn_blocking(move || Self::acquire_sync(&directory))
+            .await
+            .map_err(Error::local)?
+    }
+
+    fn acquire_sync(directory: &Path) -> Result<Self> {
+        let lease = lease::StateLease::acquire(directory, LEASE_FILE).map_err(store_error)?;
+        Ok(Self { _lease: lease })
+    }
 }
 
 /// Content-addressed local intent, distinct from the frozen remote commit ID.
@@ -246,6 +269,7 @@ struct Inner {
     authority: Arc<dyn Authority>,
     journal: Arc<Mutex<Connection>>,
     gate: Mutex<()>,
+    _lease: StateLease,
 }
 
 /// Durable content publication from an exact local file.
@@ -270,6 +294,8 @@ impl Sync {
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(Error::local)?;
+        preflight_open(&directory, filesystem, false).await?;
+        let lease = StateLease::acquire(&directory).await?;
         preflight_open(&directory, filesystem, false).await?;
         let path = directory.join("sync.db");
         let journal = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -304,6 +330,7 @@ impl Sync {
                 authority,
                 journal: Arc::new(Mutex::new(journal)),
                 gate: Mutex::new(()),
+                _lease: lease,
             }),
         })
     }
@@ -491,33 +518,73 @@ impl Sync {
             }
             intent::State::Prepared | intent::State::Unknown | intent::State::Retryable => {}
         }
-        if state == intent::State::Unknown
-            && let Some(receipt) =
-                intent::receipt_for(self.authority(), row.commit_id()?, row.digest()?).await?
-        {
-            self.save_state(edit, intent::State::Committed, Some(&receipt), None)
-                .await?;
-            return Ok(receipt.cursor.revision);
-        }
-        let request = match self.authority().restore_transaction(&row.request).await {
-            Ok(request) => request,
+        let verification =
+            yinyang_core::Transaction::verify_identity(&row.request, self.authority().filesystem())
+                .map_err(Error::from)
+                .and_then(|(_, frozen_id, frozen_digest)| {
+                    let commit_id = row.commit_id()?;
+                    let digest = row.digest()?;
+                    if frozen_id == commit_id && frozen_digest == digest {
+                        Ok((frozen_id, frozen_digest))
+                    } else {
+                        Err(Error::State(
+                            ErrorKind::Corrupt,
+                            "frozen content request identity disagrees with local intent",
+                        ))
+                    }
+                });
+        let failure_commit = match &verification {
+            Ok((commit_id, _)) => *commit_id,
+            Err(_) => derived_commit(edit),
+        };
+        let (commit_id, digest) = match verification {
+            Ok(identity) => identity,
             Err(error) => {
-                let error = Error::from(error);
-                let failure = Failure::capture(&error);
-                let retry_state = if state == intent::State::Unknown {
+                let failure = if state == intent::State::Unknown {
+                    Failure::unknown_with(
+                        failure_commit,
+                        format!("content request verification failed: {error}"),
+                    )
+                } else {
+                    Failure::capture(&error)
+                };
+                let next_state = if state == intent::State::Unknown {
                     intent::State::Unknown
                 } else {
-                    intent::State::Retryable
+                    match error.kind() {
+                        ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
+                            intent::State::Failed
+                        }
+                        _ => intent::State::Retryable,
+                    }
                 };
-                self.save_state(edit, retry_state, None, Some(&failure))
+                self.save_state(edit, next_state, None, Some(&failure))
                     .await?;
                 return Err(Error::Retained(failure));
             }
         };
         self.save_state(edit, intent::State::Unknown, None, None)
             .await?;
-        match self.authority().commit(&request).await {
+        let outcome = match self
+            .authority()
+            .commit_frozen_batch(std::slice::from_ref(&row.request))
+            .await
+        {
+            Ok(mut outcomes) if outcomes.len() == 1 => Ok(outcomes.remove(0)),
+            Ok(_) => Err(Error::State(
+                ErrorKind::Corrupt,
+                "content frozen batch returned an invalid outcome count",
+            )),
+            Err(error) => Err(Error::from(error)),
+        };
+        match outcome {
             Ok(yinyang_core::CommitOutcome::Committed(receipt)) => {
+                if receipt.commit_id != commit_id || receipt.request_digest != digest {
+                    return Err(Error::State(
+                        ErrorKind::Corrupt,
+                        "content commit returned a receipt for another request",
+                    ));
+                }
                 self.save_state(edit, intent::State::Committed, Some(&receipt), None)
                     .await?;
                 Ok(receipt.cursor.revision)
@@ -542,6 +609,12 @@ impl Sync {
                 Err(Error::Retryable)
             }
             Ok(yinyang_core::CommitOutcome::Unknown(commit)) => {
+                if commit != commit_id {
+                    return Err(Error::State(
+                        ErrorKind::Corrupt,
+                        "content commit returned an unknown outcome for another request",
+                    ));
+                }
                 let failure = Failure::unknown_with(commit, "content commit outcome is unknown");
                 self.save_state(edit, intent::State::Unknown, None, Some(&failure))
                     .await?;
@@ -549,7 +622,7 @@ impl Sync {
             }
             Err(error) => {
                 let failure = Failure::unknown_with(
-                    row.commit_id()?,
+                    commit_id,
                     format!("content commit failed after dispatch: {error}"),
                 );
                 self.save_state(edit, intent::State::Unknown, None, Some(&failure))

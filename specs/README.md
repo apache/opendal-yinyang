@@ -21,7 +21,7 @@ This directory contains the maintained contracts for Apache OpenDAL™ YinYang.
 | [Linux operations](linux-operations.md) | Health diagnostics, user-service lifecycle and installed-prefix state boundaries. |
 | [Linux applications](linux-applications.md) | Tested rsync and GNU tar workflows, their mode/timestamp boundaries, and the observed Git exclusion. |
 | [Linux trial distribution](linux-trial-distribution.md) | Direct trial binary, traceable archive verification, versioned-prefix installation, stopped activation and non-destructive inventory boundaries. |
-| [Managed space and retention](managed-space-retention.md) | Read-only logical, object, and staging accounting plus bounded non-destructive retention planning. |
+| [Managed space and retention](managed-space-retention.md) | Logical/object/staging accounting, bounded retention planning, and explicit non-physical revision expiry under stopped local state. |
 | [Managed Sync acceptance](managed-sync-acceptance.md) | Real-process Linux acceptance for ordinary-directory reconciliation, conflicts, artifacts, and recovery. |
 | [Native bridge](native-bridge.md) | In-process ownership and private adapter request semantics. |
 | [Experimental macOS frontends](macos-frontends.md) | Isolated FSKit and File Provider prototypes; not ordinary CLI admission. |

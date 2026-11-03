@@ -36,14 +36,17 @@ requires the configured remote.
 
 `backup` writes one quiesced package containing the bound root,
 `sync-engine.db`, adapter support state, retained artifacts and a
-checksum-protected manifest. It refuses incomplete installs. `restore` validates
-the complete package and adapter-specific support state before creating either
-absent destination. Restore rebinds root, state, baseline and artifact inode
-identities while preserving accepted content evidence, requests and receipts.
-Each restored artifact is verified once against its recorded length and digest;
-its new device, inode, mtime and ctime are persisted in the same rebind
-transaction. A mismatch keeps the artifact marked changed for explicit
-inspection instead of rehashing unchanged retained content on every status.
+checksum-protected manifest. Process lease files such as `sync-engine.lock`,
+`sync.lock`, `runtime.lock`, and `content/runtime.lock` are ephemeral
+coordination state and are never package evidence. The command refuses
+incomplete installs. `restore` validates the complete package and
+adapter-specific support state before creating either absent destination.
+Restore rebinds root, state, baseline and artifact inode identities while
+preserving accepted content evidence, requests and receipts. Each restored
+artifact is verified once against its recorded length and digest; its new
+device, inode, mtime and ctime are persisted in the same rebind transaction. A
+mismatch keeps the artifact marked changed for explicit inspection instead of
+rehashing unchanged retained content on every status.
 
 ## Admission
 
@@ -154,7 +157,11 @@ retained input remain. Receipt-capable adapters look up the original receipt on
 the next retry pass; otherwise they replay the same request identity with the
 same source and precondition. A later observation never proves that an
 ambiguous request committed. A newer local edit is not replaced by the older
-accepted input.
+accepted input. Managed sends exact frozen request bytes through the
+receipt-first frozen batch and can restore a pending request's exact known base
+when that revision is logically expired. Before dispatch it verifies each
+encoded transaction's canonical authority/identity/digest against the engine
+wrapper, and committed or Unknown outcomes must identify that same wrapper.
 
 Conflicts retain both available sides until an explicit decision. `--keep
 local` publishes the current local decision against a newly observed remote

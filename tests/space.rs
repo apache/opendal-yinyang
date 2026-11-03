@@ -249,6 +249,79 @@ async fn keep_last_and_requested_pin_select_only_declared_revisions() {
 }
 
 #[tokio::test]
+async fn clean_ready_handle_protects_its_base_for_recovery_and_publication() {
+    const CHUNK: usize = 64 * 1024;
+
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let original = (0..2 * CHUNK + 37)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let content = authority
+        .data()
+        .prepare(&mut original.as_slice())
+        .await
+        .unwrap();
+    let mut create = Planner::new(
+        &authority.observe_latest().await.unwrap(),
+        CommitId::generate(),
+    );
+    let node = create
+        .create_file(authority.root(), "file", content, false)
+        .await
+        .unwrap();
+    let CommitOutcome::Committed(created) =
+        authority.commit(&create.finish().unwrap()).await.unwrap()
+    else {
+        panic!("initial file creation was not committed");
+    };
+    let base = created.cursor.revision;
+
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("editor");
+    let runtime = Runtime::open(authority.clone(), &staging).await.unwrap();
+    let file = runtime.open_node(node, true).await.unwrap();
+    assert_eq!(file.status().await.unwrap().remote_revision, base);
+    assert!(!file.status().await.unwrap().pending);
+    let handle = file.release().unwrap();
+
+    runtime
+        .create_directory(authority.root(), "later-revision")
+        .await
+        .unwrap();
+    let plan = plan_managed_retention(authority.as_ref(), &staging, Some(1), &[], &[])
+        .await
+        .unwrap();
+    let decision = plan
+        .revisions
+        .iter()
+        .find(|revision| revision.revision == hex(base))
+        .expect("clean handle base decision");
+    assert!(decision.selected);
+    assert!(
+        decision.reasons.contains(&"staging_base"),
+        "clean handle base has unexpected reasons: {:?}",
+        decision.reasons
+    );
+
+    let mut recovered = runtime.recover(handle).await.unwrap();
+    assert_eq!(recovered.read(0, original.len()).await.unwrap(), original);
+    let offset = CHUNK + 19;
+    let update = b"clean-handle-write";
+    recovered.write(offset as u64, update).await.unwrap();
+    let receipt = recovered.fsync().await.unwrap().unwrap();
+    assert_ne!(receipt.cursor.revision, base);
+
+    let latest = authority.observe_latest().await.unwrap();
+    let remote = latest.open_file(node).await.unwrap();
+    assert_eq!(
+        remote.read(offset as u64, update.len()).await.unwrap(),
+        update
+    );
+}
+
+#[tokio::test]
 async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let backend = TestBackend::default();
     let fs = Fs::create(backend.operator()).await.unwrap();
@@ -275,7 +348,7 @@ async fn space_v2_traverses_metadata_and_content_without_payload_claims() {
     let report = inspect_managed_space(authority.as_ref(), &backend.operator(), &staging)
         .await
         .unwrap();
-    assert_eq!(report.schema, "yinyang.managed-space.report.v4");
+    assert_eq!(report.schema, "yinyang.managed-space.report.v5");
     assert!(!report.deletion_authorized);
     assert_eq!(report.reclaimable_bytes, None);
     assert_eq!(report.physical.state, MeasurementState::Partial);

@@ -141,6 +141,26 @@ async fn remote_bytes(authority: &Arc<dyn Authority>, node: NodeId) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn content_sync_state_has_one_process_writer() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+
+    let sync = Sync::open(authority.clone(), &state).await.unwrap();
+    assert!(state.join("sync.lock").is_file());
+    let error = match Sync::open(authority.clone(), &state).await {
+        Ok(_) => panic!("a second Sync writer opened the same state"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Busy);
+
+    drop(sync);
+    Sync::open(authority, &state).await.unwrap();
+}
+
+#[tokio::test]
 async fn content_edits_are_conditional_and_conflicts_are_terminal() {
     let backend = TestBackend::default();
     let fs = Fs::create(backend.operator()).await.unwrap();
@@ -210,6 +230,130 @@ async fn unknown_content_receipt_is_resolved_after_restart_without_recommit() {
         published_revision
     );
     assert_eq!(remote_bytes(&authority, node).await, b"replacement");
+}
+
+#[tokio::test]
+async fn unknown_content_validation_precedes_receipt_and_preserves_request_identity() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let inner: Arc<dyn Authority> = Arc::new(fs);
+    let node = create_file(&inner, "edited", b"baseline").await;
+    let fault = Arc::new(LostResponseAuthority::new(inner));
+    let authority: Arc<dyn Authority> = fault.clone();
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("sync");
+    let sync = Sync::open(authority.clone(), &state).await.unwrap();
+    let baseline = authority.observe_latest().await.unwrap();
+    let wrong_wrapper = sync
+        .stage(node, baseline.revision(), &mut &b"first replacement"[..])
+        .await
+        .unwrap();
+    fault.lose_next_response();
+    assert_eq!(
+        sync.publish(wrong_wrapper).await.unwrap_err().kind(),
+        ErrorKind::Unknown
+    );
+    let baseline = authority.observe_latest().await.unwrap();
+    let corrupt_request = sync
+        .stage(node, baseline.revision(), &mut &b"second replacement"[..])
+        .await
+        .unwrap();
+    fault.lose_next_response();
+    assert_eq!(
+        sync.publish(corrupt_request).await.unwrap_err().kind(),
+        ErrorKind::Unknown
+    );
+    drop(sync);
+
+    let database = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+    let (original_request, original_request_id, original_digest, original_commit): (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) = database
+        .query_row(
+            "SELECT request,request_id,request_digest,commit_id FROM intents WHERE id=?1",
+            rusqlite::params![wrong_wrapper.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE intents SET commit_id=?2 WHERE id=?1",
+            rusqlite::params![wrong_wrapper.as_bytes().as_slice(), vec![0xaa_u8; 16]],
+        )
+        .unwrap();
+    let (second_request_id, second_digest, second_commit): (Vec<u8>, Vec<u8>, Vec<u8>) = database
+        .query_row(
+            "SELECT request_id,request_digest,commit_id FROM intents WHERE id=?1",
+            rusqlite::params![corrupt_request.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE intents SET request=?2 WHERE id=?1",
+            rusqlite::params![corrupt_request.as_bytes().as_slice(), vec![0_u8]],
+        )
+        .unwrap();
+    drop(database);
+
+    let expected_wrapper_commit = CommitId::from_bytes(
+        original_commit
+            .as_slice()
+            .try_into()
+            .expect("fixed commit id"),
+    );
+    let expected_request_commit = CommitId::from_bytes(
+        second_commit
+            .as_slice()
+            .try_into()
+            .expect("fixed commit id"),
+    );
+    let sync = Sync::open(authority, &state).await.unwrap();
+    let error = sync.publish(wrong_wrapper).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    assert_eq!(error.commit_id(), Some(expected_wrapper_commit));
+    let error = sync.publish(corrupt_request).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unknown);
+    assert_eq!(error.commit_id(), Some(expected_request_commit));
+    drop(sync);
+
+    let database = rusqlite::Connection::open(state.join("sync.db")).unwrap();
+    let (state, request, request_id, digest, commit): (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) =
+        database
+            .query_row(
+                "SELECT state,request,request_id,request_digest,commit_id FROM intents WHERE id=?1",
+                rusqlite::params![wrong_wrapper.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(state, 1);
+    assert_eq!(request, original_request);
+    assert_eq!(request_id, original_request_id);
+    assert_eq!(digest, original_digest);
+    assert_ne!(commit, original_commit);
+
+    let (state, request_id, digest, commit): (i64, Vec<u8>, Vec<u8>, Vec<u8>) = database
+        .query_row(
+            "SELECT state,request_id,request_digest,commit_id FROM intents WHERE id=?1",
+            rusqlite::params![corrupt_request.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, 1);
+    assert_eq!(request_id, second_request_id);
+    assert_eq!(digest, second_digest);
+    assert_eq!(commit, second_commit);
 }
 
 #[tokio::test]

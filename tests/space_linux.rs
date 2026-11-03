@@ -22,12 +22,16 @@ use yinyang_test_support as support;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use support::TestBackend;
-use yinyang::core::{Authority, Fs, NodeId, Revision};
+use yinyang::core::{Authority, CommitId, CommitOutcome, Fs, NodeId, Planner, Revision};
+use yinyang::runtime::Runtime;
 use yinyang::space::{
     BackupPackageState, StagingBindingState, inspect_bound_local_staging, plan_managed_retention,
 };
 use yinyang::sync::Sync;
-use yinyang::sync_engine::{ManagedAdapter, SyncEngine, inspect_backup_package, inspect_state};
+use yinyang::sync_engine::{
+    ErrorKind as EngineErrorKind, FrozenRemoteRequest, ManagedAdapter, PreparedRemoteRequest,
+    RemoteAdapter, RemoteOperation, SyncEngine, inspect_backup_package, inspect_state,
+};
 
 fn identity_hex(identity: NodeId) -> String {
     identity
@@ -51,6 +55,93 @@ fn parse_revision(value: &str) -> Revision {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
     }
     Revision::from_bytes(bytes)
+}
+
+#[tokio::test]
+async fn managed_adapter_rejects_wrong_frozen_wrapper_before_receipt_and_dispatch() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let snapshot = authority.observe_latest().await.unwrap();
+    let mut planner = Planner::new(&snapshot, CommitId::generate());
+    planner
+        .create_directory(authority.root(), "guarded")
+        .await
+        .unwrap();
+    let transaction = planner.finish().unwrap();
+    let id = *transaction.id().as_bytes();
+    let digest = transaction.digest();
+    let bytes = transaction.to_bytes().unwrap();
+    let before = snapshot.revision();
+
+    let mut wrong_id = id;
+    wrong_id[0] ^= 1;
+    let mut wrong_digest = digest;
+    wrong_digest[0] ^= 1;
+    for (request_id, request_digest) in [(wrong_id, digest), (id, wrong_digest)] {
+        let request = PreparedRemoteRequest {
+            request: FrozenRemoteRequest {
+                id: request_id,
+                digest: request_digest,
+                bytes: bytes.clone(),
+                operation: RemoteOperation::CreateDirectory,
+                path: "guarded".to_owned(),
+                original_path: None,
+                desired_path: None,
+            },
+            source: None,
+        };
+        let error = ManagedAdapter::new(authority.clone())
+            .publish_batch(&[request])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Corrupt);
+        assert_eq!(authority.observe_latest().await.unwrap().revision(), before);
+    }
+    assert!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .resolve("guarded")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    assert!(matches!(
+        authority.commit(&transaction).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+    let committed = authority.observe_latest().await.unwrap();
+    assert!(committed.resolve("guarded").await.unwrap().is_some());
+    let adapter = ManagedAdapter::new(authority.clone());
+    for (request_id, request_digest) in [(wrong_id, digest), (id, wrong_digest)] {
+        let frozen = FrozenRemoteRequest {
+            id: request_id,
+            digest: request_digest,
+            bytes: bytes.clone(),
+            operation: RemoteOperation::CreateDirectory,
+            path: "guarded".to_owned(),
+            original_path: None,
+            desired_path: None,
+        };
+        let error = adapter.receipt(&frozen).await.unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Corrupt);
+
+        let error = adapter
+            .publish_batch(&[PreparedRemoteRequest {
+                request: frozen,
+                source: None,
+            }])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), EngineErrorKind::Corrupt);
+        assert_eq!(
+            authority.observe_latest().await.unwrap().revision(),
+            committed.revision()
+        );
+    }
 }
 
 #[tokio::test]
@@ -119,6 +210,13 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
     .unwrap();
     drop(sync);
 
+    let runtime = Runtime::open(authority.clone(), state.join("content"))
+        .await
+        .unwrap();
+    let file = runtime.open_node(seeded.id(), true).await.unwrap();
+    file.release().unwrap();
+    drop(runtime);
+
     let backup = temp.path().join("backup");
     let mut directory = SyncEngine::open(ManagedAdapter::new(authority.clone()), &state)
         .await
@@ -158,6 +256,7 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
         .flat_map(|revision| revision.reasons.iter().copied())
         .collect::<BTreeSet<_>>();
     assert!(reasons.contains("backup_sync_intent_prepared"));
+    assert!(reasons.contains("backup_staging_base"));
     assert!(reasons.contains("backup_sync_engine_baseline"));
     assert!(plan.revisions.iter().any(|revision| {
         revision.revision == revision_hex(baseline)

@@ -117,7 +117,9 @@ state/artifacts/
 `sync-engine.db` is created with `VACUUM INTO`, not by copying a live main
 database. Other local state files that are present are checksummed and copied
 at their existing relative path; the engine itself requires only its database
-and retained artifacts.
+and retained artifacts. Process lease files (`sync-engine.lock`, `sync.lock`,
+`runtime.lock`, and `content/runtime.lock`) are not copied because restore
+creates the leases needed by its own writer.
 `manifest.bin` records the filesystem identity, the complete quiesced local
 snapshot with content hashes, each retained artifact's current tree and hash,
 every database file hash, and the original filesystem identities.

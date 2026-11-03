@@ -166,6 +166,7 @@ impl RemoteAdapter for ManagedAdapter {
     }
 
     async fn receipt(&self, request: &FrozenRemoteRequest) -> Result<Option<RemoteOutcome>> {
+        super::managed_intent::verify_frozen(self.authority.as_ref(), request)?;
         let snapshot = self.authority.observe_latest().await.map_err(Error::from)?;
         let Some(receipt) = snapshot
             .receipt(CommitId::from_bytes(request.id))
@@ -174,7 +175,7 @@ impl RemoteAdapter for ManagedAdapter {
         else {
             return Ok(None);
         };
-        if receipt.request_digest != request.digest {
+        if receipt.commit_id.as_bytes() != &request.id || receipt.request_digest != request.digest {
             return Err(Error::corrupt(
                 "Managed receipt identity is paired with a different request",
             ));
@@ -197,14 +198,16 @@ impl RemoteAdapter for ManagedAdapter {
         &self,
         requests: &[PreparedRemoteRequest],
     ) -> Result<Vec<RemoteOutcome>> {
-        let mut transactions = Vec::with_capacity(requests.len());
         for request in requests {
-            transactions
-                .push(super::managed_intent::prepare(&self.authority, &request.request).await?);
+            super::managed_intent::verify_frozen(self.authority.as_ref(), &request.request)?;
         }
+        let frozen = requests
+            .iter()
+            .map(|request| request.request.bytes.clone())
+            .collect::<Vec<_>>();
         let results = self
             .authority
-            .commit_batch(&transactions)
+            .commit_frozen_batch(&frozen)
             .await
             .map_err(Error::from)?;
         if results.len() != requests.len() {
@@ -217,7 +220,9 @@ impl RemoteAdapter for ManagedAdapter {
         for (request, result) in requests.iter().zip(results) {
             match result {
                 CommitOutcome::Committed(receipt) => {
-                    if receipt.request_digest != request.request.digest {
+                    if receipt.commit_id.as_bytes() != &request.request.id
+                        || receipt.request_digest != request.request.digest
+                    {
                         return Err(Error::corrupt(
                             "Managed commit receipt is paired with a different request",
                         ));
@@ -248,12 +253,19 @@ impl RemoteAdapter for ManagedAdapter {
                         "Managed commit was not accepted",
                     )),
                 }),
-                CommitOutcome::Unknown(commit) => outcomes.push(RemoteOutcome::Unknown {
-                    failure: RemoteFailure::from_error(&Error::unknown(
-                        Some(commit),
-                        "Managed commit outcome is unknown",
-                    )),
-                }),
+                CommitOutcome::Unknown(commit) => {
+                    if commit.as_bytes() != &request.request.id {
+                        return Err(Error::corrupt(
+                            "Managed unknown outcome is paired with a different request",
+                        ));
+                    }
+                    outcomes.push(RemoteOutcome::Unknown {
+                        failure: RemoteFailure::from_error(&Error::unknown(
+                            Some(commit),
+                            "Managed commit outcome is unknown",
+                        )),
+                    });
+                }
             }
         }
         Ok(outcomes)

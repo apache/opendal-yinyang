@@ -179,9 +179,12 @@ transaction with a `synchronous=FULL` commit. The full WAL sync also makes every
 earlier `NORMAL` write durable, so no second checkpoint is needed before
 dispatch. While frozen, new writes are rejected. Retry restores that same
 identity, digest, descriptor, and predicates, including after process restart;
-it does not reprepare or rebase. Success updates the sparse base to the
-receipt's revision with another `synchronous=FULL` commit before returning. It
-never silently observes a newer conflicting file.
+it does not reprepare or rebase. Recovery submits the original frozen bytes
+through the authority's receipt-first frozen batch. A committed receipt is
+resolved before base readiness; a pending request can restore its exact known
+base even when that revision is logically expired. Success updates the sparse
+base to the receipt's revision with another `synchronous=FULL` commit before
+returning. It never silently observes a newer conflicting file.
 
 A stale file generation, changed executable state, or unlink produces Conflict.
 Staged bytes remain readable for explicit recovery/export or abort. Retryable
@@ -201,12 +204,13 @@ without losing bytes, the frozen request, or the error ledger.
 `Error::kind()` exposes domain categories, not platform status codes. Namespace
 failures distinguish NotFound, AlreadyExists, InvalidName, NotDirectory,
 IsDirectory and NotEmpty. Runtime failures distinguish ReadOnly, Busy, Closed,
-Frozen and TooLarge; publication distinguishes Conflict, Retryable and Unknown.
-Corrupt, Unsupported, Storage, Io, PermissionDenied and NoSpace preserve the
-available failure category without parsing messages. Invalid covers other
-contract violations; unknown backend failures remain Storage/Io rather than
-being guessed as conflicts or safe retries. `Error::commit_id()` retains the
-original Unknown publication identity.
+Frozen and TooLarge; fresh historical lookup distinguishes Expired from
+NotFound; publication distinguishes Conflict, Retryable and Unknown. Corrupt,
+Unsupported, Storage, Io, PermissionDenied and NoSpace preserve the available
+failure category without parsing messages. Invalid covers other contract
+violations; unknown backend failures remain Storage/Io rather than being
+guessed as conflicts or safe retries. `Error::commit_id()` retains the original
+Unknown publication identity.
 
 `HandleStatus::error` and `WritebackError::error` contain a typed `Failure`
 with kind, diagnostic message and optional commit ID. Clean fsync/close returns
@@ -265,10 +269,10 @@ plan exposes its exact CommitId. A sparse handle cannot read an untouched range
 if its authority no longer retains the exact base revision.
 
 Failure blobs use Borsh `(kind: u8, message: String, commit: Option<[u8;16]>)`.
-Kind tags, in order from 0 through 20, are Invalid, InvalidName, NotFound,
+Kind tags, in order from 0 through 21, are Invalid, InvalidName, NotFound,
 AlreadyExists, NotDirectory, IsDirectory, NotEmpty, ReadOnly, PermissionDenied,
 Busy, Closed, Frozen, TooLarge, Conflict, Retryable, Unknown, Corrupt, Unsupported,
-Storage, Io and NoSpace. Handle records keep the original message field as a
+Storage, Io, NoSpace and Expired. Handle records keep the original message field as a
 diagnostic copy; typed details live in the adjacent column. An operation
 failure records both fields and its ledger entry atomically.
 
