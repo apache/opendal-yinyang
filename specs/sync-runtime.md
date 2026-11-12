@@ -67,8 +67,9 @@ post-dispatch authority error stays `Unknown` with the CommitId in its durable
 failure. A pending exact request can restore its known base after that revision
 is logically expired. No path replans against a newer baseline.
 
-The `intents` state codec is shared by Sync, the Sync engine and
-`directory/journal.rs`:
+The shared durable-intent owner in `src/intent.rs` defines the row columns,
+state and receipt codec, prepared insertion, and evidence-guarded updates used
+by Sync, the Sync engine and `directory/journal.rs`:
 
 | Code | State |
 | --- | --- |
@@ -81,10 +82,20 @@ The `intents` state codec is shared by Sync, the Sync engine and
 
 The exact shared columns are `id`, `request_id`, `request_digest`, `request`,
 `commit_id`, `state`, `receipt_revision`, `receipt_ordinal`, `failure` and
-`metadata`. Each database supplies its own table definition and binding, but
-the state and receipt codec is one implementation. The engine uses `metadata`
-for its work association; Directory publication stores its diagnostic source
-and manifest there.
+`metadata`. Each store owns schema initialization, connections, transactions,
+durability barriers, domain identities and metadata semantics. Failure bytes
+remain store-specific; receipts use the shared codec. The engine uses
+`metadata` for its work association; Directory publication stores its
+diagnostic source and manifest there.
+
+A dispatch claim may move `Prepared`, `Unknown` or `Retryable` to durable
+`Unknown`. Local validation, retained-readiness, network and receipt-write
+uncertainty may update an `Unknown` diagnostic but cannot move it to
+`Prepared`, `Failed` or any other less ambiguous state. Only definitive
+authority evidence may resolve it to `Committed`, `Conflict`, `Retryable` or
+`Failed`. A verified committed authority result, including a receipt when the
+adapter exposes one, intentionally dominates every stored state so concurrent
+exact dispatchers converge.
 
 ## Local profile
 

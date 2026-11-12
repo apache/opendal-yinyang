@@ -45,6 +45,7 @@ struct FakeState {
     receipt_calls: usize,
     observe_with_baseline: Vec<bool>,
     unknown_once: bool,
+    conflict_once: bool,
 }
 
 impl FakeAdapter {
@@ -63,6 +64,7 @@ impl FakeAdapter {
                 receipt_calls: 0,
                 observe_with_baseline: Vec::new(),
                 unknown_once: false,
+                conflict_once: false,
             })),
             capabilities,
             model,
@@ -144,6 +146,10 @@ impl FakeAdapter {
 
     fn fail_next_unknown(&self) {
         self.state.lock().unwrap().unknown_once = true;
+    }
+
+    fn fail_next_conflict(&self) {
+        self.state.lock().unwrap().conflict_once = true;
     }
 }
 
@@ -266,8 +272,14 @@ impl RemoteAdapter for FakeAdapter {
         );
         let unknown = state.unknown_once;
         state.unknown_once = false;
+        let conflict = state.conflict_once;
+        state.conflict_once = false;
         let mut outcomes = Vec::with_capacity(requests.len());
         for request in requests {
+            if conflict {
+                outcomes.push(RemoteOutcome::Conflict { observed: None });
+                continue;
+            }
             let accepted = apply_request(&mut state, request)?;
             outcomes.push(if unknown {
                 RemoteOutcome::Unknown {
@@ -547,6 +559,23 @@ async fn executable_capability_controls_metadata_publication() {
             executable
         );
     }
+}
+
+#[tokio::test]
+async fn ambiguous_unknown_conflict_stays_unknown() {
+    let adapter = FakeAdapter::direct_like();
+    adapter.fail_next_unknown();
+    let temp = tempfile::tempdir().unwrap();
+    let (mut engine, root, _) = initialize(&adapter, &temp).await;
+    std::fs::write(root.join("unknown"), b"value").unwrap();
+    assert_eq!(engine.run().await.unwrap().unknown, 1);
+
+    adapter.reset_calls();
+    adapter.fail_next_conflict();
+    let outcome = engine.run().await.unwrap();
+    assert_eq!(outcome.unknown, 1);
+    assert_eq!(outcome.conflicts, 0);
+    assert!(!outcome.in_sync);
 }
 
 #[tokio::test]

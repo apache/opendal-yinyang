@@ -99,13 +99,13 @@ state paths, and root/state filesystem identities. `baseline` records the
 accepted remote entry and accepted local fingerprint per path.
 `baseline_meta.cursor` is the only persisted remote change cursor.
 
-`intents` is the durable request log and uses the shared state codec documented
-in [sync-runtime.md](sync-runtime.md). It stores the adapter request identity
-and digest, opaque frozen request bytes, typed state, optional commit identity,
-receipt, typed failure and engine work association metadata. A request is
-marked `Unknown` in a durable transaction before dispatch can occur. `work`
-stores only the path association and accepted inputs; it reads request state
-from `intents`.
+`intents` is the durable request log and uses the shared row and transition
+rules documented in [sync-runtime.md](sync-runtime.md). It stores the adapter
+request identity and digest, opaque frozen request bytes, typed state, optional
+commit identity, receipt, typed failure and engine work association metadata.
+A request is marked `Unknown` in a durable transaction before dispatch can
+occur. `work` stores only the path association and accepted inputs; it reads
+request state from `intents`.
 
 Managed namespace planning and content preparation are internal adapter work.
 The engine sends mixed create and content-edit requests through one
