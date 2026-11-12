@@ -22,8 +22,8 @@ use support::TestBackend;
 use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
-    Authority, CommitId, CommitOutcome, ContentEdit, DataStore, FileVersion, Fs, NodeId, Planner,
-    PreparedContent, Revision, Snapshot, Transaction,
+    Authority, CommitId, CommitOutcome, ContentEdit, DataStore, FileVersion, Fs, NodeId, NodeMode,
+    Planner, PreparedContent, Revision, Snapshot, Transaction,
 };
 use yinyang::runtime::{Error, ErrorKind, Runtime};
 use yinyang_test_support as support;
@@ -338,11 +338,75 @@ async fn exercise(
         .sequence;
     runtime.acknowledge_errors(sequence).await.unwrap();
     assert!(runtime.status().await.unwrap().errors.is_empty());
+    ordinary_modes(&runtime).await;
     identity_access(&runtime).await;
     completion_and_errors(&runtime, backend).await;
     version_reads(&runtime, backend).await;
     replace_rename(&runtime).await;
     sparse_runtime(&runtime, backend, path, object_head).await;
+}
+
+async fn ordinary_modes(runtime: &Runtime) {
+    let authority = runtime.authority();
+    let root = authority.root();
+    let (file, _) = runtime
+        .create_file_with_node_mode(root, "private", NodeMode::from_bits(0o600).unwrap())
+        .await
+        .unwrap();
+    let (directory, _) = runtime
+        .create_directory_with_node_mode(root, "private-dir", NodeMode::from_bits(0o700).unwrap())
+        .await
+        .unwrap();
+    let snapshot = authority.observe_latest().await.unwrap();
+    assert_eq!(
+        snapshot.node(file).await.unwrap().unwrap().mode().bits(),
+        0o600
+    );
+    assert_eq!(
+        snapshot
+            .node(directory)
+            .await
+            .unwrap()
+            .unwrap()
+            .mode()
+            .bits(),
+        0o700
+    );
+
+    runtime
+        .set_mode(file, NodeMode::from_bits(0o640).unwrap())
+        .await
+        .unwrap();
+    runtime
+        .set_mode(directory, NodeMode::from_bits(0o750).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .node(file)
+            .await
+            .unwrap()
+            .unwrap()
+            .mode()
+            .bits(),
+        0o640
+    );
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .node(directory)
+            .await
+            .unwrap()
+            .unwrap()
+            .mode()
+            .bits(),
+        0o750
+    );
 }
 
 async fn replace_rename(runtime: &Runtime) {

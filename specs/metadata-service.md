@@ -21,7 +21,7 @@ blocking database helper, and writer operations use a process-local gate so a
 publication transaction cannot interleave with another write on the same
 connection. Independent service processes still coordinate through SQLite.
 
-The schema profile is `yinyang-sqlite-3`. The authority row retains filesystem
+The schema profile is `yinyang-sqlite-4`. The authority row retains filesystem
 and root identities plus the latest revision. Indexed valid-time records retain
 nodes, entries, receipts, and ordered changes. Each record has an inclusive
 start and exclusive end sequence. Revision tokens are retained separately with
@@ -115,7 +115,7 @@ written pack, not every unchanged extent.
 
 `Transaction::to_bytes` freezes the original observation, identity, predicates,
 and mutations. The experimental Borsh envelope is
-`(YYPLAN01, filesystem[16], commit_id[16], base_revision[24], digest[32], conditions, mutations)`.
+`(YYPLAN02, filesystem[16], commit_id[16], base_revision[24], digest[32], conditions, mutations)`.
 Conditions are key/optional-value pairs. Mutation encodings reuse the logical
 canonical transaction tags and record encodings. Physical prepared descriptors
 are carried for file content; they do not enter the canonical logical digest.
@@ -132,7 +132,7 @@ its original receipt immediately. A pending identity is restored from its exact
 known base, including an expired base, and retains its original CommitId,
 digest, predicates, and content descriptors.
 
-`YYPLAN01` is the supported frozen-request profile. Analysis of an unknown plan
+`YYPLAN02` is the supported frozen-request profile. Analysis of an unknown plan
 identifier returns `Unsupported` before observing the authority, importing
 content, or attempting publication.
 
@@ -151,7 +151,7 @@ A future remote deployment requires a separately specified secure transport.
 
 Each TCP connection carries one request/response. Frames are a big-endian u32
 length followed by Borsh, bounded to 16 MiB. Request fields are protocol version
-1, token string, and a tagged command. Commands observe latest/specific
+2, token string, and a tagged command. Commands observe latest/specific
 revision, read/scan records at a revision, register content, prepare same-length
 or length-changing trusted updates from an exact published revision and NodeId,
 expire explicit known revisions, observe a held known revision for lazy reads,
@@ -164,11 +164,14 @@ The server handles at most 32 active connections, each with a 60-second
 timeout. This wire profile is experimental and is not a stable interoperability
 promise.
 
-Protocol version 1 is the only supported request version. The server checks the
-token first, then returns `Unsupported` for a validly authenticated unknown
-version before dispatching or decoding a command against storage. Clients and
-servers that implement different versions fail explicitly rather than
-negotiating down or sharing an authority.
+Protocol version 2 is the only supported request version. It is required
+because current Node records carry `mode:u16`, and version 1 clients or servers
+must not interpret current Profile payloads or call commands that do not carry
+Node records. The `YYSERV01` service binding layout is unchanged. The server
+checks the token first, then returns `Unsupported` for version 1 or any other
+validly authenticated version before dispatching or decoding a command against
+storage. Clients and servers that implement different versions fail explicitly
+rather than negotiating down or sharing an authority.
 
 Commands for overwrite and update retain tags 5 and 6. The current experimental
 profile then uses Expire=7, ObserveHeld=8, and RevisionHistory=9. The typed
@@ -237,13 +240,14 @@ migration support.
 
 ## Compatibility
 
-The supported service profiles are `yinyang-sqlite-3`, `YYSERV01`, `YYPLAN01`,
+The supported service profiles are `yinyang-sqlite-4`, `YYSERV01`, `YYPLAN02`,
 `YYEXP001`, the shared `YYFILE02`/`YYHASH02` content profile, and loopback RPC
-version 1. `yinyang-sqlite-2` and the earlier history wire shape are rejected
-without migration. There is no automatic schema upgrade or downgrade, no
-object-authority fallback, and no cross-profile read of local preparation
-evidence. A same-profile process restart retains published history, expiry
-state, receipts, frozen requests, and readiness.
+version 2. `yinyang-sqlite-2`, `yinyang-sqlite-3`, loopback RPC version 1 and
+the earlier history wire shape are rejected without migration. There is no
+automatic schema upgrade or downgrade, no object-authority fallback, and no
+cross-profile read of local preparation evidence. A same-profile process
+restart retains published history, expiry state, receipts, frozen requests, and
+readiness.
 
 Current-profile content and transaction vectors under
 [`format`](../crates/core/tests/fixtures/format) are consumed directly by the

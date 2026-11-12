@@ -72,7 +72,7 @@ path:
 | Capability | Meaning |
 | --- | --- |
 | `directories` | The remote represents empty directories as namespace entries. |
-| `executable` | The remote stores the executable bit. |
+| `executable` | Managed stores ordinary modes; Sync reconciles the derived executable distinction. |
 | `rename` | The remote supports identity-preserving namespace rename. |
 | `batch` | Multiple frozen requests may be submitted in one adapter call. |
 | `max_batch` | Maximum requests the adapter accepts in one call. |
@@ -83,6 +83,11 @@ Managed reports directories, executable metadata, rename, batches, change-feed
 deltas and receipt lookup. Direct reports none of those capabilities; it applies
 one exact ETag-or-absent request at a time and always performs a full
 observation.
+
+Managed Sync does not reconcile arbitrary read/write mode differences. Content
+replacement preserves the stored Managed mode. An executable update changes
+only execute bits under the Managed compatibility rule and keeps existing
+read/write bits, so a private `0600` file is not silently reset to `0644`.
 
 ## State profile
 

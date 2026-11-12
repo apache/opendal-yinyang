@@ -74,7 +74,9 @@ changes no remote state.
 
 The mount is owner-only (`SessionACL::Owner`) with `fsname=yinyang-<name>` and
 `subtype=yinyang`, so the kernel reports `fuse.yinyang` as the filesystem type.
-Only the read-only policy adds the kernel `ro` option.
+It enables kernel `default_permissions` against the synthesized owner uid/gid,
+so persisted owner modes control open, access and directory traversal. Only the
+read-only policy adds the kernel `ro` option.
 
 ## Identity and lookup references
 
@@ -85,7 +87,7 @@ path, kind, version or ETag, size and whole-second mtime. The domains are
 different, so Managed and Direct inode numbers are stable across mounts without
 pretending the identities are interchangeable. A derivation that collides with
 the root, zero, or an already mapped identity is an error (`EIO`) rather than an
-alias. The table and observed kind/executable cache live for the mount lifetime.
+alias. The table and observed kind cache live for the mount lifetime.
 
 Each successful `LOOKUP` reply adds one kernel reference. `forget` subtracts
 the reported count with saturating arithmetic. Mappings are retained after the
@@ -106,21 +108,27 @@ value may be shared across successive snapshots of the same immutable
 authority. `open` still observes the latest revision; a mutation through the
 mount installs its post-commit snapshot or invalidates the cached one so a
 following metadata callback observes the result. Direct uses its accepted
-snapshot until SIGHUP as described above. Attributes are synthesized: read-only
-directories are `0555` and files are `0444`; writable directories are `0755`
-and files are `0644` or `0755` according to the core executable bit. The
-mounting user's uid/gid, size from the content descriptor or a fixed directory
-size, and revision-derived timestamps are synthesized. `getxattr`,
-`listxattr`, `readlink`, links and special nodes return explicit unsupported
-errors.
+snapshot until SIGHUP as described above. Attributes use one ordinary
+`0o000..=0o777` mode. A writable Managed mount reports the stored mode exactly;
+a read-only mount clears `0222`, so `0600`, `0644` and `0755` become `0400`,
+`0444` and `0555`. Direct has no stored mode and reports `0755` directories and
+`0644` files, masked the same way on a read-only mount. The mounting user's
+uid/gid, size from the content descriptor or a fixed directory size, and
+revision-derived timestamps are synthesized. `getxattr`, `listxattr`,
+`readlink`, links and special nodes return explicit unsupported errors.
+
+Kernel `default_permissions` uses those attributes for owner access control.
+The frontend's `ACCESS` callback applies the same read/write/execute owner-bit
+check if the kernel forwards it. Because the session ACL is owner-only, this is
+not a multi-user, UID-preservation, ACL or general POSIX permission claim.
 
 The object authority's shared index cache charges index pages and external
 values against one 64 MiB byte bound and evicts the oldest-used entry. Cached
 entries are content-addressed `PackedRef` values, so a snapshot cannot consume
 bytes from another content identity. Writers do not use this shared cache.
 
-Direct has no persisted executable bit: writable Direct files remain `0644`
-and directories remain `0755`. Writable Direct uses a zero attribute TTL and
+Direct has no persisted mode: writable Direct files remain `0644` and
+directories remain `0755`. Writable Direct uses a zero attribute TTL and
 explicit invalidation after publication so a dirty length cannot remain cached
 after remote replacement. A pending overlay entry supplies its stable local
 identity, length and state until a later remote observation resolves it.
@@ -135,8 +143,8 @@ staging record or reading the complete payload. Concurrent opens of one NodeId
 share that immutable `FileVersion`; a later remote revision does not rebase an
 existing descriptor. `read` asks the `FileVersion` range reader for only the
 intersecting authenticated content units. `getattr` with the handle, and path
-attributes while that observation is active, use its node metadata, executable
-bit, length and revision. `release` drops the reference and reclaims a
+attributes while that observation is active, use its node metadata, mode,
+length and revision. `release` drops the reference and reclaims a
 zero-reference observation, so the next open pins the current remote revision.
 Repeated reads may reuse previously verified proof nodes and units from the
 content binding's bounded process-local cache; cache keys are bound to the exact
@@ -215,26 +223,27 @@ else's dirty bytes. A failed publication remains attached to the shared handle
 and volume ledger; later fsync/flush retries the original frozen request.
 
 `create` and `mkdir` use the Runtime helpers that return the NodeId produced by
-the committing Planner, avoiding a post-commit path lookup. `unlink`, `rmdir`,
-and path renames use the path-addressed Runtime methods, so lookup and commit
-share one guarded Snapshot. Plain `rename` replaces an existing destination;
-`RENAME_NOREPLACE` uses the no-replace form. Exchange and whiteout renames are
-explicitly unsupported.
+the committing Planner, avoiding a post-commit path lookup. Their persisted mode
+is the requested ordinary permission bits masked by the request umask, without
+substituting a fixed `0644`/`0755` value. `unlink`, `rmdir`, and path renames use
+the path-addressed Runtime methods, so lookup and commit share one guarded
+Snapshot. Plain `rename` replaces an existing destination; `RENAME_NOREPLACE`
+uses the no-replace form. Exchange and whiteout renames are explicitly
+unsupported.
 
-`setattr` supports size and the core executable flag only. Size on an open
+`setattr` supports size and one exact ordinary mode. Size on an open
 descriptor is staged for that descriptor's later flush/fsync; path truncation
-publishes before returning success. A mode request is accepted only when it is
-one of the synthesized modes above (`0444`/`0555` or `0644`/`0755` according to
-read-only policy and the executable bit); other permission combinations return
-`EOPNOTSUPP`. Linux may include `S_IFREG`/`S_IFDIR` type bits in the mode;
-they are accepted when they match the node, while setuid/setgid/sticky and
-other permission combinations are rejected. Kernel bookkeeping timestamps
-attached to a chmod or truncate request are accepted and ignored, and the reply
-always carries revision-derived timestamps. Standalone timestamp changes and
-ownership changes remain explicitly unsupported. Before changing the
-executable flag, the shared node lock
-publishes dirty content, commits a Planner based on the handle's recorded
-content revision, and advances only that clean handle to the receipt revision.
+publishes before returning success. A mode request in `0o000..=0o777` is
+persisted exactly, without applying umask again; a read-only mount returns
+`EROFS`. Linux may include `S_IFREG`/`S_IFDIR` type bits in the mode; they are
+accepted when they match the node. Setuid/setgid/sticky and other non-ordinary
+mode bits return `EOPNOTSUPP`. Kernel bookkeeping timestamps attached to a chmod
+or truncate request are accepted and ignored, and the reply always carries
+revision-derived timestamps. Standalone timestamp changes and ownership
+changes remain explicitly unsupported. Before changing a writable file's mode,
+the shared node lock publishes dirty content, commits a Planner based on the
+handle's recorded content revision, and advances only that clean handle to the
+receipt revision. A directory mode change commits conditionally by NodeId.
 An external content change therefore produces Conflict rather than rebasing
 old staged bytes onto new content. Managed chmod routes that Conflict, from
 either content publication or the metadata commit based on the recorded base,
@@ -246,7 +255,7 @@ the original base, so a pathname truncate conflict continues to report
 `O_SYNC`/`O_DSYNC` write publication, and fd-based `fchmod(2)` or
 `ftruncate(2)` do not enter the pathname replay. Content publication conflicts
 leave local bytes retained for an explicit refresh or resolution. Ownership,
-timestamps and other mode bits are not persisted.
+timestamps and special mode bits are not persisted.
 
 ### Direct writable callbacks
 

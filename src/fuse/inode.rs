@@ -21,7 +21,7 @@
 //! Direct includes the accepted object version in its identity. Both use this
 //! one table, derivation and collision policy.
 //!
-//! The map and the cached kind/executable observations live for the whole
+//! The map and the cached kind observations live for the whole
 //! mount, mirroring the macOS prototype's identity-map lifetime. Lookup
 //! counters still track kernel references so a later layer can evict entries
 //! without changing the deterministic inode numbers. This module holds no
@@ -51,7 +51,6 @@ impl InodeIdentity for NodeId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CachedInfo {
     pub directory: bool,
-    pub executable: bool,
     pub generation: u64,
 }
 
@@ -204,7 +203,6 @@ mod tests {
         assert_eq!(table.cached(id), None);
         let info = CachedInfo {
             directory: false,
-            executable: true,
             generation: 3,
         };
         table.cache(id, info);

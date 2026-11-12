@@ -22,7 +22,7 @@ use crate::authority::{
     RETAINED_REVISIONS_PAGE_MAX, RevisionHistoryPage, RevisionRecord, RevisionStatus,
 };
 use crate::compatibility::{SERVICE_BINDING_MAGIC, SQLITE_SCHEMA_PROFILE};
-use crate::namespace::{Node, NodeKind, decode, encode};
+use crate::namespace::{Node, NodeKind, NodeMode, decode, encode};
 use crate::snapshot::{
     ChangeRecord, Cursor, FileVersion, Outcome, Receipt, RecordReader, Rows, Snapshot, Table,
 };
@@ -487,7 +487,7 @@ impl MetadataService {
                 let revision = Revision::new(0);
                 tx.execute("INSERT INTO authority(singleton,profile,filesystem,root,latest) VALUES(1,?1,?2,?3,?4)",params![SQLITE_SCHEMA_PROFILE,fs.as_bytes(),root.as_bytes(),revision.to_bytes().as_slice()]).map_err(sql)?;
                 tx.execute("INSERT INTO revisions(token,sequence,expired) VALUES(?1,0,0)", params![revision.to_bytes().as_slice()]).map_err(sql)?;
-                let node = Node {id:root, generation:1, executable:false, link:None, kind:NodeKind::Directory{membership:1}};
+                let node = Node {id:root, generation:1, mode:NodeMode::DIRECTORY, link:None, kind:NodeKind::Directory{membership:1}};
                 tx.execute("INSERT INTO records(family,key,start,end,value) VALUES(0,?1,0,NULL,?2)", params![root.as_bytes(),node.encode()?]).map_err(sql)?;
             }
             let result = manifest(&tx)?;
@@ -1256,8 +1256,18 @@ mod admission_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    async fn raw_request(addr: std::net::SocketAddr, request: Vec<u8>) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_u32(request.len() as u32).await.unwrap();
+        stream.write_all(&request).await.unwrap();
+        let length = stream.read_u32().await.unwrap() as usize;
+        let mut response = vec![0; length];
+        stream.read_exact(&mut response).await.unwrap();
+        response
+    }
+
     #[tokio::test]
-    async fn unknown_rpc_version_is_rejected_before_command_dispatch() {
+    async fn old_rpc_version_is_unsupported_and_current_version_observes() {
         let temp = tempfile::tempdir().unwrap();
         let backend = TestBackend::default();
         let service = MetadataService::create(temp.path().join("metadata.db"), backend.operator())
@@ -1269,19 +1279,24 @@ mod admission_tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(serve(listener, service.clone(), token.into()));
 
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let request = borsh::to_vec(&(2_u8, token.to_owned(), 3_u8, vec![0_u8])).unwrap();
-        stream.write_u32(request.len() as u32).await.unwrap();
-        stream.write_all(&request).await.unwrap();
-        let length = stream.read_u32().await.unwrap() as usize;
-        let mut response = vec![0; length];
-        stream.read_exact(&mut response).await.unwrap();
+        let request = borsh::to_vec(&(1_u8, token.to_owned(), 3_u8, vec![0_u8])).unwrap();
+        let response = raw_request(addr, request).await;
         let (variant, kind, message): (u8, u8, String) = borsh::from_slice(&response).unwrap();
         assert_eq!(variant, 5, "expected an RPC error response");
         assert_eq!(kind, 4, "expected Unsupported");
         assert!(message.contains("unknown protocol version"), "{message}");
         assert_eq!(service.observe_latest().await.unwrap().revision(), before);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+
+        let request = borsh::to_vec(&(2_u8, token.to_owned(), 0_u8, 0_u8)).unwrap();
+        let response = raw_request(addr, request).await;
+        let (variant, filesystem, root, revision): (u8, [u8; 16], [u8; 16], [u8; 24]) =
+            borsh::from_slice(&response).unwrap();
+        assert_eq!(variant, 0, "expected a current-version observation");
+        assert_eq!(filesystem, *service.filesystem().as_bytes());
+        assert_eq!(root, *service.root().as_bytes());
+        assert_eq!(revision, before.to_bytes());
+        assert_eq!(service.observe_latest().await.unwrap().revision(), before);
         server.abort();
     }
 
@@ -1329,7 +1344,7 @@ mod admission_tests {
         Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE authority SET profile='yinyang-sqlite-2' WHERE singleton=1",
+                "UPDATE authority SET profile='yinyang-sqlite-3' WHERE singleton=1",
                 [],
             )
             .unwrap();
@@ -1346,7 +1361,7 @@ mod admission_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-sqlite-2");
+        assert_eq!(profile, "yinyang-sqlite-3");
     }
 
     #[tokio::test]

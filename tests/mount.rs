@@ -23,7 +23,7 @@ use support::TestBackend;
 use tokio::sync::Semaphore;
 use yinyang::core::service::{MetadataService, ServiceClient, serve};
 use yinyang::core::{
-    Authority, CommitOutcome, DataStore, Fs, NodeId, Revision, Snapshot, Transaction,
+    Authority, CommitOutcome, DataStore, Fs, NodeId, NodeMode, Revision, Snapshot, Transaction,
 };
 use yinyang::mount::Mount;
 use yinyang::runtime::{ErrorKind, Runtime};
@@ -350,7 +350,11 @@ async fn set_executable_serializes_with_dirty_mount_handle() {
         .unwrap();
     let (node, _) = mount
         .namespace()
-        .create_file_with_node(authority.root(), "file", false)
+        .create_file_with_node_mode(
+            authority.root(),
+            "file",
+            NodeMode::from_bits(0o600).unwrap(),
+        )
         .await
         .unwrap();
     let file = mount.open_node(node, true).await.unwrap();
@@ -366,6 +370,20 @@ async fn set_executable_serializes_with_dirty_mount_handle() {
             .unwrap()
             .unwrap()
             .executable()
+    );
+    assert_eq!(
+        authority
+            .observe_latest()
+            .await
+            .unwrap()
+            .node(node)
+            .await
+            .unwrap()
+            .unwrap()
+            .mode()
+            .bits(),
+        0o700,
+        "changing executable meaning preserves private read/write bits"
     );
     assert_eq!(
         authority

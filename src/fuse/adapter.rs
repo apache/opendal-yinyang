@@ -160,7 +160,6 @@ impl<B: Backend> AdapterInner<B> {
     fn attribute_for(&self, id: B::Inode, observed: ObservedAttr) -> Result<FileAttr> {
         let info = CachedInfo {
             directory: observed.directory,
-            executable: observed.executable,
             generation: 0,
         };
         let ino = self.inode_for(id, Some(info))?;
@@ -334,6 +333,39 @@ impl<B: Backend> AdapterInner<B> {
         match result {
             Ok(attr) => reply.attr(&self.backend.attr_ttl(), &attr),
             Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    async fn access(&self, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let Some(id) = self.node(ino) else {
+            return reply.error(fuser::Errno::ESTALE);
+        };
+        let observed = match self.backend.getattr(id, None).await {
+            Ok(observed) => observed,
+            Err(error) => return reply.error(error.errno()),
+        };
+        if self.backend.read_only() && mask.contains(AccessFlags::W_OK) {
+            return reply.error(fuser::Errno::EROFS);
+        }
+        let mode = if self.backend.read_only() {
+            observed.mode.read_only()
+        } else {
+            observed.mode
+        };
+        let mut required = 0;
+        if mask.contains(AccessFlags::R_OK) {
+            required |= 0o400;
+        }
+        if mask.contains(AccessFlags::W_OK) {
+            required |= 0o200;
+        }
+        if mask.contains(AccessFlags::X_OK) {
+            required |= 0o100;
+        }
+        if mode.bits() & required == required {
+            reply.ok();
+        } else {
+            reply.error(fuser::Errno::EACCES);
         }
     }
 
@@ -624,7 +656,6 @@ impl<B: Backend> AdapterInner<B> {
                 opened.id,
                 Some(CachedInfo {
                     directory: true,
-                    executable: false,
                     generation: 0,
                 }),
             ),
@@ -700,7 +731,6 @@ impl<B: Backend> AdapterInner<B> {
                         entry.id,
                         Some(CachedInfo {
                             directory: entry.kind == FileType::Directory,
-                            executable: false,
                             generation: 0,
                         }),
                     ) {
@@ -882,12 +912,9 @@ impl<B: Backend> Filesystem for Adapter<B> {
         reply.statfs(0, 0, 0, 0, 0, 4096, 255, 0);
     }
 
-    fn access(&self, _req: &Request, _ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        if self.inner.backend.read_only() && mask.contains(AccessFlags::W_OK) {
-            reply.error(fuser::Errno::EROFS);
-        } else {
-            reply.ok();
-        }
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let adapter = self.inner.clone();
+        self.spawn(async move { adapter.access(ino, mask, reply).await });
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {

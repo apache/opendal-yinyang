@@ -135,18 +135,22 @@ Physical references never enter logical content identities or request digests.
   nonce and advances the sequence; a revision is not a count of transactions.
   Comparison is lexicographic over sequence and nonce. Index keys use
   big-endian sequence followed by nonce.
-- Head: `(YYHEAD03:[u8;8], mode:u8=0, filesystem:[u8;16], root:[u8;16],
+- Head: `(YYHEAD04:[u8;8], mode:u8=0, filesystem:[u8;16], root:[u8;16],
   revision:Revision, descriptor:Ref)`, followed by ordinary BLAKE3 of that tuple.
-  Maximum head size is 4 KiB. Unknown profiles/modes and legacy `YYHEAD01` are
+  Maximum head size is 4 KiB. Unknown profiles/modes and legacy `YYHEAD01`
+  through `YYHEAD03` are
   rejected; creation never overwrites an existing unsupported head.
-- Descriptor: `(YYSNAP03:[u8;8], filesystem:[u8;16], root:[u8;16],
+- Descriptor: `(YYSNAP04:[u8;8], filesystem:[u8;16], root:[u8;16],
   revision:Revision, roots:[Option<Ref>;5])`, at most 4 KiB. Root order is nodes,
   directory entries, receipts, changes, retained snapshots.
-- Node: `(id:[u8;16], generation:u64, executable:bool,
+- Node: `(id:[u8;16], generation:u64, mode:u16,
   link:Option<(parent:[u8;16],name:String)>, membership:u64,
   content:Option<Vec<u8>>)`. Directories have positive membership and no
-  content; files have zero membership and a YYFILE02 descriptor. Only the root
-  has no link. A lookup validates identity, filesystem and parent-link agreement.
+  content; files have zero membership and a YYFILE02 descriptor. The mode is an
+  ordinary Unix permission value in `0o000..=0o777`; file-type,
+  setuid/setgid/sticky, ownership and ACL state are not stored. Only the root
+  has no link. A lookup validates identity, filesystem, mode and parent-link
+  agreement.
 - Directory entry: `(name:String,node_id:[u8;16])`. Its key is the parent ID
   followed by folded-name UTF-8 bytes.
 - Receipt: `(commit_id:[u8;16],request_digest:[u8;32],revision:Revision,
@@ -183,8 +187,8 @@ packing policy can reduce request overhead without changing logical semantics.
 ## Canonical requests
 
 The request hash is BLAKE3 derive-key with context
-`Apache OpenDAL YinYang request profile 2` over Borsh
-`(YYREQ002:[u8;8],filesystem:[u8;16],conditions,mutations:Vec<Vec<u8>>)`.
+`Apache OpenDAL YinYang request profile 3` over Borsh
+`(YYREQ003:[u8;8],filesystem:[u8;16],conditions,mutations:Vec<Vec<u8>>)`.
 The commit ID is the lookup key, not part of this hash; creation operands bind
 the identities allocated from that ID.
 
@@ -195,22 +199,22 @@ membership generation, and complete logical node respectively. Tag 5 is
 followed by a directory-entry key. Absence is `None`.
 
 Expected values are Borsh: kind is a directory boolean; logical state is
-`(generation,executable,Option<(content_length,content_hash)>)`; link is
+`(generation,mode:u16,Option<(content_length,content_hash)>)`; link is
 `Option<(parent,name)>`; membership is u64; complete logical node is
-`(id,generation,executable,link,membership,Option<(content_length,content_hash)>)`;
+`(id,generation,mode:u16,link,membership,Option<(content_length,content_hash)>)`;
 entry is its directory-entry encoding. Complete nodes use membership zero
 for files. Physical content descriptors are excluded.
 
 Mutations encode in operation order with one-byte tags:
-`0,id,parent,name,Option<(content_length,content_hash)>,executable` for create;
+`0,id,parent,name,Option<(content_length,content_hash)>,mode:u16` for create;
 `1,id,content_length,content_hash` for content replacement;
-`2,id,executable` for attributes; `3,id,parent,name` for rename; `4,id` for remove.
+`2,id,mode:u16` for attributes; `3,id,parent,name` for rename; `4,id` for remove.
 All IDs are fixed 16-byte arrays. The authority recomputes the digest; there is
 no API accepting a caller's claimed readiness or digest without verification.
 
 For filesystem ID consisting of sixteen bytes of value 1, no conditions and
 no mutations, the request digest is
-`811032fb290ade714ee0ca3d8716fabd1f7154e478ae5da1a8b822411513eb4d`.
+`079bd4e3c1cd9aa76631f7debadcbe6be704b6ac33ddbf028f9fa3acf7eb4eda`.
 
 ### Explicit expiry request
 
@@ -236,13 +240,14 @@ post-dispatch publication is `Unknown(original request_id)`.
 
 ## Compatibility and admission
 
-The supported object profile is `YYHEAD03` mode 0 with root descriptor
-`YYSNAP03`, index pages `YYINDEX2`, content descriptors `YYFILE02`, canonical
-requests `YYREQ002`, and expiry requests `YYEXP001`. Frozen requests use
-`YYPLAN01`; node identities use the derive-key context
+The supported object profile is `YYHEAD04` mode 0 with root descriptor
+`YYSNAP04`, index pages `YYINDEX2`, content descriptors `YYFILE02`, canonical
+requests `YYREQ003`, and expiry requests `YYEXP001`. Frozen requests use
+`YYPLAN02`; node identities use the derive-key context
 `Apache OpenDAL YinYang node identity profile 2`.
 
-Readers reject `YYHEAD01`, `YYHEAD02`, `YYSNAP02`, `YYSERV01`, unknown head
+Readers reject `YYHEAD01`, `YYHEAD02`, `YYHEAD03`, `YYSNAP02`, `YYSNAP03`,
+`YYSERV01`, unknown head
 modes, and unknown snapshot, index, content, plan, or expiry identifiers with
 `Unsupported`. Head creation and replacement do not begin when an existing head
 is an unsupported profile.

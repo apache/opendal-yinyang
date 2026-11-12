@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 use yinyang_core::{
     Authority, CommitId, CommitOutcome, ContentDescriptor, ContentEdit, FileVersion, NodeId,
-    Planner, PreparedContent, Receipt, Revision, Snapshot,
+    NodeMode, Planner, PreparedContent, Receipt, Revision, Snapshot,
 };
 
 mod staging;
@@ -293,18 +293,31 @@ impl Runtime {
     ///
     /// Adapters must use this identity rather than resolving the path again:
     /// a concurrent rename or replacement could bind that lookup to another node.
-    /// The executable flag is the only persisted mode bit supported by the core.
+    /// This compatibility helper derives `0644` or `0755`; callers that need
+    /// exact ordinary permissions use `create_file_with_node_mode`.
     pub async fn create_file_with_node(
         &self,
         parent: NodeId,
         name: &str,
         executable: bool,
     ) -> Result<(NodeId, Receipt)> {
+        self.create_file_with_node_mode(parent, name, NodeMode::from_executable(executable))
+            .await
+    }
+    /// Create a file and return the NodeId produced by the same committed plan.
+    pub async fn create_file_with_node_mode(
+        &self,
+        parent: NodeId,
+        name: &str,
+        mode: NodeMode,
+    ) -> Result<(NodeId, Receipt)> {
         self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let empty = self.authority().prepare(&mut tokio::io::empty()).await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
-        let node = plan.create_file(parent, name, empty, executable).await?;
+        let node = plan
+            .create_file_with_mode(parent, name, empty, mode)
+            .await?;
         let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
         Ok((node, receipt))
     }
@@ -319,12 +332,30 @@ impl Runtime {
         parent: NodeId,
         name: &str,
     ) -> Result<(NodeId, Receipt)> {
+        self.create_directory_with_node_mode(parent, name, NodeMode::DIRECTORY)
+            .await
+    }
+    /// Create a directory and return the NodeId produced by the committed plan.
+    pub async fn create_directory_with_node_mode(
+        &self,
+        parent: NodeId,
+        name: &str,
+        mode: NodeMode,
+    ) -> Result<(NodeId, Receipt)> {
         self.require_write()?;
         let snapshot = self.authority().observe_latest().await?;
         let mut plan = Planner::new(&snapshot, CommitId::generate());
-        let node = plan.create_directory(parent, name).await?;
+        let node = plan.create_directory_with_mode(parent, name, mode).await?;
         let receipt = outcome(self.authority().commit(&plan.finish()?).await?)?;
         Ok((node, receipt))
+    }
+    /// Set an exact ordinary mode for a node identified by its stable NodeId.
+    pub async fn set_mode(&self, node: NodeId, mode: NodeMode) -> Result<Receipt> {
+        self.require_write()?;
+        let snapshot = self.authority().observe_latest().await?;
+        let mut plan = Planner::new(&snapshot, CommitId::generate());
+        plan.set_mode(node, mode).await?;
+        outcome(self.authority().commit(&plan.finish()?).await?)
     }
     pub async fn rename(&self, node: NodeId, parent: NodeId, name: &str) -> Result<Receipt> {
         self.require_write()?;
@@ -637,9 +668,21 @@ impl FileHandle {
         .await;
         self.report(result).await
     }
-    /// Publish dirty content, commit the executable flag, and advance this clean
-    /// handle to the new metadata revision without restaging the unchanged bytes.
+    /// Publish dirty content, update executable meaning while preserving the
+    /// other read/write bits, and advance to the metadata revision.
     pub(crate) async fn set_executable(&mut self, executable: bool) -> Result<Receipt> {
+        self.publish_then_set_mode(None, Some(executable)).await
+    }
+    /// Publish dirty content, commit an exact ordinary mode, and advance this
+    /// clean handle to the new metadata revision without restaging the bytes.
+    pub(crate) async fn set_mode(&mut self, mode: NodeMode) -> Result<Receipt> {
+        self.publish_then_set_mode(Some(mode), None).await
+    }
+    async fn publish_then_set_mode(
+        &mut self,
+        mode: Option<NodeMode>,
+        executable: Option<bool>,
+    ) -> Result<Receipt> {
         self.live()?;
         let result = async {
             self.runtime.require_write()?;
@@ -651,8 +694,23 @@ impl FileHandle {
                 .authority()
                 .observe_revision(Revision::from_bytes(record.base))
                 .await?;
+            let mode = match (mode, executable) {
+                (Some(mode), None) => mode,
+                (None, Some(executable)) => snapshot
+                    .node(node)
+                    .await?
+                    .ok_or(Error::State(ErrorKind::NotFound, "node is absent"))?
+                    .mode()
+                    .with_executable(executable),
+                _ => {
+                    return Err(Error::State(
+                        ErrorKind::Invalid,
+                        "set mode requires exactly one mode source",
+                    ));
+                }
+            };
             let mut plan = Planner::new(&snapshot, CommitId::generate());
-            plan.set_executable(node, executable).await?;
+            plan.set_mode(node, mode).await?;
             let receipt = outcome(self.runtime.authority().commit(&plan.finish()?).await?)?;
             self.advance_clean_base(receipt.cursor.revision).await?;
             Ok(receipt)
