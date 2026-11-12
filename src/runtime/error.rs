@@ -19,6 +19,16 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use yinyang_core::CommitId;
 
+/// Classify an OS error through the local-state owner.
+pub fn kind_from_io(error: &std::io::Error) -> ErrorKind {
+    crate::local::store::classify_io(error).into()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn kind_from_errno(error: rustix::io::Errno) -> ErrorKind {
+    crate::local::store::classify_errno(error).into()
+}
+
 /// Classify errors without parsing diagnostic text. This is not an errno or
 /// platform status: adapters still choose their operation-specific mapping.
 #[derive(
@@ -191,6 +201,12 @@ impl From<crate::direct::ErrorKind> for ErrorKind {
             Kind::Stale => Self::Conflict,
             Kind::Unsupported => Self::Unsupported,
             Kind::Corrupt => Self::Corrupt,
+            Kind::AlreadyExists => Self::AlreadyExists,
+            Kind::Busy => Self::Busy,
+            Kind::ReadOnly => Self::ReadOnly,
+            Kind::PermissionDenied => Self::PermissionDenied,
+            Kind::NoSpace => Self::NoSpace,
+            Kind::Io => Self::Io,
             Kind::Storage => Self::Storage,
         }
     }

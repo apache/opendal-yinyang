@@ -49,11 +49,7 @@ fn store_error(error: store::Error) -> Error {
 }
 
 fn intent_error(error: rusqlite::Error) -> Error {
-    if matches!(error, rusqlite::Error::FromSqlConversionFailure(..)) {
-        Error::local_kind(ErrorKind::Corrupt, error)
-    } else {
-        Error::local(error)
-    }
+    Error::local_kind(store::classify_sqlite(&error).into(), error)
 }
 
 fn validate_profile(connection: &Connection, filesystem: NodeId) -> Result<()> {

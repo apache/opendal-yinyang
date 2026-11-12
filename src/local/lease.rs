@@ -32,12 +32,9 @@ pub(crate) struct StateLease {
 impl StateLease {
     pub(crate) fn acquire(directory: &Path, name: &'static str) -> Result<Self> {
         std::fs::create_dir_all(directory).map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!(
-                    "create local state directory {}: {error}",
-                    directory.display()
-                ),
+            local_error(
+                format!("create local state directory {}", directory.display()),
+                error,
             )
         })?;
         let path = directory.join(name);
@@ -48,20 +45,25 @@ impl StateLease {
             .write(true)
             .open(&path)
             .map_err(|error| {
-                Error::new(
-                    ErrorKind::Io,
-                    format!("open local state lease {}: {error}", path.display()),
-                )
+                local_error(format!("open local state lease {}", path.display()), error)
             })?;
+        Self::acquire_file(file, &path)
+    }
+
+    /// Acquire one nonblocking exclusive lease for a caller-opened lock file.
+    ///
+    /// The caller keeps responsibility for fd-relative opening, directory
+    /// admission, permissions and any parent fsync. The shared lease owns only
+    /// the lock operation, its Busy classification and file lifetime.
+    pub(crate) fn acquire_file(file: File, path: &Path) -> Result<Self> {
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => Error::new(
                 ErrorKind::Busy,
                 format!("local state lease {} is held", path.display()),
             ),
-            std::fs::TryLockError::Error(error) => Error::new(
-                ErrorKind::Io,
-                format!("lock local state lease {}: {error}", path.display()),
-            ),
+            std::fs::TryLockError::Error(error) => {
+                local_error(format!("lock local state lease {}", path.display()), error)
+            }
         })?;
         Ok(Self { file })
     }
@@ -69,6 +71,13 @@ impl StateLease {
     pub(crate) fn into_file(self) -> File {
         self.file
     }
+}
+
+fn local_error(context: String, error: std::io::Error) -> Error {
+    Error::new(
+        super::store::classify_io(&error),
+        format!("{context}: {error}"),
+    )
 }
 
 #[cfg(test)]

@@ -32,7 +32,9 @@ pub(crate) use staging::StagingLease;
 use staging::{CHUNK, Record, Stage, StagedRead};
 
 mod error;
-pub use error::{Error, ErrorKind, Failure, Result};
+#[cfg(target_os = "linux")]
+pub(crate) use error::kind_from_errno;
+pub use error::{Error, ErrorKind, Failure, Result, kind_from_io};
 
 // Leave room for the authenticated service request around the encoded edits.
 const OVERWRITE_ENCODED_MAX: u64 = 16 * 1024 * 1024 - 2048;

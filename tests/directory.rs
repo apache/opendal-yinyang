@@ -911,33 +911,41 @@ async fn journal_rejects_a_partial_known_schema_without_repairing_it() {
 }
 
 #[tokio::test]
-async fn journal_inspection_rejects_a_malformed_frozen_identity() {
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("source");
-    source(&input).await;
-    let fs = filesystem(&TestBackend::default()).await;
-    let state = temp.path().join("journal");
-    let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
-        .await
-        .unwrap();
-    let id = CommitId::generate();
-    let observed = fs.observe_latest().await.unwrap();
-    journal.prepare(&observed, &input, id).await.unwrap();
-    rusqlite::Connection::open(state.join("directory.db"))
-        .unwrap()
-        .execute(
-            "UPDATE intents SET request=?2 WHERE request_id=?1",
-            rusqlite::params![id.as_bytes().as_slice(), b"malformed"],
-        )
-        .unwrap();
-    assert_eq!(
-        journal.status(id).await.unwrap_err().kind(),
-        RuntimeErrorKind::Corrupt
-    );
-    assert_eq!(
-        DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
-        RuntimeErrorKind::Corrupt
-    );
+async fn journal_inspection_rejects_malformed_intent_records() {
+    for (field, value) in [
+        (
+            "request",
+            rusqlite::types::Value::Blob(b"malformed".to_vec()),
+        ),
+        ("state", rusqlite::types::Value::Integer(255)),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("source");
+        source(&input).await;
+        let fs = filesystem(&TestBackend::default()).await;
+        let state = temp.path().join("journal");
+        let journal = DirectoryJournal::open(Arc::new(fs.clone()), &state)
+            .await
+            .unwrap();
+        let id = CommitId::generate();
+        let observed = fs.observe_latest().await.unwrap();
+        journal.prepare(&observed, &input, id).await.unwrap();
+        rusqlite::Connection::open(state.join("directory.db"))
+            .unwrap()
+            .execute(
+                &format!("UPDATE intents SET {field}=?2 WHERE request_id=?1"),
+                rusqlite::params![id.as_bytes().as_slice(), value],
+            )
+            .unwrap();
+        assert_eq!(
+            journal.status(id).await.unwrap_err().kind(),
+            RuntimeErrorKind::Corrupt
+        );
+        assert_eq!(
+            DirectoryJournal::inspect(&state).await.unwrap_err().kind(),
+            RuntimeErrorKind::Corrupt
+        );
+    }
 }
 
 #[cfg(unix)]

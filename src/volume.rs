@@ -595,26 +595,7 @@ impl VolumeLoadError {
     }
 
     fn into_runtime(self) -> Error {
-        let kind = match self.kind {
-            ErrorKind::Invalid => CoreErrorKind::Invalid,
-            ErrorKind::InvalidName => CoreErrorKind::InvalidName,
-            ErrorKind::NotFound => CoreErrorKind::NotFound,
-            ErrorKind::AlreadyExists => CoreErrorKind::AlreadyExists,
-            ErrorKind::NotDirectory => CoreErrorKind::NotDirectory,
-            ErrorKind::IsDirectory => CoreErrorKind::IsDirectory,
-            ErrorKind::NotEmpty => CoreErrorKind::NotEmpty,
-            ErrorKind::PermissionDenied => CoreErrorKind::PermissionDenied,
-            ErrorKind::Corrupt => CoreErrorKind::Corrupt,
-            ErrorKind::Unsupported => CoreErrorKind::Unsupported,
-            ErrorKind::Storage => CoreErrorKind::Storage,
-            ErrorKind::Io => CoreErrorKind::Io,
-            _ => CoreErrorKind::Storage,
-        };
-        Error::Core(yinyang_core::Error::new(
-            kind,
-            "volume storage",
-            self.message,
-        ))
+        Error::local_kind(self.kind, self.message)
     }
 }
 
@@ -833,12 +814,7 @@ fn operator_error(error: opendal::Error) -> Error {
 }
 
 fn kind_from_io(error: &std::io::Error) -> ErrorKind {
-    match error.kind() {
-        std::io::ErrorKind::NotFound => ErrorKind::NotFound,
-        std::io::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
-        std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-        _ => ErrorKind::Io,
-    }
+    crate::runtime::kind_from_io(error)
 }
 
 pub struct Volume {
@@ -975,4 +951,22 @@ fn direct_admission_error(error: direct::Error) -> Error {
         "direct admission",
         error.to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_error_preserves_the_runtime_kind_and_message() {
+        let error = VolumeLoadError::new(
+            VolumeLoadStage::Operator,
+            ErrorKind::NoSpace,
+            "local volume state is full",
+            None,
+        );
+        let error = error.into_runtime();
+        assert_eq!(error.kind(), ErrorKind::NoSpace);
+        assert!(error.to_string().ends_with("local volume state is full"));
+    }
 }

@@ -106,15 +106,6 @@ pub(crate) fn exit_code_for_kind(kind: RuntimeErrorKind) -> u8 {
     }
 }
 
-pub(crate) fn runtime_kind_from_io(kind: std::io::ErrorKind) -> RuntimeErrorKind {
-    match kind {
-        std::io::ErrorKind::NotFound => RuntimeErrorKind::NotFound,
-        std::io::ErrorKind::AlreadyExists => RuntimeErrorKind::AlreadyExists,
-        std::io::ErrorKind::PermissionDenied => RuntimeErrorKind::PermissionDenied,
-        _ => RuntimeErrorKind::Io,
-    }
-}
-
 fn runtime_kind_from_opendal(kind: opendal::ErrorKind) -> RuntimeErrorKind {
     match kind {
         opendal::ErrorKind::Unsupported => RuntimeErrorKind::Unsupported,
@@ -181,7 +172,7 @@ impl From<std::io::Error> for CliError {
     fn from(error: std::io::Error) -> Self {
         Self::new(
             CliStage::Operation,
-            runtime_kind_from_io(error.kind()),
+            yinyang::runtime::kind_from_io(&error),
             error.to_string(),
         )
     }
@@ -190,18 +181,6 @@ impl From<std::io::Error> for CliError {
 impl From<serde_json::Error> for CliError {
     fn from(error: serde_json::Error) -> Self {
         Self::invalid(CliStage::Output, error.to_string())
-    }
-}
-
-impl From<String> for CliError {
-    fn from(message: String) -> Self {
-        Self::invalid(CliStage::Operation, message)
-    }
-}
-
-impl From<&str> for CliError {
-    fn from(message: &str) -> Self {
-        Self::invalid(CliStage::Operation, message)
     }
 }
 
@@ -447,12 +426,14 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             let journal = if let Some(state) = &state {
                 let journal = yinyang::DirectoryJournal::open(Arc::new(fs.clone()), state).await?;
                 if journal.status(id).await?.is_some() {
-                    return Err(format!(
-                        "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",
-                        state.display(),
-                        state.display()
-                    )
-                    .into());
+                    return Err(CliError::invalid(
+                        CliStage::Publication,
+                        format!(
+                            "publication {uuid} is already recorded in {}; replay it without SOURCE using `yy publication retry {uuid} --state {}`, or select a new --commit-id",
+                            state.display(),
+                            state.display()
+                        ),
+                    ));
                 }
                 Some(journal)
             } else {
@@ -460,13 +441,18 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             };
             let observed = fs.observe_latest().await?;
             if observed.receipt(id).await?.is_some() {
-                return Err(format!("commit identity is already used; query its original result with yy receipt {uuid}; use a new identity for a new snapshot").into());
+                return Err(CliError::invalid(
+                    CliStage::Publication,
+                    format!(
+                        "commit identity is already used; query its original result with yy receipt {uuid}; use a new identity for a new snapshot"
+                    ),
+                ));
             }
             if !replace && !observed.scan(fs.root(), None, 1).await?.entries.is_empty() {
-                return Err(
-                    "remote namespace is not empty; use --replace for a complete replacement"
-                        .into(),
-                );
+                return Err(CliError::invalid(
+                    CliStage::Publication,
+                    "remote namespace is not empty; use --replace for a complete replacement",
+                ));
             }
             eprintln!("publication ID: {uuid}");
             if let (Some(journal), Some(state)) = (journal, state) {
@@ -567,7 +553,7 @@ fn hex_nibble(value: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_revision;
+    use super::{CliError, parse_revision};
     use yinyang::runtime::ErrorKind;
 
     #[test]
@@ -589,6 +575,22 @@ mod tests {
         assert_eq!(
             ErrorKind::from(yinyang::direct::ErrorKind::Stale),
             ErrorKind::Conflict
+        );
+    }
+
+    #[test]
+    fn cli_io_errors_keep_shared_local_kinds() {
+        assert_eq!(
+            CliError::from(std::io::Error::from(std::io::ErrorKind::StorageFull)).kind(),
+            ErrorKind::NoSpace
+        );
+        assert_eq!(
+            CliError::from(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem,)).kind(),
+            ErrorKind::ReadOnly
+        );
+        assert_eq!(
+            CliError::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).kind(),
+            ErrorKind::PermissionDenied
         );
     }
 }

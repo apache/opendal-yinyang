@@ -376,7 +376,7 @@ async fn export(
         .map_err(|error| {
             CliError::new(
                 CliStage::Output,
-                crate::runtime_kind_from_io(error.kind()),
+                yinyang::runtime::kind_from_io(&error),
                 format!(
                     "create export {} (refusing to overwrite an existing path): {error}",
                     output.display()
@@ -422,7 +422,7 @@ async fn resolve(
             Resolution::Content(tokio::fs::read(path).await.map_err(|error| {
                 CliError::new(
                     CliStage::LocalState,
-                    crate::runtime_kind_from_io(error.kind()),
+                    yinyang::runtime::kind_from_io(&error),
                     format!("read resolution content {}: {error}", path.display()),
                 )
             })?)

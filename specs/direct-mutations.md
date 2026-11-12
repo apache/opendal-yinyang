@@ -157,6 +157,13 @@ schema signature because maintained inserts name their columns. An absent or
 zero-length database may be initialized. A partial first initialization is
 therefore not silently adopted.
 
+`runtime.lock` is acquired nonblocking after that preflight and before the
+database is opened for initialization or recovery. Contention is `Busy`; no
+retry loop or second owner path exists. Releasing the runtime releases the
+lease so a later open can acquire it. Local IO and SQLite classifications retain
+`NoSpace`, `ReadOnly`, `PermissionDenied`, `Busy` and the applicable path
+categories instead of collapsing them into storage failure.
+
 Mutation journal rows that make an external write or delete recoverable are
 durable `synchronous=FULL` commits before that storage request. This includes
 `Dispatching`, `SourceDispatching`, object `Pending`, and the paired frozen

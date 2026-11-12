@@ -33,6 +33,7 @@ use super::{
     DirectFile, DirectId, DirectKey, DirectNamespace, DirectNode, DirectSnapshot, Error, ErrorKind,
     Result, derive_id, pin_value,
 };
+use crate::local::store;
 use opendal::EntryMode;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -2926,8 +2927,10 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn local_io(context: &str, error: std::io::Error) -> Error {
-    let kind = ErrorKind::Storage;
-    Error::new(kind, format!("{context}: {error}"))
+    Error::new(
+        store::classify_io(&error).into(),
+        format!("{context}: {error}"),
+    )
 }
 
 fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -2979,6 +2982,67 @@ mod tests {
 
     fn mutation_input(root: &Path, id: DirectMutationId) -> PathBuf {
         root.join("inputs").join(format!("{}.data", id.to_hex()))
+    }
+
+    #[tokio::test]
+    async fn runtime_lease_is_busy_then_reopens_after_release() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let first = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let error = match DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        {
+            Ok(_) => panic!("a second Direct runtime acquired the lease"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::Busy);
+
+        drop(first);
+        DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_open_preserves_local_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = match DirectRuntime::open(
+            namespace(&operator),
+            Some(root.path().join("state")),
+            false,
+            binding("bucket"),
+        )
+        .await
+        {
+            Ok(_) => panic!("Direct runtime created state through a read-only parent"),
+            Err(error) => error,
+        };
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error}");
     }
 
     #[tokio::test]

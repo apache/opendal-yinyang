@@ -17,7 +17,9 @@
 
 use std::path::Path;
 
+use crate::local::store;
 pub use crate::runtime::ErrorKind;
+use crate::runtime::kind_from_errno;
 use yinyang_core::CommitId;
 
 #[derive(Debug)]
@@ -60,19 +62,18 @@ impl Error {
         Self::new(ErrorKind::Corrupt, message)
     }
 
-    pub fn busy(message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::Busy, message)
-    }
-
-    pub fn io(operation: &str, path: &Path, error: impl std::fmt::Display) -> Self {
-        Self::new(
-            ErrorKind::Io,
-            format!("{operation} {}: {error}", path.display()),
-        )
+    pub fn io(operation: &str, path: &Path, error: impl std::error::Error + 'static) -> Self {
+        let kind = store::classify_error(&error).into();
+        Self::new(kind, format!("{operation} {}: {error}", path.display()))
     }
 
     pub fn errno(operation: &str, path: &Path, error: rustix::io::Errno) -> Self {
-        Self::io(operation, path, error)
+        let kind = kind_from_errno(error);
+        Self::new(kind, format!("{operation} {}: {error}", path.display()))
+    }
+
+    pub(crate) fn from_local(error: store::Error) -> Self {
+        Self::new(error.kind().into(), error.to_string())
     }
 
     pub const fn kind(&self) -> ErrorKind {
@@ -117,3 +118,25 @@ impl From<crate::direct::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errno_preserves_operational_kinds() {
+        for (error, kind) in [
+            (rustix::io::Errno::NOENT, ErrorKind::NotFound),
+            (rustix::io::Errno::EXIST, ErrorKind::AlreadyExists),
+            (rustix::io::Errno::ACCESS, ErrorKind::PermissionDenied),
+            (rustix::io::Errno::ROFS, ErrorKind::ReadOnly),
+            (rustix::io::Errno::NOSPC, ErrorKind::NoSpace),
+            (rustix::io::Errno::WOULDBLOCK, ErrorKind::Busy),
+        ] {
+            assert_eq!(
+                Error::errno("test local operation", Path::new("state"), error).kind(),
+                kind
+            );
+        }
+    }
+}

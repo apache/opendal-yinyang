@@ -553,7 +553,7 @@ impl Backend for ManagedBackend {
                 self.invalidate_snapshot();
                 Ok(())
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(BackendError::runtime_namespace_mutation(error)),
         }
     }
 

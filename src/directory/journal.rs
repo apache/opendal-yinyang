@@ -814,37 +814,9 @@ fn store_error(error: store::Error) -> Error {
 
 fn local(error: impl std::error::Error + 'static) -> Error {
     let cause: &dyn std::error::Error = &error;
-    if let Some(error) = cause.downcast_ref::<std::io::Error>() {
-        return match error.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                Error::local_kind(ErrorKind::PermissionDenied, error)
-            }
-            std::io::ErrorKind::StorageFull => Error::local_kind(ErrorKind::NoSpace, error),
-            std::io::ErrorKind::ReadOnlyFilesystem => Error::local_kind(ErrorKind::ReadOnly, error),
-            _ => Error::local_kind(ErrorKind::Io, error),
-        };
-    }
-    Error::local_kind(ErrorKind::Io, error)
+    Error::local_kind(store::classify_error(cause).into(), error)
 }
 
 fn sql(error: rusqlite::Error) -> Error {
-    let kind = match &error {
-        rusqlite::Error::QueryReturnedNoRows => ErrorKind::NotFound,
-        rusqlite::Error::SqliteFailure(code, _) => match code.code {
-            rusqlite::ErrorCode::ConstraintViolation => ErrorKind::AlreadyExists,
-            rusqlite::ErrorCode::DiskFull => ErrorKind::NoSpace,
-            rusqlite::ErrorCode::ReadOnly => ErrorKind::ReadOnly,
-            rusqlite::ErrorCode::PermissionDenied => ErrorKind::PermissionDenied,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
-                ErrorKind::Busy
-            }
-            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
-                ErrorKind::Corrupt
-            }
-            _ => ErrorKind::Io,
-        },
-        rusqlite::Error::FromSqlConversionFailure(..) => ErrorKind::Corrupt,
-        _ => ErrorKind::Io,
-    };
-    Error::local_kind(kind, error)
+    Error::local_kind(store::classify_sqlite(&error).into(), error)
 }

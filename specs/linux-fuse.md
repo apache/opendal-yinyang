@@ -345,12 +345,12 @@ adapter snapshot and pending overlay. Metadata-only inode invalidation and
 dentry invalidation remain confined to the explicit SIGHUP path, outside a
 related mutation request.
 
-An `unlink` or `rename` precondition conflict does not install a refreshed
-remote snapshot and returns `EAGAIN`, not `ESTALE`, for both backends. Linux
-namei can retry `ESTALE` once inside the same syscall when `LOOKUP_REVAL` is
-not already set; a concurrent global refresh could make that retry use the
-external source or destination pin as a new intent. `EAGAIN` prevents that
-implicit retry and leaves the decision to the caller.
+An `unlink`, `rmdir`, or `rename` precondition conflict does not install a
+refreshed remote snapshot and returns `EAGAIN`, not `ESTALE`, for both
+backends. Linux namei can retry `ESTALE` once inside the same syscall when
+`LOOKUP_REVAL` is not already set; a concurrent global refresh could make that
+retry use the external source or destination pin as a new intent. `EAGAIN`
+prevents that implicit retry and leaves the decision to the caller.
 
 The pending Conflict observation remains visible, and the failed callback does
 not install a refreshed snapshot. A caller can explicitly refresh with `SIGHUP`
@@ -387,8 +387,10 @@ A remote snapshot implies no local capacity claim. The adapter has one errno
 table for core, runtime and Direct failures. Unknown Direct identity is
 `ESTALE`; content-publication conflicts on either backend are `ESTALE` and
 retain their local bytes for explicit resolution; read-only violations are
-`EROFS`; unsupported operations are `ENOSYS` or `EOPNOTSUPP`; unlink/rename
-precondition conflicts are `EAGAIN`; and every other failure class degrades to
+`EROFS`; unsupported operations are `ENOSYS` or `EOPNOTSUPP`;
+unlink/rmdir/rename precondition conflicts are `EAGAIN`; local permission
+denial is `EACCES`, local lease or locked-state contention is `EBUSY`, and
+local capacity exhaustion is `ENOSPC`. Every other failure class degrades to
 `EIO` without guessing.
 
 ## Cancellation and exit
