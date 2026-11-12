@@ -66,12 +66,12 @@ The caller supplies a dedicated local state directory. It contains
 `directory.db`, an experimental SQLite WAL database using
 `synchronous=FULL`, bound to exactly one filesystem and root. Keep the
 database and WAL together. Profile `yinyang-directory-3` uses the shared
-`intents` state codec from [sync-runtime.md](sync-runtime.md). Its `metadata`
-column stores the diagnostic source path and directory manifest derived during
-the same successful preparation. The request, CommitId, request digest,
-baseline, receipt and typed failure use the shared columns. Unknown or
-mismatched profiles and filesystem bindings are rejected. This local format has
-no migration path.
+durable-intent row and transition rules from
+[sync-runtime.md](sync-runtime.md). Its `metadata` column stores the diagnostic
+source path and directory manifest derived during the same successful
+preparation. The request, CommitId, request digest, baseline, receipt and
+typed failure use the shared columns. Unknown or mismatched profiles and
+filesystem bindings are rejected. This local format has no migration path.
 
 The supported schema signature is the exact table set `binding` and `intents`
 with their exact column-name sets. Maintained inserts name their columns

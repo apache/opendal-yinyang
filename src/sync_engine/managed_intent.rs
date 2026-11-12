@@ -17,6 +17,7 @@
 
 use super::adapter::{FrozenRemoteRequest, RemoteOperation, RemotePin, RemoteRequest};
 use super::{Error, Result};
+use crate::intent;
 use borsh::BorshSerialize;
 use std::sync::Arc;
 use yinyang_core::{Authority, CommitId, NodeId, Planner, Revision, Transaction};
@@ -387,13 +388,19 @@ pub(super) fn verify_frozen(
     authority: &dyn Authority,
     request: &FrozenRemoteRequest,
 ) -> Result<()> {
-    let (_, id, digest) = Transaction::verify_identity(&request.bytes, authority.filesystem())?;
-    if id.as_bytes() != &request.id || digest != request.digest {
-        return Err(Error::corrupt(
-            "frozen Managed transaction identity disagrees with its engine request",
-        ));
-    }
-    Ok(())
+    intent::verify_frozen(
+        &request.bytes,
+        authority.filesystem(),
+        request.id,
+        request.digest,
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        intent::VerifyFrozenError::Core(error) => Error::from(error),
+        intent::VerifyFrozenError::Mismatch => {
+            Error::corrupt("frozen Managed transaction identity disagrees with its engine request")
+        }
+    })
 }
 
 fn identity(key: &RequestKey) -> Result<([u8; 16], CommitId)> {

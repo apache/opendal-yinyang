@@ -36,6 +36,7 @@ use super::store::{
 };
 use super::types::{LocalKind, LocalNode, LocalSnapshot};
 use super::{Error, ErrorKind, Result};
+use crate::intent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -485,7 +486,9 @@ impl<R: RemoteAdapter> SyncEngine<R> {
             }
             let mut intent = intent;
             intent.state = IntentState::Unknown;
-            self.local.store().update_intent(&intent)?;
+            self.local
+                .store()
+                .update_intent(&intent, intent::Transition::ClaimDispatch)?;
             retry.push((
                 PreparedRemoteRequest {
                     request: frozen,
@@ -640,7 +643,9 @@ impl<R: RemoteAdapter> SyncEngine<R> {
         for id in &ids {
             if let Some(mut intent) = self.local.store().intent(id)? {
                 intent.state = IntentState::Unknown;
-                self.local.store().update_intent(&intent)?;
+                self.local
+                    .store()
+                    .update_intent(&intent, intent::Transition::ClaimDispatch)?;
             }
         }
         let outcomes = self.remote.publish_batch(&prepared).await?;
@@ -740,7 +745,9 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                         message: "the original request remains unknown; its accepted precondition no longer matches".to_owned(),
                         commit: None,
                     });
-                    self.local.store().update_intent(&intent)?;
+                    self.local
+                        .store()
+                        .update_intent(&intent, intent::Transition::StillUnknown)?;
                 } else {
                     intent.state = IntentState::Conflict;
                     intent.failure = Some(RemoteFailure {
@@ -748,7 +755,9 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                         message: "remote precondition no longer matches".to_owned(),
                         commit: None,
                     });
-                    self.local.store().update_intent(&intent)?;
+                    self.local
+                        .store()
+                        .update_intent(&intent, intent::Transition::Conflict)?;
                     let local = self.local.observe_path(&work.path)?;
                     self.record_conflict(
                         &work.path,
@@ -765,19 +774,25 @@ impl<R: RemoteAdapter> SyncEngine<R> {
                 intent.commit_id = failure.commit;
                 intent.state = IntentState::Unknown;
                 intent.failure = Some(failure);
-                self.local.store().update_intent(&intent)?;
+                self.local
+                    .store()
+                    .update_intent(&intent, intent::Transition::StillUnknown)?;
             }
             RemoteOutcome::Retryable { failure } => {
                 intent.commit_id = failure.commit;
                 intent.state = IntentState::Retryable;
                 intent.failure = Some(failure);
-                self.local.store().update_intent(&intent)?;
+                self.local
+                    .store()
+                    .update_intent(&intent, intent::Transition::Retryable)?;
             }
             RemoteOutcome::Unsupported { failure } => {
                 intent.commit_id = failure.commit;
                 intent.state = IntentState::Failed;
                 intent.failure = Some(failure);
-                self.local.store().update_intent(&intent)?;
+                self.local
+                    .store()
+                    .update_intent(&intent, intent::Transition::Failed)?;
             }
         }
         Ok(())

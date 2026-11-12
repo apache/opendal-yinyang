@@ -20,7 +20,7 @@
 use crate::intent;
 use crate::local::{lease, store};
 use crate::runtime::{Error, ErrorKind, Failure, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncRead;
@@ -46,6 +46,14 @@ const CREATE_SCHEMA: &str = "
 
 fn store_error(error: store::Error) -> Error {
     Error::local_kind(error.kind().into(), error)
+}
+
+fn intent_error(error: rusqlite::Error) -> Error {
+    if matches!(error, rusqlite::Error::FromSqlConversionFailure(..)) {
+        Error::local_kind(ErrorKind::Corrupt, error)
+    } else {
+        Error::local(error)
+    }
 }
 
 fn validate_profile(connection: &Connection, filesystem: NodeId) -> Result<()> {
@@ -163,26 +171,17 @@ pub struct SyncInspect {
 }
 
 #[derive(Clone)]
-struct IntentRow {
-    id: Vec<u8>,
-    request_digest: Vec<u8>,
-    request: Vec<u8>,
-    commit_id: Option<Vec<u8>>,
-    state: u8,
-    receipt_revision: Option<Vec<u8>>,
-    receipt_ordinal: Option<i64>,
-    failure: Option<Vec<u8>>,
-}
+struct IntentRow(intent::Record);
 
 impl IntentRow {
     fn edit(&self) -> Result<EditId> {
-        Ok(EditId(self.id.as_slice().try_into().map_err(|_| {
+        Ok(EditId(self.0.id.as_slice().try_into().map_err(|_| {
             Error::local_kind(ErrorKind::Corrupt, "invalid content intent id")
         })?))
     }
 
     fn commit_id(&self) -> Result<CommitId> {
-        let commit = self.commit_id.as_deref().ok_or_else(|| {
+        let commit = self.0.commit_id.as_deref().ok_or_else(|| {
             Error::local_kind(ErrorKind::Corrupt, "content intent has no commit id")
         })?;
         Ok(CommitId::from_bytes(commit.try_into().map_err(|_| {
@@ -191,14 +190,15 @@ impl IntentRow {
     }
 
     fn digest(&self) -> Result<[u8; 32]> {
-        self.request_digest
+        self.0
+            .request_digest
             .as_slice()
             .try_into()
             .map_err(|_| Error::local_kind(ErrorKind::Corrupt, "invalid content request digest"))
     }
 
     fn receipt(&self) -> Result<Option<Receipt>> {
-        let Some(commit_id) = self.commit_id.as_deref() else {
+        let Some(commit_id) = self.0.commit_id.as_deref() else {
             return Ok(None);
         };
         intent::receipt(
@@ -206,7 +206,8 @@ impl IntentRow {
                 .try_into()
                 .map_err(|_| Error::local_kind(ErrorKind::Corrupt, "invalid content commit id"))?,
             self.digest()?,
-            self.receipt_revision
+            self.0
+                .receipt_revision
                 .as_deref()
                 .map(|bytes| {
                     bytes.try_into().map_err(|_| {
@@ -214,22 +215,21 @@ impl IntentRow {
                     })
                 })
                 .transpose()?,
-            self.receipt_ordinal,
+            self.0.receipt_ordinal,
         )
         .map_err(|error| Error::local_kind(ErrorKind::Corrupt, error))
     }
 
     fn status(&self) -> Result<ContentStatus> {
-        let state = intent::State::from_code(self.state)
-            .ok_or_else(|| Error::local_kind(ErrorKind::Corrupt, "invalid content intent state"))?;
+        let state = self.0.state;
         let receipt = self.receipt()?;
-        let (baseline, _, _) = Transaction::inspect_identity(&self.request).map_err(|error| {
+        let (baseline, _, _) = Transaction::inspect_identity(&self.0.request).map_err(|error| {
             Error::local_kind(
                 ErrorKind::Corrupt,
                 format!("invalid content request: {error}"),
             )
         })?;
-        let files = Transaction::inspect(&self.request)
+        let files = Transaction::inspect(&self.0.request)
             .map_err(|error| Error::local_kind(ErrorKind::Corrupt, error))?
             .1;
         if files.len() != 1 {
@@ -239,6 +239,7 @@ impl IntentRow {
             ));
         }
         let failure = self
+            .0
             .failure
             .as_deref()
             .map(borsh::from_slice)
@@ -350,27 +351,9 @@ impl Sync {
     }
 
     fn load(connection: &Connection, id: EditId) -> Result<Option<IntentRow>> {
-        connection
-            .query_row(
-                "SELECT id,request_digest,request,commit_id,state,
-                        receipt_revision,receipt_ordinal,failure
-                 FROM intents WHERE id=?1",
-                params![id.as_bytes().as_slice()],
-                |row| {
-                    Ok(IntentRow {
-                        id: row.get(0)?,
-                        request_digest: row.get(1)?,
-                        request: row.get(2)?,
-                        commit_id: row.get(3)?,
-                        state: row.get(4)?,
-                        receipt_revision: row.get(5)?,
-                        receipt_ordinal: row.get(6)?,
-                        failure: row.get(7)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Error::local)
+        intent::load(connection, id.as_bytes())
+            .map(|row| row.map(IntentRow))
+            .map_err(intent_error)
     }
 
     pub async fn stage(
@@ -403,7 +386,6 @@ impl Sync {
         let request = planner.finish()?;
         let bytes = request.to_bytes()?;
         let digest = request.digest();
-        let state = intent::State::Prepared.code();
         self.call(move |connection| {
             if Self::load(connection, edit)?.is_some() {
                 return Ok(());
@@ -411,23 +393,18 @@ impl Sync {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(Error::local)?;
-            transaction
-                .execute(
-                    "INSERT INTO intents(
-                        id,request_id,request_digest,request,commit_id,state,
-                        receipt_revision,receipt_ordinal,failure,metadata
-                     ) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,NULL,?7)",
-                    params![
-                        edit.as_bytes().as_slice(),
-                        commit.as_bytes().as_slice(),
-                        digest.as_slice(),
-                        bytes,
-                        commit.as_bytes().as_slice(),
-                        state,
-                        Vec::<u8>::new(),
-                    ],
-                )
-                .map_err(Error::local)?;
+            intent::insert_prepared(
+                &transaction,
+                intent::Prepared {
+                    id: edit.as_bytes(),
+                    request_id: commit.as_bytes(),
+                    request_digest: &digest,
+                    request: &bytes,
+                    commit_id: Some(commit.as_bytes()),
+                    metadata: &[],
+                },
+            )
+            .map_err(Error::local)?;
             transaction.commit().map_err(Error::local)
         })
         .await?;
@@ -449,29 +426,10 @@ impl Sync {
         tokio::task::spawn_blocking(move || {
             let connection = store::open_read_only(&path).map_err(store_error)?;
             store::validate(&connection, &PROFILE, None).map_err(store_error)?;
-            let mut statement = connection
-                .prepare(
-                    "SELECT id,request_digest,request,commit_id,state,
-                            receipt_revision,receipt_ordinal,failure
-                     FROM intents ORDER BY id",
-                )
-                .map_err(Error::local)?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok(IntentRow {
-                        id: row.get(0)?,
-                        request_digest: row.get(1)?,
-                        request: row.get(2)?,
-                        commit_id: row.get(3)?,
-                        state: row.get(4)?,
-                        receipt_revision: row.get(5)?,
-                        receipt_ordinal: row.get(6)?,
-                        failure: row.get(7)?,
-                    })
-                })
-                .map_err(Error::local)?;
-            let intents = rows
-                .map(|row| row.map_err(Error::local).and_then(|row| row.status()))
+            let intents = intent::all(&connection)
+                .map_err(intent_error)?
+                .into_iter()
+                .map(|row| IntentRow(row).status())
                 .collect::<Result<Vec<_>>>()?;
             Ok(SyncInspect { intents })
         })
@@ -485,8 +443,7 @@ impl Sync {
             .call(move |connection| Self::load(connection, edit))
             .await?
             .ok_or(Error::Invalid("unknown local edit"))?;
-        let state = intent::State::from_code(row.state)
-            .ok_or_else(|| Error::local_kind(ErrorKind::Corrupt, "invalid content intent state"))?;
+        let state = row.0.state;
         match state {
             intent::State::Committed => {
                 return Ok(row
@@ -502,6 +459,7 @@ impl Sync {
             }
             intent::State::Conflict | intent::State::Failed => {
                 let failure: Option<Failure> = row
+                    .0
                     .failure
                     .as_deref()
                     .map(borsh::from_slice)
@@ -518,21 +476,22 @@ impl Sync {
             }
             intent::State::Prepared | intent::State::Unknown | intent::State::Retryable => {}
         }
-        let verification =
-            yinyang_core::Transaction::verify_identity(&row.request, self.authority().filesystem())
-                .map_err(Error::from)
-                .and_then(|(_, frozen_id, frozen_digest)| {
-                    let commit_id = row.commit_id()?;
-                    let digest = row.digest()?;
-                    if frozen_id == commit_id && frozen_digest == digest {
-                        Ok((frozen_id, frozen_digest))
-                    } else {
-                        Err(Error::State(
-                            ErrorKind::Corrupt,
-                            "frozen content request identity disagrees with local intent",
-                        ))
-                    }
-                });
+        let verification = (|| {
+            let commit_id = row.commit_id()?;
+            match intent::verify_frozen(
+                &row.0.request,
+                self.authority().filesystem(),
+                *commit_id.as_bytes(),
+                row.digest()?,
+            ) {
+                Ok(identity) => Ok((identity.commit_id, identity.digest)),
+                Err(intent::VerifyFrozenError::Core(error)) => Err(Error::from(error)),
+                Err(intent::VerifyFrozenError::Mismatch) => Err(Error::State(
+                    ErrorKind::Corrupt,
+                    "frozen content request identity disagrees with local intent",
+                )),
+            }
+        })();
         let failure_commit = match &verification {
             Ok((commit_id, _)) => *commit_id,
             Err(_) => derived_commit(edit),
@@ -548,26 +507,26 @@ impl Sync {
                 } else {
                     Failure::capture(&error)
                 };
-                let next_state = if state == intent::State::Unknown {
-                    intent::State::Unknown
+                let transition = if state == intent::State::Unknown {
+                    intent::Transition::StillUnknown
                 } else {
                     match error.kind() {
                         ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
-                            intent::State::Failed
+                            intent::Transition::LocalFailed
                         }
-                        _ => intent::State::Retryable,
+                        _ => intent::Transition::LocalRetryable,
                     }
                 };
-                self.save_state(edit, next_state, None, Some(&failure))
+                self.save_state(edit, transition, None, Some(&failure))
                     .await?;
                 return Err(Error::Retained(failure));
             }
         };
-        self.save_state(edit, intent::State::Unknown, None, None)
+        self.save_state(edit, intent::Transition::ClaimDispatch, None, None)
             .await?;
         let outcome = match self
             .authority()
-            .commit_frozen_batch(std::slice::from_ref(&row.request))
+            .commit_frozen_batch(std::slice::from_ref(&row.0.request))
             .await
         {
             Ok(mut outcomes) if outcomes.len() == 1 => Ok(outcomes.remove(0)),
@@ -585,7 +544,7 @@ impl Sync {
                         "content commit returned a receipt for another request",
                     ));
                 }
-                self.save_state(edit, intent::State::Committed, Some(&receipt), None)
+                self.save_state(edit, intent::Transition::Committed, Some(&receipt), None)
                     .await?;
                 Ok(receipt.cursor.revision)
             }
@@ -594,14 +553,14 @@ impl Sync {
                     ErrorKind::Conflict,
                     "content predicates changed",
                 ));
-                self.save_state(edit, intent::State::Conflict, None, Some(&failure))
+                self.save_state(edit, intent::Transition::Conflict, None, Some(&failure))
                     .await?;
                 Err(Error::Retained(failure))
             }
             Ok(yinyang_core::CommitOutcome::Retryable) => {
                 self.save_state(
                     edit,
-                    intent::State::Retryable,
+                    intent::Transition::Retryable,
                     None,
                     Some(&Failure::capture(&Error::Retryable)),
                 )
@@ -616,7 +575,7 @@ impl Sync {
                     ));
                 }
                 let failure = Failure::unknown_with(commit, "content commit outcome is unknown");
-                self.save_state(edit, intent::State::Unknown, None, Some(&failure))
+                self.save_state(edit, intent::Transition::StillUnknown, None, Some(&failure))
                     .await?;
                 Err(Error::Retained(failure))
             }
@@ -625,7 +584,7 @@ impl Sync {
                     commit_id,
                     format!("content commit failed after dispatch: {error}"),
                 );
-                self.save_state(edit, intent::State::Unknown, None, Some(&failure))
+                self.save_state(edit, intent::Transition::StillUnknown, None, Some(&failure))
                     .await?;
                 Err(Error::Retained(failure))
             }
@@ -635,12 +594,12 @@ impl Sync {
     async fn save_state(
         &self,
         edit: EditId,
-        state: intent::State,
+        transition: intent::Transition,
         receipt: Option<&Receipt>,
         failure: Option<&Failure>,
     ) -> Result<()> {
-        let revision = receipt.map(|receipt| receipt.cursor.revision.to_bytes().to_vec());
-        let ordinal = receipt.map(|receipt| i64::from(receipt.cursor.ordinal));
+        let receipt_revision = receipt.map(|receipt| receipt.cursor.revision.to_bytes());
+        let receipt_ordinal = receipt.map(|receipt| receipt.cursor.ordinal);
         let failure = failure
             .map(borsh::to_vec)
             .transpose()
@@ -649,20 +608,10 @@ impl Sync {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(Error::local)?;
-            let changed = transaction
-                .execute(
-                    "UPDATE intents SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
-                     WHERE id=?1",
-                    params![
-                        edit.as_bytes().as_slice(),
-                        state.code(),
-                        revision,
-                        ordinal,
-                        failure
-                    ],
-                )
-                .map_err(Error::local)?;
-            if changed != 1 {
+            let update = intent::Update::new(transition)
+                .receipt_parts(receipt_revision, receipt_ordinal)
+                .failure(failure.as_deref());
+            if !intent::update(&transaction, edit.as_bytes(), update).map_err(Error::local)? {
                 return Err(Error::Invalid("content intent disappeared"));
             }
             transaction.commit().map_err(Error::local)
