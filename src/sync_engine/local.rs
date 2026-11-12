@@ -27,10 +27,11 @@ use super::types::{
     same_stable_stat, scan_path_with_hints_counted, split_path, validate_path,
 };
 use super::{Error, ErrorKind, Result};
+use crate::local::lease::StateLease as LocalStateLease;
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, flock, fstat, fsync,
-    mkdirat, openat, renameat_with, statat, unlinkat,
+    AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, fstat, fsync, mkdirat, openat,
+    renameat_with, statat, unlinkat,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -48,28 +49,33 @@ pub(super) struct LocalTree {
     state_identity: Identity,
     install_fd: OwnedFd,
     artifact_fd: OwnedFd,
-    _lease: std::fs::File,
+    _lease: StateLease,
     store: Store,
     hash_bytes_read: AtomicU64,
 }
 
-/// Exclusive lease for an existing Sync-engine state protocol.
+/// Exclusive lease for one Sync-engine state profile.
 ///
-/// Acquisition may create the configured state directory and
-/// `sync-engine.lock`, but it never opens, creates, or recovers
-/// `sync-engine.db`.
+/// The path-based acquisition prepares and opens the directory, while callers
+/// that already hold a bound directory use the same fd-relative path. The
+/// shared local lease owns the actual nonblocking lock operation.
 pub(crate) struct StateLease {
-    _file: std::fs::File,
+    _lease: LocalStateLease,
 }
 
 impl StateLease {
     pub(crate) fn acquire(state: &Path) -> Result<Self> {
         prepare_lease_directory(state)?;
         let state = std::fs::canonicalize(state)
-            .map_err(|error| Error::io("canonicalize Sync engine state", state, error))?;
-        let (state_fd, _) = open_bound_directory(&state, "open Sync engine state")?;
-        let file = acquire_lease(&state_fd, &state)?;
-        Ok(Self { _file: file })
+            .map_err(|error| Error::io("canonicalize sync engine state", state, error))?;
+        let (state_fd, _) = open_bound_directory(&state, "open sync engine state")?;
+        Self::from_bound(&state_fd, &state)
+    }
+
+    fn from_bound(state_fd: &OwnedFd, state: &Path) -> Result<Self> {
+        Ok(Self {
+            _lease: acquire_lease(state_fd, state)?,
+        })
     }
 }
 
@@ -83,10 +89,10 @@ fn prepare_lease_directory(path: &Path) -> Result<()> {
     {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(Error::io("create Sync engine state", path, error)),
+        Err(error) => return Err(Error::io("create sync engine state", path, error)),
     }
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| Error::io("inspect Sync engine state", path, error))?;
+        .map_err(|error| Error::io("inspect sync engine state", path, error))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(Error::unsupported(format!(
             "{} must be an ordinary directory",
@@ -121,7 +127,7 @@ impl LocalTree {
                 "sync root and state must share a filesystem for atomic local installs",
             ));
         }
-        let lease = acquire_lease(&state_fd, &state)?;
+        let lease = StateLease::from_bound(&state_fd, &state)?;
         let namespace = namespace.into();
         let binding = Binding {
             model,
@@ -152,7 +158,7 @@ impl LocalTree {
         let state = std::fs::canonicalize(state)
             .map_err(|error| Error::io("canonicalize sync state", state, error))?;
         let (state_fd, state_identity) = open_bound_directory(&state, "open sync state")?;
-        let _lease = acquire_lease(&state_fd, &state)?;
+        let _lease = StateLease::from_bound(&state_fd, &state)?;
         let store = Store::open(&state.join("sync-engine.db"))?;
         let binding = store.binding()?;
         let namespace = namespace.into();
@@ -254,7 +260,7 @@ impl LocalTree {
             .ok_or_else(|| Error::corrupt("local scan omitted the synchronized root"))?;
         if root.identity != self.root_identity {
             return Err(Error::invalid(
-                "Direct Sync root identity changed since the writer opened it",
+                "sync root identity changed since the writer opened it",
             ));
         }
         let updates = snapshot
@@ -332,12 +338,9 @@ impl LocalTree {
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
-        .map_err(|error| {
-            Error::errno("create Direct Sync install temporary", &self.state, error)
-        })?;
-        fsync(&self.install_fd).map_err(|error| {
-            Error::errno("persist Direct Sync install directory", &self.state, error)
-        })?;
+        .map_err(|error| Error::errno("create sync install temporary", &self.state, error))?;
+        fsync(&self.install_fd)
+            .map_err(|error| Error::errno("persist sync install directory", &self.state, error))?;
         Ok((
             name.clone(),
             self.state.join("install").join(name),
@@ -364,17 +367,15 @@ impl LocalTree {
         )
         .map_err(|error| {
             Error::errno(
-                "retain Direct Sync install temporary",
+                "retain sync install temporary",
                 &self.install_path(temporary),
                 error,
             )
         })?;
-        fsync(&self.install_fd).map_err(|error| {
-            Error::errno("persist Direct Sync install directory", &self.state, error)
-        })?;
-        fsync(&self.artifact_fd).map_err(|error| {
-            Error::errno("persist Direct Sync artifact directory", &self.state, error)
-        })?;
+        fsync(&self.install_fd)
+            .map_err(|error| Error::errno("persist sync install directory", &self.state, error))?;
+        fsync(&self.artifact_fd)
+            .map_err(|error| Error::errno("persist sync artifact directory", &self.state, error))?;
         let stat = optional_stat(
             &self.artifact_fd,
             &name,
@@ -419,7 +420,7 @@ impl LocalTree {
         let parent_identity = identity(
             &parent_fd,
             &self.root.join(parent),
-            "inspect Direct Sync upload parent",
+            "inspect sync upload parent",
         )?;
         if parent_identity.dev != parent_dev || parent_identity.ino != parent_ino {
             return Err(Error::conflict(
@@ -432,19 +433,9 @@ impl LocalTree {
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|error| {
-            Error::errno(
-                "open Direct Sync upload",
-                &self.root.join(&node.path),
-                error,
-            )
-        })?;
+        .map_err(|error| Error::errno("open sync upload", &self.root.join(&node.path), error))?;
         let before = fstat(&source).map_err(|error| {
-            Error::errno(
-                "inspect Direct Sync upload",
-                &self.root.join(&node.path),
-                error,
-            )
+            Error::errno("inspect sync upload", &self.root.join(&node.path), error)
         })?;
         if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
             || before.st_dev != dev
@@ -462,49 +453,40 @@ impl LocalTree {
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
-        .map_err(|error| Error::errno("create Direct Sync upload artifact", &self.state, error))?;
+        .map_err(|error| Error::errno("create sync upload artifact", &self.state, error))?;
         let mut source = std::fs::File::from(source);
         let mut output = std::fs::File::from(output);
         let mut hasher = Hasher::default();
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             let count = source.read(&mut buffer).map_err(|error| {
-                Error::io(
-                    "read Direct Sync upload",
-                    &self.root.join(&node.path),
-                    error,
-                )
+                Error::io("read sync upload", &self.root.join(&node.path), error)
             })?;
             if count == 0 {
                 break;
             }
-            output.write_all(&buffer[..count]).map_err(|error| {
-                Error::io("write Direct Sync upload artifact", &self.state, error)
-            })?;
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| Error::io("write sync upload artifact", &self.state, error))?;
             hasher.update(&buffer[..count]);
         }
         let after = fstat(&source).map_err(|error| {
-            Error::errno(
-                "recheck Direct Sync upload",
-                &self.root.join(&node.path),
-                error,
-            )
+            Error::errno("recheck sync upload", &self.root.join(&node.path), error)
         })?;
         if !same_stable_stat(&before, &after) {
             return Err(Error::conflict(
                 "local upload changed while its bytes were captured",
             ));
         }
-        output.sync_all().map_err(|error| {
-            Error::io("persist Direct Sync upload artifact", &self.state, error)
-        })?;
+        output
+            .sync_all()
+            .map_err(|error| Error::io("persist sync upload artifact", &self.state, error))?;
         let (length, digest) = hasher.finish();
         let retained = fstat(&output)
             .map_err(|error| Error::errno("inspect sync upload artifact", &self.state, error))?;
         drop(output);
-        fsync(&self.artifact_fd).map_err(|error| {
-            Error::errno("persist Direct Sync artifact directory", &self.state, error)
-        })?;
+        fsync(&self.artifact_fd)
+            .map_err(|error| Error::errno("persist sync artifact directory", &self.state, error))?;
         if length != expected_length || digest.as_bytes() != &expected_digest {
             return Err(Error::conflict(
                 "local upload bytes do not match the accepted scan",
@@ -584,7 +566,7 @@ impl LocalTree {
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|error| Error::errno("open Direct Sync artifact", &self.state, error))?;
+        .map_err(|error| Error::errno("open sync artifact", &self.state, error))?;
         Ok(std::fs::File::from(fd))
     }
 
@@ -651,9 +633,8 @@ impl LocalTree {
             }
             _ => return Ok(false),
         }
-        fsync(&self.artifact_fd).map_err(|error| {
-            Error::errno("persist Direct Sync artifact release", &self.state, error)
-        })?;
+        fsync(&self.artifact_fd)
+            .map_err(|error| Error::errno("persist sync artifact release", &self.state, error))?;
         Ok(true)
     }
 
@@ -746,13 +727,7 @@ impl LocalTree {
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|error| {
-            Error::errno(
-                "open Direct Sync local conflict",
-                &self.root.join(path),
-                error,
-            )
-        })?;
+        .map_err(|error| Error::errno("open sync local conflict", &self.root.join(path), error))?;
         Ok(std::fs::File::from(fd))
     }
 
@@ -992,17 +967,13 @@ impl LocalTree {
                             )
                             .map_err(|error| {
                                 Error::errno(
-                                    "remove incomplete Direct Sync download",
+                                    "remove incomplete sync download",
                                     &self.install_path(&install.temporary),
                                     error,
                                 )
                             })?;
                             fsync(&self.install_fd).map_err(|error| {
-                                Error::errno(
-                                    "persist Direct Sync download cleanup",
-                                    &self.state,
-                                    error,
-                                )
+                                Error::errno("persist sync download cleanup", &self.state, error)
                             })?;
                         }
                         self.store.remove_install(&install.id)?;
@@ -1016,9 +987,8 @@ impl LocalTree {
                             Ok(current) => current,
                             Err(error) => {
                                 install.state = InstallState::Failed;
-                                install.error = Some(format!(
-                                    "prepared Direct Sync download is unavailable: {error}"
-                                ));
+                                install.error =
+                                    Some(format!("prepared sync download is unavailable: {error}"));
                                 self.store.update_install(&install)?;
                                 continue;
                             }
@@ -1026,7 +996,7 @@ impl LocalTree {
                         if current.length != desired.length || current.digest != desired.digest {
                             install.state = InstallState::Failed;
                             install.error = Some(
-                                "prepared Direct Sync download no longer matches its accepted bytes"
+                                "prepared sync download no longer matches its accepted bytes"
                                     .to_owned(),
                             );
                             self.store.update_install(&install)?;
@@ -1070,17 +1040,13 @@ impl LocalTree {
                             )
                             .map_err(|error| {
                                 Error::errno(
-                                    "remove quarantined Direct Sync delete",
+                                    "remove quarantined sync delete",
                                     &self.install_path(&install.temporary),
                                     error,
                                 )
                             })?;
                             fsync(&self.install_fd).map_err(|error| {
-                                Error::errno(
-                                    "persist Direct Sync delete quarantine",
-                                    &self.state,
-                                    error,
-                                )
+                                Error::errno("persist sync delete quarantine", &self.state, error)
                             })?;
                             self.prune_empty_ancestors(&install.path)?;
                         }
@@ -1187,7 +1153,7 @@ impl LocalTree {
         let parent_identity = identity(
             &parent_fd,
             &self.root.join(parent),
-            "inspect Direct Sync local parent",
+            "inspect sync local parent",
         )?;
         let Some(stat) = optional_stat(&parent_fd, name, &self.root.join(path))? else {
             return Ok(None);
@@ -1201,21 +1167,13 @@ impl LocalTree {
                     Mode::empty(),
                 )
                 .map_err(|error| {
-                    Error::errno(
-                        "open Direct Sync local directory",
-                        &self.root.join(path),
-                        error,
-                    )
+                    Error::errno("open sync local directory", &self.root.join(path), error)
                 })?;
                 Ok(Some(LocalNode {
                     path: path.to_owned(),
                     kind: LocalKind::Directory,
                     executable: false,
-                    identity: identity(
-                        &fd,
-                        &self.root.join(path),
-                        "inspect Direct Sync local directory",
-                    )?,
+                    identity: identity(&fd, &self.root.join(path), "inspect sync local directory")?,
                     parent: Some(parent_identity),
                     stat: Some(super::types::LocalStat::from_stat(&stat)),
                 }))
@@ -1239,10 +1197,10 @@ impl LocalTree {
                 }))
             }
             FileType::Symlink => Err(Error::unsupported(format!(
-                "Direct Sync local symlink is not supported: {path}"
+                "sync local symlink is not supported: {path}"
             ))),
             _ => Err(Error::unsupported(format!(
-                "Direct Sync local special file is not supported: {path}"
+                "sync local special file is not supported: {path}"
             ))),
         }
     }
@@ -1283,7 +1241,7 @@ impl LocalTree {
         let parent_identity = identity(
             &parent_fd,
             &self.root.join(parent),
-            "inspect Direct Sync install parent",
+            "inspect sync install parent",
         )?;
         let current = optional_stat(&parent_fd, name, &self.root.join(&install.path))?;
         match (install.operation, install.expected_local, current) {
@@ -1367,21 +1325,16 @@ impl LocalTree {
                 return self.install_conflict(install, "local target appeared before install");
             }
             return Err(Error::errno(
-                "install Direct Sync remote file",
+                "install sync remote file",
                 &self.root.join(&install.path),
                 error,
             ));
         }
         fsync(&parent_fd).map_err(|error| {
-            Error::errno(
-                "persist Direct Sync file install",
-                &self.root.join(parent),
-                error,
-            )
+            Error::errno("persist sync file install", &self.root.join(parent), error)
         })?;
-        fsync(&self.install_fd).map_err(|error| {
-            Error::errno("persist Direct Sync install directory", &self.state, error)
-        })?;
+        fsync(&self.install_fd)
+            .map_err(|error| Error::errno("persist sync install directory", &self.state, error))?;
 
         if exchange {
             let expected = install
@@ -1409,13 +1362,13 @@ impl LocalTree {
                 {
                     fsync(&parent_fd).map_err(|error| {
                         Error::errno(
-                            "persist Direct Sync rollback",
+                            "persist sync rollback",
                             &self.root.join(&install.path),
                             error,
                         )
                     })?;
                     fsync(&self.install_fd).map_err(|error| {
-                        Error::errno("persist Direct Sync rollback temporary", &self.state, error)
+                        Error::errno("persist sync rollback temporary", &self.state, error)
                     })?;
                 }
                 return self.install_conflict(
@@ -1442,16 +1395,16 @@ impl LocalTree {
             )
             .map_err(|error| {
                 Error::errno(
-                    "retain displaced Direct Sync local file",
+                    "retain displaced sync local file",
                     &self.install_path(&install.temporary),
                     error,
                 )
             })?;
             fsync(&self.install_fd).map_err(|error| {
-                Error::errno("persist Direct Sync install directory", &self.state, error)
+                Error::errno("persist sync install directory", &self.state, error)
             })?;
             fsync(&self.artifact_fd).map_err(|error| {
-                Error::errno("persist Direct Sync artifact directory", &self.state, error)
+                Error::errno("persist sync artifact directory", &self.state, error)
             })?;
             let mut artifact = artifact;
             artifact.phase = ArtifactPhase::Retained;
@@ -1503,7 +1456,7 @@ impl LocalTree {
         let parent_identity = identity(
             &parent_fd,
             &self.root.join(parent),
-            "inspect Direct Sync delete parent",
+            "inspect sync delete parent",
         )?;
         if parent_identity.dev != expected.parent_dev || parent_identity.ino != expected.parent_ino
         {
@@ -1533,17 +1486,13 @@ impl LocalTree {
                     .install_conflict(install, "local delete target changed before quarantine");
             }
             return Err(Error::errno(
-                "quarantine Direct Sync local file",
+                "quarantine sync local file",
                 &self.root.join(&install.path),
                 error,
             ));
         }
         fsync(&parent_fd).map_err(|error| {
-            Error::errno(
-                "persist Direct Sync local removal",
-                &self.root.join(parent),
-                error,
-            )
+            Error::errno("persist sync local removal", &self.root.join(parent), error)
         })?;
         let quarantined = hash_at(
             &self.install_fd,
@@ -1570,14 +1519,13 @@ impl LocalTree {
         )
         .map_err(|error| {
             Error::errno(
-                "remove quarantined Direct Sync local file",
+                "remove quarantined sync local file",
                 &self.install_path(&install.temporary),
                 error,
             )
         })?;
-        fsync(&self.install_fd).map_err(|error| {
-            Error::errno("persist Direct Sync delete quarantine", &self.state, error)
-        })?;
+        fsync(&self.install_fd)
+            .map_err(|error| Error::errno("persist sync delete quarantine", &self.state, error))?;
         self.prune_empty_ancestors(&install.path)?;
         self.store
             .complete_install(&install.id, None, &install.path)?;
@@ -1626,16 +1574,16 @@ impl LocalTree {
             )
             .map_err(|error| {
                 Error::errno(
-                    "recover displaced Direct Sync local file",
+                    "recover displaced sync local file",
                     &self.install_path(&install.temporary),
                     error,
                 )
             })?;
             fsync(&self.install_fd).map_err(|error| {
-                Error::errno("persist Direct Sync install directory", &self.state, error)
+                Error::errno("persist sync install directory", &self.state, error)
             })?;
             fsync(&self.artifact_fd).map_err(|error| {
-                Error::errno("persist Direct Sync artifact directory", &self.state, error)
+                Error::errno("persist sync artifact directory", &self.state, error)
             })?;
             let mut artifact = artifact;
             artifact.phase = ArtifactPhase::Retained;
@@ -1794,7 +1742,7 @@ impl LocalTree {
         let mut directory = self
             .root_fd
             .try_clone()
-            .map_err(|error| Error::io("clone Direct Sync root descriptor", &self.root, error))?;
+            .map_err(|error| Error::io("clone sync root descriptor", &self.root, error))?;
         let mut current = String::new();
         for component in path.split('/') {
             if !current.is_empty() {
@@ -1805,7 +1753,7 @@ impl LocalTree {
                 Ok(()) => {
                     fsync(&directory).map_err(|error| {
                         Error::errno(
-                            "persist Direct Sync directory creation",
+                            "persist sync directory creation",
                             &self.root.join(&current),
                             error,
                         )
@@ -1814,7 +1762,7 @@ impl LocalTree {
                 Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => {
                     return Err(Error::errno(
-                        "create Direct Sync directory",
+                        "create sync directory",
                         &self.root.join(&current),
                         error,
                     ));
@@ -1827,11 +1775,7 @@ impl LocalTree {
                 Mode::empty(),
             )
             .map_err(|error| {
-                Error::errno(
-                    "open Direct Sync directory",
-                    &self.root.join(&current),
-                    error,
-                )
+                Error::errno("open sync directory", &self.root.join(&current), error)
             })?;
             directory = next;
         }
@@ -1839,22 +1783,23 @@ impl LocalTree {
     }
 
     fn open_relative_dir(&self, path: &str) -> Result<OwnedFd> {
-        self.open_relative_dir_optional(path)?.ok_or_else(|| {
-            Error::conflict(format!("Direct Sync parent directory {path:?} is missing"))
-        })
+        self.open_relative_dir_optional(path)?
+            .ok_or_else(|| Error::conflict(format!("sync parent directory {path:?} is missing")))
     }
 
     fn open_relative_dir_optional(&self, path: &str) -> Result<Option<OwnedFd>> {
         if path.is_empty() {
-            return self.root_fd.try_clone().map(Some).map_err(|error| {
-                Error::io("clone Direct Sync root descriptor", &self.root, error)
-            });
+            return self
+                .root_fd
+                .try_clone()
+                .map(Some)
+                .map_err(|error| Error::io("clone sync root descriptor", &self.root, error));
         }
         validate_path(path)?;
         let mut directory = self
             .root_fd
             .try_clone()
-            .map_err(|error| Error::io("clone Direct Sync root descriptor", &self.root, error))?;
+            .map_err(|error| Error::io("clone sync root descriptor", &self.root, error))?;
         let mut current = String::new();
         for component in path.split('/') {
             if !current.is_empty() {
@@ -1871,7 +1816,7 @@ impl LocalTree {
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(error) => {
                     return Err(Error::errno(
-                        "open Direct Sync directory",
+                        "open sync directory",
                         &self.root.join(&current),
                         error,
                     ));
@@ -1897,7 +1842,7 @@ impl LocalTree {
                 Ok(()) => {
                     fsync(&parent_fd).map_err(|error| {
                         Error::errno(
-                            "persist Direct Sync directory cleanup",
+                            "persist sync directory cleanup",
                             &self.root.join(&parent_path),
                             error,
                         )
@@ -1910,7 +1855,7 @@ impl LocalTree {
                 ) => break,
                 Err(error) => {
                     return Err(Error::errno(
-                        "remove empty Direct Sync directory",
+                        "remove empty sync directory",
                         &self.root.join(&directory),
                         error,
                     ));
@@ -2069,7 +2014,7 @@ fn prepare_private_directory(path: &Path, operation: &str) -> Result<()> {
     }
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(Error::invalid(format!(
-            "Direct Sync state {} must not be accessible by group or other users",
+            "sync state {} must not be accessible by group or other users",
             path.display()
         )));
     }
@@ -2080,7 +2025,7 @@ pub(super) fn validate_private_state(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| Error::io("inspect Direct Sync state", path, error))?;
+        .map_err(|error| Error::io("inspect sync state", path, error))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(Error::unsupported(format!(
             "{} must be an ordinary directory",
@@ -2089,7 +2034,7 @@ pub(super) fn validate_private_state(path: &Path) -> Result<()> {
     }
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(Error::invalid(format!(
-            "Direct Sync state {} must not be accessible by group or other users",
+            "sync state {} must not be accessible by group or other users",
             path.display()
         )));
     }
@@ -2101,7 +2046,7 @@ fn open_private_directory(parent: &OwnedFd, name: &str, state: &Path) -> Result<
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(error) => {
             return Err(Error::errno(
-                "create Direct Sync state directory",
+                "create sync state directory",
                 state.join(name).as_path(),
                 error,
             ));
@@ -2113,43 +2058,31 @@ fn open_private_directory(parent: &OwnedFd, name: &str, state: &Path) -> Result<
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|error| Error::errno("open Direct Sync state directory", &state.join(name), error))?;
-    fsync(parent)
-        .map_err(|error| Error::errno("persist Direct Sync state directory", state, error))?;
+    .map_err(|error| Error::errno("open sync state directory", &state.join(name), error))?;
+    fsync(parent).map_err(|error| Error::errno("persist sync state directory", state, error))?;
     Ok(fd)
 }
 
-fn acquire_lease(state_fd: &OwnedFd, state: &Path) -> Result<std::fs::File> {
+fn acquire_lease(state_fd: &OwnedFd, state: &Path) -> Result<LocalStateLease> {
+    let path = state.join("sync-engine.lock");
     let fd = openat(
         state_fd,
         "sync-engine.lock",
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
-    .map_err(|error| Error::errno("open Direct Sync lease", state, error))?;
-    match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {
-            fsync(state_fd)
-                .map_err(|error| Error::errno("persist Direct Sync lease", state, error))?;
-            Ok(std::fs::File::from(fd))
-        }
-        Err(rustix::io::Errno::WOULDBLOCK) => Err(Error::busy(format!(
-            "another process holds the Direct Sync state lease at {}",
-            state.display()
-        ))),
-        Err(error) => Err(Error::errno(
-            "acquire Direct Sync state lease",
-            state,
-            error,
-        )),
-    }
+    .map_err(|error| Error::errno("open sync engine lease", &path, error))?;
+    let lease =
+        LocalStateLease::acquire_file(std::fs::File::from(fd), &path).map_err(Error::from_local)?;
+    fsync(state_fd).map_err(|error| Error::errno("persist sync engine lease", state, error))?;
+    Ok(lease)
 }
 
 fn optional_stat(parent: &OwnedFd, name: &str, path: &Path) -> Result<Option<Stat>> {
     match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => Ok(Some(stat)),
         Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(error) => Err(Error::errno("inspect Direct Sync local entry", path, error)),
+        Err(error) => Err(Error::errno("inspect sync local entry", path, error)),
     }
 }
 
@@ -2215,9 +2148,9 @@ fn hash_at(parent: &OwnedFd, name: &str, path: &Path) -> Result<(u64, ContentHas
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|error| Error::errno("open Direct Sync local file", path, error))?;
+    .map_err(|error| Error::errno("open sync local file", path, error))?;
     let before =
-        fstat(&fd).map_err(|error| Error::errno("inspect Direct Sync local file", path, error))?;
+        fstat(&fd).map_err(|error| Error::errno("inspect sync local file", path, error))?;
     if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
         return Err(Error::unsupported(format!(
             "{} is not a regular file",
@@ -2230,14 +2163,14 @@ fn hash_at(parent: &OwnedFd, name: &str, path: &Path) -> Result<(u64, ContentHas
     loop {
         let count = file
             .read(&mut buffer)
-            .map_err(|error| Error::io("read Direct Sync local file", path, error))?;
+            .map_err(|error| Error::io("read sync local file", path, error))?;
         if count == 0 {
             break;
         }
         hasher.update(&buffer[..count]);
     }
-    let after = fstat(&file)
-        .map_err(|error| Error::errno("recheck Direct Sync local file", path, error))?;
+    let after =
+        fstat(&file).map_err(|error| Error::errno("recheck sync local file", path, error))?;
     if !same_stable_stat(&before, &after) {
         return Err(Error::conflict(format!(
             "local file changed while hashing: {}",

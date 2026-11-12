@@ -190,11 +190,22 @@ Negotiating and listing the namespace do not modify storage.
 | `IsDirectory` | `EISDIR` | A directory was opened as a file |
 | `Stale` | `ESTALE` | The object no longer matches the accepted or open pin |
 | `Unsupported` | `EOPNOTSUPP` | The backend lacks a required Direct primitive |
+| `AlreadyExists` | `EEXIST` | A local path or durable Direct record already exists |
+| `ReadOnly` | `EROFS` | Local Direct state is on a read-only filesystem |
+| `PermissionDenied` | `EACCES` | The operating system denied access to local Direct state |
+| `Busy` | `EBUSY` | A local process lease or locked SQLite operation is busy |
+| `NoSpace` | `ENOSPC` | Local Direct state cannot accept more bytes |
+| `Corrupt` | `EIO` | Stored Direct state is malformed |
 | `Storage` | `EIO` | The storage request failed without a narrower mapping |
+| `Io` | `EIO` | A local filesystem operation failed without a narrower mapping |
 
 `DirectFlushOutcome::Conflict` is a writable runtime result rather than a
 `Direct` error kind. Writable FUSE maps it to `ESTALE` through the shared
 content-publication rule in [linux-fuse.md](linux-fuse.md).
+
+Local IO and SQLite failures use the shared local-state classification. The
+writable runtime therefore preserves capacity, read-only, permission, busy and
+path categories before the frontend applies this table.
 
 If a refresh observation is rejected, the previous snapshot is not replaced.
 Namespace operations fail with `EIO` until a later `SIGHUP` succeeds, while

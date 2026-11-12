@@ -155,34 +155,7 @@ fn store_error(error: store::Error) -> Error {
 }
 fn local(e: impl std::error::Error + 'static) -> Error {
     let cause: &dyn std::error::Error = &e;
-    let kind = if let Some(error) = cause.downcast_ref::<rusqlite::Error>() {
-        match error {
-            rusqlite::Error::QueryReturnedNoRows => ErrorKind::NotFound,
-            rusqlite::Error::SqliteFailure(code, _) => match code.code {
-                rusqlite::ErrorCode::DiskFull => ErrorKind::NoSpace,
-                rusqlite::ErrorCode::ReadOnly => ErrorKind::ReadOnly,
-                rusqlite::ErrorCode::PermissionDenied => ErrorKind::PermissionDenied,
-                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
-                    ErrorKind::Corrupt
-                }
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
-                    ErrorKind::Busy
-                }
-                _ => ErrorKind::Io,
-            },
-            _ => ErrorKind::Io,
-        }
-    } else if let Some(error) = cause.downcast_ref::<std::io::Error>() {
-        match error.kind() {
-            std::io::ErrorKind::StorageFull => ErrorKind::NoSpace,
-            std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
-            std::io::ErrorKind::ReadOnlyFilesystem => ErrorKind::ReadOnly,
-            _ => ErrorKind::Io,
-        }
-    } else {
-        ErrorKind::Io
-    };
-    Error::local_kind(kind, e)
+    Error::local_kind(store::classify_error(cause).into(), e)
 }
 fn decode(bytes: &[u8]) -> Result<Record> {
     borsh::from_slice(bytes).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e))

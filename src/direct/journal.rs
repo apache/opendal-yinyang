@@ -18,10 +18,11 @@
 //! Durable Direct Mount object generations and mutation intents.
 
 use super::{DirectId, DirectStorageBinding, Error, ErrorKind, Result};
+use crate::local::lease::StateLease;
 use crate::local::store;
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -168,7 +169,7 @@ pub(super) struct MutationRecord {
 pub(super) struct Store {
     connection: Connection,
     root: PathBuf,
-    _lock: File,
+    _lock: StateLease,
 }
 
 pub(super) struct StoreInspection {
@@ -269,18 +270,8 @@ impl Store {
             .truncate(false)
             .open(root.join("runtime.lock"))
             .map_err(|error| local("open Direct runtime lock", error))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(Error::new(
-                    ErrorKind::Storage,
-                    "Direct runtime state is already owned by another process",
-                ));
-            }
-            Err(TryLockError::Error(error)) => {
-                return Err(local("lock Direct runtime state", error));
-            }
-        }
+        let lock =
+            StateLease::acquire_file(lock, &root.join("runtime.lock")).map_err(store_error)?;
 
         let mut connection = store::open_read_write(&database, !nonempty).map_err(store_error)?;
 
@@ -537,21 +528,19 @@ fn hex(bytes: [u8; 16]) -> String {
 }
 
 fn local(context: &str, error: std::io::Error) -> Error {
-    let kind = ErrorKind::Storage;
-    Error::new(kind, format!("{context}: {error}"))
+    Error::new(
+        store::classify_io(&error).into(),
+        format!("{context}: {error}"),
+    )
 }
 
 fn store_error(error: store::Error) -> Error {
-    let kind = match crate::runtime::ErrorKind::from(error.kind()) {
-        crate::runtime::ErrorKind::Invalid => ErrorKind::Invalid,
-        crate::runtime::ErrorKind::Unsupported => ErrorKind::Unsupported,
-        crate::runtime::ErrorKind::Corrupt => ErrorKind::Corrupt,
-        _ => ErrorKind::Storage,
-    };
-    Error::new(kind, error.to_string())
+    Error::new(error.kind().into(), error.to_string())
 }
 
 fn sqlite(context: &str, error: rusqlite::Error) -> Error {
-    let kind = ErrorKind::Storage;
-    Error::new(kind, format!("{context}: {error}"))
+    Error::new(
+        store::classify_sqlite(&error).into(),
+        format!("{context}: {error}"),
+    )
 }

@@ -114,6 +114,58 @@ impl std::error::Error for Error {}
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
+/// Classify an OS error at the layer that owns local-state categories.
+pub(crate) fn classify_io(error: &std::io::Error) -> ErrorKind {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ErrorKind::NotFound,
+        std::io::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
+        std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+        std::io::ErrorKind::ReadOnlyFilesystem => ErrorKind::ReadOnly,
+        std::io::ErrorKind::StorageFull => ErrorKind::NoSpace,
+        std::io::ErrorKind::WouldBlock => ErrorKind::Busy,
+        _ => ErrorKind::Io,
+    }
+}
+
+/// Classify a rustix errno through the same OS error categories.
+pub(crate) fn classify_errno(error: rustix::io::Errno) -> ErrorKind {
+    classify_io(&std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+/// Classify a SQLite failure without parsing its diagnostic text.
+pub(crate) fn classify_sqlite(error: &rusqlite::Error) -> ErrorKind {
+    match error {
+        rusqlite::Error::QueryReturnedNoRows => ErrorKind::NotFound,
+        rusqlite::Error::SqliteFailure(code, _) => match code.code {
+            rusqlite::ErrorCode::ConstraintViolation => ErrorKind::AlreadyExists,
+            rusqlite::ErrorCode::DiskFull => ErrorKind::NoSpace,
+            rusqlite::ErrorCode::ReadOnly => ErrorKind::ReadOnly,
+            rusqlite::ErrorCode::PermissionDenied => ErrorKind::PermissionDenied,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                ErrorKind::Busy
+            }
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                ErrorKind::Corrupt
+            }
+            _ => ErrorKind::Io,
+        },
+        _ => ErrorKind::Io,
+    }
+}
+
+/// Classify a wrapped local OS or SQLite error.
+pub(crate) fn classify_error(error: &(dyn std::error::Error + 'static)) -> ErrorKind {
+    if let Some(error) = error.downcast_ref::<Error>() {
+        error.kind()
+    } else if let Some(error) = error.downcast_ref::<rusqlite::Error>() {
+        classify_sqlite(error)
+    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        classify_io(error)
+    } else {
+        ErrorKind::Io
+    }
+}
+
 pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(
         path,
@@ -421,23 +473,7 @@ fn sql_value(value: &BindingValue) -> SqlValue {
 }
 
 fn sqlite(context: &str, error: rusqlite::Error) -> Error {
-    let kind = match &error {
-        rusqlite::Error::QueryReturnedNoRows => ErrorKind::NotFound,
-        rusqlite::Error::SqliteFailure(code, _) => match code.code {
-            rusqlite::ErrorCode::ConstraintViolation => ErrorKind::AlreadyExists,
-            rusqlite::ErrorCode::DiskFull => ErrorKind::NoSpace,
-            rusqlite::ErrorCode::ReadOnly => ErrorKind::ReadOnly,
-            rusqlite::ErrorCode::PermissionDenied => ErrorKind::PermissionDenied,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
-                ErrorKind::Busy
-            }
-            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
-                ErrorKind::Corrupt
-            }
-            _ => ErrorKind::Io,
-        },
-        _ => ErrorKind::Io,
-    };
+    let kind = classify_sqlite(&error);
     Error::new(kind, format!("{context}: {error}"))
 }
 
@@ -552,5 +588,32 @@ mod tests {
 
         configure(&connection, Durability::Barrier).unwrap();
         assert_eq!(synchronous(), 1);
+    }
+
+    #[test]
+    fn sqlite_busy_and_read_only_failures_keep_operational_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let first = open_read_write(&path, true).unwrap();
+        first
+            .execute_batch("CREATE TABLE rows(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let second = open_read_write(&path, false).unwrap();
+        second.busy_timeout(Duration::ZERO).unwrap();
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let busy = second
+            .execute("INSERT INTO rows(id) VALUES(1)", [])
+            .unwrap_err();
+        assert_eq!(sqlite("competing writer", busy).kind(), ErrorKind::Busy);
+        first.execute_batch("ROLLBACK").unwrap();
+
+        let reader = open_read_only(&path).unwrap();
+        let read_only = reader
+            .execute("INSERT INTO rows(id) VALUES(2)", [])
+            .unwrap_err();
+        assert_eq!(
+            sqlite("read-only reader", read_only).kind(),
+            ErrorKind::ReadOnly
+        );
     }
 }

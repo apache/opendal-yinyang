@@ -198,7 +198,12 @@ fn direct_errno(kind: crate::direct::ErrorKind) -> fuser::Errno {
         ErrorKind::IsDirectory => fuser::Errno::EISDIR,
         ErrorKind::Stale => fuser::Errno::ESTALE,
         ErrorKind::Unsupported => fuser::Errno::EOPNOTSUPP,
-        ErrorKind::Corrupt | ErrorKind::Storage => fuser::Errno::EIO,
+        ErrorKind::AlreadyExists => fuser::Errno::EEXIST,
+        ErrorKind::ReadOnly => fuser::Errno::EROFS,
+        ErrorKind::PermissionDenied => fuser::Errno::EACCES,
+        ErrorKind::Busy => fuser::Errno::EBUSY,
+        ErrorKind::NoSpace => fuser::Errno::ENOSPC,
+        ErrorKind::Corrupt | ErrorKind::Storage | ErrorKind::Io => fuser::Errno::EIO,
     }
 }
 

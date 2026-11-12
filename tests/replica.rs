@@ -146,12 +146,31 @@ async fn binding_rejects_namespace_substitution() {
 #[tokio::test]
 async fn state_lease_rejects_concurrent_engines() {
     let temp = tempfile::tempdir().unwrap();
-    let (_engine, _, state) = initialize(&temp, "namespace").await;
+    let (engine, _, state) = initialize(&temp, "namespace").await;
     let error = SyncEngine::open(NoopAdapter::new("namespace"), &state)
         .await
         .err()
         .unwrap();
     assert_eq!(error.kind(), yinyang::sync_engine::ErrorKind::Busy);
+    drop(engine);
+    SyncEngine::open(NoopAdapter::new("namespace"), &state)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn missing_state_keeps_the_not_found_category() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    let error = SyncEngine::open(NoopAdapter::new("namespace"), &missing)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        yinyang::sync_engine::ErrorKind::NotFound,
+        "{error}"
+    );
 }
 
 #[tokio::test]

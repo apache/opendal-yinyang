@@ -79,6 +79,36 @@ pub enum ErrorKind {
     Corrupt,
     /// The storage request failed.
     Storage,
+    /// A local path already exists.
+    AlreadyExists,
+    /// Local state is on a read-only filesystem.
+    ReadOnly,
+    /// The operating system denied access to local state.
+    PermissionDenied,
+    /// Another process currently owns the local-state lease.
+    Busy,
+    /// Local state cannot accept more bytes.
+    NoSpace,
+    /// A local filesystem operation failed without a narrower mapping.
+    Io,
+}
+
+impl From<crate::local::store::ErrorKind> for ErrorKind {
+    fn from(kind: crate::local::store::ErrorKind) -> Self {
+        use crate::local::store::ErrorKind as Kind;
+        match kind {
+            Kind::Invalid => Self::Invalid,
+            Kind::Unsupported => Self::Unsupported,
+            Kind::Corrupt => Self::Corrupt,
+            Kind::Busy => Self::Busy,
+            Kind::AlreadyExists => Self::AlreadyExists,
+            Kind::NotFound => Self::NotFound,
+            Kind::ReadOnly => Self::ReadOnly,
+            Kind::PermissionDenied => Self::PermissionDenied,
+            Kind::NoSpace => Self::NoSpace,
+            Kind::Io => Self::Io,
+        }
+    }
 }
 
 /// An error returned by the Direct namespace.

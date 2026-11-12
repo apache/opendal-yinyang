@@ -236,7 +236,7 @@ async fn classify_journal_error(
             eprintln!("yy: {error}");
             Ok(ExitCode::from(exit_code_for_kind(error.kind())))
         }
-        _ => Err(error.into()),
+        _ => Err(CliError::from_runtime(CliStage::Publication, error)),
     }
 }
 

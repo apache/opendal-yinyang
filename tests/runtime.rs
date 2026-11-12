@@ -916,7 +916,11 @@ async fn durable_staging_reopens_and_preserves_concurrent_generation_conflict() 
     let backend = TestBackend::default();
     let authority: Arc<dyn Authority> = Arc::new(Fs::create(backend.operator()).await.unwrap());
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
-    assert!(Runtime::open(authority.clone(), temp.path()).await.is_err());
+    let error = match Runtime::open(authority.clone(), temp.path()).await {
+        Ok(_) => panic!("a second runtime acquired the staging lease"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Busy);
     runtime.create_file(authority.root(), "file").await.unwrap();
     let mut file = runtime.open_file("file", true).await.unwrap();
     // Cross chunk boundaries, append and truncate without resurrecting truncated bytes.
