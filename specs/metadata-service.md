@@ -50,9 +50,10 @@ No publication rewrites a complete object snapshot.
 
 An immutable `.yinyang/head` marker contains Borsh
 `([u8;8] = YYSERV01, filesystem: [u8;16], root: [u8;16])`.
-Creation conditionally installs it; opening validates it. Object-mode readers
-reject this marker. Service commits neither replace it nor consult it as a
-latest checkpoint. A service outage cannot authorize object-mode writes.
+Creation conditionally installs it and then validates the durable marker;
+opening validates it. Object-mode readers reject this marker. Service commits
+neither replace it nor consult it as a latest checkpoint. A service outage
+cannot authorize object-mode writes.
 The database is the sole authority and is required for history and receipts.
 An unknown marker profile is `Unsupported`; malformed `YYSERV01` bytes are
 `Corrupt`; a valid marker naming another filesystem or root is `Invalid`.
@@ -67,8 +68,8 @@ changes, and revision/scan tokens are shared with object mode.
 enumerates the durable revision table in strict token order and attaches
 `Readable` or `Expired` to each record. A page is limited to 256 revisions and
 uses the last returned revision as its exclusive continuation.
-`Authority::retained_revisions` filters this history to readable records for
-callers that need the retained readable set. Embedded inspection opens the
+`Authority::retained_revisions` is the readable filter over `revision_history`
+for callers that need the retained readable set. Embedded inspection opens the
 existing SQLite database read-only with `query_only` enabled; it does not
 migrate, recover, take the writer transaction, or infer revisions from content
 packs. `ServiceClient` exposes the same bounded typed page contract.

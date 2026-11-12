@@ -23,7 +23,6 @@ use crate::{
     Snapshot, Transaction,
 };
 use futures_util::future::BoxFuture;
-use std::collections::BTreeSet;
 use tokio::io::AsyncRead;
 
 /// Maximum number of retained revisions returned by one authority request.
@@ -59,46 +58,13 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     /// List every currently readable revision using bounded typed history pages.
     fn retained_revisions(&self) -> BoxFuture<'_, Result<Vec<Revision>>> {
         Box::pin(async move {
-            let mut after = None;
-            let mut revisions = Vec::new();
-            let mut seen = BTreeSet::new();
-            loop {
-                let page = self
-                    .revision_history_page(after, RETAINED_REVISIONS_PAGE_MAX)
-                    .await?;
-                let mut last = None;
-                for record in &page.revisions {
-                    if after.is_some_and(|cursor| record.revision <= cursor)
-                        || !seen.insert(record.revision)
-                    {
-                        return Err(crate::Error::new(
-                            crate::ErrorKind::Corrupt,
-                            "list revision history",
-                            "authority page is not strictly ordered",
-                        ));
-                    }
-                    last = Some(record.revision);
-                    if record.status == RevisionStatus::Readable {
-                        revisions.push(record.revision);
-                    }
-                }
-                match page.next {
-                    Some(next)
-                        if after.is_none_or(|cursor| next > cursor) && last == Some(next) =>
-                    {
-                        after = Some(next);
-                    }
-                    Some(_) => {
-                        return Err(crate::Error::new(
-                            crate::ErrorKind::Corrupt,
-                            "list revision history",
-                            "authority continuation does not advance",
-                        ));
-                    }
-                    None => break,
-                }
-            }
-            Ok(revisions)
+            Ok(self
+                .revision_history()
+                .await?
+                .into_iter()
+                .filter(|record| record.status == RevisionStatus::Readable)
+                .map(|record| record.revision)
+                .collect())
         })
     }
     /// List known readable and expired revisions using bounded authority pages.
@@ -117,12 +83,11 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
     /// List all known revisions, including their expiry state.
     fn revision_history(&self) -> BoxFuture<'_, Result<Vec<RevisionRecord>>> {
         Box::pin(async move {
-            let mut after = None;
             let mut revisions = Vec::new();
-            let mut seen = BTreeSet::new();
+            let mut previous = None;
             loop {
                 let page = self
-                    .revision_history_page(after, RETAINED_REVISIONS_PAGE_MAX)
+                    .revision_history_page(previous, RETAINED_REVISIONS_PAGE_MAX)
                     .await?;
                 if page.revisions.is_empty() {
                     if page.next.is_some() {
@@ -135,24 +100,18 @@ pub trait Authority: std::fmt::Debug + Send + Sync {
                     break;
                 }
                 for record in page.revisions {
-                    if after.is_some_and(|cursor| record.revision <= cursor)
-                        || !seen.insert(record.revision)
-                    {
+                    if previous.is_some_and(|previous| record.revision <= previous) {
                         return Err(crate::Error::new(
                             crate::ErrorKind::Corrupt,
                             "list revision history",
                             "authority page is not strictly ordered",
                         ));
                     }
+                    previous = Some(record.revision);
                     revisions.push(record);
                 }
-                let last = revisions.last().map(|record| record.revision);
                 match page.next {
-                    Some(next)
-                        if after.is_none_or(|cursor| next > cursor) && last == Some(next) =>
-                    {
-                        after = Some(next);
-                    }
+                    Some(next) if previous == Some(next) => {}
                     Some(_) => {
                         return Err(crate::Error::new(
                             crate::ErrorKind::Corrupt,

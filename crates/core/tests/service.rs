@@ -762,6 +762,9 @@ async fn service_client_expiry_preserves_remote_snapshot_reads() {
     assert!(history.revisions.iter().any(|record| {
         record.revision == created.cursor.revision && record.status == RevisionStatus::Expired
     }));
+    let retained = client.retained_revisions().await.unwrap();
+    assert!(!retained.contains(&created.cursor.revision));
+    assert!(retained.contains(&current.cursor.revision));
     server.abort();
     let _ = server.await;
 }
