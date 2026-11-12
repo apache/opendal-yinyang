@@ -35,6 +35,7 @@ pub struct TestState {
     pub fail_next_write_response: bool,
     pub fail_next_write_before_effect: bool,
     pub fail_next_delete_before_effect: bool,
+    pub omit_next_write_etag: bool,
     pub stat_calls: u64,
     pub head_stat_calls: u64,
     pub fail_data_close: bool,
@@ -99,6 +100,10 @@ impl TestBackend {
 
     pub fn fail_next_delete_before_effect(&self) {
         self.state.lock().unwrap().fail_next_delete_before_effect = true;
+    }
+
+    pub fn omit_next_write_etag(&self) {
+        self.state.lock().unwrap().omit_next_write_etag = true;
     }
 
     pub fn stat_calls(&self) -> u64 {
@@ -411,7 +416,12 @@ impl oio::Write for TestWriter {
         {
             object.bytes[0] ^= 1;
         }
-        let metadata = metadata(&object);
+        let metadata = if state.omit_next_write_etag {
+            state.omit_next_write_etag = false;
+            metadata_without_etag(&object)
+        } else {
+            metadata(&object)
+        };
         state.objects.insert(self.path.clone(), object);
         if state.fail_next_write_response {
             state.fail_next_write_response = false;
@@ -491,6 +501,10 @@ fn metadata(object: &StoredObject) -> Metadata {
     let mut builder = MetadataBuilder::file(object.bytes.len() as u64);
     builder.etag(object.etag.clone());
     builder.build()
+}
+
+fn metadata_without_etag(object: &StoredObject) -> Metadata {
+    MetadataBuilder::file(object.bytes.len() as u64).build()
 }
 
 fn not_found() -> opendal::Error {
