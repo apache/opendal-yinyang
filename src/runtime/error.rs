@@ -24,6 +24,7 @@ pub fn kind_from_io(error: &std::io::Error) -> ErrorKind {
     crate::local::store::classify_io(error).into()
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn kind_from_errno(error: rustix::io::Errno) -> ErrorKind {
     crate::local::store::classify_errno(error).into()
 }

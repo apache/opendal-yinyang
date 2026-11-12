@@ -128,6 +128,7 @@ pub(crate) fn classify_io(error: &std::io::Error) -> ErrorKind {
 }
 
 /// Classify a rustix errno through the same OS error categories.
+#[cfg(target_os = "linux")]
 pub(crate) fn classify_errno(error: rustix::io::Errno) -> ErrorKind {
     classify_io(&std::io::Error::from_raw_os_error(error.raw_os_error()))
 }

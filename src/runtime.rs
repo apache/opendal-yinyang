@@ -32,6 +32,7 @@ pub(crate) use staging::StagingLease;
 use staging::{CHUNK, Record, Stage, StagedRead};
 
 mod error;
+#[cfg(target_os = "linux")]
 pub(crate) use error::kind_from_errno;
 pub use error::{Error, ErrorKind, Failure, Result, kind_from_io};
 
