@@ -955,8 +955,9 @@ async fn durable_staging_reopens_and_preserves_concurrent_generation_conflict() 
     drop(runtime);
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     let mut file = runtime.recover(id).await.unwrap();
-    assert!(file.status().await.unwrap().conflict);
-    assert!(file.status().await.unwrap().error.is_some());
+    let status = file.status().await.unwrap();
+    assert!(status.conflict);
+    assert_eq!(status.error.unwrap().kind(), ErrorKind::Conflict);
     assert!(matches!(file.fsync().await, Err(Error::Conflict)));
     assert_eq!(file.read(65544, 8).await.unwrap(), b"retained");
     file.abort().await.unwrap();
@@ -1400,20 +1401,31 @@ async fn upload_failure_and_unknown_publication_keep_frozen_identity() {
     assert_eq!(unknown.kind(), ErrorKind::Unknown);
     assert_eq!(unknown.commit_id(), Some(id));
     assert!(file.status().await.unwrap().frozen);
-    assert!(file.abort().await.is_err());
-    assert!(file.write(0, b"different").await.is_err());
     let handle = file.release().unwrap();
     drop(runtime);
     let inspected = Runtime::inspect(temp.path()).await.unwrap();
+    assert_eq!(
+        inspected
+            .handles
+            .iter()
+            .find(|status| status.id == handle)
+            .unwrap()
+            .error
+            .as_ref(),
+        Some(&unknown)
+    );
     assert!(
         inspected
             .errors
             .iter()
-            .any(|e| e.error.kind() == ErrorKind::Unknown && e.error.commit_id() == Some(id))
+            .any(|entry| entry.handle == handle && entry.error == unknown)
     );
     // A later retry fences the delayed object CAS without changing the original request.
     let runtime = Runtime::open(authority.clone(), temp.path()).await.unwrap();
     let mut file = runtime.recover(handle).await.unwrap();
+    assert_eq!(file.status().await.unwrap().error.as_ref(), Some(&unknown));
+    assert!(file.abort().await.is_err());
+    assert!(file.write(0, b"different").await.is_err());
     let receipt = file.fsync().await.unwrap().unwrap();
     assert_eq!(receipt.commit_id, id);
     assert!(!file.status().await.unwrap().pending);

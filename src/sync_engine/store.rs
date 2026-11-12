@@ -1106,59 +1106,53 @@ impl Store {
     }
 
     pub fn intents(&self) -> Result<Vec<IntentRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT id,request_id,request_digest,request,commit_id,state,receipt_revision,
-                        receipt_ordinal,failure,metadata
-                 FROM intents ORDER BY id",
-            )
-            .map_err(|error| Error::corrupt(format!("read intents: {error}")))?;
-        let rows = statement
-            .query_map([], intent_from_row)
-            .map_err(|error| Error::corrupt(format!("read intents: {error}")))?;
-        rows.map(|row| row.map_err(|error| Error::corrupt(format!("read intent: {error}"))))
+        intent::all(&self.connection)
+            .map_err(|error| Error::corrupt(format!("read intents: {error}")))?
+            .into_iter()
+            .map(intent_from_record)
             .collect()
     }
 
     pub fn intent(&self, id: &str) -> Result<Option<IntentRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT id,request_id,request_digest,request,commit_id,state,receipt_revision,
-                        receipt_ordinal,failure,metadata
-                 FROM intents WHERE id=?1",
-            )
-            .map_err(|error| Error::corrupt(format!("read intent: {error}")))?;
-        statement
-            .query_row(params![id.as_bytes()], intent_from_row)
-            .optional()
-            .map_err(|error| Error::corrupt(format!("read intent: {error}")))
+        intent::load(&self.connection, id.as_bytes())
+            .map_err(|error| Error::corrupt(format!("read intent: {error}")))?
+            .map(intent_from_record)
+            .transpose()
     }
 
     pub fn insert_intent(&self, intent: &IntentRecord) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO intents(
-                    id,request_id,request_digest,request,commit_id,state,receipt_revision,
-                    receipt_ordinal,failure,metadata
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params_from_iter(intent_params(intent)?),
-            )
-            .map_err(|error| Error::corrupt(format!("insert intent: {error}")))?;
+        intent::insert_prepared(
+            &self.connection,
+            intent::Prepared {
+                id: intent.id.as_bytes(),
+                request_id: &intent.request_id,
+                request_digest: &intent.request_digest,
+                request: &intent.request,
+                commit_id: intent.commit_id.as_ref().map(|id| id.as_slice()),
+                metadata: &[],
+            },
+        )
+        .map_err(|error| Error::corrupt(format!("insert intent: {error}")))?;
         Ok(())
     }
 
-    pub fn update_intent(&self, intent: &IntentRecord) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE intents SET
-                    request_id=?2,request_digest=?3,request=?4,commit_id=?5,state=?6,
-                    receipt_revision=?7,receipt_ordinal=?8,failure=?9,metadata=?10
-                 WHERE id=?1",
-                params_from_iter(intent_params(intent)?),
-            )
-            .map_err(|error| Error::corrupt(format!("update intent: {error}")))?;
+    pub fn update_intent(
+        &self,
+        intent: &IntentRecord,
+        transition: intent::Transition,
+    ) -> Result<()> {
+        let failure = intent.failure.as_ref().map(encode_json).transpose()?;
+        let update = intent::Update::new(transition)
+            .commit_id(intent.commit_id.as_ref().map(|id| id.as_slice()))
+            .receipt_parts(intent.receipt_revision, intent.receipt_ordinal)
+            .failure(failure.as_deref());
+        if !intent::update(&self.connection, intent.id.as_bytes(), update)
+            .map_err(|error| Error::corrupt(format!("update intent: {error}")))?
+        {
+            return Err(Error::corrupt(
+                "intent state does not permit this transition",
+            ));
+        }
         Ok(())
     }
 
@@ -1285,22 +1279,19 @@ impl Store {
                 params![work.id],
             )
             .map_err(|error| Error::corrupt(format!("complete work association: {error}")))?;
-        transaction
-            .execute(
-                "UPDATE intents SET
-                   state=?2,commit_id=?3,receipt_revision=?4,receipt_ordinal=?5,failure=NULL
-                 WHERE id=CAST(?1 AS BLOB)",
-                params![
-                    work.id,
-                    i64::from(IntentState::Committed.code()),
-                    commit_id.map(|value| value.to_vec()),
-                    receipt
-                        .and_then(|receipt| receipt.revision)
-                        .map(|value| value.to_vec()),
-                    receipt.and_then(|receipt| receipt.ordinal).map(i64::from),
-                ],
-            )
-            .map_err(|error| Error::corrupt(format!("complete intent: {error}")))?;
+        let update = intent::Update::new(intent::Transition::Committed)
+            .commit_id(commit_id.as_ref().map(|id| id.as_slice()))
+            .receipt_parts(
+                receipt.and_then(|receipt| receipt.revision),
+                receipt.and_then(|receipt| receipt.ordinal),
+            );
+        if !intent::update(&transaction, work.id.as_bytes(), update)
+            .map_err(|error| Error::corrupt(format!("complete intent: {error}")))?
+        {
+            return Err(Error::corrupt(
+                "publication intent disappeared before completion",
+            ));
+        }
         transaction
             .commit()
             .map_err(|error| Error::corrupt(format!("commit publication completion: {error}")))?;
@@ -1854,74 +1845,45 @@ fn conflict_params(conflict: &ConflictRecord) -> Result<Vec<rusqlite::types::Val
     ])
 }
 
-fn intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IntentRecord> {
-    let id: Vec<u8> = row.get(0)?;
-    let request_id: Vec<u8> = row.get(1)?;
-    let request_digest: Vec<u8> = row.get(2)?;
-    let commit_id: Option<Vec<u8>> = row.get(4)?;
-    let revision: Option<Vec<u8>> = row.get(6)?;
-    let failure: Option<Vec<u8>> = row.get(8)?;
+fn intent_from_record(record: intent::Record) -> Result<IntentRecord> {
+    let request_id = decode_fixed(&record.request_id, "intent request id")
+        .map_err(|error| Error::corrupt(error.to_string()))?;
+    let request_digest = decode_fixed(&record.request_digest, "intent request digest")
+        .map_err(|error| Error::corrupt(error.to_string()))?;
+    let commit_id = record
+        .commit_id
+        .as_deref()
+        .map(|bytes| decode_fixed(bytes, "intent commit id"))
+        .transpose()
+        .map_err(|error| Error::corrupt(error.to_string()))?;
+    let receipt_revision = record
+        .receipt_revision
+        .as_deref()
+        .map(|bytes| decode_fixed(bytes, "intent receipt revision"))
+        .transpose()
+        .map_err(|error| Error::corrupt(error.to_string()))?;
+    let receipt_ordinal = record
+        .receipt_ordinal
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| Error::corrupt("negative intent receipt ordinal"))?;
+    let failure = record
+        .failure
+        .as_deref()
+        .map(|bytes| decode_json(bytes, "intent failure"))
+        .transpose()
+        .map_err(|error| Error::corrupt(error.to_string()))?;
     Ok(IntentRecord {
-        id: String::from_utf8(id).map_err(|_| corrupt_sql("intent id is not UTF-8"))?,
-        request_id: decode_fixed(&request_id, "intent request id")
-            .map_err(|error| corrupt_sql(error.to_string()))?,
-        request_digest: decode_fixed(&request_digest, "intent request digest")
-            .map_err(|error| corrupt_sql(error.to_string()))?,
-        request: row.get(3)?,
-        commit_id: commit_id
-            .as_deref()
-            .map(|bytes| decode_fixed(bytes, "intent commit id"))
-            .transpose()
-            .map_err(|error| corrupt_sql(error.to_string()))?,
-        state: IntentState::from_code(row.get(5)?)
-            .ok_or_else(|| corrupt_sql("unknown intent state"))?,
-        receipt_revision: revision
-            .as_deref()
-            .map(|bytes| decode_fixed(bytes, "intent receipt revision"))
-            .transpose()
-            .map_err(|error| corrupt_sql(error.to_string()))?,
-        receipt_ordinal: row
-            .get::<_, Option<i64>>(7)?
-            .map(|value| {
-                u32::try_from(value).map_err(|_| corrupt_sql("negative intent receipt ordinal"))
-            })
-            .transpose()?,
-        failure: failure
-            .as_deref()
-            .map(|bytes| decode_json(bytes, "intent failure"))
-            .transpose()
-            .map_err(|error| corrupt_sql(error.to_string()))?,
+        id: String::from_utf8(record.id).map_err(|_| Error::corrupt("intent id is not UTF-8"))?,
+        request_id,
+        request_digest,
+        request: record.request,
+        commit_id,
+        state: record.state,
+        receipt_revision,
+        receipt_ordinal,
+        failure,
     })
-}
-
-fn intent_params(intent: &IntentRecord) -> Result<Vec<rusqlite::types::Value>> {
-    use rusqlite::types::Value;
-    Ok(vec![
-        Value::Blob(intent.id.as_bytes().to_vec()),
-        Value::Blob(intent.request_id.to_vec()),
-        Value::Blob(intent.request_digest.to_vec()),
-        Value::Blob(intent.request.clone()),
-        intent
-            .commit_id
-            .map(|value| Value::Blob(value.to_vec()))
-            .unwrap_or(Value::Null),
-        Value::Integer(i64::from(intent.state.code())),
-        intent
-            .receipt_revision
-            .map(|value| Value::Blob(value.to_vec()))
-            .unwrap_or(Value::Null),
-        intent
-            .receipt_ordinal
-            .map(|value| Value::Integer(i64::from(value)))
-            .unwrap_or(Value::Null),
-        intent
-            .failure
-            .as_ref()
-            .map(|failure| encode_json(failure).map(Value::Blob))
-            .transpose()?
-            .unwrap_or(Value::Null),
-        Value::Blob(Vec::new()),
-    ])
 }
 
 fn work_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkRecord> {

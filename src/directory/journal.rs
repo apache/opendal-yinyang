@@ -23,7 +23,7 @@ use crate::intent;
 use crate::local::store;
 use crate::runtime::{Error, ErrorKind, Failure, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -40,14 +40,6 @@ const PROFILE: store::Profile = store::Profile {
     table: "binding",
     schema: SCHEMA,
 };
-
-#[derive(Clone, Copy)]
-enum StateFilter {
-    Active,
-    Any,
-    Local,
-    Unknown,
-}
 
 /// Stable identity and baseline of one durable directory publication request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,22 +106,6 @@ impl DirectoryStatus {
     pub const fn can_export(&self) -> bool {
         self.state.can_export()
     }
-}
-
-fn state_code(state: &DirectoryState) -> u8 {
-    match state {
-        DirectoryState::Prepared => intent::State::Prepared.code(),
-        DirectoryState::Unknown => intent::State::Unknown.code(),
-        DirectoryState::Committed(_) => intent::State::Committed.code(),
-        DirectoryState::Conflict => intent::State::Conflict.code(),
-        DirectoryState::Retryable => intent::State::Retryable.code(),
-        DirectoryState::Failed => intent::State::Failed.code(),
-    }
-}
-
-fn decode_state(code: u8) -> Result<intent::State> {
-    intent::State::from_code(code)
-        .ok_or_else(|| Error::local_kind(ErrorKind::Corrupt, "invalid directory intent state"))
 }
 
 /// Read-only view of a directory journal without an authority or credentials.
@@ -277,7 +253,6 @@ impl DirectoryJournal {
         let manifest = borsh::to_vec(&prepared.manifest).map_err(local)?;
         let source = source.to_string_lossy().into_owned();
         let metadata = borsh::to_vec(&DirectoryMetadata { source, manifest }).map_err(local)?;
-        let state = state_code(&DirectoryState::Prepared);
         self.call(move |connection| {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -285,20 +260,16 @@ impl DirectoryJournal {
             if load(&tx, commit_id)?.is_some() {
                 return Err(existing_identity(commit_id));
             }
-            tx.execute(
-                "INSERT INTO intents(
-                    id,request_id,request_digest,request,commit_id,state,
-                    receipt_revision,receipt_ordinal,failure,metadata
-                 ) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,NULL,?7)",
-                params![
-                    commit_id.as_bytes().as_slice(),
-                    commit_id.as_bytes().as_slice(),
-                    digest.as_slice(),
-                    request,
-                    commit_id.as_bytes().as_slice(),
-                    state,
-                    metadata
-                ],
+            intent::insert_prepared(
+                &tx,
+                intent::Prepared {
+                    id: commit_id.as_bytes(),
+                    request_id: commit_id.as_bytes(),
+                    request_digest: &digest,
+                    request: &request,
+                    commit_id: Some(commit_id.as_bytes()),
+                    metadata: &metadata,
+                },
             )
             .map_err(sql)?;
             tx.commit().map_err(sql)
@@ -317,13 +288,12 @@ impl DirectoryJournal {
         let row = load_async(self, commit_id)
             .await?
             .ok_or_else(|| Error::local_kind(ErrorKind::NotFound, "unknown directory intent"))?;
-        let stored_state = decode_state(row.state)?;
-        if stored_state == intent::State::Committed {
+        if row.0.state == intent::State::Committed {
             return receipt(&row, commit_id, row.digest()?);
         }
         let status = match row.status(commit_id) {
             Ok(status) => status,
-            Err(error) if stored_state == intent::State::Unknown => {
+            Err(error) if row.0.state == intent::State::Unknown => {
                 return Err(unknown_after_dispatch(self, commit_id, error).await);
             }
             Err(error) => return Err(error),
@@ -337,52 +307,47 @@ impl DirectoryJournal {
             }
             DirectoryState::Prepared | DirectoryState::Unknown | DirectoryState::Retryable => {}
         }
-        let (_, frozen_id, frozen_digest) =
-            match Transaction::verify_identity(&row.request, self.inner.authority.filesystem()) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    let error = Error::from(error);
-                    if matches!(&status.state, DirectoryState::Unknown) {
-                        return Err(unknown_after_dispatch(self, commit_id, error).await);
-                    }
-                    let state = match error.kind() {
-                        ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
-                            intent::State::Failed.code()
-                        }
-                        _ => intent::State::Retryable.code(),
-                    };
-                    let failure = Failure::capture(&error);
-                    save_state_async(
-                        self,
-                        commit_id,
-                        state,
-                        None,
-                        Some(failure.clone()),
-                        StateFilter::Local,
-                    )
-                    .await?;
-                    return Err(Error::Retained(failure));
+        match intent::verify_frozen(
+            &row.0.request,
+            self.inner.authority.filesystem(),
+            *commit_id.as_bytes(),
+            row.digest()?,
+        ) {
+            Ok(_) => {}
+            Err(intent::VerifyFrozenError::Core(error)) => {
+                let error = Error::from(error);
+                if matches!(&status.state, DirectoryState::Unknown) {
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
                 }
-            };
-        if frozen_id != commit_id || frozen_digest != row.digest()? {
-            let error = Error::local_kind(
-                ErrorKind::Corrupt,
-                "frozen directory transaction identity disagrees",
-            );
-            if matches!(&status.state, DirectoryState::Unknown) {
-                return Err(unknown_after_dispatch(self, commit_id, error).await);
+                let transition = match error.kind() {
+                    ErrorKind::Invalid | ErrorKind::Corrupt | ErrorKind::Unsupported => {
+                        intent::Transition::LocalFailed
+                    }
+                    _ => intent::Transition::LocalRetryable,
+                };
+                let failure = Failure::capture(&error);
+                save_state_async(self, commit_id, transition, None, Some(failure.clone())).await?;
+                return Err(Error::Retained(failure));
             }
-            let failure = Failure::capture(&error);
-            save_state_async(
-                self,
-                commit_id,
-                intent::State::Failed.code(),
-                None,
-                Some(failure.clone()),
-                StateFilter::Local,
-            )
-            .await?;
-            return Err(Error::Retained(failure));
+            Err(intent::VerifyFrozenError::Mismatch) => {
+                let error = Error::local_kind(
+                    ErrorKind::Corrupt,
+                    "frozen directory transaction identity disagrees",
+                );
+                if matches!(&status.state, DirectoryState::Unknown) {
+                    return Err(unknown_after_dispatch(self, commit_id, error).await);
+                }
+                let failure = Failure::capture(&error);
+                save_state_async(
+                    self,
+                    commit_id,
+                    intent::Transition::LocalFailed,
+                    None,
+                    Some(failure.clone()),
+                )
+                .await?;
+                return Err(Error::Retained(failure));
+            }
         }
         // From this point a dispatch may occur. Unknown is durable first.
         match claim_dispatch(self, commit_id).await {
@@ -403,7 +368,7 @@ impl DirectoryJournal {
         let outcome = match self
             .inner
             .authority
-            .commit_frozen_batch(std::slice::from_ref(&row.request))
+            .commit_frozen_batch(std::slice::from_ref(&row.0.request))
             .await
         {
             Ok(mut outcomes) if outcomes.len() == 1 => Ok(outcomes.remove(0)),
@@ -426,10 +391,9 @@ impl DirectoryJournal {
                 if let Err(error) = save_state_async(
                     self,
                     commit_id,
-                    intent::State::Committed.code(),
+                    intent::Transition::Committed,
                     Some(receipt.clone()),
                     None,
-                    StateFilter::Any,
                 )
                 .await
                 {
@@ -451,10 +415,9 @@ impl DirectoryJournal {
                 if let Err(error) = save_state_async(
                     self,
                     commit_id,
-                    intent::State::Conflict.code(),
+                    intent::Transition::Conflict,
                     None,
                     Some(failure.clone()),
-                    StateFilter::Unknown,
                 )
                 .await
                 {
@@ -467,10 +430,9 @@ impl DirectoryJournal {
                 if let Err(error) = save_state_async(
                     self,
                     commit_id,
-                    intent::State::Retryable.code(),
+                    intent::Transition::Retryable,
                     None,
                     Some(failure.clone()),
-                    StateFilter::Unknown,
                 )
                 .await
                 {
@@ -496,20 +458,13 @@ impl DirectoryJournal {
     pub async fn intents(&self) -> Result<Vec<DirectoryStatus>> {
         let _gate = self.inner.gate.lock().await;
         let rows = self
-            .call(|connection| {
-                let mut statement = connection
-                    .prepare(
-                        "SELECT id,request_id,request_digest,request,commit_id,state,
-                                receipt_revision,receipt_ordinal,failure,metadata
-                         FROM intents ORDER BY id",
-                    )
-                    .map_err(sql)?;
-                let rows = statement.query_map([], row_from_sql).map_err(sql)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
-            })
+            .call(|connection| intent::all(connection).map_err(sql))
             .await?;
         rows.into_iter()
-            .map(|row| row.status(commit_id(&row)?))
+            .map(|row| {
+                let row = StoredRow(row);
+                row.status(commit_id(&row)?)
+            })
             .collect()
     }
 
@@ -532,17 +487,11 @@ impl DirectoryJournal {
                 .try_into()
                 .map_err(|_| Error::State(ErrorKind::Corrupt, "invalid directory root"))?;
             validate_binding(&connection, filesystem, root)?;
-            let mut statement = connection
-                .prepare(
-                    "SELECT id,request_id,request_digest,request,commit_id,state,
-                            receipt_revision,receipt_ordinal,failure,metadata
-                     FROM intents ORDER BY id",
-                )
-                .map_err(sql)?;
-            let rows = statement.query_map([], row_from_sql).map_err(sql)?;
-            let intents = rows
+            let intents = intent::all(&connection)
+                .map_err(sql)?
+                .into_iter()
                 .map(|row| {
-                    let row = row.map_err(sql)?;
+                    let row = StoredRow(row);
                     row.status(commit_id(&row)?)
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -571,7 +520,7 @@ impl DirectoryJournal {
                 Error::local_kind(ErrorKind::Corrupt, "failed intent has no diagnostic")
             })?));
         }
-        let (baseline, request_id, digest) = Transaction::inspect_identity(&row.request)?;
+        let (baseline, request_id, digest) = Transaction::inspect_identity(&row.0.request)?;
         if baseline != status.intent.baseline
             || request_id != commit_id
             || digest != row.digest()?
@@ -581,7 +530,7 @@ impl DirectoryJournal {
                 "retained directory transaction identity disagrees",
             ));
         }
-        let metadata: DirectoryMetadata = borsh::from_slice(&row.metadata).map_err(local)?;
+        let metadata: DirectoryMetadata = borsh::from_slice(&row.0.metadata).map_err(local)?;
         let manifest: DirectoryManifest = borsh::from_slice(&metadata.manifest).map_err(local)?;
         let entries = manifest.install_entries()?;
         install_directory(self.inner.authority.as_ref(), destination, entries)
@@ -601,18 +550,7 @@ impl DirectoryJournal {
 }
 
 #[derive(Clone)]
-struct StoredRow {
-    id: Vec<u8>,
-    request_id: Vec<u8>,
-    digest: Vec<u8>,
-    request: Vec<u8>,
-    commit_id: Option<Vec<u8>>,
-    state: u8,
-    receipt_revision: Option<Vec<u8>>,
-    receipt_ordinal: Option<i64>,
-    failure: Option<Vec<u8>>,
-    metadata: Vec<u8>,
-}
+struct StoredRow(intent::Record);
 
 #[derive(BorshSerialize, BorshDeserialize)]
 struct DirectoryMetadata {
@@ -622,7 +560,8 @@ struct DirectoryMetadata {
 
 impl StoredRow {
     fn digest(&self) -> Result<[u8; 32]> {
-        self.digest
+        self.0
+            .request_digest
             .as_slice()
             .try_into()
             .map_err(|_| Error::local_kind(ErrorKind::Corrupt, "invalid directory request digest"))
@@ -630,7 +569,7 @@ impl StoredRow {
 
     fn status(&self, id: CommitId) -> Result<DirectoryStatus> {
         let stored_id =
-            CommitId::from_bytes(self.id.as_slice().try_into().map_err(|_| {
+            CommitId::from_bytes(self.0.id.as_slice().try_into().map_err(|_| {
                 Error::local_kind(ErrorKind::Corrupt, "invalid directory intent id")
             })?);
         if stored_id != id {
@@ -639,17 +578,18 @@ impl StoredRow {
                 "directory intent identity disagrees",
             ));
         }
-        let digest: [u8; 32] = self.digest.as_slice().try_into().map_err(|_| {
+        let digest: [u8; 32] = self.0.request_digest.as_slice().try_into().map_err(|_| {
             Error::local_kind(ErrorKind::Corrupt, "invalid directory request digest")
         })?;
         let (request_baseline, request_id, request_digest) =
-            Transaction::inspect_identity(&self.request).map_err(|error| {
+            Transaction::inspect_identity(&self.0.request).map_err(|error| {
                 Error::local_kind(
                     ErrorKind::Corrupt,
                     format!("invalid retained frozen request: {error}"),
                 )
             })?;
         let expected_request_id: [u8; 16] = self
+            .0
             .request_id
             .as_slice()
             .try_into()
@@ -661,6 +601,7 @@ impl StoredRow {
             ));
         }
         if self
+            .0
             .commit_id
             .as_deref()
             .is_some_and(|commit| commit != id.as_bytes())
@@ -670,7 +611,7 @@ impl StoredRow {
                 "stored directory commit id disagrees",
             ));
         }
-        let state = match decode_state(self.state)? {
+        let state = match self.0.state {
             intent::State::Prepared => DirectoryState::Prepared,
             intent::State::Unknown => DirectoryState::Unknown,
             intent::State::Committed => DirectoryState::Committed(receipt(self, id, digest)?),
@@ -679,7 +620,7 @@ impl StoredRow {
             intent::State::Failed => DirectoryState::Failed,
         };
         if !matches!(state, DirectoryState::Committed(_))
-            && (self.receipt_revision.is_some() || self.receipt_ordinal.is_some())
+            && (self.0.receipt_revision.is_some() || self.0.receipt_ordinal.is_some())
         {
             return Err(Error::local_kind(
                 ErrorKind::Corrupt,
@@ -687,12 +628,13 @@ impl StoredRow {
             ));
         }
         let failure = self
+            .0
             .failure
             .as_deref()
             .map(borsh::from_slice)
             .transpose()
             .map_err(local)?;
-        let metadata: DirectoryMetadata = borsh::from_slice(&self.metadata).map_err(local)?;
+        let metadata: DirectoryMetadata = borsh::from_slice(&self.0.metadata).map_err(local)?;
         Ok(DirectoryStatus {
             intent: DirectoryIntent {
                 commit_id: id,
@@ -704,21 +646,6 @@ impl StoredRow {
             failure,
         })
     }
-}
-
-fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
-    Ok(StoredRow {
-        id: row.get(0)?,
-        request_id: row.get(1)?,
-        digest: row.get(2)?,
-        request: row.get(3)?,
-        commit_id: row.get(4)?,
-        state: row.get(5)?,
-        receipt_revision: row.get(6)?,
-        receipt_ordinal: row.get(7)?,
-        failure: row.get(8)?,
-        metadata: row.get(9)?,
-    })
 }
 
 fn validate_binding(connection: &Connection, filesystem: [u8; 16], root: [u8; 16]) -> Result<()> {
@@ -734,15 +661,8 @@ fn validate_binding(connection: &Connection, filesystem: [u8; 16], root: [u8; 16
 }
 
 fn load(connection: &Connection, id: CommitId) -> Result<Option<StoredRow>> {
-    connection
-        .query_row(
-            "SELECT id,request_id,request_digest,request,commit_id,state,
-                    receipt_revision,receipt_ordinal,failure,metadata
-             FROM intents WHERE id=?1",
-            params![id.as_bytes().as_slice()],
-            row_from_sql,
-        )
-        .optional()
+    intent::load(connection, id.as_bytes())
+        .map(|row| row.map(StoredRow))
         .map_err(sql)
 }
 
@@ -753,49 +673,16 @@ async fn load_async(journal: &DirectoryJournal, id: CommitId) -> Result<Option<S
 fn save_state(
     connection: &Connection,
     id: CommitId,
-    state: u8,
+    transition: intent::Transition,
     receipt: Option<&Receipt>,
     failure: Option<&Failure>,
-    filter: StateFilter,
 ) -> Result<()> {
-    let receipt_revision = receipt.map(|receipt| receipt.cursor.revision.to_bytes().to_vec());
-    let receipt_ordinal = receipt.map(|receipt| i64::from(receipt.cursor.ordinal));
     let failure = failure.map(borsh::to_vec).transpose().map_err(local)?;
-    let statement = match filter {
-        StateFilter::Active => {
-            "UPDATE intents
-             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
-             WHERE id=?1 AND state IN (0,1,4)"
-        }
-        StateFilter::Any => {
-            "UPDATE intents
-             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
-             WHERE id=?1"
-        }
-        StateFilter::Local => {
-            "UPDATE intents
-             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
-             WHERE id=?1 AND state IN (0,4)"
-        }
-        StateFilter::Unknown => {
-            "UPDATE intents
-             SET state=?2,receipt_revision=?3,receipt_ordinal=?4,failure=?5
-             WHERE id=?1 AND state=1"
-        }
-    };
-    let changed = connection
-        .execute(
-            statement,
-            params![
-                id.as_bytes().as_slice(),
-                state,
-                receipt_revision,
-                receipt_ordinal,
-                failure
-            ],
-        )
-        .map_err(sql)?;
-    if changed != 1 {
+    let mut update = intent::Update::new(transition).failure(failure.as_deref());
+    if let Some(receipt) = receipt {
+        update = update.receipt(receipt);
+    }
+    if !intent::update(connection, id.as_bytes(), update).map_err(sql)? {
         return Err(Error::local_kind(
             ErrorKind::Busy,
             "directory intent state changed concurrently; inspect it before retrying",
@@ -807,17 +694,16 @@ fn save_state(
 async fn save_state_async(
     journal: &DirectoryJournal,
     id: CommitId,
-    state: u8,
+    transition: intent::Transition,
     receipt: Option<Receipt>,
     failure: Option<Failure>,
-    filter: StateFilter,
 ) -> Result<()> {
     journal
         .call(move |connection| {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            save_state(&tx, id, state, receipt.as_ref(), failure.as_ref(), filter)?;
+            save_state(&tx, id, transition, receipt.as_ref(), failure.as_ref())?;
             tx.commit().map_err(sql)
         })
         .await
@@ -833,10 +719,9 @@ async fn unknown_after_dispatch(
     match save_state_async(
         journal,
         id,
-        intent::State::Unknown.code(),
+        intent::Transition::StillUnknown,
         None,
         Some(failure.clone()),
-        StateFilter::Unknown,
     )
     .await
     {
@@ -856,16 +741,7 @@ enum DispatchClaim {
 
 async fn claim_dispatch(journal: &DirectoryJournal, id: CommitId) -> Result<DispatchClaim> {
     for _ in 0..2 {
-        match save_state_async(
-            journal,
-            id,
-            intent::State::Unknown.code(),
-            None,
-            None,
-            StateFilter::Active,
-        )
-        .await
-        {
+        match save_state_async(journal, id, intent::Transition::ClaimDispatch, None, None).await {
             Ok(()) => return Ok(DispatchClaim::Dispatch),
             Err(error) if error.kind() == ErrorKind::Busy => {
                 let row = load_async(journal, id).await?.ok_or_else(|| {
@@ -896,19 +772,26 @@ async fn claim_dispatch(journal: &DirectoryJournal, id: CommitId) -> Result<Disp
 
 fn receipt(row: &StoredRow, id: CommitId, digest: [u8; 32]) -> Result<Receipt> {
     let revision = row
+        .0
         .receipt_revision
         .as_deref()
         .ok_or_else(|| Error::local_kind(ErrorKind::Corrupt, "missing receipt revision"))?;
     let revision: [u8; 24] = revision
         .try_into()
         .map_err(|_| Error::local_kind(ErrorKind::Corrupt, "invalid receipt revision"))?;
-    intent::receipt(*id.as_bytes(), digest, Some(revision), row.receipt_ordinal)
-        .map_err(|error| Error::local_kind(ErrorKind::Corrupt, error))?
-        .ok_or_else(|| Error::local_kind(ErrorKind::Corrupt, "missing receipt fields"))
+    intent::receipt(
+        *id.as_bytes(),
+        digest,
+        Some(revision),
+        row.0.receipt_ordinal,
+    )
+    .map_err(|error| Error::local_kind(ErrorKind::Corrupt, error))?
+    .ok_or_else(|| Error::local_kind(ErrorKind::Corrupt, "missing receipt fields"))
 }
 
 fn commit_id(row: &StoredRow) -> Result<CommitId> {
     let bytes: [u8; 16] = row
+        .0
         .id
         .as_slice()
         .try_into()

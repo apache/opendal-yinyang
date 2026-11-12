@@ -217,7 +217,7 @@ with kind, diagnostic message and optional commit ID. Clean fsync/close returns
 the retained category until acknowledgment. Clearing the volume ledger does not
 clear an active handle's error, pending data or frozen request.
 
-The current local profile is `yinyang-stage-4`. It stores the filesystem
+The current local profile is `yinyang-stage-5`. It stores the filesystem
 binding, handle records, the typed error ledger, sparse base descriptors, and
 exact dirty segments in `staging.db`. The shared local store opens SQLite in WAL
 mode with `synchronous=NORMAL`; `sync_local`, `flush`, `fsync`, `commit` and
@@ -261,20 +261,22 @@ An absent or zero-table database is initialized only after the writer lease is
 held. A writer that opens between preflight and lease acquisition is revalidated
 under the lease and must still use the current profile.
 
-Inspect and backup validation accept only `yinyang-stage-4` without changing
+Inspect and backup validation accept only `yinyang-stage-5` without changing
 authoritative database/WAL bytes or journal mode, cleaning handles, or
 acquiring the writer lease. SQLite may create an empty `-wal` and may create or
 update derived `-shm`; existing WAL/journal bytes remain protected. A frozen
 plan exposes its exact CommitId. A sparse handle cannot read an untouched range
 if its authority no longer retains the exact base revision.
 
-Failure blobs use Borsh `(kind: u8, message: String, commit: Option<[u8;16]>)`.
+`Failure` values use Borsh `(kind: u8, message: String, commit: Option<[u8;16]>)`.
 Kind tags, in order from 0 through 21, are Invalid, InvalidName, NotFound,
 AlreadyExists, NotDirectory, IsDirectory, NotEmpty, ReadOnly, PermissionDenied,
 Busy, Closed, Frozen, TooLarge, Conflict, Retryable, Unknown, Corrupt, Unsupported,
-Storage, Io, NoSpace and Expired. Handle records keep the original message field as a
-diagnostic copy; typed details live in the adjacent column. An operation
-failure records both fields and its ledger entry atomically.
+Storage, Io, NoSpace and Expired. A handle record stores its optional typed
+failure directly in `handles.record`; `handles` has no separate failure column.
+The `errors` ledger stores each failure once with its `sequence` and `handle`.
+Neither representation stores a diagnostic string or a second failure encoding.
+An operation failure records the handle failure and its ledger entry atomically.
 
 Failures are returned immediately and retained on the handle and volume ledger.
 A successful retry clears the active handle error, not the ledger. A clean
