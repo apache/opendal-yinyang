@@ -18,9 +18,9 @@
 //! Direct namespace adapter for the shared sync engine.
 
 use super::adapter::{
-    EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter, RemoteBaseline,
-    RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure, RemoteObservation, RemoteOutcome,
-    RemotePin, RemoteRequest, SyncModel, digest,
+    DownloadedFile, EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter,
+    RemoteBaseline, RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure,
+    RemoteObservation, RemoteOutcome, RemotePin, RemoteRequest, SyncModel, digest,
 };
 use super::local::validate_private_state;
 use super::{Error, Result};
@@ -138,7 +138,11 @@ impl RemoteAdapter for DirectAdapter {
         })
     }
 
-    async fn read_file(&self, entry: &RemoteEntry, output: BorrowedFd<'_>) -> Result<()> {
+    async fn read_file(
+        &self,
+        entry: &RemoteEntry,
+        output: BorrowedFd<'_>,
+    ) -> Result<DownloadedFile> {
         let snapshot = self.cached_snapshot()?;
         let node = snapshot
             .resolve(&entry.path)
@@ -154,6 +158,7 @@ impl RemoteAdapter for DirectAdapter {
             .try_clone_to_owned()
             .map_err(|error| Error::io("duplicate Direct download fd", Path::new("."), error))?;
         let mut target = std::fs::File::from(duplicate);
+        let mut hasher = blake3::Hasher::new();
         let mut offset = 0_u64;
         while offset < file.length() {
             let end = offset.saturating_add(64 * 1024).min(file.length());
@@ -161,6 +166,12 @@ impl RemoteAdapter for DirectAdapter {
                 .read(offset, (end - offset) as usize)
                 .await
                 .map_err(Error::from)?;
+            if bytes.len() as u64 != end - offset {
+                return Err(Error::conflict(
+                    "Direct download returned an incomplete authenticated range",
+                ));
+            }
+            hasher.update(&bytes);
             target
                 .write_all(&bytes)
                 .map_err(|error| Error::io("write Direct download", Path::new("."), error))?;
@@ -173,7 +184,11 @@ impl RemoteAdapter for DirectAdapter {
         }
         target
             .sync_all()
-            .map_err(|error| Error::io("persist Direct download", Path::new("."), error))
+            .map_err(|error| Error::io("persist Direct download", Path::new("."), error))?;
+        Ok(DownloadedFile {
+            length: offset,
+            digest: *hasher.finalize().as_bytes(),
+        })
     }
 
     async fn freeze(&self, request: RemoteRequest) -> Result<FrozenRemoteRequest> {

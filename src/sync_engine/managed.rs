@@ -18,20 +18,18 @@
 //! Managed authority and durable-intent adapter for the shared sync engine.
 
 use super::adapter::{
-    EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter, RemoteBaseline,
-    RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure, RemoteObservation, RemoteOutcome,
-    RemotePin, RemoteRequest, SyncModel,
+    DownloadedFile, EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter,
+    RemoteBaseline, RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure,
+    RemoteObservation, RemoteOutcome, RemotePin, RemoteRequest, SyncModel,
 };
 use super::{Error, ErrorKind, Result};
 use std::collections::BTreeMap;
-use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use yinyang_core::{
-    Authority, CommitId, CommitOutcome, ContentId, Cursor, Node, NodeId, NodeKind, Revision,
-    Snapshot,
+    Authority, CommitId, CommitOutcome, Cursor, Node, NodeId, NodeKind, Revision, Snapshot,
 };
 
 #[derive(Clone)]
@@ -99,7 +97,11 @@ impl RemoteAdapter for ManagedAdapter {
         })
     }
 
-    async fn read_file(&self, entry: &RemoteEntry, output: BorrowedFd<'_>) -> Result<()> {
+    async fn read_file(
+        &self,
+        entry: &RemoteEntry,
+        output: BorrowedFd<'_>,
+    ) -> Result<DownloadedFile> {
         let RemotePin::Managed { node, revision, .. } = &entry.pin else {
             return Err(Error::corrupt(
                 "Managed adapter received a Direct remote pin",
@@ -123,6 +125,7 @@ impl RemoteAdapter for ManagedAdapter {
             .try_clone_to_owned()
             .map_err(|error| Error::io("duplicate Managed download fd", Path::new("."), error))?;
         let mut target = tokio::fs::File::from_std(std::fs::File::from(owned));
+        let mut hasher = blake3::Hasher::new();
         let length = version.descriptor().content_id().length();
         let mut offset = 0_u64;
         while offset < length {
@@ -132,6 +135,12 @@ impl RemoteAdapter for ManagedAdapter {
                 .read_range(offset..end, &mut bytes)
                 .await
                 .map_err(Error::from)?;
+            if bytes.len() as u64 != end - offset {
+                return Err(Error::conflict(
+                    "Managed download returned an incomplete authenticated range",
+                ));
+            }
+            hasher.update(&bytes);
             target
                 .write_all(&bytes)
                 .await
@@ -142,23 +151,19 @@ impl RemoteAdapter for ManagedAdapter {
             .flush()
             .await
             .map_err(|error| Error::io("flush Managed download", Path::new("."), error))?;
-        let verify_path = format!("/proc/self/fd/{}", output.as_raw_fd());
-        let mut verification = tokio::fs::File::open(&verify_path)
-            .await
-            .map_err(|error| Error::io("open Managed verification fd", Path::new("."), error))?;
-        if ContentId::calculate(&mut verification)
-            .await
-            .map_err(Error::from)?
-            != version.descriptor().content_id()
-        {
+        if offset != entry.length {
             return Err(Error::conflict(
-                "Managed downloaded content does not match its accepted digest",
+                "Managed downloaded length does not match its accepted entry",
             ));
         }
         target
             .sync_all()
             .await
-            .map_err(|error| Error::io("sync Managed download", Path::new("."), error))
+            .map_err(|error| Error::io("sync Managed download", Path::new("."), error))?;
+        Ok(DownloadedFile {
+            length: offset,
+            digest: *hasher.finalize().as_bytes(),
+        })
     }
 
     async fn freeze(&self, request: RemoteRequest) -> Result<FrozenRemoteRequest> {
