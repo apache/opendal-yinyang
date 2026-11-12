@@ -29,12 +29,12 @@ pub(super) const CHUNK: u64 = 64 * 1024;
 const SCHEMA: &[store::TableColumns<'static>] = &[
     ("authority", &["singleton", "profile", "filesystem"]),
     ("bases", &["handle", "descriptor", "prefix"]),
-    ("handles", &["id", "record", "failure"]),
-    ("errors", &["sequence", "handle", "message", "failure"]),
+    ("handles", &["id", "record"]),
+    ("errors", &["sequence", "handle", "failure"]),
     ("segments", &["handle", "position", "data"]),
 ];
 const PROFILE: store::Profile = store::Profile {
-    name: "yinyang-stage-4",
+    name: "yinyang-stage-5",
     table: "authority",
     schema: SCHEMA,
 };
@@ -50,11 +50,10 @@ const CREATE_SCHEMA: &str = "
       descriptor BLOB NOT NULL,
       prefix INTEGER NOT NULL
     );
-    CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB NOT NULL, failure BLOB);
+    CREATE TABLE handles(id BLOB PRIMARY KEY, record BLOB NOT NULL);
     CREATE TABLE errors(
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
       handle BLOB NOT NULL,
-      message TEXT NOT NULL,
       failure BLOB NOT NULL
     );
     CREATE TABLE segments(
@@ -76,9 +75,6 @@ pub(super) struct Record {
     pub ready: bool,
     pub plan: Option<Vec<u8>>,
     pub conflict: bool,
-    pub error: Option<String>,
-    // Stored in an additive SQLite column; keep existing staged record bytes readable.
-    #[borsh(skip)]
     pub failure: Option<Failure>,
 }
 impl Record {
@@ -189,16 +185,8 @@ fn decode(bytes: &[u8]) -> Result<Record> {
 }
 fn save(c: &Connection, r: &Record) -> Result<()> {
     c.execute(
-        "INSERT OR REPLACE INTO handles(id,record,failure) VALUES(?1,?2,?3)",
-        params![
-            r.id.as_slice(),
-            borsh::to_vec(r).map_err(local)?,
-            r.failure
-                .as_ref()
-                .map(borsh::to_vec)
-                .transpose()
-                .map_err(local)?
-        ],
+        "INSERT OR REPLACE INTO handles(id,record) VALUES(?1,?2)",
+        params![r.id.as_slice(), borsh::to_vec(r).map_err(local)?],
     )
     .map_err(local)?;
     Ok(())
@@ -217,22 +205,15 @@ fn validate_store(c: &Connection, filesystem: Option<NodeId>) -> Result<()> {
     )
     .map_err(store_error)
 }
-fn decoded_record(bytes: &[u8], failure: Option<Vec<u8>>) -> Result<Record> {
-    let mut r = decode(bytes)?;
-    r.failure = failure
-        .map(|b| borsh::from_slice(&b).map_err(|e| Error::local_kind(ErrorKind::Corrupt, e)))
-        .transpose()?;
-    Ok(r)
-}
 fn record(c: &Connection, id: [u8; 16]) -> Result<Record> {
-    let (bytes, failure): (Vec<u8>, Option<Vec<u8>>) = c
+    let bytes: Vec<u8> = c
         .query_row(
-            "SELECT record,failure FROM handles WHERE id=?1",
+            "SELECT record FROM handles WHERE id=?1",
             params![id.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .map_err(local)?;
-    decoded_record(&bytes, failure)
+    decode(&bytes)
 }
 fn base(c: &Connection, id: [u8; 16]) -> Result<Option<Base>> {
     let (descriptor, prefix): (Vec<u8>, i64) = match c
@@ -309,17 +290,14 @@ fn delete_segment(c: &Connection, id: [u8; 16], position: u64) -> Result<()> {
 }
 fn records(c: &Connection) -> Result<Vec<Record>> {
     let mut query = c
-        .prepare("SELECT record,failure FROM handles ORDER BY id")
+        .prepare("SELECT record FROM handles ORDER BY id")
         .map_err(local)?;
     let rows = query
-        .query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
-        })
+        .query_map([], |r| r.get::<_, Vec<u8>>(0))
         .map_err(local)?;
     let mut result = Vec::new();
     for row in rows {
-        let (bytes, failure) = row.map_err(local)?;
-        let record = decoded_record(&bytes, failure)?;
+        let record = decode(&row.map_err(local)?)?;
         if record.ready {
             result.push(record);
         }
@@ -328,20 +306,19 @@ fn records(c: &Connection) -> Result<Vec<Record>> {
 }
 fn errors(c: &Connection) -> Result<Vec<WritebackError>> {
     let mut query = c
-        .prepare("SELECT sequence,handle,message,failure FROM errors ORDER BY sequence")
+        .prepare("SELECT sequence,handle,failure FROM errors ORDER BY sequence")
         .map_err(local)?;
     let rows = query
         .query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<Vec<u8>>>(3)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
             ))
         })
         .map_err(local)?;
     rows.map(|r| {
-        let (sequence, id, _message, failure) = r.map_err(local)?;
+        let (sequence, id, failure) = r.map_err(local)?;
         let bytes = failure.ok_or(Error::State(
             ErrorKind::Corrupt,
             "staging error entry has no typed failure",
@@ -1029,16 +1006,12 @@ impl Stage {
         self.call(move |c| {
             let tx = c.transaction().map_err(local)?;
             let mut r = record(&tx, id)?;
-            r.error = Some(failure.to_string());
-            r.failure = Some(failure.clone());
+            let failure_bytes = borsh::to_vec(&failure).map_err(local)?;
+            r.failure = Some(failure);
             save(&tx, &r)?;
             tx.execute(
-                "INSERT INTO errors(handle,message,failure) VALUES(?1,?2,?3)",
-                params![
-                    id.as_slice(),
-                    failure.to_string(),
-                    borsh::to_vec(&failure).map_err(local)?
-                ],
+                "INSERT INTO errors(handle,failure) VALUES(?1,?2)",
+                params![id.as_slice(), failure_bytes],
             )
             .map_err(local)?;
             tx.commit().map_err(local)?;
@@ -1103,6 +1076,8 @@ fn mutable(r: &Record) -> Result<()> {
 mod tests {
     use super::*;
 
+    const OLD_PROFILE: &str = "yinyang-stage-4";
+
     fn raw_database_with_fs(path: &std::path::Path, profile: &str, fs: NodeId) {
         let c = Connection::open(path).unwrap();
         c.execute_batch(CREATE_SCHEMA).unwrap();
@@ -1159,7 +1134,6 @@ mod tests {
                 ready: true,
                 plan: None,
                 conflict: false,
-                error: None,
                 failure: None,
             },
         )
@@ -1220,7 +1194,6 @@ mod tests {
             ready: false,
             plan: None,
             conflict: false,
-            error: None,
             failure: None,
         };
         let temp = tempfile::tempdir().unwrap();
@@ -1256,15 +1229,15 @@ mod tests {
         let race_path = temp.path().join("race/staging.db");
         let mut race_writer = wal_stage(&race_path, fs, &incomplete);
         let reader = store::open_read_only(&race_path).unwrap();
-        let (stale_record, failure) = reader
+        let stale_record: Vec<u8> = reader
             .query_row(
-                "SELECT record,failure FROM handles WHERE id=?1",
+                "SELECT record FROM handles WHERE id=?1",
                 params![id.as_slice()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+                |row| row.get(0),
             )
             .map_err(local)
             .unwrap();
-        let stale = decoded_record(&stale_record, failure).unwrap();
+        let stale = decode(&stale_record).unwrap();
         assert!(!stale.ready);
 
         let tx = race_writer.transaction().unwrap();
@@ -1306,7 +1279,7 @@ mod tests {
     async fn unsupported_profile_is_rejected_without_creating_a_lease_or_changing_sqlite() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let fs = raw_database(&path, "yinyang-stage-3");
+        let fs = raw_database(&path, OLD_PROFILE);
         assert_eq!(
             Stage::inspect(path.clone()).await.unwrap_err().kind(),
             ErrorKind::Unsupported
@@ -1336,14 +1309,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(profile, "yinyang-stage-3");
+        assert_eq!(profile, OLD_PROFILE);
     }
 
     #[tokio::test]
     async fn unsupported_profile_read_only_rejection_preserves_authoritative_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("staging.db");
-        let _ = raw_database(&path, "yinyang-stage-3");
+        let _ = raw_database(&path, OLD_PROFILE);
         Connection::open(&path)
             .unwrap()
             .execute_batch("PRAGMA journal_mode=WAL")
@@ -1526,7 +1499,6 @@ mod tests {
             ready: false,
             plan: None,
             conflict: false,
-            error: None,
             failure: None,
         };
         stage.save(record).await.unwrap();
@@ -1579,7 +1551,6 @@ mod tests {
                 ready: false,
                 plan: None,
                 conflict: false,
-                error: None,
                 failure: None,
             })
             .await
@@ -1656,7 +1627,7 @@ mod tests {
                 let failure =
                     borsh::to_vec(&Failure::capture(&Error::Invalid("accepted"))).unwrap();
                 c.execute(
-                    "INSERT INTO errors(handle,message,failure) VALUES(?1,'accepted',?2)",
+                    "INSERT INTO errors(handle,failure) VALUES(?1,?2)",
                     params![[0_u8; 16].as_slice(), failure],
                 )
                 .map_err(local)?;

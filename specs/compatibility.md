@@ -113,7 +113,7 @@ each have one current identifier:
 
 | Local state | Current identifier |
 | --- | --- |
-| File staging | `yinyang-stage-4` |
+| File staging | `yinyang-stage-5` |
 | Sync engine | `yinyang-sync-engine-2` |
 | Sync content journal | `yinyang-sync-4` |
 | Directory publication | `yinyang-directory-3` |

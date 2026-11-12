@@ -185,7 +185,8 @@ impl Runtime {
     }
     pub(crate) async fn discard_clean(&self, id: uuid::Uuid) -> Result<()> {
         let r = self.inner.stage.load(*id.as_bytes()).await?;
-        if !r.ready || r.local != r.remote || r.plan.is_some() || r.conflict || r.error.is_some() {
+        if !r.ready || r.local != r.remote || r.plan.is_some() || r.conflict || r.failure.is_some()
+        {
             return Err(Error::State(
                 ErrorKind::Busy,
                 "handle is not a disposable clean observation",
@@ -264,7 +265,6 @@ impl Runtime {
             ready: false,
             plan: None,
             conflict: false,
-            error: None,
             failure: None,
         };
         self.inner.stage.save(r.clone()).await?;
@@ -667,7 +667,7 @@ impl FileHandle {
         if record.local != record.remote
             || record.plan.is_some()
             || record.conflict
-            || record.error.is_some()
+            || record.failure.is_some()
         {
             return Err(Error::State(
                 ErrorKind::Busy,
@@ -707,7 +707,6 @@ impl FileHandle {
     pub async fn acknowledge_error(&mut self) -> Result<()> {
         self.live()?;
         let mut record = self.runtime.inner.stage.load(self.id).await?;
-        record.error = None;
         record.failure = None;
         self.runtime.inner.stage.save(record).await?;
         if let Ok(mut errors) = self.runtime.inner.volatile_errors.lock() {
@@ -917,7 +916,6 @@ impl FileHandle {
                     r.base = receipt.cursor.revision.to_bytes();
                     r.remote = r.local;
                     r.plan = None;
-                    r.error = None;
                     r.failure = None;
                     r.conflict = false;
                     let descriptor = base.descriptor().to_bytes();
