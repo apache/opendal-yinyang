@@ -136,6 +136,7 @@ pub(crate) fn classify_errno(error: rustix::io::Errno) -> ErrorKind {
 pub(crate) fn classify_sqlite(error: &rusqlite::Error) -> ErrorKind {
     match error {
         rusqlite::Error::QueryReturnedNoRows => ErrorKind::NotFound,
+        rusqlite::Error::FromSqlConversionFailure(..) => ErrorKind::Corrupt,
         rusqlite::Error::SqliteFailure(code, _) => match code.code {
             rusqlite::ErrorCode::ConstraintViolation => ErrorKind::AlreadyExists,
             rusqlite::ErrorCode::DiskFull => ErrorKind::NoSpace,
