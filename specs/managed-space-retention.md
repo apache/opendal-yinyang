@@ -20,12 +20,14 @@ yy --volume CONFIG space retention expire \
 ```
 
 `--volume` is required. Managed `report` and `plan` use the selected authority.
-Direct `report` and `plan` keep their existing local-state observation path and
-make no Managed authority or namespace-object claim. `expire` is rejected for
-Direct or read-only volumes and on non-Linux hosts before authority or
-local-state side effects. `expire` requires a writable Managed volume on Linux.
-`report` and `plan` remain observation-only even when the volume configuration
-is writable.
+Direct Sync `report` and `plan` keep their existing local-state observation path
+and make no Managed authority or namespace-object claim. Direct Mount `report`
+and `plan` are rejected during static volume admission, before credentials,
+operator construction, or local-state inspection; Direct Mount state is
+available through `status` and `doctor`. `expire` is rejected for Direct or
+read-only volumes and on non-Linux hosts before authority or local-state side
+effects. `expire` requires a writable Managed volume on Linux. `report` and
+`plan` remain observation-only even when the volume configuration is writable.
 
 `space report --json` emits `yinyang.managed-space.report.v5`. `space retention
 plan --json` emits `yinyang.managed-retention.plan.v5`. `space retention expire
@@ -148,11 +150,13 @@ observed by `space retention plan --backup`.
 Local staging uses only existing paths:
 
 - `<staging>/staging.db` denotes managed mount or file-runtime staging;
-- `<staging>/content/staging.db` denotes content staging used by Sync;
 - `<staging>/sync.db` denotes the content-only library Sync intent journal;
   and
 - `<staging>/sync-engine.db` and the engine-owned artifacts exposed by its
   read-only inspection denote the shared Managed or Direct Sync engine.
+
+There is no nested `<staging>/content` runtime component. Space maintenance
+does not create, inspect, lease, or register that obsolete path.
 
 No other path is identified as a maintenance component or registered in
 `staging.databases`. In particular, a one-shot directory-publication `--state`
@@ -355,17 +359,15 @@ configured writer leases in this order:
 
 1. `sync-engine.lock`;
 2. `sync.lock`;
-3. `content/runtime.lock`; and
-4. the Mount/file runtime `runtime.lock`.
+3. the Mount/file runtime `runtime.lock`.
 
 Lease acquisition may create the configured directories and lock files. It
 never creates, initializes, migrates, or recovers `sync-engine.db`, `sync.db`,
-`content/staging.db`, or `staging.db`. The leases cover evidence inspection and
-the dispatch attempt, and are released when the command returns, including
-when the authority outcome is `Unknown`. The command does not retain a lease
-while an Unknown outcome remains unresolved. After release, keeping every
-declared activity stopped is the caller's obligation. A held lease or lease
-error refuses mutation.
+or `staging.db`. The leases cover evidence inspection and the dispatch attempt,
+and are released when the command returns, including when the authority outcome
+is `Unknown`. The command does not retain a lease while an Unknown outcome
+remains unresolved. After release, keeping every declared activity stopped is
+the caller's obligation. A held lease or lease error refuses mutation.
 
 After acquiring the leases, the command observes and freezes one exact
 `expected_latest` revision. It then validates the configured local state and
@@ -506,8 +508,10 @@ is a one-invocation declaration, not a persistent pin. Explicit backup
 packages are validated read-only and do not require the original local root;
 they remain protection evidence, not deletion authorization. A revision
 needed by an undisclosed backup, external reader, or unpinned workflow must
-still be supplied explicitly. It does not inspect Direct namespaces. It does
-not make SQLite sidecar files byte-identical or infer noncurrent backend
-versions that the configured backend does not return. Reachability does not
-scrub content payloads, and a complete observed root set does not prove global
-orphanhood, external-reader absence, or deletion eligibility.
+still be supplied explicitly. Direct Mount space reporting and planning are not
+supported; Direct Sync reports only existing local state and does not inspect
+Direct namespace objects. It does not make SQLite sidecar files byte-identical
+or infer noncurrent backend versions that the configured backend does not
+return. Reachability does not scrub content payloads, and a complete observed
+root set does not prove global orphanhood, external-reader absence, or deletion
+eligibility.

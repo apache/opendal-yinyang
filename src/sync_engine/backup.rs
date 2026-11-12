@@ -34,13 +34,8 @@ use std::path::{Component, Path, PathBuf};
 const MAGIC: [u8; 8] = *b"YYSYNC01";
 const VERSION: u8 = 1;
 const MANIFEST: &str = "manifest.bin";
-const DATABASES: [&str; 3] = ["sync-engine.db", "sync.db", "content/staging.db"];
-const PROCESS_LEASES: [&str; 4] = [
-    "sync-engine.lock",
-    "sync.lock",
-    "runtime.lock",
-    "content/runtime.lock",
-];
+const DATABASES: [&str; 2] = ["sync-engine.db", "sync.db"];
+const PROCESS_LEASES: [&str; 3] = ["sync-engine.lock", "sync.lock", "runtime.lock"];
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 struct BackupManifest {
@@ -269,7 +264,7 @@ impl BackupManifest {
             (database.length, database.hash) = hash_file(&destination)?;
         }
         self.save(&output.join(MANIFEST))?;
-        for relative in ["root", "state/artifacts", "state/content", "state"] {
+        for relative in ["root", "state/artifacts", "state"] {
             let path = output.join(relative);
             if path.is_dir() {
                 sync_directory(&path)?;
@@ -528,7 +523,7 @@ impl BackupManifest {
         };
         let mut store = Store::open(&state.join("sync-engine.db"))?;
         store.rebind(&binding, &identities, &state)?;
-        for relative in ["artifacts", "content", "content/staging.db"] {
+        for relative in ["artifacts"] {
             let path = state.join(relative);
             if path.is_dir() {
                 sync_directory(&path)?;
@@ -788,6 +783,12 @@ fn discover_support(state: &Path) -> Result<Vec<String>> {
             let relative_text = relative
                 .to_str()
                 .ok_or_else(|| Error::unsupported("sync state path is not UTF-8"))?;
+            if relative_text == "content" || relative_text.starts_with("content/") {
+                return Err(Error::unsupported(format!(
+                    "sync state contains obsolete nested content runtime state: {}",
+                    path.display()
+                )));
+            }
             if relative_text == "install"
                 || relative_text == "artifacts"
                 || relative_text.starts_with("install/")
@@ -1017,14 +1018,14 @@ mod tests {
     }
 
     #[test]
-    fn process_leases_are_not_backup_support_files() {
+    fn process_leases_and_databases_are_not_backup_support_files() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir(temp.path().join("content")).unwrap();
         for path in [
+            "sync-engine.db",
+            "sync.db",
             "sync-engine.lock",
             "sync.lock",
             "runtime.lock",
-            "content/runtime.lock",
             "adapter.json",
         ] {
             fs::write(temp.path().join(path), b"test").unwrap();
@@ -1033,6 +1034,24 @@ mod tests {
         assert_eq!(
             discover_support(temp.path()).unwrap(),
             vec!["adapter.json".to_owned()]
+        );
+    }
+
+    #[test]
+    fn obsolete_nested_content_state_is_not_generic_support() {
+        use crate::sync_engine::ErrorKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("content")).unwrap();
+        fs::write(temp.path().join("content/staging.db"), b"obsolete").unwrap();
+
+        let error = discover_support(temp.path()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("obsolete nested content runtime state"),
+            "{error}"
         );
     }
 }

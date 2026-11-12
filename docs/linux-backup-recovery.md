@@ -7,7 +7,8 @@ object metadata, immutable content, metadata-service database, local Mount/Sync
 state, retained artifacts, and publication journals. It is not an online
 snapshot protocol: every writer must be stopped before the backup begins.
 
-Restore a `YYBK0001` package only with the current local and SQLite profiles.
+Restore a `YYSYNC01` version 1 package only with the current local and SQLite
+profiles.
 Older identifiers are rejected rather than migrated. Cross-version migration
 and downgrade are not provided.
 
@@ -114,12 +115,13 @@ state/sync-engine.db
 state/artifacts/
 ```
 
-`sync-engine.db` is created with `VACUUM INTO`, not by copying a live main
-database. Other local state files that are present are checksummed and copied
-at their existing relative path; the engine itself requires only its database
-and retained artifacts. Process lease files (`sync-engine.lock`, `sync.lock`,
-`runtime.lock`, and `content/runtime.lock`) are not copied because restore
-creates the leases needed by its own writer.
+`sync-engine.db` and a present content-only Sync journal `sync.db` are created
+with `VACUUM INTO`, not by copying live main databases. Other local support
+files are checksummed and copied at their existing relative path; the engine
+itself requires only its database and retained artifacts. An obsolete nested
+`content/` runtime subtree is rejected rather than copied as generic support.
+Process lease files (`sync-engine.lock`, `sync.lock`, and `runtime.lock`) are
+not copied because restore creates the leases needed by its own writer.
 `manifest.bin` records the filesystem identity, the complete quiesced local
 snapshot with content hashes, each retained artifact's current tree and hash,
 every database file hash, and the original filesystem identities.

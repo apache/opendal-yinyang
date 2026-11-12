@@ -35,12 +35,14 @@ and the local side of a conflict are available offline. The remote conflict side
 requires the configured remote.
 
 `backup` writes one quiesced package containing the bound root,
-`sync-engine.db`, adapter support state, retained artifacts and a
-checksum-protected manifest. Process lease files such as `sync-engine.lock`,
-`sync.lock`, `runtime.lock`, and `content/runtime.lock` are ephemeral
-coordination state and are never package evidence. The command refuses
-incomplete installs. `restore` validates the complete package and
-adapter-specific support state before creating either absent destination.
+`sync-engine.db`, a present content-only Sync journal `sync.db`, other adapter
+support state, retained artifacts and a checksum-protected `YYSYNC01` version 1
+manifest. Process lease files such as `sync-engine.lock`, `sync.lock`, and
+`runtime.lock` are ephemeral coordination state and are never package evidence.
+An obsolete nested `content/` runtime subtree is rejected rather than
+reclassified as generic support. The command refuses incomplete installs.
+`restore` validates the complete package and adapter-specific support state
+before creating either absent destination.
 Restore rebinds root, state, baseline and artifact inode identities while
 preserving accepted content evidence, requests and receipts. Each restored
 artifact is verified once against its recorded length and digest; its new

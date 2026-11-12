@@ -132,6 +132,39 @@ fn direct_space_report_does_not_require_a_managed_authority() {
 }
 
 #[test]
+fn direct_mount_space_commands_fail_before_storage_operator_construction() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("direct-mount.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "direct-mount-space",
+            "model": "direct",
+            "access": "mount",
+            "frontend": "library",
+            "publication": "object",
+            "storage_profile": "minio",
+            "read_only": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for command in [
+        vec!["space", "report", "--json"],
+        vec!["space", "retention", "plan", "--json"],
+    ] {
+        let mut args = vec!["--volume", config.to_str().unwrap()];
+        args.extend(command);
+        let output = yy_without_storage(&args);
+        assert!(!output.status.success(), "{args:?}");
+        assert_stderr(&output, "Direct Mount");
+        assert_stderr(&output, "status or doctor");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
 fn sync_rejects_a_read_only_volume() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("read-only.json");

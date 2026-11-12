@@ -118,7 +118,7 @@ each have one current identifier:
 | Sync content journal | `yinyang-sync-4` |
 | Directory publication | `yinyang-directory-3` |
 | Direct mutation runtime | `yinyang-direct-runtime-2` |
-| Backup manifest | `YYBK0001` version 1 |
+| Backup manifest | `YYSYNC01` version 1 |
 
 Every local database contains exactly one profile row with `singleton=1`.
 The shared local store validates the current identifier and the exact table and

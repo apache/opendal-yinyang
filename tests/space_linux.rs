@@ -210,9 +210,7 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
     .unwrap();
     drop(sync);
 
-    let runtime = Runtime::open(authority.clone(), state.join("content"))
-        .await
-        .unwrap();
+    let runtime = Runtime::open(authority.clone(), &state).await.unwrap();
     let file = runtime.open_node(seeded.id(), true).await.unwrap();
     file.release().unwrap();
     drop(runtime);
