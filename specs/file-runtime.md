@@ -78,6 +78,10 @@ records reader; neither holds an active read transaction between calls. A
 remote service client retains no database transaction. Releasing or closing the
 handle releases its retained snapshot.
 
+Read-only revision lookup and typed history pages reuse this cache for immutable
+history indexes. Expiry and frozen-plan restoration read history indexes without
+the cache so write admission and recovery authenticate current storage bytes.
+
 A handle is uniquely leased in a runtime and is not cloneable. Its UUID can be
 recovered after drop or process restart. Rename does not change its node
 identity or invalidate content publication. Unlink does not invalidate staged

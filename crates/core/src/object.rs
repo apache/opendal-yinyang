@@ -362,7 +362,10 @@ impl ObjectFs {
         if latest.revision == revision {
             return Ok(latest.view_cached(self.cache.clone()));
         }
-        match self.revision_reference(&latest, revision).await? {
+        match self
+            .revision_reference(&latest, revision, Some(&self.cache))
+            .await?
+        {
             Some((RevisionStatus::Readable, bytes)) => Ok(self
                 .load(PackedRef::from_wire(decode(&bytes)?)?, revision, None)
                 .await?
@@ -385,7 +388,7 @@ impl ObjectFs {
             return Ok(latest.view_cached(self.cache.clone()));
         }
         let (_, bytes) = self
-            .revision_reference(&latest, revision)
+            .revision_reference(&latest, revision, None)
             .await?
             .ok_or_else(|| {
                 Error::new(
@@ -403,12 +406,13 @@ impl ObjectFs {
         &self,
         latest: &ObjectState,
         revision: Revision,
+        cache: Option<&IndexCache>,
     ) -> Result<Option<(RevisionStatus, Vec<u8>)>> {
         let readable = latest
             .history
             .get(
                 &self.data,
-                None,
+                cache,
                 &history_key(RevisionStatus::Readable, revision),
             )
             .await?;
@@ -416,7 +420,7 @@ impl ObjectFs {
             .history
             .get(
                 &self.data,
-                None,
+                cache,
                 &history_key(RevisionStatus::Expired, revision),
             )
             .await?;
@@ -452,7 +456,7 @@ impl ObjectFs {
                 .history
                 .scan(
                     &self.data,
-                    None,
+                    Some(&self.cache),
                     &[match status {
                         RevisionStatus::Readable => HISTORY_READABLE,
                         RevisionStatus::Expired => HISTORY_EXPIRED,
@@ -523,7 +527,7 @@ impl ObjectFs {
                     ));
                 }
                 let (status, bytes) = self
-                    .revision_reference(&base, *revision)
+                    .revision_reference(&base, *revision, None)
                     .await?
                     .ok_or_else(|| {
                         Error::new(
@@ -661,7 +665,7 @@ impl ObjectFs {
             latest.view_cached(self.cache.clone())
         } else {
             let (_, reference) = self
-                .revision_reference(latest, revision)
+                .revision_reference(latest, revision, None)
                 .await?
                 .ok_or_else(|| {
                     Error::new(
@@ -1055,6 +1059,123 @@ mod tests {
             backend.state.lock().unwrap().data_reads,
             0,
             "a warm page cache was not shared across snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_history_reuses_the_authority_index_cache() {
+        let backend = TestBackend::default();
+        let fs = ObjectFs::create(backend.operator()).await.unwrap();
+        let oldest = fs.observe_latest().await.unwrap().revision();
+        for name in ["one", "two", "three"] {
+            let mut plan = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+            plan.create_directory(fs.root(), name).await.unwrap();
+            fs.commit(&plan.finish().unwrap()).await.unwrap();
+        }
+
+        fs.revision_history_page(None, RETAINED_REVISIONS_PAGE_MAX)
+            .await
+            .unwrap();
+        backend.state.lock().unwrap().data_reads = 0;
+        let history = fs
+            .revision_history_page(None, RETAINED_REVISIONS_PAGE_MAX)
+            .await
+            .unwrap();
+        assert_eq!(history.revisions.len(), 4);
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            1,
+            "only the fresh snapshot descriptor should be read"
+        );
+
+        backend.state.lock().unwrap().data_reads = 0;
+        fs.observe_revision(oldest).await.unwrap();
+        assert_eq!(
+            backend.state.lock().unwrap().data_reads,
+            2,
+            "only the fresh latest and selected snapshot descriptors should be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_and_recovery_history_reads_bypass_the_authority_index_cache() {
+        let backend = TestBackend::default();
+        let fs = ObjectFs::create(backend.operator()).await.unwrap();
+        let mut older_plan =
+            Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        older_plan
+            .create_directory(fs.root(), "older")
+            .await
+            .unwrap();
+        let older_request = older_plan.finish().unwrap();
+        let older_revision = match fs.commit(&older_request).await.unwrap() {
+            Outcome::Committed(receipt) => receipt.cursor.revision,
+            other => panic!("expected committed, got {other:?}"),
+        };
+
+        let older_snapshot = fs.observe_revision(older_revision).await.unwrap();
+        let mut pending = Planner::new(&older_snapshot, CommitId::generate());
+        pending
+            .create_directory(fs.root(), "pending")
+            .await
+            .unwrap();
+        let pending_bytes = pending.finish().unwrap().to_bytes().unwrap();
+
+        let mut advance = Planner::new(&fs.observe_latest().await.unwrap(), CommitId::generate());
+        advance
+            .create_directory(fs.root(), "advance")
+            .await
+            .unwrap();
+        fs.commit(&advance.finish().unwrap()).await.unwrap();
+        let latest = fs.observe_latest().await.unwrap();
+
+        fs.revision_history_page(None, RETAINED_REVISIONS_PAGE_MAX)
+            .await
+            .unwrap();
+        let history = fs
+            .observe_state()
+            .await
+            .unwrap()
+            .history()
+            .0
+            .clone()
+            .expect("history index is present");
+        let history_object = uuid::Uuid::from_bytes(history.object).simple().to_string();
+        {
+            let mut state = backend.state.lock().unwrap();
+            let key = state
+                .objects
+                .keys()
+                .find(|key| key.ends_with(&history_object))
+                .cloned()
+                .expect("history index page is stored");
+            state.objects.get_mut(&key).unwrap().bytes[history.offset as usize] ^= 1;
+        }
+
+        let expiry = ExpiryRequest::new(
+            fs.filesystem(),
+            CommitId::generate(),
+            latest.revision(),
+            vec![older_revision],
+        )
+        .unwrap();
+        assert_eq!(
+            fs.expire(&expiry).await.unwrap_err().kind(),
+            ErrorKind::Corrupt
+        );
+        assert_eq!(
+            fs.restore_transaction(&older_request.to_bytes().unwrap())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
+        );
+        assert_eq!(
+            fs.commit_frozen_batch(&[pending_bytes])
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corrupt
         );
     }
 }

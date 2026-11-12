@@ -505,16 +505,12 @@ impl MetadataService {
             root,
         };
         let marker = fs.marker()?;
-        match operator
+        // The conditional install may have failed before or after taking effect.
+        // Verify the durable marker once for either outcome.
+        let _ = operator
             .write_with(".yinyang/head", marker.clone())
             .if_not_exists(true)
-            .await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                fs.verify_binding(&operator).await?;
-            }
-        }
+            .await;
         fs.verify_binding(&operator).await?;
         Ok(fs)
     }
@@ -1314,6 +1310,52 @@ mod admission_tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(backend.state.lock().unwrap().data_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn create_verifies_the_binding_once_and_rejects_a_foreign_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = TestBackend::default();
+        let path = temp.path().join("metadata.db");
+        drop(
+            MetadataService::create(&path, backend.operator())
+                .await
+                .unwrap(),
+        );
+
+        backend.state.lock().unwrap().read_paths.clear();
+        let reopened = MetadataService::create(&path, backend.operator())
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .read_paths
+                .iter()
+                .filter(|path| path.as_str() == ".yinyang/head")
+                .count(),
+            1
+        );
+        drop(reopened);
+
+        backend.state.lock().unwrap().read_paths.clear();
+        let error = MetadataService::create(temp.path().join("foreign.db"), backend.operator())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert_eq!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .read_paths
+                .iter()
+                .filter(|path| path.as_str() == ".yinyang/head")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
