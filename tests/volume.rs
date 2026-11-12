@@ -186,6 +186,56 @@ async fn managed_expiry_admission_is_static_and_rejects_unsupported_volumes() {
 }
 
 #[tokio::test]
+async fn direct_mount_space_observation_is_rejected_without_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let managed = config(temp.path().join("managed-state"));
+    let path = temp.path().join("managed.json");
+    load_context(&path, &managed)
+        .await
+        .unwrap()
+        .admit_space_observation()
+        .unwrap();
+
+    let direct_mount = VolumeConfig {
+        name: "direct-mount".into(),
+        model: Model::Direct,
+        access: Access::Mount,
+        frontend: Frontend::Library,
+        publication: Publication::Object,
+        storage_profile: StorageProfile::Minio,
+        staging: std::path::PathBuf::new(),
+        read_only: true,
+        service_address: None,
+    };
+    let path = temp.path().join("direct-mount.json");
+    let error = load_context(&path, &direct_mount)
+        .await
+        .unwrap()
+        .admit_space_observation()
+        .unwrap_err();
+    assert_eq!(error.stage(), VolumeLoadStage::Admission);
+    assert_eq!(error.kind(), yinyang::runtime::ErrorKind::Invalid);
+    assert!(error.message().contains("Direct Mount"));
+    assert!(error.message().contains("status or doctor"));
+
+    #[cfg(target_os = "linux")]
+    {
+        let direct_sync = VolumeConfig {
+            access: Access::Sync,
+            read_only: false,
+            staging: temp.path().join("direct-sync-state"),
+            ..direct_mount
+        };
+        let path = temp.path().join("direct-sync.json");
+        load_context(&path, &direct_sync)
+            .await
+            .unwrap()
+            .admit_space_observation()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn fuse_frontend_admits_read_only_and_writable_managed_mounts() {
     let temp = tempfile::tempdir().unwrap();
     let backend = TestBackend::default();
