@@ -86,6 +86,8 @@ pub async fn run(context: VolumeContext, command: SpaceCommand) -> CliResult<Exi
     );
     if expiry {
         context.admit_managed_expiry()?;
+    } else {
+        context.admit_space_observation()?;
     }
     if config.model == Model::Direct {
         return run_sync_space(config, command).await;

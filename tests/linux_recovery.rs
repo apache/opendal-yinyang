@@ -1425,6 +1425,10 @@ fn explicit_expiry_clean_ready_work(publication: Publication) {
     let immutable_before = immutable_identities(&fixture.operator());
     let committed = run_expiry(&fixture, &empty_config, &[expire.cursor.revision], &[], &[]);
     assert_expiry_success(&committed, publication, "committed");
+    assert!(
+        !empty_state.join("content").exists(),
+        "managed expiry created obsolete nested content runtime state"
+    );
     let expiry_revision = runtime()
         .block_on(authority.observe_latest())
         .expect("observe expiry audit revision")
@@ -1628,7 +1632,7 @@ fn package_by_path<'a>(packages: &'a [serde_json::Value], path: &Path) -> &'a se
 }
 
 fn clear_ephemeral_locks(staging: &Path) {
-    for relative in ["sync-engine.lock", "runtime.lock", "content/runtime.lock"] {
+    for relative in ["sync-engine.lock", "runtime.lock"] {
         match fs::remove_file(staging.join(relative)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1638,7 +1642,7 @@ fn clear_ephemeral_locks(staging: &Path) {
 }
 
 fn assert_no_ephemeral_locks(staging: &Path) {
-    for relative in ["sync-engine.lock", "runtime.lock", "content/runtime.lock"] {
+    for relative in ["sync-engine.lock", "runtime.lock"] {
         assert!(
             !staging.join(relative).exists(),
             "read-only planning created writer lease {relative} under {}",

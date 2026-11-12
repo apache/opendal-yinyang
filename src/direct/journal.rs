@@ -22,6 +22,7 @@ use crate::local::lease::StateLease;
 use crate::local::store;
 use borsh::{BorshDeserialize, BorshSerialize};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -302,6 +303,7 @@ impl Store {
             _lock: lock,
         };
         store.recover_dispatching()?;
+        let _ = store.release_completed_inputs();
         Ok(store)
     }
 
@@ -434,6 +436,56 @@ impl Store {
 
     pub fn temporary_path(&self, directory: &str, id: [u8; 16]) -> PathBuf {
         self.root.join(directory).join(format!("{}.tmp", hex(id)))
+    }
+
+    pub fn release_completed_input(&self, id: [u8; 16]) -> Result<()> {
+        let Some(mutation) = self.mutation(id)? else {
+            return Ok(());
+        };
+        if mutation.state != MUTATION_APPLIED {
+            return Ok(());
+        }
+        for endpoint in [mutation.source.as_ref(), mutation.destination.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if self
+                .object(&endpoint.key)?
+                .is_some_and(|object| object.pending_mutation == Some(id))
+            {
+                return Ok(());
+            }
+        }
+        self.remove_input(id)
+    }
+
+    fn release_completed_inputs(&self) -> Result<()> {
+        let referenced = self
+            .objects()?
+            .into_iter()
+            .filter_map(|object| object.pending_mutation)
+            .collect::<BTreeSet<_>>();
+        let mut first_error = None;
+        for mutation in self.mutations()? {
+            if mutation.state == MUTATION_APPLIED
+                && !referenced.contains(&mutation.id)
+                && let Err(error) = self.remove_input(mutation.id)
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn remove_input(&self, id: [u8; 16]) -> Result<()> {
+        match std::fs::remove_file(self.input_path(id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(local("remove completed Direct mutation input", error)),
+        }
     }
 
     fn recover_dispatching(&self) -> Result<()> {

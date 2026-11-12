@@ -302,6 +302,15 @@ impl Admission {
         }
         Ok(())
     }
+
+    fn admit_space_observation(&self, config: &VolumeConfig) -> Result<()> {
+        if config.model == Model::Direct && config.access == Access::Mount {
+            return Err(invalid_admission(
+                "Direct Mount volumes do not support space report or retention planning; use status or doctor for Direct Mount state",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl VolumeConfig {
@@ -687,6 +696,16 @@ impl VolumeContext {
     pub fn admit_managed_expiry(&self) -> std::result::Result<(), VolumeLoadError> {
         self.admission
             .admit_managed_expiry(&self.config)
+            .map_err(|error| {
+                VolumeLoadError::from_runtime(VolumeLoadStage::Admission, error, Some(&self.config))
+            })
+    }
+
+    /// Admit non-mutating space observation without loading storage or
+    /// credentials.
+    pub fn admit_space_observation(&self) -> std::result::Result<(), VolumeLoadError> {
+        self.admission
+            .admit_space_observation(&self.config)
             .map_err(|error| {
                 VolumeLoadError::from_runtime(VolumeLoadStage::Admission, error, Some(&self.config))
             })

@@ -56,7 +56,6 @@ const SCAN_LIMIT: usize = 4096;
 struct ExpiryLeases {
     _engine: EngineStateLease,
     _sync: SyncStateLease,
-    _content: StagingLease,
     _runtime: StagingLease,
 }
 
@@ -67,17 +66,13 @@ impl ExpiryLeases {
             .map_err(|error| expiry_lease_error("Sync engine", error))?;
         let sync = SyncStateLease::acquire(staging)
             .await
-            .map_err(|error| expiry_lease_error("content Sync", error))?;
-        let content = StagingLease::acquire(staging.join("content"))
-            .await
-            .map_err(|error| expiry_lease_error("content runtime", error))?;
+            .map_err(|error| expiry_lease_error("Sync journal", error))?;
         let runtime = StagingLease::acquire(staging.to_owned())
             .await
             .map_err(|error| expiry_lease_error("runtime", error))?;
         Ok(Self {
             _engine: engine,
             _sync: sync,
-            _content: content,
             _runtime: runtime,
         })
     }
@@ -1759,14 +1754,14 @@ fn expiry_limits(protected: usize, requested: usize) -> Vec<String> {
     ]
 }
 
-/// Inspect existing content, Sync journal and shared Sync engine evidence
-/// without creating a directory or database, acquiring a runtime lease,
-/// changing state or recovering records.
+/// Inspect existing Mount/file-runtime staging, the content Sync journal and
+/// shared Sync engine evidence without creating a directory or database,
+/// acquiring a runtime lease, changing state or recovering records.
 pub async fn inspect_local_staging(staging: &Path) -> StagingSpace {
-    let content = inspect_local_content_staging(staging).await;
+    let runtime = inspect_local_runtime_staging(staging).await;
     let sync = inspect_sync_evidence(staging).await;
     let engine = inspect_engine_evidence(staging).await;
-    assemble_staging_space(staging, content, sync, engine)
+    assemble_staging_space(staging, runtime, sync, engine)
 }
 
 pub async fn inspect_sync_space(staging: &Path) -> SyncSpaceReport {
@@ -1801,29 +1796,29 @@ pub async fn plan_sync_retention(staging: &Path) -> SyncRetentionPlan {
 /// this path reads protection facts without opening the original local root.
 #[cfg(target_os = "linux")]
 async fn inspect_package_staging(staging: &Path) -> StagingSpace {
-    let content = inspect_local_content_staging(staging).await;
+    let runtime = inspect_local_runtime_staging(staging).await;
     let sync = inspect_sync_evidence(staging).await;
     let engine = inspect_engine_protection_evidence(staging).await;
-    assemble_staging_space(staging, content, sync, engine)
+    assemble_staging_space(staging, runtime, sync, engine)
 }
 
 fn assemble_staging_space(
     staging: &Path,
-    mut content: StagingSpace,
+    mut runtime: StagingSpace,
     sync: SyncInspection,
     engine: EngineInspectionRecord,
 ) -> StagingSpace {
-    merge_protected(&mut content.protected, &sync.protected);
-    merge_protected(&mut content.protected, &engine.protected);
-    content
+    merge_protected(&mut runtime.protected, &sync.protected);
+    merge_protected(&mut runtime.protected, &engine.protected);
+    runtime
         .frozen_commits
         .extend(sync.frozen_commits.iter().cloned());
-    content.frozen_commits.sort();
-    content.frozen_commits.dedup();
-    push_unique(&mut content.errors, sync.evidence.error.clone());
-    push_unique(&mut content.errors, engine.evidence.error.clone());
+    runtime.frozen_commits.sort();
+    runtime.frozen_commits.dedup();
+    push_unique(&mut runtime.errors, sync.evidence.error.clone());
+    push_unique(&mut runtime.errors, engine.evidence.error.clone());
     if sync.evidence.state != StagingState::Missing {
-        content.databases.push(StagingDatabase {
+        runtime.databases.push(StagingDatabase {
             kind: "sync-journal",
             path: display_path(&staging.join("sync.db")),
             state: measurement_state(sync.evidence.state),
@@ -1831,18 +1826,18 @@ fn assemble_staging_space(
         });
     }
     if engine.evidence.state != StagingState::Missing {
-        content.databases.push(StagingDatabase {
+        runtime.databases.push(StagingDatabase {
             kind: "sync-engine",
             path: display_path(&staging.join("sync-engine.db")),
             state: measurement_state(engine.evidence.state),
             error: engine.evidence.error.clone(),
         });
     }
-    content.protected_revisions = protected_revisions(&content.protected);
-    content.sync = sync.evidence;
-    content.engine = engine.evidence;
-    content.state = staging_state(&content.databases, &content.errors, content.state);
-    content
+    runtime.protected_revisions = protected_revisions(&runtime.protected);
+    runtime.sync = sync.evidence;
+    runtime.engine = engine.evidence;
+    runtime.state = staging_state(&runtime.databases, &runtime.errors, runtime.state);
+    runtime
 }
 
 /// Inspect local evidence only after existing read-only validators prove every
@@ -1877,22 +1872,12 @@ async fn validate_local_staging_binding(
     }
 
     let sync = staging.join("sync.db");
-    let content = staging.join("content");
     if path_exists(&sync)? {
         Sync::validate_restore(staging, filesystem)
             .await
             .map_err(|error| {
                 format!(
                     "validate Sync binding for filesystem {}: {error}",
-                    identity_hex(filesystem)
-                )
-            })?;
-    } else if path_exists(&content.join("staging.db"))? {
-        Runtime::validate_staging(&content, filesystem)
-            .await
-            .map_err(|error| {
-                format!(
-                    "validate Sync content staging binding for filesystem {}: {error}",
                     identity_hex(filesystem)
                 )
             })?;
@@ -2273,10 +2258,10 @@ fn staging_state(
     }
 }
 
-/// Inspect existing Managed content staging databases without creating a
+/// Inspect the existing Mount/file-runtime staging database without creating a
 /// directory or database, acquiring a runtime lease, changing state, or
 /// recovering records.
-async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
+async fn inspect_local_runtime_staging(staging: &Path) -> StagingSpace {
     let mut errors = Vec::new();
     let directory = match measure_directory(staging).await {
         Ok(usage) => Some(usage),
@@ -2286,29 +2271,21 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
             None
         }
     };
-    let candidates = [
-        ("mount", staging.join("staging.db")),
-        ("sync-content", staging.join("content").join("staging.db")),
-    ];
-    let mut existing = Vec::new();
-    let mut detection_failed = false;
-    for (kind, path) in candidates {
-        match path.try_exists() {
-            Ok(true) => existing.push((kind, path)),
-            Ok(false) => {}
-            Err(error) => {
-                detection_failed = true;
-                errors.push(format!(
-                    "inspect staging database {}: {error}",
-                    path.display()
-                ));
-            }
+    let database_path = staging.join("staging.db");
+    let exists = match database_path.try_exists() {
+        Ok(exists) => exists,
+        Err(error) => {
+            errors.push(format!(
+                "inspect staging database {}: {error}",
+                database_path.display()
+            ));
+            false
         }
-    }
-    if existing.is_empty() {
+    };
+    if !exists {
         return StagingSpace {
             path: display_path(staging),
-            state: if detection_failed {
+            state: if !errors.is_empty() {
                 StagingState::Unavailable
             } else if staging.try_exists().unwrap_or(false) {
                 StagingState::NotInitialized
@@ -2328,109 +2305,104 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
         };
     }
 
-    let mut databases = Vec::new();
     let mut handles = StagingHandles::default();
     let mut protected = BTreeMap::<Revision, BTreeSet<&'static str>>::new();
     let mut frozen_commits = BTreeSet::new();
     let mut handle_revisions = BTreeMap::new();
-    let mut valid = 0_u64;
-    for (kind, database_path) in existing {
-        let parent = database_path
-            .parent()
-            .expect("staging database always has a parent");
-        match Runtime::inspect(parent).await {
-            Ok(status) => {
-                valid += 1;
-                databases.push(StagingDatabase {
-                    kind,
-                    path: display_path(&database_path),
-                    state: MeasurementState::Available,
-                    error: None,
-                });
-                for handle in status.handles {
-                    handle_revisions.insert(handle.id, handle.remote_revision);
-                    handles.total = handles.total.saturating_add(1);
-                    handles.handle_bytes = handles.handle_bytes.saturating_add(handle.length);
-                    // Every ready handle remains recoverable by UUID and may
-                    // read untouched bytes or publish from this exact base.
-                    let mut reasons = BTreeSet::from(["staging_base"]);
-                    if handle.pending {
-                        handles.pending = handles.pending.saturating_add(1);
-                        reasons.insert("staging_pending");
-                    }
-                    if handle.frozen {
-                        handles.frozen = handles.frozen.saturating_add(1);
-                        reasons.insert("staging_frozen");
-                    }
-                    if let Some(commit) = handle.frozen_commit_id {
-                        frozen_commits.insert(commit_hex(commit));
-                    }
-                    let mut conflict = handle.conflict;
-                    let mut unknown = false;
-                    let mut failed = false;
-                    if let Some(error) = &handle.error {
-                        match error.kind() {
-                            RuntimeErrorKind::Unknown => {
-                                unknown = true;
-                                reasons.insert("staging_unknown");
-                            }
-                            RuntimeErrorKind::Conflict => {
-                                conflict = true;
-                            }
-                            _ => {
-                                failed = true;
-                                reasons.insert("staging_failed");
-                            }
+    let mut databases = Vec::new();
+    let state = match Runtime::inspect(staging).await {
+        Ok(status) => {
+            databases.push(StagingDatabase {
+                kind: "mount",
+                path: display_path(&database_path),
+                state: MeasurementState::Available,
+                error: None,
+            });
+            for handle in status.handles {
+                handle_revisions.insert(handle.id, handle.remote_revision);
+                handles.total = handles.total.saturating_add(1);
+                handles.handle_bytes = handles.handle_bytes.saturating_add(handle.length);
+                // Every ready handle remains recoverable by UUID and may
+                // read untouched bytes or publish from this exact base.
+                let mut reasons = BTreeSet::from(["staging_base"]);
+                if handle.pending {
+                    handles.pending = handles.pending.saturating_add(1);
+                    reasons.insert("staging_pending");
+                }
+                if handle.frozen {
+                    handles.frozen = handles.frozen.saturating_add(1);
+                    reasons.insert("staging_frozen");
+                }
+                if let Some(commit) = handle.frozen_commit_id {
+                    frozen_commits.insert(commit_hex(commit));
+                }
+                let mut conflict = handle.conflict;
+                let mut unknown = false;
+                let mut failed = false;
+                if let Some(error) = &handle.error {
+                    match error.kind() {
+                        RuntimeErrorKind::Unknown => {
+                            unknown = true;
+                            reasons.insert("staging_unknown");
+                        }
+                        RuntimeErrorKind::Conflict => {
+                            conflict = true;
+                        }
+                        _ => {
+                            failed = true;
+                            reasons.insert("staging_failed");
                         }
                     }
-                    if conflict {
-                        handles.conflict = handles.conflict.saturating_add(1);
-                        reasons.insert("staging_conflict");
-                    }
-                    if unknown {
-                        handles.unknown = handles.unknown.saturating_add(1);
-                    }
-                    if failed {
-                        handles.failed = handles.failed.saturating_add(1);
-                    }
-                    protected
-                        .entry(handle.remote_revision)
-                        .or_default()
-                        .extend(reasons);
                 }
-                handles.ledger_errors = handles
-                    .ledger_errors
-                    .saturating_add(status.errors.len() as u64);
-                for error in status.errors {
-                    if let Some(commit) = error.error.commit_id() {
-                        frozen_commits.insert(commit_hex(commit));
-                    }
-                    if let Some(revision) = handle_revisions.get(&error.handle) {
-                        let reason = match error.error.kind() {
-                            RuntimeErrorKind::Unknown => "staging_unknown",
-                            RuntimeErrorKind::Conflict => "staging_conflict",
-                            _ => "staging_failed",
-                        };
-                        protected.entry(*revision).or_default().insert(reason);
-                    } else {
-                        errors.push(format!(
-                            "ledger error {} references absent handle {}",
-                            error.sequence, error.handle
-                        ));
-                    }
+                if conflict {
+                    handles.conflict = handles.conflict.saturating_add(1);
+                    reasons.insert("staging_conflict");
+                }
+                if unknown {
+                    handles.unknown = handles.unknown.saturating_add(1);
+                }
+                if failed {
+                    handles.failed = handles.failed.saturating_add(1);
+                }
+                protected
+                    .entry(handle.remote_revision)
+                    .or_default()
+                    .extend(reasons);
+            }
+            handles.ledger_errors = handles
+                .ledger_errors
+                .saturating_add(status.errors.len() as u64);
+            for error in status.errors {
+                if let Some(commit) = error.error.commit_id() {
+                    frozen_commits.insert(commit_hex(commit));
+                }
+                if let Some(revision) = handle_revisions.get(&error.handle) {
+                    let reason = match error.error.kind() {
+                        RuntimeErrorKind::Unknown => "staging_unknown",
+                        RuntimeErrorKind::Conflict => "staging_conflict",
+                        _ => "staging_failed",
+                    };
+                    protected.entry(*revision).or_default().insert(reason);
+                } else {
+                    errors.push(format!(
+                        "ledger error {} references absent handle {}",
+                        error.sequence, error.handle
+                    ));
                 }
             }
-            Err(error) => {
-                databases.push(StagingDatabase {
-                    kind,
-                    path: display_path(&database_path),
-                    state: MeasurementState::Unavailable,
-                    error: Some(error.to_string()),
-                });
-                errors.push(format!("{}: {error}", database_path.display()));
-            }
+            StagingState::Available
         }
-    }
+        Err(error) => {
+            databases.push(StagingDatabase {
+                kind: "mount",
+                path: display_path(&database_path),
+                state: MeasurementState::Unavailable,
+                error: Some(error.to_string()),
+            });
+            errors.push(format!("{}: {error}", database_path.display()));
+            StagingState::Unavailable
+        }
+    };
     let protected_revisions = protected
         .iter()
         .map(|(revision, reasons)| ProtectedRevision {
@@ -2438,13 +2410,6 @@ async fn inspect_local_content_staging(staging: &Path) -> StagingSpace {
             reasons: reasons.iter().copied().collect(),
         })
         .collect::<Vec<_>>();
-    let state = if valid == databases.len() as u64 {
-        StagingState::Available
-    } else if valid == 0 {
-        StagingState::Unavailable
-    } else {
-        StagingState::Partial
-    };
     StagingSpace {
         path: display_path(staging),
         state,

@@ -34,13 +34,8 @@ use std::path::{Component, Path, PathBuf};
 const MAGIC: [u8; 8] = *b"YYSYNC01";
 const VERSION: u8 = 1;
 const MANIFEST: &str = "manifest.bin";
-const DATABASES: [&str; 3] = ["sync-engine.db", "sync.db", "content/staging.db"];
-const PROCESS_LEASES: [&str; 4] = [
-    "sync-engine.lock",
-    "sync.lock",
-    "runtime.lock",
-    "content/runtime.lock",
-];
+const DATABASES: [&str; 3] = ["sync-engine.db", "sync.db", "staging.db"];
+const PROCESS_LEASES: [&str; 3] = ["sync-engine.lock", "sync.lock", "runtime.lock"];
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 struct BackupManifest {
@@ -269,7 +264,7 @@ impl BackupManifest {
             (database.length, database.hash) = hash_file(&destination)?;
         }
         self.save(&output.join(MANIFEST))?;
-        for relative in ["root", "state/artifacts", "state/content", "state"] {
+        for relative in ["root", "state/artifacts", "state"] {
             let path = output.join(relative);
             if path.is_dir() {
                 sync_directory(&path)?;
@@ -362,11 +357,7 @@ impl BackupManifest {
             ));
         }
         for evidence in self.databases.iter().chain(&self.support) {
-            if !safe_relative(&evidence.path) {
-                return Err(Error::corrupt(
-                    "backup manifest contains an unsafe support path",
-                ));
-            }
+            validate_support_path(&evidence.path)?;
         }
         Ok(())
     }
@@ -528,15 +519,13 @@ impl BackupManifest {
         };
         let mut store = Store::open(&state.join("sync-engine.db"))?;
         store.rebind(&binding, &identities, &state)?;
-        for relative in ["artifacts", "content", "content/staging.db"] {
-            let path = state.join(relative);
-            if path.is_dir() {
-                sync_directory(&path)?;
-            } else if path.is_file() {
-                File::open(&path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|error| Error::io("persist restored state", &path, error))?;
-            }
+        let path = state.join("artifacts");
+        if path.is_dir() {
+            sync_directory(&path)?;
+        } else if path.is_file() {
+            File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| Error::io("persist restored state", &path, error))?;
         }
         sync_directory(&state)?;
         sync_directory(&root)?;
@@ -788,6 +777,7 @@ fn discover_support(state: &Path) -> Result<Vec<String>> {
             let relative_text = relative
                 .to_str()
                 .ok_or_else(|| Error::unsupported("sync state path is not UTF-8"))?;
+            validate_support_path(relative_text)?;
             if relative_text == "install"
                 || relative_text == "artifacts"
                 || relative_text.starts_with("install/")
@@ -815,6 +805,20 @@ fn discover_support(state: &Path) -> Result<Vec<String>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn validate_support_path(path: &str) -> Result<()> {
+    if !safe_relative(path) {
+        return Err(Error::corrupt(
+            "backup manifest contains an unsafe support path",
+        ));
+    }
+    if path == "content" || path.starts_with("content/") {
+        return Err(Error::unsupported(format!(
+            "sync backup contains obsolete nested content runtime state: {path}"
+        )));
+    }
+    Ok(())
 }
 
 fn verify_evidence(path: &Path, expected: &FileEvidence) -> Result<()> {
@@ -969,9 +973,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_path_traversal_is_rejected() {
+    fn manifest_unsafe_and_obsolete_paths_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let manifest = BackupManifest {
+        let mut manifest = BackupManifest {
             magic: MAGIC,
             version: VERSION,
             model: 0,
@@ -1014,17 +1018,43 @@ mod tests {
         manifest.save(&temp.path().join(MANIFEST)).unwrap();
         let error = BackupManifest::load(temp.path()).unwrap_err();
         assert!(error.to_string().contains("invalid path"));
+
+        manifest.artifacts.clear();
+        for path in ["content", "content/staging.db"] {
+            for database in [false, true] {
+                let evidence = FileEvidence {
+                    path: path.to_owned(),
+                    length: 1,
+                    hash: [0; 32],
+                };
+                if database {
+                    manifest.databases.push(evidence);
+                } else {
+                    manifest.support.push(evidence);
+                }
+                manifest.save(&temp.path().join(MANIFEST)).unwrap();
+                let error = inspect(temp.path()).unwrap_err();
+                assert_eq!(error.kind(), crate::sync_engine::ErrorKind::Unsupported);
+                assert!(error.to_string().contains("obsolete nested content"));
+                if database {
+                    manifest.databases.pop();
+                } else {
+                    manifest.support.pop();
+                }
+            }
+        }
     }
 
     #[test]
-    fn process_leases_are_not_backup_support_files() {
+    fn process_leases_and_databases_are_not_backup_support_files() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir(temp.path().join("content")).unwrap();
         for path in [
+            "sync-engine.db",
+            "sync.db",
+            "staging.db",
             "sync-engine.lock",
             "sync.lock",
             "runtime.lock",
-            "content/runtime.lock",
             "adapter.json",
         ] {
             fs::write(temp.path().join(path), b"test").unwrap();
@@ -1033,6 +1063,24 @@ mod tests {
         assert_eq!(
             discover_support(temp.path()).unwrap(),
             vec!["adapter.json".to_owned()]
+        );
+    }
+
+    #[test]
+    fn obsolete_nested_content_state_is_not_generic_support() {
+        use crate::sync_engine::ErrorKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("content")).unwrap();
+        fs::write(temp.path().join("content/staging.db"), b"obsolete").unwrap();
+
+        let error = discover_support(temp.path()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("obsolete nested content runtime state"),
+            "{error}"
         );
     }
 }

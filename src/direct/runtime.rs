@@ -196,6 +196,9 @@ pub struct DirectMutationEndpoint {
 }
 
 /// Durable status of one Direct mutation.
+///
+/// `input_length` and `input_digest` identify the accepted dispatch input even
+/// after that immutable input file has been released.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectMutationStatus {
     pub id: DirectMutationId,
@@ -1050,6 +1053,7 @@ impl DirectRuntime {
             .await?;
         self.persist_staged_mutation(&mutation)?;
         let mutation = self.dispatch_destination(mutation, &input).await?;
+        self.release_completed_mutation_input(&mutation);
         status_from_mutation(&mutation)
     }
 
@@ -1083,6 +1087,7 @@ impl DirectRuntime {
         } else {
             mutation
         };
+        self.release_completed_mutation_input(&mutation);
         status_from_mutation(&mutation)
     }
 
@@ -1170,7 +1175,18 @@ impl DirectRuntime {
             }
         };
         self.apply_mutation_to_object(&mutation).await?;
+        self.release_completed_mutation_input(&mutation);
         status_from_mutation(&mutation)
+    }
+
+    fn release_completed_mutation_input(&self, mutation: &MutationRecord) {
+        if mutation.state != MUTATION_APPLIED {
+            return;
+        }
+        let Some(store) = &self.store else {
+            return;
+        };
+        let _ = guard(store).release_completed_input(mutation.id);
     }
 
     async fn retry_destination(&self, mut mutation: MutationRecord) -> Result<MutationRecord> {
@@ -2140,7 +2156,11 @@ impl DirectRuntime {
                         Some("successful Direct write response omitted an ETag".to_owned());
                 }
                 let object = record_from_entry(entry, &inner);
-                guard(store).put_records(&[object], &[mutation])?;
+                guard(store).put_records(
+                    std::slice::from_ref(&object),
+                    std::slice::from_ref(&mutation),
+                )?;
+                self.release_completed_mutation_input(&mutation);
                 Ok(flush_outcome_from_entry(entry, &inner, mutation_id))
             }
             Ok(DirectMutationOutcome::Conflict { observed }) => {
@@ -2960,6 +2980,10 @@ mod tests {
         DirectSnapshot::build(namespace(operator), Vec::new()).unwrap()
     }
 
+    fn mutation_input(root: &Path, id: DirectMutationId) -> PathBuf {
+        root.join("inputs").join(format!("{}.data", id.to_hex()))
+    }
+
     #[tokio::test]
     async fn runtime_lease_is_busy_then_reopens_after_release() {
         let backend = TestBackend::default();
@@ -3085,18 +3109,95 @@ mod tests {
             .unwrap();
         file.write(0, b"bytes").await.unwrap();
         let DirectFlushOutcome::Applied {
+            mutation,
             accepted: Some(accepted),
-            ..
         } = file.flush().await.unwrap()
         else {
             panic!("conditional create did not apply");
         };
         assert!(accepted.etag().is_some());
+        assert!(!mutation_input(state.path(), mutation).exists());
         assert_eq!(operator.read("created").await.unwrap().to_vec(), b"bytes");
         let status = file.status().await.unwrap();
         assert_eq!(status.state, DirectObjectState::Clean);
         assert!(status.existed_remote);
         assert!(status.pending_mutation.is_none());
+        let mutation = runtime.mutation_status(mutation).unwrap();
+        assert_eq!(mutation.state, DirectMutationState::Applied);
+        assert_eq!(mutation.input_length, 5);
+        assert!(mutation.input_digest.is_some());
+    }
+
+    #[tokio::test]
+    async fn successful_copy_releases_completed_input() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("source", b"source".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let source = snapshot.resolve("source").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+
+        let status = runtime
+            .copy_file(&snapshot, source, snapshot.root(), "destination", false)
+            .await
+            .unwrap();
+        assert_eq!(status.state, DirectMutationState::Applied);
+        assert_eq!(status.input_length, 6);
+        assert!(status.input_digest.is_some());
+        assert!(!mutation_input(state.path(), status.id).exists());
+        assert_eq!(
+            operator.read("destination").await.unwrap().to_vec(),
+            b"source"
+        );
+        assert_eq!(operator.read("source").await.unwrap().to_vec(), b"source");
+        assert_eq!(
+            runtime.mutation_status(status.id).unwrap().state,
+            DirectMutationState::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_rename_releases_completed_input() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        operator.write("source", b"source".to_vec()).await.unwrap();
+        let snapshot = snapshot(&operator, &backend);
+        let source = snapshot.resolve("source").unwrap().id();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+
+        let status = runtime
+            .rename_file(&snapshot, source, snapshot.root(), "destination", false)
+            .await
+            .unwrap();
+        assert_eq!(status.state, DirectMutationState::Applied);
+        assert_eq!(status.input_length, 6);
+        assert!(status.input_digest.is_some());
+        assert!(!mutation_input(state.path(), status.id).exists());
+        assert!(operator.stat("source").await.is_err());
+        assert_eq!(
+            operator.read("destination").await.unwrap().to_vec(),
+            b"source"
+        );
+        assert_eq!(
+            runtime.mutation_status(status.id).unwrap().state,
+            DirectMutationState::Applied
+        );
     }
 
     #[tokio::test]
@@ -3119,14 +3220,14 @@ mod tests {
         file.truncate(0).await.unwrap();
         file.write(0, b"local").await.unwrap();
         operator.write("file", b"external".to_vec()).await.unwrap();
-        let outcome = file.flush().await.unwrap();
-        assert!(matches!(
-            outcome,
-            DirectFlushOutcome::Conflict {
-                observed: DirectObservation::Present(_),
-                ..
-            }
-        ));
+        let DirectFlushOutcome::Conflict {
+            mutation,
+            observed: DirectObservation::Present(_),
+        } = file.flush().await.unwrap()
+        else {
+            panic!("conditional replacement did not conflict");
+        };
+        assert!(mutation_input(state.path(), mutation).exists());
         assert_eq!(file.read(0, 5).await.unwrap(), b"local");
         let id = file.id();
         drop(file);
@@ -3146,6 +3247,7 @@ mod tests {
             .find(|status| status.id == id)
             .expect("conflicted generation was not retained");
         assert_eq!(status.state, DirectObjectState::Conflict);
+        assert!(mutation_input(state.path(), mutation).exists());
         assert_eq!(
             reopened
                 .open_pending(id, false)
@@ -3220,6 +3322,7 @@ mod tests {
             DirectFlushOutcome::Unknown { mutation, .. } => mutation,
             outcome => panic!("lost response was not Unknown: {outcome:?}"),
         };
+        assert!(mutation_input(state.path(), mutation).exists());
         drop(file);
         drop(runtime);
 
@@ -3235,6 +3338,7 @@ mod tests {
             reopened.mutation_status(mutation).unwrap().state,
             DirectMutationState::Unknown
         );
+        assert!(mutation_input(state.path(), mutation).exists());
         let pending = reopened.pending_objects().await.unwrap();
         assert!(
             pending
@@ -3242,6 +3346,269 @@ mod tests {
                 .any(|status| status.state == DirectObjectState::Unknown),
             "restart did not preserve the Unknown local generation"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_etag_keeps_failed_object_and_input_across_restart() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "created")
+            .await
+            .unwrap();
+        file.write(0, b"bytes").await.unwrap();
+        backend.omit_next_write_etag();
+        assert!(matches!(
+            file.flush().await.unwrap(),
+            DirectFlushOutcome::Unsupported { .. }
+        ));
+        let id = file
+            .status()
+            .await
+            .unwrap()
+            .pending_mutation
+            .expect("failed object still references its mutation");
+        let mutation = runtime.mutation_status(id).unwrap();
+        assert_eq!(mutation.state, DirectMutationState::Applied);
+        assert_eq!(
+            mutation.accepted.as_ref().and_then(DirectObjectPin::etag),
+            None
+        );
+        assert!(mutation_input(state.path(), id).exists());
+        let object = file.id();
+        drop(file);
+        drop(runtime);
+
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert!(mutation_input(state.path(), id).exists());
+        assert_eq!(
+            reopened.mutation_status(id).unwrap().state,
+            DirectMutationState::Applied
+        );
+        let pending = reopened.pending_objects().await.unwrap();
+        let status = pending
+            .iter()
+            .find(|status| status.id == object)
+            .expect("failed object was not retained");
+        assert_eq!(status.state, DirectObjectState::Failed);
+        assert_eq!(status.pending_mutation, Some(id));
+    }
+
+    #[tokio::test]
+    async fn reopen_releases_completed_input_after_read_only_admission() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "created")
+            .await
+            .unwrap();
+        file.write(0, b"bytes").await.unwrap();
+        let DirectFlushOutcome::Applied { mutation, .. } = file.flush().await.unwrap() else {
+            panic!("conditional create did not apply");
+        };
+        let input = mutation_input(state.path(), mutation);
+        assert!(!input.exists());
+        std::fs::write(&input, b"bytes").unwrap();
+        drop(file);
+        drop(runtime);
+
+        let inspection = DirectRuntime::inspect(state.path(), Some(&binding("bucket"))).unwrap();
+        assert_eq!(inspection.state, DirectRuntimeInspectionState::Ready);
+        assert!(input.exists());
+        let read_only = DirectRuntime::open(namespace(&operator), None, true, binding("bucket"))
+            .await
+            .unwrap();
+        drop(read_only);
+        assert!(input.exists());
+
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert!(!input.exists());
+        let status = reopened.mutation_status(mutation).unwrap();
+        assert_eq!(status.state, DirectMutationState::Applied);
+        assert_eq!(status.input_length, 5);
+        assert!(status.input_digest.is_some());
+        drop(reopened);
+
+        DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert!(!input.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_does_not_change_completed_mutation() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "created")
+            .await
+            .unwrap();
+        file.write(0, b"bytes").await.unwrap();
+        let DirectFlushOutcome::Applied { mutation, .. } = file.flush().await.unwrap() else {
+            panic!("conditional create did not apply");
+        };
+        let input = mutation_input(state.path(), mutation);
+        std::fs::create_dir(&input).unwrap();
+        drop(file);
+        drop(runtime);
+
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert!(input.is_dir());
+        assert_eq!(
+            reopened.mutation_status(mutation).unwrap().state,
+            DirectMutationState::Applied
+        );
+        drop(reopened);
+
+        std::fs::remove_dir(&input).unwrap();
+        DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_commit_failure_keeps_recovery_input() {
+        let backend = TestBackend::default();
+        let operator = backend.operator();
+        let state = tempfile::tempdir().unwrap();
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        let snapshot = empty_snapshot(&operator);
+        let file = runtime
+            .create_file(&snapshot, snapshot.root(), "created")
+            .await
+            .unwrap();
+        file.write(0, b"bytes").await.unwrap();
+        let trigger = rusqlite::Connection::open(state.path().join("runtime.db")).unwrap();
+        trigger
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_completed_direct_mutation
+                BEFORE INSERT ON mutations
+                WHEN EXISTS (SELECT 1 FROM mutations WHERE id = NEW.id)
+                BEGIN
+                  SELECT RAISE(ABORT, 'completion commit failed');
+                END;
+                ",
+            )
+            .unwrap();
+
+        assert!(file.flush().await.is_err());
+        let store = runtime.store.as_ref().unwrap();
+        let id = DirectMutationId::from_bytes(
+            guard(store)
+                .object("created")
+                .unwrap()
+                .unwrap()
+                .pending_mutation
+                .expect("durable pending object still references its mutation"),
+        );
+        assert!(mutation_input(state.path(), id).exists());
+        assert_eq!(operator.read("created").await.unwrap().to_vec(), b"bytes");
+        let object = file.id();
+        drop(file);
+        drop(runtime);
+        trigger
+            .execute_batch("DROP TRIGGER fail_completed_direct_mutation;")
+            .unwrap();
+        drop(trigger);
+
+        let (written, stats) = {
+            let state = backend.state.lock().unwrap();
+            (state.written_bytes, state.stat_calls)
+        };
+        let reopened = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        {
+            let state = backend.state.lock().unwrap();
+            assert_eq!(state.written_bytes, written);
+            assert_eq!(state.stat_calls, stats);
+        }
+        assert!(mutation_input(state.path(), id).exists());
+        assert_eq!(
+            reopened.mutation_status(id).unwrap().state,
+            DirectMutationState::Unknown
+        );
+        let pending = reopened.pending_objects().await.unwrap();
+        let status = pending
+            .iter()
+            .find(|status| status.id == object)
+            .expect("pending object was not retained");
+        assert_eq!(status.state, DirectObjectState::Unknown);
+        assert_eq!(status.pending_mutation, Some(id));
     }
 
     #[tokio::test]
@@ -3268,8 +3635,29 @@ mod tests {
             DirectFlushOutcome::Unknown { mutation, .. } => mutation,
             outcome => panic!("failed request was not Unknown: {outcome:?}"),
         };
+        assert!(mutation_input(state.path(), mutation).exists());
+        drop(file);
+        drop(runtime);
+
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.mutation_status(mutation).unwrap().state,
+            DirectMutationState::Unknown
+        );
+        assert!(mutation_input(state.path(), mutation).exists());
+        let pending = runtime.open_pending(file_id, false).await.unwrap();
+        assert_eq!(pending.read(0, 5).await.unwrap(), b"local");
+        drop(pending);
         let status = runtime.retry_mutation(mutation).await.unwrap();
         assert_eq!(status.state, DirectMutationState::Applied);
+        assert!(!mutation_input(state.path(), mutation).exists());
         assert_eq!(operator.read("file").await.unwrap().to_vec(), b"local");
     }
 
@@ -3482,10 +3870,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.state, DirectMutationState::PendingSourceCleanup);
+        let input = mutation_input(state.path(), status.id);
+        assert!(input.exists());
         assert_eq!(operator.read("source").await.unwrap().to_vec(), b"source");
         assert_eq!(
             operator.read("destination").await.unwrap().to_vec(),
             b"source"
+        );
+        drop(runtime);
+        let runtime = DirectRuntime::open(
+            namespace(&operator),
+            Some(state.path().to_owned()),
+            false,
+            binding("bucket"),
+        )
+        .await
+        .unwrap();
+        assert!(input.exists());
+        assert_eq!(
+            runtime.mutation_status(status.id).unwrap().state,
+            DirectMutationState::PendingSourceCleanup
         );
 
         operator
@@ -3494,6 +3898,7 @@ mod tests {
             .unwrap();
         let status = runtime.retry_mutation(status.id).await.unwrap();
         assert_eq!(status.state, DirectMutationState::Conflict);
+        assert!(input.exists());
         assert_eq!(
             operator.read("destination").await.unwrap().to_vec(),
             b"external"

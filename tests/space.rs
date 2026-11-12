@@ -29,8 +29,9 @@ use yinyang::core::{
 };
 use yinyang::runtime::{ErrorKind, Runtime};
 use yinyang::space::{
-    MeasurementState, StagingBindingState, StagingState, inspect_bound_local_staging,
-    inspect_managed_space, plan_managed_retention,
+    ExpiryReportState, MeasurementState, StagingBindingState, StagingState,
+    expire_managed_retention, inspect_bound_local_staging, inspect_managed_space,
+    plan_managed_retention,
 };
 use yinyang::sync::Sync;
 
@@ -319,6 +320,48 @@ async fn clean_ready_handle_protects_its_base_for_recovery_and_publication() {
         remote.read(offset as u64, update.len()).await.unwrap(),
         update
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_expiry_does_not_create_nested_content_state() {
+    let backend = TestBackend::default();
+    let fs = Fs::create(backend.operator()).await.unwrap();
+    let authority: Arc<dyn Authority> = Arc::new(fs);
+    let temp = tempfile::tempdir().unwrap();
+    let editor = Runtime::open(authority.clone(), temp.path().join("editor"))
+        .await
+        .unwrap();
+    editor
+        .create_directory(authority.root(), "one")
+        .await
+        .unwrap();
+    editor
+        .create_directory(authority.root(), "two")
+        .await
+        .unwrap();
+    let revisions = authority.retained_revisions().await.unwrap();
+    assert_eq!(revisions.len(), 3);
+
+    let staging = temp.path().join("expiry");
+    let report = expire_managed_retention(
+        authority.as_ref(),
+        &staging,
+        &[revisions[0]],
+        &[],
+        CommitId::generate(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.state, ExpiryReportState::Committed);
+    assert!(
+        !staging.join("content").exists(),
+        "managed expiry created an obsolete nested content runtime"
+    );
+    let inspection = inspect_bound_local_staging(&staging, authority.filesystem()).await;
+    assert_eq!(inspection.state, StagingState::NotInitialized);
+    assert_eq!(inspection.binding.state, StagingBindingState::Verified);
 }
 
 #[tokio::test]
