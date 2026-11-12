@@ -107,7 +107,7 @@ runtime.db
 runtime.db-wal / runtime.db-shm       SQLite coordination as needed
 runtime.lock                          exclusive process lease
 objects/<16-byte-object-id>.data      shared local object generation
-inputs/<16-byte-mutation-id>.data     immutable accepted dispatch input
+inputs/<16-byte-mutation-id>.data     immutable accepted dispatch input while retained
 ```
 
 `runtime.db` uses SQLite WAL and `synchronous=FULL`. Its exact tables are:
@@ -166,8 +166,34 @@ one commit and at most one WAL fsync.
 On reopen, a stored `Dispatching` mutation becomes `Unknown`; a stored
 `SourceDispatching` rename becomes `PendingSourceCleanup`; and an object left
 `Pending` becomes `Unknown`. Startup performs no remote retry. The profile has
-no automatic garbage collection; completed inputs and readable conflict bytes
-remain until an explicit later policy is specified.
+no background or general-purpose garbage collection. Readable conflict bytes
+and shared object generations remain retained.
+
+After recovery, a writable reopen releases a mutation input only when the
+durable mutation state is `Applied` and no durable object record names that
+mutation in `pending_mutation`. A successful flush, copy, completed rename, or
+retry runs the same check before returning, so its input is normally released
+immediately. `Applied` alone is not sufficient: a successful response without
+a usable ETag can leave a `Failed` object that still references the mutation,
+and a dirty object retained after unlink can remain in `Conflict`.
+
+`Staged`, `Dispatching`, `DestinationApplied`, `PendingSourceCleanup`,
+`Conflict`, `Unknown`, and `Failed` mutations retain their inputs for recovery.
+In particular, an incomplete rename source cleanup retains the source input.
+A crash before the completion record is durable therefore retains the recovery
+input. A crash after the completion record but before input release can leave a
+safe completed input; the next writable reopen releases it idempotently.
+
+A local input-release failure does not change the recorded mutation outcome or
+re-dispatch the request. The immutable input remains at its derived path, and a
+later writable reopen retries release. Missing input files are treated as
+already released. Read-only inspection and read-only runtimes neither release
+inputs nor create state.
+
+Mutation rows are diagnostic history and are not deleted with their inputs.
+`input_length` and `input_digest` continue to identify the accepted input after
+the file no longer exists; their presence does not promise that the input file
+is still retained.
 
 `DirectRuntime::inspect(path, Option<&DirectStorageBinding>)` performs
 non-mutating doctor admission. It returns `Missing` when the path is absent and
