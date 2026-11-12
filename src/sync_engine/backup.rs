@@ -523,15 +523,13 @@ impl BackupManifest {
         };
         let mut store = Store::open(&state.join("sync-engine.db"))?;
         store.rebind(&binding, &identities, &state)?;
-        for relative in ["artifacts"] {
-            let path = state.join(relative);
-            if path.is_dir() {
-                sync_directory(&path)?;
-            } else if path.is_file() {
-                File::open(&path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|error| Error::io("persist restored state", &path, error))?;
-            }
+        let path = state.join("artifacts");
+        if path.is_dir() {
+            sync_directory(&path)?;
+        } else if path.is_file() {
+            File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| Error::io("persist restored state", &path, error))?;
         }
         sync_directory(&state)?;
         sync_directory(&root)?;
