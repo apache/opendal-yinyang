@@ -34,7 +34,7 @@ use std::path::{Component, Path, PathBuf};
 const MAGIC: [u8; 8] = *b"YYSYNC01";
 const VERSION: u8 = 1;
 const MANIFEST: &str = "manifest.bin";
-const DATABASES: [&str; 2] = ["sync-engine.db", "sync.db"];
+const DATABASES: [&str; 3] = ["sync-engine.db", "sync.db", "staging.db"];
 const PROCESS_LEASES: [&str; 3] = ["sync-engine.lock", "sync.lock", "runtime.lock"];
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
@@ -357,11 +357,7 @@ impl BackupManifest {
             ));
         }
         for evidence in self.databases.iter().chain(&self.support) {
-            if !safe_relative(&evidence.path) {
-                return Err(Error::corrupt(
-                    "backup manifest contains an unsafe support path",
-                ));
-            }
+            validate_support_path(&evidence.path)?;
         }
         Ok(())
     }
@@ -781,12 +777,7 @@ fn discover_support(state: &Path) -> Result<Vec<String>> {
             let relative_text = relative
                 .to_str()
                 .ok_or_else(|| Error::unsupported("sync state path is not UTF-8"))?;
-            if relative_text == "content" || relative_text.starts_with("content/") {
-                return Err(Error::unsupported(format!(
-                    "sync state contains obsolete nested content runtime state: {}",
-                    path.display()
-                )));
-            }
+            validate_support_path(relative_text)?;
             if relative_text == "install"
                 || relative_text == "artifacts"
                 || relative_text.starts_with("install/")
@@ -814,6 +805,20 @@ fn discover_support(state: &Path) -> Result<Vec<String>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn validate_support_path(path: &str) -> Result<()> {
+    if !safe_relative(path) {
+        return Err(Error::corrupt(
+            "backup manifest contains an unsafe support path",
+        ));
+    }
+    if path == "content" || path.starts_with("content/") {
+        return Err(Error::unsupported(format!(
+            "sync backup contains obsolete nested content runtime state: {path}"
+        )));
+    }
+    Ok(())
 }
 
 fn verify_evidence(path: &Path, expected: &FileEvidence) -> Result<()> {
@@ -968,9 +973,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_path_traversal_is_rejected() {
+    fn manifest_unsafe_and_obsolete_paths_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let manifest = BackupManifest {
+        let mut manifest = BackupManifest {
             magic: MAGIC,
             version: VERSION,
             model: 0,
@@ -1013,6 +1018,31 @@ mod tests {
         manifest.save(&temp.path().join(MANIFEST)).unwrap();
         let error = BackupManifest::load(temp.path()).unwrap_err();
         assert!(error.to_string().contains("invalid path"));
+
+        manifest.artifacts.clear();
+        for path in ["content", "content/staging.db"] {
+            for database in [false, true] {
+                let evidence = FileEvidence {
+                    path: path.to_owned(),
+                    length: 1,
+                    hash: [0; 32],
+                };
+                if database {
+                    manifest.databases.push(evidence);
+                } else {
+                    manifest.support.push(evidence);
+                }
+                manifest.save(&temp.path().join(MANIFEST)).unwrap();
+                let error = inspect(temp.path()).unwrap_err();
+                assert_eq!(error.kind(), crate::sync_engine::ErrorKind::Unsupported);
+                assert!(error.to_string().contains("obsolete nested content"));
+                if database {
+                    manifest.databases.pop();
+                } else {
+                    manifest.support.pop();
+                }
+            }
+        }
     }
 
     #[test]
@@ -1021,6 +1051,7 @@ mod tests {
         for path in [
             "sync-engine.db",
             "sync.db",
+            "staging.db",
             "sync-engine.lock",
             "sync.lock",
             "runtime.lock",

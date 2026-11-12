@@ -211,9 +211,28 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
     drop(sync);
 
     let runtime = Runtime::open(authority.clone(), &state).await.unwrap();
+    // Pin the checkpointed empty handle table so the subsequent committed
+    // handle remains in WAL even after its runtime connection closes.
+    let wal_reader = rusqlite::Connection::open(state.join("staging.db")).unwrap();
+    wal_reader
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); BEGIN; SELECT count(*) FROM handles;")
+        .unwrap();
     let file = runtime.open_node(seeded.id(), true).await.unwrap();
+    let handle = file.id();
     file.release().unwrap();
     drop(runtime);
+
+    let main_only = temp.path().join("main-only.db");
+    std::fs::copy(state.join("staging.db"), &main_only).unwrap();
+    let main_only = rusqlite::Connection::open(main_only).unwrap();
+    assert_eq!(
+        main_only
+            .query_row("SELECT count(*) FROM handles", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "the committed handle must require the source WAL"
+    );
 
     let backup = temp.path().join("backup");
     let mut directory = SyncEngine::open(ManagedAdapter::new(authority.clone()), &state)
@@ -221,6 +240,16 @@ async fn explicit_backup_protects_readable_package_dependencies_without_original
         .unwrap();
     directory.backup(&backup).await.unwrap();
     drop(directory);
+    assert!(
+        Runtime::inspect(backup.join("state"))
+            .await
+            .unwrap()
+            .handles
+            .iter()
+            .any(|record| record.id == handle),
+        "the standalone package must retain the handle committed only in source WAL"
+    );
+    drop(wal_reader);
 
     std::fs::rename(&root, temp.path().join("root-moved")).unwrap();
     let package = inspect_backup_package(&backup).unwrap();

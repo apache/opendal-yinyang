@@ -115,11 +115,13 @@ state/sync-engine.db
 state/artifacts/
 ```
 
-`sync-engine.db` and a present content-only Sync journal `sync.db` are created
-with `VACUUM INTO`, not by copying live main databases. Other local support
+`sync-engine.db`, a present content-only Sync journal `sync.db`, and a present
+file-runtime `staging.db` are created with `VACUUM INTO`, including committed
+WAL state rather than copying only main databases. Other local support
 files are checksummed and copied at their existing relative path; the engine
 itself requires only its database and retained artifacts. An obsolete nested
-`content/` runtime subtree is rejected rather than copied as generic support.
+`content/` runtime subtree is rejected during capture and package admission,
+including inspection and restore, rather than copied as generic support.
 Process lease files (`sync-engine.lock`, `sync.lock`, and `runtime.lock`) are
 not copied because restore creates the leases needed by its own writer.
 `manifest.bin` records the filesystem identity, the complete quiesced local
