@@ -394,7 +394,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
         Ok(())
     }
 
-    async fn observe(&self, baseline: &BaselineRecord) -> Result<RemoteObservation> {
+    async fn observe(&mut self, baseline: &BaselineRecord) -> Result<RemoteObservation> {
         let remote_baseline = if self.remote.capabilities().delta {
             Some(RemoteBaseline {
                 cursor: Some(baseline.cursor.clone()),
@@ -1218,7 +1218,7 @@ impl<R: RemoteAdapter> SyncEngine<R> {
     }
 
     async fn capture_remote_artifact(
-        &self,
+        &mut self,
         entry: &RemoteEntry,
     ) -> Result<super::store::ArtifactRecord> {
         let (temporary, path, file) = self.local.create_install_file("conflict")?;

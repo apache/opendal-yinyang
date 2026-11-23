@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yinyang::sync_engine::{
-    EntryKind, FrozenRemoteRequest, PreparedRemoteRequest, RemoteAdapter, RemoteBaseline,
-    RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure, RemoteObservation,
-    RemoteOperation, RemoteOutcome, RemotePin, RemoteRequest, SyncEngine, SyncModel,
+    DirectAdapter, EntryKind, FrozenRemoteRequest, ManagedAdapter, PreparedRemoteRequest,
+    RemoteAdapter, RemoteBaseline, RemoteCapabilities, RemoteCursor, RemoteEntry, RemoteFailure,
+    RemoteObservation, RemoteOperation, RemoteOutcome, RemotePin, RemoteRequest, SyncEngine,
+    SyncModel,
 };
 
 #[derive(Clone)]
@@ -426,6 +427,13 @@ async fn initialize(
         .await
         .unwrap();
     (engine, root, state_path)
+}
+
+#[test]
+fn sync_run_futures_are_send() {
+    fn assert_returns_send_future<T, F: Future + Send>(_: impl FnOnce(T) -> F) {}
+    assert_returns_send_future(SyncEngine::<DirectAdapter>::run);
+    assert_returns_send_future(SyncEngine::<ManagedAdapter>::run);
 }
 
 #[tokio::test]
